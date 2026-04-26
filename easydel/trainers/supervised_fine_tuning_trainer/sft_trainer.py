@@ -118,7 +118,7 @@ class SFTTrainer(Trainer):
         self._dataset_text_field = arguments.dataset_text_field
 
         if not isinstance(model, EasyDeLState):
-            model = model.to_state()
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
 
         super().__init__(
             arguments=arguments,

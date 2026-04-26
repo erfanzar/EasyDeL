@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import typing as tp
 
-import flax
 import jax
-from eformer.escale import with_sharding_constraint
+import spectrax as spx
 from jax import numpy as jnp
 from jax.nn import sigmoid
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -186,7 +186,7 @@ def training_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     batch = dict(batch)
     if "reference_logps" not in batch:
@@ -198,7 +198,7 @@ def training_step(
         ref_kl_out = forward_fn(reference_state.model, kl_batch)
         batch["_reference_kl_logps"] = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
 
-    def _loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
+    def _loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
@@ -296,7 +296,7 @@ def evaluation_step(
         gradient_accumulation_steps=1,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     policy_out = forward_fn(state.model, batch)
     policy_logps = policy_out["completion_logps"]

@@ -17,13 +17,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -64,14 +62,14 @@ def repeat_kv(
     return x.reshape(bs, s, n_kv_heads * n_rep, head_dim)
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(spx.Module):
     """Root Mean Square Layer Normalization for Cohere models.
 
     Implements RMS normalization with learnable scale parameters,
     providing training stability without mean centering.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
         self,
@@ -80,7 +78,7 @@ class RMSNorm(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         do_t: bool = False,
-        rngs: nn.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ):
         """Initialize RMSNorm layer.
 
@@ -90,22 +88,22 @@ class RMSNorm(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             do_t (bool, optional): Whether to transpose the kernel weight. Defaults to False.
-            rngs (nn.Rngs, optional): Random number generator state. Defaults to None.
+            rngs (spx.Rngs, optional): Random number generator state. Defaults to None.
         """
         super().__init__()
 
         if rngs is None:
-            rngs = nn.Rngs(0)
+            rngs = spx.Rngs(0)
         self.dim = dim
         self.eps = eps
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.do_t = do_t
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
             dtype=self.param_dtype,
             init_method="ones",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -119,18 +117,7 @@ class RMSNorm(nn.Module):
         """
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specifications for RMSNorm parameters.
-
-        Marks the kernel weight as replicated across all devices since
-        normalization parameters are small and needed on every device.
-
-        Returns:
-            dict[str, object]: Mapping of parameter names to sharding specs.
-        """
-        return {"kernel": Replicated}
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def forward(self, x: jnp.ndarray) -> jnp.ndarray:
         """Apply RMS normalization with learnable scale.
 
         Args:
@@ -150,7 +137,7 @@ class RMSNorm(nn.Module):
         else:
             x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = self.kernel.value.astype(self.dtype)
+        weight = self.weight.value.astype(self.dtype)
         if self.do_t:
             weight = weight.T
         return output * weight
@@ -171,7 +158,7 @@ class CohereAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ) -> None:
         """Initialize Cohere attention with optional Q/K normalization.
@@ -181,7 +168,7 @@ class CohereAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__(
@@ -243,7 +230,7 @@ class CohereAttention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class CohereMLP(nn.Module):
+class CohereMLP(spx.Module):
     """Multi-Layer Perceptron module for Cohere models.
 
     Implements feedforward network with configurable activation functions
@@ -257,7 +244,7 @@ class CohereMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Cohere MLP block.
@@ -268,7 +255,7 @@ class CohereMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -297,7 +284,7 @@ class CohereMLP(nn.Module):
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
         self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -311,7 +298,7 @@ class CohereMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = jax.nn.silu(checkpoint_name(self.gate_proj(hidden_states), name="mlp_gate"))
         up = checkpoint_name(self.up_proj(hidden_states), name="mlp_up")
@@ -319,12 +306,12 @@ class CohereMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states
 
 
-class CohereBlock(nn.Module):
+class CohereBlock(spx.Module):
     """Single decoder layer for Cohere models.
 
     Combines multi-head attention and feedforward networks with
@@ -340,7 +327,7 @@ class CohereBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ) -> None:
         """Initialize Cohere decoder block.
@@ -350,7 +337,7 @@ class CohereBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -385,7 +372,7 @@ class CohereBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -420,7 +407,7 @@ class CohereBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         attn_outputs = self.self_attn(
             hidden_states,
@@ -448,7 +435,7 @@ class CohereBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -481,7 +468,7 @@ class CohereModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Cohere base model.
 
@@ -490,7 +477,7 @@ class CohereModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -503,7 +490,7 @@ class CohereModel(EasyDeLBaseModule):
         self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -514,19 +501,19 @@ class CohereModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_eps,
@@ -534,7 +521,7 @@ class CohereModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -546,6 +533,7 @@ class CohereModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Performs forward pass through the Cohere transformer model.
 
@@ -615,29 +603,53 @@ class CohereModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -651,28 +663,28 @@ class CohereModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """
         Returns the encoder part of the model's graph definition.
         For CohereModel (decoder-only), this is not applicable.
         """
         raise NotImplementedError("CohereModel is a decoder-only model and does not have a separate encoder.")
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """
         Returns the decoder part of the model's graph definition.
         For CohereModel, this is the model itself.
         """
         return self
 
-    def get_lm_head(self) -> nn.Module:
+    def get_lm_head(self) -> spx.Module:
         """
         Returns the language model head of the module.
         CohereModel does not include the lm_head.
         """
         raise NotImplementedError("CohereModel does not include the language model head. See CohereForCausalLM.")
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """
         Returns the embedding layer of the module.
         """
@@ -705,7 +717,7 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Cohere model for causal language modeling.
 
@@ -714,7 +726,7 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -728,7 +740,7 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         )
         self.logit_scale = self.config.logit_scale
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -800,7 +812,7 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
             past_key_values=outputs.past_key_values,
         )
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """
         Returns the encoder part of the model's graph definition.
         For CohereForCausalLM (decoder-only), this is not applicable.
@@ -833,20 +845,20 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
 
         return _project
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """
         Returns the decoder part of the model's graph definition.
         For CohereForCausalLM, this is the underlying CohereModel.
         """
         return self.model.get_decoder()  # self.model is the CohereModel instance
 
-    def get_lm_head(self) -> nn.Module:
+    def get_lm_head(self) -> spx.Module:
         """
         Returns the language model head of the module.
         """
         return self.lm_head
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """
         Returns the embedding layer of the module.
         """
@@ -879,7 +891,7 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Cohere model for sequence classification.
 
@@ -888,7 +900,7 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -902,7 +914,7 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
             classifier_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -989,7 +1001,7 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
             attentions=transformer_outputs.attentions,
         )
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """
         Returns the encoder part of the model's graph definition.
         For CohereForSequenceClassification (decoder-only), this is not applicable.
@@ -998,14 +1010,14 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
             "CohereForSequenceClassification is a decoder-only model and does not have a separate encoder."
         )
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """
         Returns the decoder part of the model's graph definition.
         For CohereForSequenceClassification, this is the underlying CohereModel.
         """
         return self.model  # self.model is the CohereModel instance
 
-    def get_lm_head(self) -> nn.Module:
+    def get_lm_head(self) -> spx.Module:
         """
         Returns the language model head of the module.
         CohereForSequenceClassification uses a classification head instead.
@@ -1014,7 +1026,7 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
             "CohereForSequenceClassification uses a classification head (self.score), not an lm_head."
         )
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """
         Returns the embedding layer of the module.
         """

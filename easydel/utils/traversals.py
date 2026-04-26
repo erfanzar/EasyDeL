@@ -12,23 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility functions for managing and manipulating nnx module states."""
+"""Utility functions for managing and manipulating SpectraX module states."""
 
+import dataclasses
 import typing as tp
 from collections.abc import Generator, Iterable, Mapping
 from copy import deepcopy
 
 import jax
 import jax.numpy as jnp
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from flax import nnx, struct
-from flax import nnx as nn
-from flax.nnx import traversals
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
 
-T = tp.TypeVar("T", bound=nn.Module)
+T = tp.TypeVar("T", bound=spx.Module)
 ModulePath = tuple[str, ...]
 
 PyTree = dict
@@ -41,13 +40,13 @@ logger = get_logger(__name__)
 
 
 class MetaValueRecreator:
-    """Helper for recreating nnx meta values (RNG keys/counts) deterministically.
+    """Helper for recreating meta values deterministically.
 
     Maintains an internal counter and PRNG key that advance on each call,
-    producing reproducible sequences for RNG count and key state variables.
+    producing reproducible sequences for state variables.
 
     Attributes:
-        _count: Monotonically increasing counter for ``RngCount`` variables.
+        _count: Monotonically increasing counter.
         _rng: Current PRNG key, split on each ``get_rng`` call.
     """
 
@@ -67,7 +66,7 @@ class MetaValueRecreator:
         return key
 
 
-@struct.dataclass
+@dataclasses.dataclass
 class _EmptyNode:
     pass
 
@@ -207,25 +206,14 @@ def flatten_dict(
     Raises:
         TypeError: If input is not a dictionary or mapping
     """
-
-    if isinstance(xs, dict) or fumap:
-        if sep is not None:
-            xs = int_key_to_string(xs)
-        return _dict_flatten_dict(
-            xs=xs,
-            keep_empty_nodes=keep_empty_nodes,
-            is_leaf=is_leaf,
-            sep=sep,
-            fumap=fumap,
-        )
-    return tp.cast(
-        dict[tuple | str, tp.Any],
-        traversals.flatten_mapping(
-            xs,
-            keep_empty_nodes=keep_empty_nodes,
-            is_leaf=is_leaf,
-            sep=sep,
-        ),
+    if sep is not None:
+        xs = int_key_to_string(xs)
+    return _dict_flatten_dict(
+        xs=xs,
+        keep_empty_nodes=keep_empty_nodes,
+        is_leaf=is_leaf,
+        sep=sep,
+        fumap=fumap,
     )
 
 
@@ -239,220 +227,7 @@ def unflatten_dict(xs, sep=None):
     Returns:
         Nested dictionary.
     """
-    if isinstance(xs, dict):
-        return _dict_unflatten_dict(xs=xs, sep=sep)
-    return traversals.unflatten_mapping(xs, sep=sep)
-
-
-def nnx_init(
-    module: type[M],
-    _add_rngs: bool = True,
-    _rng_key: str = "rngs",
-    _seed: int = 0,
-    _lazy: bool = True,
-    **kwargs,
-) -> M:
-    """Initializes an nnx module with lazy initialization support.
-
-    This function provides a convenient way to initialize nnx modules while
-    handling random number generation and optional lazy initialization.
-
-    Args:
-        module: The nnx module to initialize.
-        _add_rngs: Whether to add a `rngs` attribute to the module's
-            arguments for random number generation. Defaults to True.
-        _rng_key: The key to use for the `rngs` attribute. Defaults to "rngs".
-        _seed: The seed value for random number generation. Defaults to 0.
-        _lazy: Whether to perform lazy initialization. If True, the module's
-            parameters will be initialized lazily when first used. Defaults
-            to True.
-        **kwargs: Additional keyword arguments to pass to the module's
-            constructor.
-
-    Returns:
-        nnx.State: The initialized nnx state.
-    """
-    if not _lazy:
-        return module(**kwargs, **({_rng_key: nnx.Rngs(_seed)} if _add_rngs else {}))
-
-    return nnx.eval_shape(lambda: module(**kwargs, **({_rng_key: nnx.Rngs(_seed)} if _add_rngs else {})))
-
-
-def create_graphdef(
-    module: nnx.Module,
-    _add_rngs: bool = True,
-    _rng_key: str = "rngs",
-    _seed: int = 0,
-    **kwargs,
-) -> tp.Any:
-    """Creates a graph definition from an nnx module.
-
-    This function initializes the module lazily and extracts the graph
-    definition, which represents the structure of the module without any
-    parameter values.
-
-    Args:
-        module: The nnx module to create the graph definition from.
-        _add_rngs: Whether to add a `rngs` attribute to the module's
-            arguments for random number generation. Defaults to True.
-        _rng_key: The key to use for the `rngs` attribute. Defaults to "rngs".
-        _seed: The seed value for random number generation. Defaults to 0.
-        **kwargs: Additional keyword arguments to pass to the module's
-            constructor.
-
-    Returns:
-        dict: The graph definition of the module.
-    """
-    return nnx.split(
-        nnx_init(
-            module=module,
-            _rng_key=_rng_key,
-            _add_rngs=_add_rngs,
-            _seed=_seed,
-            _lazy=True,
-            **kwargs,
-        )
-    )[0]
-
-
-def init_graphstate(
-    module: nnx.Module,
-    _add_rngs: bool = True,
-    _rng_key: str = "rngs",
-    _seed: int = 0,
-    _lazy: bool = True,
-    **kwargs,
-) -> tp.Any:
-    """Initializes the graph state of an nnx module.
-
-    This function initializes the module and returns the graph state, which
-    contains the initialized parameter values and other state information.
-
-    Args:
-        module: The nnx module to initialize.
-        _add_rngs: Whether to add a `rngs` attribute to the module's
-            arguments for random number generation. Defaults to True.
-        _rng_key: The key to use for the `rngs` attribute. Defaults to "rngs".
-        _seed: The seed value for random number generation. Defaults to 0.
-        _lazy: Whether to perform lazy initialization. If True, the module's
-            parameters will be initialized lazily when first used. Defaults
-            to True.
-        **kwargs: Additional keyword arguments to pass to the module's
-            constructor.
-
-    Returns:
-        dict: The initialized graph state of the module.
-    """
-    return nnx.split(
-        nnx_init(
-            module=module,
-            _rng_key=_rng_key,
-            _add_rngs=_add_rngs,
-            _seed=_seed,
-            _lazy=_lazy,
-            **kwargs,
-        )
-    )[1]
-
-
-def validate_state(state: dict[str, tp.Any], init_state: dict[str, tp.Any]) -> StateValidationResult:
-    """Validate a state dictionary against a reference init state.
-
-    Checks for missing keys and type mismatches between ``state`` and
-    ``init_state``.
-
-    Args:
-        state: State dictionary to validate.
-        init_state: Reference state dictionary.
-
-    Returns:
-        ``StateValidationResult`` with validation outcome details.
-    """
-    missing_keys = set(init_state.keys()) - set(state.keys())
-    invalid_types = {k: type(v) for k, v in state.items() if k in init_state and not isinstance(v, type(init_state[k]))}
-    return StateValidationResult(
-        is_valid=len(missing_keys) == 0 and len(invalid_types) == 0,
-        missing_keys=missing_keys,
-        invalid_types=invalid_types,
-    )
-
-
-def differentiate_state(
-    state: dict[str, tp.Any],
-    init_state: dict[str, tp.Any],
-    validate: bool = True,
-) -> dict[str, nnx.VariableState]:
-    """
-    Enhanced state differentiation with validation and error handling.
-
-    Args:
-        state: Current state dictionary
-        init_state: Initial state dictionary
-        validate: Whether to perform validation
-
-    Returns:
-        Dictionary of missing attributes
-
-    Raises:
-        ValueError: If validation fails and validate=True
-    """
-    if validate:
-        validation = validate_state(state, init_state)
-        if not validation.is_valid:
-            raise ValueError(
-                f"State validation failed:\n"
-                f"Missing keys: {validation.missing_keys}\n"
-                f"Invalid types: {validation.invalid_types}"
-            )
-
-    missing_attributes = {}
-    for key, value in init_state.items():
-        if key not in state:
-            if not isinstance(value, nnx.VariableState):
-                raise TypeError(f"Value for key {key} must be VariableState, got {type(value)}")
-            missing_attributes[key] = value
-
-    return missing_attributes
-
-
-def redefine_state(state: dict, missings: dict[str, nnx.VariableState]) -> dict:
-    """Redefines missing attributes in a state dictionary.
-
-    This function takes a state dictionary `state` and a dictionary
-    `missings` containing missing attributes. It iterates over the
-    `missings` dictionary and redefines the missing attributes in the `state`
-    dictionary based on their type.
-
-    Args:
-        state: The state dictionary to redefine.
-        missings: A dictionary of missing attributes.
-
-    Returns:
-        dict: The redefined state dictionary.
-
-    Raises:
-        AttributeError: If an unexpected type is encountered in the `missings`
-            dictionary.
-    """
-    _miss_count: int = 0
-    _state_rngs: jax.random.PRNGKey = jax.random.PRNGKey(42)
-    for key, value in missings.items():
-        if isinstance(type(value), nnx.Param) or issubclass(type(value), nnx.Param):
-            if value.value is not None:
-                raise ValueError("there's missing parameter in state which can't be None.")
-            state[key] = value
-        elif isinstance(type(value), nnx.RngCount) or issubclass(type(value), nnx.RngCount):
-            state[key] = nnx.VariableState(
-                nnx.RngCount,
-                jax.numpy.array(_miss_count, dtype=jax.numpy.uint32),
-            )
-            _miss_count += 1
-        elif isinstance(type(value), nnx.RngKey) or issubclass(type(value), nnx.RngKey):
-            state[key] = nnx.VariableState(nnx.RngKey, _state_rngs)
-            _state_rngs = jax.random.split(_state_rngs)[0]
-        else:
-            raise AttributeError(f"Unexpected type({type(value)}) found which cannot be redefined.")
-    return state
+    return _dict_unflatten_dict(xs=xs, sep=sep)
 
 
 def is_flatten(tree: dict) -> bool:
@@ -471,141 +246,80 @@ def is_flatten(tree: dict) -> bool:
     return True in set(isinstance(k, tuple) for k in tree.keys())
 
 
-def recreate_meta_values(values: dict[str, tp.Any], seed: int | None = None) -> dict[str, tp.Any]:
-    """
-    Enhanced meta value recreation with better state management.
+def recreate_meta_values(values: spx.State | dict, seed: int | None = None) -> spx.State | dict:
+    """No-op for SpectraX state (RNGs are not stored in state).
+
+    In spectrax, this recreated RngCount/RngKey meta values. SpectraX
+    handles RNGs separately via :class:`spx.Rngs`, so state containers
+    do not hold them.
 
     Args:
-        values: Dictionary of values to recreate
-        seed: Optional seed for random number generation
+        values: State or dictionary (returned unchanged).
+        seed: Ignored; kept for API compatibility.
 
     Returns:
-        Dictionary with recreated meta values
-
-    Raises:
-        TypeError: For unexpected value types
+        The input values unchanged.
     """
-    recreator = MetaValueRecreator(seed or 42)
-    input_is_flatten = is_flatten(values)
-
-    if not input_is_flatten:
-        values = traversals.flatten_mapping(values)
-
-    try:
-        for key, value in values.items():
-            if isinstance(type(value), nnx.RngCount | type) and issubclass(type(value), nnx.RngCount):
-                values[key].value = recreator.get_count()
-            elif isinstance(type(value), nnx.RngKey | type) and issubclass(type(value), nnx.RngKey):
-                values[key].value = recreator.get_rng()
-            else:
-                raise TypeError(f"Unexpected type {type(value)} for key {key}")
-    except Exception as e:
-        raise ValueError(f"Failed to recreate meta values: {e!s}") from e
-
-    return traversals.unflatten_mapping(values) if not input_is_flatten else values
-
-
-def refine_graphs(*graphs: dict) -> nnx.State:
-    """Refines and merges multiple graph representations into a single nnx.State.
-
-    This function takes multiple graph representations, which can be either
-    dictionaries or nnx.State instances, and merges them into a single
-    nnx.State object. It ensures that all inputs are converted to
-    nnx.State instances before merging.
-
-    Args:
-        *graphs: The graph representations to merge.
-
-    Returns:
-        nnx.State: The merged nnx.State object.
-    """
-    _state_creators = ()
-    for graph in graphs:
-        if isinstance(graph, nnx.State):
-            _state_creators += (graph,)
-        else:
-            if is_flatten(graph):
-                graph = traversals.unflatten_mapping(graph)
-            _state_creators += (nnx.State(graph),)
-    return nnx.merge_state(*_state_creators)
-
-
-def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False) -> nnx.State:
-    """
-    Attaches a parameter tree to an nnx state.
-
-    This function takes a parameter tree, which is a dictionary containing
-    parameter values, and attaches it to an existing nnx state. It first
-    splits the nnx state into parameters and other state elements. Then,
-    it flattens the parameter tree and the nnx state's parameters for
-    easy traversal. For each parameter key in the flattened nnx state,
-    if the corresponding value is not None (indicating an existing
-    parameter), it replaces the value with the corresponding value from
-    the input parameter tree. Finally, it recreates the meta values in
-    the "others" part of the state (which includes things like RNG keys
-    and counts), and then merges the updated parameters and "others"
-    back into a single nnx.State object.
-
-    Args:
-        tree: The parameter tree to attach.
-        state: The nnx state to attach the tree to.
-        silence: Suppress missing-parameter warnings.
-
-    Returns:
-        nnx.State: The updated nnx state with the attached parameter tree.
-    """
-    params, others = nnx.split_state(state, nnx.Param, ...)
-    lost_data = False
-    if not is_flatten(params):
-        params = flatten_dict(params)
-    if not is_flatten(tree):
-        tree = flatten_dict(tree)
-    tree = string_key_to_int(tree)
-    for keys in list(params.keys()):
-        tree_values = tree.get(keys, None)
-        if tree_values is not None:
-            params[keys].value = tree_values
-        elif not silence:
-            if keys[-1] != "bias":
-                _path = ".".join([str(k) for k in keys])
-                logger.info(f"a parameter's missing at {_path}, please double check.")
-                lost_data = True
-            # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
-            params[keys].value = None
-    if lost_data:
-        logger.debug(f"tree-array strc keys {tree.keys()}")
-    others = recreate_meta_values(others)
-    state = refine_graphs(others, params)
-    return state
+    return values
 
 
 def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
-    """
-    Attaches a parameter tree to an nnx model.
+    """Attaches a parameter tree to a SpectraX model.
 
     This function takes a parameter tree, which is a dictionary containing
-    parameter values, and attaches it to an existing nnx model. It first
-    splits the nnx model into parameters and other model elements. Then,
-    it flattens the parameter tree and the nnx model's parameters for
-    easy traversal. For each parameter key in the flattened nnx model,
-    if the corresponding value is not None (indicating an existing
-    parameter), it replaces the value with the corresponding value from
-    the input parameter tree. Finally, it recreates the meta values in
-    the "others" part of the model (which includes things like RNG keys
-    and counts), and then merges the updated parameters and "others"
-    back into a single nnx.Module object.
+    parameter values, and attaches it to an existing SpectraX model. It
+    exports the model state, updates parameter values from the tree, and
+    binds the updated state back into a new model instance.
 
     Args:
         tree: The parameter tree to attach.
-        model: The nnx model to attach the tree to.
+        model: The SpectraX model to attach the tree to.
         silence: Suppress missing-parameter warnings.
 
     Returns:
-        nnx.Module: The updated nnx model with the attached parameter tree.
+        The updated SpectraX model with the attached parameter tree.
     """
-    graphdef, graphstate = nnx.split(model)
-    graphstate = merge_state_and_tree(tree=tree, state=graphstate, silence=silence)
-    return nnx.merge(graphdef, graphstate)
+    gdef, state = spx.export(model)
+
+    if not is_flatten(tree):
+        tree = flatten_dict(tree)
+    tree = string_key_to_int(tree)
+
+    # Build updated state data (flat inner dicts; State.__init__ converts to nested)
+    new_data: dict[str, dict[str, tp.Any]] = {}
+    for c, p, v in state.items():
+        new_data.setdefault(c, {})[p] = v
+
+    for keys, value in tree.items():
+        if not keys:
+            continue
+        c = keys[0]
+        path_str = ".".join(str(k) for k in keys[1:])
+        full_path = ".".join(str(k) for k in keys)
+        placed = False
+        # Try matching against the collection named by the first key segment.
+        if path_str in new_data.get(c, {}):
+            new_data[c][path_str] = value
+            placed = True
+        # Fallback: the tree may omit the collection prefix (e.g. HF checkpoints).
+        # Try the full dotted path in every known collection.
+        if not placed:
+            for coll in new_data:
+                if full_path in new_data[coll]:
+                    new_data[coll][full_path] = value
+                    placed = True
+                    break
+        if not placed and not silence:
+            logger.info(f"a parameter's missing at {c}/{path_str}, please double check.")
+
+    bound = spx.bind(gdef, spx.State(new_data))
+    # spx.bind does not restore _spx_opaque; copy it over so that
+    # transparent Opaque unwrapping continues to work.
+    object.__setattr__(bound, "_spx_opaque", dict(model._spx_opaque))
+    for opaque_name in model._spx_attr_order:
+        if opaque_name not in bound._spx_attr_order:
+            bound._spx_attr_order.append(opaque_name)
+    return bound
 
 
 def specs_to_name_sharding(tree: dict, mesh: Mesh | None = None) -> dict:
@@ -776,7 +490,7 @@ def recursive_merge(full_tree, updates):
         return updates
 
 
-def iter_module_search(model: nn.Module, instance: type[T] | None = None) -> Generator[tuple[tp.Any, T], None, None]:
+def iter_module_search(model: spx.Module, instance: type[T] | None = None) -> Generator[tuple[tp.Any, T], None, None]:
     """
     Iterates through a model and yields paths and modules of a specific type.
 
@@ -793,16 +507,20 @@ def iter_module_search(model: nn.Module, instance: type[T] | None = None) -> Gen
         >>> for path, module in iter_module_search(model, ParallelLinear):
         ...   print(f"Found Linear layer at {path}")
     """
+    _skip_types = (spx.Rngs,)
     if instance is None:
-        for path, module in nn.graph.iter_graph(model):
-            yield path, module
+        for path_str, module in spx.iter_modules(model):
+            if isinstance(module, _skip_types):
+                continue
+            yield tuple(path_str.split(".")), module
     else:
-        for path, module in nn.graph.iter_graph(model):
-            if isinstance(module, instance):
-                yield path, module
+        for path_str, module in spx.iter_modules(model, select=instance):
+            if isinstance(module, _skip_types):
+                continue
+            yield tuple(path_str.split(".")), module
 
 
-def get_module_from_path(model: nn.Module, path: ModulePath) -> nn.Module | None:
+def get_module_from_path(model: spx.Module, path: ModulePath) -> spx.Module | None:
     """
     Retrieves a module from a model given its path.
 
@@ -821,11 +539,22 @@ def get_module_from_path(model: nn.Module, path: ModulePath) -> nn.Module | None
 
     current = model
     for item in path:
-        current = current[item] if isinstance(item, int) else getattr(current, item)
+        if isinstance(item, int):
+            current = current[item]
+        else:
+            try:
+                current = getattr(current, item)
+            except AttributeError:
+                # Path segments from iter_modules are strings; container
+                # indices like "0" need integer indexing.
+                try:
+                    current = current[int(item)]
+                except (ValueError, IndexError, TypeError):
+                    raise
     return current
 
 
-def set_module_from_path(model: nn.Module, path: ModulePath, new_value: tp.Any) -> None:
+def set_module_from_path(model: spx.Module, path: ModulePath, new_value: tp.Any) -> None:
     """
     Sets a module at a specific path in the model.
 
@@ -848,11 +577,26 @@ def set_module_from_path(model: nn.Module, path: ModulePath, new_value: tp.Any) 
     current = model
     # Navigate to the parent of the target location
     for item in path[:-1]:
-        current = current[item] if isinstance(item, int) else getattr(current, item)
+        if isinstance(item, int):
+            current = current[item]
+        else:
+            try:
+                current = getattr(current, item)
+            except AttributeError:
+                try:
+                    current = current[int(item)]
+                except (ValueError, IndexError, TypeError):
+                    raise
 
     # Set the new value at the target location
     last_item = path[-1]
     if isinstance(last_item, int):
         current[last_item] = new_value
     else:
-        setattr(current, last_item, new_value)
+        try:
+            setattr(current, last_item, new_value)
+        except (AttributeError, TypeError):
+            try:
+                current[int(last_item)] = new_value
+            except (ValueError, IndexError, TypeError):
+                raise

@@ -70,12 +70,11 @@ from abc import abstractmethod
 from collections.abc import Callable
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -199,7 +198,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         vision_feature_layer: int | list[int] = -1,
         vision_feature_select_strategy: str = "default",
         image_token_index: int | None = None,
@@ -236,7 +235,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             dtype: Data type for computations. Defaults to bfloat16.
             param_dtype: Data type for parameters. Defaults to bfloat16.
             precision: JAX precision setting for matrix multiplications.
-            rngs: Flax random number generators for initialization.
+            rngs: SpecTrax random number generators for initialization.
             vision_feature_layer: Which vision encoder layer(s) to extract
                 features from. Can be:
                 - int: Single layer index (e.g., -1 for last, -2 for second-to-last)
@@ -272,7 +271,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 model = BaseVisionLanguageModule(
                     config=llava_config,
                     base_model_class=LlavaModel,
-                    rngs=nn.Rngs(0),
+                    rngs=spx.Rngs(0),
                     vision_feature_layer=-2,
                     image_token_index=32000,
                 )
@@ -286,7 +285,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 model = MyVideoVLM(
                     config=config,
                     base_model_class=VideoVLMModel,
-                    rngs=nn.Rngs(0),
+                    rngs=spx.Rngs(0),
                     temporal_patch_size=2,
                     mrope_section=(24, 20, 20),
                 )
@@ -618,14 +617,14 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         """
         return self._multimodal_merge_feature.create_multimodal_mask(input_ids)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Returns the vision encoder/tower component.
 
         Retrieves the vision encoder module from the base model. This is
         typically a ViT, SigLIP, or similar vision transformer.
 
         Returns:
-            nn.Module: The vision tower module responsible for extracting
+            spx.Module: The vision tower module responsible for extracting
                 visual features from images.
 
         Raises:
@@ -649,14 +648,14 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             f"Cannot find vision tower. Tried: {self._vision_tower_name}, visual, vision_model, image_encoder"
         )
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Returns the multimodal projector component.
 
         Retrieves the projector module that transforms vision features to
         the language model's hidden dimension.
 
         Returns:
-            nn.Module: The projector module (typically an MLP).
+            spx.Module: The projector module (typically an MLP).
 
         Raises:
             AttributeError: If no projector can be found under any of
@@ -679,14 +678,14 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             f"Cannot find projector. Tried: {self._projector_name}, projector, mm_projector, vision_projector"
         )
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Returns the language model component.
 
         Retrieves the language model (decoder) that generates text
         conditioned on the multimodal embeddings.
 
         Returns:
-            nn.Module: The language model module (e.g., Llama, Qwen).
+            spx.Module: The language model module (e.g., Llama, Qwen).
 
         Raises:
             AttributeError: If no language model can be found under any of
@@ -707,33 +706,33 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 return getattr(self.base_model, name)
         raise AttributeError(f"Cannot find language model. Tried: {self._language_model_name}, text_model, llm, decoder")
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """Returns the encoder component.
 
         For VLMs, the encoder is the vision tower that processes images.
 
         Returns:
-            nn.Module: The vision tower module.
+            spx.Module: The vision tower module.
 
         See Also:
             get_vision_tower: Direct method for accessing vision encoder.
         """
         return self.get_vision_tower()
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """Returns the decoder component.
 
         For VLMs, the decoder is the language model that generates text.
 
         Returns:
-            nn.Module: The language model module.
+            spx.Module: The language model module.
 
         See Also:
             get_language_model: Direct method for accessing language model.
         """
         return self.get_language_model()
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -849,7 +848,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None

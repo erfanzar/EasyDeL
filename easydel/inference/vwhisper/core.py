@@ -56,7 +56,7 @@ import typing as tp
 
 import jax
 import numpy as np
-from flax import nnx as nn
+import spectrax as spx
 from jax import numpy as jnp
 
 from easydel.utils import Registry
@@ -107,8 +107,8 @@ class vWhisperInference:
         generation_config (GenerationConfig): Generation configuration
             from the model or inference config.
         dtype: JAX data type for model computations.
-        graphdef: Flax NNX graph definition for the model.
-        graphstate: Flax NNX graph state containing model parameters.
+        graphdef: SpecTrax graph definition for the model.
+        graphstate: SpecTrax graph state containing model parameters.
         max_length (int): Maximum sequence length for generation.
         generate_function: The JIT-compiled generation function.
 
@@ -228,7 +228,7 @@ class vWhisperInference:
 
         Note:
             - The model is split into graphdef and graphstate using
-              Flax NNX's split function for JIT compilation compatibility.
+              SpecTrax export for JIT compilation compatibility.
             - If inference_config provides a generation_config, it takes
               precedence over the model's built-in generation_config.
         """
@@ -239,7 +239,7 @@ class vWhisperInference:
         self.feature_extractor = self.processor.feature_extractor
         self.tokenizer = tokenizer
         self.model = model
-        graphdef, graphstate = nn.split(model)
+        graphdef, graphstate = spx.export(model)
         self.graphdef = graphdef
         self.graphstate = graphstate
         generation_config = inference_config.generation_config or self.model.generation_config

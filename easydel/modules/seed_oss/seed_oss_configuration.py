@@ -125,7 +125,6 @@ class SeedOssConfig(EasyDeLBaseConfig):
 
         self.gradient_checkpointing = gradient_checkpointing
         self.gradient_checkpointing_targets = gradient_checkpointing_targets or ()
-        self.scan_layers = scan_layers
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
@@ -134,6 +133,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            scan_layers=scan_layers,
             use_scan_mlp=use_scan_mlp,
             scan_mlp_chunk_size=scan_mlp_chunk_size,
             bits=bits,

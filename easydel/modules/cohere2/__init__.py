@@ -60,7 +60,8 @@ Example Usage:
     ```python
     from easydel import Cohere2Config, Cohere2ForCausalLM
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Create configuration for Command R2
     config = Cohere2Config(
@@ -75,7 +76,7 @@ Example Usage:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = Cohere2ForCausalLM(config, rngs=rngs)
 
     # Generate text

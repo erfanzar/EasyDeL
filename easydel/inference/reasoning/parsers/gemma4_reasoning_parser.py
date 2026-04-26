@@ -54,8 +54,12 @@ class Gemma4ReasoningParser(ReasoningParser):
     - Both batch and streaming extraction
     """
 
-    start_token = CHANNEL_START
-    end_token = CHANNEL_END
+    start_token = f"{CHANNEL_START}thought{CHANNEL_END}"
+    end_token = f"{CHANNEL_START}final{CHANNEL_END}"
+    reasoning_start_tokens = (
+        f"{CHANNEL_START}thought{CHANNEL_END}",
+        f"{CHANNEL_START}analysis{CHANNEL_END}",
+    )
 
     def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
@@ -65,6 +69,7 @@ class Gemma4ReasoningParser(ReasoningParser):
             re.escape(CHANNEL_START) + r"(.*?)" + re.escape(CHANNEL_END),
             re.DOTALL,
         )
+        self._prompt_channel: str | None = None
 
     @cached_property
     def start_token_id(self) -> int:
@@ -90,6 +95,13 @@ class Gemma4ReasoningParser(ReasoningParser):
         """Disable special-token stripping to preserve channel markers."""
         request.skip_special_tokens = False
         return request
+
+    def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
+        """Track the channel opened by the prompt, if generation starts inside one."""
+        del prompt_token_ids
+        self._prompt_channel = None
+        for match in self._channel_pattern.finditer(prompt_text or ""):
+            self._prompt_channel = match.group(1).strip() or None
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """Check whether reasoning has ended by scanning token IDs backwards.
@@ -129,10 +141,10 @@ class Gemma4ReasoningParser(ReasoningParser):
         ``thought\\n`` prefix from reasoning.
         """
         del request
-        if CHANNEL_START not in model_output and CHANNEL_END not in model_output:
+        if CHANNEL_START not in model_output and CHANNEL_END not in model_output and self._prompt_channel is None:
             return None, model_output
 
-        reasoning, content = self._parse_channels(model_output)
+        reasoning, content = self._parse_channels(model_output, initial_channel=self._prompt_channel)
         if reasoning is not None:
             reasoning = _strip_thought_label(reasoning)
         return reasoning, content
@@ -155,8 +167,14 @@ class Gemma4ReasoningParser(ReasoningParser):
         """
         del previous_token_ids, delta_token_ids, request
 
-        previous_reasoning, previous_content = self._parse_channels(previous_text)
-        current_reasoning, current_content = self._parse_channels(current_text)
+        previous_reasoning, previous_content = self._parse_channels(
+            previous_text,
+            initial_channel=self._prompt_channel,
+        )
+        current_reasoning, current_content = self._parse_channels(
+            current_text,
+            initial_channel=self._prompt_channel,
+        )
 
         reasoning_delta = _suffix(previous_reasoning, current_reasoning)
         content_delta = _suffix(previous_content, current_content)
@@ -190,10 +208,15 @@ class Gemma4ReasoningParser(ReasoningParser):
 
     _REASONING_CHANNELS = frozenset({"thought", "analysis"})
 
-    def _parse_channels(self, text: str) -> tuple[str | None, str | None]:
+    def _parse_channels(
+        self,
+        text: str,
+        *,
+        initial_channel: str | None = None,
+    ) -> tuple[str | None, str | None]:
         """Split text into reasoning and content by channel markers."""
         cursor = 0
-        current_channel: str | None = None
+        current_channel: str | None = initial_channel
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
 

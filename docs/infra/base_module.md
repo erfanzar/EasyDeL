@@ -1,13 +1,13 @@
 # Base Module System
 
-The `EasyDeLBaseModule` class is the foundation for all neural network models in EasyDeL. Built on Flax NNX, it provides a rich set of features including automatic sharding, quantization, LoRA support, and seamless integration with the HuggingFace ecosystem.
+The `EasyDeLBaseModule` class is the foundation for all neural network models in EasyDeL. Built on SpecTrax SpecTrax, it provides a rich set of features including automatic sharding, quantization, LoRA support, and seamless integration with the HuggingFace ecosystem.
 
 ## Understanding EasyDeLBaseModule
 
 ### Class Hierarchy
 
 ```md
-flax.nnx.Module
+spx.Module
     └── EasyDeLBaseModule
             ├── EasyGenerationMixin      (generation capabilities)
             ├── EasyBridgeMixin          (HuggingFace compatibility)
@@ -17,7 +17,7 @@ flax.nnx.Module
 ### Basic Structure
 
 ```python
-import flax.nnx as nnx
+import spectrax as spx
 from easydel import EasyDeLBaseModule
 
 class MyModel(EasyDeLBaseModule):
@@ -27,7 +27,7 @@ class MyModel(EasyDeLBaseModule):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = None,
-        rngs: nnx.Rngs = None,
+        rngs: spx.Rngs = None,
     ):
         super().__init__(
             config=config,
@@ -37,7 +37,7 @@ class MyModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         # Initialize your layers here
-        self.embed_tokens = nnx.Embed(
+        self.embed_tokens = nn.Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             rngs=rngs,
@@ -59,7 +59,7 @@ class MyModel(EasyDeLBaseModule):
 ### Model Information
 
 ```python
-model = MyModel(config, rngs=nnx.Rngs(0))
+model = MyModel(config, rngs=spx.Rngs(0))
 
 # Access configuration
 model.config              # The model's config object
@@ -88,7 +88,7 @@ graphdef, state = model.split_module()
 model = model.merge_module(graphdef, state)
 ```
 
-### Graph Operations (Flax NNX)
+### Graph Operations (SpecTrax SpecTrax)
 
 ```python
 # Get graph components
@@ -382,7 +382,7 @@ def train_step(params, inputs):
 ```python
 model = MyModel(
     config=config,
-    rngs=nnx.Rngs(0),  # Provide random key
+    rngs=spx.Rngs(0),  # Provide random key
 )
 ```
 
@@ -393,7 +393,7 @@ model = MyModel(
     config=config,
     dtype=jnp.bfloat16,      # Computation dtype
     param_dtype=jnp.float32,  # Parameter storage dtype
-    rngs=nnx.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 ```
 

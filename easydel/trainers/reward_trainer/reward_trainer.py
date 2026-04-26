@@ -24,11 +24,10 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.trainer_protocol import TrainerConfigureFunctionOutput
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 
 from ..prompt_transforms import RewardPreprocessTransform
 from ..trainer import Trainer
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import RewardDataCollatorWithPaddingGrain, RewardDataCollatorWithPaddingTFDS
 from ._fn import evaluation_step, training_step
 from .reward_config import RewardConfig
@@ -111,7 +110,7 @@ class RewardTrainer(Trainer):
             self.input_data_collator_grain = data_collator
 
         if not isinstance(model, EasyDeLState):
-            model = model.to_state()
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
 
         super().__init__(
             arguments=arguments,
@@ -167,7 +166,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_training_static_argnums = (2, 3, 4, 5, 6, 7)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             training_step,
             static_argnums=sharded_training_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -182,7 +181,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_evaluation_static_argnums = (2, 3, 4)
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=sharded_evaluation_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),

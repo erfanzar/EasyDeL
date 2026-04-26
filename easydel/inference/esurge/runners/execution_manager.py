@@ -79,7 +79,7 @@ from functools import partial
 
 import jax
 import numpy
-from eformer import escale as es
+import spectrax as spx
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
 from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
@@ -95,6 +95,7 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.sampler import build_history_token_counts
@@ -182,33 +183,12 @@ def _compute_sampling_valid_mask(  # pyright: ignore[reportUnusedFunction]
     return in_range & active_mask_slice & scheduled & not_finished
 
 
-def _device_put_tree_with_shardings(tree, shardings_tree):
-    """Place a PyTree on device with per-leaf shardings.
-
-    Args:
-        tree: PyTree to transfer to device.
-        shardings_tree: PyTree with same structure containing shardings.
-
-    Returns:
-        PyTree with all array leaves placed on device with their specified
-        shardings. Non-array leaves are passed through unchanged.
-    """
-    return jax.tree_util.tree_map(lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x, tree, shardings_tree)
-
-
 def _device_put_tree_uniform(tree, sharding):  # pyright: ignore[reportUnusedFunction]
-    """Place a PyTree on device with uniform sharding for all leaves.
-
-    Args:
-        tree: PyTree to transfer to device.
-        sharding: Single sharding to apply to all array leaves.
-
-    Returns:
-        PyTree with all array leaves placed on device with the same sharding.
-    """
-    leaves, treedef = jax.tree_util.tree_flatten(tree)
-    shardings_tree = jax.tree_util.tree_unflatten(treedef, [sharding] * len(leaves))
-    return _device_put_tree_with_shardings(tree, shardings_tree)
+    """Place every array leaf of ``tree`` on devices with the same sharding."""
+    return jax.tree_util.tree_map(
+        lambda x: jax.device_put(x, sharding) if hasattr(x, "dtype") else x,
+        tree,
+    )
 
 
 def _tree_hash(tree):
@@ -440,7 +420,7 @@ class ExecutionManager:
         self.log_it = logger.info if verbose else logger.debug
         self._verbose = verbose
 
-        self._empty_sharding = jax.NamedSharding(model.mesh, jax.sharding.PartitionSpec())
+        self._empty_sharding = replicated_named_sharding(model.mesh)
 
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._empty_sharding)
 
@@ -726,13 +706,21 @@ class ExecutionManager:
 
         if graphstate is not None:
             template_graphstate = self.graphstate if self.graphstate is not None else graphstate
-            shardings = es.extract_shardings(template_graphstate, self.mesh)
-            self.graphstate = _device_put_tree_with_shardings(graphstate, shardings)
+            shardings = spx.extract_sharding_structure(template_graphstate,  mesh=self.mesh)
+            self.graphstate = jax.tree_util.tree_map(
+                lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
+                graphstate,
+                shardings,
+            )
 
         if graphother is not None:
             template_graphother = self.graphother if self.graphother is not None else graphother
-            shardings = es.extract_shardings(template_graphother, self.mesh)
-            self.graphother = _device_put_tree_with_shardings(graphother, shardings)
+            shardings = spx.extract_sharding_structure(template_graphother, mesh=self.mesh)
+            self.graphother = jax.tree_util.tree_map(
+                lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
+                graphother,
+                shardings,
+            )
 
         # AOT mode may capture graphstate/graphother as compile-time constants.
         # In that configuration, cached model executables must be rebuilt when

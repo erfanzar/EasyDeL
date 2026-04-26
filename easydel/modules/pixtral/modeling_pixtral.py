@@ -16,13 +16,12 @@
 import functools
 
 import jax.lax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -167,7 +166,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=0):
     return q_embed, k_embed
 
 
-class PixtralMLP(nn.Module):
+class PixtralMLP(spx.Module):
     """Multi-Layer Perceptron module for Pixtral vision models.
 
     Implements the feedforward network with a Gated Linear Unit (GLU) structure
@@ -181,7 +180,7 @@ class PixtralMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Pixtral MLP block.
 
@@ -191,7 +190,7 @@ class PixtralMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -232,7 +231,7 @@ class PixtralMLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SiLU-gated feedforward transformation.
@@ -246,7 +245,7 @@ class PixtralMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -254,7 +253,7 @@ class PixtralMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -275,7 +274,7 @@ class PixtralAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Pixtral attention layer with 2D RoPE support.
 
@@ -284,7 +283,7 @@ class PixtralAttention(AttentionModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -328,7 +327,7 @@ class PixtralAttention(AttentionModule):
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -421,7 +420,7 @@ class PixtralAttention(AttentionModule):
         )
 
 
-class PixtralBlock(nn.Module):
+class PixtralBlock(spx.Module):
     """Single transformer block for Pixtral vision models.
 
     Combines bidirectional attention with feedforward networks,
@@ -435,7 +434,7 @@ class PixtralBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Pixtral transformer block.
 
@@ -444,7 +443,7 @@ class PixtralBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -480,7 +479,7 @@ class PixtralBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -526,7 +525,7 @@ class PixtralBlock(nn.Module):
         )
 
 
-class PixtralTransformer(nn.Module):
+class PixtralTransformer(spx.Module):
     """Transformer stack for Pixtral vision models.
 
     Processes patch embeddings through multiple transformer blocks with
@@ -540,7 +539,7 @@ class PixtralTransformer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Pixtral transformer stack.
 
@@ -549,7 +548,7 @@ class PixtralTransformer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -562,20 +561,20 @@ class PixtralTransformer(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for _ in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=_):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(self.config.num_hidden_layers)
-            ]
-        )
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         position_embeddings: Array | None = None,
@@ -618,7 +617,9 @@ class PixtralTransformer(nn.Module):
             position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
-        for _idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, _idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -629,11 +630,18 @@ class PixtralTransformer(nn.Module):
                 output_attentions=output_attentions,
                 frequencies=position_embeddings,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
+            return hidden_states, all_hidden_states, all_attentions, _idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -667,7 +675,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Pixtral vision model.
 
@@ -676,7 +684,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -685,15 +693,13 @@ class PixtralVisionModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.patch_conv = nn.Conv(
-            in_features=config.num_channels,
-            out_features=config.hidden_size,
-            kernel_size=(config.patch_size,) * 2,
-            strides=(config.patch_size,) * 2,
+        self.patch_conv = nn.Conv2d(
+            in_channels=config.num_channels,
+            out_channels=config.hidden_size,
+            kernel_size=config.patch_size,
+            stride=config.patch_size,
             use_bias=False,
-            precision=precision,
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
         )
         self.ln_pre = RMSNorm(
@@ -724,7 +730,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
             max_patches_per_side=self.config.image_size // self.config.patch_size,
         )
 
-    def __call__(
+    def forward(
         self,
         pixel_values: list[Array],
         output_hidden_states: bool | None = False,

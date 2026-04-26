@@ -14,11 +14,10 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -61,7 +60,7 @@ class Glm46VModel(Glm4vModel):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM-4.6V multimodal base model.
 
@@ -71,7 +70,7 @@ class Glm46VModel(Glm4vModel):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -122,7 +121,7 @@ class Glm46VForConditionalGeneration(BaseVisionLanguageModule[Glm46VModel, Glm46
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM-4.6V model for conditional generation.
 
@@ -132,7 +131,7 @@ class Glm46VForConditionalGeneration(BaseVisionLanguageModule[Glm46VModel, Glm46
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -214,7 +213,7 @@ class Glm46VForConditionalGeneration(BaseVisionLanguageModule[Glm46VModel, Glm46
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -308,7 +307,7 @@ class Glm46VForConditionalGeneration(BaseVisionLanguageModule[Glm46VModel, Glm46
         hidden_states = apply_logical_sharding(
             outputs.last_hidden_state,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None

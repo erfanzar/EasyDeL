@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
+from .._shared import normalize_logprob_vocab_chunk_size
 from ..training_configurations import TrainingArguments
 
 
@@ -127,9 +128,7 @@ class BCOConfig(TrainingArguments):
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
-        if self.logprob_vocab_chunk_size is not None:
-            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
-            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
+        self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

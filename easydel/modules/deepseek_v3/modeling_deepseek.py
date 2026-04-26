@@ -19,13 +19,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -65,7 +63,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .deepseek_configuration import DeepseekV3Config
 
 
-class DeepseekV3MLP(nn.Module):
+class DeepseekV3MLP(spx.Module):
     """Multi-Layer Perceptron module for DeepSeek V3 dense layers.
 
     Implements the feedforward network with SwiGLU activation function
@@ -81,7 +79,7 @@ class DeepseekV3MLP(nn.Module):
         hidden_size=None,
         intermediate_size=None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 MLP block.
 
@@ -94,7 +92,7 @@ class DeepseekV3MLP(nn.Module):
             hidden_size (int | None, optional): Override for hidden size. Defaults to None (uses config).
             intermediate_size (int | None, optional): Override for intermediate size.
                 Defaults to None (uses config).
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -116,7 +114,7 @@ class DeepseekV3MLP(nn.Module):
         self.up_proj = linear_class(self.hidden_size, self.intermediate_size)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -131,7 +129,7 @@ class DeepseekV3MLP(nn.Module):
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.partition_manager,
+                partition_manager=self.config.runtime_sharding_resolver,
             )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -140,12 +138,12 @@ class DeepseekV3MLP(nn.Module):
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.partition_manager,
+                partition_manager=self.config.runtime_sharding_resolver,
             )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class MoEGate(nn.Module):
+class MoEGate(spx.Module):
     """Router module that scores tokens and selects experts for DeepSeek V3 MoE.
 
     Implements token-to-expert routing with sigmoid scoring and noaux_tc
@@ -159,7 +157,7 @@ class MoEGate(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize MoE gating module.
 
@@ -169,7 +167,7 @@ class MoEGate(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -185,17 +183,17 @@ class MoEGate(nn.Module):
         self.topk_group = self.config.topk_group
         self.norm_topk_prob = self.config.norm_topk_prob
         self.gating_dim = self.config.hidden_size
-        kernel = nn.initializers.kaiming_uniform()(
-            rngs.param(),
+        kernel = jax.nn.initializers.kaiming_uniform()(
+            rngs.param,
             (self.gating_dim, self.n_routed_experts),
             param_dtype,
         )
 
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=kernel.shape,
             dtype=param_dtype,
             init_method="kaiming_uniform",
-            key=rngs.param(),
+            key=rngs.param,
             value=kernel,
         )
         if self.topk_method == "noaux_tc":
@@ -203,27 +201,10 @@ class MoEGate(nn.Module):
                 shape=(self.n_routed_experts,),
                 dtype=param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
             )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specifications for MoEGate parameters.
-
-        When expert tensor mode is enabled, the gate kernel is replicated
-        across all devices. Otherwise, it is sharded column-wise for
-        distributed routing computation. The score correction bias (used
-        with noaux_tc routing) is always replicated.
-
-        Returns:
-            dict[str, object]: Mapping of parameter names to sharding specs.
-        """
-        kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
-        specs = {"kernel": kernel_spec}
-        if hasattr(self, "e_score_correction_bias"):
-            specs["e_score_correction_bias"] = Replicated
-        return specs  # pyright: ignore[reportReturnType]
-
-    def __call__(self, hidden_states):
+    def forward(self, hidden_states):
         """Compute expert routing weights for input tokens.
 
         Implements sigmoid scoring with noaux_tc group-based top-k expert selection.
@@ -238,7 +219,7 @@ class MoEGate(nn.Module):
         squ, _ = hidden_states.shape
         logits = jnp.dot(
             hidden_states.astype(jnp.float32),
-            self.kernel.value.astype(jnp.float32),
+            self.weight.value.astype(jnp.float32),
             precision=self.precision,
         )
 
@@ -278,7 +259,7 @@ class MoEGate(nn.Module):
         return topk_weight * self.routed_scaling_factor
 
 
-class DeepseekV3MLPMoE(nn.Module):
+class DeepseekV3MLPMoE(spx.Module):
     """Mixture-of-experts feed-forward module for DeepSeek V3 MoE layers.
 
     Implements the expert network with SwiGLU activation function for
@@ -288,14 +269,14 @@ class DeepseekV3MLPMoE(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                {"name": "gate_proj.weight", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.weight", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
             ],
             "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x},
+                {"name": "down_proj.weight", "spliter": lambda x: x},
             ],
             "inverse_spliter": lambda x: x,
         },
@@ -310,7 +291,7 @@ class DeepseekV3MLPMoE(nn.Module):
         hidden_size: int | None = None,
         intermediate_size: int | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 MoE MLP block.
 
@@ -323,7 +304,7 @@ class DeepseekV3MLPMoE(nn.Module):
             hidden_size (int | None, optional): Override for hidden size. Defaults to None (uses config).
             intermediate_size (int | None, optional): Override for intermediate size.
                 Defaults to None (uses config).
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.precision = precision
@@ -337,8 +318,8 @@ class DeepseekV3MLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
@@ -349,8 +330,8 @@ class DeepseekV3MLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
@@ -361,14 +342,14 @@ class DeepseekV3MLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         group_sizes: Array,
@@ -387,7 +368,7 @@ class DeepseekV3MLPMoE(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts)), "mlp_gate")
@@ -397,7 +378,7 @@ class DeepseekV3MLPMoE(nn.Module):
             apply_logical_sharding(
                 down,
                 dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.partition_manager,
+                partition_manager=self.config.runtime_sharding_resolver,
             ),
             "mlp_output",
         )
@@ -418,7 +399,7 @@ class DeepseekV3MoE(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 MoE layer.
 
@@ -429,7 +410,7 @@ class DeepseekV3MoE(BaseMoeModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -474,7 +455,7 @@ class DeepseekV3MoE(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states: Array):
+    def forward(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.
 
         Args:
@@ -489,9 +470,9 @@ class DeepseekV3MoE(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
         if self.config.n_shared_experts is not None:
@@ -525,7 +506,7 @@ class DeepseekV3Attention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 MLA attention layer.
 
@@ -536,7 +517,7 @@ class DeepseekV3Attention(UnifiedAttention):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         # Set MLA-specific dimensions before calling super().__init__()
         # so they're available in define_network
@@ -568,7 +549,7 @@ class DeepseekV3Attention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.Precision,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Define MLA-specific network structure.
 
@@ -580,7 +561,7 @@ class DeepseekV3Attention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.Precision): Numerical precision.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
 
         # Query projection with optional LoRA
@@ -727,7 +708,7 @@ class DeepseekV3Attention(UnifiedAttention):
         )
 
 
-class DeepseekV3DecoderLayer(nn.Module):
+class DeepseekV3DecoderLayer(spx.Module):
     """Single decoder layer for DeepSeek V3 models.
 
     Combines Multi-head Latent Attention (MLA) and feedforward networks
@@ -742,7 +723,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 decoder layer.
 
@@ -753,7 +734,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -813,7 +794,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -851,7 +832,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         # Self Attention
@@ -880,7 +861,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(hidden_states, "layer_output")
         return DecoderLayerOutput(
@@ -912,7 +893,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 base model.
 
@@ -921,7 +902,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -946,19 +927,19 @@ class DeepseekV3Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    layer_idx=i,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_idx=i,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -983,7 +964,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
             base=self.config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1072,10 +1053,11 @@ class DeepseekV3Model(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, layer in enumerate(self.layers):
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             output = layer(
@@ -1085,10 +1067,10 @@ class DeepseekV3Model(EasyDeLBaseModule):
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
             )
-            hidden_states = output.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(output.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (output.attention_weight,)
@@ -1096,8 +1078,15 @@ class DeepseekV3Model(EasyDeLBaseModule):
             if output_router_logits and hasattr(output, "router_logits") and output.router_logits is not None:
                 all_router_logits += (output.router_logits,)
 
-            past_key_values[idx] = output.cache_view
+            self._layer_cache_view_update(None, idx, output.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -1164,7 +1153,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DeepSeek V3 model for causal language modeling.
 
@@ -1173,7 +1162,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1187,7 +1176,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1361,7 +1350,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         if is_mla_ragged:
             return MLARaggedPagesCacheConfig.create(
                 mesh=self.mesh,
-                partition_manager=text_config.partition_manager,
+                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                 kvdtype=text_config.kvdtype,
                 max_model_length=max_length,
                 num_hidden_layers=config.num_hidden_layers,
@@ -1374,7 +1363,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
-            partition_manager=text_config.partition_manager,
+            partition_manager=text_config.runtime_sharding_resolver,
             kvdtype=text_config.kvdtype,
             max_model_length=max_length,
             num_hidden_layers=config.num_hidden_layers,

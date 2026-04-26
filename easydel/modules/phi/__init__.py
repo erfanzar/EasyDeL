@@ -35,7 +35,8 @@ Usage Example:
     ```python
     from easydel.modules.phi import PhiConfig, PhiForCausalLM
     import jax
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Configure a Phi-2 style model
     config = PhiConfig(
@@ -48,7 +49,7 @@ Usage Example:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = PhiForCausalLM(config, rngs=rngs)
 
     # Generate text

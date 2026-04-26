@@ -31,14 +31,13 @@ from __future__ import annotations
 
 import typing as tp
 
-from eformer import escale as es
-from eformer.escale import with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
+from spectrax import PartitionAxis, with_sharding_constraint
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
@@ -69,7 +68,7 @@ class RecurrentCacheConfig(BaseCacheConfig):
     """
 
     num_hidden_layers: int = field(pytree_node=False)
-    partition_axis: es.PartitionAxis = field(pytree_node=False)
+    partition_axis: PartitionAxis = field(pytree_node=False)
     batch_size: int = field(pytree_node=False)
     conv_dim: int = field(pytree_node=False)
     conv_kernel_size: int = field(pytree_node=False)
@@ -80,7 +79,7 @@ class RecurrentCacheConfig(BaseCacheConfig):
     def create(
         cls,
         num_hidden_layers: int,
-        partition_axis: es.PartitionAxis,
+        partition_axis: PartitionAxis,
         batch_size: int,
         conv_dim: int,
         conv_kernel_size: int,
@@ -133,7 +132,7 @@ class RecurrentCacheConfig(BaseCacheConfig):
     def create_for_mamba(
         cls,
         num_hidden_layers: int,
-        partition_axis: es.PartitionAxis,
+        partition_axis: PartitionAxis,
         batch_size: int,
         intermediate_size: int,
         ssm_state_size: int,
@@ -169,7 +168,7 @@ class RecurrentCacheConfig(BaseCacheConfig):
     def create_for_mamba2(
         cls,
         num_hidden_layers: int,
-        partition_axis: es.PartitionAxis,
+        partition_axis: PartitionAxis,
         batch_size: int,
         intermediate_size: int,
         num_heads: int,

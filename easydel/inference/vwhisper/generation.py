@@ -43,7 +43,7 @@ Note:
     understanding of Whisper's token format.
 """
 
-from flax import nnx as nn
+import spectrax as spx
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 
 from easydel.utils.compiling_utils import ejit
@@ -70,9 +70,9 @@ def _compiled_generate(  # pyright: ignore[reportUnusedFunction]
     only when these static values change.
 
     Args:
-        graphdef: Flax NNX graph definition from nn.split(model).
+        graphdef: SpecTrax graph definition from spx.export(model).
             Contains the model architecture without parameters.
-        graphstate: Flax NNX graph state from nn.split(model).
+        graphstate: SpecTrax graph state from spx.export(model).
             Contains the model parameters and state.
         inference_config (vWhisperInferenceConfig): Configuration object
             containing generation settings like max_length and
@@ -111,7 +111,7 @@ def _compiled_generate(  # pyright: ignore[reportUnusedFunction]
         - Subsequent calls with the same static args are cached.
         - The model.mesh context is used for proper device placement.
     """
-    model = nn.merge(graphdef, graphstate)
+    model = spx.bind(graphdef, graphstate)
     with model.mesh:
         return model._force_generate(
             input_features=input_features,
@@ -227,9 +227,11 @@ def get_decoder_input_ids(
                 acceptable_languages = (
                     list(TO_LANGUAGE_CODE.values())
                     if len(language) == 2
-                    else list(generation_config.lang_to_id)
-                    if "<" in language or "|" in language or ">" in language
-                    else list(TO_LANGUAGE_CODE)
+                    else (
+                        list(generation_config.lang_to_id)
+                        if "<" in language or "|" in language or ">" in language
+                        else list(TO_LANGUAGE_CODE)
+                    )
                 )
                 raise ValueError(f"Unsupported language: {language}. Language should be one of: {acceptable_languages}.")
 

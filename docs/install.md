@@ -93,7 +93,7 @@ This repo also ships a helper script to install EasyDeL + Ray on TPU VMs and run
 
 ## Usage Example
 
-Once Ray is configured, you can use `eformer.escale.tpexec` instead of `eopod` for executing distributed code and benefiting from Ray's capabilities.
+Once Ray is configured, use `eopod` for distributed launch orchestration and SpectraX sharding utilities for in-process mesh/sharding control.
 
 ### Authenticating with Hugging Face and Weights & Biases
 

@@ -21,25 +21,28 @@ import jax
 import numpy as np
 from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time
 from easydel.utils.traversals import deepcopy_model
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import xpo_step
 from .xpo_config import XPOConfig
 
 
-def _ensure_state(model: EasyDeLBaseModule | EasyDeLState) -> EasyDeLState:
+def _ensure_state(
+    model: EasyDeLBaseModule | EasyDeLState,
+    *,
+    trainable_selector: tp.Any = "parameters",
+) -> EasyDeLState:
     """Convert a model to EasyDeLState if it isn't already.
 
     Args:
@@ -48,7 +51,7 @@ def _ensure_state(model: EasyDeLBaseModule | EasyDeLState) -> EasyDeLState:
     Returns:
         EasyDeLState instance.
     """
-    return model if isinstance(model, EasyDeLState) else model.to_state()
+    return model if isinstance(model, EasyDeLState) else model.to_state(trainable_selector=trainable_selector)
 
 
 @Registry.register("trainer", "xpo")
@@ -93,7 +96,7 @@ class XPOTrainer(GRPOTrainer):
         """
 
         if reference_model is not None:
-            self.ref_state = _ensure_state(reference_model)
+            self.ref_state = _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
 
         self._beta_schedule = arguments.beta
         self._alpha_schedule = arguments.alpha
@@ -176,7 +179,7 @@ class XPOTrainer(GRPOTrainer):
             mesh configuration, and checkpoint manager.
         """
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -205,14 +208,14 @@ class XPOTrainer(GRPOTrainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             xpo_step,
             in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnums,
         )
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             xpo_step,
             in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
             out_shardings=empty_sharding,

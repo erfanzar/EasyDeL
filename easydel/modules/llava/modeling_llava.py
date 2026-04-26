@@ -14,14 +14,13 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -88,7 +87,7 @@ class LlavaCausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-class LlavaMultiModalProjector(nn.Module):
+class LlavaMultiModalProjector(spx.Module):
     """Multi-modal projector for LLaVA models.
 
     Projects visual features from the vision encoder into the language model's
@@ -103,7 +102,7 @@ class LlavaMultiModalProjector(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the LLaVA multi-modal projector.
 
@@ -113,7 +112,7 @@ class LlavaMultiModalProjector(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -127,7 +126,7 @@ class LlavaMultiModalProjector(nn.Module):
             config.vision_config.hidden_size * num_feature_layers,
             config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
             param_dtype=param_dtype,
             dtype=dtype,
             precision=precision,
@@ -139,14 +138,14 @@ class LlavaMultiModalProjector(nn.Module):
             config.get_text_config().hidden_size,
             config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
             param_dtype=param_dtype,
             dtype=dtype,
             precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, image_features: jax.Array) -> jax.Array:
+    def forward(self, image_features: jax.Array) -> jax.Array:
         """Project image features into the language model embedding space.
 
         Args:
@@ -174,7 +173,7 @@ class LlavaModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -184,7 +183,7 @@ class LlavaModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize LLaVA base model.
 
@@ -196,7 +195,7 @@ class LlavaModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -304,7 +303,7 @@ class LlavaModel(EasyDeLBaseModule):
 
         return inputs_embeds
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -489,7 +488,7 @@ class LlavaModel(EasyDeLBaseModule):
         For LLaVA, the vision tower serves as the encoder for processing images.
 
         Returns:
-            nn.Module: The vision tower module.
+            spx.Module: The vision tower module.
         """
         return self.vision_tower
 
@@ -497,7 +496,7 @@ class LlavaModel(EasyDeLBaseModule):
         """Return the decoder component of the model.
 
         Returns:
-            nn.Module: The language model's decoder.
+            spx.Module: The language model's decoder.
         """
         return self.language_model.get_decoder()
 
@@ -530,7 +529,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
 
     Class Attributes:
         _task_type: IMAGE_TEXT_TO_TEXT task type
@@ -561,7 +560,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize LLaVA model for conditional generation.
 
@@ -574,7 +573,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -629,7 +628,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -713,7 +712,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -768,26 +767,26 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
         """
         return self.lm_head(hidden_states)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Return the vision tower component.
 
         Returns:
-            nn.Module: The vision encoder used for image feature extraction.
+            spx.Module: The vision encoder used for image feature extraction.
         """
         return self.base_model.vision_tower
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Return the multimodal projector component.
 
         Returns:
-            nn.Module: The projection layer that maps vision features to text space.
+            spx.Module: The projection layer that maps vision features to text space.
         """
         return self.base_model.multi_modal_projector
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Return the language model component.
 
         Returns:
-            nn.Module: The underlying language model for text generation.
+            spx.Module: The underlying language model for text generation.
         """
         return self.base_model.language_model

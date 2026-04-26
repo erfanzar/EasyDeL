@@ -62,7 +62,8 @@ Usage Example:
     ```python
     from easydel import Exaone4Config, Exaone4ForCausalLM
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration
     config = Exaone4Config(
@@ -77,7 +78,7 @@ Usage Example:
     )
 
     # Create causal language model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = Exaone4ForCausalLM(
         config=config,
         dtype=jnp.bfloat16,

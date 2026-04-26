@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
+from .._shared import normalize_logprob_vocab_chunk_size
 from ..training_configurations import TrainingArguments
 
 LOSS_TYPES = tp.Literal["sigmoid", "hinge", "ipo", "simpo", "alphapo"]
@@ -156,9 +157,7 @@ class CPOConfig(TrainingArguments):
         if self.loss_type == "alphapo":
             self.loss_type = "simpo"
             self.cpo_alpha = 0.0
-        if self.logprob_vocab_chunk_size is not None:
-            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
-            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
+        self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

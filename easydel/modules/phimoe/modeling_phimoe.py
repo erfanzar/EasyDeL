@@ -16,13 +16,12 @@
 import functools
 
 import jax.lax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -46,7 +45,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .phimoe_configuration import PhiMoeConfig
 
 
-class PhiMoEBlockSparseTop2MLP(nn.Module):
+class PhiMoEBlockSparseTop2MLP(spx.Module):
     """Expert MLP module for PhiMoE Sparse Mixture of Experts.
 
     Implements the feedforward network used by each expert in the PhiMoE model's
@@ -61,7 +60,7 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize PhiMoE expert MLP block.
 
@@ -71,7 +70,7 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -103,7 +102,7 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         self.w3 = column_parallel_linear(hidden_dim, ffn_dim, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation for expert processing.
 
         Args:
@@ -136,7 +135,7 @@ class PhiMoEAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize PhiMoE attention with sliding window configuration.
@@ -146,7 +145,7 @@ class PhiMoEAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         # PhiMoE router decisions are highly sensitive to attention noise.
@@ -170,7 +169,7 @@ class PhiMoEAttention(UnifiedAttention):
         )
 
 
-class PhiMoeSparseMoeBlock(nn.Module):
+class PhiMoeSparseMoeBlock(spx.Module):
     """Sparse Mixture of Experts block for PhiMoE models.
 
     Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
@@ -185,7 +184,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize PhiMoE Sparse MoE block.
@@ -196,7 +195,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -218,10 +217,10 @@ class PhiMoeSparseMoeBlock(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
         )
 
-        self.experts = nn.List(
+        self.experts = nn.ModuleList(
             [
                 PhiMoEBlockSparseTop2MLP(
                     config=config,
@@ -234,7 +233,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
             ]
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         deterministic: bool = True,
@@ -323,7 +322,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
         return final_hidden_state, checkpoint_name(router_logits, "moe_router_logits")
 
 
-class PhiMoeDecoderLayer(nn.Module):
+class PhiMoeDecoderLayer(spx.Module):
     """Single decoder layer for PhiMoE models.
 
     Combines multi-head attention with sliding window and Sparse MoE feedforward
@@ -337,7 +336,7 @@ class PhiMoeDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize PhiMoE decoder layer.
@@ -347,7 +346,7 @@ class PhiMoeDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -360,20 +359,20 @@ class PhiMoeDecoderLayer(nn.Module):
         for expert_idx in range(config.num_local_experts):
             gate_up_splits.append(
                 {
-                    "name": f"block_sparse_moe.experts.{expert_idx}.w1.kernel",
-                    "spliter": (lambda x, idx=expert_idx: x[idx, : x.shape[1] // 2, :].swapaxes(-1, -2)),
+                    "name": f"block_sparse_moe.experts.{expert_idx}.w1.weight",
+                    "spliter": lambda x, idx=expert_idx: x[idx, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 }
             )
             gate_up_splits.append(
                 {
-                    "name": f"block_sparse_moe.experts.{expert_idx}.w3.kernel",
-                    "spliter": (lambda x, idx=expert_idx: x[idx, x.shape[1] // 2 :, :].swapaxes(-1, -2)),
+                    "name": f"block_sparse_moe.experts.{expert_idx}.w3.weight",
+                    "spliter": lambda x, idx=expert_idx: x[idx, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 }
             )
             down_splits.append(
                 {
-                    "name": f"block_sparse_moe.experts.{expert_idx}.w2.kernel",
-                    "spliter": (lambda x, idx=expert_idx: x[idx].swapaxes(-1, -2)),
+                    "name": f"block_sparse_moe.experts.{expert_idx}.w2.weight",
+                    "spliter": lambda x, idx=expert_idx: x[idx].swapaxes(-1, -2),
                 }
             )
 
@@ -384,7 +383,7 @@ class PhiMoeDecoderLayer(nn.Module):
         # while EasyDeL stores per-expert w1/w2/w3 modules.
         self.reform_param = {
             "mlp.router.weight$": {
-                "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}]
+                "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}]
             },
             "mlp.experts.gate_up_proj$": {"splits": gate_up_splits},
             "mlp.experts.down_proj$": {"splits": down_splits},
@@ -422,7 +421,7 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -460,7 +459,7 @@ class PhiMoeDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -518,7 +517,7 @@ class PhiMoeModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize PhiMoE base model.
 
@@ -527,7 +526,7 @@ class PhiMoeModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -547,26 +546,26 @@ class PhiMoeModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_dropout = nn.Dropout(config.embd_pdrop)
+        self.embed_dropout = nn.Dropout(config.embd_pdrop, rngs=rngs)
         remat_layer_block = auto_remat(
             PhiMoeDecoderLayer,
             policy=config.gradient_checkpointing,
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for idx in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = LayerNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
@@ -575,7 +574,7 @@ class PhiMoeModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -660,10 +659,11 @@ class PhiMoeModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             inputs_embeds,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -672,19 +672,26 @@ class PhiMoeModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=bool(output_router_logits),
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -750,7 +757,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize PhiMoE model for causal language modeling.
 
@@ -759,7 +766,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -772,7 +779,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
             lm_head_bias=config.lm_head_bias,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

@@ -72,7 +72,8 @@ Example Usage:
     ```python
     from easydel import Qwen3VLConfig, Qwen3VLForConditionalGeneration
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Create configuration for Qwen3-VL
     config = Qwen3VLConfig(
@@ -90,7 +91,7 @@ Example Usage:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = Qwen3VLForConditionalGeneration(config, rngs=rngs)
 
     # Process multimodal input

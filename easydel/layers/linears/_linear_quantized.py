@@ -51,24 +51,21 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer.common_types import ColumnWise, Replicated, RowWise
+import spectrax as spx
 from ejkernel.loggings import get_logger
 from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeStubs]
     quantized_matmul as ej_quantized_matmul,
 )
 from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
-from flax.nnx import rnglib
-from flax.nnx.nn import initializers
-from flax.typing import Dtype, Initializer, PrecisionLike
 from jax import shard_map
+from spectrax.common_types import ColumnWise, Replicated, RowWise
 
-from easydel.layers._sharding import resolve_safe_sharding
+from easydel.infra.sharding import sharding_for_layout
 from easydel.layers.quantization._configs import QuantizationType, resolve_ejkernel_quant_params
 from easydel.layers.quantization._quants import quantize
 
-from ._linear import ColumnParallelLinear, RowParallelLinear
+from ._linear import ColumnParallelLinear, Dtype, Initializer, PrecisionLike, RowParallelLinear
 
 logger = get_logger(__name__)
 
@@ -80,8 +77,8 @@ Array = jax.Array
 Axis = int
 Size = int
 
-default_kernel_init = initializers.lecun_normal()
-default_bias_init = initializers.zeros_init()
+default_kernel_init = jax.nn.initializers.lecun_normal()
+default_bias_init = jax.nn.initializers.zeros
 
 _QMM_NON_AFFINE_MODES = frozenset({"nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"})
 _EJKERNEL_GROUP_SIZES = (1024, 512, 256, 128, 64, 32, 16)
@@ -134,6 +131,19 @@ _QMM_DEFAULT_POLICY_TABLE: dict[str, tp.Any] = {
         },
     },
 }
+
+
+def _is_mosaic_version_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "stable_mosaic.version" in message and "Unsupported version" in message
+
+
+def _qmm_xla_fallback_kwargs(kwargs: dict[str, tp.Any]) -> dict[str, tp.Any]:
+    return {
+        "fuse": False,
+        "platform": "xla",
+        "use_best_config": bool(kwargs.get("use_best_config", True)),
+    }
 
 
 def _policy_mode_key(mode: str | None) -> str:
@@ -237,10 +247,10 @@ def _pick_mesh_from_arrays(*arrays: jax.Array | None) -> jax.sharding.Mesh | jax
         if isinstance(sharding, jax.sharding.NamedSharding):
             return sharding.mesh
     try:
-        from eformer.escale import get_incontext_mesh
+        from spectrax import get_incontext_mesh
 
-        mesh = get_incontext_mesh(raise_error=False)
-        if getattr(mesh, "empty", True):
+        mesh = spx.to_jax_mesh(get_incontext_mesh(raise_error=False))
+        if mesh is None or getattr(mesh, "empty", True):
             return None
         return mesh
     except Exception:
@@ -415,7 +425,7 @@ def _quantized_linear_sharding_fn(
     return None
 
 
-def _quantized_linear_craft_spec(
+def _quantized_linear_layout_spec(
     *,
     direction: tp.Literal["row", "column"] | None,
     use_bias: bool,
@@ -495,7 +505,7 @@ def _reconcile_input_k_dim(
     return jax.lax.dynamic_slice_in_dim(local_inputs, start, local_kernel.shape[0], axis=-1)
 
 
-class ParallelLinearQuantized(nn.Module):
+class ParallelLinearQuantized(spx.Module):
     """A quantized linear transformation layer with parallel execution support.
 
     This layer stores weights in a quantized format to reduce memory usage,
@@ -533,7 +543,7 @@ class ParallelLinearQuantized(nn.Module):
         ...     in_features=768,
         ...     out_features=3072,
         ...     config=config,
-        ...     rngs=nn.Rngs(0)
+        ...     rngs=spx.Rngs(0)
         ... )
         >>>
         >>> # Forward pass with automatic dequantization
@@ -563,7 +573,7 @@ class ParallelLinearQuantized(nn.Module):
         qmm_tpu_auto_xla_max_m: int | None = 1024,
         qmm_policy_table: dict[str, tp.Any] | None = None,
         qmm_allow_input_all_gather: bool = False,
-        rngs: rnglib.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize a quantized parallel linear layer.
 
@@ -612,7 +622,7 @@ class ParallelLinearQuantized(nn.Module):
             qmm_allow_input_all_gather: Whether column-parallel execution may
                 all_gather local input K slices when they mismatch the local
                 kernel shard. Defaults to False to avoid OOM.
-            rngs: Flax random number generators for initialization.
+            rngs: SpecTrax random number generators for initialization.
 
         Raises:
             ValueError: If config.dtype is not a supported quantization type.
@@ -639,15 +649,35 @@ class ParallelLinearQuantized(nn.Module):
         # Set by _quantize_array during __init__; used by _resolve_ejkernel_params afterwards.
         self._ej_group_size: int | None = None
 
-        kernel = kernel_init(rngs.params(), (in_features, out_features), param_dtype)
+        kernel = kernel_init(rngs.parameters, (in_features, out_features), param_dtype)
         quant_kernel, quant_scales, quant_biases = self._quantize_array(kernel)
+        mode, group_size, _bits, needs_biases = self._resolve_ejkernel_params()
+        layout_specs = _quantized_linear_layout_spec(
+            direction=self._direction,
+            use_bias=use_bias,
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
 
-        self.quant_kernel = nn.Param(quant_kernel)
-        self.quant_scales = nn.Param(quant_scales)
-        self.quant_biases = nn.Param(quant_biases)
+        self.quant_kernel = spx.Parameter(
+            quant_kernel,
+            sharding=sharding_for_layout(layout_specs.get("quant_kernel")),
+        )
+        self.quant_scales = spx.Parameter(
+            quant_scales,
+            sharding=sharding_for_layout(layout_specs.get("quant_scales")),
+        )
+        self.quant_biases = spx.Parameter(
+            quant_biases,
+            sharding=sharding_for_layout(layout_specs.get("quant_biases")),
+        )
 
         if use_bias:
-            self.bias = nn.Param(bias_init(rngs.params(), (out_features,), param_dtype))
+            self.bias = spx.Parameter(
+                bias_init(rngs.parameters, (out_features,), param_dtype),
+                sharding=sharding_for_layout(layout_specs.get("bias")),
+            )
 
     def _qmm_runtime_kwargs(
         self,
@@ -849,7 +879,7 @@ class ParallelLinearQuantized(nn.Module):
         )
         return array.astype(self.param_dtype)
 
-    def from_quantized(self, rngs: rnglib.Rngs | None = None) -> RowParallelLinear | ColumnParallelLinear:
+    def from_quantized(self, rngs: spx.Rngs | None = None) -> RowParallelLinear | ColumnParallelLinear:
         """Convert this quantized module back to a regular Linear module.
 
         Creates a non-quantized linear layer with the same configuration
@@ -873,14 +903,14 @@ class ParallelLinearQuantized(nn.Module):
             >>> # regular_layer is now a ColumnParallelLinear
         """
         if rngs is None:
-            rngs = nn.Rngs(0)
+            rngs = spx.Rngs(0)
         if self._direction == "row":
             linear_class = RowParallelLinear
         elif self._direction == "column":
             linear_class = ColumnParallelLinear
         else:
             raise ValueError(f"Unknown direction '{self._direction}'. Use 'row' or 'column'.")
-        linear = nn.eval_shape(
+        linear = jax.eval_shape(
             lambda r: linear_class(
                 in_features=self.in_features,
                 out_features=self.out_features,
@@ -899,10 +929,26 @@ class ParallelLinearQuantized(nn.Module):
         scale_value = getattr(self.quant_scales, "value", self.quant_scales)
         bias_value = getattr(self.quant_biases, "value", self.quant_biases)
         dequantized_kernel = self._dequantize_array(kernel_value, scale_value, bias_value)
-        linear.kernel = nn.Param(dequantized_kernel)
+        weight_metadata = dict(getattr(linear.weight, "metadata", {}))
+        weight_sharding = weight_metadata.pop("sharding", getattr(linear.weight, "sharding", None))
+        weight_axis_names = weight_metadata.pop("axis_names", None)
+        linear.weight = spx.Parameter(
+            dequantized_kernel,
+            sharding=weight_sharding,
+            axis_names=weight_axis_names,
+            metadata=weight_metadata,
+        )
 
         if self.use_bias:
-            linear.bias = nn.Param(self.bias.value)
+            bias_metadata = dict(getattr(linear.bias, "metadata", {})) if linear.bias is not None else {}
+            bias_sharding = bias_metadata.pop("sharding", getattr(linear.bias, "sharding", None))
+            bias_axis_names = bias_metadata.pop("axis_names", None)
+            linear.bias = spx.Parameter(
+                self.bias.value,
+                sharding=bias_sharding,
+                axis_names=bias_axis_names,
+                metadata=bias_metadata,
+            )
 
         return linear
 
@@ -915,8 +961,8 @@ class ParallelLinearQuantized(nn.Module):
 
         Args:
             kernel: New kernel weights to quantize and store.
-                Can be a jax.Array or nn.Param.
-            bias: New bias values to store. Can be a jax.Array, nn.Param,
+                Can be a jax.Array or spx.Parameter.
+            bias: New bias values to store. Can be a jax.Array, spx.Parameter,
                 or None. Ignored if use_bias is False.
 
         Returns:
@@ -1044,7 +1090,8 @@ class ParallelLinearQuantized(nn.Module):
         backend = jax.default_backend()
         qmm_kwargs = self._qmm_runtime_kwargs(backend, m_tokens=int(inputs_2d.shape[0]), quant_mode=mode)
 
-        def _direct_matmul() -> Array:
+        def _direct_matmul(runtime_kwargs: dict[str, tp.Any] | None = None) -> Array:
+            runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
             return ej_quantized_matmul(
                 inputs_2d,
                 kernel_value,
@@ -1054,21 +1101,38 @@ class ParallelLinearQuantized(nn.Module):
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
-                **qmm_kwargs,
+                **runtime_kwargs,
             )
 
         mesh = _pick_mesh_from_arrays(inputs_2d, kernel_value, scale_value, bias_value)
         if mesh is None:
-            return _direct_matmul()
+            try:
+                return _direct_matmul()
+            except Exception as exc:
+                if qmm_kwargs.get("allow_dense_fallback", False) and _is_mosaic_version_error(exc):
+                    return _direct_matmul(_qmm_xla_fallback_kwargs(qmm_kwargs))
+                raise
 
         resolved = self._resolve_shard_specs(mesh, inputs_2d, kernel_value, scale_value, bias_value, backend == "tpu")
         if resolved is None:
-            return _direct_matmul()
+            try:
+                return _direct_matmul()
+            except Exception as exc:
+                if qmm_kwargs.get("allow_dense_fallback", False) and _is_mosaic_version_error(exc):
+                    return _direct_matmul(_qmm_xla_fallback_kwargs(qmm_kwargs))
+                raise
 
         input_spec, kernel_spec, scale_spec, bias_spec, output_spec, tp_axis_name = resolved
         direction = self._direction
 
-        def _local_matmul(local_inputs, local_kernel, local_scales, local_biases=None):
+        def _local_matmul(
+            local_inputs,
+            local_kernel,
+            local_scales,
+            local_biases=None,
+            runtime_kwargs: dict[str, tp.Any] | None = None,
+        ):
+            runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
             local_inputs = _reconcile_input_k_dim(
                 local_inputs,
                 local_kernel,
@@ -1085,7 +1149,7 @@ class ParallelLinearQuantized(nn.Module):
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
-                **qmm_kwargs,
+                **runtime_kwargs,
             )
             if tp_axis_name is not None and direction == "row":
                 out = jax.lax.psum(out, tp_axis_name)
@@ -1093,22 +1157,37 @@ class ParallelLinearQuantized(nn.Module):
 
         shard_kw = dict(mesh=mesh, out_specs=output_spec, check_vma=False)
 
-        if bias_value is None:
+        def _run_mapped(runtime_kwargs: dict[str, tp.Any] | None = None):
+            runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
+            if bias_value is None:
 
-            @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec), **shard_kw)
-            def _mapped(local_inputs, local_kernel, local_scales):
-                return _local_matmul(local_inputs, local_kernel, local_scales)
+                @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec), **shard_kw)
+                def _mapped(local_inputs, local_kernel, local_scales):
+                    return _local_matmul(local_inputs, local_kernel, local_scales, runtime_kwargs=runtime_kwargs)
 
-            return _mapped(inputs_2d, kernel_value, scale_value)
+                return _mapped(inputs_2d, kernel_value, scale_value)
 
-        @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec, bias_spec), **shard_kw)
-        def _mapped(local_inputs, local_kernel, local_scales, local_biases):
-            return _local_matmul(local_inputs, local_kernel, local_scales, local_biases)
+            @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec, bias_spec), **shard_kw)
+            def _mapped(local_inputs, local_kernel, local_scales, local_biases):
+                return _local_matmul(
+                    local_inputs,
+                    local_kernel,
+                    local_scales,
+                    local_biases,
+                    runtime_kwargs=runtime_kwargs,
+                )
 
-        return _mapped(inputs_2d, kernel_value, scale_value, bias_value)
+            return _mapped(inputs_2d, kernel_value, scale_value, bias_value)
+
+        try:
+            return _run_mapped()
+        except Exception as exc:
+            if qmm_kwargs.get("allow_dense_fallback", False) and _is_mosaic_version_error(exc):
+                return _run_mapped(_qmm_xla_fallback_kwargs(qmm_kwargs))
+            raise
 
     @jax.named_scope("easydel-linear-quantized-call")
-    def __call__(self, inputs: Array, w: Array | None = None) -> Array:
+    def forward(self, inputs: Array, w: Array | None = None) -> Array:
         """Apply the quantized linear transformation to inputs.
 
         Dequantizes weights on-the-fly and performs matrix multiplication
@@ -1167,44 +1246,14 @@ class ParallelLinearQuantized(nn.Module):
 
         return out
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, tp.Any]:
-        """Return dynamic partition specs for quantized parameters."""
-        if self._direction is None:
-            return {}
-        mode, group_size, _bits, needs_biases = self._resolve_ejkernel_params()
-        specs = _quantized_linear_craft_spec(
-            direction=self._direction,
-            use_bias=self.use_bias,
-            mode=mode,
-            group_size=group_size,
-            needs_biases=needs_biases,
-        )
-        if partition_manager is None:
-            return specs
-
-        mesh = _kwargs.get("mesh")
-
-        def _shape_of(name: str) -> tuple[int, ...] | None:
-            if not hasattr(self, name):
-                return None
-            value = getattr(getattr(self, name), "value", getattr(self, name))
-            if value is None or not hasattr(value, "shape"):
-                return None
-            return tuple(value.shape)
-
-        safe_specs: dict[str, tp.Any] = {}
-        for name, axes in specs.items():
-            shape = _shape_of(name)
-            if shape is None:
-                safe_specs[name] = axes
-                continue
-            safe_specs[name] = resolve_safe_sharding(
-                axes=axes,
-                shape=shape,
-                partition_manager=partition_manager,
-                mesh=mesh,
-            )
-        return safe_specs
+    def native_forward(
+        self,
+        inputs: Array,
+        *,
+        w: Array | None = None,
+    ) -> Array:
+        """Trace-safe alias used by LM-head projection helpers."""
+        return self(inputs=inputs, w=w)
 
     @property
     def wqdtype(self) -> QuantizationType:

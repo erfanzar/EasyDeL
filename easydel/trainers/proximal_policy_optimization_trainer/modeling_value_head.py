@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import typing as tp
 
-from flax import nnx as nn
+import spectrax as spx
 
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.layers import ParallelLinear
 
 
 def _infer_hidden_size(config) -> int:
@@ -85,7 +86,7 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         self,
         base_model: EasyDeLBaseModule,
         *,
-        rngs: nn.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ):
         """Initialize the CausalLMWithValueHead wrapper.
 
@@ -104,18 +105,18 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
 
         self.model = base_model
         hidden_size = _infer_hidden_size(base_model.config)
-        self.value_head = nn.Linear(
+        self.value_head = ParallelLinear(
             hidden_size,
             1,
             use_bias=False,
             dtype=base_model.dtype,
             param_dtype=base_model.param_dtype,
             precision=base_model.precision,
-            kernel_init=nn.initializers.zeros,
+            kernel_init=jax.nn.initializers.zeros,
             rngs=self.rngs,
         )
 
-    def __call__(self, *args, **kwargs):
+    def forward(self, *args, **kwargs):
         """Forward pass delegated to the underlying model."""
         return self.model(*args, **kwargs)
 

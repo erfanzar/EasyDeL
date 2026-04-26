@@ -35,7 +35,8 @@ Usage Example:
     ```python
     import jax
     from easydel import SmolLM3Config, SmolLM3ForCausalLM
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration
     config = SmolLM3Config(
@@ -55,7 +56,7 @@ Usage Example:
         config=config,
         dtype=jax.numpy.float32,
         param_dtype=jax.numpy.float32,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     # Prepare inputs

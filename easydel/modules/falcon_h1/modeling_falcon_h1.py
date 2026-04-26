@@ -19,13 +19,11 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
-from flax import nnx as nn
+import spectrax as spx
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import HybridCache, HybridCacheView, OperationsMetadata
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -135,7 +133,7 @@ class FalconH1Attention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize FalconH1 attention layer with RoPE and muP key scaling.
 
@@ -146,7 +144,7 @@ class FalconH1Attention(UnifiedAttention):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -189,7 +187,7 @@ class FalconH1Attention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class Conv1D(nn.Module):
+class Conv1D(spx.Module):
     """Depthwise causal 1D convolution layer for the Mamba SSM mixer.
 
     Implements a 1D convolution with depthwise grouping for processing sequential
@@ -218,7 +216,7 @@ class Conv1D(nn.Module):
         features: int,
         kernel_size: int,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         stride: int = 1,
         padding: int = 0,
         dilation: int = 1,
@@ -233,7 +231,7 @@ class Conv1D(nn.Module):
         Args:
             features (int): Number of input/output channels (depthwise).
             kernel_size (int): Size of the convolutional kernel along sequence dim.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
             stride (int, optional): Convolution stride. Defaults to 1.
             padding (int, optional): Padding on each side of input. Defaults to 0.
             dilation (int, optional): Kernel dilation factor. Defaults to 1.
@@ -256,28 +254,21 @@ class Conv1D(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(kernel_size, 1, features),
             dtype=param_dtype,
             init_method="lecun_normal",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
         if use_bias:
             self.bias = ArrayParam.bound(
                 shape=(features,),
                 dtype=param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
             )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for convolution parameters."""
-        specs = {"kernel": Replicated}
-        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
-            specs["bias"] = Replicated
-        return specs  # pyright: ignore[reportReturnType]
-
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply 1D convolution to the input.
 
         Args:
@@ -288,7 +279,7 @@ class Conv1D(nn.Module):
             Array: Convolved output of shape (batch, channels, output_seq_len)
                 where output_seq_len depends on padding, stride, and dilation.
         """
-        rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
+        rhs = jnp.asarray(jnp.swapaxes(self.weight.value, 0, 2), dtype=self.dtype)
         y = lax.conv_general_dilated(
             lhs=x.astype(self.dtype),
             rhs=rhs,
@@ -303,7 +294,7 @@ class Conv1D(nn.Module):
         return y.astype(x.dtype)
 
 
-class FalconH1RMSNormGated(nn.Module):
+class FalconH1RMSNormGated(spx.Module):
     """Group RMS normalization with optional SiLU gating for FalconH1 Mamba blocks.
 
     Implements grouped RMS normalization where the hidden dimension is divided into
@@ -327,7 +318,7 @@ class FalconH1RMSNormGated(nn.Module):
         hidden_size: int,
         eps: float,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         n_groups: int = 1,
         norm_before_gate: bool = True,
         dtype: jnp.dtype = jnp.float32,
@@ -337,7 +328,7 @@ class FalconH1RMSNormGated(nn.Module):
         Args:
             hidden_size (int): Size of the hidden dimension to normalize.
             eps (float): Small epsilon for numerical stability in rsqrt.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
             n_groups (int, optional): Number of groups to divide hidden_size into.
                 Each group is normalized independently. Defaults to 1 (full RMSNorm).
             norm_before_gate (bool, optional): If True, normalizes first then applies
@@ -350,18 +341,14 @@ class FalconH1RMSNormGated(nn.Module):
         self.n_groups = n_groups
         self.norm_before_gate = norm_before_gate
         self.dtype = dtype
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(hidden_size,),
             dtype=dtype,
             init_method="ones",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for normalization parameters."""
-        return {"kernel": Replicated}
-
-    def __call__(self, hidden_states: Array, gate: Array | None = None) -> Array:
+    def forward(self, hidden_states: Array, gate: Array | None = None) -> Array:
         """Apply grouped RMS normalization with optional SiLU gating.
 
         Args:
@@ -391,7 +378,7 @@ class FalconH1RMSNormGated(nn.Module):
         variance = jnp.mean(jnp.square(hs), axis=-1, keepdims=True)
         hs = hs * lax.rsqrt(variance + self.variance_epsilon)
 
-        w = self.kernel.value.astype(jnp.float32).reshape(self.n_groups, dim // self.n_groups)
+        w = self.weight.value.astype(jnp.float32).reshape(self.n_groups, dim // self.n_groups)
         hs = w[None, None, :, :] * hs
         hs = hs.reshape(batch_size, seq_len, dim)
 
@@ -403,7 +390,7 @@ class FalconH1RMSNormGated(nn.Module):
         return hs.astype(input_dtype)
 
 
-class FalconH1Mixer(nn.Module):
+class FalconH1Mixer(spx.Module):
     """Mamba2-style selective state space model (SSM) mixer for FalconH1 blocks.
 
     Implements a Mamba2-style SSM layer that provides efficient sequence modeling
@@ -437,7 +424,7 @@ class FalconH1Mixer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the FalconH1 Mamba mixer.
 
@@ -450,7 +437,7 @@ class FalconH1Mixer(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
 
         Raises:
             ValueError: If mamba_n_heads is not divisible by mamba_n_groups.
@@ -515,19 +502,19 @@ class FalconH1Mixer(nn.Module):
             shape=(self.num_heads,),
             dtype=param_dtype,
             init_method="zeros",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
         self.A_log = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=param_dtype,
             init_method="zeros",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
         self.D = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=param_dtype,
             init_method="ones",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
         if self.mamba_rms_norm:
@@ -557,15 +544,7 @@ class FalconH1Mixer(nn.Module):
         )
         self.ssm_op = SSM2Op(metadata)
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for state space parameters."""
-        return {
-            "dt_bias": Replicated,
-            "A_log": Replicated,
-            "D": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo | None,
@@ -646,8 +625,8 @@ class FalconH1Mixer(nn.Module):
             # A in real form (negative for stability)
             A_real = -jnp.exp(self.A_log.value.astype(jnp.float32))
             D_val = self.D.value.astype(jnp.float32)
-            kernel = self.conv1d.kernel.value  # [kernel_size, 1, conv_dim]
-            conv_bias = self.conv1d.bias.value if self.use_conv_bias else jnp.zeros(self.conv_dim, dtype=kernel.dtype)
+            kernel = self.conv1d.weight  # [kernel_size, 1, conv_dim]
+            conv_bias = self.conv1d.bias if self.use_conv_bias else jnp.zeros(self.conv_dim, dtype=kernel.dtype)
 
             token_outputs = jnp.zeros((seq_len, self.intermediate_size), dtype=jnp.float32)
 
@@ -763,7 +742,7 @@ class FalconH1Mixer(nn.Module):
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         # Prepare dt with bias
@@ -805,13 +784,13 @@ class FalconH1Mixer(nn.Module):
         scan_output = apply_logical_sharding(
             scan_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
         return contextualized_states, updated_cache_view
 
 
-class FalconH1MLP(nn.Module):
+class FalconH1MLP(spx.Module):
     """SwiGLU Multi-Layer Perceptron for FalconH1 models.
 
     Implements a gated feedforward network using SwiGLU (Swish-Gated Linear Unit)
@@ -838,7 +817,7 @@ class FalconH1MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SwiGLU MLP block.
 
@@ -849,7 +828,7 @@ class FalconH1MLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.dtype = dtype
@@ -876,7 +855,7 @@ class FalconH1MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply SwiGLU feedforward transformation with muP scaling.
 
         Computes: down_proj(up_proj(x) * act_fn(gate_proj(x) * gate_mul)) * down_mul
@@ -890,19 +869,19 @@ class FalconH1MLP(nn.Module):
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         y = self.up_proj(x) * self.act_fn(self.gate_proj(x) * self.gate_multiplier)
         y = self.down_proj(y) * self.down_multiplier
         y = apply_logical_sharding(
             y,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return y
 
 
-class FalconH1DecoderLayer(nn.Module):
+class FalconH1DecoderLayer(spx.Module):
     """Single decoder layer for FalconH1 hybrid models.
 
     Implements a parallel hybrid architecture where the Mamba SSM mixer and
@@ -936,7 +915,7 @@ class FalconH1DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the FalconH1 decoder layer.
 
@@ -947,7 +926,7 @@ class FalconH1DecoderLayer(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -998,7 +977,7 @@ class FalconH1DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo | None,
@@ -1084,7 +1063,7 @@ class FalconH1DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -1131,7 +1110,7 @@ class FalconH1Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the FalconH1 base model.
 
@@ -1143,7 +1122,7 @@ class FalconH1Model(EasyDeLBaseModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -1167,19 +1146,19 @@ class FalconH1Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
 
         self.final_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
@@ -1188,7 +1167,7 @@ class FalconH1Model(EasyDeLBaseModule):
         self.embedding_multiplier = float(config.embedding_multiplier)
         self.lm_head_multiplier = float(config.lm_head_multiplier)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         attention_mask: Array | None = None,
@@ -1292,7 +1271,8 @@ class FalconH1Model(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        for layer_idx, layer in enumerate(self.layers):
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1310,7 +1290,7 @@ class FalconH1Model(EasyDeLBaseModule):
                 output_attentions=output_attentions,
             )
 
-            hidden_states = layer_output.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_output.hidden_states, layer_idx, layers=self.layers)
 
             if past_key_values is not None and layer_output.cache_view is not None:
                 past_key_values = past_key_values.update_view(layer_idx, layer_output.cache_view)
@@ -1318,6 +1298,13 @@ class FalconH1Model(EasyDeLBaseModule):
             if output_attentions and layer_output.attention_weight is not None:
                 all_attentions += (layer_output.attention_weight,)
 
+            return hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, past_key_values, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, past_key_values, 0),
+            trace=True,
+        )
         hidden_states = self.final_layernorm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1377,7 +1364,7 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the FalconH1 causal language model.
 
@@ -1388,7 +1375,7 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -1403,7 +1390,7 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         attention_mask: Array | None = None,

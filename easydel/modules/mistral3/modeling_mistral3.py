@@ -15,14 +15,13 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -36,7 +35,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ACT2FN
-from easydel.layers import RMSNorm, RowParallelLinear
+from easydel.layers import ParallelLinear, RMSNorm, RowParallelLinear
 from easydel.modules._base import BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
@@ -95,7 +94,7 @@ class Mistral3CausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-class Mistral3PatchMerger(nn.Module):
+class Mistral3PatchMerger(spx.Module):
     """Spatially merges neighboring vision patches before projecting into text space.
 
     Reduces the spatial resolution of vision patch tokens by merging adjacent patches
@@ -109,7 +108,7 @@ class Mistral3PatchMerger(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mistral3 patch merger.
 
@@ -119,7 +118,7 @@ class Mistral3PatchMerger(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -129,7 +128,7 @@ class Mistral3PatchMerger(nn.Module):
         hidden_size = config.vision_config.hidden_size
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = self.config.vision_config.patch_size
-        self.merging_layer = nn.Linear(
+        self.merging_layer = ParallelLinear(
             hidden_size * self.spatial_merge_size**2,
             hidden_size,
             use_bias=False,
@@ -137,7 +136,7 @@ class Mistral3PatchMerger(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
         )
 
     def forward(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
@@ -180,7 +179,7 @@ class Mistral3PatchMerger(nn.Module):
         return image_features
 
 
-class Mistral3MultiModalProjector(nn.Module):
+class Mistral3MultiModalProjector(spx.Module):
     """Projects vision tower features into the language model embedding space.
 
     Transforms vision encoder outputs into a representation compatible with
@@ -195,7 +194,7 @@ class Mistral3MultiModalProjector(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mistral3 multimodal projector.
 
@@ -205,7 +204,7 @@ class Mistral3MultiModalProjector(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -231,7 +230,7 @@ class Mistral3MultiModalProjector(nn.Module):
             config.vision_config.hidden_size * num_feature_layers,
             config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
             param_dtype=param_dtype,
             dtype=dtype,
             precision=precision,
@@ -243,14 +242,14 @@ class Mistral3MultiModalProjector(nn.Module):
             config.get_text_config().hidden_size,
             config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
             param_dtype=param_dtype,
             dtype=dtype,
             precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
+    def forward(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
         """Project vision features into language model space.
 
         Applies RMS normalization, patch merging, and a two-layer MLP projection
@@ -294,7 +293,7 @@ class Mistral3Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mistral3 base model.
 
@@ -303,7 +302,7 @@ class Mistral3Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -417,7 +416,7 @@ class Mistral3Model(EasyDeLBaseModule):
 
         return inputs_embeds
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -641,7 +640,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
 
     Class Attributes:
         _task_type: IMAGE_TEXT_TO_TEXT task type
@@ -672,7 +671,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mistral3 model for conditional generation.
 
@@ -681,7 +680,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -737,7 +736,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -805,7 +804,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -864,26 +863,26 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         """
         return self.lm_head(hidden_states)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Get the vision tower component.
 
         Returns:
-            nn.Module: The vision encoder used for image feature extraction.
+            spx.Module: The vision encoder used for image feature extraction.
         """
         return self.base_model.vision_tower
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Get the multimodal projector component.
 
         Returns:
-            nn.Module: The projector that aligns vision features with text embeddings.
+            spx.Module: The projector that aligns vision features with text embeddings.
         """
         return self.base_model.multi_modal_projector
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Get the language model component.
 
         Returns:
-            nn.Module: The underlying language model for text generation.
+            spx.Module: The underlying language model for text generation.
         """
         return self.base_model.language_model

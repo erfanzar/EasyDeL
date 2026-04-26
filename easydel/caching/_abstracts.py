@@ -222,46 +222,46 @@ class OperationsMetadata(BaseRunTimeMetadata):
         cls,
         postpadded: bool = False,
         starts: tp.Any | None = None,
-        indexs: tp.Any | None = None,
+        indexes: tp.Any | None = None,
     ) -> "OperationsMetadata":
         """Create OperationsMetadata for transformer cache.
 
         Args:
             postpadded: Whether sequences are post-padded.
             starts: Starting positions for sequences.
-            indexs: Current position indices.
+            indexes: Current position indices.
 
         Returns:
             OperationsMetadata with transformer field populated.
         """
         from easydel.caching.transformer import TransformerMetadata
 
-        return cls(transformer=TransformerMetadata(postpadded=postpadded, starts=starts, indexs=indexs))
+        return cls(transformer=TransformerMetadata(postpadded=postpadded, starts=starts, indexes=indexes))
 
     @classmethod
     def for_hybrid(
         cls,
         postpadded: bool = False,
         starts: tp.Any | None = None,
-        indexs: tp.Any | None = None,
+        indexes: tp.Any | None = None,
     ) -> "OperationsMetadata":
         """Create OperationsMetadata for hybrid cache.
 
         Since HybridCache contains multiple view types, the metadata includes
-        fields needed by TransformerCacheView layers (postpadded, starts, indexs).
+        fields needed by TransformerCacheView layers (postpadded, starts, indexes).
         Recurrent layers don't need additional metadata during inference.
 
         Args:
             postpadded: Whether sequences are post-padded.
             starts: Starting positions for sequences.
-            indexs: Current position indices.
+            indexes: Current position indices.
 
         Returns:
             OperationsMetadata with hybrid field populated.
         """
         from easydel.caching.hybrid import HybridMetadata
 
-        return cls(hybrid=HybridMetadata(postpadded=postpadded, starts=starts, indexs=indexs))
+        return cls(hybrid=HybridMetadata(postpadded=postpadded, starts=starts, indexes=indexes))
 
     @classmethod
     def for_ragged(
@@ -371,7 +371,7 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
 
     Special handling for HybridMetadata:
     - When expected_type is "transformer", extracts TransformerMetadata from
-      HybridMetadata's embedded fields (postpadded, starts, indexs).
+      HybridMetadata's embedded fields (postpadded, starts, indexes).
     - This enables HybridCache to work seamlessly with TransformerCacheView layers.
 
     Args:
@@ -405,7 +405,7 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
                 return TransformerMetadata(
                     postpadded=getattr(metadata.hybrid, "postpadded", False),
                     starts=getattr(metadata.hybrid, "starts", None),
-                    indexs=getattr(metadata.hybrid, "indexs", None),
+                    indexes=getattr(metadata.hybrid, "indexes", None),
                 )
             return None
         elif expected_type == "hybrid":
@@ -428,7 +428,7 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
         return TransformerMetadata(
             postpadded=getattr(metadata, "postpadded", False),
             starts=getattr(metadata, "starts", None),
-            indexs=getattr(metadata, "indexs", None),
+            indexes=getattr(metadata, "indexes", None),
         )
 
     # Already a specific type, return as-is

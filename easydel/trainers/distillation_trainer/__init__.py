@@ -28,7 +28,7 @@ The module includes:
 Key Features:
 - Flexible temperature scaling for controlling distillation softness
 - Support for combining distillation loss with supervised learning loss
-- Efficient batch processing with JAX/Flax
+- Efficient batch processing with JAX/spectrax
 - Support for both encoder-decoder and decoder-only architectures
 - Gradient accumulation and mixed precision training
 

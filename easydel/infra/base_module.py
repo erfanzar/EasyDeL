@@ -35,7 +35,8 @@ Key Classes:
 
 Example:
     >>> from easydel.infra import EasyDeLBaseModule, EasyDeLBaseConfig
-    >>> import flax.nnx as nn
+    >>> import spectrax as spx
+    >>> from spectrax import nn
     >>>
     >>> class MyModel(EasyDeLBaseModule):
     ...     def __init__(self, config, dtype, param_dtype, precision, rngs):
@@ -43,7 +44,7 @@ Example:
     ...         # Initialize model layers
     ...         self.layer = nn.Linear(config.hidden_size, config.hidden_size)
     ...
-    ...     def __call__(self, inputs):
+    ...     def forward(self, inputs):
     ...         return self.layer(inputs)
     >>>
     >>> # Create and use the model
@@ -53,7 +54,7 @@ Example:
     ...     dtype=jnp.float32,
     ...     param_dtype=jnp.float32,
     ...     precision='highest',
-    ...     rngs=nn.Rngs(0)
+    ...     rngs=spx.Rngs(0)
     ... )
 
 The module integrates with JAX's sharding system for distributed training,
@@ -63,6 +64,7 @@ between EasyDeL and HuggingFace model formats.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import re
@@ -71,23 +73,23 @@ import warnings
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import cached_property, partial
+from functools import cached_property, partial, wraps
 from re import Pattern
 from typing import Self, Unpack
 
-import flax
-import flax.struct
 import jax
 import jax.tree_util
-from eformer.escale import make_shard_and_gather_fns, match_partition_rules
+import spectrax as spx
 from eformer.loggings import get_logger
-from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float, Int
+from spectrax import make_shard_and_gather_fns, match_partition_rules, nn
+from spectrax.common_types import NOT_GIVEN
 
-from easydel.infra.utils import ArrayParam
+from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.utils import ArrayParam, materialize_meta_leaves
 from easydel.layers.norms import LayerNorm
 from easydel.utils import traversals
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
@@ -103,8 +105,9 @@ from .loss_utils import (
     resolve_loss_strategy,
 )
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin
+from .mixins.protocol import printify_module
 from .modeling_outputs import EmbeddingInfo
-from .utils import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree
+from .utils import device_put_or_shard_abstract, sanitize_partition_spec_for_shape
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
@@ -124,6 +127,78 @@ logger = get_logger(__name__)
 
 BaseConf = EasyDeLBaseConfig
 """Alias for EasyDeLBaseConfig for backward compatibility."""
+
+
+def _looks_like_config(value: tp.Any) -> bool:
+    return isinstance(value, EasyDeLBaseConfig) or (
+        value is not None and hasattr(value, "runtime_sharding_resolver") and hasattr(value, "mesh")
+    )
+
+
+def _resolve_init_config(
+    init: tp.Callable, instance: tp.Any, args: tuple[tp.Any, ...], kwargs: dict[str, tp.Any]
+) -> tp.Any:
+    if _looks_like_config(kwargs.get("config")):
+        return kwargs["config"]
+
+    try:
+        bound = inspect.signature(init).bind_partial(instance, *args, **kwargs)
+    except Exception:
+        bound = None
+    if bound is not None:
+        config = bound.arguments.get("config")
+        if _looks_like_config(config):
+            return config
+
+    for value in args:
+        if _looks_like_config(value):
+            return value
+    return None
+
+
+def _is_reusable_context(value: tp.Any) -> bool:
+    return hasattr(value, "__enter__") and hasattr(value, "__exit__")
+
+
+@contextlib.contextmanager
+def _parameter_init_sharding_context(config: tp.Any):
+    if not _looks_like_config(config):
+        yield
+        return
+
+    mesh = config.mesh
+    resolver = config.runtime_sharding_resolver
+
+    if hasattr(resolver, "with_mesh"):
+        resolver = resolver.with_mesh(mesh)
+
+    def place(value: tp.Any, metadata: dict[str, tp.Any], explicit_sharding: bool) -> tp.Any | None:
+        if not metadata or not isinstance(value, jax.Array):
+            return None
+
+        has_layout_metadata = any(key in metadata for key in ("sharding", "tensor_layout"))
+        existing = getattr(value, "sharding", None)
+        if isinstance(existing, NamedSharding) and not explicit_sharding and not has_layout_metadata:
+            return None
+
+        shape = tuple(int(dim) for dim in value.shape)
+        try:
+            named = resolver.named_sharding_for_metadata(metadata, shape=shape, mesh=mesh)
+        except (TypeError, ValueError):
+            return None
+        if named is None:
+            return None
+        if existing is not None and existing == named:
+            return value
+        return jax.device_put(value, named)
+
+    with contextlib.ExitStack() as stack:
+        if _is_reusable_context(mesh):
+            stack.enter_context(mesh)
+        if hasattr(resolver, "logical_axis_rules"):
+            stack.enter_context(resolver.logical_axis_rules())
+        stack.enter_context(spx.variable_init_placement(place))
+        yield
 
 
 @dataclass
@@ -176,16 +251,161 @@ class ParameterTransformRule:
     consolidate_experts: bool = False
 
 
-class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin, BaseModuleProtocol):
+class EasyDeLLayerStackMixin:
+    """Shared repeated-layer cache, scan, and pipeline-stage helpers."""
+
+    config: tp.Any
+
+    def _layer_cache_view_at(
+        self: Self,
+        cache_views: tp.Any,
+        layer_idx: tp.Any,
+        *,
+        enabled: bool,
+        cache: tp.Any = None,
+    ) -> tp.Any:
+        """Read a mutable per-layer cache view for trace/cache execution."""
+        if not enabled:
+            return None
+        if cache is not None:
+            return cache[layer_idx]
+        if cache_views is None:
+            return None
+        return cache_views[layer_idx]
+
+    def _layer_cache_view_update(
+        self: Self,
+        cache_views: tp.Any,
+        layer_idx: tp.Any,
+        new_view: tp.Any,
+        *,
+        enabled: bool,
+        cache: tp.Any = None,
+    ) -> tp.Any:
+        """Update mutable per-layer cache views only on cache/trace paths."""
+        if not enabled or new_view is None:
+            return cache_views
+        if cache is not None:
+            cache[layer_idx] = new_view
+        elif cache_views is not None:
+            cache_views[layer_idx] = new_view
+        return cache_views
+
+    def _pipeline_stage_count(self: Self) -> int:
+        """Return the logical pipeline width from the canonical SpectraX mesh."""
+        return int(self.config.mesh.shape["pp"]) * int(self.config.pipeline_virtual_stages)
+
+    def _pipeline_physical_stage_count(self: Self) -> int:
+        """Return the physical pipeline width from the canonical SpectraX mesh."""
+        return int(self.config.mesh.shape["pp"])
+
+    def _layer_physical_stage_assignment(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
+        """Resolve a layer position to the physical PP owner used for sharding.
+
+        Logical virtual stages are ordered as ``virt * pp + rank`` by the
+        default SpectraX virtual schedules. Parameter metadata stores the
+        physical owner so creation-time sharding matches the schedule instead
+        of requiring runtime cross-rank parameter moves.
+        """
+        physical_pp = self._pipeline_physical_stage_count()
+        if physical_pp <= 1:
+            return 0, 1
+        logical_pp = self._pipeline_stage_count()
+        logical_stage = min(logical_pp - 1, (int(layer_idx) * logical_pp) // int(total_layers))
+        layout = self.config.pipeline_stage_layout
+        if layout == "contiguous":
+            virtual_stages = max(1, int(self.config.pipeline_virtual_stages))
+            return min(physical_pp - 1, logical_stage // virtual_stages), physical_pp
+        if layout == "loop":
+            offset = logical_stage % physical_pp
+            virtual_stage = logical_stage // physical_pp
+            physical_stage = offset if virtual_stage % 2 == 0 else physical_pp - 1 - offset
+            return physical_stage, physical_pp
+        return logical_stage % physical_pp, physical_pp
+
+    @contextlib.contextmanager
+    def _assign_layer_stage(self: Self, layer_idx: int, *, total_layers: int):
+        """Assign subsequently-created variables to the layer's physical PP owner."""
+        current, total = self._layer_physical_stage_assignment(layer_idx, total_layers)
+        with spx.assign_stage(total=total, current=current):
+            yield
+
+    def _layer_scan_trace(
+        self: Self,
+        trace: bool,
+        *,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
+        cache: tp.Any = None,
+        cache_views: tp.Iterable[tp.Any] | None = None,
+        extra: bool = False,
+    ) -> bool:
+        """Resolve whether a repeated-layer stack must use the Python trace path."""
+        del cache
+        has_cache_views = cache_views is not None and any(view is not None for view in cache_views)
+        return (
+            trace
+            or output_hidden_states
+            or output_attentions
+            or has_cache_views
+            or extra
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1
+        )
+
+    def _mark_layer_stage_boundary(
+        self: Self,
+        hidden_states: tp.Any,
+        layer_idx: tp.Any,
+        *,
+        layers: tp.Sized | None = None,
+    ) -> tp.Any:
+        """Mark dynamic pipeline stage boundaries for repeated layer stacks."""
+        try:
+            idx = int(layer_idx)
+        except (TypeError, ValueError):
+            return hidden_states
+        total = len(layers if layers is not None else self.layers)  # type: ignore[attr-defined]
+        pp = self._pipeline_stage_count()
+        if pp <= 1 or idx + 1 >= total:
+            return hidden_states
+        current = min(pp - 1, (idx * pp) // total)
+        nxt = min(pp - 1, ((idx + 1) * pp) // total)
+        if current != nxt:
+            edge_sharding = self._layer_stage_boundary_sharding(hidden_states)
+            return spx.sxstage_iter(hidden_states, stage=current, sharding=edge_sharding)
+        return hidden_states
+
+    def _layer_stage_boundary_sharding(self: Self, hidden_states: tp.Any) -> PartitionSpec | None:
+        """Resolve the activation sharding contract for PP stage edges."""
+        if not hasattr(hidden_states, "shape"):
+            return None
+        try:
+            return self.config.runtime_sharding_resolver.with_mesh(self.config.mesh).resolve(
+                dynamic_axes=spx.common_types.HiddenStateSharding,
+                shape=tuple(hidden_states.shape),
+            )
+        except Exception:
+            return None
+
+
+class EasyDeLBaseModule(
+    EasyDeLLayerStackMixin,
+    spx.Module,
+    EasyBridgeMixin,
+    EasyGenerationMixin,
+    OperationCacheMixin,
+    BaseModuleProtocol,
+):
     """Base class for all EasyDeL neural network modules.
 
     EasyDeLBaseModule provides the foundational functionality for all EasyDeL models,
     including parameter management, distributed training support, quantization,
     LoRA adaptation, and integration with HuggingFace models. It inherits from
-    nn.Module and multiple mixins that provide additional capabilities.
+    spx.Module and multiple mixins that provide additional capabilities.
 
     This class should be subclassed to create specific model architectures. Subclasses
-    must implement the __call__ method and may override various hooks for customization.
+    must implement the forward method and may override various hooks for customization.
 
     Attributes:
         config_class: The configuration class associated with this model type.
@@ -208,12 +428,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         ...     def __init__(self, config, dtype, param_dtype, precision, rngs):
         ...         super().__init__(config, dtype, param_dtype, precision, rngs)
         ...         self.embed = nn.Embed(config.vocab_size, config.hidden_size)
-        ...         self.layers = nn.List([
+        ...         self.layers = nn.ModuleList([
         ...             TransformerBlock(config, dtype, param_dtype, precision, rngs)
         ...             for _ in range(config.num_hidden_layers)
         ...         ])
         ...
-        ...     def __call__(self, input_ids, attention_mask=None):
+        ...     def forward(self, input_ids, attention_mask=None):
         ...         hidden_states = self.embed(input_ids)
         ...         for layer in self.layers:
         ...             hidden_states = layer(hidden_states, attention_mask)
@@ -228,10 +448,27 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
     config_class: type[BaseConf] | None
     base_model_prefix: str
-    config: BaseConf | None = None
-    _model_task: str | None = None
-    _model_type: str | None = None
+    config: BaseConf | None
+    _model_task: str | None
+    _model_type: str | None
     _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
+
+    def __init_subclass__(cls, **kwargs: tp.Any) -> None:
+        super().__init_subclass__(**kwargs)
+        original_init = cls.__dict__.get("__init__")
+        if original_init is None or getattr(original_init, "_easydel_init_sharding_wrapped", False):
+            return
+
+        @wraps(original_init)
+        def init_with_parameter_sharding(self, *args, **kwargs):
+            config = _resolve_init_config(original_init, self, args, kwargs)
+            with _parameter_init_sharding_context(config):
+                original_init(self, *args, **kwargs)
+
+        init_with_parameter_sharding._easydel_init_sharding_wrapped = True
+        with contextlib.suppress(Exception):
+            init_with_parameter_sharding.__signature__ = inspect.signature(original_init)
+        cls.__init__ = init_with_parameter_sharding
 
     def __init__(
         self,
@@ -239,7 +476,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the EasyDeLBaseModule.
 
@@ -259,7 +496,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 float32 computation).
             precision: JAX precision setting for matrix operations. Can be 'highest',
                 'high', 'default', or a jax.lax.Precision enum value.
-            rngs: Flax random number generator container for parameter initialization
+            rngs: SpecTrax random number generator container for parameter initialization
                 and stochastic operations like dropout.
 
         Example:
@@ -269,7 +506,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ...     dtype=jnp.bfloat16,
             ...     param_dtype=jnp.bfloat16,
             ...     precision='high',
-            ...     rngs=nn.Rngs(42)
+            ...     rngs=spx.Rngs(42)
             ... )
 
         Note:
@@ -277,99 +514,128 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             initialize the base functionality. Failing to call super().__init__()
             will result in missing core attributes.
         """
+        super().__init__()
         self.config: BaseConf = config
         self.dtype: jnp.dtype = dtype
         self.param_dtype: jnp.dtype = param_dtype
         self.precision: lax.PrecisionLike = precision
-        self.rngs: nn.Rngs = rngs
+        self.rngs: spx.Rngs = rngs
 
         _ = self.graphtree_shape
-        _ = self.graphtree_params_shape
+        _ = self.graphtree_parameters_shape
         _ = self.mesh
+        self.register_context(mesh=self.mesh)
         _ = self.model_task
         _ = self.model_type
 
-    @property
-    def parameters(self: Self) -> dict:
-        """Retrieve the module's parameters as a nested dictionary.
+    def __str__(self) -> str:
+        return printify_module(self)
 
-        This property iterates through the module and its submodules, extracting
-        all variables marked as nn.Param and returning them in a flat dictionary
-        where keys represent the parameter path (e.g., 'layers.0.attention.qkv.kernel').
-
-        Returns:
-            dict: A dictionary mapping parameter paths (strings) to their values
-                (JAX arrays). The paths use dot notation to represent the module
-                hierarchy.
-
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> params = model.parameters
-            >>> print(params.keys())
-            dict_keys(['embed.embedding', 'layers.0.attention.q_proj.kernel', ...])
-            >>> print(params['embed.embedding'].shape)
-            (32000, 4096)
-
-        Note:
-            This creates a new dictionary on each access. For performance-critical
-            code that needs repeated parameter access, consider caching the result.
-        """
-        from easydel.utils.traversals import iter_module_search
-
-        parameters = {}
-        for key, value in iter_module_search(self, nn.Param):
-            parameters[key] = value.value
-        return parameters
+    def __repr__(self) -> str:
+        return printify_module(self)
 
     @property
-    def graphstate_type(self: Self):
-        """Determine the parameter type based on LoRA enablement status.
+    def default_trainable_selector(self: Self) -> spx.SelectorSugar:
+        """Return the canonical default trainable selector for this module."""
+        return "parameters"
 
-        Returns the appropriate parameter type class for use with nnx.split().
-        If LoRA is enabled on the model, returns nn.LoRAParam to properly
-        separate LoRA parameters; otherwise returns nn.Param.
+    def _resolve_trainable_selector(
+        self: Self, trainable_selector: spx.SelectorSugar | None = None
+    ) -> spx.SelectorSugar:
+        """Resolve ``trainable_selector`` against the module default."""
+        return self.default_trainable_selector if trainable_selector is None else trainable_selector
 
-        Returns:
-            type: nn.LoRAParam if LoRA is enabled on this model instance,
-                otherwise nn.Param.
+    def _partition_trainable_state(
+        self: Self,
+        state: spx.State,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> tuple[spx.State, spx.State]:
+        """Partition ``state`` into selected trainables and the remaining state."""
+        selector = spx.as_selector(self._resolve_trainable_selector(trainable_selector))
+        return selector.partition_state(self, state)
 
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> print(model.graphstate_type)
-            <class 'flax.nnx.variables.Param'>
-            >>>
-            >>> model = model.apply_lora_to_layers(lora_rank=8)
-            >>> print(model.graphstate_type)
-            <class 'flax.nnx.lora.LoRAParam'>
+    @property
+    def parameters(self: Self) -> spx.State:
+        """Return the default trainable state for this module.
+
+        By default this is the ``"parameters"`` collection only. Models that
+        want LoRA-only or combined training should pass an explicit
+        ``trainable_selector`` to :meth:`split_parameters`,
+        :meth:`split_module`, or :meth:`to_state`.
         """
-        return nn.LoRAParam if self.lora_is_enabled else nn.Param
+        return self.split_parameters()
 
-    def split_module(self: Self):
-        """Split the module into graph definition and state components.
+    def parameter_values(
+        self: Self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+        extract_fn: tp.Callable | None = None,
+        remove_none: bool = True,
+    ) -> dict[str, tp.Any]:
+        """Return a flat ``path -> array`` mapping for the selected trainables."""
+        flat_values: dict[str, tp.Any] = {}
+        for _collection, path, value in self.split_parameters(selector).items():
+            leaf = extract_fn(value) if extract_fn is not None else value
+            leaf = leaf.value if hasattr(leaf, "value") else leaf
+            if remove_none and leaf is None:
+                continue
+            flat_values[path] = leaf
+        return flat_values
 
-        Uses flax.nnx.split to decompose the module into its structural definition
-        (GraphDef) and two state components: parameters and other state variables.
-        This is useful for functional transformations, serialization, and
-        manipulation of model state.
+    def abstract_parameter_leaves(
+        self: Self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> tuple[tuple[str, str, tuple[tp.Any, ...], tp.Any], ...]:
+        """Return selected trainable leaves that are still abstract placeholders."""
+        missing: list[tuple[str, str, tuple[tp.Any, ...], tp.Any]] = []
+        for collection, path, value in self.split_parameters(selector).items():
+            leaf = value.value if hasattr(value, "value") else value
+            if isinstance(leaf, jax.ShapeDtypeStruct):
+                missing.append((collection, path, tuple(leaf.shape), leaf.dtype))
+        return tuple(missing)
 
-        Returns:
-            tuple: A tuple of (GraphDef, GraphState, GraphState) where:
-                - GraphDef: The module's structure without values
-                - GraphState (first): The parameter state (nn.Param or nn.LoRAParam)
-                - GraphState (second): Other state variables (non-parameters)
+    def assert_parameters_materialized(
+        self: Self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+        context: str = "parameter materialization",
+    ) -> Self:
+        """Fail if a real-weight path still contains lazy ShapeDtypeStruct leaves."""
+        missing = self.abstract_parameter_leaves(selector=selector)
+        if not missing:
+            return self
 
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> graphdef, params, others = model.split_module()
-            >>> # Modify parameters
-            >>> modified_params = jax.tree_map(lambda x: x * 0.5, params)
-            >>> # Reconstruct model
-            >>> new_model = model.merge_module(graphdef, modified_params, others)
-        """
-        return nn.split(self, self.graphstate_type, ...)
+        preview_items = [
+            f"{collection}/{path} shape={shape} dtype={dtype}" for collection, path, shape, dtype in missing[:8]
+        ]
+        preview = "; ".join(preview_items)
+        if len(missing) > len(preview_items):
+            preview = f"{preview}; ... +{len(missing) - len(preview_items)} more"
+        raise ValueError(
+            f"{context} left {len(missing)} abstract trainable parameter leaf/leaves. "
+            "This means checkpoint conversion/loading did not materialize required weights. "
+            f"First missing leaves: {preview}"
+        )
 
-    @staticmethod
-    def merge_module(graphdef: nn.GraphDef, graphstate: nn.GraphState, graphother: nn.GraphState):
+    def split_module(
+        self: Self,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> tuple[spx.GraphDef, spx.State, spx.State]:
+        """Split the module into graph definition, selected trainables, and the remainder."""
+        gdef, state = spx.export(self)
+        graphstate, graphother = self._partition_trainable_state(state, trainable_selector=trainable_selector)
+        graphother = materialize_meta_leaves(graphother, seed=42)
+        return gdef, graphstate, graphother
+
+    def merge_module(
+        self: Self,
+        graphdef: spx.GraphDef,
+        graphstate: spx.State,
+        graphother: spx.State,
+    ) -> Self:
         """Merge graph components back into a complete module.
 
         Reconstructs a complete module instance from its decomposed components.
@@ -392,102 +658,61 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> # Apply some transformation to parameters
             >>> new_params = jax.tree_map(lambda x: x.astype(jnp.float16), params)
             >>> # Merge back into a complete model
-            >>> new_model = EasyDeLBaseModule.merge_module(graphdef, new_params, others)
+            >>> new_model = model.merge_module(graphdef, new_params, others)
         """
-        return nn.merge(graphdef, graphstate, graphother)
+        full_state = graphstate.merge(graphother, copy=True)
+        bound = spx.bind(graphdef, full_state)
+        object.__setattr__(bound, "_spx_opaque", dict(self._spx_opaque))
+        for opaque_name in self._spx_attr_order:
+            if opaque_name not in bound._spx_attr_order:
+                bound._spx_attr_order.append(opaque_name)
+        # Preserve training mode across bind/reconstruct
+        bound.train(self.training)
+        return bound
 
     @property
-    def graphdef(self: Self) -> nn.GraphDef:
+    def graphdef(self: Self) -> spx.GraphDef:
         """Get the graph definition (structure without parameters) of the module.
 
-        Uses flax.nnx.split to separate the graph definition from the state.
+        Uses spx.export to separate the graph definition from the state.
         The graph definition contains the module's structural information
         including layer types, shapes, and connections, but no parameter values.
 
         Returns:
-            nn.GraphDef: The graph definition of the module, which can be used
+            spx.GraphDef: The graph definition of the module, which can be used
                 to reconstruct the module structure or for functional transformations.
 
         Example:
             >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
             >>> gdef = model.graphdef
             >>> # The graphdef can be used with different parameter states
-            >>> new_model = nn.merge(gdef, new_params, new_others)
+            >>> new_model = spx.bind(gdef, new_params.merge(new_others, copy=True))
         """
-        return nn.split(self, self.graphstate_type, ...)[0]
+        return spx.export(self)[0]
 
     @property
-    def graphstate(self: Self) -> nn.GraphState:
-        """Get the graph state (parameters) of the module.
-
-        Uses flax.nnx.split to separate the parameter state from the graph
-        definition. Returns the trainable parameters as a GraphState object
-        that can be manipulated, serialized, or used in functional transformations.
-
-        Returns:
-            nn.GraphState: The graph state containing the module's trainable
-                parameters (weights, biases, embeddings, etc.).
-
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> state = model.graphstate
-            >>> # Access individual parameters
-            >>> flat_state = state.flat_state()
-            >>> print(flat_state.keys())
-        """
-        return nn.split(self, self.graphstate_type, ...)[1]
+    def graphstate(self: Self) -> spx.State:
+        """Return the default selected trainable state for the module."""
+        return self.split_parameters()
 
     @property
-    def graphother(self: Self) -> nn.GraphState:
-        """Get any other state variables in the module (non-parameters).
-
-        Uses flax.nnx.split to separate non-parameter state variables from
-        the graph definition and parameters. This includes variables like
-        batch normalization statistics, cached values, or other mutable state.
-
-        Returns:
-            nn.GraphState: The graph state containing non-parameter variables
-                such as batch statistics, caches, or other mutable state.
-
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> other_state = model.graphother
-            >>> # May contain cached values or other non-trainable state
-        """
-        return nn.split(self, self.graphstate_type, ...)[-1]
+    def graphother(self: Self) -> spx.State:
+        """Return the complement of :attr:`graphstate` in the exported module state."""
+        _, state = spx.export(self)
+        _graphstate, graphother = self._partition_trainable_state(state)
+        return graphother
 
     @property
-    def graphtree_params_shape(self: Self) -> dict:
-        """Compute the shapes of the module's parameters as a nested dictionary.
-
-        Uses nnx.eval_shape to determine parameter shapes without allocating
-        memory for the actual parameter values. This is useful for inspecting
-        model architecture, calculating memory requirements, or preparing
-        sharding specifications.
-
-        Returns:
-            dict: A nested dictionary mirroring the parameter structure, where
-                each leaf contains a jax.ShapeDtypeStruct with shape and dtype
-                information instead of actual array values.
-
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> shapes = model.graphtree_params_shape
-            >>> print(shapes['layers']['0']['attention']['q_proj']['kernel'])
-            ShapeDtypeStruct(shape=(4096, 4096), dtype=float32)
-        """
-        graphtree = nn.eval_shape(lambda: nn.split(self, self.graphstate_type, ...)[1])
-
-        flattened_tree = flatten_dict(graphtree)
-
-        param_shapes = {key: val.value for key, val in flattened_tree.items()}
-        return unflatten_dict(param_shapes)
+    def graphtree_parameters_shape(self: Self) -> dict:
+        """Compute shape metadata for the default selected trainable state."""
+        graphtree = jax.eval_shape(lambda: self.split_parameters())
+        return graphtree.raw()
 
     @property
     def graphtree_shape(self: Self) -> dict:
         """Compute the shapes of all state variables (including non-parameters).
 
-        Uses nnx.eval_shape on the entire module state (both parameters and
+        Uses jax.eval_shape on the entire module state (both parameters and
         other variables) and extracts shape information. This provides a
         complete view of all arrays in the model.
 
@@ -501,22 +726,19 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> all_shapes = model.graphtree_shape
             >>> # Includes both parameters and other state like batch stats
         """
-        graphtree = nn.eval_shape(lambda: nn.split(self)[1])
-
-        flattened_tree = flatten_dict(graphtree)
-
-        param_shapes = {key: getattr(val, "value", val) for key, val in flattened_tree.items()}
-        return unflatten_dict(param_shapes)
+        _, state = spx.export(self)
+        graphtree = jax.eval_shape(lambda: state)
+        return graphtree.raw()
 
     @property
-    def mesh(self: Self) -> jax.sharding.Mesh:
-        """Get the JAX device mesh from the module's configuration.
+    def mesh(self: Self) -> spx.SpxMesh:
+        """Get the SpectraX device mesh from the module's configuration.
 
         Returns the mesh used for distributed training and sharding operations.
         The mesh defines how arrays are partitioned across devices.
 
         Returns:
-            jax.sharding.Mesh: The device mesh defined in self.config.mesh,
+            spx.SpxMesh: The device mesh defined in self.config.mesh,
                 which specifies the topology of devices for data and model
                 parallelism.
 
@@ -527,56 +749,47 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> print(model.mesh.axis_names)
             ('dp', 'fsdp', 'tp', 'sp')
         """
-        result = self.config.mesh
-        if result is None:
-            raise ValueError("mesh is not configured")
-        return result
+        return self.config.mesh
 
     @property
-    def explicit_mesh(self: Self) -> jax.sharding.Mesh:
-        """Get the explicit-axis JAX device mesh from the module's configuration.
+    def explicit_mesh(self: Self) -> spx.SpxMesh:
+        """Get the explicit-axis SpectraX device mesh from the module's configuration.
 
         Returns the explicit mesh variant where axes are explicitly named
         and managed. This is useful for advanced sharding strategies.
 
         Returns:
-            jax.sharding.Mesh: The explicit-axis device mesh defined in
+            spx.SpxMesh: The explicit-axis device mesh defined in
                 self.config.explicit_mesh.
         """
-        result = self.config.explicit_mesh
-        if result is None:
-            raise ValueError("explicit_mesh is not configured")
-        return result
+        return self.config.explicit_mesh
 
     @property
-    def manual_mesh(self: Self) -> jax.sharding.Mesh:
-        """Get the manual-axis JAX device mesh from the module's configuration.
+    def manual_mesh(self: Self) -> spx.SpxMesh:
+        """Get the manual-axis SpectraX device mesh from the module's configuration.
 
         Returns the manual mesh variant where axis handling is done manually
         by the user. This provides maximum flexibility for custom sharding.
 
         Returns:
-            jax.sharding.Mesh: The manual-axis device mesh defined in
+            spx.SpxMesh: The manual-axis device mesh defined in
                 self.config.manual_mesh.
         """
-        result = self.config.manual_mesh
-        if result is None:
-            raise ValueError("manual_mesh is not configured")
-        return result
+        return self.config.manual_mesh
 
     def mesh_call(self: Self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
         """Call the module under the configured JAX mesh context.
 
         This is a convenience method equivalent to `with self.mesh: self(*args, **kwargs)`.
-        It ensures that all operations within __call__ respect the mesh sharding
+        It ensures that all operations within the forward pass respect the mesh sharding
         configuration.
 
         Args:
-            *args: Positional arguments to pass to __call__.
-            **kwargs: Keyword arguments to pass to __call__.
+            *args: Positional arguments to pass to the module.
+            **kwargs: Keyword arguments to pass to the module.
 
         Returns:
-            Any: The output from __call__, with appropriate sharding applied
+            Any: The module output, with appropriate sharding applied
                 based on the mesh configuration.
 
         Example:
@@ -630,23 +843,6 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             'llama'
         """
         return self._model_type
-
-    @property
-    def params(self: Self) -> dict:
-        """Get the parameters and other state variables as a dictionary.
-
-        Uses flax.nnx.split to get the combined state (both parameters and
-        other variables) as a single dictionary.
-
-        Returns:
-            dict: A dictionary containing all state variables of the module,
-                including both trainable parameters and other state.
-
-        Example:
-            >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
-            >>> all_state = model.params
-        """
-        return nn.split(self)[-1]  # pyright: ignore[reportReturnType]
 
     @cached_property
     def causal_mask(self: Self) -> tp.Any:
@@ -705,7 +901,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
     @cached_property
     def static_arguments(self: Self) -> tuple:
-        """Get static arguments needed by the module's __call__ method.
+        """Get static arguments needed by the module's forward method.
 
         Retrieves static arguments that don't change during execution and can
         be pre-computed. These are typically used for JIT compilation optimization.
@@ -805,8 +1001,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> print(model.module_dtype)
             bfloat16
         """
-        params_state = nn.split(self, self.graphstate_type, ...)[1].flat_state()
-        return jax.tree_util.tree_leaves(params_state)[0].dtype
+        leaves = jax.tree_util.tree_leaves(self.split_parameters())
+        return leaves[0].dtype
 
     def compute_complex_rotary(self, position_ids: jax.Array) -> jnp.ndarray:
         """Compute complex-valued rotary position embeddings.
@@ -864,16 +1060,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         from easydel.utils.traversals import iter_module_search
 
-        gdef, state, others = nn.split(self, self.graphstate_type, ...)
+        gdef, params, others = self.split_module()
 
-        def _map(path, val: nn.VariableState):
-            if val.value is not None:
-                if not path[-1].startswith("quant_"):
-                    val.value = val.value.astype(dtype)
-            return val
+        def _map_leaf(leaf):
+            if leaf is not None:
+                leaf = leaf.astype(dtype)
+            return leaf
 
-        state.update(state.map(_map))
-        self = nn.merge(gdef, state, others)
+        params = jax.tree_util.tree_map(_map_leaf, params)
+        self = self.merge_module(gdef, params, others)
 
         for _path, module in iter_module_search(self):
             if hasattr(module, "param_dtype"):
@@ -974,7 +1169,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         from easydel.utils.traversals import iter_module_search
 
-        gdef, gtree, others = nn.split(self, self.graphstate_type, ...)
+        gdef, params, others = self.split_module()
 
         def _map(array):
             if array.dtype in [
@@ -987,9 +1182,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 array = array.astype(dtype)
             return array
 
-        gtree = jax.tree_util.tree_map(_map, gtree)
+        params = jax.tree_util.tree_map(_map, params)
         others = jax.tree_util.tree_map(_map, others)
-        self = nn.merge(gdef, gtree, others)
+        self = self.merge_module(gdef, params, others)
 
         for _path, module in iter_module_search(self):
             if hasattr(module, "param_dtype"):
@@ -1022,7 +1217,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         return match_partition_rules(
             rules=self._get_partition_rules(partition_rules),
-            tree=self.graphtree_params_shape,
+            tree=self.graphtree_parameters_shape,
         )
 
     @property
@@ -1045,7 +1240,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     return sharding.spec
             return PartitionSpec()
 
-        return nn.from_tree(jax.tree_util.tree_map(_map, nn.to_tree(self)))
+        gdef, state = spx.export(self)
+        new_state = jax.tree_util.tree_map(_map, state)
+        return spx.bind(gdef, new_state)
 
     @property
     def _shardings(self: Self):
@@ -1058,12 +1255,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             dict: A nested dictionary mirroring the parameter structure,
                 containing the sharding info (or empty PartitionSpec if unsharded).
         """
-        return nn.from_tree(
-            jax.tree_util.tree_map(
-                lambda x: x.sharding if hasattr(x, "sharding") else PartitionSpec(),
-                nn.to_tree(self),
-            )
+        gdef, state = spx.export(self)
+        new_state = jax.tree_util.tree_map(
+            lambda x: x.sharding if hasattr(x, "sharding") else PartitionSpec(),
+            state,
         )
+        return spx.bind(gdef, new_state)
 
     @property
     def _named_shardings(self: Self):
@@ -1076,24 +1273,24 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             dict: A nested dictionary mirroring the parameter structure,
                 containing NamedSharding objects or None.
         """
-        return nn.from_tree(
-            jax.tree_util.tree_map(
-                lambda x: x.sharding if hasattr(x, "sharding") else None,
-                nn.to_tree(self),
-            )
+        gdef, state = spx.export(self)
+        new_state = jax.tree_util.tree_map(
+            lambda x: x.sharding if hasattr(x, "sharding") else None,
+            state,
         )
+        return spx.bind(gdef, new_state)
 
-    def _get_mesh(self, mesh: Mesh | None = None) -> Mesh:
-        """Retrieve the JAX device mesh, with fallback to configuration.
+    def _get_mesh(self, mesh: spx.SpxMesh | None = None) -> spx.SpxMesh:
+        """Retrieve the SpectraX device mesh, with fallback to configuration.
 
         Gets the mesh to use for sharding operations, prioritizing the provided
         argument over the mesh in the configuration.
 
         Args:
-            mesh: A JAX device mesh to use. If None, uses self.config.mesh.
+            mesh: A SpectraX device mesh to use. If None, uses self.config.mesh.
 
         Returns:
-            Mesh: The resolved JAX device mesh.
+            spx.SpxMesh: The resolved SpectraX device mesh.
 
         Raises:
             ValueError: If no mesh is provided and none is found in the
@@ -1105,45 +1302,139 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> mesh = model._get_mesh(custom_mesh)  # Uses provided mesh
         """
         if mesh is None:
-            if not hasattr(self, "config") or not hasattr(self.config, "mesh") or self.config.mesh is None:
-                raise ValueError("A mesh must be provided, either as an argument or through the model config.")
             return self.config.mesh
         return mesh
 
-    def _get_partition_rules(self, partition_rules: PartitionLike) -> PartitionLike:
-        """Retrieve partition rules, with fallback to configuration.
+    @property
+    def runtime_sharding_resolver(self):
+        """Return the model's runtime sharding resolver."""
+        return self.config.runtime_sharding_resolver.with_mesh(self.config.mesh)
 
-        Gets the partition rules to use for sharding, prioritizing the provided
-        argument over rules from the configuration. If the configuration returns
-        ``None``, falls back to :meth:`resolve_shardings_automatically`.
+    @staticmethod
+    def _state_to_flat_items(state: tp.Any) -> dict[tuple[str, str], tp.Any]:
+        if isinstance(state, spx.State):
+            return {(collection, path): leaf for collection, path, leaf in state.items()}
+        if isinstance(state, Mapping):
+            flat_state = flatten_dict(state)
+            output: dict[tuple[str, str], tp.Any] = {}
+            for path, leaf in flat_state.items():
+                if not isinstance(path, tuple) or len(path) < 2:
+                    continue
+                output[(str(path[0]), ".".join(str(part) for part in path[1:]))] = leaf
+            return output
+        raise TypeError(f"Unsupported state container: {type(state).__name__}")
 
-        Args:
-            partition_rules: Partition rules to use. If None, calls
-                ``self.config.get_partition_rules(...)`` and falls back to
-                automatic sharding rules when it returns ``None``.
+    @staticmethod
+    def _flat_items_to_state(flat_items: Mapping[tuple[str, str], tp.Any]) -> spx.State:
+        nested: dict[str, dict[str, tp.Any]] = {}
+        for (collection, path), leaf in flat_items.items():
+            nested.setdefault(collection, {})[path] = leaf
+        return spx.State(nested)
 
-        Returns:
-            PartitionLike: The resolved partition rules as a mapping from
-                parameter name patterns to PartitionSpec generators.
+    @staticmethod
+    def _metadata_rule_path_aliases(path: str) -> tuple[str, ...]:
+        """Return compatibility aliases for canonical metadata-derived paths."""
+        parts = path.split(".")
+        if not parts:
+            return (path,)
 
-        Raises:
-            ValueError: If no rules are provided and the configuration doesn't
-                support partition rule generation.
+        aliases = [tuple(parts)]
+        lowered_path = ".".join(parts).lower()
+        terminal = parts[-1]
 
-        Example:
-            >>> rules = model._get_partition_rules(None)  # Uses config or auto
-            >>> custom_rules = [(".*kernel", ("fsdp", "tp"))]
-            >>> rules = model._get_partition_rules(custom_rules)  # Uses provided
+        if terminal == "weight":
+            aliases.append((*parts[:-1], "kernel"))
+            if "norm" in lowered_path:
+                aliases.append((*parts[:-1], "scale"))
+            if "embed" in lowered_path:
+                aliases.append((*parts[:-1], "embedding"))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for alias_parts in aliases:
+            alias_path = ".".join(alias_parts)
+            if alias_path in seen:
+                continue
+            seen.add(alias_path)
+            deduped.append(alias_path)
+        return tuple(deduped)
+
+    @staticmethod
+    def _compatibility_rule_alias_patterns(pattern: str) -> tuple[str, ...]:
+        """Return legacy terminal-name aliases for auto-generated regex patterns."""
+        aliases = [pattern]
+        lowered_pattern = pattern.lower()
+        if "/weight" in pattern:
+            aliases.append(pattern.replace("/weight", "/kernel"))
+            if "norm" in lowered_pattern:
+                aliases.append(pattern.replace("/weight", "/scale"))
+            if "embed" in lowered_pattern:
+                aliases.append(pattern.replace("/weight", "/embedding"))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            if alias in seen:
+                continue
+            seen.add(alias)
+            deduped.append(alias)
+        return tuple(deduped)
+
+    def _metadata_partition_specs_state(self, mesh: Mesh | None = None) -> spx.State:
+        """Build a sparse partition-spec state tree from variable metadata."""
+        mesh = self._get_mesh(mesh)
+        resolver = self.runtime_sharding_resolver.with_mesh(mesh)
+        graph_collections = self.graphstate.collections()
+        data: dict[str, dict[str, tp.Any]] = {}
+
+        for path, var in spx.iter_variables(self):
+            if getattr(var, "kind", None) not in graph_collections:
+                continue
+            value = getattr(var, "value", None)
+            shape = tuple(value.shape) if hasattr(value, "shape") else NOT_GIVEN
+            spec = resolver.partition_spec_for_variable(var, shape=shape, mesh=mesh)
+            if spec is None:
+                continue
+            data.setdefault(var.kind, {})[path] = spec
+
+        return spx.State(data)
+
+    def _metadata_partition_rules(self, mesh: Mesh | None = None) -> tuple[tuple[str, tp.Any], ...]:
+        """Bridge metadata-derived parameter specs into legacy regex rules.
+
+        Emits one slash-form regex per (path, leaf-name-alias) pair. The
+        rules are matched against slash-separated string paths (the form
+        produced by ``spectrax.match_partition_rules`` via its internal
+        ``_path_to_string`` and by the on-disk Checkpointer paths), so we
+        do not emit tuple-form ``(DictKey(key='...'), ...)`` regexes —
+        nothing in the matching pipeline uses that representation.
         """
+        mesh = self._get_mesh(mesh)
+        flat_specs = self._state_to_flat_items(self._metadata_partition_specs_state(mesh=mesh))
+        rules: list[tuple[str, tp.Any]] = []
+        seen: set[tuple[str, tp.Any]] = set()
+
+        for (_collection, path), spec in flat_specs.items():
+            if not isinstance(spec, PartitionSpec):
+                continue
+            for aliased_path in self._metadata_rule_path_aliases(path):
+                regex_parts: list[str] = []
+                for part in aliased_path.split("."):
+                    regex_parts.append(r"\d+" if part.isdigit() else re.escape(part))
+                pattern = r"^(?:.*/)?" + "/".join(regex_parts) + r"(?:/.*)?$"
+                key = (pattern, spec)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rules.append((pattern, spec))
+        return tuple(rules)
+
+    def _get_legacy_partition_rules(self, partition_rules: PartitionLike) -> PartitionLike:
+        """Retrieve legacy regex-based partition rules."""
 
         def _normalize_rules_for_variable_leaves(rules: PartitionLike) -> PartitionLike:
             normalized: list[tuple[str, tp.Any]] = []
             for pattern, spec in rules:
                 if isinstance(pattern, str):
-                    # VariableState leaves in state/optimizer trees add a trailing
-                    # "/.../..." suffix after parameter names. Keep anchored
-                    # parameter regexes compatible with both raw parameter paths and
-                    # deeper state/optimizer value paths.
                     if (
                         pattern.endswith("(?:/.*)?$")
                         or pattern.endswith("/.*$")
@@ -1174,115 +1465,181 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             rules = None
 
         if rules is None:
-            rules = self.resolve_shardings_automatically()
+            rules = ((".*", PartitionSpec()),)
 
         return _normalize_rules_for_variable_leaves(rules)
+
+    def _parameter_partition_specs(
+        self,
+        partition_rules: PartitionLike = None,
+        mesh: Mesh | None = None,
+    ) -> spx.State:
+        """Return the canonical partition-spec tree for model parameters."""
+        mesh = self._get_mesh(mesh)
+
+        if partition_rules is not None:
+            specs = match_partition_rules(
+                rules=self._get_partition_rules(partition_rules),
+                tree=self.graphtree_parameters_shape,
+            )
+        else:
+            metadata_specs = self._metadata_partition_specs_state(mesh=mesh)
+            graph_flat = self._state_to_flat_items(self.graphtree_parameters_shape)
+            metadata_flat = self._state_to_flat_items(metadata_specs)
+
+            if metadata_flat and len(metadata_flat) == len(graph_flat):
+                specs = metadata_specs
+            else:
+                legacy_specs = match_partition_rules(
+                    rules=self._get_legacy_partition_rules(None),
+                    tree=self.graphtree_parameters_shape,
+                )
+                merged = self._state_to_flat_items(legacy_specs)
+                merged.update(metadata_flat)
+                specs = self._flat_items_to_state(merged)
+
+        flat_specs = self._state_to_flat_items(specs)
+        flat_shapes = self._state_to_flat_items(self.graphtree_parameters_shape)
+        adjusted = 0
+        for key, spec in list(flat_specs.items()):
+            if not isinstance(spec, PartitionSpec):
+                continue
+            shape_obj = flat_shapes.get(key)
+            shape = tuple(getattr(shape_obj, "shape", ()))
+            if not shape:
+                continue
+            safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+            if safe_spec != spec:
+                flat_specs[key] = safe_spec
+                adjusted += 1
+        if adjusted:
+            specs = self._flat_items_to_state(flat_specs)
+        if adjusted:
+            logger.warning("Adjusted %d non-divisible parameter sharding specs.", adjusted)
+        return specs
+
+    def _apply_partition_specs_to_state(
+        self,
+        state: spx.State,
+        partition_specs: spx.State,
+        *,
+        mesh: Mesh | None = None,
+    ) -> spx.State:
+        mesh = self._get_mesh(mesh)
+        resolver = self.runtime_sharding_resolver.with_mesh(mesh)
+        flat_state = self._state_to_flat_items(state)
+        flat_specs = self._state_to_flat_items(partition_specs)
+        variables = {(var.kind, path): var for path, var in spx.iter_variables(self)}
+        updated: dict[tuple[str, str], tp.Any] = {}
+
+        for key, leaf in flat_state.items():
+            spec = flat_specs.get(key)
+            if isinstance(spec, PartitionSpec) and hasattr(leaf, "shape"):
+                var = variables.get(key)
+                if var is not None:
+                    sharding = resolver.named_sharding_for_variable(var, shape=tuple(leaf.shape), mesh=mesh)
+                else:
+                    sharding = None
+                if sharding is None:
+                    sharding = resolver.named_sharding_for_spec(spec, shape=tuple(leaf.shape), mesh=mesh)
+                updated[key] = device_put_or_shard_abstract(leaf, sharding)
+            else:
+                updated[key] = leaf
+
+        return self._flat_items_to_state(updated)
+
+    def _get_partition_rules(self, partition_rules: PartitionLike) -> PartitionLike:
+        """Return compatibility regex rules with metadata-derived rules first."""
+        if partition_rules is not None:
+            return self._get_legacy_partition_rules(partition_rules)
+
+        metadata_rules = self._metadata_partition_rules(mesh=self._get_mesh(None))
+        legacy_rules = self._get_legacy_partition_rules(None)
+        if not metadata_rules:
+            compatibility_rules: list[tuple[str, tp.Any]] = []
+            seen: set[tuple[str, tp.Any]] = set()
+            for pattern, spec in legacy_rules:
+                for alias_pattern in self._compatibility_rule_alias_patterns(pattern):
+                    key = (alias_pattern, spec)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    compatibility_rules.append((alias_pattern, spec))
+            return tuple(compatibility_rules)
+
+        combined: list[tuple[str, tp.Any]] = list(metadata_rules)
+        for pattern, spec in legacy_rules:
+            if pattern in (".*", r".*"):
+                continue
+            combined.append((pattern, spec))
+        compatibility_rules = []
+        seen: set[tuple[str, tp.Any]] = set()
+        for pattern, spec in combined:
+            for alias_pattern in self._compatibility_rule_alias_patterns(pattern):
+                key = (alias_pattern, spec)
+                if key in seen:
+                    continue
+                seen.add(key)
+                compatibility_rules.append((alias_pattern, spec))
+        compatibility_rules.append((".*", PartitionSpec()))
+        return tuple(compatibility_rules)
 
     def resolve_shardings_automatically(
         self,
         *,
-        partition_manager: tp.Any | None = None,
-        **kwargs,
-    ) -> tuple[tuple[str, tp.Any], ...]:
-        """Resolve partition rules from module-level dynamic specs.
+        mesh: Mesh | None = None,
+    ) -> tuple[tuple[str, jax.sharding.NamedSharding], ...]:
+        """Return per-variable ``(regex, NamedSharding)`` rules.
 
-        Traverses all submodules and collects partition specs from any module
-        exposing a ``craft_sharding`` hook. Returned rules match the format of
-        ``get_partition_rules``: a tuple of (pattern, spec) pairs.
+        One rule per ``(variable, leaf-name-alias)`` pair: the regex pins
+        the *literal* path (including each layer index) and the
+        ``NamedSharding`` is the variable's live placement, produced by
+        ``named_sharding_for_variable``.
+
+        Layer indices are NOT collapsed to ``\\d+`` -- each layer gets
+        its own rule.  Under pipeline parallelism that's the only way to
+        carry per-stage information through ``(regex, sharding)`` rules:
+        layer 0 may live on stage 0's submesh while layer 9 lives on
+        stage 1's submesh, and a single ``\\d+``-collapsed rule cannot
+        represent both.
 
         Args:
-            partition_manager: Optional partition manager to resolve specs.
-                If None, uses ``self.config.partition_manager`` when available.
-            **kwargs: Extra context forwarded to ``craft_sharding``.
+            mesh: Optional mesh override.  Defaults to the model's
+                configured mesh.
 
         Returns:
-            Tuple of (pattern, PartitionSpec) rules.
+            Tuple of ``(slash-form regex, NamedSharding)`` pairs.  The
+            regex matches the variable's slash-separated string path
+            (the form ``spectrax.match_partition_rules`` and the
+            on-disk ``Checkpointer`` use), so the returned rules can be
+            consumed by either pipeline.
         """
-        from easydel.utils.traversals import iter_module_search
+        mesh = self._get_mesh(mesh)
+        resolver = self.runtime_sharding_resolver.with_mesh(mesh)
+        graph_collections = self.graphstate.collections()
 
-        pm = partition_manager
-        if pm is None and hasattr(self, "config"):
-            pm = getattr(self.config, "partition_manager", None)
-
-        raw_rules: list[tuple[str, tp.Any]] = []
-
-        def _resolve_spec(spec: tp.Any) -> tp.Any:
-            if pm is None or not hasattr(pm, "resolve"):
-                return spec
-            try:
-                return pm.resolve(spec)
-            except Exception:
-                return spec
-
-        for path, module in iter_module_search(self, nn.Module):
-            if not hasattr(module, "craft_sharding"):
+        rules: list[tuple[str, jax.sharding.NamedSharding]] = []
+        seen: set[str] = set()
+        for path, var in spx.iter_variables(self):
+            if getattr(var, "kind", None) not in graph_collections:
                 continue
-            spec_attr = module.craft_sharding
-            if spec_attr is None:
+            value = getattr(var, "value", None)
+            shape = tuple(value.shape) if hasattr(value, "shape") else None
+            if shape is None:
                 continue
-            if callable(spec_attr):
-                try:
-                    spec = spec_attr(partition_manager=pm, **kwargs)
-                except TypeError:
-                    spec = spec_attr()
-            else:
-                spec = spec_attr
-
-            if not spec:
+            ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=mesh)
+            if ns is None:
                 continue
-
-            prefix = "/".join(str(p) for p in path) if path else ""
-
-            def _add_rule(suffix: tp.Any, spec_value: tp.Any, prefix: str) -> None:
-                if suffix in (None, ""):
-                    pattern = prefix
-                elif prefix:
-                    pattern = f"{prefix}/{suffix}"
-                else:
-                    pattern = str(suffix)
-                if pattern:
-                    raw_rules.append((pattern, _resolve_spec(spec_value)))
-
-            if isinstance(spec, dict):
-                for suffix, spec_value in spec.items():
-                    _add_rule(suffix, spec_value, prefix)
-            elif isinstance(spec, (list, tuple)):
-                for item in spec:
-                    if isinstance(item, tuple) and len(item) == 2:
-                        _add_rule(item[0], item[1], prefix)
-                    else:
-                        _add_rule("", item, prefix)
-            else:
-                _add_rule("", spec, prefix)
-
-        def _generalize_numeric_path(pattern: str) -> str:
-            """Build a regex that matches both direct and optimizer-prefixed paths."""
-            parts = pattern.split("/")
-            regex_parts: list[str] = []
-            for part in parts:
-                if part.isdigit():
-                    regex_parts.append(r"\d+")
-                else:
-                    regex_parts.append(re.escape(part))
-            # Optax state trees often prepend segments like "mu/", "nu/" or tuple-index
-            # wrappers before the original parameter path. Allow optional prefixes so
-            # auto-generated rules keep working for optimizer-state sharding.
-            return r"^(?:.*/)?" + "/".join(regex_parts) + r"$"
-
-        seen: set[tuple[str, tp.Any]] = set()
-        rules: list[tuple[str, tp.Any]] = []
-        for pattern, spec in raw_rules:
-            generalized = _generalize_numeric_path(pattern)
-            key = (generalized, spec)
-            if key in seen:
-                continue
-            seen.add(key)
-            rules.append((generalized, spec))
-
-        # Explicit catch-all replication for any unmatched leaf path.
-        # Use empty PartitionSpec() to avoid rank-dependent ambiguity.
-        rules.append((".*", PartitionSpec()))
-
+            for aliased_path in self._metadata_rule_path_aliases(path):
+                # Pin literal indices -- per-layer NamedShardings can differ
+                # under PP, so collapsing layers/0, layers/1, ... to ``\d+``
+                # would lose the per-stage submesh info.
+                regex_parts = [re.escape(part) for part in aliased_path.split(".")]
+                pattern = r"^(?:.*/)?" + "/".join(regex_parts) + r"(?:/.*)?$"
+                if pattern in seen:
+                    continue
+                seen.add(pattern)
+                rules.append((pattern, ns))
         return tuple(rules)
 
     def _apply_sharding_fns(
@@ -1308,23 +1665,25 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             Parameters that are not callable (e.g., pre-sharded NF4 arrays)
             are left unchanged.
         """
-        gdef, state, others = nn.split(self, self.graphstate_type, ...)
+        gdef, params, others = self.split_module()
         sharding_fns = flatten_dict(sharding_fns)
         _shard_keys = list(sharding_fns.keys())
 
-        def _map(path, val: nn.VariableState):
-            if val.value is not None and path in _shard_keys:
-                fn = sharding_fns[path]
-                if callable(fn):
-                    val.value = fn(val.value)
-                else:
-                    # NOTE: It should smt like NF4 or 8bit array if it's not callable and that mean it's already pre-sharded.
-                    ...
-            return val
+        def _apply_state(state: spx.State) -> spx.State:
+            new_data: dict[str, dict[str, tp.Any]] = {}
+            for c, p, leaf in state.items():
+                path = tuple((c + "/" + p).split("/"))
+                if leaf is not None and path in _shard_keys:
+                    fn = sharding_fns[path]
+                    if callable(fn):
+                        leaf = fn(leaf)
+                    # else: pre-sharded, leave as-is
+                new_data.setdefault(c, {})[p] = leaf
+            return spx.State(new_data)
 
-        state.update(state.map(_map))
-        others.update(others.map(_map))
-        self = nn.merge(gdef, state, others)
+        params = _apply_state(params)
+        others = _apply_state(others)
+        self = self.merge_module(gdef, params, others)
         return self
 
     def shard_model(
@@ -1367,19 +1726,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             requires gathering (see gather_model()).
         """
         mesh = self._get_mesh(mesh)
-        partition_rules = self._get_partition_rules(partition_rules)
-        partition_specs = match_partition_rules(rules=partition_rules, tree=self.graphtree_params_shape)
-        partition_specs, adjusted = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
-        if adjusted:
-            logger.warning("Adjusted %d non-divisible parameter sharding specs before shard_model.", adjusted)
-        shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
+        gdef, graphstate, graphother = self.split_module()
+        partition_specs = self._parameter_partition_specs(partition_rules=partition_rules, mesh=mesh)
+        graphstate = self._apply_partition_specs_to_state(graphstate, partition_specs, mesh=mesh)
+        self = self.merge_module(gdef, graphstate, graphother)
         if overlay_fns is not None:
-            shard_fns.update(overlay_fns)
-        self = self._apply_sharding_fns(shard_fns)
+            self = self._apply_sharding_fns(overlay_fns)
         return self
 
     def gather_model(
@@ -1416,37 +1768,19 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             so it should only be done when necessary (e.g., checkpointing).
         """
         mesh = self._get_mesh(mesh)
-        partition_rules = self._get_partition_rules(partition_rules)
-        partition_specs = match_partition_rules(
-            rules=partition_rules,
-            tree=self.graphtree_params_shape,
-        )
-        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
-        _, gather_fns = make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-        )
-
+        gdef, graphstate, graphother = self.split_module()
+        partition_specs = self._parameter_partition_specs(partition_rules=partition_rules, mesh=mesh)
+        _, gather_fns = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
+        graphstate = jax.tree_util.tree_map(lambda f, o: f(o), gather_fns, graphstate)
+        self = self.merge_module(gdef, graphstate, graphother)
         if overlay_fns is not None:
-            gather_fns.update(overlay_fns)
-        return self._apply_sharding_fns(gather_fns)
+            self = self._apply_sharding_fns(overlay_fns)
+        return self
 
     def _make_shard_fns(self: Self):
         """Build sanitized shard functions from partition rules."""
         mesh = self._get_mesh(None)
-        partition_specs = match_partition_rules(
-            rules=self._get_partition_rules(None),
-            tree=self.graphtree_params_shape,
-        )
-        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
+        partition_specs = self._parameter_partition_specs(None, mesh=mesh)
         shard_fns, _ = make_shard_and_gather_fns(
             partition_specs=partition_specs,
             mesh=mesh,
@@ -1478,14 +1812,16 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         Example:
             >>> shardings = jax.tree_map(
-            ...     lambda x: NamedSharding(mesh, PartitionSpec()),
+            ...     lambda x: replicated_named_sharding(mesh),
             ...     model.split_module()[1:]
             ... )
             >>> model = model.apply_out_shardings(shardings)
         """
         splits = self.split_module()
 
-        @partial(jax.jit, out_shardings=out_shardings)
+        # # @erfanzar NOTE: spx.jit (not jax.jit) so MPMD meshes route to
+        # sxjit and per-stage out_shardings land on the right submesh.
+        @partial(spx.jit, mesh=self.mesh, out_shardings=out_shardings)
         def _call(graphstate, graphother):
             return graphstate, graphother
 
@@ -1514,38 +1850,14 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> # All parameters now have explicit sharding annotations
         """
 
-        class ShardState(flax.struct.PyTreeNode):
-            graphdef: nn.GraphDef
-            graphstate: nn.GraphState
-
-        gdef, gstate = nn.split(self)
-        mock = ShardState(graphdef=gdef, graphstate=gstate)
-        shape_tree = nn.eval_shape(lambda: mock)
-        partition_specs = match_partition_rules(self._get_partition_rules(partition_rules), shape_tree)
-        partition_specs = jax.tree_util.tree_map(
-            lambda spec, shape: (
-                sanitize_partition_spec_for_shape(
-                    spec=spec,
-                    shape=tuple(shape.shape),
-                    mesh=self.mesh,
-                )
-                if isinstance(spec, PartitionSpec) and hasattr(shape, "shape")
-                else spec
-            ),
-            partition_specs,
-            shape_tree,
-        )
-        shardings = jax.tree_util.tree_map(
-            lambda x: NamedSharding(mesh=self.mesh, spec=x),
-            partition_specs,
-        )
-
-        @partial(jax.jit, out_shardings=shardings)
-        def _call(cl):
-            return cl
-
-        mock = _call(mock)
-        self = nn.merge(mock.graphdef, mock.graphstate)
+        # # @erfanzar NOTE: delegate to ``_apply_partition_specs_to_state`` so
+        # placement goes through ``named_sharding_for_variable`` (variable-aware,
+        # MPMD-correct).  Hand-rolling ``NamedSharding(self.mesh, spec)`` here
+        # would collapse per-stage submeshes back to the full mesh on PP runs.
+        gdef, gstate = spx.export(self)
+        partition_specs = self._parameter_partition_specs(partition_rules, mesh=self.mesh)
+        gstate = self._apply_partition_specs_to_state(gstate, partition_specs, mesh=self.mesh)
+        self = spx.bind(gdef, gstate)
         return self
 
     def fully_gather(self: Self) -> Self:
@@ -1563,24 +1875,22 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> model = model.fully_gather()
             >>> # All parameters are now replicated across devices
         """
-
-        class ShardState(flax.struct.PyTreeNode):
-            graphdef: nn.GraphDef
-            graphstate: nn.GraphState
-
-        gdef, gstate = nn.split(self)
-        mock = ShardState(graphdef=gdef, graphstate=gstate)
+        # # @erfanzar NOTE: spx.jit so MPMD meshes hit sxjit -- gathering
+        # across stage submeshes onto the full mesh is a cross-mesh transfer
+        # the MPMD runtime knows how to schedule.
+        gdef, gstate = spx.export(self)
+        partition_specs = self._parameter_partition_specs(None, mesh=self.mesh)
         shardings = jax.tree_util.tree_map(
-            lambda x: NamedSharding(mesh=self.mesh, spec=PartitionSpec()),
-            match_partition_rules(self._get_partition_rules(None), nn.eval_shape(lambda: mock)),
+            lambda x: replicated_named_sharding(self.mesh),
+            partition_specs,
         )
 
-        @partial(jax.jit, out_shardings=shardings)
-        def _call(cl):
-            return cl
+        @partial(spx.jit, mesh=self.mesh, out_shardings=shardings)
+        def _apply(state):
+            return state
 
-        mock = _call(mock)
-        self = nn.merge(mock.graphdef, mock.graphstate)
+        gstate = _apply(gstate)
+        self = spx.bind(gdef, gstate)
         return self
 
     def quantize(
@@ -1642,7 +1952,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             )
         return self
 
-    def to_state(self, state_class: type[EasyDeLState] | None = None) -> EasyDeLState:
+    def to_state(
+        self,
+        state_class: type[EasyDeLState] | None = None,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> EasyDeLState:
         """Convert the module instance into an EasyDeLState object.
 
         Creates an EasyDeLState that encapsulates the model's parameters and
@@ -1652,6 +1967,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         Args:
             state_class: Optional custom state class to use. Must be a subclass
                 of EasyDeLState. If None, uses the default EasyDeLState class.
+            trainable_selector: Selector describing which collections belong in
+                the state's ``graphstate``. Defaults to
+                :attr:`default_trainable_selector`.
 
         Returns:
             EasyDeLState: An EasyDeLState object representing the current model
@@ -1670,7 +1988,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             from easydel.infra.base_state import EasyDeLState
 
             state_class = EasyDeLState
-        gstruct, gstate, gother = self.split_module()
+        gstruct, gstate, gother = self.split_module(trainable_selector=trainable_selector)
         return state_class.create(
             step=0,
             graphdef=gstruct,
@@ -1690,7 +2008,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 transformation function (e.g., device specification).
 
         Returns:
-            torch.nn.Module: The equivalent HuggingFace PyTorch model with
+            torch.spx.Module: The equivalent HuggingFace PyTorch model with
                 weights loaded from this JAX model.
 
         Example:
@@ -1715,14 +2033,14 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         )
 
     def prepare_inputs_for_call(self, **kwargs):
-        """Prepare keyword arguments before passing to __call__.
+        """Prepare keyword arguments before passing to the module.
 
         Hook method that can modify or add arguments before they are passed
-        to the module's __call__ method. The base implementation returns
+        to the module. The base implementation returns
         kwargs unchanged; subclasses can override for custom preprocessing.
 
         Args:
-            **kwargs: The keyword arguments intended for __call__.
+            **kwargs: The keyword arguments intended for the module call.
 
         Returns:
             dict: The prepared keyword arguments, potentially modified.
@@ -1737,7 +2055,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         return kwargs
 
     def get_static_arguments(self: Self) -> tuple:
-        """Get static arguments required by the module's __call__ method.
+        """Get static arguments required by the module's forward method.
 
         Returns a tuple of static arguments that don't change across calls
         and can be potentially cached or handled differently by JIT compilation.
@@ -1754,7 +2072,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         return ()
 
-    def get_encoder(self: Self) -> nn.Module | EasyDeLBaseModule:
+    def get_encoder(self: Self) -> spx.Module | EasyDeLBaseModule:
         """Return the encoder component of the model.
 
         Should be overridden by encoder-decoder models to return their
@@ -1762,7 +2080,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         such as feature extraction or embedding generation.
 
         Returns:
-            nn.Module | EasyDeLBaseModule: The encoder module.
+            spx.Module | EasyDeLBaseModule: The encoder module.
 
         Raises:
             NotImplementedError: If the model does not implement an encoder.
@@ -1775,7 +2093,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         raise NotImplementedError()
 
-    def get_decoder(self: Self) -> nn.Module | EasyDeLBaseModule:
+    def get_decoder(self: Self) -> spx.Module | EasyDeLBaseModule:
         """Return the decoder component of the model.
 
         Should be overridden by encoder-decoder models to return their
@@ -1783,7 +2101,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         decoder separately from the encoder.
 
         Returns:
-            nn.Module | EasyDeLBaseModule: The decoder module.
+            spx.Module | EasyDeLBaseModule: The decoder module.
 
         Raises:
             NotImplementedError: If the model does not implement a decoder.
@@ -1816,14 +2134,14 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         raise NotImplementedError()
 
-    def get_embedding(self: Self) -> nn.Module | Embed:
+    def get_embedding(self: Self) -> spx.Module | Embed:
         """Return the input embedding layer of the model.
 
         Should be overridden by models to return their token embedding
         layer. Useful for weight tying or accessing embeddings directly.
 
         Returns:
-            nn.Module | Embed: The embedding layer that converts token IDs
+            spx.Module | Embed: The embedding layer that converts token IDs
                 to dense vectors.
 
         Raises:
@@ -1926,7 +2244,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ...     dtype=jnp.bfloat16,
             ...     param_dtype=jnp.bfloat16,
             ...     precision='high',
-            ...     rngs=nn.Rngs(0)
+            ...     rngs=spx.Rngs(0)
             ... )
 
         Note:
@@ -1935,13 +2253,29 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         from easydel.utils.traversals import iter_module_search
 
-        def _shard(x):
-            return x
-
-        rng = kwargs.get("rngs", nn.Rngs(44))
+        rng = kwargs.get("rngs", spx.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
         partition_rules = lazy_model._get_partition_rules(None)
-        for path, module in iter_module_search(lazy_model, (nn.Module, ArrayParam)):
+        # # @erfanzar NOTE: variable-aware sharding via the runtime resolver.
+        # The resolver's ``named_sharding_for_variable`` reads each Variable's
+        # metadata (including the per-stage assignment recorded by
+        # ``spx.assign_stage`` during ``lazy_init``), so PP placements are
+        # preserved.  Hand-rolling ``NamedSharding(lazy_model.mesh, spec)``
+        # against a regex-derived PartitionSpec would collapse stages back to
+        # the full mesh.
+        resolver = lazy_model.runtime_sharding_resolver
+        full_mesh = lazy_model.mesh
+
+        def _sharding_for(var, fallback_spec, shape):
+            if var is not None and hasattr(var, "metadata"):
+                ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=full_mesh)
+                if ns is not None:
+                    return ns
+            if shape is None or not isinstance(fallback_spec, PartitionSpec):
+                return replicated_named_sharding(full_mesh)
+            return spx.get_corrected_named_sharding(shape, fallback_spec, raise_mesh_error=False)
+
+        for path, module in iter_module_search(lazy_model, (spx.Module, ArrayParam)):
             if not path:
                 continue
             joined_path = "/".join([str(p) for p in path])
@@ -1949,104 +2283,156 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             partition_spec = match_partition_rules(
                 partition_rules,
                 {
-                    joined_path + "/kernel": a,
+                    joined_path + "/weight": a,
                     joined_path + "/bias": a,
-                    joined_path + "/embedding": a,
-                    joined_path + "/scale": a,
                     joined_path: a,
                 },
                 strict=False,
             )
 
-            def _to_named(spec, shape: tuple[int, ...] | None = None):
-                if shape is not None and isinstance(spec, PartitionSpec):
-                    spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=lazy_model.mesh)
-                return NamedSharding(lazy_model.mesh, spec)
-
+            weight_var = module.weight if hasattr(module, "weight") and module.weight is not None else None
+            bias_var = module.bias if hasattr(module, "bias") and module.bias is not None else None
             shardings = {
-                "kernel": _to_named(
-                    partition_spec[joined_path + "/kernel"],
-                    tuple(module.kernel.value.shape) if hasattr(module, "kernel") else None,
+                "weight": _sharding_for(
+                    weight_var,
+                    partition_spec[joined_path + "/weight"],
+                    tuple(weight_var.value.shape) if weight_var is not None else None,
                 ),
-                "bias": _to_named(
+                "bias": _sharding_for(
+                    bias_var,
                     partition_spec[joined_path + "/bias"],
-                    tuple(module.bias.value.shape) if hasattr(module, "bias") and module.bias is not None else None,
+                    tuple(bias_var.value.shape) if bias_var is not None else None,
                 ),
-                "embedding": _to_named(
-                    partition_spec[joined_path + "/embedding"],
-                    tuple(module.embedding.value.shape) if hasattr(module, "embedding") else None,
-                ),
-                "scale": _to_named(
-                    partition_spec[joined_path + "/scale"],
-                    tuple(module.scale.value.shape) if hasattr(module, "scale") else None,
-                ),
-                "raw": _to_named(partition_spec[joined_path]),
+                "raw": _sharding_for(None, partition_spec[joined_path], None),
             }
-            if hasattr(module, "kernel") and hasattr(module, "kernel_init"):
-                arr = module.kernel_init(
-                    key=rng.param(),
-                    shape=module.kernel.value.shape,
-                    dtype=module.kernel.value.dtype,
-                )
-                arr = jax.jit(_shard, out_shardings=shardings["kernel"])(arr)
-                if isinstance(module.kernel, nn.Param):
-                    module.kernel.value = arr
+
+            def _init_array_param(param: ArrayParam, key: jax.Array) -> jax.Array:
+                """Initialize an ArrayParam using its stored init metadata."""
+                direct_initializers = {"zeros", "ones"}
+                if param.init_method in direct_initializers:
+                    init_fn = getattr(jax.nn.initializers, param.init_method)
                 else:
-                    module.kernel = arr
+                    init_fn = getattr(
+                        jax.nn.initializers,
+                        param.init_method,
+                        jax.nn.initializers.normal,
+                    )(**(param.init_kwargs or {}))
+                return init_fn(key, param.value.shape, param.value.dtype)
+
+            if hasattr(module, "weight") and hasattr(module, "kernel_init"):
+                arr = module.kernel_init(
+                    key=rng.param,
+                    shape=module.weight.value.shape,
+                    dtype=module.weight.value.dtype,
+                )
+                arr = jax.device_put(arr, shardings["weight"])
+                if isinstance(module.weight, spx.Parameter):
+                    module.weight.value = arr
+                else:
+                    module.weight = arr
+            # Fallback for ArrayParam weights without kernel_init.
+            elif hasattr(module, "weight") and isinstance(module.weight, ArrayParam):
+                if isinstance(module.weight.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(module.weight, rng.param)
+                    arr = jax.device_put(arr, shardings["weight"])
+                    module.weight.value = arr
+
             if hasattr(module, "bias") and hasattr(module, "bias_init") and module.bias is not None:
                 arr = module.bias_init(
-                    key=rng.param(),
+                    key=rng.param,
                     shape=module.bias.value.shape,
                     dtype=module.bias.value.dtype,
                 )
-                arr = jax.jit(_shard, out_shardings=shardings["bias"])(arr)
+                arr = jax.device_put(arr, shardings["bias"])
                 module.bias.value = arr
-            # Handle modules (e.g., nnx.LayerNorm) that don't store init fns.
+            # Handle modules (e.g., nn.LayerNorm) that don't store init fns.
             if hasattr(module, "bias") and module.bias is not None:
                 bias = module.bias
-                if isinstance(bias, nn.Param) and isinstance(bias.value, jax.ShapeDtypeStruct):
-                    arr = jax.nn.initializers.zeros(rng.param(), bias.value.shape, bias.value.dtype)
-                    arr = jax.jit(_shard, out_shardings=shardings["bias"])(arr)
+                if isinstance(bias, spx.Parameter) and isinstance(bias.value, jax.ShapeDtypeStruct):
+                    arr = jax.nn.initializers.zeros(rng.param, bias.value.shape, bias.value.dtype)
+                    arr = jax.device_put(arr, shardings["bias"])
+                    bias.value = arr
+                elif isinstance(bias, ArrayParam) and isinstance(bias.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(bias, rng.param)
+                    arr = jax.device_put(arr, shardings["bias"])
                     bias.value = arr
 
-            if hasattr(module, "embedding") and hasattr(module, "embedding_init"):
+            if hasattr(module, "weight") and hasattr(module, "embedding_init"):
                 arr = module.embedding_init(
-                    key=rng.param(),
-                    shape=module.embedding.value.shape,
-                    dtype=module.embedding.value.dtype,
+                    key=rng.param,
+                    shape=module.weight.value.shape,
+                    dtype=module.weight.value.dtype,
                 )
-                arr = jax.jit(_shard, out_shardings=shardings["embedding"])(arr)
-                module.embedding.value = arr
+                arr = jax.device_put(arr, shardings["weight"])
+                module.weight.value = arr
 
-            if hasattr(module, "scale") and hasattr(module, "scale_init"):
+            if hasattr(module, "weight") and hasattr(module, "scale_init"):
                 arr = module.scale_init(
-                    key=rng.param(),
-                    shape=module.scale.value.shape,
-                    dtype=module.scale.value.dtype,
+                    key=rng.param,
+                    shape=module.weight.value.shape,
+                    dtype=module.weight.value.dtype,
                 )
-                arr = jax.jit(_shard, out_shardings=shardings["scale"])(arr)
-                module.scale.value = arr
-            # Handle modules (e.g., nnx.LayerNorm) that don't store init fns.
-            if hasattr(module, "scale"):
-                scale = module.scale
-                if isinstance(scale, nn.Param) and isinstance(scale.value, jax.ShapeDtypeStruct):
-                    arr = jax.nn.initializers.ones(rng.param(), scale.value.shape, scale.value.dtype)
-                    arr = jax.jit(_shard, out_shardings=shardings["scale"])(arr)
-                    scale.value = arr
+                arr = jax.device_put(arr, shardings["weight"])
+                module.weight.value = arr
+            # Handle modules (e.g., nn.LayerNorm) that don't store init fns.
+            elif hasattr(module, "weight") and module.weight is not None:
+                weight = module.weight
+                if isinstance(weight, spx.Parameter) and isinstance(weight.value, jax.ShapeDtypeStruct):
+                    arr = jax.nn.initializers.ones(rng.param, weight.value.shape, weight.value.dtype)
+                    arr = jax.device_put(arr, shardings["weight"])
+                    weight.value = arr
+                elif isinstance(weight, ArrayParam) and isinstance(weight.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(weight, rng.param)
+                    arr = jax.device_put(arr, shardings["weight"])
+                    weight.value = arr
+
+            # General fallback: initialize any ArrayParam attributes that are
+            # still ShapeDtypeStruct (e.g. A_log, D, dt_bias in Mamba layers).
+            for attr_name in dir(module):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    attr = getattr(module, attr_name)
+                except Exception:
+                    continue
+                if isinstance(attr, ArrayParam) and isinstance(attr.value, jax.ShapeDtypeStruct):
+                    arr = _init_array_param(attr, rng.param)
+                    # No per-attribute sharding info available here; just assign.
+                    attr.value = arr
 
             if hasattr(module, "rngs"):
-                module.rngs = rng.fork()
+                module.rngs = rng.fork(1)[0]
             if hasattr(module, "resure"):
-                module.resure(rng.param(), shard_fn=jax.jit(_shard, out_shardings=shardings["raw"]))
-        for path, module in iter_module_search(lazy_model, nn.Param):
+                _raw_sharding = shardings["raw"]
+                module.resure(rng.param, shard_fn=lambda x, _s=_raw_sharding: jax.device_put(x, _s))
+        parameter_collections = {"parameters", "lora"} if lazy_model.lora_is_enabled else {"parameters"}
+        for path, module in spx.iter_variables(lazy_model):
+            if module.kind not in parameter_collections:
+                continue
             if path and type(module.value) is jax.ShapeDtypeStruct:
-                logger.warning(f"({type(module).__name__}) found empty array at " + ("/".join([str(s) for s in path])))
+                if isinstance(module, ArrayParam):
+                    # ArrayParam stores init info in its own attributes.
+                    direct_initializers = {"zeros", "ones"}
+                    if module.init_method in direct_initializers:
+                        init_fn = getattr(jax.nn.initializers, module.init_method)
+                    else:
+                        init_fn = getattr(
+                            jax.nn.initializers,
+                            module.init_method,
+                            jax.nn.initializers.normal,
+                        )(**(module.init_kwargs or {}))
+                    arr = init_fn(rng.param, module.value.shape, module.value.dtype)
+                    module.value = arr
+                else:
+                    logger.warning(
+                        f"({type(module).__name__}) found empty array at " + ("/".join([str(s) for s in path]))
+                    )
 
         return lazy_model
 
     @classmethod
     def lazy_init(cls: type[Self], **kwargs) -> Self:
-        """Perform lazy initialization using nnx.eval_shape.
+        """Perform lazy initialization using jax.eval_shape.
 
         Initializes the module structure and determines parameter shapes
         without actually allocating memory for the parameters. This is
@@ -2068,10 +2454,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ...     dtype=jnp.bfloat16,
             ...     param_dtype=jnp.bfloat16,
             ...     precision='high',
-            ...     rngs=nn.Rngs(0)
+            ...     rngs=spx.Rngs(0)
             ... )
             >>> # Inspect shapes without allocating memory
-            >>> print(lazy_model.graphtree_params_shape)
+            >>> print(lazy_model.graphtree_parameters_shape)
 
         Note:
             The returned model cannot be used for computation directly.
@@ -2082,9 +2468,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         def _init(rngs):
             return cls(**kwargs, rngs=rngs)
 
-        return nn.eval_shape(_init, rngs=rngs)
+        return jax.eval_shape(_init, rngs=rngs)
 
-    def merge_lora_params(self: Self, pytree: dict) -> Self:
+    def merge_lora_parameters(self: Self, pytree: dict) -> Self:
         """Merge LoRA parameters from a pytree into the base model.
 
         Combines LoRA low-rank adaptation matrices with the base model's
@@ -2102,23 +2488,23 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         Example:
             >>> # After training LoRA adapters
             >>> lora_params = load_lora_params("lora_checkpoint/")
-            >>> model = model.merge_lora_params(lora_params)
+            >>> model = model.merge_lora_parameters(lora_params)
             >>> # Model now has LoRA weights baked into base weights
 
         See Also:
-            split_lora_params: Inverse operation to extract LoRA params.
+            split_lora_parameters: Inverse operation to extract LoRA params.
             apply_lora_to_layers: Apply LoRA to specific layers.
         """
-        from easydel.infra.utils import merge_lora_params
+        from easydel.infra.utils import merge_lora_parameters
 
-        self = merge_lora_params(self, pytree)
+        self = merge_lora_parameters(self, pytree)
         return self
 
-    def split_lora_params(self: Self) -> tp.Any:
+    def split_lora_parameters(self: Self) -> tp.Any:
         """Split merged LoRA parameters back out from the base model.
 
         Extracts LoRA adaptation matrices that were previously merged using
-        merge_lora_params() or a similar process. Restores the base model
+        merge_lora_parameters() or a similar process. Restores the base model
         weights to their original pre-merge state.
 
         Returns:
@@ -2127,16 +2513,16 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         Example:
             >>> # Extract LoRA params for saving
-            >>> lora_params = model.split_lora_params()
+            >>> lora_params = model.split_lora_parameters()
             >>> save_lora_params(lora_params, "lora_checkpoint/")
             >>> # Base model weights are restored
 
         See Also:
-            merge_lora_params: Inverse operation to merge LoRA params.
+            merge_lora_parameters: Inverse operation to merge LoRA params.
         """
-        from easydel.infra.utils import split_lora_params
+        from easydel.infra.utils import split_lora_parameters
 
-        pytree = split_lora_params(self)
+        pytree = split_lora_parameters(self)
         return pytree
 
     @property
@@ -2158,8 +2544,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> print(model.lora_is_enabled)
             True
         """
-        for _, tensor in nn.iter_graph(self):
-            if isinstance(tensor, nn.LoRAParam):
+        for _, tensor in spx.iter_variables(self):
+            if isinstance(tensor, nn.LoraParameter):
                 return True
         return False
 
@@ -2191,9 +2577,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             RowParallelLinearQuantized,
         )
 
-        for _, tensor in nn.iter_graph(self):
+        # Check 1: any child module is a quantized layer type.
+        # This works for lazy models where variables hold ShapeDtypeStruct.
+        for _, module in spx.iter_modules(self):
             if isinstance(
-                tensor,
+                module,
                 (
                     RowParallelLinearQuantized,
                     ColumnParallelLinearQuantized,
@@ -2202,12 +2590,13 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ):
                 return True
 
-            possible_tensor = getattr(tensor, "value", getattr(tensor, "raw_value", tensor))
-
-            if isinstance(possible_tensor, (Array8B, ArrayNF4, Array1B)):
+        # Check 2: any variable value is a quantized array type.
+        # This works for fully-materialized models.
+        for _, var in spx.iter_variables(self):
+            val = getattr(var, "value", getattr(var, "raw_value", var))
+            if isinstance(val, (Array8B, ArrayNF4, Array1B)):
                 return True
-
-            if getattr(possible_tensor, "dtype", None) in [
+            if getattr(val, "dtype", None) in [
                 jnp.float8_e4m3,
                 jnp.float8_e5m2,
                 jnp.float4_e2m1fn,
@@ -2220,7 +2609,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         lora_rank: int,
         lora_pattern: str | None = None,
         verbose: bool = False,
-        rngs: nn.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ) -> Self:
         """Apply Low-Rank Adaptation (LoRA) to specified linear layers.
 
@@ -2254,7 +2643,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         See Also:
             unwrap_lora_to_layers: Remove LoRA and restore original layers.
-            merge_lora_params: Merge LoRA weights into base weights.
+            merge_lora_parameters: Merge LoRA weights into base weights.
         """
         from easydel.infra.utils import apply_lora_to_layers
 
@@ -2270,7 +2659,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
     def unwrap_lora_to_layers(self: Self, verbose: bool = False) -> Self:
         """Revert LoRA layers to their original linear layers.
 
-        Replaces LoraLinear layers with their original flax.nnx.Linear
+        Replaces LoraLinear layers with their original spectrax.nn.Linear
         counterparts, discarding the LoRA A and B matrices. The base
         weights are preserved.
 
@@ -2312,7 +2701,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         from easydel.utils import traversals
 
         reform_param = {}
-        for path, module in traversals.iter_module_search(self, nn.Module):
+        for path, module in traversals.iter_module_search(self, spx.Module):
             if hasattr(module, "reform_param") and module.reform_param:
                 path_str = ".".join(map(str, path))
                 for key, value in module.reform_param.items():
@@ -2389,7 +2778,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         the resulting graph definition.
 
         Returns:
-            nn.GraphDef: A graph definition suitable for use during generation,
+            spx.GraphDef: A graph definition suitable for use during generation,
                 with gradient checkpointing disabled.
         """
 
@@ -2402,7 +2791,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             precision=self.precision,
             rngs=self.rngs,
         )
-        gdef, _, _ = nn.split(dummy, self.graphstate_type, ...)
+        gdef, _ = spx.export(dummy)
         return gdef
 
     @property
@@ -2414,7 +2803,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         the non-parameter state variables with concrete values.
 
         Returns:
-            nn.GraphState: A graph state containing non-parameter variables
+            spx.State: A graph state containing non-parameter variables
                 suitable for generation, with meta-placeholders replaced by
                 concrete values.
         """
@@ -2428,137 +2817,57 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             precision=self.precision,
             rngs=self.rngs,
         )
-        _, _, gother = nn.split(dummy, self.graphstate_type, ...)
+        _, state = spx.export(dummy)
+        _graphstate, gother = self._partition_trainable_state(state)
         gother = traversals.recreate_meta_values(gother)
         return gother
 
     @property
-    def params_sharding(self: Self) -> dict:
-        """Get the sharding annotation for each parameter.
+    def parameters_sharding(self: Self) -> dict:
+        """Get the sharding annotation for the default selected trainable values.
 
         Returns:
-            dict: A nested dictionary mirroring the parameter structure,
-                containing the sharding information (e.g., NamedSharding,
-                PartitionSpec) for each parameter, or None if unsharded.
-
-        Example:
-            >>> shardings = model.params_sharding
-            >>> print(shardings['layers']['0']['attention']['q_proj']['kernel'])
-            NamedSharding(mesh=..., spec=PartitionSpec('fsdp', 'tp'))
+            dict: A flat ``path -> sharding`` mapping for the default
+                trainable selector.
         """
         return jax.tree_util.tree_map(
             lambda x: x.sharding if hasattr(x, "sharding") else None,
-            self.split_params_dict(),
+            self.parameter_values(),
         )
 
-    def merge_params(self, tree):
-        """Merge a parameter state tree back into the module.
-
-        Reconstructs the module using its existing graph definition and
-        'other' state, but replaces the parameter state with the provided tree.
-
-        Args:
-            tree: A pytree (typically nn.GraphState) containing the parameters
-                to merge into the module.
-
-        Returns:
-            EasyDeLBaseModule: The module instance with new parameters merged in.
-
-        Example:
-            >>> # Modify parameters externally
-            >>> params = model.split_params()
-            >>> modified_params = jax.tree_map(lambda x: x * 0.9, params)
-            >>> model = model.merge_params(modified_params)
-        """
-        gdef, _, gother = nn.split(self, self.graphstate_type, ...)
-        self = nn.merge(gdef, tree, gother)
+    def merge_parameters(
+        self: Self,
+        tree: spx.State,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> Self:
+        """Merge a selected trainable state tree back into the module."""
+        gdef, _graphstate, gother = self.split_module(trainable_selector=selector)
+        self = self.merge_module(gdef, tree, gother)
         return self
 
-    def split_params(self: Self):
-        """Split the module and return the parameter state.
+    def split_parameters(self, selector: spx.SelectorSugar | None = None) -> spx.State:
+        """Return the selected trainable state as an :class:`spx.State`."""
+        _, state = spx.export(self)
+        graphstate, _graphother = self._partition_trainable_state(state, trainable_selector=selector)
+        return graphstate
 
-        Uses nnx.split to extract the GraphState containing only the
-        trainable parameters (nn.Param or nn.LoRAParam).
-
-        Returns:
-            nn.GraphState: The parameter state of the module.
-
-        Example:
-            >>> params = model.split_params()
-            >>> # params is a GraphState that can be manipulated
-            >>> flat_params = params.flat_state()
-        """
-        return nn.split(self, self.graphstate_type, ...)[1]
-
-    def split_params_dict(
-        self,
-        extract_fn: tp.Callable | None = None,
-        remove_none: bool = True,
-    ) -> dict:
-        """Split module parameters and return as a nested dictionary.
-
-        Extracts the parameter state, converts it to a plain dictionary
-        (removing VariableState wrappers), and optionally removes None values.
-
-        Args:
-            extract_fn: Optional function to apply to each parameter during
-                extraction. Defaults to None.
-            remove_none: If True, removes key-value pairs where the value
-                is None. Defaults to True.
-
-        Returns:
-            dict: A nested dictionary containing the module's parameters
-                as plain arrays (not wrapped in VariableState).
-
-        Example:
-            >>> params_dict = model.split_params_dict()
-            >>> # params_dict is a regular nested dict
-            >>> kernel = params_dict['layers']['0']['attention']['q_proj']['kernel']
-            >>> print(type(kernel))  # jax.Array, not VariableState
-        """
-        flat_params = flatten_dict(self.split_params().to_pure_dict(extract_fn=extract_fn))
-        if remove_none:
-            flat_params = {
-                k: v.value if hasattr(v, "value") else v
-                for k, v in flat_params.items()
-                if (v.value if hasattr(v, "value") else v) is not None
-            }
-        else:
-            flat_params = {k: v.value if hasattr(v, "value") else v for k, v in flat_params.items()}
-        return unflatten_dict(flat_params)
-
-    def merge_params_dict(self: Self, params_dict: dict) -> Self:
-        """Merge parameters from a dictionary into the module's state.
-
-        Updates the module's current parameter state with values from the
-        provided dictionary. The dictionary structure should match the
-        module's parameter structure.
-
-        Args:
-            params_dict: A nested dictionary containing the parameters to merge.
-                Can be either nested or flattened (will be detected automatically).
-
-        Returns:
-            Self: The module instance with parameters from the dictionary merged.
-
-        Raises:
-            KeyError: If a key from params_dict is not found in the module's
-                current state.
-
-        Example:
-            >>> # Load parameters from a file
-            >>> params_dict = load_params("checkpoint.pkl")
-            >>> model = model.merge_params_dict(params_dict)
-        """
-        current_state = self.split_params().flat_state()
-        if not is_flatten(params_dict):
-            params_dict = flatten_dict(params_dict)
-        for key, value in params_dict.items():
+    def merge_parameter_values(
+        self: Self,
+        parameter_values: dict,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> Self:
+        """Merge a flat or nested parameter-values mapping into the selected state."""
+        current_state = self.split_parameters(selector).flat_state()
+        if not is_flatten(parameter_values):
+            parameter_values = flatten_dict(parameter_values)
+        for key, value in parameter_values.items():
             if key in current_state:
                 current_state[key].value = value
             else:
                 raise KeyError(f"Parameter key {key} not found in the current model state.")
-        self = self.merge_params(unflatten_dict(current_state))
+        self = self.merge_parameters(unflatten_dict(current_state), selector=selector)
         return self
 
     def flops_per_token(
@@ -2645,8 +2954,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         operations required for one forward pass with the given arguments.
 
         Args:
-            *args: Positional arguments to pass to __call__.
-            **kwargs: Keyword arguments to pass to __call__.
+            *args: Positional arguments to pass to the module.
+            **kwargs: Keyword arguments to pass to the module.
 
         Returns:
             float | None: The estimated FLOP count, or None if calculation fails.
@@ -2657,7 +2966,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         from .utils import count_flop_jaxpr
 
-        return count_flop_jaxpr(jax.make_jaxpr(self.__call__)(*args, **kwargs))
+        return count_flop_jaxpr(jax.make_jaxpr(self.forward)(*args, **kwargs))
 
     @property
     def pure_transform_fn(self: Self):
@@ -2750,7 +3059,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         loss_kwargs = loss_kwargs or {}
         forward_batch = batch
         try:
-            call_signature = inspect.signature(self.__call__)
+            call_signature = inspect.signature(self.forward)
         except (TypeError, ValueError):
             call_signature = None
 
@@ -2785,7 +3094,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             loss_config=loss_config,
             batch=batch,
             loss_kwargs=loss_kwargs,
-            paxis=self.config.partition_axis,
+            paxis=None if self.mesh.is_mpmd else self.config.partition_axis,
             forward_plan=forward_plan,
         )
         if hasattr(outputs, "aux_loss"):
@@ -2824,7 +3133,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ),
             False,
         )
-        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+        w = self.get_embedding().weight.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
 
     def make_lm_head_fn(self) -> "Callable[[Array], Array]":
@@ -2833,15 +3142,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         The returned function can safely be called from inside any JAX
         traced region — ``jax.lax.scan``, ``jax.lax.fori_loop``,
         ``jax.checkpoint``, and their compositions — without triggering
-        ``flax.errors.TraceContextError``.
+        ``ValueError``.
 
         **Why this is needed:**  When gradient checkpointing is enabled the
-        LM-head linear layer is wrapped with ``nn.remat``.  NNX's remat
+        LM-head linear layer is wrapped with ``nn.remat``.  SpecTrax's remat
         uses a split/merge protocol that *mutates* Variables
         (``update_from_state``) — which fails when the call site is inside
         a different JAX trace level (e.g. ``lax.scan`` body under
         ``jax.grad``).  This method bypasses the ``nn.remat`` wrapper by
-        calling the head's ``native_forward`` directly (reads-only on NNX
+        calling the head's ``native_forward`` directly (reads-only on SpecTrax
         Variables — no mutation, no trace-context check).
 
         The default implementation resolves tied-embedding weights and
@@ -2867,9 +3176,16 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ),
             False,
         )
-        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+        w = self.get_embedding().weight.value.T if tie_embeddings else None
 
-        _native_forward = head.native_forward
+        _native_forward = getattr(head, "native_forward", None)
+
+        if _native_forward is None:
+
+            def _native_forward(hidden_states: "Array", *, w: "Array | None" = None) -> "Array":
+                if w is None:
+                    return head(hidden_states)
+                return head(hidden_states, w=w)
 
         def _project(hidden_states: "Array") -> "Array":
             return _native_forward(hidden_states, w=w)
@@ -3015,14 +3331,14 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 of the current configuration.
 
         Returns:
-            nn.GraphDef: A new graph definition with updated configuration
+            spx.GraphDef: A new graph definition with updated configuration
                 that can be merged with existing parameters.
 
         Example:
             >>> # Get a new graphdef with different settings
             >>> new_gdef = model.new_graphdef(attn_mechanism='flash')
             >>> # Merge with existing parameters
-            >>> new_model = nn.merge(new_gdef, model.graphstate, model.graphother)
+            >>> new_model = spx.bind(new_gdef, model.graphstate.merge(model.graphother, copy=True))
         """
         config = deepcopy(self.config)
         for k, v in kwargs.items():

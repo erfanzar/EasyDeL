@@ -14,6 +14,7 @@
 
 """Tests for Gemma4 model — text, vision-language, and generation."""
 
+import numpy as np
 import pytest
 import transformers
 
@@ -56,7 +57,7 @@ class TestGemma4:
             num_key_value_heads=4,
             head_dim=16,
             patch_size=4,
-            pooling_kernel_size=1,
+            pooling_kernel_size=2,
             position_embedding_size=16,
         )
         return ed.Gemma4Config(
@@ -78,16 +79,19 @@ class TestGemma4:
         pooling = gemma4_config.vision_config.pooling_kernel_size
         grid = image_size // patch_size
         num_image_tokens = (grid // pooling) ** 2
+        grid_y, grid_x = np.meshgrid(np.arange(grid), np.arange(grid), indexing="ij")
+        image_position_ids = np.stack((grid_x, grid_y), axis=-1).reshape(1, grid * grid, 2)
+        image_position_ids = np.broadcast_to(image_position_ids, (batch_size * num_images, grid * grid, 2)).copy()
 
         return {
             "image_token_id": gemma4_config.image_token_id,
             "num_image_tokens": num_image_tokens,
-            "pixel_values_shape": (batch_size * num_images, 3, image_size, image_size),
+            "pixel_values_shape": (batch_size * num_images, grid * grid, 3 * patch_size * patch_size),
             "num_images": num_images,
             "use_token_type_ids": True,
+            "image_position_ids": image_position_ids,
         }
 
-    @pytest.mark.xfail(reason="HF Gemma4 VLM forward has pixel_position_ids bug in current transformers")
     def test_vision_language(self, gemma4_config, small_model_config, vlm_config):
         """Test Gemma4ForConditionalGeneration with vision inputs."""
         local_cfg = small_model_config.copy()

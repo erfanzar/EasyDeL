@@ -51,12 +51,12 @@ from __future__ import annotations
 
 import typing as tp
 
-from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
+from spectrax import PartitionAxis, with_sharding_constraint
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 

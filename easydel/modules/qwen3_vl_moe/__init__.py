@@ -67,7 +67,7 @@ Usage Example:
         }
     )
 
-    model = Qwen3VLMoeForConditionalGeneration(config, rngs=nnx.Rngs(0))
+    model = Qwen3VLMoeForConditionalGeneration(config, rngs=spx.Rngs(0))
 
     # Prepare inputs
     input_ids = jnp.array([[1, 2, 151655, 3, 4]])  # 151655 is image_token_id

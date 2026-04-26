@@ -28,14 +28,12 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -47,7 +45,7 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     BaseModelOutput,
@@ -64,6 +62,7 @@ from easydel.layers import (
     Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    ParallelLinear,
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
@@ -117,7 +116,7 @@ class Qwen3OmniMoeCausalLMOutputWithPast(ModelOutput):
     router_logits: tuple[Array] | None = None
 
 
-class Qwen3OmniMoeAudioMLP(nn.Module):
+class Qwen3OmniMoeAudioMLP(spx.Module):
     """Feed-forward network for audio encoder.
 
     Implements a two-layer feedforward network with configurable activation
@@ -131,7 +130,7 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize audio encoder MLP.
 
@@ -141,7 +140,7 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.fc1 = ColumnParallelLinear(
             config.d_model,
@@ -163,7 +162,7 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
         )
         self.act = ACT2FN[config.activation_function]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply feedforward transformation to audio features.
 
         Args:
@@ -175,7 +174,7 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
-class Qwen3OmniMoeAudioAttention(nn.Module):
+class Qwen3OmniMoeAudioAttention(spx.Module):
     """Self-attention module for audio encoder.
 
     Implements multi-head self-attention for processing audio features
@@ -191,7 +190,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize audio encoder attention layer.
 
@@ -201,7 +200,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -253,7 +252,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             requires_cache=False,  # Audio encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         attention_mask: Array | None = None,
@@ -279,17 +278,17 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         q = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         k = apply_logical_sharding(
             k,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         v = apply_logical_sharding(
             v,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_output = self.attention.forward(
@@ -305,12 +304,12 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         attn_output = apply_logical_sharding(
             attn_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return self.out_proj(attn_output)
 
 
-class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
+class Qwen3OmniMoeAudioEncoderLayer(spx.Module):
     """Transformer layer for audio encoder.
 
     Implements a single transformer layer with pre-normalization architecture,
@@ -326,7 +325,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize audio encoder layer.
 
@@ -336,7 +335,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.self_attn = Qwen3OmniMoeAudioAttention(
             config=config,
@@ -380,7 +379,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         attention_mask: Array | None = None,
@@ -446,7 +445,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize audio encoder.
 
@@ -456,7 +455,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -470,34 +469,31 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         self.n_window_infer = config.n_window_infer
         self.conv_chunksize = config.conv_chunksize
 
-        self.conv2d1 = nn.Conv(
-            in_features=1,
-            out_features=config.downsample_hidden_size,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+        self.conv2d1 = nn.Conv2d(
+            in_channels=1,
+            out_channels=config.downsample_hidden_size,
+            kernel_size=3,
+            stride=2,
             padding=((1, 1), (1, 1)),
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.conv2d2 = nn.Conv(
-            in_features=config.downsample_hidden_size,
-            out_features=config.downsample_hidden_size,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+        self.conv2d2 = nn.Conv2d(
+            in_channels=config.downsample_hidden_size,
+            out_channels=config.downsample_hidden_size,
+            kernel_size=3,
+            stride=2,
             padding=((1, 1), (1, 1)),
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.conv2d3 = nn.Conv(
-            in_features=config.downsample_hidden_size,
-            out_features=config.downsample_hidden_size,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+        self.conv2d3 = nn.Conv2d(
+            in_channels=config.downsample_hidden_size,
+            out_channels=config.downsample_hidden_size,
+            kernel_size=3,
+            stride=2,
             padding=((1, 1), (1, 1)),
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
         )
 
@@ -515,19 +511,19 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         self.max_source_positions = config.max_source_positions
         self.d_model = config.d_model
 
-        self.layers = nn.List(
-            [
-                Qwen3OmniMoeAudioEncoderLayer(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.encoder_layers):
+            with spx.assign_stage(total=config.encoder_layers, current=i):
+                self.layers.append(
+                    Qwen3OmniMoeAudioEncoderLayer(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.encoder_layers)
-            ]
-        )
 
         self.ln_post = LayerNorm(
             config.d_model,
@@ -557,7 +553,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_features: Float[Array, "batch mel_bins time"],
         feature_lens: Int[Array, "batch"] | None = None,
@@ -576,9 +572,9 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
 
         hidden_states = input_features.transpose(0, 2, 1)[..., None]
 
-        hidden_states = nn.gelu(self.conv2d1(hidden_states))
-        hidden_states = nn.gelu(self.conv2d2(hidden_states))
-        hidden_states = nn.gelu(self.conv2d3(hidden_states))
+        hidden_states = jax.nn.gelu(self.conv2d1(hidden_states))
+        hidden_states = jax.nn.gelu(self.conv2d2(hidden_states))
+        hidden_states = jax.nn.gelu(self.conv2d3(hidden_states))
 
         b, t, f, c = hidden_states.shape
         hidden_states = hidden_states.reshape(b, t, f * c)
@@ -590,9 +586,18 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         hidden_states = hidden_states + pos_emb[None, :, :]
 
         # Note: For simplicity, we process without cu_seqlens chunking
-        for layer in self.layers:
+        def _layer_loop(layer, carry):
+            hidden_states, idx = carry
             hidden_states = layer(hidden_states, attention_mask)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
 
+            return hidden_states, idx + 1
+
+        hidden_states, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         hidden_states = self.ln_post(hidden_states)
 
         hidden_states = self.proj1(hidden_states)
@@ -655,7 +660,7 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
     return attention_mask
 
 
-class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
+class Qwen3OmniMoeVisionPatchEmbed(spx.Module):
     """3D patch embedding for vision encoder.
 
     Converts image/video patches into embedding vectors using 3D convolution
@@ -669,7 +674,7 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision patch embedding layer.
 
@@ -678,7 +683,7 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
         self.patch_size = config.patch_size
@@ -687,19 +692,17 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
         self.hidden_size = config.hidden_size
 
         kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv(
-            in_features=config.in_channels,
-            out_features=config.hidden_size,
+        self.proj = nn.Conv3d(
+            in_channels=config.in_channels,
+            out_channels=config.hidden_size,
             kernel_size=kernel_size,
-            strides=kernel_size,
+            stride=kernel_size,
             use_bias=True,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Convert image/video patches to embeddings.
 
         Args:
@@ -722,7 +725,7 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
         return hidden_states.reshape(-1, self.hidden_size)
 
 
-class Qwen3OmniMoeVisionPatchMerger(nn.Module):
+class Qwen3OmniMoeVisionPatchMerger(spx.Module):
     """Spatial patch merger for vision encoder.
 
     Merges spatially adjacent patches to reduce sequence length while
@@ -738,7 +741,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         use_postshuffle_norm: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision patch merger.
 
@@ -749,7 +752,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             use_postshuffle_norm (bool, optional): Whether to apply norm after shuffling.
                 Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
         self.spatial_merge_size = config.spatial_merge_size
@@ -763,31 +766,26 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.mlp = nn.List(
-            [
-                ColumnParallelLinear(
-                    self.hidden_size,
-                    self.hidden_size,
-                    use_bias=True,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                ),
-                None,
-                RowParallelLinear(
-                    self.hidden_size,
-                    config.out_hidden_size,
-                    use_bias=True,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                ),
-            ]
+        self.mlp_linear_1 = ColumnParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.mlp_linear_2 = RowParallelLinear(
+            self.hidden_size,
+            config.out_hidden_size,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Merge adjacent patches and project to output dimension.
 
         Args:
@@ -797,13 +795,13 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
             Merged and projected embeddings.
         """
         x = self.ln_q(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
-        x = self.mlp[0](x)
-        x = nn.gelu(x, approximate=False)
-        x = self.mlp[2](x)
+        x = self.mlp_linear_1(x)
+        x = jax.nn.gelu(x, approximate=False)
+        x = self.mlp_linear_2(x)
         return x
 
 
-class Qwen3OmniMoeVisionMLP(nn.Module):
+class Qwen3OmniMoeVisionMLP(spx.Module):
     """Feed-forward network for vision encoder.
 
     Implements a two-layer feedforward network with GELU activation
@@ -817,7 +815,7 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision encoder MLP.
 
@@ -826,7 +824,7 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.linear_fc1 = ColumnParallelLinear(
             config.hidden_size,
@@ -848,7 +846,7 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply feedforward transformation to vision features.
 
         Args:
@@ -860,7 +858,7 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
         return self.linear_fc2(self.act(self.linear_fc1(x)))
 
 
-class Qwen3OmniMoeVisionAttention(nn.Module):
+class Qwen3OmniMoeVisionAttention(spx.Module):
     """Self-attention module for vision encoder.
 
     Implements multi-head self-attention with rotary position embeddings
@@ -876,7 +874,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision encoder attention layer.
 
@@ -886,7 +884,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
@@ -917,7 +915,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -957,7 +955,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         return checkpoint_name(self.proj(attn_output), "vision_attn_output")
 
 
-class Qwen3OmniMoeVisionBlock(nn.Module):
+class Qwen3OmniMoeVisionBlock(spx.Module):
     """Transformer block for vision encoder.
 
     Implements a single transformer layer with pre-normalization architecture,
@@ -972,7 +970,7 @@ class Qwen3OmniMoeVisionBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision encoder block.
 
@@ -982,7 +980,7 @@ class Qwen3OmniMoeVisionBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.norm1 = LayerNorm(config.hidden_size, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.norm2 = LayerNorm(config.hidden_size, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
@@ -1002,7 +1000,7 @@ class Qwen3OmniMoeVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -1061,7 +1059,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision encoder.
 
@@ -1070,7 +1068,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1080,7 +1078,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.merger_list = nn.List(
+        self.merger_list = nn.ModuleList(
             [
                 Qwen3OmniMoeVisionPatchMerger(
                     config=config,
@@ -1120,19 +1118,19 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
         self._rotary_dim = head_dim // 2
 
-        self.blocks = nn.List(
-            [
-                Qwen3OmniMoeVisionBlock(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for idx in range(config.depth):
+            with spx.assign_stage(total=config.depth, current=idx):
+                self.blocks.append(
+                    Qwen3OmniMoeVisionBlock(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(config.depth)
-            ]
-        )
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
             config=config,
@@ -1180,7 +1178,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         rotary_pos_emb = jnp.take(rotary_pos_emb_full, pos_ids, axis=0)
         return rotary_pos_emb.reshape(pos_ids.shape[0], -1)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         grid_thw: Array,
@@ -1204,9 +1202,18 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         cu_seqlens = jnp.cumsum(repeated, dtype="i4")
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
-        for block in self.blocks:
+        def _layer_loop(block, carry):
+            hidden_states, idx = carry
             hidden_states = block(hidden_states, cu_seqlens, rotary_pos_emb)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
+            return hidden_states, idx + 1
+
+        hidden_states, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         return self.merger(hidden_states)
 
     def get_encoder(self):
@@ -1226,7 +1233,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Qwen3OmniMoeTextMLP(nn.Module):
+class Qwen3OmniMoeTextMLP(spx.Module):
     """Dense MLP for non-MoE layers in Qwen3OmniMoe text decoder.
 
     Implements the feedforward network with SwiGLU activation function
@@ -1240,7 +1247,7 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize text decoder MLP.
 
@@ -1249,7 +1256,7 @@ class Qwen3OmniMoeTextMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         column_linear = partial(
@@ -1276,7 +1283,7 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -1288,7 +1295,7 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -1296,7 +1303,7 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen3OmniMoeMLPStack(nn.Module):
+class Qwen3OmniMoeMLPStack(spx.Module):
     """Stacked MoE MLP module using ParallelMoELinear layers.
 
     Implements the expert MLP stack with SwiGLU activation function using
@@ -1307,11 +1314,11 @@ class Qwen3OmniMoeMLPStack(nn.Module):
         "gate_up_proj$": {
             "splits": [
                 {
-                    "name": "gate_proj.kernel",
+                    "name": "gate_proj.weight",
                     "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 },
                 {
-                    "name": "up_proj.kernel",
+                    "name": "up_proj.weight",
                     "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 },
             ],
@@ -1322,7 +1329,7 @@ class Qwen3OmniMoeMLPStack(nn.Module):
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
@@ -1335,7 +1342,7 @@ class Qwen3OmniMoeMLPStack(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize MoE MLP stack.
 
@@ -1344,7 +1351,7 @@ class Qwen3OmniMoeMLPStack(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.gate_proj = ColumnParallelMoELinear(
@@ -1352,9 +1359,9 @@ class Qwen3OmniMoeMLPStack(nn.Module):
             in_features=config.hidden_size,
             out_features=config.moe_intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1365,8 +1372,8 @@ class Qwen3OmniMoeMLPStack(nn.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1377,15 +1384,15 @@ class Qwen3OmniMoeMLPStack(nn.Module):
             out_features=config.moe_intermediate_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         group_sizes: Array,
@@ -1423,7 +1430,7 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize text decoder MoE sparse block.
 
@@ -1432,7 +1439,7 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1453,7 +1460,7 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
         self.experts = Qwen3OmniMoeMLPStack(
             config=config,
@@ -1463,7 +1470,7 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Array) -> tuple[Array, Array]:
         """Route tokens through experts and combine outputs.
 
         Args:
@@ -1478,9 +1485,9 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
@@ -1500,7 +1507,7 @@ class Qwen3OmniMoeTextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize text decoder attention layer.
@@ -1510,7 +1517,7 @@ class Qwen3OmniMoeTextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer for sliding window configuration.
         """
         sliding_window = None
@@ -1544,7 +1551,7 @@ class Qwen3OmniMoeTextAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class Qwen3OmniMoeTextDecoderLayer(nn.Module):
+class Qwen3OmniMoeTextDecoderLayer(spx.Module):
     """Single decoder layer for Qwen3OmniMoe text model.
 
     Combines multi-head attention with Q/K normalization and feedforward networks
@@ -1558,7 +1565,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize text decoder layer.
@@ -1568,7 +1575,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer, used to determine MoE vs MLP.
         """
         self.config = config
@@ -1619,7 +1626,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -1676,7 +1683,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         )
 
 
-class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
+class Qwen3OmniMoeTalkerResizeMLP(spx.Module):
     """Resize MLP for projecting thinker hidden states to talker dimensions.
 
     Uses two linear layers (linear_fc1, linear_fc2) with activation in between.
@@ -1689,7 +1696,7 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize talker resize MLP.
 
@@ -1698,7 +1705,7 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         text_config = config.text_config
@@ -1723,7 +1730,7 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         )
         self.act_fn = ACT2FN[text_config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Project hidden states from thinker to talker dimension.
 
         Args:
@@ -1735,7 +1742,7 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
 
-class Qwen3OmniMoeTalkerTextMLP(nn.Module):
+class Qwen3OmniMoeTalkerTextMLP(spx.Module):
     """Dense MLP for Talker text model.
 
     Implements the feedforward network with SwiGLU activation function
@@ -1750,7 +1757,7 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize talker text MLP.
 
@@ -1761,7 +1768,7 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         imz = intermediate_size or config.intermediate_size
@@ -1789,7 +1796,7 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         self.down_proj = row_linear(imz, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -1801,7 +1808,7 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -1809,7 +1816,7 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen3OmniMoeTalkerMLPStack(nn.Module):
+class Qwen3OmniMoeTalkerMLPStack(spx.Module):
     """Stacked MoE MLP module for Talker using ParallelMoELinear layers.
 
     Implements the expert MLP stack with SwiGLU activation function for
@@ -1820,11 +1827,11 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
         "gate_up_proj$": {
             "splits": [
                 {
-                    "name": "gate_proj.kernel",
+                    "name": "gate_proj.weight",
                     "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 },
                 {
-                    "name": "up_proj.kernel",
+                    "name": "up_proj.weight",
                     "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 },
             ],
@@ -1835,7 +1842,7 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
@@ -1848,7 +1855,7 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Talker MoE MLP stack.
 
@@ -1857,7 +1864,7 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.gate_proj = ColumnParallelMoELinear(
@@ -1865,9 +1872,9 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
             in_features=config.hidden_size,
             out_features=config.moe_intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1878,8 +1885,8 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1890,15 +1897,15 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
             out_features=config.moe_intermediate_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         group_sizes: Array,
@@ -1941,7 +1948,7 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Talker MoE sparse block with shared expert.
 
@@ -1950,7 +1957,7 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1972,7 +1979,7 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
 
         self.experts = Qwen3OmniMoeTalkerMLPStack(
@@ -2000,10 +2007,10 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
 
-    def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Array) -> tuple[Array, Array]:
         """Route tokens through experts and shared expert, then combine outputs.
 
         Args:
@@ -2018,9 +2025,9 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
 
@@ -2046,7 +2053,7 @@ class Qwen3OmniMoeTalkerTextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Talker text attention layer.
@@ -2056,7 +2063,7 @@ class Qwen3OmniMoeTalkerTextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder stack.
         """
         super().__init__(
@@ -2086,7 +2093,7 @@ class Qwen3OmniMoeTalkerTextAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
+class Qwen3OmniMoeTalkerTextDecoderLayer(spx.Module):
     """Decoder layer for Talker text model with shared expert MoE.
 
     Combines multi-head attention with Q/K normalization and MoE feedforward
@@ -2100,7 +2107,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Talker text decoder layer.
@@ -2110,7 +2117,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer, used to determine MoE vs MLP.
         """
         self.config = config
@@ -2161,7 +2168,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -2218,7 +2225,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         )
 
 
-class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
+class Qwen3OmniMoeTalkerCodePredictorMLP(spx.Module):
     """Dense MLP for Talker code predictor.
 
     Implements the feedforward network with SwiGLU activation function
@@ -2232,7 +2239,7 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize code predictor MLP.
 
@@ -2241,7 +2248,7 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         column_linear = partial(
@@ -2268,7 +2275,7 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -2280,7 +2287,7 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -2302,7 +2309,7 @@ class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize code predictor attention with Q/K normalization and sliding window.
@@ -2332,7 +2339,7 @@ class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
+class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(spx.Module):
     """Decoder layer for Talker code predictor (non-MoE)."""
 
     def __init__(
@@ -2342,7 +2349,7 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize code predictor decoder layer with attention and MLP.
@@ -2388,7 +2395,7 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -2452,7 +2459,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize code predictor model with codec embeddings and decoder layers.
 
@@ -2471,7 +2478,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.codec_embedding = nn.List(
+        self.codec_embedding = nn.ModuleList(
             [
                 Embed(
                     config.vocab_size,
@@ -2491,19 +2498,19 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -2513,7 +2520,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2564,7 +2571,8 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2573,18 +2581,25 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutput(
@@ -2622,7 +2637,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize code predictor with per-group LM heads for codec token prediction.
 
@@ -2648,7 +2663,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
             lm_head_name="lm_head",
         )
 
-        self.lm_head = nn.List(
+        self.lm_head = nn.ModuleList(
             [
                 ColumnParallelLinear(
                     config.hidden_size,
@@ -2664,7 +2679,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
             ]
         )
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2743,7 +2758,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the Talker text model with codec embedding and decoder layers.
 
@@ -2777,19 +2792,19 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -2799,7 +2814,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -2860,14 +2875,15 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2876,21 +2892,28 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         return VLMCausalLMOutput(
@@ -2934,7 +2957,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize full Talker model with text model, code predictor, and projections.
 
@@ -3001,7 +3024,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -3087,7 +3110,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         return self.model.get_embedding()
 
 
-class Qwen3OmniMoeCode2WavLayerScale(nn.Module):
+class Qwen3OmniMoeCode2WavLayerScale(spx.Module):
     """Learnable per-channel scaling for residual branches.
 
     Helps stabilize training of deep networks.
@@ -3100,7 +3123,7 @@ class Qwen3OmniMoeCode2WavLayerScale(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize learnable per-channel scale parameter.
 
@@ -3111,23 +3134,12 @@ class Qwen3OmniMoeCode2WavLayerScale(nn.Module):
             param_dtype: Parameter storage data type.
             rngs: Random number generator state.
         """
-        self.scale = nn.Param(
+        self.weight = spx.Parameter(
             jnp.full((dim,), init_value, dtype=param_dtype),
         )
         self.dtype = dtype
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specifications for the scale parameter.
-
-        Marks the scale parameter as replicated since it is a small
-        per-channel vector that does not benefit from sharding.
-
-        Returns:
-            dict[str, object]: Mapping of parameter names to sharding specs.
-        """
-        return {"scale": Replicated}
-
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply per-channel scaling to the input tensor.
 
         Args:
@@ -3136,10 +3148,10 @@ class Qwen3OmniMoeCode2WavLayerScale(nn.Module):
         Returns:
             Scaled tensor with same shape as input.
         """
-        return x * self.scale.value.astype(self.dtype)
+        return x * self.weight.value.astype(self.dtype)
 
 
-class Qwen3OmniMoeCode2WavMLP(nn.Module):
+class Qwen3OmniMoeCode2WavMLP(spx.Module):
     """MLP for Code2Wav transformer."""
 
     def __init__(
@@ -3149,7 +3161,7 @@ class Qwen3OmniMoeCode2WavMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize gated MLP with gate, up, and down projections.
 
@@ -3183,7 +3195,7 @@ class Qwen3OmniMoeCode2WavMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply gated MLP: down_proj(act(gate_proj(x)) * up_proj(x)).
 
         Args:
@@ -3197,7 +3209,7 @@ class Qwen3OmniMoeCode2WavMLP(nn.Module):
         return self.down_proj(gate * up)
 
 
-class Qwen3OmniMoeCode2WavAttention(nn.Module):
+class Qwen3OmniMoeCode2WavAttention(spx.Module):
     """Sliding window attention for Code2Wav vocoder."""
 
     def __init__(
@@ -3208,7 +3220,7 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize sliding window attention with Q/K/V/O projections.
 
@@ -3276,7 +3288,7 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
             requires_cache=False,  # Code2Wav encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         attention_mask: Array | None = None,
@@ -3304,17 +3316,17 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         q = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         k = apply_logical_sharding(
             k,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         v = apply_logical_sharding(
             v,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         if self.sliding_window is not None:
@@ -3338,12 +3350,12 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         attn_output = apply_logical_sharding(
             attn_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return self.o_proj(attn_output)
 
 
-class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
+class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
     """Transformer layer with LayerScale for Code2Wav vocoder."""
 
     def __init__(
@@ -3354,7 +3366,7 @@ class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize transformer layer with attention, MLP, and LayerScale branches.
 
@@ -3414,7 +3426,7 @@ class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         attention_mask: Array | None = None,
@@ -3443,7 +3455,7 @@ class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
         return hidden_states
 
 
-class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
+class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
     """Transformer model for Code2Wav, containing layers and norm."""
 
     def __init__(
@@ -3453,7 +3465,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize transformer model with stacked layers and final norm.
 
@@ -3466,19 +3478,19 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
         """
         self.config = config
 
-        self.layers = nn.List(
-            [
-                Qwen3OmniMoeCode2WavTransformerLayer(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    Qwen3OmniMoeCode2WavTransformerLayer(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -3488,7 +3500,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Array,
         attention_mask: Array | None = None,
@@ -3506,9 +3518,18 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
         """
         hidden_states = inputs_embeds
 
-        for layer in self.layers:
+        def _layer_loop(layer, carry):
+            hidden_states, idx = carry
             hidden_states = layer(hidden_states, attention_mask, position_ids)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
 
+            return hidden_states, idx + 1
+
+        hidden_states, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutput(last_hidden_state=hidden_states)
@@ -3528,7 +3549,7 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Code2Wav vocoder with codec embeddings and transformer.
 
@@ -3571,7 +3592,7 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         # Note: upsample and decoder blocks are not implemented here as they require
         # ConvNeXt blocks. The HuggingFace implementation uses these for audio synthesis.
 
-    def __call__(
+    def forward(
         self,
         codec_tokens: Int[Array, "batch num_quantizers seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -3648,7 +3669,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Thinker text model.
 
@@ -3657,7 +3678,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -3682,19 +3703,19 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -3704,7 +3725,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -3760,7 +3781,8 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
 
         hidden_states = inputs_embeds
 
-        for layer_idx, layer in enumerate(self.layers):
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_self_attentions, all_router_logits, layer_idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -3773,13 +3795,20 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                 cache_view=past_key_values.views[layer_idx] if past_key_values is not None else None,
                 cache_metadata=cache_metadata,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_self_attentions += (layer_outputs.attentions,)
             if output_router_logits:
                 all_router_logits += (layer_outputs.router_logits,)
 
+            return hidden_states, all_hidden_states, all_self_attentions, all_router_logits, layer_idx + 1
+
+        hidden_states, all_hidden_states, all_self_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_self_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -3827,7 +3856,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize base Qwen3OmniMoe model.
 
@@ -3837,7 +3866,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -3880,19 +3909,19 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=text_config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(text_config.num_hidden_layers):
+            with spx.assign_stage(total=text_config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=text_config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(text_config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             text_config.hidden_size,
@@ -4008,7 +4037,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
 
         return inputs_embeds  # pyright: ignore[reportReturnType]
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -4115,10 +4144,11 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=text_config.partition_manager,
+            partition_manager=text_config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -4127,21 +4157,28 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         return VLMCausalLMOutput(
@@ -4207,7 +4244,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3OmniMoe Thinker for conditional generation.
 
@@ -4217,7 +4254,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         text_model = Qwen3OmniMoeThinkerTextModel(
             config=config.text_config,
@@ -4258,7 +4295,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         text_config = config.text_config
         self.vocab_size = text_config.vocab_size
-        self.lm_head = nn.Linear(
+        self.lm_head = ParallelLinear(
             text_config.hidden_size,
             text_config.vocab_size,
             use_bias=False,
@@ -4385,7 +4422,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         return inputs_embeds  # pyright: ignore[reportReturnType]
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -4510,11 +4547,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         """Returns the language model head for text generation."""
         return self.lm_head
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Returns the vision encoder tower."""
         return self.visual
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Returns the language model (text decoder)."""
         return self.model
 
@@ -4609,7 +4646,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize full Qwen3OmniMoe model with Thinker, Talker, and Code2Wav.
 
@@ -4619,7 +4656,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
             config=config.thinker_config,
@@ -4679,7 +4716,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         return self.thinker.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

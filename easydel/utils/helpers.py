@@ -63,8 +63,13 @@ from eformer.loggings import get_logger
 warnings.filterwarnings("ignore", message=".*'repr' attribute.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*'frozen' attribute.*", category=UserWarning)
 
-if tp.TYPE_CHECKING:
-    from flax.metrics.tensorboard import SummaryWriter
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        SummaryWriter = tp.Any  # type: ignore[misc,assignment]
 try:
     import wandb
 except ModuleNotFoundError:

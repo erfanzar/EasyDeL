@@ -37,7 +37,7 @@ class TestQwen3:
             num_hidden_layers=4,
             num_attention_heads=8,
             num_key_value_heads=4,
-            head_dim=128,
+            head_dim=16,
         )
 
     def test_causal_lm(self, qwen3_config, small_model_config):

@@ -59,7 +59,7 @@ if tp.TYPE_CHECKING:
 
     from easydel.data.core.protocols import ShardedDataSource
 
-from eformer.common_types import NOT_GIVEN
+from spectrax.common_types import NOT_GIVEN
 
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -118,7 +118,7 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         >>> cfg = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
         ...     "loader": {"dtype": "bf16", "from_torch": True},
-        ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)}
+        ...     "sharding": {"axis_dims": (1, 1, 1, 1, -1, 1)}
         ... }
         >>> kwargs = to_from_pretrained_kwargs(cfg)
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(**kwargs)
@@ -149,9 +149,9 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         dtype=coerce_dtype(loader.get("dtype")),
         param_dtype=coerce_dtype(loader.get("param_dtype")),
         precision=coerce_precision(loader.get("precision")),
-        sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, -1, 1))),
+        sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, 1, -1, 1))),
         sharding_dcn_axis_dims=tuple(dcn_axis_dims) if dcn_axis_dims else None,
-        sharding_axis_names=tuple(sharding.get("axis_names", ("dp", "fsdp", "ep", "tp", "sp"))),
+        sharding_axis_names=tuple(sharding.get("axis_names", ("pp", "dp", "fsdp", "ep", "tp", "sp"))),
         partition_axis=sharding.get("partition_axis"),
         shard_fns=sharding.get("shard_fns"),
         backend=platform.get("backend"),
@@ -218,7 +218,7 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
         >>> cfg = {
         ...     "model": {"name_or_path": "/checkpoints/step_1000"},
         ...     "loader": {"dtype": "bf16"},
-        ...     "sharding": {"axis_dims": [1, -1, 1, 1, 1]},
+        ...     "sharding": {"axis_dims": [1, 1, -1, 1, 1, 1]},
         ... }
         >>> kwargs = to_load_state_kwargs(cfg)
         >>> kwargs["load_directory"]
@@ -254,9 +254,9 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
         dtype=coerce_dtype(loader.get("dtype")),
         param_dtype=coerce_dtype(loader.get("param_dtype")),
         precision=coerce_precision(loader.get("precision")),
-        sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, -1, 1))),
+        sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, 1, -1, 1))),
         sharding_dcn_axis_dims=tuple(dcn_axis_dims) if dcn_axis_dims else None,
-        sharding_axis_names=tuple(sharding.get("axis_names", ("dp", "fsdp", "ep", "tp", "sp"))),
+        sharding_axis_names=tuple(sharding.get("axis_names", ("pp", "dp", "fsdp", "ep", "tp", "sp"))),
         partition_axis=sharding.get("partition_axis"),
         shard_fns=sharding.get("shard_fns"),
         backend=platform.get("backend"),
@@ -306,7 +306,7 @@ def build_model(cfg_like: eLMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
         ...         "task": "causal_lm"
         ...     },
         ...     "loader": {"dtype": "bf16"},
-        ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)}
+        ...     "sharding": {"axis_dims": (1, 1, 1, 1, -1, 1)}
         ... }
         >>> model = build_model(cfg)
         >>> print(type(model).__name__)
@@ -433,7 +433,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     distributed_connect_timeout_s_val = es.get("distributed_connect_timeout_s")
     distributed_verify_sampling_digest_val = es.get("distributed_verify_sampling_digest")
 
-    sharding_axis_dims_val: tuple | list | None = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
+    sharding_axis_dims_val: tuple | list | None = es.get("sharding_axis_dims", (1, 1, 1, 1, -1, 1))
     sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
 
     max_num_batched_tokens = es.get("max_num_batched_tokens", NOT_GIVEN)

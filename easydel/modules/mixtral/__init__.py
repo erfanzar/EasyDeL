@@ -50,7 +50,8 @@ Usage Example:
     ```python
     from easydel.modules.mixtral import MixtralConfig, MixtralForCausalLM
     import jax
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Configure Mixtral-8x7B style model
     config = MixtralConfig(
@@ -67,7 +68,7 @@ Usage Example:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = MixtralForCausalLM(config, rngs=rngs)
 
     # Generate text with MoE routing

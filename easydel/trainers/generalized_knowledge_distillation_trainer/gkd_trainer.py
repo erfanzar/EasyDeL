@@ -23,19 +23,18 @@ import jax
 import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 from transformers import GenerationConfig
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.traversals import deepcopy_model
 
 from ..supervised_fine_tuning_trainer import SFTTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import gkd_step
 from .gkd_config import GKDConfig
@@ -84,7 +83,7 @@ class GKDTrainer(SFTTrainer):
         if isinstance(model, EasyDeLState):
             student_state = model
         else:
-            student_state = model.to_state()
+            student_state = model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.lmbda = None if arguments.lmbda is None else float(arguments.lmbda)
         self.seq_kd = bool(arguments.seq_kd)
@@ -97,7 +96,7 @@ class GKDTrainer(SFTTrainer):
         elif isinstance(teacher_model, EasyDeLState):
             teacher_state = teacher_model
         else:
-            teacher_state = teacher_model.to_state()
+            teacher_state = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.teacher_state = teacher_state
 
@@ -146,7 +145,7 @@ class GKDTrainer(SFTTrainer):
             Configuration containing compiled step functions and mesh.
         """
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -167,7 +166,7 @@ class GKDTrainer(SFTTrainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9, 10)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             gkd_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -187,7 +186,7 @@ class GKDTrainer(SFTTrainer):
             None,
         )
 
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             gkd_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,

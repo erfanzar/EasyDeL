@@ -588,9 +588,7 @@ def test_save_checkpoint_for_step_runs_cleanup_after_temporary_metadata_is_resto
 
     old_checkpoint = tmp_path / "run-1"
     old_checkpoint.mkdir(parents=True)
-    (old_checkpoint / "metadata.json").write_text(
-        json.dumps({"step": 1, "timestamp": "old", "is_temporary": False})
-    )
+    (old_checkpoint / "metadata.json").write_text(json.dumps({"step": 1, "timestamp": "old", "is_temporary": False}))
     os.utime(old_checkpoint, (1, 1))
 
     class _TemporaryMetadataCheckpointer(_CheckpointerStub):

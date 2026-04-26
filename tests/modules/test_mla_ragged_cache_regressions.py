@@ -18,8 +18,8 @@ import types
 
 import jax.numpy as jnp
 import pytest
-from eformer import common_types
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import common_types
 
 import easydel as ed
 from easydel.caching import (
@@ -264,7 +264,7 @@ def test_glm_moe_dsa_v2_uses_absorbed_mla_path_for_hybrid_cache(monkeypatch: pyt
             cache_cfg,
             layer_index=0,
             mesh=config.mesh,
-            partition_manager=config.partition_manager,
+            runtime_sharding_resolver=config.runtime_sharding_resolver,
         )
         cache_view = ParallelHybridCacheView(transformer=inner_cache_view, recurrent=None)
 
@@ -273,7 +273,7 @@ def test_glm_moe_dsa_v2_uses_absorbed_mla_path_for_hybrid_cache(monkeypatch: pyt
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             precision=None,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
             layer_idx=0,
         )
 

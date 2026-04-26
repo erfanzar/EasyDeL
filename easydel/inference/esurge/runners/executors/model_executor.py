@@ -71,8 +71,7 @@ import typing as tp
 from collections import OrderedDict
 
 import jax
-from eformer import escale as es
-from flax import nnx as nn
+import spectrax as spx
 from jax import numpy as jnp
 
 from easydel.caching import (
@@ -83,7 +82,7 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.utils import ejit, set_inference_mode
+from easydel.utils import set_inference_mode
 
 from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
 
@@ -214,6 +213,14 @@ class ModelStepExecutor:
         cache.move_to_end(key)
         return value
 
+    def _uses_mpmd_mesh(self) -> bool:
+        return self.mesh.is_mpmd
+
+    def _compile_mode(self) -> str:
+        if self._uses_mpmd_mesh():
+            return "mpmd"
+        return "aot" if self.use_aot_forward else "jit"
+
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
         self._cache_store(self._cache, key, value)
 
@@ -226,17 +233,17 @@ class ModelStepExecutor:
 
     def has(self, key: tuple[int, int, str, str]) -> bool:
         """Check if a (num_tokens, padded_num_reqs) pair is fully compiled."""
-        mode = key[3] if len(key) == 4 else ("aot" if self.use_aot_forward else "jit")
+        mode = key[3] if len(key) == 4 else self._compile_mode()
         backbone_key = (key[0], "backbone", mode)
         lm_head_key = (key[1], "lm_head", mode)
         return backbone_key in self._backbone_cache and lm_head_key in self._lm_head_cache
 
     def has_backbone(self, num_tokens: int) -> bool:
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         return (int(num_tokens), "backbone", mode) in self._backbone_cache
 
     def has_lm_head(self, padded_num_reqs: int) -> bool:
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         return (int(padded_num_reqs), "lm_head", mode) in self._lm_head_cache
 
     def get_compiled(self, *, num_tokens: int, padded_num_reqs: int) -> tp.Any:
@@ -245,7 +252,7 @@ class ModelStepExecutor:
         Returns a cached wrapper that calls backbone then lm_head, producing
         a ``ModelStepOutputs`` — same interface as before the split.
         """
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         backbone_fn = self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
         lm_head_fn = self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
         _pnr = int(padded_num_reqs)
@@ -266,12 +273,12 @@ class ModelStepExecutor:
 
     def get_backbone(self, *, num_tokens: int) -> tp.Any:
         """Retrieve a pre-compiled backbone function."""
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         return self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
 
     def get_lm_head(self, *, padded_num_reqs: int) -> tp.Any:
         """Retrieve a pre-compiled lm_head function."""
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         return self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
 
     def compile(
@@ -320,10 +327,19 @@ class ModelStepExecutor:
         Keyed by ``num_tokens`` only — independent of ``padded_num_reqs``.
         """
         self.graphdef = graphdef
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         key = (int(num_tokens), "backbone", mode)
         if key in self._backbone_cache:
             return None
+
+        if self._uses_mpmd_mesh():
+
+            def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
+                return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
+
+            out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+            self._cache_store(self._backbone_cache, key, wrapped_backbone)
+            return out
 
         if self.use_aot_forward:
             if self.bind_graphstate_for_aot:
@@ -331,7 +347,7 @@ class ModelStepExecutor:
                 def _bound_backbone(kv_pages_, metadata_):
                     return self._backbone_fn(graphdef, graphstate, graphother, kv_pages_, metadata_)
 
-                compiled_bound = jax.jit(_bound_backbone).lower(inputs.kv_pages, inputs.batch_metadata).compile()
+                compiled_bound = spx.jit(_bound_backbone).lower(inputs.kv_pages, inputs.batch_metadata).compile()
 
                 def _wrapped_bound_backbone(graphstate_, graphother_, kv_pages_, metadata_):
                     del graphstate_, graphother_
@@ -368,7 +384,7 @@ class ModelStepExecutor:
         Keyed by ``padded_num_reqs`` only — independent of ``num_tokens``.
         """
         self.graphdef = graphdef
-        mode = "aot" if self.use_aot_forward else "jit"
+        mode = self._compile_mode()
         key = (int(padded_num_reqs), "lm_head", mode)
         if key in self._lm_head_cache:
             return
@@ -380,13 +396,22 @@ class ModelStepExecutor:
         # Input is pre-gathered: [padded_num_reqs, hidden_dim]
         dummy_hs = jnp.zeros((int(padded_num_reqs), int(hidden_dim)), dtype=dtype)
 
+        if self._uses_mpmd_mesh():
+
+            def wrapped_lm_head(graphstate_, graphother_, hs_):
+                return self._lm_head_fn(self.graphdef, graphstate_, graphother_, hs_)
+
+            _ = wrapped_lm_head(graphstate, graphother, dummy_hs)
+            self._cache_store(self._lm_head_cache, key, wrapped_lm_head)
+            return
+
         if self.use_aot_forward:
             if self.bind_graphstate_for_aot:
 
                 def _bound_lm_head(hs_):
                     return self._lm_head_fn(graphdef, graphstate, graphother, hs_)
 
-                compiled_bound = jax.jit(_bound_lm_head).lower(dummy_hs).compile()
+                compiled_bound = spx.jit(_bound_lm_head).lower(dummy_hs).compile()
 
                 def _wrapped_bound_lm_head(graphstate_, graphother_, hs_):
                     del graphstate_, graphother_
@@ -443,24 +468,44 @@ class ModelStepExecutor:
             video_grid_thw=None,
         )
 
-        kv_pages_sharding = es.extract_shardings(kv_pages_template, self.mesh)
+        kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
 
         backbone_out_shardings = BackboneOutputs(
-            kv_pages=es.extract_shardings(kv_pages_template, self.mesh),
+            kv_pages=spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh),
             hidden_states=self._empty_sharding,
         )
 
-        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
-            static_argnums=(0,),
-            donate_argnames=["kv_pages"],
-            in_shardings=(
-                es.extract_shardings(graphstate_template, self.mesh),
-                es.extract_shardings(graphother_template, self.mesh),
-                kv_pages_sharding,
-                metadata_sharding,
-            ),
-            out_shardings=backbone_out_shardings,
+        # @erfanzar NOTE:
+        #   The MPMD and SPMD JIT paths used to diverge here: SPMD declared
+        #   ``in_shardings``/``out_shardings`` while MPMD passed neither.
+        #   spectrax's ``sxjit`` *does* honor ``in_shardings`` (see the
+        #   placement priority in ``runtime/mpmd/runtime.py``: explicit >
+        #   already-on-correct-rank > auto-inferred > replicated), so
+        #   omitting them on MPMD just left layout/sharding decisions to
+        #   the auto-inference path, which is fine when leaves are already
+        #   correctly placed but doesn't pin layouts the way SPMD does. We
+        #   now share the same input/output sharding declarations across
+        #   both paths; the only real difference is the ``mesh=`` arg
+        #   (required by sxjit) and the ``donate_*`` flavor (sxjit rejects
+        #   ``donate_argnames``, so we use ``donate_argnums`` everywhere).
+        in_shardings = (
+            spx.extract_sharding_structure(graphstate_template, mesh=self.mesh),
+            spx.extract_sharding_structure(graphother_template, mesh=self.mesh),
+            kv_pages_sharding,
+            metadata_sharding,
         )
+        common_jit_kwargs = {
+            "static_argnums": (0,),
+            "donate_argnums": (3,),
+            "in_shardings": in_shardings,
+            "out_shardings": backbone_out_shardings,
+        }
+        if self._uses_mpmd_mesh():
+            jit_kwargs = {**common_jit_kwargs, "mesh": self.mesh}
+        else:
+            jit_kwargs = dict(common_jit_kwargs)
+
+        @spx.jit(**jit_kwargs)  # pyright: ignore[reportUntypedFunctionDecorator]
         def _backbone_step(
             graphdef,
             graphstate,
@@ -469,7 +514,7 @@ class ModelStepExecutor:
             metadata: BatchMetadata,
         ) -> BackboneOutputs:
             with self.model.mesh:
-                model: "EasyDeLBaseModule" = nn.merge(graphdef, graphstate, graphother)
+                model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
                 input_ids_view = metadata.input_ids_buf
                 position_ids_view = metadata.position_ids_buf
 
@@ -566,11 +611,11 @@ class ModelStepExecutor:
             independent of ``num_tokens``.
         """
 
-        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
+        @spx.jit(  # pyright: ignore[reportUntypedFunctionDecorator]
             static_argnums=(0,),
             in_shardings=(
-                es.extract_shardings(graphstate_template, self.mesh),
-                es.extract_shardings(graphother_template, self.mesh),
+                spx.extract_sharding_structure(graphstate_template, mesh=self.mesh),
+                spx.extract_sharding_structure(graphother_template, mesh=self.mesh),
                 self._empty_sharding,
             ),
             out_shardings=self._empty_sharding,
@@ -582,9 +627,9 @@ class ModelStepExecutor:
             gathered_hidden_states: jax.Array,
         ) -> jax.Array:
             with self.model.mesh:
-                # nn.merge only runs at trace/compile time (inside @ejit),
-                # not at inference runtime — XLA sees through it.
-                model: "EasyDeLBaseModule" = nn.merge(graphdef, graphstate, graphother)
+                # spx.bind only runs at trace/compile time (inside @spx.jit),
+                # not at inference runtime; XLA sees through it.
+                model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
                 return model.apply_lm_head(gathered_hidden_states)
 
         return _lm_head_step

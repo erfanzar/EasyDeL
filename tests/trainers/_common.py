@@ -78,7 +78,7 @@ def _load_model_kwargs() -> dict[str, Any]:
         param_dtype=jnp.bfloat16,
         precision=lax.Precision.DEFAULT,
         auto_shard_model=True,
-        sharding_axis_dims=(1, -1, 1, 1, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=MAX_TOTAL_LENGTH,
             mask_max_position_embeddings=MAX_TOTAL_LENGTH,

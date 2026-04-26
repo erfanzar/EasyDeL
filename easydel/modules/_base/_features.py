@@ -54,7 +54,7 @@ See Also:
 from typing import Any
 
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
 from jaxtyping import Array, Float
 
 
@@ -172,7 +172,7 @@ class TieEmbeddingsFeature:
         # During initialization
         if tie_feature.tie:
             # lm_head will use embedding weights transposed
-            lm_head.kernel = embedding.embedding.T
+            lm_head.weight = embedding.weight.T
         ```
 
     Note:
@@ -200,11 +200,11 @@ class TieEmbeddingsFeature:
         """
         self.tie = tie
 
-    def setup(self, embedding_module: nn.Module, lm_head_module: nn.Module) -> None:
+    def setup(self, embedding_module: spx.Module, lm_head_module: spx.Module) -> None:
         """Set up weight tying between embedding and LM head.
 
         This method configures the relationship between the input embedding
-        layer and the output projection (LM head). In Flax NNX, this typically
+        layer and the output projection (LM head). In spectrax, this typically
         means the LM head's forward method will accept the embedding weights
         as a parameter rather than using its own kernel.
 
@@ -216,14 +216,14 @@ class TieEmbeddingsFeature:
                 its forward method.
 
         Note:
-            In Flax NNX, actual weight tying is handled differently than in
+            In spectrax, actual weight tying is handled differently than in
             PyTorch. Instead of sharing parameters, the embedding weights are
             passed to the LM head during forward pass:
 
             ```python
             # In forward pass
             if tie_embeddings:
-                logits = lm_head(hidden, w=embedding.embedding.T)
+                logits = lm_head(hidden, w=embedding.weight.T)
             else:
                 logits = lm_head(hidden)
             ```
@@ -231,10 +231,10 @@ class TieEmbeddingsFeature:
         if not self.tie:
             return
 
-        # In Flax NNX, weight tying is handled differently
+        # In spectrax, weight tying is handled differently
         # This is a placeholder for the actual implementation
         # which would depend on how the embedding and lm_head are structured
-        # Typically: lm_head.kernel = embedding.embedding
+        # Typically: lm_head.weight = embedding.weight
         pass
 
     def __repr__(self) -> str:

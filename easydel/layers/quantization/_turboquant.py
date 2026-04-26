@@ -129,7 +129,9 @@ class TurboQuantConstants:
         (fully replicated).  If the arrays sit on a single device the
         shard-map will fail, so this helper broadcasts them first.
         """
-        replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        from easydel.infra.sharding import replicated_named_sharding
+
+        replicated = replicated_named_sharding(mesh)
         return TurboQuantConstants(
             key_codebook=jax.device_put(self.key_codebook, replicated),
             value_codebook=jax.device_put(self.value_codebook, replicated),

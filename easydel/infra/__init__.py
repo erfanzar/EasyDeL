@@ -32,13 +32,16 @@ Classes:
     EasyDeLBaseModule: Base class for all model implementations
     EasyDeLState: State container for model parameters and optimizer state
     LossConfig: Configuration for loss computation
-    PartitionAxis: Axis specification for model parallelism
+    AxisPolicy: Canonical semantic-axis configuration
+    PartitionAxis: Legacy axis specification compatibility surface
+    RuntimeShardingResolver: Runtime sharding lowering helper
+    TensorLayout: Parameter metadata for compound logical layouts
 
 Utilities:
     PyTree: JAX pytree utilities
     auto_pytree: Decorator for automatic pytree registration
     Rngs: Random number generator management
-    escale: Scaling utilities for distributed training
+    sharding: SpectraX sharding utilities for distributed training
 
 Example:
     >>> from easydel.infra import (
@@ -72,11 +75,16 @@ Note:
 
 import typing as tp
 
-from eformer import escale
-from eformer.escale import PartitionAxis
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import PyTree, auto_pytree
-from flax.nnx import Rngs
+from spectrax import PartitionAxis
+from spectrax import sharding as _spectrax_sharding
+
+from .sharding import AxisPolicy, RuntimeShardingResolver, TensorLayout, logical_axis_rules, sharding_for_layout
+
+Rngs = spx.Rngs
+sharding = _spectrax_sharding
 
 if tp.TYPE_CHECKING:  # pragma: no cover
     from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
@@ -122,6 +130,7 @@ def init_cluster():
 
 
 __all__ = (
+    "AxisPolicy",
     "BenchmarkConfig",
     "EasyDeLBaseConfig",
     "EasyDeLBaseConfigDict",
@@ -131,10 +140,14 @@ __all__ = (
     "PartitionAxis",
     "PyTree",
     "Rngs",
+    "RuntimeShardingResolver",
+    "TensorLayout",
     "auto_pytree",
     "eLargeModel",
-    "escale",
     "init_cluster",
+    "logical_axis_rules",
+    "sharding",
+    "sharding_for_layout",
 )
 
 

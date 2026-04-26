@@ -55,7 +55,8 @@ Usage Example
 -------------
 ```python
 from easydel import OpenELMConfig, OpenELMForCausalLM
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 import jax.numpy as jnp
 
 # Create configuration
@@ -73,7 +74,7 @@ model = OpenELMForCausalLM(
     config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Generate text

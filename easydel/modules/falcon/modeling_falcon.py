@@ -18,13 +18,12 @@ import math
 import typing
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -128,7 +127,7 @@ class FalconAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Falcon attention layer with ALiBi or RoPE support.
@@ -138,7 +137,7 @@ class FalconAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         use_gqa = config.multi_query or (
@@ -163,7 +162,7 @@ class FalconAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> ColumnParallelLinear:
         """Create the fused query-key-value projection layer.
 
@@ -172,7 +171,7 @@ class FalconAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             ColumnParallelLinear: Fused QKV projection layer.
@@ -194,7 +193,7 @@ class FalconAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> RowParallelLinear:
         """Create the output projection layer.
 
@@ -203,7 +202,7 @@ class FalconAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RowParallelLinear: Output projection layer.
@@ -220,7 +219,7 @@ class FalconAttention(UnifiedAttention):
         )
 
 
-class FalconMlp(nn.Module):
+class FalconMlp(spx.Module):
     """Multi-Layer Perceptron module for Falcon models.
 
     Implements the feedforward network with GELU activation function
@@ -234,7 +233,7 @@ class FalconMlp(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Falcon MLP block.
@@ -245,7 +244,7 @@ class FalconMlp(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -272,7 +271,7 @@ class FalconMlp(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array, deterministic: bool = True):
+    def forward(self, x: Array, deterministic: bool = True):
         """Apply GELU feedforward transformation.
 
         Args:
@@ -285,21 +284,21 @@ class FalconMlp(nn.Module):
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         x = checkpoint_name(
-            self.dense_4h_to_h(nn.gelu(checkpoint_name(self.dense_h_to_4h(x), name="mlp_up"), approximate=False)),
+            self.dense_4h_to_h(jax.nn.gelu(checkpoint_name(self.dense_h_to_4h(x), name="mlp_up"), approximate=False)),
             name="mlp_down",
         )
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return x
 
 
-class FalconBlock(nn.Module):
+class FalconBlock(spx.Module):
     """Single decoder layer for Falcon models.
 
     Combines multi-head attention and feedforward networks with
@@ -314,7 +313,7 @@ class FalconBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Falcon decoder layer.
@@ -324,7 +323,7 @@ class FalconBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -395,10 +394,10 @@ class FalconBlock(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.dropout = nn.Dropout(self.config.attention_dropout)
-        self.dropout_mlp = nn.Dropout(self.config.hidden_dropout)
+        self.dropout = nn.Dropout(self.config.attention_dropout, rngs=rngs)
+        self.dropout_mlp = nn.Dropout(self.config.hidden_dropout, rngs=rngs)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -510,7 +509,7 @@ class FalconModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Falcon base model.
 
@@ -519,7 +518,7 @@ class FalconModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -541,19 +540,19 @@ class FalconModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.h = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.h = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.h.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.ln_f = LayerNorm(
             self.config.hidden_size,
             dtype=dtype,
@@ -562,7 +561,7 @@ class FalconModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -643,26 +642,35 @@ class FalconModel(EasyDeLBaseModule):
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.h))
         hidden_states = inputs_embeds
-        for idx, layer in enumerate(self.h):
+
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             layer_outputs = layer(
                 hidden_states=hidden_states,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
                 alibi=alibi,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.h.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.ln_f(hidden_states)
 
         if all_hidden_states is not None:
@@ -727,7 +735,7 @@ class FalconForCausalLM(BaseCausalLMModule[FalconModel, FalconConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Falcon model for causal language modeling.
 
@@ -736,7 +744,7 @@ class FalconForCausalLM(BaseCausalLMModule[FalconModel, FalconConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

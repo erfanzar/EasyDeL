@@ -56,7 +56,8 @@ Example Usage:
     ```python
     from easydel import FalconH1Config, FalconH1ForCausalLM
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Create configuration
     config = FalconH1Config(
@@ -70,7 +71,7 @@ Example Usage:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = FalconH1ForCausalLM(config, rngs=rngs)
 
     # Generate text

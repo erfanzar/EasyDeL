@@ -60,7 +60,7 @@ def main():
     model = ed.AutoEasyDeLModelForEmbedding.from_pretrained(
         "Qwen/Qwen3-4B",
         auto_shard_model=True,
-        sharding_axis_dims=(1, -1, 1, 1, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
             attn_mechanism=ed.AttentionMechanisms.AUTO,
             attn_dtype="bf16",

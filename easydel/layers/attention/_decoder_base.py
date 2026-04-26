@@ -52,16 +52,17 @@ Example:
     Using pre-norm residual patterns in a custom decoder layer::
 
         >>> from easydel.layers.attention import BaseDecoderLayer
-        >>> import flax.nnx as nn
+        >>> import spectrax as spx
+from spectrax import nn
         >>>
-        >>> class MyDecoderLayer(nn.Module):
+        >>> class MyDecoderLayer(spx.Module):
         ...     def __init__(self, config, rngs):
         ...         self.attention = MyAttention(config, rngs=rngs)
         ...         self.mlp = MyMLP(config, rngs=rngs)
         ...         self.input_layernorm = RMSNorm(config.hidden_size, rngs=rngs)
         ...         self.post_attention_layernorm = RMSNorm(config.hidden_size, rngs=rngs)
         ...
-        ...     def __call__(self, hidden_states, mask_info, position_ids, mode, ...):
+        ...     def forward(self, hidden_states, mask_info, position_ids, mode, ...):
         ...         # Attention with pre-norm residual
         ...         hidden_states, attn_out = BaseDecoderLayer.pre_norm_residual_attn(
         ...             hidden_states,
@@ -90,7 +91,7 @@ Example:
         ...     mask_info=mask_info,
         ...     position_ids=position_ids,
         ...     mode=mode,
-        ...     partition_manager=config.partition_manager
+        ...     partition_manager=config.runtime_sharding_resolver
         ... )
 
 Note:
@@ -106,11 +107,10 @@ See Also:
 from collections.abc import Callable
 
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     OperationsMetadata,

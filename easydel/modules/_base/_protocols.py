@@ -56,11 +56,11 @@ See Also:
 from typing import Any, Protocol, runtime_checkable
 
 import jax
-from eformer import common_types
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types
 
 from easydel.caching import (
     HybridCache,
@@ -174,7 +174,7 @@ class BaseModelProtocol(Protocol):
         """
         ...
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """Return the input embedding layer of the model.
 
         The embedding layer converts token IDs to dense vector representations.
@@ -187,7 +187,7 @@ class BaseModelProtocol(Protocol):
         """
         ...
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """Return the decoder (transformer layers) part of the model.
 
         For decoder-only models, this returns the stack of transformer layers
@@ -228,7 +228,7 @@ class EncoderDecoderProtocol(BaseModelProtocol, Protocol):
         additional parameters like encoder_outputs, decoder_input_ids, etc.
     """
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """Return the encoder part of the model.
 
         The encoder processes the input sequence and produces contextualized
@@ -301,7 +301,7 @@ class VisionModelProtocol(Protocol):
         """
         ...
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """Return the patch embedding/projection layer.
 
         The embedding layer converts image patches to dense vectors. For ViT,
@@ -397,7 +397,7 @@ class VisionLanguageProtocol(Protocol):
         """
         ...
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Return the vision encoder component.
 
         The vision tower processes images and produces visual features.
@@ -408,7 +408,7 @@ class VisionLanguageProtocol(Protocol):
         """
         ...
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Return the language model component.
 
         The language model processes the combined vision-text sequence and

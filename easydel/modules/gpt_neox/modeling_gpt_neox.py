@@ -17,13 +17,12 @@ import functools
 from typing import ClassVar
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -66,7 +65,7 @@ class GPTNeoXAttention(UnifiedAttention):
         layer_idx (int): Index of this layer in the model stack.
         head_dim (int): Dimension of each attention head.
         num_heads (int): Number of attention heads.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -92,7 +91,7 @@ class GPTNeoXAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize GPT-NeoX attention module.
@@ -102,7 +101,7 @@ class GPTNeoXAttention(UnifiedAttention):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             layer_idx: Index of this layer in the model (0-indexed).
         """
         super().__init__(
@@ -138,7 +137,7 @@ class GPTNeoXAttention(UnifiedAttention):
             base=config.rotary_emb_base,
         )
 
-    def _create_attention_performer(self, config: GPTNeoXConfig, rngs: nn.Rngs):
+    def _create_attention_performer(self, config: GPTNeoXConfig, rngs: spx.Rngs):
         """Create the attention performer with GPT-NeoX specific settings.
 
         Args:
@@ -156,7 +155,7 @@ class GPTNeoXAttention(UnifiedAttention):
         )
 
 
-class GPTNeoXMlp(nn.Module):
+class GPTNeoXMlp(spx.Module):
     """GPT-NeoX MLP (Feed-Forward Network) module.
 
     This module implements the feed-forward network used in GPT-NeoX transformer
@@ -183,7 +182,7 @@ class GPTNeoXMlp(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ) -> None:
         """Initialize GPT-NeoX MLP module.
@@ -193,7 +192,7 @@ class GPTNeoXMlp(nn.Module):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             layer_idx: Index of this layer in the model (0-indexed).
         """
         self.config = config
@@ -218,7 +217,7 @@ class GPTNeoXMlp(nn.Module):
         )
         self.act = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the GPTNeoXMlp module.
@@ -233,7 +232,7 @@ class GPTNeoXMlp(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(
             self.dense_4h_to_h(self.act(checkpoint_name(self.dense_h_to_4h(hidden_states), name="mlp_up"))),
@@ -242,12 +241,12 @@ class GPTNeoXMlp(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states
 
 
-class GPTNeoXBlock(nn.Module):
+class GPTNeoXBlock(spx.Module):
     """GPT-NeoX Transformer block.
 
     This module represents a single transformer block in the GPT-NeoX model,
@@ -281,7 +280,7 @@ class GPTNeoXBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ) -> None:
         """Initialize GPT-NeoX transformer block.
@@ -291,7 +290,7 @@ class GPTNeoXBlock(nn.Module):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             layer_idx: Index of this layer in the model (0-indexed).
         """
         self.config = config
@@ -332,7 +331,7 @@ class GPTNeoXBlock(nn.Module):
             layer_idx=layer_idx,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -424,7 +423,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GPT-NeoX base model.
 
@@ -433,7 +432,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__(
             config=config,
@@ -456,19 +455,19 @@ class GPTNeoXModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=self.config.layer_norm_eps,
@@ -496,7 +495,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
             base=self.config.rotary_emb_base,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -509,6 +508,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         extra_embedding: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        trace: bool = False,
     ):
         """Performs forward pass through the GPT-NeoX transformer model.
 
@@ -586,28 +586,54 @@ class GPTNeoXModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 frequencies=self.frequencies,
                 output_attentions=output_attentions,
             )
-
-            hidden_states = layer_outputs.hidden_states
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-            past_key_values[idx] = layer_outputs.cache_view
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.final_layer_norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -677,7 +703,7 @@ class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # ty
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GPT-NeoX for causal language modeling.
 
@@ -686,7 +712,7 @@ class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # ty
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__(
             config=config,

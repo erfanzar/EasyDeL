@@ -16,8 +16,8 @@
 
 import jax.numpy as jnp
 import pytest
+import spectrax as spx
 import transformers
-from flax import nnx as nn
 
 import easydel as ed
 from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOp
@@ -143,7 +143,7 @@ class TestGLMMoeDSA:
                 dtype=small_model_config["dtype"],
                 param_dtype=small_model_config["dtype"],
                 precision=small_model_config["precision"],
-                rngs=nn.Rngs(0),
+                rngs=spx.Rngs(0),
             )
             cache_cfg = model.create_unified_attention_cache_config(
                 max_length=small_model_config["max_position_embeddings"],

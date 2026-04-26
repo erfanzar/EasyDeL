@@ -61,12 +61,11 @@ See Also:
 from collections.abc import Callable
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -119,7 +118,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
 
     Type Parameters:
         ModelT: The base model type (encoder-decoder or vision-language).
-            Must implement __call__ with appropriate inputs and return
+            Must implement forward with appropriate inputs and return
             an object with last_hidden_state.
         ConfigT: The configuration type. Must have vocab_size and either
             hidden_size or get_text_config() method.
@@ -139,7 +138,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
@@ -147,7 +146,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         lm_head_name: str = "lm_head",
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
-        lm_head_class: nn.Module = ColumnParallelLinear,
+        lm_head_class: spx.Module = ColumnParallelLinear,
         create_lm_head: bool = True,
     ):
         """Initialize the Conditional Generation module.
@@ -170,7 +169,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             dtype: Data type for computations. Defaults to jnp.bfloat16.
             param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
             precision: JAX precision setting for matrix operations.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             tie_word_embeddings: Whether to share weights between input
                 embeddings and LM head. Reduces parameters and can improve
                 generalization. Defaults to False.
@@ -192,7 +191,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
                 config=t5_config,
                 base_model_class=T5Model,
                 tie_word_embeddings=True,
-                rngs=nn.Rngs(0),
+                rngs=spx.Rngs(0),
             )
 
             # VLM without creating new LM head (using base model's head)
@@ -200,7 +199,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
                 config=llava_config,
                 base_model_class=LlavaModel,
                 create_lm_head=False,
-                rngs=nn.Rngs(0),
+                rngs=spx.Rngs(0),
             )
             ```
         """
@@ -244,7 +243,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             if tie_word_embeddings:
                 self._tie_embeddings_feature.setup(self.get_embedding(), lm_head)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -349,7 +348,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -394,7 +393,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             ),
             False,
         )
-        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+        w = self.get_embedding().weight.value.T if tie_embeddings else None
         lm_head = self.get_task_head()
         return lm_head(hidden_states, w=w)
 

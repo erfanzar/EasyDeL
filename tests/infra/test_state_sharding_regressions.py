@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
-from flax import nnx as nn
+import spectrax as spx
 from jax.sharding import NamedSharding, PartitionSpec
 
 import easydel as ed
@@ -39,7 +39,7 @@ def tiny_sharded_llama():
         max_position_embeddings=32,
     )
     config.add_basic_configurations(
-        sharding_axis_dims=(1, 1, -1, 1, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         use_sharding_constraint=False,
     )
     with config.mesh:
@@ -48,7 +48,7 @@ def tiny_sharded_llama():
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
         return model.shard_model()
 
@@ -76,11 +76,11 @@ def test_shard_state_places_rng_count_with_explicit_named_sharding(tiny_sharded_
 
     for path, leaf in flat:
         path_str = _path_to_str(path)
-        if "graphother" in path_str and "rngs" in path_str and "count" in path_str and "value" in path_str:
+        if "graphother" in path_str and "rng" in path_str:
             rng_count_leaf = leaf
             break
 
-    assert rng_count_leaf is not None, "Expected RNG count leaf in graphother tree."
+    assert rng_count_leaf is not None, "Expected RNG leaf in graphother tree."
     sharding = getattr(rng_count_leaf, "sharding", None)
     assert isinstance(sharding, NamedSharding)
     assert sharding.spec == PartitionSpec()
@@ -91,18 +91,20 @@ def test_optimizer_gather_works_without_mesh_context_and_create_validation(tiny_
     gathered_opt_state = state.gather_optimizer_state()
     assert isinstance(gathered_opt_state, EasyDeLState)
 
-    graphdef, graphstate, _ = nn.split(tiny_sharded_llama, nn.Param, ...)
+    gdef, gstate = spx.export(tiny_sharded_llama)
+    gstate = gstate.filter("parameters", copy=True)
+    gstate.exclude("parameters")
     with pytest.raises(ValueError):
-        EasyDeLState.create(graphdef=graphdef, graphstate=graphstate, graphother=None)
+        EasyDeLState.create(graphdef=gdef, graphstate=gstate, graphother=None)
 
 
 def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
-    from eformer import escale as es
+    import spectrax as spx
 
     state = EasyDeLState.create(model=tiny_sharded_llama)
     rules = state.model._get_partition_rules(None)
     eval_opt_state = jax.eval_shape(lambda: optax.adam(1e-3).init(state.graphstate))
-    partition_specs = es.match_partition_rules(rules, eval_opt_state)
+    partition_specs = spx.match_partition_rules(rules, eval_opt_state)
 
     def _has_sharded_axis(spec: jax.sharding.PartitionSpec) -> bool:
         return any(axis_spec is not None for axis_spec in tuple(spec))
@@ -128,7 +130,7 @@ def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):
 
 
 def test_init_tx_builds_corrected_explicit_output_shardings(monkeypatch, tiny_sharded_llama):
-    import eformer.escale as es
+    import spectrax as spx
 
     state = EasyDeLState.create(model=tiny_sharded_llama)
     compile_calls = {"count": 0}
@@ -156,7 +158,7 @@ def test_init_tx_builds_corrected_explicit_output_shardings(monkeypatch, tiny_sh
         )
 
     monkeypatch.setattr(base_state_module, "ejit", fake_ejit)
-    monkeypatch.setattr(es, "match_partition_rules", fake_match_partition_rules)
+    monkeypatch.setattr(spx, "match_partition_rules", fake_match_partition_rules)
     updated = state.init_tx(optax.adam(1e-3))
 
     assert compile_calls["count"] == 1

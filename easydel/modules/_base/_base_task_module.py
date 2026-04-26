@@ -51,7 +51,7 @@ Example:
                 rngs=rngs,
             )
 
-        def __call__(self, input_ids, **kwargs):
+        def forward(self, input_ids, **kwargs):
             # Implementation
             pass
 
@@ -69,7 +69,7 @@ from collections.abc import Callable
 from typing import Any, Generic, TypeVar
 
 import jax
-from flax import nnx as nn
+import spectrax as spx
 from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -136,7 +136,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
 
     Note:
         Subclasses must implement:
-            - __call__: Forward pass through the model
+            - forward: Forward pass through the model
             - get_task_head: Return the task-specific head (e.g., lm_head)
     """
 
@@ -192,7 +192,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
@@ -226,8 +226,8 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
                 from dtype for mixed-precision training. Defaults to jnp.bfloat16.
             precision: Precision setting for JAX matrix operations. Can be
                 None (default), jax.lax.Precision.DEFAULT, HIGH, or HIGHEST.
-            rngs: Flax NNX random number generators for initialization and
-                dropout. Must include at least 'params' key.
+            rngs: spectrax random number generators for initialization and
+                dropout. Must include at least 'parameters' key.
             tie_word_embeddings: Whether to share weights between the input
                 embedding layer and the output projection (LM head). Reduces
                 parameters and can improve performance. Defaults to False.
@@ -569,7 +569,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         return self._pooling_feature.pool(hidden_states, input_ids, attention_mask=attention_mask)
 
     @abstractmethod
-    def __call__(self, *args, **kwargs):
+    def forward(self, *args, **kwargs):
         """Forward pass through the module.
 
         This method must be implemented by subclasses to define the specific
@@ -665,7 +665,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             ```python
             embedding = module.get_embedding()
             if tie_embeddings:
-                lm_head.kernel = embedding.embedding.T
+                lm_head.weight = embedding.weight.T
             ```
         """
         return self.base_model.get_embedding()

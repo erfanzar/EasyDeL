@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue as queue_lib
 import time
 import traceback
 import typing as tp
@@ -769,31 +770,34 @@ class BaseInferenceApiServer(ABC):
     def _start_stream_task(
         self,
         stream_fn: tp.Callable[[], Iterator[tp.Any]],
-    ) -> asyncio.Queue[tuple[str, tp.Any]]:
-        """Run blocking ``stream_fn`` in a worker thread and push results to an asyncio queue."""
+    ) -> tp.Any:
+        """Run blocking ``stream_fn`` in a worker thread and expose async ``get``."""
 
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[str, tp.Any]] = asyncio.Queue()
+        queue: queue_lib.Queue[tuple[str, tp.Any]] = queue_lib.Queue()
+
+        class _AsyncStreamQueue:
+            async def get(self) -> tuple[str, tp.Any]:
+                while True:
+                    try:
+                        return queue.get_nowait()
+                    except queue_lib.Empty:
+                        await asyncio.sleep(0.001)
+
+        def _enqueue(kind: str, payload: tp.Any) -> None:
+            queue.put((kind, payload))
 
         def _producer() -> None:
-            _QUEUE_TIMEOUT = 30  # seconds; prevents indefinite hang if event loop stalls
             try:
                 for output in stream_fn():
-                    asyncio.run_coroutine_threadsafe(queue.put(("data", output)), loop).result(timeout=_QUEUE_TIMEOUT)
+                    _enqueue("data", output)
             except Exception as exc:
                 exc.__stream_producer_traceback__ = traceback.format_exc()
-                try:
-                    asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result(timeout=_QUEUE_TIMEOUT)
-                except Exception:
-                    pass  # If we can't report the error, at least send the end signal
+                _enqueue("error", exc)
             finally:
-                try:
-                    asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result(timeout=_QUEUE_TIMEOUT)
-                except Exception:
-                    pass  # Best-effort; consumer will eventually time out
+                _enqueue("end", None)
 
         self.thread_pool.submit(_producer)
-        return queue
+        return _AsyncStreamQueue()
 
     @staticmethod
     def _normalize_conversation_id(value: tp.Any) -> str | None:

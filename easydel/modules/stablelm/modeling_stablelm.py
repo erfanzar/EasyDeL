@@ -18,12 +18,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -47,7 +46,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .stablelm_configuration import StableLmConfig
 
 
-class StableLmMLP(nn.Module):
+class StableLmMLP(spx.Module):
     """Multi-Layer Perceptron module for StableLM models.
 
     Implements the feedforward network with SwiGLU activation function
@@ -61,7 +60,7 @@ class StableLmMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize StableLM MLP block.
@@ -72,7 +71,7 @@ class StableLmMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -113,7 +112,7 @@ class StableLmMLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -127,7 +126,7 @@ class StableLmMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
@@ -136,12 +135,12 @@ class StableLmMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states
 
 
-class StableLmLayerNormPerHead(nn.Module):
+class StableLmLayerNormPerHead(spx.Module):
     """Layer normalization applied independently to each attention head.
 
     This module normalizes each attention head separately, which can improve
@@ -157,7 +156,7 @@ class StableLmLayerNormPerHead(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize per-head layer normalization.
 
@@ -168,9 +167,9 @@ class StableLmLayerNormPerHead(nn.Module):
             bias (bool, optional): Whether to include bias in LayerNorm. Defaults to False.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
-        self.norms = nn.List(
+        self.norms = nn.ModuleList(
             [
                 LayerNorm(
                     head_dim,
@@ -184,7 +183,7 @@ class StableLmLayerNormPerHead(nn.Module):
             ]
         )
 
-    def __call__(self, hidden_states):
+    def forward(self, hidden_states):
         """Apply layer normalization independently to each head.
 
         Args:
@@ -221,7 +220,7 @@ class StableLmAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize StableLM attention layer with optional Q/K normalization.
@@ -231,7 +230,7 @@ class StableLmAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.qk_layernorm = config.qk_layernorm
@@ -315,7 +314,7 @@ class StableLmAttention(UnifiedAttention):
             base=config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -419,7 +418,7 @@ class StableLmAttention(UnifiedAttention):
         )
 
 
-class StableLmDecoderLayer(nn.Module):
+class StableLmDecoderLayer(spx.Module):
     """Single decoder layer for StableLM models.
 
     Combines multi-head attention and feedforward networks with
@@ -433,7 +432,7 @@ class StableLmDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize StableLM decoder layer.
@@ -443,7 +442,7 @@ class StableLmDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -484,7 +483,7 @@ class StableLmDecoderLayer(nn.Module):
             )
         self.dropout = nn.Dropout(self.config.hidden_dropout, rngs=rngs)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -522,7 +521,7 @@ class StableLmDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         attn_outputs = self.self_attn(
             hidden_states,
@@ -559,7 +558,7 @@ class StableLmDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -589,7 +588,7 @@ class StableLmModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize StableLM base model.
 
@@ -598,7 +597,7 @@ class StableLmModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -624,19 +623,19 @@ class StableLmModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = LayerNorm(
             config.hidden_size,
@@ -661,7 +660,7 @@ class StableLmModel(EasyDeLBaseModule):
             rotary_dim=rotary_emb_dim,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -673,6 +672,7 @@ class StableLmModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through the StableLM base model.
 
@@ -746,29 +746,53 @@ class StableLmModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -833,7 +857,7 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize StableLM model for causal language modeling.
 
@@ -842,7 +866,7 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -855,7 +879,7 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -917,7 +941,7 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None

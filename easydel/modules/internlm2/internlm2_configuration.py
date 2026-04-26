@@ -177,7 +177,6 @@ class InternLM2Config(EasyDeLBaseConfig):
         self.fcm_max_ratio = fcm_max_ratio
         self.rope_scaling = rope_scaling
         self.bits = bits
-        self.scan_layers = scan_layers
         self.attn_implementation = "eager"
         # HF: AttributeError: 'InternLM2Config' object has no attribute 'attn_implementation'.
         # Did you mean: '_attn_implementation'?
@@ -186,6 +185,7 @@ class InternLM2Config(EasyDeLBaseConfig):
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
+            scan_layers=scan_layers,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
@@ -212,7 +212,7 @@ class InternLM2Config(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.

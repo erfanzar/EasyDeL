@@ -17,7 +17,8 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 
-from easydel.trainers.training_utils import make_assertions_and_get_sizes, minibatch_call
+from easydel.trainers import training_utils
+from easydel.trainers.training_utils import compile_trainer_step, make_assertions_and_get_sizes, minibatch_call
 
 
 @dataclasses.dataclass
@@ -82,3 +83,32 @@ def test_minibatch_call_preserves_non_batch_leaves_across_accumulation():
 
     assert jnp.allclose(grads, full_grads)
     assert jnp.allclose(metrics, full_loss)
+
+
+def test_compile_trainer_step_delegates_to_spx_jit(monkeypatch):
+    class _Mesh:
+        is_mpmd = True
+
+    captured = {}
+
+    def fake_jit(fn, **kwargs):
+        captured.update(kwargs)
+
+        def raw(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return raw
+
+    monkeypatch.setattr(training_utils.spx, "jit", fake_jit)
+
+    def fn(x, scale):
+        return {"loss": x * scale, "aux": x + scale}
+
+    compiled = compile_trainer_step(fn, mesh=_Mesh(), static_argnums=(1,), in_shardings=("ignored",))
+    out = compiled(jnp.asarray(2.0), 5.0)
+
+    assert captured["mesh"].is_mpmd
+    assert captured["in_shardings"] == ("ignored",)
+    assert set(out) == {"loss", "aux"}
+    assert float(out["aux"]) == 7.0
+    assert float(out["loss"]) == 10.0

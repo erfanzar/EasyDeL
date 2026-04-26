@@ -17,13 +17,12 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -46,7 +45,7 @@ from .xerxes_configuration import XerxesConfig as XerxesConfig
 logger = get_logger(__name__)
 
 
-class Identity(nn.Module):
+class Identity(spx.Module):
     """No-op module used as a placeholder when optional layers are disabled.
 
     This module returns its input unchanged, serving as a pass-through
@@ -57,7 +56,7 @@ class Identity(nn.Module):
         """Initialize the Identity module (no parameters)."""
         ...
 
-    def __call__(self, x):
+    def forward(self, x):
         """Pass through input unchanged.
 
         Args:
@@ -69,7 +68,7 @@ class Identity(nn.Module):
         return x
 
 
-class PostCross(nn.Module):
+class PostCross(spx.Module):
     """Applies a bounded tanh transform after cross attention.
 
     Implements a soft clipping function that bounds outputs to approximately [-30, 30]
@@ -80,7 +79,7 @@ class PostCross(nn.Module):
         """Initialize the PostCross module (no parameters)."""
         ...
 
-    def __call__(self, x):
+    def forward(self, x):
         """Apply bounded tanh transformation.
 
         Args:
@@ -92,7 +91,7 @@ class PostCross(nn.Module):
         return jax.nn.tanh(x / 30.0) * 30.0
 
 
-class XerxesMLP(nn.Module):
+class XerxesMLP(spx.Module):
     """Multi-Layer Perceptron module for Xerxes models.
 
     Implements the feedforward network with SwiGLU or GELU activation function
@@ -106,7 +105,7 @@ class XerxesMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Xerxes MLP block.
 
@@ -116,7 +115,7 @@ class XerxesMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -125,7 +124,7 @@ class XerxesMLP(nn.Module):
         self.rngs = rngs
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
-        self.act = nn.swish if config.swish_run else functools.partial(nn.gelu, approximate=True)
+        self.act = jax.nn.silu if config.swish_run else functools.partial(jax.nn.gelu, approximate=True)
         column_parallel_linear = functools.partial(
             ColumnParallelLinear,
             use_bias=False,
@@ -160,7 +159,7 @@ class XerxesMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply gated feedforward transformation.
@@ -174,7 +173,7 @@ class XerxesMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -182,7 +181,7 @@ class XerxesMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states
 
@@ -209,7 +208,7 @@ class XerxesAttention(UnifiedAttention):
         causal: bool = True,
         is_cross_attention: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Xerxes attention layer with conditional Q/K normalization.
 
@@ -221,7 +220,7 @@ class XerxesAttention(UnifiedAttention):
             precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
             causal (bool, optional): Whether to use causal attention. Defaults to True.
             is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         # Set sliding window BEFORE super().__init__()
         self.is_local_attn = False
@@ -291,7 +290,7 @@ class XerxesAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class XerxesSparseMoeBlock(nn.Module):
+class XerxesSparseMoeBlock(spx.Module):
     """Sparse Mixture-of-Experts block for Xerxes models.
 
     Implements a top-k routing mechanism where each token is processed by
@@ -305,7 +304,7 @@ class XerxesSparseMoeBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: None | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Xerxes Sparse MoE block.
 
@@ -316,7 +315,7 @@ class XerxesSparseMoeBlock(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.Precision | None, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Raises:
             AssertionError: If config.swish_run is True (incompatible with MoE).
@@ -335,10 +334,10 @@ class XerxesSparseMoeBlock(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
         )
-        self.experts = nn.List(
+        self.experts = nn.ModuleList(
             [
                 XerxesMLP(
                     config=config,
@@ -351,7 +350,7 @@ class XerxesSparseMoeBlock(nn.Module):
             ]
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Apply sparse MoE transformation with top-k expert routing.
 
         Args:
@@ -365,7 +364,7 @@ class XerxesSparseMoeBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
@@ -390,7 +389,7 @@ class XerxesSparseMoeBlock(nn.Module):
         return final_hidden_state, router_logits
 
 
-class XerxesDecoderLayer(nn.Module):
+class XerxesDecoderLayer(spx.Module):
     """Single decoder layer for Xerxes models.
 
     Combines multi-head attention and feedforward networks (or MoE) with
@@ -406,7 +405,7 @@ class XerxesDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Xerxes decoder layer.
 
@@ -416,7 +415,7 @@ class XerxesDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -458,7 +457,7 @@ class XerxesDecoderLayer(nn.Module):
         self.pre_feedforward_layernorm = Identity() if identity else rms()
         self.post_feedforward_layernorm = Identity() if identity else rms()
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -531,7 +530,7 @@ class XerxesDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -563,7 +562,7 @@ class XerxesModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Xerxes base model.
 
@@ -572,7 +571,7 @@ class XerxesModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -597,19 +596,19 @@ class XerxesModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    self.config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        self.config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -639,7 +638,7 @@ class XerxesModel(EasyDeLBaseModule):
 
         return ModuleCaches(frequencies)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -724,11 +723,13 @@ class XerxesModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             inputs_embeds,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         outputs = None
-        for idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, outputs, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -737,24 +738,31 @@ class XerxesModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
                 default_frequencies=self.default_frequencies,
             )
-            hidden_states = outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.layers)
 
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.partition_manager,
+                partition_manager=self.config.runtime_sharding_resolver,
             )
             if output_attentions:
                 all_attentions += (outputs.attention_weight,)
 
-            past_key_values[idx] = outputs.cache_view
+            self._layer_cache_view_update(None, idx, outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, outputs, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, outputs, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, outputs, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)  # pyright: ignore[reportOptionalSubscript]
@@ -822,7 +830,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Xerxes model for causal language modeling.
 
@@ -831,7 +839,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -846,7 +854,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
         identity = config.xe_kvnorm and not config.xe_moe
         self.post_pross = Identity() if identity else PostCross()
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -909,7 +917,7 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         lm_logits = None
         if apply_lm_head:

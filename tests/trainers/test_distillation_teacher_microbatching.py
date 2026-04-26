@@ -103,6 +103,7 @@ class _StudentModule:
 
 class _StudentState:
     def __init__(self):
+        self.model = SimpleNamespace(mesh=None)
         self.graphstate = jnp.asarray(1.0, dtype=jnp.float32)
         self.step = jnp.asarray(0, dtype=jnp.int32)
 
@@ -134,7 +135,7 @@ def test_distillation_teacher_forward_uses_minibatches(monkeypatch):
     monkeypatch.setattr(distill_fn, "minibatch_call", _run_single_minibatch)
     monkeypatch.setattr(distill_fn, "update_state_respectfully", lambda state, gradients, loss_config, metrics: state)
     monkeypatch.setattr(distill_fn, "update_metrics", lambda metrics, learning_rate_fn, step, gradients: metrics)
-    monkeypatch.setattr(distill_fn, "with_sharding_constraint", lambda arr, sharding: arr)
+    monkeypatch.setattr(distill_fn, "with_sharding_constraint", lambda batch, sharding, **kwargs: batch)
 
     _state, metrics = distill_fn.distillation_step(
         student_state=student_state,
@@ -164,7 +165,7 @@ def test_gkd_teacher_forward_uses_minibatches(monkeypatch):
     monkeypatch.setattr(gkd_fn, "minibatch_call", _run_single_minibatch)
     monkeypatch.setattr(gkd_fn, "update_state_respectfully", lambda state, gradients, loss_config, metrics: state)
     monkeypatch.setattr(gkd_fn, "update_metrics", lambda metrics, learning_rate_fn, step, gradients: metrics)
-    monkeypatch.setattr(gkd_fn, "with_sharding_constraint", lambda arr, sharding: arr)
+    monkeypatch.setattr(gkd_fn, "with_sharding_constraint", lambda batch, sharding, **kwargs: batch)
 
     _state, metrics = gkd_fn.gkd_step(
         student_state=student_state,

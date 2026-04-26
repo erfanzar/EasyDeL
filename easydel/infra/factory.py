@@ -419,9 +419,8 @@ class Registry:
         specific task type. The registration includes the module class, its
         associated configuration, and optional metadata about layer names.
 
-        The decorator also sets internal class attributes (``_model_task`` and
-        ``_model_type``) and enhances the ``__str__`` and ``__repr__`` methods
-        using the ``printify_nnx`` utility.
+        The decorator sets internal class attributes (``_model_task`` and
+        ``_model_type``) on the registered module.
 
         Args:
             task_type: The task category for this module. Determines which
@@ -483,10 +482,6 @@ class Registry:
             Returns:
                 The same module class with enhanced attributes and methods.
             """
-            from .mixins.protocol import printify_nnx
-
-            module.__str__ = printify_nnx
-            module.__repr__ = printify_nnx
             module._model_task = task_type
             module._model_type = model_type
             self._task_registry[task_type][model_type] = ModuleRegistration(

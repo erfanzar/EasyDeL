@@ -37,7 +37,8 @@ Usage Example:
     ```python
     import jax
     from easydel import SeedOssConfig, SeedOssForCausalLM
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration
     config = SeedOssConfig(
@@ -58,7 +59,7 @@ Usage Example:
         config=config,
         dtype=jax.numpy.bfloat16,
         param_dtype=jax.numpy.bfloat16,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     # Prepare inputs

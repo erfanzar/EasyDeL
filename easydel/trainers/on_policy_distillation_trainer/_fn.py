@@ -29,10 +29,10 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
-from eformer.escale import with_sharding_constraint
 from jax import Array as JaxArray
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -103,7 +103,7 @@ def on_policy_distillation_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
@@ -119,7 +119,9 @@ def on_policy_distillation_step(
         teacher_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
         if use_chunked:
             teacher_kwargs["apply_lm_head"] = False
-        teacher_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_kwargs)
+        teacher_kwargs = filter_kwargs_for_callable(
+            getattr(teacher_state.model, "forward", teacher_state.model), teacher_kwargs
+        )
         teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
 
         _teacher_static_kw = {
@@ -160,7 +162,7 @@ def on_policy_distillation_step(
         call_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
         if use_chunked:
             call_kwargs["apply_lm_head"] = False
-        call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
 

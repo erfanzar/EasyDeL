@@ -53,7 +53,8 @@ Usage Example:
     )
     import jax
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Configure CLIP with ViT-B/32 vision and text encoders
     vision_config = CLIPVisionConfig(
@@ -79,7 +80,7 @@ Usage Example:
     )
 
     # Initialize full CLIP model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = CLIPModel(config, rngs=rngs)
 
     # Encode image and text

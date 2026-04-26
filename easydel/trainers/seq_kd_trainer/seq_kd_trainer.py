@@ -113,10 +113,10 @@ class SeqKDTrainer(Trainer):
         self.arguments = arguments
 
         if not isinstance(student_model, EasyDeLState):
-            student_model = student_model.to_state()
+            student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
 
         if teacher_model is not None and not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state()
+            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.teacher_state = teacher_model
         self.teacher_fn = teacher_fn

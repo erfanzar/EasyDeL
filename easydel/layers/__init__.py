@@ -15,7 +15,7 @@
 """EasyDeL Layers Module — pure NN building blocks.
 
 This module provides optimized neural network layers and components for building
-deep learning models in JAX/Flax.
+deep learning models in JAX/spectrax.
 
 Submodules:
     attention: FlexibleAttentionModule, UnifiedAttention, AttentionMechanisms

@@ -46,10 +46,10 @@ References:
 
 import jax
 import jax.numpy as jnp
-from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
 from jax import lax
 from jaxtyping import Array, Float
+from spectrax import with_sharding_constraint
 
 from easydel.caching import KDACacheView
 

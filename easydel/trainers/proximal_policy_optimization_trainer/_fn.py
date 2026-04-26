@@ -27,9 +27,9 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
-from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -227,7 +227,7 @@ def ppo_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:

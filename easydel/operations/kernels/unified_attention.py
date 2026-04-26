@@ -27,11 +27,11 @@ Notes:
 from __future__ import annotations
 
 import jax
-from eformer import common_types as ct
 from ejkernel.modules import UnifiedAttentionConfig, unified_attention  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
+from spectrax import common_types as ct
 
 from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, unwrap_metadata
@@ -216,8 +216,8 @@ class UnifiedAttn(OperationImpl):
         # Unwrap OperationsMetadata -> RaggedPagesMetadata (reuses the same runtime fields).
         cache_metadata = unwrap_metadata(cache_metadata, "ragged")
         kv_pages = cache_view.key_cache
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = self.metadata.runtime_sharding_resolver.with_mesh(self.metadata.mesh)
+        resolve = resolver.resolve
 
         sinks_axis = None
 

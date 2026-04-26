@@ -30,8 +30,8 @@ Classes:
 Functions:
     return_type_adjuster: Decorator to adjust return types for type checking
     get_module_repr: Get string representation of module parameters
-    prettify_nnx: Format module structure for display
-    printify_nnx: Create printable representation of NNX modules
+    prettify_module: Format module structure for display
+    printify_module: Create printable representation of spectrax modules
 
 Type Aliases:
     PartitionLike: Type for partition rule specifications
@@ -43,7 +43,7 @@ The protocol includes methods for:
 - Model I/O (saving, loading, HuggingFace Hub integration)
 - Text generation (greedy search, sampling, beam search)
 - Cache management (standard and paged attention)
-- Framework conversion (PyTorch ↔ JAX/Flax)
+- Framework conversion (PyTorch ↔ JAX/spectrax)
 
 Supported model types:
 - Causal Language Models
@@ -79,13 +79,14 @@ import typing as tp
 from abc import ABCMeta, abstractmethod
 from mimetypes import common_types
 
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import Mesh
 from jaxtyping import Array, Bool, Float, Int, Shaped
+from spectrax import nn
 
-from easydel.layers import ParallelLinear, QuantizationConfig
+from easydel.layers import Embed, ParallelLinear, QuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig
 from ..loss_utils import LossConfig, LossMetrics
@@ -158,11 +159,11 @@ if tp.TYPE_CHECKING:
 
 def return_type_adjuster(
     original_return_type: type[_T],
-) -> tp.Callable[[tp.Callable[..., nn.Module]], tp.Callable[..., _T]]:
+) -> tp.Callable[[tp.Callable[..., spx.Module]], tp.Callable[..., _T]]:
     """Decorator factory to adjust return type annotations for type checking.
 
     This decorator is used to cast the return type of a function that returns
-    an nn.Module to a more specific type for improved type checking support
+    an spx.Module to a more specific type for improved type checking support
     in IDEs and static analysis tools.
 
     Args:
@@ -174,13 +175,13 @@ def return_type_adjuster(
 
     Example:
         >>> @return_type_adjuster(MyModelClass)
-        ... def load_model(config) -> nn.Module:
+        ... def load_model(config) -> spx.Module:
         ...     return MyModelClass(config)
         ...
         >>> model = load_model(config)  # Type checker sees MyModelClass
     """
 
-    def decorator(func: tp.Callable[..., nn.Module]) -> tp.Callable[..., _T]:
+    def decorator(func: tp.Callable[..., spx.Module]) -> tp.Callable[..., _T]:
         def wrapper(*args: tp.Any, **kwargs: tp.Any) -> _T:
             return tp.cast(_T, func(*args, **kwargs))
 
@@ -189,15 +190,15 @@ def return_type_adjuster(
     return decorator
 
 
-def get_module_repr(module: nn.Module) -> str:
+def get_module_repr(module: spx.Module) -> str:
     """Get a string representation of module parameters.
 
-    Creates a human-readable string representation of a Flax NNX module,
+    Creates a human-readable string representation of a spectrax module,
     showing key parameters like input/output features for linear layers,
     dropout rates, embedding dimensions, and normalization epsilon values.
 
     Args:
-        module: The Flax NNX module to represent.
+        module: The spectrax module to represent.
 
     Returns:
         A formatted string representation of the module. The format depends
@@ -217,14 +218,14 @@ def get_module_repr(module: nn.Module) -> str:
 
     if isinstance(module, ParallelLinear):
         in_features = (
-            (module.kernel.shape[0] if hasattr(module.kernel, "shape") else "Null")
-            if hasattr(module, "kernel")
+            (module.weight.shape[0] if hasattr(module.weight, "shape") else "Null")
+            if hasattr(module, "weight")
             else getattr(module.kernel_init, "__wrapped__", module.kernel_init).__code__.co_argcount - 1
         )
         out_features = (
             module.features
             if hasattr(module, "features")
-            else (module.kernel.shape[-1] if hasattr(module.kernel, "shape") else "Null")
+            else (module.weight.shape[-1] if hasattr(module.weight, "shape") else "Null")
         )
         use_bias = module.use_bias if hasattr(module, "use_bias") else False
         return f"Linear(in_features={in_features}, out_features={out_features}, bias={use_bias})"
@@ -234,30 +235,33 @@ def get_module_repr(module: nn.Module) -> str:
         return f"Dropout(p={rate})"
 
     elif isinstance(module, nn.Embed):
-        if hasattr(module, "embedding"):
-            num_embeddings, embedding_dim = module.embedding.shape
+        if hasattr(module, "weight"):
+            num_embeddings, embedding_dim = module.weight.shape
+            return f"Embedding({num_embeddings}, {embedding_dim})"
+        return "Embedding(...)"
+    elif isinstance(module, Embed):
+        if hasattr(module, "weight"):
+            num_embeddings, embedding_dim = module.weight.shape
             return f"Embedding({num_embeddings}, {embedding_dim})"
         return "Embedding(...)"
 
     elif hasattr(module, "eps"):
         shape_str = ""
-        if hasattr(module, "kernel"):
-            shape_str = str(tuple(module.kernel.shape))
-        elif hasattr(module, "scale"):
-            shape_str = str(tuple(module.scale.shape))
+        if hasattr(module, "weight"):
+            shape_str = str(tuple(module.weight.shape))
         return f"{module_name}({shape_str}, eps={module.eps})"
 
     return module_name
 
 
-def prettify_nnx(
-    module: nn.Module,
+def prettify_module(
+    module: spx.Module,
     indent: str = "",
     depth: int = 0,
     max_depth: int | None = None,
     module_param=None,
 ) -> str:
-    """Format the structure of a Flax NNX module for display.
+    """Format the structure of a spectrax module for display.
 
     Recursively creates a human-readable representation of a module's
     structure, similar to PyTorch's module printing.
@@ -273,7 +277,7 @@ def prettify_nnx(
         Formatted string representation of the module hierarchy.
 
     Example:
-        >>> print(prettify_nnx(my_model, max_depth=2))
+        >>> print(prettify_module(my_model, max_depth=2))
         MyModel(
           (encoder): Encoder(
             (layers): ModuleList(...)
@@ -297,7 +301,7 @@ def prettify_nnx(
         params_children = {}
 
     if children or any(
-        isinstance(value, list) and all(isinstance(item, nn.Module) for item in value)
+        isinstance(value, list) and all(isinstance(item, spx.Module) for item in value)
         for value in module.__dict__.values()
     ):
         output.append(current_line + "(")
@@ -305,7 +309,7 @@ def prettify_nnx(
 
         for key, child in children:
             child_param = params_children.get(key, None)
-            child_str = prettify_nnx(
+            child_str = prettify_module(
                 child,
                 new_indent,
                 depth + 1,
@@ -315,7 +319,7 @@ def prettify_nnx(
             output.append(f"{new_indent}({key}): {child_str}")
 
         for key, value in module.__dict__.items():
-            if isinstance(value, list) and all(isinstance(item, nn.Module) for item in value):
+            if isinstance(value, list) and all(isinstance(item, spx.Module) for item in value):
                 output.append(f"{new_indent}({key}): ModuleList(")
 
                 if value:
@@ -323,7 +327,7 @@ def prettify_nnx(
                     item_param = params_children.get(key, [None])[0] if params_children else None
 
                     if len(value) > 1:
-                        child_str = prettify_nnx(
+                        child_str = prettify_module(
                             first_item,
                             new_indent + "  ",
                             depth + 1,
@@ -332,7 +336,7 @@ def prettify_nnx(
                         ).lstrip()
                         output.append(f"{new_indent}  (0-{len(value) - 1}): {len(value)} x {child_str}")
                     else:
-                        child_str = prettify_nnx(
+                        child_str = prettify_module(
                             first_item,
                             new_indent + "  ",
                             depth + 1,
@@ -391,7 +395,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         - gather_model: Collect distributed parameters
         - quantize: Apply quantization to model weights
         - apply_lora_to_layers: Add LoRA adapters
-        - merge_lora_params/split_lora_params: Manage LoRA parameters
+        - merge_lora_parameters/split_lora_parameters: Manage LoRA parameters
 
     Serialization:
         - save_pretrained: Save model to disk
@@ -901,7 +905,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutputWithPoolingAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+            BaseModelOutputWithPoolingAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions.
+        """
 
     @tp.overload
     def __call__(
@@ -1312,7 +1317,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             **kwargs: Additional keyword arguments forwarded to the model.
 
         Returns:
-            ModelOutput: Backbone output with last_hidden_state, optional hidden_states/attentions, and multimodal metadata."""
+            ModelOutput: Backbone output with last_hidden_state, optional hidden_states/attentions, and multimodal metadata.
+        """
 
     @tp.overload
     def __call__(
@@ -1366,7 +1372,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutputWithPastAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+            BaseModelOutputWithPastAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions.
+        """
 
     @tp.overload
     def __call__(
@@ -2124,7 +2131,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutputWithPoolingAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+            BaseModelOutputWithPoolingAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions.
+        """
 
     @tp.overload
     def mesh_call(
@@ -2560,7 +2568,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             **kwargs: Additional keyword arguments forwarded to the model.
 
         Returns:
-            ModelOutput: Backbone output with last_hidden_state, optional hidden_states/attentions, and multimodal metadata."""
+            ModelOutput: Backbone output with last_hidden_state, optional hidden_states/attentions, and multimodal metadata.
+        """
 
     @tp.overload
     def mesh_call(
@@ -2620,7 +2629,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutputWithPastAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+            BaseModelOutputWithPastAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions.
+        """
 
     @tp.overload
     def mesh_call(
@@ -2930,40 +2940,52 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def graphdef(self) -> nn.GraphDef:
+    def graphdef(self) -> spx.GraphDef:
         """Returns the static graph definition of the model.
 
         The graphdef contains the model's structure without any variable data,
         used for JAX transformations and serialization.
 
         Returns:
-            nn.GraphDef: The Flax NNX graph definition.
+            spx.GraphDef: The spectrax graph definition.
         """
         ...
 
     @property
     @abstractmethod
-    def graphstate(self) -> nn.GraphState:
-        """Returns the trainable state (parameters) of the model.
+    def default_trainable_selector(self) -> spx.SelectorSugar:
+        """Returns the canonical selector used for ``graphstate`` extraction."""
+        ...
 
-        The graphstate contains all trainable parameters like weights and biases
-        that are updated during training.
+    @property
+    @abstractmethod
+    def parameters(self) -> spx.State:
+        """Returns the default selected trainable state of the model."""
+        ...
+
+    @property
+    @abstractmethod
+    def graphstate(self) -> spx.State:
+        """Returns the default selected trainable state of the model.
+
+        The graphstate mirrors :attr:`parameters` and is defined by
+        :attr:`default_trainable_selector`.
 
         Returns:
-            nn.GraphState: The trainable state containing model parameters.
+            spx.State: The selected trainable state containing model parameters.
         """
         ...
 
     @property
     @abstractmethod
-    def graphother(self) -> nn.GraphState:
-        """Returns the non-trainable state of the model.
+    def graphother(self) -> spx.State:
+        """Returns the remainder of the model state not included in graphstate.
 
-        The graphother contains non-trainable state like batch normalization
-        statistics, RNG keys, and other mutable but non-optimized state.
+        The graphother contains every collection excluded from the default
+        trainable selector.
 
         Returns:
-            nn.GraphState: The non-trainable state of the model.
+            spx.State: The remainder of the model state.
         """
         ...
 
@@ -3071,7 +3093,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             mesh (jax.sharding.Mesh, optional): The mesh to shard across.
 
         Returns:
-            nn.Module: The sharded model.
+            spx.Module: The sharded model.
         """
 
     @abstractmethod
@@ -3087,7 +3109,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             mesh (jax.sharding.Mesh, optional): The mesh to gather from.
 
         Returns:
-            nn.Module: The gathered model.
+            spx.Module: The gathered model.
         """
 
     @property
@@ -3114,7 +3136,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    def to_state(self) -> EasyDeLState:
+    def to_state(
+        self,
+        state_class: type[EasyDeLState] | None = None,
+        *,
+        trainable_selector: spx.SelectorSugar | None = None,
+    ) -> EasyDeLState:
         """Convert the current model to an EasyDeLState object.
 
         Creates a state object that encapsulates the model's parameters,
@@ -3130,7 +3157,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     def to_torch(self) -> PreTrainedModel:
         """Convert the current EasyDeL model to a HuggingFace PyTorch model.
 
-        Transforms the JAX/Flax model parameters into their PyTorch equivalents
+        Transforms the JAX/spectrax model parameters into their PyTorch equivalents
         and returns a compatible HuggingFace PreTrainedModel instance.
 
         Returns:
@@ -3171,7 +3198,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @classmethod
     @abstractmethod
     def lazy_init(cls: type[Self], *args, **kwargs) -> Self:
-        """Initialize the model lazily using nnx.eval_shape.
+        """Initialize the model lazily using spx.eval_shape.
 
         Creates a model instance without actually allocating memory for
         parameters. This is useful for determining model structure and
@@ -3193,7 +3220,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         lora_rank: int,
         lora_pattern: str | None = None,
         verbose: bool = False,
-        rngs: nn.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ) -> Self:
         """Apply LoRA (Low-Rank Adaptation) to specified linear layers.
 
@@ -3209,7 +3236,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
                 (typically attention projections).
             verbose: If True, prints information about which layers are
                 being modified.
-            rngs: Optional Flax random number generators for initializing
+            rngs: Optional SpecTrax random number generators for initializing
                 LoRA parameters.
 
         Returns:
@@ -3218,7 +3245,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def merge_lora_params(self: Self, pytree: dict) -> Self:
+    def merge_lora_parameters(self: Self, pytree: dict) -> Self:
         """Merge LoRA parameters into the base model parameters.
 
         Combines the low-rank adaptation matrices with the original weights
@@ -3234,7 +3261,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def split_lora_params(self: Self) -> dict:  # pyright: ignore[reportInvalidTypeVarUse]
+    def split_lora_parameters(self: Self) -> dict:  # pyright: ignore[reportInvalidTypeVarUse]
         """Split LoRA parameters from the base model parameters.
 
         Extracts the LoRA adaptation matrices from the model, returning
@@ -3289,7 +3316,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def params_sharding(self) -> dict:
+    def parameters_sharding(self) -> dict:
         """Get the sharding specification for model parameters.
 
         Returns a dictionary mapping parameter paths to their sharding
@@ -3302,7 +3329,23 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def merge_params(self, tree):
+    def parameter_values(
+        self,
+        *,
+        selector: spx.SelectorSugar | None = None,
+        extract_fn: tp.Callable | None = None,
+        remove_none: bool = True,
+    ) -> dict[str, tp.Any]:
+        """Return a flat ``path -> array`` mapping for the selected trainables."""
+        ...
+
+    @abstractmethod
+    def merge_parameters(
+        self,
+        tree: spx.State,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> Self:
         """Merge a parameter tree into the current model.
 
         Updates the model's parameters with values from the provided
@@ -3314,7 +3357,10 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def split_params(self):
+    def split_parameters(
+        self,
+        selector: spx.SelectorSugar | None = None,
+    ) -> spx.State:
         """Split the model into its parameter tree.
 
         Extracts the model's parameters as a pytree structure that can
@@ -3326,31 +3372,19 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def split_params_dict(
+    def merge_parameter_values(
         self,
-        params_dict: dict,
-    ) -> dict:
-        """Split model parameters from a dictionary into state components.
-
-        Takes a flat parameter dictionary and organizes it into separate
-        state components (trainable params, non-trainable state, etc.).
-
-        Args:
-            params_dict: A dictionary of model parameters.
-
-        Returns:
-            dict: A dictionary with parameters organized by state type.
-        """
-
-    @abstractmethod
-    def merge_params_dict(self, params_dict: dict):
+        parameter_values: dict,
+        *,
+        selector: spx.SelectorSugar | None = None,
+    ) -> Self:
         """Merge model parameters from a dictionary into the current model.
 
         Takes a dictionary of parameters and updates the model's internal
         state with these values.
 
         Args:
-            params_dict: A dictionary of parameters to merge.
+            parameter_values: A dictionary of parameter values to merge.
         """
 
     @abstractmethod
@@ -3595,35 +3629,17 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """
         ...
 
-    def __str__(self) -> str:
-        """Return a human-readable string representation of the model.
 
-        Returns:
-            str: A formatted string showing the model's structure and layers,
-            prefixed with "EasyDeL-".
-        """
-        return printify_nnx(self)
+def printify_module(model: spx.Module) -> str:
+    """Create a printable string representation of an EasyDeL spectrax module.
 
-    def __repr__(self) -> str:
-        """Return a detailed string representation of the model.
-
-        Returns:
-            str: A formatted string showing the model's structure and layers,
-            prefixed with "EasyDeL-".
-        """
-        return printify_nnx(self)
-
-
-def printify_nnx(model: nn.Module) -> str:
-    """Create a printable string representation of an EasyDeL NNX module.
-
-    This function wraps prettify_nnx to create a standardized string
+    This function wraps prettify_module to create a standardized string
     representation prefixed with "EasyDeL-". It handles edge cases
     gracefully by returning a fallback string if the module cannot
     be properly formatted.
 
     Args:
-        model: The Flax NNX module to create a string representation for.
+        model: The spectrax module to create a string representation for.
 
     Returns:
         A string representation of the model prefixed with "EasyDeL-".
@@ -3632,7 +3648,7 @@ def printify_nnx(model: nn.Module) -> str:
 
     Example:
         >>> model = LlamaForCausalLM(config)
-        >>> print(printify_nnx(model))
+        >>> print(printify_module(model))
         EasyDeL-LlamaForCausalLM(
           (model): LlamaModel(
             (embed_tokens): Embedding(32000, 4096)
@@ -3641,6 +3657,6 @@ def printify_nnx(model: nn.Module) -> str:
         )
     """
     try:
-        return "EasyDeL-" + prettify_nnx(model)
+        return "EasyDeL-" + prettify_module(model)
     except AttributeError:
         return "EasyDeL-Partitions"

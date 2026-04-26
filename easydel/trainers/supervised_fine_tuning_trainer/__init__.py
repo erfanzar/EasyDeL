@@ -31,7 +31,7 @@ Key Features:
 - Response template masking for instruction tuning
 - Gradient accumulation and mixed precision training
 - LoRA and QLoRA support for parameter-efficient fine-tuning
-- Integration with JAX/Flax for distributed training
+- Integration with JAX/spectrax for distributed training
 
 Example:
     >>> from easydel.trainers import SFTConfig, SFTTrainer

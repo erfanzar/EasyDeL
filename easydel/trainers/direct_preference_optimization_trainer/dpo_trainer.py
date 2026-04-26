@@ -17,24 +17,22 @@ import typing as tp
 from collections import defaultdict
 from functools import partial
 
-import jax
 import numpy as np
 from eformer.loggings import get_logger
-from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.traversals import deepcopy_model
 
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..prompt_transforms import DPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DataCollatorForPreferenceGrain, DataCollatorForPreferenceTFDS
 from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
@@ -157,11 +155,11 @@ class DPOTrainer(Trainer):
 
         # Setup models
         if not isinstance(model, EasyDeLState):
-            model = model.to_state()
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
         if reference_model is None:
             reference_model = deepcopy_model(model)
         if not isinstance(reference_model, EasyDeLState):
-            reference_model = reference_model.to_state()
+            reference_model = reference_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.reference_state: EasyDeLState | None = reference_model
 
@@ -237,7 +235,7 @@ class DPOTrainer(Trainer):
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Configure and JIT-compile training and evaluation step functions."""
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -258,8 +256,9 @@ class DPOTrainer(Trainer):
             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
 
-        jited_concatenated_forward = ejit(
+        jited_concatenated_forward = compile_trainer_auxiliary(
             partial_concatenated_forward,
+            mesh=mesh,
             out_shardings=(empty_sharding,),
             static_argnames=(
                 "is_encoder_decoder",
@@ -286,7 +285,7 @@ class DPOTrainer(Trainer):
         )
 
         sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             training_step,
             in_shardings=(
                 self.state_shardings,
@@ -308,7 +307,7 @@ class DPOTrainer(Trainer):
         )
 
         sharded_evaluation_static_argnums = (3, 4, 5, 6, 7)
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(
                 self.state_shardings,

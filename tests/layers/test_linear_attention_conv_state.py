@@ -14,7 +14,8 @@
 
 import jax
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
 
@@ -24,16 +25,15 @@ def _make_depthwise_conv(
     in_features: int = 4,
     kernel_size: int = 4,
     dtype: jnp.dtype = jnp.float32,
-) -> nn.Conv:
-    return nn.Conv(
-        in_features=in_features,
-        out_features=in_features,
-        kernel_size=(kernel_size,),
-        feature_group_count=in_features,
+) -> nn.Conv1d:
+    return nn.Conv1d(
+        in_channels=in_features,
+        out_channels=in_features,
+        kernel_size=kernel_size,
+        groups=in_features,
         use_bias=False,
         dtype=dtype,
-        param_dtype=dtype,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
 
@@ -52,7 +52,7 @@ def test_apply_conv_with_state_decode_matches_manual_cached_depthwise_conv():
     )
 
     expected_state = jnp.concatenate((conv_state[:, :, 1:], x[:, 0, :][..., None]), axis=-1)
-    kernel = conv.kernel.value.squeeze(1).T
+    kernel = conv.weight.value.squeeze(1).T
     expected_output = jax.nn.silu(jnp.sum(expected_state * kernel[None, :, :], axis=-1))[:, None, :]
 
     assert jnp.allclose(new_state, expected_state)

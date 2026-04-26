@@ -78,16 +78,14 @@ from dataclasses import fields
 from functools import reduce
 from operator import mul
 
-import flax
-import flax.struct
 import jax
 import jax.numpy as jnp
-from eformer.escale import PartitionAxis
-from eformer.escale.partition.constraints import with_sharding_constraint
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from jax import lax
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
+from spectrax import PartitionAxis, with_sharding_constraint
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -99,7 +97,7 @@ class LossForwardPlan:
     A frozen dataclass that communicates how the forward pass should be
     configured before the loss is computed. Strategies inspect the model,
     labels, and config in ``plan_forward`` and return a plan whose
-    ``forward_kwargs`` are merged into the model's ``__call__`` invocation.
+    ``forward_kwargs`` are merged into the model invocation.
 
     For example, ``CausalLMLossStrategy`` returns
     ``LossForwardPlan(forward_kwargs={"apply_lm_head": False})`` so that
@@ -481,9 +479,9 @@ class LossMetrics:
     weight_sum: float | Array | None = None
     accuracy: float | Array | None = None
     learning_rate: float | Array | None = None
-    max_grad_norm: flax.struct.PyTreeNode | None = None
-    mean_grad_norm: flax.struct.PyTreeNode | None = None
-    grad_norms: flax.struct.PyTreeNode | None = None
+    max_grad_norm: spx.Module | None = None
+    mean_grad_norm: spx.Module | None = None
+    grad_norms: spx.Module | None = None
     chosen_rewards: jax.Array | None = None
     rejected_rewards: jax.Array | None = None
     other_metrics: collections.abc.Mapping[str, jax.Array] | None = None
@@ -2377,7 +2375,7 @@ def _should_chunk_causal_lm_loss(
 
     * ``labels`` is not ``None`` and has at least 2 dimensions.
     * The module supports the chunked protocol (has ``compute_lm_logits``
-      and an ``apply_lm_head`` parameter in ``__call__``).
+      and an ``apply_lm_head`` parameter in ``forward``).
     * The loss config does not use features incompatible with the chunked
       path (custom ``reduction``, ``divide_weight_sum``, or per-sequence
       normalizing factors).
@@ -2429,7 +2427,7 @@ def _supports_chunked_causal_lm_forward(module: tp.Any) -> bool:
 
     1. A ``compute_lm_logits`` method that projects hidden states to vocab
        logits (used as the per-chunk LM-head callable).
-    2. An ``apply_lm_head`` parameter in ``__call__`` so the forward pass
+    2. An ``apply_lm_head`` parameter in ``forward`` so the forward pass
        can be told to skip the built-in LM-head projection.
 
     Args:
@@ -2441,8 +2439,13 @@ def _supports_chunked_causal_lm_forward(module: tp.Any) -> bool:
     if not hasattr(module, "compute_lm_logits"):
         return False
 
+    forward = getattr(module, "forward", None)
+    if forward is None and callable(module):
+        forward = module
+    if forward is None:
+        return False
     try:
-        call_signature = inspect.signature(module.__call__)
+        call_signature = inspect.signature(forward)
     except (TypeError, ValueError):
         return False
     return "apply_lm_head" in call_signature.parameters
@@ -2527,13 +2530,13 @@ class CausalLMLossStrategy(BaseLossStrategy):
             TypeError: If the chunked path was selected but the model did
                 not return ``last_hidden_state``.
         """
-        del paxis
+        effective_paxis = None if module.mesh.is_mpmd else (paxis or module.config.partition_axis)
         last_hidden_state = getattr(outputs, "last_hidden_state", None)
         if forward_plan.forward_kwargs.get("apply_lm_head", True):
             return ForCausalLMLoss(
                 labels=labels,
                 config=loss_config,
-                paxis=module.config.partition_axis,
+                paxis=effective_paxis,
                 **loss_kwargs,
                 **outputs,
                 **batch,
@@ -2559,7 +2562,7 @@ class CausalLMLossStrategy(BaseLossStrategy):
         )
 
         # Use the trace-safe projection bypass.  module.compute_lm_logits
-        # goes through lm_head.__call__ which carries nn.remat — calling it
+        # goes through lm_head.forward which carries nn.remat — calling it
         # from inside fori_loop / jax.checkpoint triggers TraceContextError.
         _lm_head_fn = module.make_lm_head_fn() if hasattr(module, "make_lm_head_fn") else module.compute_lm_logits
 

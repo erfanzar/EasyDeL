@@ -106,7 +106,7 @@ Usage Example:
                      for i in range(48)],
     )
 
-    model = KimiLinearForCausalLM(config, rngs=nnx.Rngs(0))
+    model = KimiLinearForCausalLM(config, rngs=spx.Rngs(0))
 
     # Forward pass
     input_ids = jnp.array([[1, 2, 3, 4, 5]])

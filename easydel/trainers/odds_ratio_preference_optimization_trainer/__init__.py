@@ -30,7 +30,7 @@ Key Features:
 - Implicit reward modeling through log-odds differences
 - Support for both classification and ranking objectives
 - Efficient batch processing with gradient accumulation
-- Integration with JAX/Flax for distributed training
+- Integration with JAX/spectrax for distributed training
 
 Example:
     >>> from easydel.trainers import ORPOConfig, ORPOTrainer

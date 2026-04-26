@@ -16,14 +16,13 @@
 import functools
 from typing import ClassVar
 
-import jax.lax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import jax
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -47,7 +46,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .phi_configuration import PhiConfig
 
 
-class PhiMLP(nn.Module):
+class PhiMLP(spx.Module):
     """Multi-Layer Perceptron module for Phi models.
 
     Implements the feedforward network with configurable activation function
@@ -63,7 +62,7 @@ class PhiMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Phi MLP block.
 
@@ -74,7 +73,7 @@ class PhiMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.Precision | None, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -86,7 +85,7 @@ class PhiMLP(nn.Module):
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -95,7 +94,7 @@ class PhiMLP(nn.Module):
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -103,7 +102,7 @@ class PhiMLP(nn.Module):
         )
         self.act = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply feedforward transformation.
@@ -117,14 +116,14 @@ class PhiMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act(self.fc1(hidden_states)), "mlp_gate")
         hidden_states = checkpoint_name(self.fc2(gate), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -157,7 +156,7 @@ class PhiAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Phi attention layer with partial RoPE and optional Q/K normalization.
 
@@ -167,7 +166,7 @@ class PhiAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.qk_layernorm = config.qk_layernorm
         config.attention_bias = True
@@ -252,8 +251,8 @@ class PhiAttention(UnifiedAttention):
         """
         return config.get_basic_rope(
             dtype,
-            head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
-            rotary_dim=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
         )
 
     def _preprocess_qkv(self, query_states, key_states, value_states):
@@ -274,7 +273,7 @@ class PhiAttention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class PhiDecoderLayer(nn.Module):
+class PhiDecoderLayer(spx.Module):
     """Single decoder layer for Phi models.
 
     Combines multi-head attention and feedforward networks with parallel
@@ -291,7 +290,7 @@ class PhiDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Phi decoder layer.
 
@@ -301,7 +300,7 @@ class PhiDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -335,7 +334,7 @@ class PhiDecoderLayer(nn.Module):
         )
         self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -372,7 +371,7 @@ class PhiDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -402,7 +401,7 @@ class PhiDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -433,7 +432,7 @@ class PhiModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Phi base model.
 
@@ -442,7 +441,7 @@ class PhiModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -468,19 +467,21 @@ class PhiModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    layer_idx=idx,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for idx in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_idx=idx,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(self.config.num_hidden_layers)
-            ]
-        )
+        if self.config.scan_layers and self._pipeline_stage_count() == 1:
+            self.layers = self.layers.stack()
         self.final_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -498,15 +499,11 @@ class PhiModel(EasyDeLBaseModule):
             determined by partial_rotary_factor and head dimension.
         """
         return self.config.get_basic_frequencies(
-            head_size=int(
-                self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
-            ),
-            rotary_dim=int(
-                self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
-            ),
+            head_size=self.config.head_dim,
+            rotary_dim=self.config.head_dim,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -518,6 +515,7 @@ class PhiModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Performs a forward pass through the Phi transformer model.
 
@@ -596,29 +594,54 @@ class PhiModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        frequencies = self.config.get_basic_frequencies()
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
-                frequencies=self.frequencies,
+                frequencies=frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.final_layernorm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -685,7 +708,7 @@ class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Phi model for causal language modeling.
 
@@ -694,7 +717,7 @@ class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -707,7 +730,7 @@ class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
             lm_head_bias=True,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

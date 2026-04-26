@@ -49,12 +49,12 @@ from __future__ import annotations
 import typing as tp
 
 import jax
-from eformer import escale as es
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import PartitionAxis
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
@@ -73,7 +73,7 @@ class LightningCacheConfig(BaseCacheConfig):
     transformer cache but optimized for Lightning's memory access patterns.
 
     Attributes:
-        partition_axis (es.PartitionAxis): Axis configuration for tensor partitioning.
+        partition_axis (PartitionAxis): Axis configuration for tensor partitioning.
             Defines how tensors are sharded across devices.
         batch_size (int | None): Number of sequences in batch.
             None allows dynamic batch sizes.
@@ -91,7 +91,7 @@ class LightningCacheConfig(BaseCacheConfig):
             Can differ from head_dim for asymmetric attention.
     """
 
-    partition_axis: es.PartitionAxis = field(pytree_node=False)
+    partition_axis: PartitionAxis = field(pytree_node=False)
     batch_size: int | None = field(pytree_node=False)
     num_heads: int | None = field(pytree_node=False)
     head_dim: int | None = field(pytree_node=False)
@@ -103,7 +103,7 @@ class LightningCacheConfig(BaseCacheConfig):
     @classmethod
     def create(
         cls,
-        partition_axis: es.PartitionAxis,
+        partition_axis: PartitionAxis,
         batch_size: int | None = None,
         num_heads: int | None = None,
         head_dim: int | None = None,
@@ -119,7 +119,7 @@ class LightningCacheConfig(BaseCacheConfig):
         flexibility in parameters as it handles unified KV tensors.
 
         Args:
-            partition_axis (es.PartitionAxis): Tensor partitioning configuration.
+            partition_axis (PartitionAxis): Tensor partitioning configuration.
             batch_size (int | None): Batch size for cache allocation.
                 None for dynamic batching.
             num_heads (int | None): Number of attention heads.

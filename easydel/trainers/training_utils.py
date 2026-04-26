@@ -18,6 +18,7 @@ import typing as tp
 import warnings
 
 import jax
+import spectrax as spx
 from jax import lax
 from jax import numpy as jnp
 from jax import tree_util as tu
@@ -29,6 +30,7 @@ from easydel.utils.helpers import check_bool_flag
 
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
+_UNSPECIFIED = object()
 
 QuantizationMode = tp.Literal[
     "nf4",
@@ -763,6 +765,81 @@ def make_assertions_and_get_sizes(
     if batch_partition_spec is None:
         batch_partition_spec = PartitionSpec(("dp", "fsdp"), "sp")
     return batch_size, minibatch_size, batch_partition_spec
+
+
+def _normalize_static_argnums(static_argnums: int | tp.Sequence[int] | None) -> tuple[int, ...]:
+    if static_argnums is None:
+        return ()
+    if isinstance(static_argnums, int):
+        return (static_argnums,)
+    return tuple(static_argnums)
+
+
+def _normalize_static_argnames(static_argnames: str | tp.Iterable[str] | None) -> tuple[str, ...]:
+    if static_argnames is None:
+        return ()
+    if isinstance(static_argnames, str):
+        return (static_argnames,)
+    return tuple(static_argnames)
+
+
+def compile_trainer_step(
+    fn: tp.Callable[..., tp.Any],
+    *,
+    mutable: tp.Any = (),
+    mesh: tp.Any | None = None,
+    schedule: tp.Any | None = None,
+    in_shardings: tp.Any = _UNSPECIFIED,
+    out_shardings: tp.Any = _UNSPECIFIED,
+    static_argnums: int | tp.Sequence[int] | None = None,
+    static_argnames: str | tp.Iterable[str] | None = None,
+    donate_argnums: int | tp.Sequence[int] | None = None,
+    donate_argnames: str | tp.Iterable[str] | None = None,
+    keep_unused: bool = False,
+    **jit_kwargs,
+) -> tp.Callable[..., tp.Any]:
+    """Compile a trainer step with the SpectraX MPMD path when the mesh requires it."""
+
+    static_nums = _normalize_static_argnums(static_argnums)
+    kwargs = {
+        "mutable": mutable,
+        "static_argnums": static_argnums,
+        "static_argnames": static_argnames,
+        "donate_argnums": donate_argnums,
+        "donate_argnames": donate_argnames,
+        "keep_unused": keep_unused,
+        **jit_kwargs,
+    }
+    if schedule is not None:
+        kwargs["schedule"] = schedule
+    if mesh is not None:
+        kwargs["mesh"] = mesh
+    if in_shardings is not _UNSPECIFIED:
+        kwargs["in_shardings"] = in_shardings
+    if out_shardings is not _UNSPECIFIED:
+        kwargs["out_shardings"] = out_shardings
+    compiled = spx.jit(fn, **kwargs)
+    compiled.static_argnums_ = static_nums
+    return compiled
+
+
+def compile_trainer_auxiliary(
+    fn: tp.Callable[..., tp.Any],
+    *,
+    mesh: tp.Any | None = None,
+    in_shardings: tp.Any = _UNSPECIFIED,
+    out_shardings: tp.Any = _UNSPECIFIED,
+    **jit_kwargs,
+) -> tp.Callable[..., tp.Any]:
+    """Compile nested trainer helpers through the same SpectraX jit surface."""
+
+    return compile_trainer_step(
+        fn,
+        mesh=mesh,
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+        **jit_kwargs,
+    )
 
 
 def _infer_batch_size(batch: tp.Any) -> int:

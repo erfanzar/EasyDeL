@@ -71,7 +71,7 @@ Usage Example:
         first_k_dense_replace=1,  # First layer is dense
     )
 
-    model = Glm4MoeForCausalLM(config, rngs=nnx.Rngs(0))
+    model = Glm4MoeForCausalLM(config, rngs=spx.Rngs(0))
 
     # Forward pass
     input_ids = jnp.array([[1, 2, 3, 4, 5]])

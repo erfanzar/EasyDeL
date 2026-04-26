@@ -38,25 +38,25 @@ class TestToFromPretrainedKwargs:
     def test_sharding_defaults(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_from_pretrained_kwargs(cfg)
-        assert result["sharding_axis_dims"] == (1, 1, 1, -1, 1)
-        assert result["sharding_axis_names"] == ("dp", "fsdp", "ep", "tp", "sp")
+        assert result["sharding_axis_dims"] == (1, 1, 1, 1, -1, 1)
+        assert result["sharding_axis_names"] == ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
     def test_custom_sharding(self):
         cfg = {
             "model": {"name_or_path": "test-model"},
-            "sharding": {"axis_dims": [2, 1, 1, 4, 1], "auto_shard_model": False},
+            "sharding": {"axis_dims": [1, 2, 1, 1, 4, 1], "auto_shard_model": False},
         }
         result = to_from_pretrained_kwargs(cfg)
-        assert result["sharding_axis_dims"] == (2, 1, 1, 4, 1)
+        assert result["sharding_axis_dims"] == (1, 2, 1, 1, 4, 1)
         assert result["auto_shard_model"] is False
 
     def test_dcn_axis_dims(self):
         cfg = {
             "model": {"name_or_path": "test-model"},
-            "sharding": {"dcn_axis_dims": [2, 2, 1, 1, 1]},
+            "sharding": {"dcn_axis_dims": [1, 2, 2, 1, 1, 1]},
         }
         result = to_from_pretrained_kwargs(cfg)
-        assert result["sharding_dcn_axis_dims"] == (2, 2, 1, 1, 1)
+        assert result["sharding_dcn_axis_dims"] == (1, 2, 2, 1, 1, 1)
 
     def test_dcn_axis_dims_none(self):
         cfg = {"model": {"name_or_path": "test-model"}}
@@ -228,10 +228,10 @@ class TestToEsurgeKwargs:
     def test_sharding_axis_dims(self):
         cfg = {
             "model": {"name_or_path": "test-model"},
-            "esurge": {"sharding_axis_dims": [2, 1, 1, 4, 1]},
+            "esurge": {"sharding_axis_dims": [1, 2, 1, 1, 4, 1]},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["sharding_axis_dims"] == (2, 1, 1, 4, 1)
+        assert result["sharding_axis_dims"] == (1, 2, 1, 1, 4, 1)
 
     def test_sharding_axis_dims_none(self):
         cfg = {

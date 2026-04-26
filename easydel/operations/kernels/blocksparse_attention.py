@@ -64,7 +64,6 @@ from __future__ import annotations
 import typing as tp
 
 import jax
-from eformer import common_types
 from eformer.loggings import get_logger
 from ejkernel.modules import blocksparse_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -72,6 +71,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata

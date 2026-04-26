@@ -117,6 +117,7 @@ def make_vlm_inputs(
     mm_token_type_ids: bool = False,
     image_grid_hws: np.ndarray | None = None,
     image_grid_thw: np.ndarray | None = None,
+    image_position_ids: np.ndarray | None = None,
     video_grid_thw: np.ndarray | None = None,
     seed: int = 42,
 ) -> dict:
@@ -137,6 +138,8 @@ def make_vlm_inputs(
             accept `image_grid_hws` (e.g. Gemma3).
         image_grid_thw: Optional per-image (temporal, height, width) grid for
             models that accept `image_grid_thw` (e.g. GLM/Qwen style patch grids).
+        image_position_ids: Optional per-image patch coordinates for models that
+            require explicit 2D image positions (e.g. Gemma4).
         video_grid_thw: Optional per-video (temporal, height, width) grid for
             models that accept `video_grid_thw`.
         seed: Random seed
@@ -213,6 +216,11 @@ def make_vlm_inputs(
         image_grid_thw = np.asarray(image_grid_thw, dtype=np.int64)
         result["torch"]["image_grid_thw"] = torch.from_numpy(image_grid_thw).to(torch.long)
         result["jax"]["image_grid_thw"] = jnp.asarray(image_grid_thw, dtype="i4")
+
+    if image_position_ids is not None:
+        image_position_ids = np.asarray(image_position_ids, dtype=np.int64)
+        result["torch"]["image_position_ids"] = torch.from_numpy(image_position_ids).to(torch.long)
+        result["jax"]["image_position_ids"] = jnp.asarray(image_position_ids, dtype="i4")
 
     if video_grid_thw is not None:
         video_grid_thw = np.asarray(video_grid_thw, dtype=np.int64)

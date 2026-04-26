@@ -14,12 +14,11 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -91,7 +90,7 @@ class Glm4vMoeTextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize text decoder attention layer.
@@ -101,7 +100,7 @@ class Glm4vMoeTextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         super().__init__(
@@ -122,7 +121,7 @@ class Glm4vMoeTextAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> RowParallelLinear:
         """Create the output projection layer without bias.
 
@@ -131,7 +130,7 @@ class Glm4vMoeTextAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision for operations.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RowParallelLinear: Output projection layer.
@@ -158,7 +157,7 @@ class Glm4vMoeTextAttention(UnifiedAttention):
         )
 
 
-class Glm4vMoeTextDecoderLayer(nn.Module):
+class Glm4vMoeTextDecoderLayer(spx.Module):
     """Single decoder block for GLM4V-MoE with attention and MoE MLP.
 
     Implements a transformer decoder layer with pre-normalization,
@@ -174,7 +173,7 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize text decoder layer.
@@ -184,7 +183,7 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder. Determines whether
                 to use dense MLP or MoE based on first_k_dense_replace config.
         """
@@ -217,7 +216,7 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -275,7 +274,7 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -328,7 +327,7 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V-MoE text decoder.
 
@@ -338,7 +337,7 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -361,22 +360,22 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                    layer_idx=i,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                        layer_idx=i,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -470,11 +469,13 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         layer_outputs = None
-        for idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -483,19 +484,26 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
             if output_router_logits:
                 all_router_logits += (layer_outputs.router_logits,)
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -550,7 +558,7 @@ class Glm4vMoeModel(Glm4vModel):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V-MoE multimodal model.
 
@@ -560,7 +568,7 @@ class Glm4vMoeModel(Glm4vModel):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         EasyDeLBaseModule.__init__(
             self,
@@ -585,7 +593,7 @@ class Glm4vMoeModel(Glm4vModel):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -735,7 +743,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V-MoE for conditional generation.
 
@@ -745,7 +753,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -825,7 +833,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -912,7 +920,7 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
         hidden_states = apply_logical_sharding(
             outputs.last_hidden_state,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None

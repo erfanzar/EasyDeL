@@ -14,7 +14,7 @@
 
 from types import SimpleNamespace
 
-from eformer.escale import PartitionAxis, PartitionManager
+from spectrax import PartitionAxis, PartitionManager
 
 from easydel.axis import (
     register_attention_data_parallel_axis,

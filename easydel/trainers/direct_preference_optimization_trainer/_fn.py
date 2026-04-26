@@ -16,7 +16,7 @@
 
 This module contains the core computational functions used by the DPO trainer,
 including various loss functions, forward pass implementations, and training/evaluation
-step functions. These functions are designed to work with JAX/Flax models and support
+step functions. These functions are designed to work with JAX/spectrax models and support
 distributed training through JAX's sharding capabilities.
 
 The module implements multiple DPO loss variants as described in various papers:
@@ -33,21 +33,22 @@ All functions are JIT-compilable for optimal performance on TPU/GPU hardware.
 
 import typing as tp
 
-import flax
-import flax.nnx
 import jax
-from eformer.escale import with_sharding_constraint
+import spectrax as spx
 from jax import lax
 from jax import numpy as jnp
 from jax.nn import log_sigmoid as logsigmoid
 from jax.nn import relu, sigmoid
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
+from .._logprob_utils import compute_token_logps_and_entropies_chunked, resolve_lmhead_chunksize
+from .._shared import apply_paired_truncation, gather_multimodal_kwargs
 from ..training_utils import (
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
@@ -66,110 +67,25 @@ def _compute_token_logps_chunked(
     *,
     chunk_size: int | None,
 ) -> Array:
-    """Compute selected token log-probabilities without materializing a full-vocab log-softmax.
+    """Thin wrapper for backwards compatibility.
 
-    This function avoids the O(batch * seq * vocab) memory cost of a naive
-    ``jax.nn.log_softmax`` by splitting the vocabulary dimension into chunks
-    and executing a numerically-stable 3-pass algorithm:
-
-    1. **Chunked max** -- Iterate over vocabulary chunks to find the per-token
-       maximum logit (used for numerical stability in the subsequent exp).
-    2. **Chunked sum-exp** -- Iterate again to compute
-       ``sum(exp(logit - max))`` for each token position, yielding the
-       log-partition function ``log_z = log(sum_exp) + max``.
-    3. **Gather & subtract** -- Gather the raw logit for each target token and
-       return ``target_logit - log_z``, which equals the log-probability.
-
-    Each chunked helper is wrapped with ``jax.checkpoint`` so that only one
-    vocabulary chunk is materialized at a time during the backward pass,
-    keeping peak memory proportional to ``chunk_size`` rather than
-    ``vocab_size``.
-
-    Args:
-        logits: Float array of shape ``(batch, seq_len, vocab_size)`` containing
-            the unnormalized log-probabilities (logits) produced by the model.
-        targets: Integer array of shape ``(batch, seq_len)`` holding the token
-            indices whose log-probabilities should be extracted.
-        chunk_size: Number of vocabulary entries to process in each chunk.
-            If ``None``, ``<= 0`` or ``>= vocab_size`` the entire vocabulary is processed
-            in a single pass (no chunking).
-
-    Returns:
-        Float array of shape ``(batch, seq_len)`` with the log-probability of
-        each target token at every sequence position.
+    Forwards to the shared :func:`compute_token_logps_and_entropies_chunked`
+    in ``trainers/_logprob_utils.py`` and discards the entropy slot since DPO
+    does not consume per-token entropies.
     """
-
-    vocab_size = logits.shape[-1]
-    if chunk_size is None or chunk_size <= 0 or chunk_size >= vocab_size:
-        chunk_size = vocab_size
-    num_full_chunks = vocab_size // chunk_size
-    tail = vocab_size - num_full_chunks * chunk_size
-
-    def _max_step(start: int, size: int, running_max: Array) -> Array:
-        chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
-        return jnp.maximum(running_max, jnp.max(chunk, axis=-1))
-
-    _max_step = jax.checkpoint(_max_step, prevent_cse=False, static_argnums=(1,))
-
-    def max_body(i: int, running_max: Array) -> Array:
-        return _max_step(i * chunk_size, chunk_size, running_max)
-
-    logit_max = jnp.full(logits.shape[:-1], -jnp.inf, dtype=jnp.float32)
-    if num_full_chunks > 0:
-        logit_max = lax.fori_loop(0, num_full_chunks, max_body, logit_max)
-    if tail:
-        start = num_full_chunks * chunk_size
-        logit_max = _max_step(start, tail, logit_max)
-
-    def _sum_step(start: int, size: int, running_sum: Array) -> Array:
-        chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
-        return running_sum + jnp.sum(jnp.exp(chunk - logit_max[..., None]), axis=-1)
-
-    _sum_step = jax.checkpoint(_sum_step, prevent_cse=False, static_argnums=(1,))
-
-    def sum_body(i: int, running_sum: Array) -> Array:
-        return _sum_step(i * chunk_size, chunk_size, running_sum)
-
-    exp_sum = jnp.zeros_like(logit_max)
-    if num_full_chunks > 0:
-        exp_sum = lax.fori_loop(0, num_full_chunks, sum_body, exp_sum)
-    if tail:
-        start = num_full_chunks * chunk_size
-        exp_sum = _sum_step(start, tail, exp_sum)
-
-    log_z = jnp.log(exp_sum) + logit_max
-    target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1).astype(jnp.float32)
-    return jnp.squeeze(target_logits, axis=-1) - log_z
+    log_probs, _ = compute_token_logps_and_entropies_chunked(
+        logits,
+        targets,
+        return_entropy=False,
+        chunk_size=chunk_size,
+    )
+    return log_probs
 
 
-def _resolve_dpo_lmhead_chunksize(model: tp.Any) -> int | None:
-    """Return the configured LM-head token chunk size when headless DPO is supported.
-
-    Headless (hidden-state-only) DPO avoids materializing the full logit tensor
-    by projecting hidden states through the LM head in smaller sequence chunks.
-    This helper checks whether *model* exposes the two prerequisites for that
-    path:
-
-    1. A ``config`` attribute that carries a positive ``lmhead_chunksize`` value
-       (the number of sequence-dimension tokens to project at once).
-    2. A ``compute_lm_logits`` method used to perform the chunked projection.
-
-    Args:
-        model: The model instance to inspect.  No type constraint is enforced;
-            the function relies on duck-typing via ``hasattr`` checks.
-
-    Returns:
-        The chunk size as a positive ``int`` if the model supports headless DPO,
-        or ``None`` otherwise.
-    """
-
-    if not hasattr(model, "config") or not hasattr(model, "compute_lm_logits"):
-        return None
-    chunk_size = getattr(model.config, "lmhead_chunksize", None)
-    if chunk_size is None:
-        return None
-    chunk_size = int(chunk_size)
-    return chunk_size if chunk_size > 0 else None
+# Backwards-compatible alias retained for any in-tree references; new call
+# sites should use :func:`resolve_lmhead_chunksize` from ``_logprob_utils``
+# directly.
+_resolve_dpo_lmhead_chunksize = resolve_lmhead_chunksize
 
 
 def _compute_dpo_outputs_from_hidden_states(
@@ -933,17 +849,7 @@ def concatenated_forward(
     num_examples = batch["prompt_input_ids"].shape[0]
     concatenated_batch = concatenated_inputs(batch=batch, padding_value=padding_value)
 
-    model_kwargs = {}
-    if aux_loss_enabled:
-        model_kwargs["output_router_logits"] = True
-
-    # Include image-related inputs if available.
-    if "pixel_values" in concatenated_batch:
-        model_kwargs["pixel_values"] = concatenated_batch["pixel_values"]
-    if "pixel_attention_mask" in concatenated_batch:
-        model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
-    if "image_sizes" in concatenated_batch:
-        model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
+    model_kwargs = gather_multimodal_kwargs(concatenated_batch, aux_loss_enabled=aux_loss_enabled)
 
     prompt_input_ids = concatenated_batch["prompt_input_ids"]
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
@@ -964,7 +870,7 @@ def concatenated_forward(
             "labels": labels,
             **model_kwargs,
         }
-        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
@@ -986,19 +892,13 @@ def concatenated_forward(
             ],
             axis=1,
         )
-        if max_length is not None:
-            if truncation_mode == "keep_end":
-                input_ids = input_ids[:, -max_length:]
-                attention_mask = attention_mask[:, -max_length:]
-                loss_mask = loss_mask[:, -max_length:]
-            elif truncation_mode == "keep_start":
-                input_ids = input_ids[:, :max_length]
-                attention_mask = attention_mask[:, :max_length]
-                loss_mask = loss_mask[:, :max_length]
-            else:
-                raise ValueError(
-                    f"Unknown truncation mode: '{truncation_mode}'. Should be one of ['keep_end', 'keep_start']."
-                )
+        input_ids, attention_mask, loss_mask = apply_paired_truncation(
+            input_ids,
+            attention_mask,
+            loss_mask,
+            max_length=max_length,
+            truncation_mode=truncation_mode,
+        )
         lmhead_chunksize = _resolve_dpo_lmhead_chunksize(model)
         call_kwargs = {
             **model_kwargs,
@@ -1007,7 +907,7 @@ def concatenated_forward(
         }
         if lmhead_chunksize is not None:
             call_kwargs["apply_lm_head"] = False
-        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
@@ -1119,7 +1019,7 @@ def training_step(
         batch_partition_spec=partition_spec,
     )
 
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
     _loss_func = get_loss_function(
         loss_type=loss_type,
         beta=beta,
@@ -1145,12 +1045,12 @@ def training_step(
                 "ref_rejected_logps": ref_rejected_logps,
             }
 
-    def calculate_loss(tree: flax.nnx.GraphState, call_batch):
+    def calculate_loss(tree: spx.State, call_batch):
         """
         Inner function to compute loss and metrics for a given minibatch.
 
         Args:
-            tree (flax.nnx.GraphState): The current model graph state.
+            tree (spx.State): The current model graph state.
             call_batch (dict): A minibatch of data.
 
         Returns:
@@ -1251,19 +1151,19 @@ def evaluation_step(
         batch_partition_spec=partition_spec,
     )
 
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
     _loss_func = get_loss_function(
         loss_type=loss_type,
         beta=beta,
         label_smoothing=label_smoothing,
     )
 
-    def calculate_loss(tree: flax.nnx.GraphState):
+    def calculate_loss(tree: spx.State):
         """
         Inner function to compute loss metrics for evaluation.
 
         Args:
-            tree (flax.nnx.GraphState): The current model graph state.
+            tree (spx.State): The current model graph state.
 
         Returns:
             LossMetrics: The computed loss metrics.
@@ -1272,17 +1172,16 @@ def evaluation_step(
         chosen_logps = model_output["chosen_logps"]
         rejected_logps = model_output["rejected_logps"]
 
-        ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
-        if ref_chosen_logps is None or ref_rejected_logps is None:
-            ref_model = state.model if reference_state is None else reference_state.model
-            ref_output = concatenated_forward(ref_model, batch)
-            ref_chosen_logps = ref_output["chosen_logps"]
-            ref_rejected_logps = ref_output["rejected_logps"]
-
         if reference_free:
             ref_chosen_for_loss = jnp.zeros_like(chosen_logps)
             ref_rejected_for_loss = jnp.zeros_like(rejected_logps)
         else:
+            ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+            if ref_chosen_logps is None or ref_rejected_logps is None:
+                ref_model = state.model if reference_state is None else reference_state.model
+                ref_output = concatenated_forward(ref_model, batch)
+                ref_chosen_logps = ref_output["chosen_logps"]
+                ref_rejected_logps = ref_output["rejected_logps"]
             ref_chosen_for_loss = ref_chosen_logps
             ref_rejected_for_loss = ref_rejected_logps
 

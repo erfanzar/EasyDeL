@@ -180,10 +180,10 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
 
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
-        self.scan_layers = scan_layers
 
         super().__init__(
             bos_token_id=bos_token_id,
+            scan_layers=scan_layers,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,
@@ -254,7 +254,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
@@ -381,7 +381,7 @@ class Gemma3Config(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.

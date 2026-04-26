@@ -33,9 +33,9 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
-from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -112,7 +112,7 @@ def get_per_token_logps(
     """
 
     model_kwargs = compact_generation_model_kwargs(
-        normalize_generation_model_kwargs(model_kwargs, model_callable=model.__call__),
+        normalize_generation_model_kwargs(model_kwargs, model_callable=getattr(model, "forward", model)),
     )
     model_kwargs = prepare_generation_model_kwargs_for_call(
         model_kwargs,
@@ -232,7 +232,7 @@ def get_per_token_logps_and_entropies(
         fashion, avoiding materialization of the full logit tensor.
     """
     model_kwargs = compact_generation_model_kwargs(
-        normalize_generation_model_kwargs(model_kwargs, model_callable=model.__call__),
+        normalize_generation_model_kwargs(model_kwargs, model_callable=getattr(model, "forward", model)),
     )
     model_kwargs = prepare_generation_model_kwargs_for_call(
         model_kwargs,
@@ -401,7 +401,7 @@ def grpo_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
@@ -438,7 +438,7 @@ def grpo_step(
         prompt_len = prompt_ids.shape[-1]
         prompt_model_kwargs = extract_generation_model_kwargs(
             minibatch,
-            model_callable=module.__call__,
+            model_callable=getattr(module, "forward", module),
         )
         completion_model_kwargs = repeat_prompt_aligned_model_kwargs(
             prompt_model_kwargs,

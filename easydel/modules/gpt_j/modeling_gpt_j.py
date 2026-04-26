@@ -18,13 +18,12 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -64,7 +63,7 @@ class GPTJAttention(UnifiedAttention):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         layer_idx (int): Index of this layer in the model (0-indexed).
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         q_proj (ColumnParallelLinear): Query projection layer.
         k_proj (ColumnParallelLinear): Key projection layer.
         v_proj (ColumnParallelLinear): Value projection layer.
@@ -94,7 +93,7 @@ class GPTJAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize GPT-J attention module.
@@ -104,7 +103,7 @@ class GPTJAttention(UnifiedAttention):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             layer_idx: Index of this layer in the model (0-indexed).
         """
         super().__init__(
@@ -140,7 +139,7 @@ class GPTJAttention(UnifiedAttention):
             is_neox_style=False,
         )
 
-    def _create_attention_performer(self, config: GPTJConfig, rngs: nn.Rngs):
+    def _create_attention_performer(self, config: GPTJConfig, rngs: spx.Rngs):
         """Create attention performer with GPT-J specific dropout settings.
 
         Args:
@@ -177,7 +176,7 @@ class GPTJAttention(UnifiedAttention):
             config.num_attention_heads * self.head_dim,
             use_bias=False,
             dtype=dtype,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
@@ -202,7 +201,7 @@ class GPTJAttention(UnifiedAttention):
             self.num_key_value_heads * self.head_dim,
             use_bias=False,
             dtype=dtype,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
@@ -227,7 +226,7 @@ class GPTJAttention(UnifiedAttention):
             self.num_key_value_heads * self.head_dim,
             use_bias=False,
             dtype=dtype,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
@@ -255,7 +254,7 @@ class GPTJAttention(UnifiedAttention):
             config.hidden_size,
             use_bias=False,
             dtype=dtype,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
@@ -268,7 +267,7 @@ class GPTJAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Define GPT-J-specific network architecture with residual dropout.
 
@@ -348,7 +347,7 @@ class GPTJAttention(UnifiedAttention):
         return self.resid_dropout(attn_output)
 
 
-class GPTJMLP(nn.Module):
+class GPTJMLP(spx.Module):
     """GPT-J MLP module.
 
     This module implements the feed-forward network used in the GPT-J model.
@@ -359,7 +358,7 @@ class GPTJMLP(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -370,7 +369,7 @@ class GPTJMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GPT-J MLP module.
 
@@ -380,7 +379,7 @@ class GPTJMLP(nn.Module):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         self.config: GPTJConfig = config
         self.dtype = dtype
@@ -388,7 +387,7 @@ class GPTJMLP(nn.Module):
         self.precision = precision
         self.intermediate_size = intermediate_size
         embed_dim = config.hidden_size
-        kernel_init = nn.initializers.normal(config.initializer_range)
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
         self.fc_in = ColumnParallelLinear(
             embed_dim,
@@ -410,9 +409,9 @@ class GPTJMLP(nn.Module):
         )
 
         self.act = ACT2FN[config.activation_function]
-        self.dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the GPTJMLP module.
@@ -427,19 +426,19 @@ class GPTJMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act(self.fc_in(hidden_states)), "mlp_gate")
         hidden_states = checkpoint_name(self.dropout(self.fc_out(gate)), "mlp_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states
 
 
-class GPTJBlock(nn.Module):
+class GPTJBlock(spx.Module):
     """GPT-J Transformer block.
 
     This module represents a single transformer block in the GPT-J model,
@@ -451,7 +450,7 @@ class GPTJBlock(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -462,7 +461,7 @@ class GPTJBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GPT-J transformer block.
 
@@ -472,7 +471,7 @@ class GPTJBlock(nn.Module):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         self.config: GPTJConfig = config
         self.dtype = dtype
@@ -508,7 +507,7 @@ class GPTJBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -567,7 +566,7 @@ class GPTJBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
@@ -588,7 +587,7 @@ class GPTJModel(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -598,7 +597,7 @@ class GPTJModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GPT-J base model.
 
@@ -607,7 +606,7 @@ class GPTJModel(EasyDeLBaseModule):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__(
             config=config,
@@ -620,7 +619,7 @@ class GPTJModel(EasyDeLBaseModule):
         self.wte = Embed(
             self.config.vocab_size,
             self.embed_dim,
-            embedding_init=nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -635,19 +634,19 @@ class GPTJModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.h = nn.List(
-            [
-                remat_layer_block(
-                    config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.h = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.h.append(
+                    remat_layer_block(
+                        config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.ln_f = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_epsilon,
@@ -679,7 +678,7 @@ class GPTJModel(EasyDeLBaseModule):
             base=10000,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -757,23 +756,32 @@ class GPTJModel(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.h))
 
         hidden_states = self.dropout(inputs_embeds)
-        for idx, block in enumerate(self.h):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states=hidden_states,
                 mask_info=mask_info,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.h.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = checkpoint_name(self.ln_f(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -826,7 +834,7 @@ class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):  # type: ignor
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         transformer (GPTJModel): The base GPT-J transformer model.
         lm_head (nn.Linear): Linear layer projecting hidden states to vocabulary logits.
     """
@@ -842,7 +850,7 @@ class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):  # type: ignor
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GPT-J for causal language modeling.
 
@@ -851,7 +859,7 @@ class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):  # type: ignor
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__(
             config=config,

@@ -25,9 +25,6 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer import escale as es
-from eformer.escale import PartitionAxis, PartitionManager
 from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
@@ -35,10 +32,13 @@ from eformer.pytree import auto_pytree
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
+from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 from ..ragged_page.cache import (
+    HEAD_DIM_ALIGNMENT,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
     RaggedPagesCacheView,
@@ -79,7 +79,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
     @staticmethod
     def _compute_free_hbm(
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
     ):
         """Compute free HBM budget available for MLA cache pages.
@@ -90,7 +90,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
         Args:
             mesh: JAX device mesh used to look up axis sizes.
-            partition_manager: Provides the data-parallel axis name.
+            runtime_sharding_resolver: Provides the data-parallel axis name.
             hbm_utilization: Fraction of total HBM to consider available
                 (0.0-1.0).
 
@@ -98,7 +98,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             Total allocatable bytes across all devices on the page axis.
         """
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
+        page_axis_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
         return available_alloc
@@ -107,7 +107,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
     def create(
         cls,
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
         num_kv_heads: int,
@@ -135,7 +135,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
         Args:
             mesh: JAX device mesh for sharding and HBM budget estimation.
-            partition_manager: Resolves sharding specs and provides the
+            runtime_sharding_resolver: Resolves sharding specs and provides the
                 data-parallel axis name.
             kvdtype: Data type for the KV cache (e.g. ``jnp.bfloat16``).
             num_hidden_layers: Number of transformer layers that require
@@ -185,17 +185,19 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if version != "v1":
             raise ValueError(f"MLA ragged cache only supports version='v1', got {version!r}")
 
-        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
+        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         if data_parallel_size > 1:
             logger.info(f"Scaling MLA KV page budget by data-parallel page axis: {data_parallel_size=}.")
 
         free = cls._compute_free_hbm(
             mesh=mesh,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
-        kv_dim_padded = align_to_multiple(int(kv_lora_rank), 128) + align_to_multiple(int(qk_rope_head_dim), 128)
+        kv_dim_padded = align_to_multiple(int(kv_lora_rank), HEAD_DIM_ALIGNMENT) + align_to_multiple(
+            int(qk_rope_head_dim), HEAD_DIM_ALIGNMENT
+        )
         kv_packing = get_dtype_packing(kvdtype)
         page_size_per_kv_packing = cdiv(page_size, kv_packing)
         packed_page_tokens = page_size_per_kv_packing * kv_packing
@@ -249,13 +251,14 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
     @property
     def kv_dim_padded(self) -> int:
-        """Total KV dimension after padding each component to a multiple of 128.
+        """Total KV dimension after padding each component to ``HEAD_DIM_ALIGNMENT``.
 
         The ``ejkernel`` backend pads the low-rank KV and RoPE components
-        separately to 128-element boundaries for efficient memory access.
+        separately for efficient memory access.
         """
-        # ejkernel pads lkv and rope components separately.
-        return align_to_multiple(self.kv_lora_rank, 128) + align_to_multiple(self.qk_rope_head_dim, 128)
+        return align_to_multiple(self.kv_lora_rank, HEAD_DIM_ALIGNMENT) + align_to_multiple(
+            self.qk_rope_head_dim, HEAD_DIM_ALIGNMENT
+        )
 
     @property
     def kv_packing(self) -> int:
@@ -314,7 +317,7 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         layer_index: int | None = None,
         *,
         mesh: Mesh | None = None,
-        partition_manager: es.PartitionManager | None = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: EasyQuantizer | None = None,
     ) -> "MLARaggedPagesCacheView":
         """Allocate a single-layer MLA ragged page cache view.
@@ -323,7 +326,7 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
             config: MLA cache configuration describing page layout and dimensions.
             layer_index: Transformer layer index this view belongs to (defaults to 0).
             mesh: JAX device mesh used for sharding the page buffer.
-            partition_manager: Partition manager that resolves sharding specs.
+            runtime_sharding_resolver: Runtime sharding resolver for page tensors.
             quantizer: Optional quantizer applied to the allocated page buffer.
 
         Returns:
@@ -333,11 +336,14 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
-        if partition_manager is None:
-            partition_manager = PartitionManager(PartitionAxis())
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         kv_pages_shape, axes = config.get_shape_and_axes()
-        kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
+        kv_pages_sharding = runtime_sharding_resolver.resolve(
+            axes=axes,
+            mode=common_types.MODE_PREFILL,
+            shape=kv_pages_shape,
+        )
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
 
         with jax.named_scope("easydel-mla-ragged-cache-init"):
@@ -347,7 +353,7 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
             metadata=config,
             layer_index=layer_index or 0,
             kv_pages=kv_pages,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
         )
 
     def flattened_kv_pages(self) -> jax.Array:
@@ -420,18 +426,18 @@ class MLARaggedPagesCache(RaggedPagesCache):
         cls,
         mesh: Mesh,
         config: MLARaggedPagesCacheConfig,
-        partition_manager: es.PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
     ) -> "MLARaggedPagesCache":
         """Allocate an MLA ragged page cache for all transformer layers.
 
         Creates one :class:`MLARaggedPagesCacheView` per layer, each backed by
-        a zeroed page buffer sharded according to *partition_manager*.
+        a zeroed page buffer sharded according to *runtime_sharding_resolver*.
 
         Args:
             mesh: JAX device mesh for sharding.
             config: MLA cache configuration (page count, dimensions, etc.).
-            partition_manager: Resolves sharding specs for page tensors.
+            runtime_sharding_resolver: Resolves sharding specs for page tensors.
             quantizer: Optional quantizer applied to each layer's page buffer.
 
         Returns:
@@ -442,7 +448,7 @@ class MLARaggedPagesCache(RaggedPagesCache):
                 config=config,
                 layer_index=i,
                 mesh=mesh,
-                partition_manager=partition_manager,
+                runtime_sharding_resolver=runtime_sharding_resolver,
                 quantizer=quantizer,
             )
             for i in range(config.num_hidden_layers)

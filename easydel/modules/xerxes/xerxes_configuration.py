@@ -112,7 +112,6 @@ class XerxesConfig(EasyDeLBaseConfig):
     ):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
-        self.scan_layers = scan_layers
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -156,6 +155,7 @@ class XerxesConfig(EasyDeLBaseConfig):
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            scan_layers=scan_layers,
             bits=bits,
             **kwargs,
         )
@@ -167,7 +167,7 @@ class XerxesConfig(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.

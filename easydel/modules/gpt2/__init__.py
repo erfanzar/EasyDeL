@@ -44,7 +44,8 @@ Usage Example:
     ```python
     from easydel.modules.gpt2 import GPT2Config, GPT2LMHeadModel
     import jax
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Configure GPT-2 Medium
     config = GPT2Config(
@@ -57,7 +58,7 @@ Usage Example:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = GPT2LMHeadModel(config, rngs=rngs)
 
     # Generate text

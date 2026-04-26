@@ -74,7 +74,8 @@ Example Usage:
     ```python
     from easydel import Qwen2VLConfig, Qwen2VLForConditionalGeneration
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Create configuration with custom settings
     config = Qwen2VLConfig(
@@ -91,7 +92,7 @@ Example Usage:
     )
 
     # Initialize model for conditional generation
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = Qwen2VLForConditionalGeneration(config, rngs=rngs)
 
     # Process image and text

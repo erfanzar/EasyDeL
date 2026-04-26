@@ -12,14 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared sharding helpers for layer parameter specs."""
+"""Shared sharding helpers for layer parameter layouts.
+
+This module is now a thin compatibility shim over the canonical
+``RuntimeShardingResolver`` so layers do not carry a second sharding
+resolution path.
+"""
 
 from __future__ import annotations
 
 import typing as tp
 
-from eformer import common_types
 from jax.sharding import PartitionSpec
+from spectrax import common_types
+
+from easydel.infra.sharding import coerce_runtime_sharding_resolver
 
 
 def _is_valid_mesh(mesh: tp.Any) -> bool:
@@ -55,30 +62,6 @@ def _mesh_partition_product(mesh: tp.Any, axis_spec: tp.Any) -> int:
             product *= _mesh_axis_size(mesh, str(axis_name))
         return int(product)
     return _mesh_axis_size(mesh, str(axis_spec))
-
-
-def _resolve_partition_spec(
-    *,
-    partition_manager: tp.Any,
-    axes: tp.Any,
-    shape: tuple[int, ...],
-    mode: str = common_types.MODE_TRAIN,
-) -> tp.Any | None:
-    if partition_manager is None or not hasattr(partition_manager, "resolve"):
-        return None
-    resolve = partition_manager.resolve
-    attempts: tuple[tp.Callable[[], tp.Any], ...] = (
-        lambda: resolve(axes=axes, mode=mode, shape=shape),
-        lambda: resolve(axes=axes, shape=shape),
-        lambda: resolve(axes=axes),
-        lambda: resolve(axes),
-    )
-    for attempt in attempts:
-        try:
-            return attempt()
-        except Exception:
-            continue
-    return None
 
 
 def _coerce_partition_spec(spec: tp.Any) -> PartitionSpec | None:
@@ -122,7 +105,7 @@ def pick_mesh(*, partition_manager: tp.Any | None = None, mesh: tp.Any | None = 
                 return candidate
 
     try:
-        from eformer.escale import get_incontext_mesh
+        from spectrax import get_incontext_mesh
 
         candidate = get_incontext_mesh(raise_error=False)
         if _is_valid_mesh(candidate):
@@ -146,21 +129,24 @@ def resolve_safe_sharding(
     *,
     axes: tp.Any,
     shape: tuple[int, ...],
+    runtime_sharding_resolver: tp.Any | None = None,
+    axis_policy: tp.Any | None = None,
     partition_manager: tp.Any | None = None,
     mesh: tp.Any | None = None,
     mode: str = common_types.MODE_TRAIN,
 ) -> tp.Any:
-    """Resolve sharding axes and drop non-divisible mesh axes to EMPTY/None."""
-    resolved = _resolve_partition_spec(
-        partition_manager=partition_manager,
-        axes=axes,
-        shape=shape,
-        mode=mode,
+    """Resolve sharding axes through the canonical runtime resolver."""
+    mesh_obj = pick_mesh(partition_manager=runtime_sharding_resolver or partition_manager, mesh=mesh)
+    resolver = coerce_runtime_sharding_resolver(
+        runtime_sharding_resolver if runtime_sharding_resolver is not None else axis_policy,
+        mesh=mesh_obj,
     )
-    if resolved is None:
-        return axes
-
-    mesh_obj = pick_mesh(partition_manager=partition_manager, mesh=mesh)
-    if mesh_obj is None:
-        return resolved
-    return _sanitize_spec_for_shape(spec=resolved, shape=shape, mesh=mesh_obj)
+    try:
+        return resolver.resolve(axes=axes, mode=mode, shape=shape)
+    except Exception:
+        if partition_manager is None or not hasattr(partition_manager, "resolve"):
+            return axes
+        resolved = partition_manager.resolve(axes=axes, mode=mode, shape=shape)
+        if mesh_obj is None:
+            return resolved
+        return _sanitize_spec_for_shape(spec=resolved, shape=shape, mesh=mesh_obj)

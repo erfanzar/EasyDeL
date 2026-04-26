@@ -29,11 +29,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import jax
-from eformer import common_types
-from eformer.escale import PartitionManager
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
+from spectrax import common_types
+
+from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -416,7 +417,7 @@ class MoeFusedHooks:
     finalize_output: Callable | None = None
 
     def __hash__(self) -> int:
-        """Makes the hooks dataclass hashable for NNX graph hashing.
+        """Makes the hooks dataclass hashable for SpecTrax graph hashing.
 
         Returns:
             Hash value based on the identity of all hook callables.
@@ -1133,7 +1134,17 @@ class MoeMetrics:
     routing_entropy: float | None = None
 
 
-def resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
+def _coerce_axis_manager(manager: object | None) -> RuntimeShardingResolver | object:
+    if isinstance(manager, RuntimeShardingResolver):
+        return manager
+    if manager is None:
+        return coerce_runtime_sharding_resolver(None)
+    if hasattr(manager, "paxis") and hasattr(manager, "resolve"):
+        return manager
+    return coerce_runtime_sharding_resolver(manager)
+
+
+def resolve_eformer_axis(axis: str | list[str], manager: object | None):
     """Resolves logical axis name(s) to physical mesh axis names.
 
     This convenience wrapper resolves symbolic axis names (like "tp", "ep", "fsdp")
@@ -1148,7 +1159,8 @@ def resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
             - "dp": Data parallel axis
             - "fsdp": Fully sharded data parallel axis
             - "sp": Sequence parallel axis
-        manager: The `PartitionManager` instance providing axis resolution configuration.
+        manager: Runtime sharding resolver or legacy axis manager providing
+            logical-axis resolution.
 
     Returns:
         If input was a string, returns a single resolved axis name (str).
@@ -1163,6 +1175,7 @@ def resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
         >>> resolved = resolve_eformer_axis(["tp", "ep"], partition_manager)
         >>> # resolved might be ["tensor", "expert"]
     """
+    manager = _coerce_axis_manager(manager)
     was_list = isinstance(axis, list | tuple)
     if not was_list:
         axis = [axis]
@@ -1173,7 +1186,7 @@ def resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
 
 
 def get_moe_partition_spec(
-    partition_manager: PartitionManager,
+    runtime_sharding_resolver: object | None,
     direction: typing.Literal["row", "column"],
     tensors_are_expert: bool,
     is_bias: bool = False,
@@ -1193,8 +1206,9 @@ def get_moe_partition_spec(
         - Row-wise (wd kernel): Input dimension is partitioned
 
     Args:
-        partition_manager: EFormer PartitionManager providing axis name resolution
-            and mesh configuration.
+        runtime_sharding_resolver: Runtime sharding resolver providing semantic
+            axis resolution. Legacy axis managers that expose ``paxis`` and
+            ``resolve`` are still accepted at this internal boundary.
         direction: Weight matrix orientation determining which dimension is sharded:
             - "column": For gate (wi) and up (wu) projections. Shape [E, H, M] with
               TP sharding on M (intermediate) dimension.
@@ -1227,7 +1241,7 @@ def get_moe_partition_spec(
         ValueError: If direction is not "row" or "column".
 
     Example:
-        >>> from eformer.escale import PartitionManager
+        >>> from spectrax import PartitionManager
         >>> pm = PartitionManager(mesh, ...)
         >>>
         >>> # Get spec for gate projection kernel [E, H, M]
@@ -1245,10 +1259,11 @@ def get_moe_partition_spec(
     if direction not in ("row", "column"):
         raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
 
-    expert_axis_name = resolve_eformer_axis(EP, partition_manager)
-    fsdp_axis_name = resolve_eformer_axis(FSDP, partition_manager)
-    sp_axis_name = resolve_eformer_axis(SP, partition_manager)
-    tensor_axis_name = resolve_eformer_axis(TP, partition_manager)
+    axis_manager = _coerce_axis_manager(runtime_sharding_resolver)
+    expert_axis_name = resolve_eformer_axis(EP, axis_manager)
+    fsdp_axis_name = resolve_eformer_axis(FSDP, axis_manager)
+    sp_axis_name = resolve_eformer_axis(SP, axis_manager)
+    tensor_axis_name = resolve_eformer_axis(TP, axis_manager)
     expert_place = (expert_axis_name,)
     if module_view:
         if sp_is_ep_bound:

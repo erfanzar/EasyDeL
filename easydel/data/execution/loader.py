@@ -195,12 +195,18 @@ class ShardingSpec:
             return batch
 
         import jax
-        from jax.sharding import NamedSharding, PartitionSpec
+        import spectrax as spx
+        from jax.sharding import PartitionSpec
 
+        # # @erfanzar NOTE: get_corrected_named_sharding is MPMD-aware -- it
+        # routes the spec through the resolver onto the per-stage submesh and
+        # sanitizes for the concrete shape.  Hand-rolling NamedSharding(mesh,
+        # spec) would collapse PP submeshes back to the full mesh, the same
+        # bug class as init_tx had.
         result = {}
         for key, arr in batch.items():
             spec = self.partition_specs.get(key, PartitionSpec())
-            sharding = NamedSharding(self.mesh, spec)
+            sharding = spx.get_corrected_named_sharding(tuple(arr.shape), spec, raise_mesh_error=False)
             result[key] = jax.device_put(arr, sharding)
 
         return result

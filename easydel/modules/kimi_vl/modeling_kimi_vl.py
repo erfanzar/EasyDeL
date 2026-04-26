@@ -43,15 +43,16 @@ from functools import cached_property
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from flax import nnx as nn
+import spectrax as spx
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types, nn
 
+from easydel.infra.base_module import EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
 from easydel.infra.utils import auto_remat
+from easydel.layers import ParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
@@ -127,7 +128,7 @@ def _apply_rope(
     return _to_real(q_out, xq.dtype), _to_real(k_out, xk.dtype)
 
 
-class Learnable2DInterpPosEmb(nn.Module):
+class Learnable2DInterpPosEmb(spx.Module):
     """Learnable 2D positional embeddings with resolution interpolation.
 
     This module provides learnable position embeddings that can be interpolated
@@ -150,7 +151,7 @@ class Learnable2DInterpPosEmb(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize learnable 2D position embeddings.
 
@@ -164,22 +165,18 @@ class Learnable2DInterpPosEmb(nn.Module):
                 Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters.
                 Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.height = height
         self.width = width
         self.dim = dim
         self.interpolation_mode = interpolation_mode
-        self.kernel = nn.Param(
-            nn.initializers.normal()(rngs.params(), (dim, width, height), param_dtype),
+        self.weight = spx.Parameter(
+            jax.nn.initializers.normal()(rngs.parameters, (dim, width, height), param_dtype),
         )
         self.dtype = dtype
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for position embedding parameters."""
-        return {"kernel": Replicated}
-
-    def __call__(self, x: Array, grid_hws: Array) -> Array:
+    def forward(self, x: Array, grid_hws: Array) -> Array:
         """Add interpolated position embeddings to input features.
 
         For each image in the batch (specified by grid_hws), interpolates
@@ -195,7 +192,7 @@ class Learnable2DInterpPosEmb(nn.Module):
             Array: Features with position embeddings added, same shape as input.
         """
         pos_embs = []
-        kernel = self.kernel.value.astype(jnp.float32).transpose(2, 1, 0)
+        kernel = self.weight.value.astype(jnp.float32).transpose(2, 1, 0)
         for h, w in grid_hws:
             h = int(h)
             w = int(w)
@@ -212,7 +209,7 @@ class Learnable2DInterpPosEmb(nn.Module):
         return x + jnp.concatenate(pos_embs, axis=0).astype(x.dtype)
 
 
-class MoonVisionPatchEmbed(nn.Module):
+class MoonVisionPatchEmbed(spx.Module):
     """Patch embedding layer for MoonViT vision transformer.
 
     Converts image patches into embeddings using a convolution operation,
@@ -236,7 +233,7 @@ class MoonVisionPatchEmbed(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize MoonViT patch embedding layer.
 
@@ -254,23 +251,21 @@ class MoonVisionPatchEmbed(nn.Module):
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.patch_size = patch_size
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.dtype = dtype
 
-        self.proj = nn.Conv(
-            in_features=in_dim,
-            out_features=out_dim,
-            kernel_size=(patch_size, patch_size),
-            strides=(patch_size, patch_size),
+        self.proj = nn.Conv2d(
+            in_channels=in_dim,
+            out_channels=out_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
             padding="VALID",
             use_bias=True,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
@@ -283,7 +278,7 @@ class MoonVisionPatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, pixel_values: Array, grid_hws: Array) -> Array:
+    def forward(self, pixel_values: Array, grid_hws: Array) -> Array:
         """Embed image patches with position information.
 
         Applies convolution to extract patch features and adds interpolated
@@ -308,7 +303,7 @@ class MoonVisionPatchEmbed(nn.Module):
         return checkpoint_name(self.pos_emb(x, grid_hws), "embeddings")
 
 
-class Rope2DPosEmb(nn.Module):
+class Rope2DPosEmb(spx.Module):
     """2D rotary position embedding for vision transformers.
 
     Implements rotary position embeddings extended to 2D spatial grids
@@ -392,7 +387,7 @@ class Rope2DPosEmb(nn.Module):
         return jnp.concatenate(pieces, axis=0)
 
 
-class MLP2(nn.Module):
+class MLP2(spx.Module):
     """Two-layer feedforward network for MoonViT transformer blocks.
 
     Standard MLP with configurable activation function. Uses HuggingFace-compatible
@@ -412,7 +407,7 @@ class MLP2(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize two-layer MLP.
 
@@ -425,10 +420,10 @@ class MLP2(nn.Module):
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         in_dim, hidden_dim, out_dim = dims
-        self.fc0 = nn.Linear(
+        self.fc0 = ParallelLinear(
             in_dim,
             hidden_dim,
             use_bias=True,
@@ -437,7 +432,7 @@ class MLP2(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.fc1 = nn.Linear(
+        self.fc1 = ParallelLinear(
             hidden_dim,
             out_dim,
             use_bias=True,
@@ -448,7 +443,7 @@ class MLP2(nn.Module):
         )
         self.activation = activation
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply two-layer MLP transformation.
 
         Args:
@@ -463,7 +458,7 @@ class MLP2(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class MoonVitEncoderLayer(nn.Module):
+class MoonVitEncoderLayer(spx.Module):
     """Transformer encoder layer for MoonViT vision transformer.
 
     Implements a standard vision transformer encoder layer with:
@@ -490,7 +485,7 @@ class MoonVitEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize MoonViT encoder layer.
 
@@ -508,7 +503,7 @@ class MoonVitEncoderLayer(nn.Module):
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
@@ -537,7 +532,7 @@ class MoonVitEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.wqkv = nn.Linear(
+        self.wqkv = ParallelLinear(
             hidden_dim,
             hidden_dim * 3,
             use_bias=attn_bias,
@@ -546,7 +541,7 @@ class MoonVitEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.wo = nn.Linear(
+        self.wo = ParallelLinear(
             hidden_dim,
             hidden_dim,
             use_bias=attn_bias,
@@ -603,7 +598,7 @@ class MoonVitEncoderLayer(nn.Module):
         attn_out = attn_out.squeeze(0).reshape(seq_length, -1)
         return checkpoint_name(self.wo(attn_out), "attn_output")
 
-    def __call__(self, hidden_states: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
+    def forward(self, hidden_states: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
         """Forward pass through the encoder layer.
 
         Applies pre-norm self-attention and MLP with residual connections:
@@ -631,7 +626,7 @@ class MoonVitEncoderLayer(nn.Module):
         return checkpoint_name(hidden_states, "layer_output")
 
 
-class MoonVitEncoder(nn.Module):
+class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
     """Vision transformer encoder for MoonViT with packed sequence support.
 
     Processes packed sequences of image patches from multiple images
@@ -655,7 +650,7 @@ class MoonVitEncoder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize MoonViT encoder.
 
@@ -671,8 +666,9 @@ class MoonVitEncoder(nn.Module):
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
+        self.config = base_config
         self.rope_2d = Rope2DPosEmb(hidden_dim // num_heads, 512, 512)
 
         def activation(x):
@@ -684,23 +680,23 @@ class MoonVitEncoder(nn.Module):
             save_names=base_config.gradient_checkpointing_targets,
             exclude_names=base_config.gradient_checkpointing_targets,
         )
-        self.blocks = nn.List(
-            [
-                remat_layer_block(
-                    base_config=base_config,
-                    num_heads=num_heads,
-                    hidden_dim=hidden_dim,
-                    mlp_dim=mlp_dim,
-                    activation=activation,
-                    attn_bias=True,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for _ in range(num_layers):
+            with spx.assign_stage(total=num_layers, current=_):
+                self.blocks.append(
+                    remat_layer_block(
+                        base_config=base_config,
+                        num_heads=num_heads,
+                        hidden_dim=hidden_dim,
+                        mlp_dim=mlp_dim,
+                        activation=activation,
+                        attn_bias=True,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(num_layers)
-            ]
-        )
         self.final_layernorm = LayerNorm(
             hidden_dim,
             epsilon=1e-5,
@@ -709,7 +705,7 @@ class MoonVitEncoder(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array, grid_hws: Array) -> Array:
+    def forward(self, hidden_states: Array, grid_hws: Array) -> Array:
         """Forward pass through the MoonViT encoder.
 
         Processes packed image patches through transformer layers with
@@ -730,9 +726,18 @@ class MoonVitEncoder(nn.Module):
         lengths = jnp.concatenate([jnp.zeros((1,), dtype=jnp.int32), grid_lens], axis=0)
         cu_seqlens = jnp.cumsum(lengths, axis=0)
 
-        for block in self.blocks:
+        def _layer_loop(block, carry):
+            hidden_states, idx = carry
             hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
+            return hidden_states, idx + 1
+
+        hidden_states, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         return checkpoint_name(self.final_layernorm(hidden_states), "model_output")
 
 
@@ -778,7 +783,7 @@ def patch_merger(
     return outputs
 
 
-class MoonVitPretrainedModel(nn.Module):
+class MoonVitPretrainedModel(spx.Module):
     """MoonViT vision tower for Kimi-VL multimodal model.
 
     Complete vision encoder that processes images through:
@@ -802,7 +807,7 @@ class MoonVitPretrainedModel(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize MoonViT vision tower.
 
@@ -814,7 +819,7 @@ class MoonVitPretrainedModel(nn.Module):
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.merge_kernel_size = tuple(config.merge_kernel_size)
         self.patch_size = config.patch_size
@@ -840,7 +845,7 @@ class MoonVitPretrainedModel(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, pixel_values: Array, grid_hws: Array) -> list[Array]:
+    def forward(self, pixel_values: Array, grid_hws: Array) -> list[Array]:
         """Process images through the vision tower.
 
         Embeds image patches, processes them through the transformer encoder,
@@ -861,7 +866,7 @@ class MoonVitPretrainedModel(nn.Module):
         return patch_merger(hidden_states, grid_hws, merge_kernel_size=self.merge_kernel_size)
 
 
-class KimiVLMultiModalProjector(nn.Module):
+class KimiVLMultiModalProjector(spx.Module):
     """Multi-modal projector for bridging vision and language models.
 
     Projects merged patch features from MoonViT into the DeepSeek-V3
@@ -888,7 +893,7 @@ class KimiVLMultiModalProjector(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize multi-modal projector.
 
@@ -900,7 +905,7 @@ class KimiVLMultiModalProjector(nn.Module):
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         merge_kernel = tuple(config.vision_config.merge_kernel_size)
         hidden_size = config.vision_config.hidden_size * merge_kernel[0] * merge_kernel[1]
@@ -913,7 +918,7 @@ class KimiVLMultiModalProjector(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.linear_1 = nn.Linear(
+        self.linear_1 = ParallelLinear(
             hidden_size,
             hidden_size,
             use_bias=True,
@@ -922,7 +927,7 @@ class KimiVLMultiModalProjector(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.linear_2 = nn.Linear(
+        self.linear_2 = ParallelLinear(
             hidden_size,
             config.text_config.hidden_size,
             use_bias=True,
@@ -932,7 +937,7 @@ class KimiVLMultiModalProjector(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, image_features: list[Array]) -> Array:
+    def forward(self, image_features: list[Array]) -> Array:
         """Project merged image features to language model dimension.
 
         Concatenates features from all images, normalizes, flattens the
@@ -994,7 +999,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi-VL model for conditional generation.
 
@@ -1006,7 +1011,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
                 Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         language_model = DeepseekV3ForCausalLM(
             config=config.text_config,
@@ -1174,7 +1179,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
 
         return checkpoint_name(inputs_embeds, "embeddings")
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1388,7 +1393,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         """
         return self.language_model.get_embedding()
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Get the vision tower module.
 
         Returns:
@@ -1396,7 +1401,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         """
         return self.vision_tower
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Get the multi-modal projector.
 
         Returns:
@@ -1404,7 +1409,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         """
         return self.multi_modal_projector
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Get the language model backbone.
 
         Returns:

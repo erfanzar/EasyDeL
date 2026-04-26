@@ -36,7 +36,7 @@ Versions:
 Example:
     >>> config = RaggedPagesCacheConfig.create(
     ...     mesh=mesh,
-    ...     partition_manager=pm,
+    ...     runtime_sharding_resolver=pm,
     ...     kvdtype=jnp.bfloat16,
     ...     num_hidden_layers=32,
     ...     num_kv_heads=8,
@@ -53,9 +53,7 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer import escale as es
-from eformer.escale import PartitionAxis, PartitionManager
+import spectrax as spx
 from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
@@ -63,8 +61,10 @@ from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float, Int
+from spectrax import PartitionAxis, common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
+from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
@@ -83,10 +83,19 @@ logger = get_logger(__name__)
 
 PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
 
+# Padding multiple for the per-head dimension. Aligns to 128 to satisfy the
+# Pallas/TPU tile shape used by the ragged-page kernels.
+HEAD_DIM_ALIGNMENT = 128
+# Processing-window size used when batching cache-update slices. 16 MiB keeps
+# the inner buffer in HBM-friendly territory across page sizes.
+KV_UPDATE_WINDOW_BYTES = 16 * 1024 * 1024
+# Hard cap on slices per processing page; matches the kernel's loop unroll budget.
+MAX_SLICES_PER_UPDATE_PAGE = 64
 
-def _attention_dp_axis(partition_manager: PartitionManager):
+
+def _attention_dp_axis(runtime_sharding_resolver: RuntimeShardingResolver):
     """Resolve the concrete mesh axis used for KV-page data parallelism."""
-    return resolve_attention_data_parallel_axis(partition_manager, mode=MODE_PREFILL)
+    return resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -131,12 +140,12 @@ def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
     Raises:
         ValueError: If page_size_bytes is too large (slices <= 0).
     """
-    num_slices_per_page = (16 * 1024 * 1024) // page_size_bytes
+    num_slices_per_page = KV_UPDATE_WINDOW_BYTES // page_size_bytes
     if num_slices_per_page <= 0:
         raise ValueError("Number of slices should be positive")
     num_slices_per_page = previous_power_of_2(num_slices_per_page)
-    if num_slices_per_page > 64:
-        num_slices_per_page = 64
+    if num_slices_per_page > MAX_SLICES_PER_UPDATE_PAGE:
+        num_slices_per_page = MAX_SLICES_PER_UPDATE_PAGE
     return num_slices_per_page
 
 
@@ -195,9 +204,8 @@ def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) 
 
 def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, kvdtype: jnp.dtype) -> int:
     """Return packed combined KV heads for a given cache dtype."""
+    del k_headdim
     packing = get_dtype_packing(kvdtype)
-    if k_headdim == 64:
-        return align_to_multiple(num_kv_heads, packing)
     return align_to_multiple(num_kv_heads * 2, packing)
 
 
@@ -321,7 +329,7 @@ def get_page_size_bytes(
     Returns:
         int: Size of one page in bytes.
     """
-    padded_head_size = cdiv(head_size, 128) * 128
+    padded_head_size = cdiv(head_size, HEAD_DIM_ALIGNMENT) * HEAD_DIM_ALIGNMENT
     num_combined_kv_heads = num_kv_heads * 2
     packing = get_dtype_packing(kv_cache_dtype)
     num_combined_kv_heads = cdiv(num_combined_kv_heads, packing) * packing
@@ -408,7 +416,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     Example:
         >>> config = RaggedPagesCacheConfig.create(
         ...     mesh=mesh,
-        ...     partition_manager=pm,
+        ...     runtime_sharding_resolver=pm,
         ...     kvdtype=jnp.bfloat16,
         ...     num_hidden_layers=32,
         ...     num_kv_heads=8,
@@ -443,7 +451,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     @staticmethod
     def _compute_free_hbm(
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
         kv_head_shards: int | None = None,
     ):
@@ -451,18 +459,18 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
         Args:
             mesh: JAX device mesh.
-            partition_manager: Partition manager with axis configuration.
+            runtime_sharding_resolver: Partition manager with axis configuration.
             hbm_utilization: Target memory utilization fraction.
 
         Returns:
             int: Available bytes used for KV page-pool sizing, scaled by
                 both KV-head and data-parallel page-axis factors.
         """
-        physical_kv_head_axis = partition_manager.paxis.kv_head_axis
+        physical_kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         physical_kv_head_size = _mesh_axis_size(mesh, physical_kv_head_axis)
         kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
+        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(runtime_sharding_resolver))
         available_alloc = budget * kv_head_size * page_axis_size
         effective_kv_head_axis = physical_kv_head_axis if kv_head_size > 1 else "replicated"
         logger.info(
@@ -483,7 +491,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     def create(
         cls,
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
         num_kv_heads: int,
@@ -502,7 +510,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
         Args:
             mesh: JAX device mesh for distributed execution.
-            partition_manager: Manager for tensor partitioning/sharding.
+            runtime_sharding_resolver: Manager for tensor partitioning/sharding.
             kvdtype: Data type for KV cache storage (e.g., jnp.bfloat16).
             num_hidden_layers: Number of transformer layers.
             num_kv_heads: Number of key-value attention heads.
@@ -536,8 +544,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             raise ValueError("`num_kv_heads` must be positive")
         if kv_head_dim_size is None or kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
-        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
-        physical_kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(runtime_sharding_resolver))
+        physical_kv_head_size = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
         kvdtype = _canonicalize_dtype(kvdtype)
         kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
             kvdtype,
@@ -550,7 +558,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
         free = cls._compute_free_hbm(
             mesh=mesh,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
         )
@@ -622,8 +630,6 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         Returns:
             int: Aligned number of combined K+V heads.
         """
-        if self.k_headdim == 64:
-            return align_to_multiple(self.num_kv_heads, self.kv_head_packing)
         return align_to_multiple(self.num_kv_heads * 2, self.kv_head_packing)
 
     @property
@@ -640,11 +646,11 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         """Get aligned head dimension for storage.
 
         Returns:
-            int: Head dimension aligned to 128.
+            int: Head dimension aligned to ``HEAD_DIM_ALIGNMENT``.
         """
         if self.k_headdim == 64:
-            return 128
-        return align_to_multiple(self.k_headdim, 128)
+            return HEAD_DIM_ALIGNMENT
+        return align_to_multiple(self.k_headdim, HEAD_DIM_ALIGNMENT)
 
     def get_padded_num_slices(
         self,
@@ -773,9 +779,9 @@ class RaggedPagesCacheView(BaseCacheView):
         | Float[Array, "num_pages page_size kv_head_combined head_dim"]
         | ImplicitArray
     )
-    partition_manager: PartitionManager = field(
+    runtime_sharding_resolver: RuntimeShardingResolver = field(
         pytree_node=False,
-        default_factory=lambda: PartitionManager(PartitionAxis()),
+        default_factory=lambda: coerce_runtime_sharding_resolver(PartitionAxis()),
     )
 
     @classmethod
@@ -785,7 +791,7 @@ class RaggedPagesCacheView(BaseCacheView):
         layer_index: int | None = None,
         *,
         mesh: "Mesh | None" = None,
-        partition_manager: "es.PartitionManager | None" = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: "EasyQuantizer | None" = None,
     ) -> "RaggedPagesCacheView":
         """Initialize a RaggedPagesCacheView from a cache config.
@@ -797,7 +803,7 @@ class RaggedPagesCacheView(BaseCacheView):
             config: RaggedPagesCacheConfig with cache dimensions.
             layer_index: Index of this layer in the model.
             mesh: JAX device mesh for sharding.
-            partition_manager: Partition manager for sharding.
+            runtime_sharding_resolver: Partition manager for sharding.
             quantizer: Quantization configuration.
 
         Returns:
@@ -807,10 +813,13 @@ class RaggedPagesCacheView(BaseCacheView):
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         # Allocate KV pages
         kv_pages_shape, axes = config.get_shape_and_axes()
-        kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
+        kv_pages_sharding = runtime_sharding_resolver.resolve(
+            axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape
+        )
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
             kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=config.kvdtype, device=kv_pages_sharding))
@@ -819,7 +828,7 @@ class RaggedPagesCacheView(BaseCacheView):
             metadata=config,
             layer_index=layer_index or 0,
             kv_pages=kv_pages,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
         )
 
     def concatenate_to_cache(
@@ -867,7 +876,7 @@ class RaggedPagesCacheView(BaseCacheView):
                 # Keep shard_map enabled so each shard can derive its own page index.
                 use_shardmap = True
 
-            data_parallel_axis = _attention_dp_axis(self.partition_manager)
+            data_parallel_axis = _attention_dp_axis(self.runtime_sharding_resolver)
 
             def _update_fn(
                 kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
@@ -910,7 +919,7 @@ class RaggedPagesCacheView(BaseCacheView):
                 return pages.reshape(*orgshape)
 
             if use_shardmap:
-                resolve = self.partition_manager.resolve
+                resolve = self.runtime_sharding_resolver.resolve
                 page_axis = ATTN_DP if data_parallel_size > 1 else EMPTY
                 _update_fn = jax.shard_map(
                     _update_fn,
@@ -921,7 +930,7 @@ class RaggedPagesCacheView(BaseCacheView):
                         resolve([EMPTY], mode=MODE_PREFILL),
                     ),
                     out_specs=resolve([page_axis, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
-                    mesh=es.get_incontext_mesh(),
+                    mesh=spx.to_jax_mesh(spx.get_incontext_mesh()),
                     check_vma=False,
                 )
 
@@ -1004,7 +1013,7 @@ class RaggedPagesCache(BaseCache):
         cls,
         mesh: Mesh,
         config: RaggedPagesCacheConfig,
-        partition_manager: es.PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
     ) -> RaggedPagesCache:
         """
@@ -1016,7 +1025,7 @@ class RaggedPagesCache(BaseCache):
         Args:
             mesh (Mesh): The JAX device mesh.
             config (RaggedPagesCacheConfig): Static configuration for the cache.
-            partition_manager (es.PartitionManager): Manages tensor sharding.
+            runtime_sharding_resolver (RuntimeShardingResolver): Manages tensor sharding.
             quantizer (tp.Optional["EasyQuantizer"]): Optional quantizer to apply.
 
         Returns:
@@ -1027,7 +1036,7 @@ class RaggedPagesCache(BaseCache):
                 config=config,
                 layer_index=i,
                 mesh=mesh,
-                partition_manager=partition_manager,
+                runtime_sharding_resolver=runtime_sharding_resolver,
                 quantizer=quantizer,
             )
             for i in range(config.num_hidden_layers)
@@ -1078,20 +1087,20 @@ class RaggedPagesCache(BaseCache):
         cls,
         cache_data: list[dict[str, tp.Any]],
         metadata: RaggedPagesCacheConfig | None = None,
-        partition_manager: PartitionManager | None = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
     ) -> "RaggedPagesCache":
         """Reconstruct cache from pure Python data.
 
         Args:
             cache_data: List of dicts containing serialized view data.
             metadata: Shared RaggedPagesCacheConfig for reconstruction.
-            partition_manager: Optional partition manager for sharding.
+            runtime_sharding_resolver: Optional partition manager for sharding.
 
         Returns:
             Reconstructed RaggedPagesCache instance.
         """
         views: list[RaggedPagesCacheView] = []
-        pm = partition_manager or PartitionManager(PartitionAxis())
+        pm = coerce_runtime_sharding_resolver(runtime_sharding_resolver)
 
         for layer_data in cache_data:
             if layer_data.get("is_none", False):
@@ -1102,7 +1111,7 @@ class RaggedPagesCache(BaseCache):
                     kv_pages=layer_data["kv_pages"],
                     metadata=metadata,
                     layer_index=layer_data.get("layer_index", 0),
-                    partition_manager=pm,
+                    runtime_sharding_resolver=pm,
                 )
                 views.append(view)
 
@@ -1144,7 +1153,7 @@ class RaggedPagesCache(BaseCache):
                     kv_pages=new_kv_pages,
                     metadata=self_view.metadata,
                     layer_index=self_view.layer_index,
-                    partition_manager=self_view.partition_manager,
+                    runtime_sharding_resolver=self_view.runtime_sharding_resolver,
                 )
                 new_views.append(new_view)
 

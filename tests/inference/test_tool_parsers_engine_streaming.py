@@ -195,7 +195,7 @@ _TOOL_STREAM_CASES = [
     ),
     _ToolParserStreamCase(
         "gemma4",
-        '<|tool_call>call:get_weather{location:<escape>"Paris"<escape>}<tool_call|>',
+        '<|tool_call>call:get_weather{location:<|"|>Paris<|"|>}<tool_call|>',
     ),
     _ToolParserStreamCase(
         "phi4_mini_json",

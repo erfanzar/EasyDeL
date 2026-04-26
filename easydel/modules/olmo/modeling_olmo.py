@@ -17,12 +17,11 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -46,7 +45,7 @@ from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassification
 from .olmo_configuration import OlmoConfig
 
 
-class OlmoMLP(nn.Module):
+class OlmoMLP(spx.Module):
     """Multi-Layer Perceptron module for OLMo models.
 
     Implements the feedforward network with SwiGLU activation function
@@ -60,7 +59,7 @@ class OlmoMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize OLMo MLP block.
@@ -71,7 +70,7 @@ class OlmoMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -113,7 +112,7 @@ class OlmoMLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -127,7 +126,7 @@ class OlmoMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -135,7 +134,7 @@ class OlmoMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -153,7 +152,7 @@ class OlmoAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize OLMo attention layer with grouped-query attention support.
@@ -163,7 +162,7 @@ class OlmoAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.clip_qkv = getattr(config, "clip_qkv", None)
@@ -206,7 +205,7 @@ class OlmoAttention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class OlmoDecoderLayer(nn.Module):
+class OlmoDecoderLayer(spx.Module):
     """Single decoder layer for OLMo models.
 
     Combines multi-head attention and feedforward networks with
@@ -220,7 +219,7 @@ class OlmoDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize OLMo decoder layer.
@@ -230,7 +229,7 @@ class OlmoDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -269,7 +268,7 @@ class OlmoDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -347,7 +346,7 @@ class OlmoModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize OLMo base model.
 
@@ -356,7 +355,7 @@ class OlmoModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -381,19 +380,21 @@ class OlmoModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        if self.config.scan_layers and self._pipeline_stage_count() == 1:
+            self.layers = self.layers.stack()
         self.norm = LayerNorm(
             config.hidden_size,
             epsilon=1e-5,
@@ -402,7 +403,7 @@ class OlmoModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -414,6 +415,7 @@ class OlmoModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through the OLMo base model.
 
@@ -486,29 +488,54 @@ class OlmoModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        frequencies = self.config.get_basic_frequencies()
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
-                frequencies=self.frequencies,
+                frequencies=frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -573,7 +600,7 @@ class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize OLMo model for causal language modeling.
 
@@ -582,7 +609,7 @@ class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -621,7 +648,7 @@ class OlmoForSequenceClassification(BaseSequenceClassificationModule[OlmoModel, 
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize OLMo model for sequence classification.
 
@@ -630,7 +657,7 @@ class OlmoForSequenceClassification(BaseSequenceClassificationModule[OlmoModel, 
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

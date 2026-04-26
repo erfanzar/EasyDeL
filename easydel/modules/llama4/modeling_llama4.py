@@ -19,14 +19,12 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -145,7 +143,7 @@ def _create_chunked_attention_mask(  # pyright: ignore[reportUnusedFunction]
     return ((blcok_position == 0) & (token_position <= 0)).astype("b1")
 
 
-class Llama4TextExperts(nn.Module):
+class Llama4TextExperts(spx.Module):
     """Mixture of Experts module for Llama4 text models.
 
     Implements a sparse mixture of experts with top-k routing,
@@ -156,14 +154,14 @@ class Llama4TextExperts(nn.Module):
         # HuggingFace has fused gate_up_proj, we split into separate gate_proj and up_proj
         "gate_up_proj$": {
             "splits": [
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[:, :, : x.shape[-1] // 2]},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[:, :, x.shape[-1] // 2 :]},
+                {"name": "gate_proj.weight", "spliter": lambda x: x[:, :, : x.shape[-1] // 2]},
+                {"name": "up_proj.weight", "spliter": lambda x: x[:, :, x.shape[-1] // 2 :]},
             ],
             "inverse_spliter": lambda g, u: jnp.concatenate([g, u], axis=-1),
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x},
+                {"name": "down_proj.weight", "spliter": lambda x: x},
             ],
             "inverse_spliter": lambda x: x,
         },
@@ -176,7 +174,7 @@ class Llama4TextExperts(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 text experts module.
 
@@ -186,7 +184,7 @@ class Llama4TextExperts(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -202,9 +200,9 @@ class Llama4TextExperts(nn.Module):
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -214,9 +212,9 @@ class Llama4TextExperts(nn.Module):
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -227,15 +225,15 @@ class Llama4TextExperts(nn.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         group_sizes: Array,
@@ -256,14 +254,14 @@ class Llama4TextExperts(nn.Module):
         return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
-class Llama4TextL2Norm(nn.Module):
+class Llama4TextL2Norm(spx.Module):
     """L2 normalization layer for Llama4 text models.
 
     Normalizes inputs using L2 norm with learned scaling parameters,
     providing stable gradients during training.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(self, eps: float = 1e-6) -> None:
         """Initialize L2 normalization layer.
@@ -277,7 +275,7 @@ class Llama4TextL2Norm(nn.Module):
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     @jax.named_scope("easydel-L2norm")
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def forward(self, x: jnp.ndarray) -> jnp.ndarray:
         """Apply L2 normalization.
 
         Args:
@@ -289,7 +287,7 @@ class Llama4TextL2Norm(nn.Module):
         return self._norm(x.astype(jnp.float32)).astype(x.dtype)
 
 
-class Llama4TextMLP(nn.Module):
+class Llama4TextMLP(spx.Module):
     """Multi-Layer Perceptron for Llama4 text models.
 
     Implements feedforward network with SwiGLU activation function
@@ -304,7 +302,7 @@ class Llama4TextMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 text MLP block.
 
@@ -316,7 +314,7 @@ class Llama4TextMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -347,7 +345,7 @@ class Llama4TextMLP(nn.Module):
         self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size)
         self.activation_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -359,7 +357,7 @@ class Llama4TextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.activation_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -367,7 +365,7 @@ class Llama4TextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -386,7 +384,7 @@ class Llama4TextMoe(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 Mixture of Experts layer.
 
@@ -396,7 +394,7 @@ class Llama4TextMoe(BaseMoeModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -497,7 +495,7 @@ class Llama4TextMoe(BaseMoeModule):
             output_weights_hook=_unity_output_weights,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         training: bool = False,
@@ -530,9 +528,9 @@ class Llama4TextMoe(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.router,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             layer_idx=layer_idx,
@@ -556,7 +554,7 @@ class Llama4TextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Llama4 text attention layer.
@@ -566,7 +564,7 @@ class Llama4TextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model (determines RoPE usage).
         """
         self.use_rope = (layer_idx + 1) % 4 != 0
@@ -586,7 +584,7 @@ class Llama4TextAttention(UnifiedAttention):
         self.qk_norm = Llama4TextL2Norm() if config.use_qk_norm and self.use_rope else None
         self._cached_position_ids: Int[Array, "batch seq_len"] | None = None
 
-    def _create_attention_performer(self, config: Llama4TextConfig, rngs: nn.Rngs):
+    def _create_attention_performer(self, config: Llama4TextConfig, rngs: spx.Rngs):
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -635,7 +633,7 @@ class Llama4TextAttention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class Llama4TextDecoderLayer(nn.Module):
+class Llama4TextDecoderLayer(spx.Module):
     """Single Llama4 text decoder block combining attention and MLP.
 
     Combines multi-head attention and feedforward networks (dense or MoE)
@@ -649,7 +647,7 @@ class Llama4TextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Llama4 text decoder layer.
@@ -659,7 +657,7 @@ class Llama4TextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -712,7 +710,7 @@ class Llama4TextDecoderLayer(nn.Module):
 
         self.layer_idx = layer_idx
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -794,7 +792,7 @@ class Llama4TextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 text base model.
 
@@ -803,7 +801,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -827,19 +825,19 @@ class Llama4TextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = Llama4TextRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -848,7 +846,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -931,12 +929,13 @@ class Llama4TextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         mask_info = mask_info.apply_chunked(self.config.attention_chunk_size)
         frequencies = self.compute_complex_rotary(position_ids)
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -945,18 +944,25 @@ class Llama4TextModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -1021,7 +1027,7 @@ class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 model for causal language modeling.
 
@@ -1030,7 +1036,7 @@ class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1069,7 +1075,7 @@ class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4Tex
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 model for sequence classification.
 
@@ -1078,7 +1084,7 @@ class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4Tex
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1093,7 +1099,7 @@ class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4Tex
         )
 
 
-class Llama4MultiModalProjector(nn.Module):
+class Llama4MultiModalProjector(spx.Module):
     """Multi-modal projector for Llama4 vision-language models.
 
     Projects vision features into the text embedding space using MLP layers,
@@ -1107,7 +1113,7 @@ class Llama4MultiModalProjector(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 multi-modal projector.
 
@@ -1117,7 +1123,7 @@ class Llama4MultiModalProjector(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1135,7 +1141,7 @@ class Llama4MultiModalProjector(nn.Module):
             kernel_init=jax.nn.initializers.normal(0.01),
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Project vision features to text embedding space.
 
         Args:
@@ -1174,7 +1180,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
     return output_tensor
 
 
-class Llama4VisionPixelShuffleMLP(nn.Module):
+class Llama4VisionPixelShuffleMLP(spx.Module):
     """Pixel shuffle MLP for Llama4 vision models.
 
     Performs spatial downsampling of vision features through pixel shuffling
@@ -1188,7 +1194,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 vision pixel shuffle MLP.
 
@@ -1198,7 +1204,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1218,7 +1224,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, encoded_patches: Array) -> Array:
+    def forward(self, encoded_patches: Array) -> Array:
         """Apply pixel shuffle and MLP transformation to vision features.
 
         Args:
@@ -1279,7 +1285,7 @@ class Llama4VisionAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Llama4 vision attention layer.
@@ -1289,7 +1295,7 @@ class Llama4VisionAttention(AttentionModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the encoder.
         """
         super().__init__(config=config)
@@ -1327,7 +1333,7 @@ class Llama4VisionAttention(AttentionModule):
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -1381,7 +1387,7 @@ class Llama4VisionAttention(AttentionModule):
         )
 
 
-class Llama4VisionMLP2(nn.Module):
+class Llama4VisionMLP2(spx.Module):
     """Two-layer MLP module for Llama4 vision models.
 
     Implements a simple two-layer feedforward network with GELU activation
@@ -1395,7 +1401,7 @@ class Llama4VisionMLP2(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 vision two-layer MLP.
 
@@ -1405,7 +1411,7 @@ class Llama4VisionMLP2(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1427,7 +1433,7 @@ class Llama4VisionMLP2(nn.Module):
         self.fc1 = linear_class(self.intermediate_size, config.projector_input_dim)
         self.fc2 = linear_class(config.projector_output_dim, config.projector_output_dim)
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply two-layer feedforward transformation with GELU activation.
 
         Args:
@@ -1440,7 +1446,7 @@ class Llama4VisionMLP2(nn.Module):
         return self.activation_fn(hidden_states)
 
 
-class Llama4VisionMLP(nn.Module):
+class Llama4VisionMLP(spx.Module):
     """MLP module for Llama4 vision transformer.
 
     Standard feedforward network with GELU activation for vision
@@ -1454,7 +1460,7 @@ class Llama4VisionMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 vision MLP block.
 
@@ -1464,7 +1470,7 @@ class Llama4VisionMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1486,7 +1492,7 @@ class Llama4VisionMLP(nn.Module):
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
         self.activation_fn = ACT2FN["gelu"]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply feedforward transformation with GELU activation.
 
         Args:
@@ -1501,7 +1507,7 @@ class Llama4VisionMLP(nn.Module):
         return hidden_states
 
 
-class Llama4VisionEncoderLayer(nn.Module):
+class Llama4VisionEncoderLayer(spx.Module):
     """Single encoder layer for Llama4 vision models.
 
     Combines self-attention and feedforward networks with layer normalization
@@ -1515,7 +1521,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Llama4 vision encoder layer.
@@ -1525,7 +1531,7 @@ class Llama4VisionEncoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the encoder.
         """
         self.config = config
@@ -1567,7 +1573,7 @@ class Llama4VisionEncoderLayer(nn.Module):
 
         self.layer_idx = layer_idx
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         output_attentions: bool = False,
@@ -1590,7 +1596,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         attn_outputs = self.self_attn(
             hidden_states,
@@ -1606,7 +1612,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return EncoderLayerOutput(
@@ -1615,7 +1621,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         )
 
 
-class Llama4VisionEncoder(nn.Module):
+class Llama4VisionEncoder(spx.Module):
     """Vision encoder stack for Llama4 models.
 
     Stacks multiple vision encoder layers to progressively encode
@@ -1629,7 +1635,7 @@ class Llama4VisionEncoder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 vision encoder.
 
@@ -1638,7 +1644,7 @@ class Llama4VisionEncoder(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1651,21 +1657,21 @@ class Llama4VisionEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(self.config.num_hidden_layers)
-            ]
-        )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: jax.Array,
         frequencies: jax.Array,
@@ -1692,7 +1698,9 @@ class Llama4VisionEncoder(nn.Module):
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
-        for encoder_layer in self.layers:
+
+        def _layer_loop(encoder_layer, carry):
+            hidden_states, encoder_states, all_attentions = carry
             if output_hidden_states:
                 assert encoder_states is not None
                 encoder_states = (*encoder_states, hidden_states)
@@ -1706,8 +1714,15 @@ class Llama4VisionEncoder(nn.Module):
                 assert all_attentions is not None
                 all_attentions = (*all_attentions, layer_outputs.attention_weight)
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
+            return hidden_states, encoder_states, all_attentions
+
+        hidden_states, encoder_states, all_attentions = self.layers.scan(
+            _layer_loop,
+            (hidden_states, encoder_states, all_attentions),
+            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+        )
         if output_hidden_states:
             assert encoder_states is not None
             encoder_states = (*encoder_states, hidden_states)
@@ -1719,7 +1734,7 @@ class Llama4VisionEncoder(nn.Module):
         )
 
 
-class Llama4UnfoldConvolution(nn.Module):
+class Llama4UnfoldConvolution(spx.Module):
     """Unfold convolution module for Llama4 vision models.
 
     Implements patch extraction with optional convolution,
@@ -1733,7 +1748,7 @@ class Llama4UnfoldConvolution(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 unfold convolution layer.
 
@@ -1742,7 +1757,7 @@ class Llama4UnfoldConvolution(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         patch_size_val = config.patch_size
         if isinstance(patch_size_val, int):
@@ -1769,7 +1784,7 @@ class Llama4UnfoldConvolution(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
         """Extract and embed image patches.
 
         Args:
@@ -1817,7 +1832,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 vision model.
 
@@ -1826,7 +1841,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1855,14 +1870,14 @@ class Llama4VisionModel(EasyDeLBaseModule):
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": self.scale},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
         self.positional_embedding_vlm = ArrayParam.bound(
             shape=(self.num_patches, self.hidden_size),
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": self.scale},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
         self.layernorm_pre = LayerNorm(
             num_features=self.hidden_size,
@@ -1896,14 +1911,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
         )
         self.vision_idx = self.config.image_size // self.config.patch_size
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for vision-only parameters."""
-        return {
-            "class_embedding": Replicated,
-            "positional_embedding_vlm": ColumnWise,
-        }
-
-    def __call__(
+    def forward(
         self,
         pixel_values: jax.Array,
         attention_mask: jax.Array | None = None,
@@ -2025,7 +2033,7 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
 
     Class Attributes:
         _task_type: IMAGE_TEXT_TO_TEXT task type
@@ -2056,7 +2064,7 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Llama4 vision-language model for conditional generation.
 
@@ -2065,7 +2073,7 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         language_model = Llama4ForCausalLM(
             config=config.get_text_config(),
@@ -2187,7 +2195,7 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
 
         return inputs_embeds
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -2358,14 +2366,14 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
         """Returns the embedding layer."""
         return self.language_model.get_embedding()
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Returns the vision tower component."""
         return self.vision_model
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Returns the multimodal projector component."""
         return self.multi_modal_projector
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Returns the language model component."""
         return self.language_model

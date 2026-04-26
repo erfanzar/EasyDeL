@@ -15,12 +15,11 @@
 """Regression tests: chunked LM-head projection inside nested JAX traced regions.
 
 Validates that calling ``model.apply_lm_head`` (and related paths) from inside
-``jax.lax.scan``, ``jax.lax.fori_loop``, and ``jax.checkpoint`` does NOT
-trigger ``flax.errors.TraceContextError``, regardless of the gradient
+``jax.lax.scan``, ``jax.lax.fori_loop``, and ``jax.checkpoint``, regardless of the gradient
 checkpointing policy or tied-embedding configuration.
 
 The root cause was that ``BaseCausalLMModule.__init__`` wrapped the LM-head
-class with ``auto_remat``.  NNX's ``nn.remat`` performs variable mutation
+class with ``auto_remat``.  SpecTrax's ``nn.remat`` performs variable mutation
 (``update_from_state``) in its ``split_inputs`` protocol, which fails when
 called from a different JAX trace level (e.g., inside a ``lax.scan`` body
 that runs under ``jax.grad``).
@@ -31,7 +30,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-from flax import nnx
+import spectrax as spx
 
 # Import easydel first so jax.distributed.initialize() runs before jax.devices()
 import easydel  # noqa: F401
@@ -59,14 +58,13 @@ def _make_model(tie: bool, gradient_checkpointing: str):
             config=cfg,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
-            rngs=nnx.Rngs(0),
+            rngs=spx.Rngs(0),
         )
     return model
 
 
 def _split(model):
-    graphdef, graphstate, graphother = nnx.split(model, nnx.Param, ...)
-    return graphdef, graphstate, graphother
+    return model.split_module()
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +83,7 @@ def _loss_make_lm_head_fn_scan(graphdef, graphother, model):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             graphother,
         )
-        mdl = nnx.merge(graphdef, params, other)
+        mdl = spx.bind(graphdef, params.merge(other, copy=True))
         outputs = mdl(input_ids=jnp.ones((B, L), dtype=jnp.int32), apply_lm_head=False)
         hidden = outputs.last_hidden_state
 
@@ -117,7 +115,7 @@ def _loss_distillation_chunked(graphdef, graphother, model):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             graphother,
         )
-        mdl = nnx.merge(graphdef, params, other)
+        mdl = spx.bind(graphdef, params.merge(other, copy=True))
         outputs = mdl(input_ids=jnp.ones((B, L), dtype=jnp.int32), apply_lm_head=False)
         student_h = outputs.last_hidden_state
         teacher_h = jax.lax.stop_gradient(student_h)
@@ -148,7 +146,7 @@ def _loss_logprob_utils(graphdef, graphother, model):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             graphother,
         )
-        mdl = nnx.merge(graphdef, params, other)
+        mdl = spx.bind(graphdef, params.merge(other, copy=True))
         outputs = mdl(input_ids=jnp.ones((B, L), dtype=jnp.int32), apply_lm_head=False)
         hidden = outputs.last_hidden_state
         logp_sums, _, _ = compute_sequence_scores_from_hidden_states(
@@ -212,8 +210,8 @@ def test_lm_head_is_wrapped_with_remat():
     """LM head should still be wrapped with nn.remat for memory savings."""
     model = _make_model(tie=False, gradient_checkpointing="mlp_notsaveable")
     head = model.get_task_head()
-    assert getattr(head.__call__, "_easydel_auto_remat_wrapped", False), (
-        "LM head __call__ should be wrapped with auto_remat"
+    assert getattr(head.forward, "_easydel_auto_remat_wrapped", False), (
+        "LM head forward should be wrapped with auto_remat"
     )
 
 
@@ -232,7 +230,7 @@ def test_make_lm_head_fn_bypasses_remat():
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            mdl = nnx.merge(graphdef, params, other)
+            mdl = spx.bind(graphdef, params.merge(other, copy=True))
             lm_fn = mdl.make_lm_head_fn()
 
             def _scan_body(carry, _):

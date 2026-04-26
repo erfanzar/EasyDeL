@@ -17,15 +17,13 @@ from functools import cached_property, partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -123,7 +121,7 @@ class Gemma3CausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-class Gemma3RMSNorm(nn.Module):
+class Gemma3RMSNorm(spx.Module):
     """Root Mean Square Layer Normalization for Gemma3 models.
 
     Implements RMS normalization with Float8 support for efficient computation
@@ -131,7 +129,7 @@ class Gemma3RMSNorm(nn.Module):
     normalizes inputs by the root mean square, providing training stability.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
         self,
@@ -154,16 +152,12 @@ class Gemma3RMSNorm(nn.Module):
         self.epsilon = self.config.rms_norm_eps if epsilon is None else epsilon
         self.param_dtype = param_dtype
         dim = self.config.hidden_size if dim is None else dim
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(dim,),
             dtype=param_dtype,
             init_method="ones",
             key=None,
         )
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for normalization parameters."""
-        return {"kernel": Replicated}
 
     def _norm(self, x: jax.Array) -> jax.Array:
         """Apply RMS normalization without learnable scale.
@@ -176,7 +170,7 @@ class Gemma3RMSNorm(nn.Module):
         """
         return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
         """Apply RMS normalization with learnable scale.
 
         Args:
@@ -188,7 +182,7 @@ class Gemma3RMSNorm(nn.Module):
                 automatically casts to bfloat16 for compatibility.
         """
         variance = self._norm(hidden_states.astype(jnp.float32)).astype(self.param_dtype)
-        out = (1 + self.kernel.value.astype(self.param_dtype)) * variance
+        out = (1 + self.weight.value.astype(self.param_dtype)) * variance
 
         if out.dtype in lowfloats:
             out = out.astype(jnp.bfloat16)
@@ -220,7 +214,7 @@ class Gemma3Attention(UnifiedAttention):
         causal: bool = True,
         is_cross_attention: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 attention layer.
 
@@ -235,7 +229,7 @@ class Gemma3Attention(UnifiedAttention):
             causal (bool, optional): Whether to apply causal masking. Defaults to True.
             is_cross_attention (bool, optional): Whether this is a cross-attention layer.
                 Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.is_sliding = config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
 
@@ -298,7 +292,7 @@ class Gemma3Attention(UnifiedAttention):
         return self.q_norm(query_states), self.k_norm(key_states), value_states
 
 
-class Gemma3MLP(nn.Module):
+class Gemma3MLP(spx.Module):
     """Multi-Layer Perceptron module for Gemma3 models.
 
     Implements the feedforward network component of the transformer architecture
@@ -313,7 +307,7 @@ class Gemma3MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 MLP block.
 
@@ -324,7 +318,7 @@ class Gemma3MLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision for
                 matrix operations. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -333,7 +327,7 @@ class Gemma3MLP(nn.Module):
 
         embed_dim = self.config.hidden_size
         inner_dim = self.config.intermediate_size if self.config.intermediate_size is not None else 4 * embed_dim
-        kernel_init = jax.nn.initializers.normal(config.initializer_range)
+        kernel_init = jax.jax.nn.initializers.normal(config.initializer_range)
 
         self.act = ACT2FN[self.config.hidden_activation]
 
@@ -359,7 +353,7 @@ class Gemma3MLP(nn.Module):
         self.down_proj = row_parallel_linear(inner_dim, embed_dim)
         self.up_proj = column_parallel_linear(embed_dim, inner_dim)
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass through the MLP block.
@@ -375,7 +369,7 @@ class Gemma3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -383,12 +377,12 @@ class Gemma3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Gemma3DecoderLayer(nn.Module):
+class Gemma3DecoderLayer(spx.Module):
     """Single decoder layer for Gemma3 models.
 
     Combines self-attention and feedforward networks with residual connections
@@ -410,7 +404,7 @@ class Gemma3DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 decoder layer.
 
@@ -421,7 +415,7 @@ class Gemma3DecoderLayer(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | jax.lax.Precision | None, optional): Numerical precision for
                 matrix operations. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -454,7 +448,7 @@ class Gemma3DecoderLayer(nn.Module):
         self.is_sliding = self.self_attn.is_sliding
         self.sliding_window = config.sliding_window
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -495,7 +489,7 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -511,14 +505,14 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
@@ -537,7 +531,7 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -570,7 +564,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 text base model.
 
@@ -580,7 +574,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -594,7 +588,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         self.embed_tokens = Embed(
             self.config.vocab_size,
             self.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            embedding_init=jax.jax.nn.initializers.normal(stddev=self.config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -605,19 +599,19 @@ class Gemma3TextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    self.config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        self.config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = Gemma3RMSNorm(self.config, param_dtype=self.dtype)
 
     @cached_property
@@ -640,7 +634,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
         return ModuleCaches(frequencies)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -761,12 +755,13 @@ class Gemma3TextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -778,19 +773,26 @@ class Gemma3TextModel(EasyDeLBaseModule):
                 mask_info=layer_mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
                 default_frequencies=self.default_frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
         if output_hidden_states:
@@ -860,7 +862,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 model for causal language modeling.
 
@@ -871,7 +873,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
                 Note: float16 is not recommended and will trigger a warning.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         if param_dtype == jnp.float16 or param_dtype == "f2":
             logger.error(
@@ -889,7 +891,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1047,7 +1049,7 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 model for sequence classification.
 
@@ -1057,7 +1059,7 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1071,7 +1073,7 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
             score_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1181,7 +1183,7 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
         return self.score
 
 
-class Gemma3MultiModalProjector(nn.Module):
+class Gemma3MultiModalProjector(spx.Module):
     """Multi-modal projector for Gemma3 vision-language models.
 
     Projects vision features into the text embedding space, enabling
@@ -1202,7 +1204,7 @@ class Gemma3MultiModalProjector(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the multi-modal projector.
 
@@ -1212,7 +1214,7 @@ class Gemma3MultiModalProjector(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1251,11 +1253,7 @@ class Gemma3MultiModalProjector(nn.Module):
             / (kernel_size * kernel_size)
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for multimodal projection parameters."""
-        return {"mm_input_projection_weight": ColumnWise}
-
-    def __call__(self, vision_outputs: Float[Array, "batch hidden_dim num_patches"]) -> Array:
+    def forward(self, vision_outputs: Float[Array, "batch hidden_dim num_patches"]) -> Array:
         """Project vision features to text embedding space.
 
         Applies average pooling to reduce spatial dimensions, normalizes with RMSNorm,
@@ -1317,7 +1315,7 @@ class Gemma3Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the Gemma3 multimodal base model.
 
@@ -1328,7 +1326,7 @@ class Gemma3Model(EasyDeLBaseModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1431,7 +1429,7 @@ class Gemma3Model(EasyDeLBaseModule):
 
         return inputs_embeds
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -1689,7 +1687,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Gemma3 for conditional generation.
 
@@ -1700,7 +1698,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1753,7 +1751,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -1878,14 +1876,14 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Returns the vision tower component."""
         return self.base_model.vision_tower
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Returns the multimodal projector component."""
         return self.base_model.multi_modal_projector
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Returns the language model component."""
         return self.base_model.language_model

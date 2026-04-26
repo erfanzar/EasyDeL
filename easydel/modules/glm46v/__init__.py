@@ -56,7 +56,7 @@ Usage Example:
         vision_config={"hidden_size": 1536, "depth": 24},
     )
 
-    model = Glm46VForConditionalGeneration(config, rngs=nnx.Rngs(0))
+    model = Glm46VForConditionalGeneration(config, rngs=spx.Rngs(0))
 
     # Forward pass with image
     input_ids = jnp.array([[1, 2, 151343, 3, 4]])  # 151343 is image_token_id

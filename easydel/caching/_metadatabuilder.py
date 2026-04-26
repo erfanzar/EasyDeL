@@ -69,22 +69,22 @@ BoolVectorLike = ArrayLike | Sequence[bool] | Sequence[int]
 
 
 class SupportsStartsIndexs(tp.Protocol):
-    """Protocol for cache views that carry transformer-style starts/indexs.
+    """Protocol for cache views that carry transformer-style starts/indexes.
 
     This protocol defines the interface for cache views that support
-    sequence position tracking through starts and indexs arrays.
+    sequence position tracking through starts and indexes arrays.
     Used by the metadata builder to extract position information
     from existing cache views.
 
     Attributes:
         starts: Array-like containing starting positions for each sequence.
             Shape: [batch_size]
-        indexs: Array-like containing current position indices for each sequence.
+        indexes: Array-like containing current position indices for each sequence.
             Shape: [batch_size]
     """
 
     starts: ArrayLike
-    indexs: ArrayLike
+    indexes: ArrayLike
 
 
 class _HasCpuTensor(tp.Protocol):
@@ -295,13 +295,13 @@ class AttentionMetadataBuilder:
         *,
         postpadded: bool = False,
         starts: IntVectorLike | None = None,
-        indexs: IntVectorLike | None = None,
+        indexes: IntVectorLike | None = None,
         cache_view: SupportsStartsIndexs | None = None,
     ) -> TransformerMetadata:
         """Build transformer-style runtime metadata.
 
         Creates a TransformerMetadata object for standard KV-cache attention.
-        If `starts`/`indexs` are not provided but a `cache_view` is, values
+        If `starts`/`indexes` are not provided but a `cache_view` is, values
         are taken from the view.
 
         Args:
@@ -309,10 +309,10 @@ class AttentionMetadataBuilder:
                 Affects how attention masks are computed.
             starts: Starting positions for each sequence in the batch.
                 Shape: [batch_size]. Optional.
-            indexs: Current position indices for each sequence.
+            indexes: Current position indices for each sequence.
                 Shape: [batch_size]. Optional.
             cache_view: Optional cache view implementing SupportsStartsIndexs
-                protocol to infer starts/indexs if not provided.
+                protocol to infer starts/indexes if not provided.
 
         Returns:
             TransformerMetadata: Runtime metadata for transformer attention.
@@ -326,13 +326,13 @@ class AttentionMetadataBuilder:
         if cache_view is not None:
             if starts is None:
                 starts = cache_view.starts
-            if indexs is None:
-                indexs = cache_view.indexs
+            if indexes is None:
+                indexes = cache_view.indexes
 
         starts_arr = None if starts is None else jnp.asarray(starts, dtype=jnp.int32)
-        indexs_arr = None if indexs is None else jnp.asarray(indexs, dtype=jnp.int32)
+        indexes_arr = None if indexes is None else jnp.asarray(indexes, dtype=jnp.int32)
 
-        return TransformerMetadata(postpadded=postpadded, starts=starts_arr, indexs=indexs_arr)
+        return TransformerMetadata(postpadded=postpadded, starts=starts_arr, indexes=indexes_arr)
 
     @classmethod
     def build_recurrent_metadata(cls) -> RecurrentMetadata:
@@ -639,7 +639,7 @@ class AttentionMetadataBuilder:
         expected_cache_type: tp.Literal["auto", "transformer", "ragged", "recurrent"] = "auto",
         postpadded: bool = False,
         starts: IntVectorLike | None = None,
-        indexs: IntVectorLike | None = None,
+        indexes: IntVectorLike | None = None,
         cache_view: SupportsStartsIndexs | None = None,
         pages_tables: IntMatrixLike | None = None,
         block_tables: IntMatrixLike | None = None,
@@ -671,8 +671,8 @@ class AttentionMetadataBuilder:
                 `expected_cache_type="auto"`.
             expected_cache_type: Force the type to build. "auto" infers based on
                 mechanism name and provided fields.
-            postpadded, starts, indexs: Transformer-style runtime fields.
-            cache_view: Optional cache view to infer `starts`/`indexs` if missing.
+            postpadded, starts, indexes: Transformer-style runtime fields.
+            cache_view: Optional cache view to infer `starts`/`indexes` if missing.
             pages_tables / block_tables: Page/block tables for paged attention.
             context_lens / seq_lens: Per-request context lengths.
             query_start_loc: Cumulative query start offsets.
@@ -736,7 +736,7 @@ class AttentionMetadataBuilder:
         return cls.build_transformer_metadata(
             postpadded=postpadded,
             starts=starts,
-            indexs=indexs,
+            indexes=indexes,
             cache_view=cache_view,
         )
 

@@ -24,8 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import spectrax as spx
 import torch
-from flax import nnx as nn
 
 import easydel as ed
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -59,7 +59,7 @@ def small_model_config():
         "use_cache": True,
         "moe_method": "fused_moe",
         # Keep tensor parallelism when possible, but stay valid on single-device (CPU) setups.
-        "sharding_axis_dims": (1, 1, -1, tp_dim, 1),
+        "sharding_axis_dims": (1, 1, 1, -1, tp_dim, 1),
         "use_expert_tensor_mode": False,
         "bos_token_id": 0,
         "eos_token_id": 1,
@@ -104,7 +104,7 @@ def jax_mesh(small_model_config):
     dims = small_model_config["sharding_axis_dims"]
     mesh = jax.sharding.Mesh(
         np.array(jax.devices()).reshape(dims),
-        ("dp", "fsdp", "ep", "tp", "sp"),
+        ("pp", "dp", "fsdp", "ep", "tp", "sp"),
     )
     return mesh
 
@@ -190,7 +190,7 @@ def model_factory(small_model_config, jax_mesh):
                 dtype=small_model_config["dtype"],
                 param_dtype=small_model_config["dtype"],
                 precision=small_model_config["precision"],
-                rngs=nn.Rngs(42),
+                rngs=spx.Rngs(42),
             )
             ed_model = ed.traversals.merge_model_and_tree(ed_model, tree=ed_model.transform_fn(hf_model.state_dict()))
             ed_model.eval()
@@ -274,7 +274,7 @@ def model_tester(small_model_config, random_input_ids):
 
                 @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(ids, gd, gs, go):
-                    return nn.merge(gd, gs, go).compute_loss(
+                    return spx.bind(gd, gs.merge(go, copy=True)).compute_loss(
                         input_ids=ids,
                         attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
                         output_router_logits=True,
@@ -286,7 +286,7 @@ def model_tester(small_model_config, random_input_ids):
 
                 @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(ids, gd, gs, go):
-                    return nn.merge(gd, gs, go).compute_loss(
+                    return spx.bind(gd, gs.merge(go, copy=True)).compute_loss(
                         input_ids=ids,
                         attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
                         **kwargs_jax,

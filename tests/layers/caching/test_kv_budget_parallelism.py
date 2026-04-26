@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import jax.numpy as jnp
-from eformer.escale import PartitionAxis, PartitionManager
+from spectrax import PartitionAxis
 
 import easydel.caching.ragged_page.cache as ragged_cache_mod
 import easydel.caching.unified_attention.cache as unified_cache_mod
+from easydel.infra.sharding import coerce_runtime_sharding_resolver
 
 
 class _FakeMesh:
@@ -33,7 +34,7 @@ def _mesh_dp_tp():
 
 
 def _partition_manager():
-    return PartitionManager(PartitionAxis(kv_head_axis="tp", data_parallel_axis="dp"))
+    return coerce_runtime_sharding_resolver(PartitionAxis(kv_head_axis="tp", data_parallel_axis="dp"))
 
 
 def test_ragged_page_budget_scales_with_mesh_dp_axis(monkeypatch):
@@ -46,7 +47,7 @@ def test_ragged_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     pm = _partition_manager()
     cfg_no_dp = ragged_cache_mod.RaggedPagesCacheConfig.create(
         mesh=_mesh_tp_only(),
-        partition_manager=pm,
+        runtime_sharding_resolver=pm,
         kvdtype=jnp.float32,
         num_hidden_layers=1,
         num_kv_heads=1,
@@ -57,7 +58,7 @@ def test_ragged_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     )
     cfg_dp2 = ragged_cache_mod.RaggedPagesCacheConfig.create(
         mesh=_mesh_dp_tp(),
-        partition_manager=pm,
+        runtime_sharding_resolver=pm,
         kvdtype=jnp.float32,
         num_hidden_layers=1,
         num_kv_heads=1,
@@ -82,7 +83,7 @@ def test_ragged_page_budget_replicates_kv_cache_when_tp_head_sharding_is_incompa
     pm = _partition_manager()
     cfg = ragged_cache_mod.RaggedPagesCacheConfig.create(
         mesh=_FakeMesh({"dp": 1, "tp": 4}),
-        partition_manager=pm,
+        runtime_sharding_resolver=pm,
         kvdtype=jnp.bfloat16,
         num_hidden_layers=1,
         num_kv_heads=1,
@@ -99,6 +100,32 @@ def test_ragged_page_budget_replicates_kv_cache_when_tp_head_sharding_is_incompa
     assert axes[2] == ragged_cache_mod.common_types.EMPTY
 
 
+def test_ragged_v3_storage_keeps_combined_kv_heads_for_small_head_dim(monkeypatch):
+    monkeypatch.setattr(
+        ragged_cache_mod,
+        "per_device_hbm_budget_bytes",
+        lambda *_args, **_kwargs: 1 << 20,
+    )
+
+    cfg = ragged_cache_mod.RaggedPagesCacheConfig.create(
+        mesh=_mesh_tp_only(),
+        runtime_sharding_resolver=_partition_manager(),
+        kvdtype=jnp.bfloat16,
+        num_hidden_layers=1,
+        num_kv_heads=2,
+        max_model_length=160,
+        kv_head_dim_size=64,
+        hbm_utilization=0.9,
+        page_size=32,
+        version="v3",
+    )
+
+    shape, _axes = cfg.get_shape_and_axes()
+
+    assert shape[2] * shape[3] >= cfg.num_kv_heads * 2
+    assert shape[4] >= cfg.k_headdim
+
+
 def test_unified_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     monkeypatch.setattr(
         unified_cache_mod,
@@ -109,7 +136,7 @@ def test_unified_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     pm = _partition_manager()
     cfg_no_dp = unified_cache_mod.UnifiedAttentionCacheConfig.create(
         mesh=_mesh_tp_only(),
-        partition_manager=pm,
+        runtime_sharding_resolver=pm,
         kvdtype=jnp.float32,
         num_hidden_layers=1,
         num_kv_heads=1,
@@ -120,7 +147,7 @@ def test_unified_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     )
     cfg_dp2 = unified_cache_mod.UnifiedAttentionCacheConfig.create(
         mesh=_mesh_dp_tp(),
-        partition_manager=pm,
+        runtime_sharding_resolver=pm,
         kvdtype=jnp.float32,
         num_hidden_layers=1,
         num_kv_heads=1,

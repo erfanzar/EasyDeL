@@ -17,13 +17,12 @@ import typing
 from functools import partial
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -75,7 +74,7 @@ class ArcticAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Arctic attention layer with sliding window configuration.
@@ -86,7 +85,7 @@ class ArcticAttention(UnifiedAttention):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__(
@@ -121,7 +120,7 @@ class ArcticAttention(UnifiedAttention):
             use_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             precision=precision,
         )
 
@@ -145,7 +144,7 @@ class ArcticAttention(UnifiedAttention):
             use_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             precision=precision,
         )
 
@@ -169,7 +168,7 @@ class ArcticAttention(UnifiedAttention):
             use_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             precision=precision,
         )
 
@@ -195,7 +194,7 @@ class ArcticAttention(UnifiedAttention):
             use_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             precision=precision,
         )
 
@@ -211,12 +210,12 @@ class ArcticAttention(UnifiedAttention):
         """
         return config.get_basic_rope(dtype, self.head_dim, self.head_dim, True)
 
-    def _create_attention_performer(self, config: ArcticConfig, rngs: nn.Rngs):
+    def _create_attention_performer(self, config: ArcticConfig, rngs: spx.Rngs):
         """Create flexible attention module with Arctic configuration.
 
         Args:
             config (ArcticConfig): Model configuration.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             FlexibleAttentionModule: Attention performer for Arctic.
@@ -228,7 +227,7 @@ class ArcticAttention(UnifiedAttention):
         )
 
 
-class ArcticMLPMoE(nn.Module):
+class ArcticMLPMoE(spx.Module):
     """Mixture-of-Experts MLP block for Arctic models.
 
     Implements the feedforward network with SwiGLU activation function
@@ -238,14 +237,14 @@ class ArcticMLPMoE(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "w1.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "w3.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                {"name": "w1.weight", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "w3.weight", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
             ],
             "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
         },
         "down_proj$": {
             "splits": [
-                {"name": "w2.kernel", "spliter": lambda x: x},
+                {"name": "w2.weight", "spliter": lambda x: x},
             ],
             "inverse_spliter": lambda x: x,
         },
@@ -259,7 +258,7 @@ class ArcticMLPMoE(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         is_residual_mlp: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Arctic MoE MLP block.
 
@@ -271,7 +270,7 @@ class ArcticMLPMoE(nn.Module):
                 Defaults to None.
             is_residual_mlp (bool, optional): Whether this is a residual MLP block.
                 Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -288,8 +287,8 @@ class ArcticMLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
@@ -300,8 +299,8 @@ class ArcticMLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
@@ -312,14 +311,14 @@ class ArcticMLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         group_sizes: Array,
@@ -339,7 +338,7 @@ class ArcticMLPMoE(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return apply_logical_sharding(
             self.w2(
@@ -349,11 +348,11 @@ class ArcticMLPMoE(nn.Module):
                 sorted_experts,
             ),
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
 
-class ArcticMLP(nn.Module):
+class ArcticMLP(spx.Module):
     """Multi-Layer Perceptron module for Arctic models.
 
     Implements the feedforward network with SwiGLU activation function
@@ -368,7 +367,7 @@ class ArcticMLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         is_residual_mlp: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Arctic MLP block.
 
@@ -380,7 +379,7 @@ class ArcticMLP(nn.Module):
                 Defaults to None.
             is_residual_mlp (bool, optional): Whether this is a residual MLP block.
                 Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -395,14 +394,14 @@ class ArcticMLP(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
         )
         self.w1 = linear_class(self.hidden_dim, self.ffn_dim, rngs=rngs)
         self.w3 = linear_class(self.hidden_dim, self.ffn_dim, rngs=rngs)
         self.w2 = linear_class(self.ffn_dim, self.hidden_dim, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -416,7 +415,7 @@ class ArcticMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         w1 = checkpoint_name(self.act_fn(self.w1(hidden_states)), "mlp_gate")
         w3 = checkpoint_name(self.w3(hidden_states), "mlp_up")
@@ -424,7 +423,7 @@ class ArcticMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -443,7 +442,7 @@ class ArcticMoeBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ) -> None:
         """Initialize Arctic MoE block.
@@ -454,7 +453,7 @@ class ArcticMoeBlock(BaseMoeModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model, used to determine if this
                 is an MoE layer based on moe_layer_frequency.
         """
@@ -488,7 +487,7 @@ class ArcticMoeBlock(BaseMoeModule):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
-                kernel_init=nn.initializers.normal(),
+                kernel_init=jax.nn.initializers.normal(),
                 rngs=rngs,
             )
             self.experts = ArcticMLPMoE(
@@ -508,7 +507,7 @@ class ArcticMoeBlock(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass through the MoE or MLP block.
@@ -529,16 +528,16 @@ class ArcticMoeBlock(BaseMoeModule):
                 hidden_state=hidden_states,
                 gate_layer=self.gate,
                 expert_layer=self.experts,
-                wi_kernel=self.experts.w1.kernel.value,
-                wu_kernel=self.experts.w3.kernel.value,
-                wd_kernel=self.experts.w2.kernel.value,
+                wi_kernel=self.experts.w1.weight.value,
+                wu_kernel=self.experts.w3.weight.value,
+                wd_kernel=self.experts.w2.weight.value,
                 act_fn=self.experts.act_fn,
             )
             return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
         return self.mlp(hidden_states), None  # pyright: ignore[reportReturnType]
 
 
-class ArcticDecoderLayer(nn.Module):
+class ArcticDecoderLayer(spx.Module):
     """Single decoder layer for Arctic models.
 
     Combines multi-head attention with MoE/MLP feedforward networks,
@@ -553,7 +552,7 @@ class ArcticDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ) -> None:
         """Initialize Arctic decoder layer.
@@ -563,7 +562,7 @@ class ArcticDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -621,7 +620,7 @@ class ArcticDecoderLayer(nn.Module):
                 rngs=rngs,
             )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -659,7 +658,7 @@ class ArcticDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -678,7 +677,7 @@ class ArcticDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         residual_attn = hidden_states
         router_logits = None
@@ -698,7 +697,7 @@ class ArcticDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(hidden_states, "layer_output")
 
@@ -732,7 +731,7 @@ class ArcticModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Arctic base model.
 
@@ -741,7 +740,7 @@ class ArcticModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -765,19 +764,19 @@ class ArcticModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    layer_idx=layer_idx,
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        layer_idx=layer_idx,
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             self.config.hidden_size,
@@ -787,7 +786,7 @@ class ArcticModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -881,9 +880,11 @@ class ArcticModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, layer in enumerate(self.layers):
+
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             outputs = layer(
@@ -891,18 +892,18 @@ class ArcticModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-            hidden_states = outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.layers)
 
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.partition_manager,
+                partition_manager=self.config.runtime_sharding_resolver,
             )
 
             if output_attentions:
@@ -911,8 +912,15 @@ class ArcticModel(EasyDeLBaseModule):
             if output_router_logits:
                 all_router_logits += (outputs.router_logits,)
 
-            past_key_values[idx] = outputs.cache_view
+            self._layer_cache_view_update(None, idx, outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_self_attns, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -985,7 +993,7 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type:
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Arctic model for causal language modeling.
 
@@ -994,7 +1002,7 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type:
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1008,7 +1016,7 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type:
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1111,7 +1119,7 @@ class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticMod
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Arctic model for sequence classification.
 
@@ -1120,7 +1128,7 @@ class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticMod
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1135,7 +1143,7 @@ class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticMod
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

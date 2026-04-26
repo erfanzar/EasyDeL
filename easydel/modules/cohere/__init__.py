@@ -44,7 +44,8 @@ Usage Example:
     ```python
     from easydel.modules.cohere import CohereConfig, CohereForCausalLM
     import jax
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Configure Cohere Command-R style model
     config = CohereConfig(
@@ -58,7 +59,7 @@ Usage Example:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = CohereForCausalLM(config, rngs=rngs)
 
     # Generate text

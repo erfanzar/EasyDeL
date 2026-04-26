@@ -758,7 +758,7 @@ def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str,
         or monitoring weight distributions during training.
 
     Example:
-        >>> stats = compute_weight_stats(model.params, r'.*dense.*')
+        >>> stats = compute_weight_stats(model.parameter_values(), r'.*dense.*')
         >>> # Gets statistics for all dense layer weights
     """
     stats = {}

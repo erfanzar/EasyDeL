@@ -14,7 +14,7 @@
 
 from types import SimpleNamespace
 
-from eformer.escale import PartitionAxis, PartitionManager
+from spectrax import PartitionAxis, PartitionManager
 
 from easydel.infra.base_config import _mesh_shape_ep
 

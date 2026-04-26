@@ -60,12 +60,12 @@ References:
 """
 
 import jax
-from eformer import common_types
 from ejkernel.modules import ring_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from easydel.caching import TransformerCacheView
 

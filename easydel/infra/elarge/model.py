@@ -1677,8 +1677,6 @@ class eLargeModel:
             ...     reference_model=ref_model
             ... )
         """
-        from easydel.infra.base_state import EasyDeLState
-
         trainer_cfg = self.get_trainer_config()
         trainer_type = trainer_cfg.get("trainer_type", "sft")
 
@@ -2243,7 +2241,7 @@ class eLargeModel:
 
         sharding = self._config.get("sharding", {})
         axis_dims = sharding.get("axis_dims")
-        shard_str = f", sharding={axis_dims}" if axis_dims and axis_dims != (1, 1, 1, -1, 1) else ""
+        shard_str = f", sharding={axis_dims}" if axis_dims and axis_dims != (1, 1, 1, 1, -1, 1) else ""
 
         return f"eLargeModel(model={self.model_name!r}, task={task_str}, dtype={dtype_str}{quant_str}{shard_str})"
 

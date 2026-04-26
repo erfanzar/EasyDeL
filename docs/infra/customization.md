@@ -467,7 +467,7 @@ class MyCustomConfig(EasyDeLBaseConfig):
 ```python
 def test_custom_attention():
     config = MyModelConfig(use_custom_attention=True)
-    model = MyModel(config, rngs=nnx.Rngs(0))
+    model = MyModel(config, rngs=spx.Rngs(0))
 
     # Test that custom attention works
     outputs = model(input_ids=jnp.ones((1, 10), dtype=jnp.int32))

@@ -18,27 +18,26 @@ import collections.abc
 import typing as tp
 from functools import partial
 
-import flax.nnx
 import jax
 import jax.nn
 import numpy as np
+import spectrax as spx
 from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
-from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import nash_md_step
 from .nash_md_config import NashMDConfig
 
@@ -48,7 +47,11 @@ if tp.TYPE_CHECKING:
     pass
 
 
-def _ensure_state(model: EasyDeLBaseModule | EasyDeLState | None) -> EasyDeLState | None:
+def _ensure_state(
+    model: EasyDeLBaseModule | EasyDeLState | None,
+    *,
+    trainable_selector: tp.Any = "parameters",
+) -> EasyDeLState | None:
     """Convert model to EasyDeLState if needed.
 
     Args:
@@ -61,7 +64,7 @@ def _ensure_state(model: EasyDeLBaseModule | EasyDeLState | None) -> EasyDeLStat
         return None
     if isinstance(model, EasyDeLState):
         return model
-    return model.to_state()
+    return model.to_state(trainable_selector=trainable_selector)
 
 
 @Registry.register("trainer", ["nash-md", "nash_md"])
@@ -108,7 +111,7 @@ class NashMDTrainer(GRPOTrainer):
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
         )
-        ref_state = _ensure_state(reference_model)
+        ref_state = _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
         if ref_state is not None:
             self.ref_state = ref_state
 
@@ -175,7 +178,7 @@ class NashMDTrainer(GRPOTrainer):
             Configuration containing compiled step functions and mesh.
         """
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -204,14 +207,14 @@ class NashMDTrainer(GRPOTrainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             nash_md_step,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnums,
         )
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             nash_md_step,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
             out_shardings=empty_sharding,
@@ -219,20 +222,30 @@ class NashMDTrainer(GRPOTrainer):
         )
 
         def _compute_model_logps(
-            graphtree: flax.nnx.GraphState,
-            graphother: flax.nnx.GraphState,
+            graphtree: spx.State,
+            graphother: spx.State,
             ids: jax.Array,
             mask: jax.Array,
-            graphdef: flax.nnx.GraphDef,
+            graphdef: spx.GraphDef,
         ):
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = flax.nnx.merge(graphdef, graphtree, graphother)
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
             with apply.mesh:
-                ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
-                mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
+                ids = with_sharding_constraint(
+                    ids,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                mask = with_sharding_constraint(
+                    mask,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
                 return get_per_token_logps(
                     apply,
                     ids,
@@ -241,8 +254,9 @@ class NashMDTrainer(GRPOTrainer):
                     logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                 )
 
-        self.compute_refmodel_logps = ejit(
+        self.compute_refmodel_logps = compile_trainer_step(
             partial(_compute_model_logps, graphdef=self.model_state.graphdef),
+            mesh=mesh,
             static_argnames=("graphdef",),
             in_shardings=(
                 self.ref_state.shardings.graphstate,

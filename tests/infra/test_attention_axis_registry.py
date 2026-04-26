@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from eformer import common_types
-from eformer.escale import PartitionAxis
+from spectrax import PartitionAxis, common_types
 
 from easydel.axis import (
     ATTN_DP,

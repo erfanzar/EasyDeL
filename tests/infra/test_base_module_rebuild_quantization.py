@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
 
 import easydel as ed
 from easydel.layers.quantization import QuantizationConfig, QuantizationType
@@ -36,7 +36,7 @@ def _build_tiny_qwen3():
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
         precision=None,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
 

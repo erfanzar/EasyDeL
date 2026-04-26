@@ -77,7 +77,8 @@ Usage Example
 ```python
 from easydel import Phi3Config, Phi3ForCausalLM
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 
 # Initialize Phi-3-mini configuration
 config = Phi3Config(
@@ -96,7 +97,7 @@ model = Phi3ForCausalLM(
     config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.float32,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Forward pass for training

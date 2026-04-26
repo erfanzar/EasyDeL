@@ -31,12 +31,12 @@ class _ConfigStub:
 
 
 class _StateStub:
-    def to_pure_dict(self):
+    def raw(self):
         return {"weight": "raw"}
 
 
 class _ArrayStateStub:
-    def to_pure_dict(self):
+    def raw(self):
         return {"weight": jnp.ones((2, 2), dtype=jnp.float32)}
 
 
@@ -61,7 +61,7 @@ def test_save_model_files_saves_tree_as_is_without_default_gathering(tmp_path, m
             saved_trees.append(tree)
             return str(tmp_path / f"{prefix}.ckpt")
 
-    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _StateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.spx.export", lambda *args, **kwargs: (None, _StateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
 
     EasyBridgeMixin._save_model_files(
@@ -85,7 +85,7 @@ def test_save_model_files_saves_tree_as_is_in_multiprocess_mode(tmp_path, monkey
             saved_trees.append(tree)
             return str(tmp_path / f"{prefix}.ckpt")
 
-    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _StateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.spx.export", lambda *args, **kwargs: (None, _StateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
     monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_count", lambda: 2)
 
@@ -110,7 +110,7 @@ def test_save_model_files_preserves_jax_arrays_in_multiprocess_mode(tmp_path, mo
             saved_trees.append(tree)
             return str(tmp_path / f"{prefix}.ckpt")
 
-    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _ArrayStateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.spx.export", lambda *args, **kwargs: (None, _ArrayStateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
     monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_count", lambda: 2)
 
@@ -147,7 +147,7 @@ def test_save_model_files_skips_rank_zero_only_artifacts_on_nonzero_process_for_
     model = _BridgeModelStub()
     model.config = _ConfigRecorder()
 
-    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _StateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.spx.export", lambda *args, **kwargs: (None, _StateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
     monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_index", lambda: 1)
 
@@ -167,7 +167,7 @@ def test_save_model_files_normalizes_numpy_arrays_before_checkpoint_write(tmp_pa
     saved_trees: list[dict[str, object]] = []
 
     class _NumpyStateStub:
-        def to_pure_dict(self):
+        def raw(self):
             return {"weight": np.ones((2, 2), dtype=np.float32)}
 
     class _CheckpointerStub:
@@ -178,7 +178,7 @@ def test_save_model_files_normalizes_numpy_arrays_before_checkpoint_write(tmp_pa
             saved_trees.append(tree)
             return str(tmp_path / f"{prefix}.ckpt")
 
-    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _NumpyStateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.spx.export", lambda *args, **kwargs: (None, _NumpyStateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
 
     EasyBridgeMixin._save_model_files(
@@ -198,7 +198,7 @@ def test_save_model_files_offloads_numpy_arrays_to_cpu_before_checkpoint_write(t
     info_calls: list[tuple[object, ...]] = []
 
     class _NumpyStateStub:
-        def to_pure_dict(self):
+        def raw(self):
             return {"layer": {"weight": np.ones((2, 2), dtype=np.float32)}}
 
     class _CheckpointerStub:
@@ -215,7 +215,7 @@ def test_save_model_files_offloads_numpy_arrays_to_cpu_before_checkpoint_write(t
         device_put_calls.append((value, device))
         return jnp.asarray(value)
 
-    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _NumpyStateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.spx.export", lambda *args, **kwargs: (None, _NumpyStateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
     monkeypatch.setattr(
         "easydel.infra.mixins.bridge.jax.devices",

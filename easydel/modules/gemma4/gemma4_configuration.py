@@ -232,10 +232,10 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
     ):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
-        self.scan_layers = scan_layers
 
         super().__init__(
             bos_token_id=bos_token_id,
+            scan_layers=scan_layers,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,

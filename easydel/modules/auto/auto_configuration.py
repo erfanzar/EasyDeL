@@ -14,19 +14,27 @@
 import json
 import typing as tp
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 
-import flax
-from eformer.escale import PartitionAxis, make_shard_and_gather_fns, match_partition_rules
+import jax
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath
 from jax.sharding import PartitionSpec
+from spectrax import PartitionAxis, make_shard_and_gather_fns, match_partition_rules
 
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
+from easydel.infra.sharding import replicated_named_sharding
+from easydel.utils.instrumentation import phase_timer
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 logger = get_logger(name=__name__)
+
+# Tagged variant of the shared phase timer; preserves the prior log prefix
+# (``[AutoShardAndGatherFunctions] ...``) at every existing call site.
+_shardgen_phase = partial(phase_timer, tag="AutoShardAndGatherFunctions")
 
 
 def get_modules_by_type(
@@ -36,7 +44,7 @@ def get_modules_by_type(
     """
     The get_modules_by_type function is a helper function that returns the following:
         1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
-        2. The EasyDeL Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FalconForCausalLM)
+        2. The EasyDeL Model class for the model type specified (e.g., LlamaForCausalLM, FalconForCausalLM)
     """
     registred_module = registry.get_module_registration(
         task_type=task_type,
@@ -241,7 +249,7 @@ class AutoEasyDeLConfig:
 
         config = AutoEasyDeLConfig.from_pretrained(
             "meta-llama/Llama-2-7b",
-            sharding_axis_dims=(1, -1, 1, 1, 1),
+            sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         )
     """
 
@@ -262,9 +270,9 @@ class AutoEasyDeLConfig:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -331,6 +339,48 @@ class AutoEasyDeLConfig:
         return config
 
 
+def _shard_gather_fns_from_named_shardings(
+    named_shardings: tp.Any,
+    mesh: tp.Any,
+) -> tuple[tp.Any, tp.Any]:
+    """Build per-leaf shard/gather closures from a tree of ``NamedShardings``.
+
+    MPMD-safe analogue of :func:`spectrax.make_shard_and_gather_fns`: the
+    spectrax helper rebinds every leaf to the *full* mesh inside its
+    ``_named`` wrapper, which collapses per-stage submeshes.  This helper
+    trusts the per-leaf NamedShardings as-is, so PP placements (where each
+    leaf may live on a different submesh) survive.
+    """
+    replicated = replicated_named_sharding(mesh)
+
+    def _resolve_target(ns):
+        # NamedSharding -> trust it (PP-stage submesh preserved).
+        # None / SingleDeviceSharding / anything else -> replicate to the mesh.
+        return ns if isinstance(ns, jax.sharding.NamedSharding) else replicated
+
+    def _make_shard(ns):
+        target = _resolve_target(ns)
+
+        def _shard(x, _ns=target):
+            return jax.device_put(x, _ns) if hasattr(x, "shape") else x
+
+        return _shard
+
+    def _make_gather(ns):
+        # Always replicate to the full mesh on gather, regardless of input sharding.
+        del ns
+
+        def _gather(x, _r=replicated):
+            return jax.device_put(x, _r) if hasattr(x, "shape") else x
+
+        return _gather
+
+    is_leaf = lambda x: isinstance(x, jax.sharding.Sharding) or x is None  # noqa: E731
+    shard_fns = jax.tree_util.tree_map(_make_shard, named_shardings, is_leaf=is_leaf)
+    gather_fns = jax.tree_util.tree_map(_make_gather, named_shardings, is_leaf=is_leaf)
+    return shard_fns, gather_fns
+
+
 class AutoShardAndGatherFunctions:
     """
     A class to automatically generate shard and gather functions for a given model configuration.
@@ -371,14 +421,56 @@ class AutoShardAndGatherFunctions:
 
         Returns:
             A tuple containing the shard and gather functions.
+
+        Note:
+            This performs a full ``module.lazy_init`` to derive parameter
+            shapes. For large models that lazy_init dominates the cost
+            (often minutes for 27B+). If you already have a lazy-initialized
+            model instance, prefer :meth:`from_model` to avoid the duplicate
+            traversal.
         """
         _, module = get_modules_by_type(config.model_type, model_task)
-        model = module.lazy_init(config=config, rngs=flax.nnx.Rngs(0))
-        partition_rules = model._get_partition_rules(partition_rules)
+        with _shardgen_phase("from_config: module.lazy_init"):
+            model = module.lazy_init(config=config, rngs=spx.Rngs(0))
+        return cls.from_model(model, partition_rules=partition_rules, flatten=flatten)
 
-        partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)
+    @classmethod
+    def from_model(
+        cls,
+        model: EasyDeLBaseModule,
+        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
+        flatten: bool = True,
+    ):
+        """Derive shard/gather functions from an already lazy-initialized model.
 
-        shard_fns, gather_fns = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=config.mesh)
+        This is the cheap path used by ``from_pretrained`` after it has
+        already paid the lazy_init cost — it avoids running ``lazy_init`` a
+        second time just to compute parameter shapes.
+
+        # @erfanzar NOTE: when ``partition_rules`` is None we go through the
+        # MPMD-aware path: ``spx.extract_sharding_structure`` reads each
+        # Variable's *live* ``NamedSharding`` (with per-stage submeshes
+        # preserved) and we build per-leaf ``device_put`` closures from
+        # that.  The legacy regex/PartitionSpec path -- which routes through
+        # ``make_shard_and_gather_fns(mesh=...)`` -- rebinds every leaf to
+        # the *full* mesh, the same regression class that nuked opt-state
+        # placement in ``init_tx``.  We only fall through to it when the
+        # caller hands us explicit rules.
+        """
+        if partition_rules is None:
+            with _shardgen_phase("from_model: extract_sharding_structure"):
+                _gdef, gstate = spx.export(model)
+                named_shardings = spx.extract_sharding_structure(gstate.raw(), mesh=model.mesh)
+            with _shardgen_phase("from_model: build per-leaf shard/gather fns"):
+                shard_fns, gather_fns = _shard_gather_fns_from_named_shardings(named_shardings, model.mesh)
+        else:
+            with _shardgen_phase("from_model: _get_partition_rules"):
+                partition_rules = model._get_partition_rules(partition_rules)
+            with _shardgen_phase("from_model: match_partition_rules(graphtree_shape)"):
+                partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)
+            with _shardgen_phase("from_model: make_shard_and_gather_fns"):
+                shard_fns, gather_fns = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=model.mesh)
+
         if flatten and not is_flatten(shard_fns):
             gather_fns = flatten_dict(gather_fns)
             shard_fns = flatten_dict(shard_fns)
@@ -411,9 +503,9 @@ class AutoShardAndGatherFunctions:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -429,8 +521,8 @@ class AutoShardAndGatherFunctions:
 
         Args:
             pretrained_model_name_or_path: The name or path of the pretrained model.
-            sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, -1, 1, 1, 1).
-            sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
+            sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, 1, -1, 1, 1, 1).
+            sharding_axis_names: The names of the sharding axes. Defaults to ("pp", "dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             backend: The backend to use for custom kernels. Defaults to None.
             partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.

@@ -18,12 +18,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -51,7 +50,7 @@ from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassification
 from .seed_oss_configuration import SeedOssConfig
 
 
-class SeedOssMLP(nn.Module):
+class SeedOssMLP(spx.Module):
     """Seed OSS gated MLP with SiLU activation.
 
     This implements a gated feed-forward network using the SwiGLU activation pattern,
@@ -77,7 +76,7 @@ class SeedOssMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SeedOssMLP layer.
 
@@ -119,7 +118,7 @@ class SeedOssMLP(nn.Module):
         self.dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply the gated MLP transformation.
@@ -133,7 +132,7 @@ class SeedOssMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.gate_proj(hidden_states), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -142,7 +141,7 @@ class SeedOssMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -168,7 +167,7 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SeedOssAttention layer.
 
@@ -204,7 +203,7 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> RowParallelLinear:
         """Create the output projection layer without bias.
 
@@ -230,7 +229,7 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
         )
 
 
-class SeedOssDecoderLayer(nn.Module):
+class SeedOssDecoderLayer(spx.Module):
     """Single transformer decoder layer for Seed OSS.
 
     Implements a standard transformer decoder block with pre-normalization (Pre-LN),
@@ -259,7 +258,7 @@ class SeedOssDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SeedOssDecoderLayer.
 
@@ -308,7 +307,7 @@ class SeedOssDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -361,7 +360,7 @@ class SeedOssDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -398,7 +397,7 @@ class SeedOssModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SeedOssModel.
 
@@ -426,26 +425,26 @@ class SeedOssModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.dropout = nn.Dropout(rate=config.embd_pdrop)
+        self.dropout = nn.Dropout(rate=config.embd_pdrop, rngs=rngs)
         remat_layer_block = auto_remat(
             SeedOssDecoderLayer,
             policy=config.gradient_checkpointing,
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -454,7 +453,7 @@ class SeedOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -533,10 +532,11 @@ class SeedOssModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, layer in enumerate(self.layers):
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -545,18 +545,25 @@ class SeedOssModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -627,7 +634,7 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SeedOssForCausalLM model.
 
@@ -650,7 +657,7 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -700,7 +707,7 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -776,7 +783,7 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the SeedOssForSequenceClassification model.
 
@@ -800,7 +807,7 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
             classifier_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,

@@ -17,14 +17,12 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
-from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import RecurrentCache, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -32,7 +30,7 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers import RMSNorm as FlaxMamba2RMSNorm
+from easydel.layers import RMSNorm as Mamba2RMSNorm
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM2Op
@@ -133,7 +131,7 @@ def create_tuple_parser(
     return parse
 
 
-class Conv1D(nn.Module):
+class Conv1D(spx.Module):
     """Lightweight 1D convolution wrapper used by the Mamba2 mixer."""
 
     def __init__(
@@ -150,7 +148,7 @@ class Conv1D(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Conv1D layer.
 
@@ -166,13 +164,13 @@ class Conv1D(nn.Module):
             dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision for computations. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(kernel_size, 1, features),
             dtype=param_dtype,
             init_method="lecun_normal",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
         if use_bias:
@@ -180,7 +178,7 @@ class Conv1D(nn.Module):
                 shape=(features,),
                 dtype=param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
             )
 
         self.features = features
@@ -195,14 +193,7 @@ class Conv1D(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for convolution parameters."""
-        specs = {"kernel": Replicated}
-        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
-            specs["bias"] = Replicated
-        return specs  # pyright: ignore[reportReturnType]
-
-    def __call__(self, x):
+    def forward(self, x):
         """Apply 1D convolution.
 
         Args:
@@ -220,7 +211,7 @@ class Conv1D(nn.Module):
                 f"Input to `Conv` needs to have rank {unbatched_rank}, but input has shape {x.shape}.",
             )
         org_x_dtype = x.dtype
-        rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
+        rhs = jnp.asarray(jnp.swapaxes(self.weight.value, 0, 2), dtype=self.dtype)
         x = lax.conv_general_dilated(
             lhs=x.astype(self.dtype),
             rhs=rhs,
@@ -236,7 +227,7 @@ class Conv1D(nn.Module):
         return x.astype(org_x_dtype)
 
 
-class MambaRMSNormGated(nn.Module):
+class MambaRMSNormGated(spx.Module):
     """RMSNorm variant that optionally gates inputs before normalization."""
 
     def __init__(
@@ -255,14 +246,14 @@ class MambaRMSNormGated(nn.Module):
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(self.hidden_size,),
             dtype=self.dtype,
             init_method="ones",
             key=None,
         )
 
-    def __call__(self, hidden_states, gate=None):
+    def forward(self, hidden_states, gate=None):
         """Apply gated RMS normalization.
 
         Args:
@@ -283,10 +274,10 @@ class MambaRMSNormGated(nn.Module):
         variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
         hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
 
-        return (self.kernel.value * hidden_states).astype(input_dtype)
+        return (self.weight.value * hidden_states).astype(input_dtype)
 
 
-class Mamba2Mixer(nn.Module):
+class Mamba2Mixer(spx.Module):
     """Core selective state space mixer for Mamba2 blocks.
 
     Implements the improved selective state space model (SSM) from Mamba2,
@@ -320,7 +311,7 @@ class Mamba2Mixer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Mamba2Mixer.
 
@@ -330,7 +321,7 @@ class Mamba2Mixer(nn.Module):
             dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -390,7 +381,7 @@ class Mamba2Mixer(nn.Module):
             self.config.time_step_floor,
             jnp.exp(
                 jax.random.normal(
-                    key=rngs.params(),
+                    key=rngs.parameters,
                     shape=(self.config.num_heads,),
                     dtype=self.param_dtype,
                 )
@@ -446,15 +437,7 @@ class Mamba2Mixer(nn.Module):
         )
         self.ssm_op = SSM2Op(metadata)
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for state space parameters."""
-        return {
-            "A_log": Replicated,
-            "D": Replicated,
-            "dt_bias": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         input_states: Array,
         cache_params: RecurrentCacheView | None = None,
@@ -559,7 +542,7 @@ class Mamba2Mixer(nn.Module):
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         # Prepare dt with bias and clipping
@@ -596,13 +579,13 @@ class Mamba2Mixer(nn.Module):
         scan_output = apply_logical_sharding(
             scan_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
         return contextualized_states, cache_view
 
 
-class Mamba2Block(nn.Module):
+class Mamba2Block(spx.Module):
     """Single Mamba2 layer combining normalization, SSM mixer, and residual connections.
 
     Implements a complete Mamba2 block with pre-normalization architecture,
@@ -627,7 +610,7 @@ class Mamba2Block(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Mamba2Block.
 
@@ -637,7 +620,7 @@ class Mamba2Block(nn.Module):
             dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -645,7 +628,7 @@ class Mamba2Block(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.residual_in_fp32 = config.residual_in_fp32
-        self.norm = FlaxMamba2RMSNorm(
+        self.norm = Mamba2RMSNorm(
             dim=config.hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=dtype,
@@ -668,7 +651,7 @@ class Mamba2Block(nn.Module):
             layer_idx=layer_idx,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cache_params: RecurrentCacheView | None = None,
@@ -702,7 +685,7 @@ class Mamba2Block(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states, cache_params  # pyright: ignore[reportReturnType]
 
@@ -735,7 +718,7 @@ class Mamba2Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Mamba2Model.
 
@@ -744,7 +727,7 @@ class Mamba2Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -760,21 +743,21 @@ class Mamba2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List(
-            [
-                Mamba2Block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    Mamba2Block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
-        self.norm_f = FlaxMamba2RMSNorm(
+        self.norm_f = Mamba2RMSNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=dtype,
@@ -782,7 +765,7 @@ class Mamba2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
@@ -834,18 +817,28 @@ class Mamba2Model(EasyDeLBaseModule):
         if attention_mask is None:
             attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
         hidden_states = inputs_embeds
-        for idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, idx = carry
             hidden_states, cache_view = block(
                 hidden_states=hidden_states,
                 cache_params=cache_params.views[idx],
                 cache_position=cache_position,
                 attention_mask=attention_mask,
             )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             cache_params[idx] = cache_view
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
+            return hidden_states, all_hidden_states, idx + 1
+
+        hidden_states, all_hidden_states, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, 0),
+            trace=True,
+        )
         hidden_states = self.norm_f(hidden_states)
 
         if output_hidden_states:
@@ -912,7 +905,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Mamba2ForCausalLM.
 
@@ -921,7 +914,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
             dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -934,7 +927,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
@@ -1016,7 +1009,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
             dict: Prepared inputs including cache_params, attention_mask,
                 and cache_position for the generation loop.
         """
-        from eformer.escale import PartitionAxis
+        from spectrax import PartitionAxis
 
         from easydel.caching import RecurrentCache, RecurrentCacheConfig
 

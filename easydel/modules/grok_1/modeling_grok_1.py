@@ -17,12 +17,11 @@ from functools import cached_property
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -40,7 +39,7 @@ from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers import RMSNorm as FlaxGrok1RMSNorm
+from easydel.layers import RMSNorm as Grok1RMSNorm
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.modules._base import BaseCausalLMModule
 
@@ -59,7 +58,7 @@ class Grok1Attention(AttentionModule):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -70,7 +69,7 @@ class Grok1Attention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Grok-1 attention with rotary position embeddings.
 
@@ -80,7 +79,7 @@ class Grok1Attention(AttentionModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -142,7 +141,7 @@ class Grok1Attention(AttentionModule):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
         )
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
     def _merge_heads(self, hidden_states):
         """
@@ -156,7 +155,7 @@ class Grok1Attention(AttentionModule):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.hidden_size))
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -244,7 +243,7 @@ class Grok1Attention(AttentionModule):
         )
 
 
-class Grok1BLockSparseMLP(nn.Module):
+class Grok1BLockSparseMLP(spx.Module):
     """Grok-1 Block Sparse MLP module.
 
     This module implements the specific MLP structure used within the sparse Mixture of Experts
@@ -255,7 +254,7 @@ class Grok1BLockSparseMLP(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -265,7 +264,7 @@ class Grok1BLockSparseMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Grok-1 Block Sparse MLP.
 
@@ -278,7 +277,7 @@ class Grok1BLockSparseMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -318,7 +317,7 @@ class Grok1BLockSparseMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply gated MLP transformation for expert processing.
 
         Computes: linear_1(gelu(linear(x)) * linear_v(x))
@@ -332,20 +331,20 @@ class Grok1BLockSparseMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(nn.gelu(self.linear(hidden_states)), "mlp_gate")
+        gate = checkpoint_name(jax.nn.gelu(self.linear(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.linear_v(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.linear_1(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Grok1SparseMoeBlock(nn.Module):
+class Grok1SparseMoeBlock(spx.Module):
     """Grok-1 Sparse Mixture of Experts (MoE) block.
 
     This module implements the sparse MoE layer used in Grok-1. It routes tokens
@@ -356,7 +355,7 @@ class Grok1SparseMoeBlock(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -366,7 +365,7 @@ class Grok1SparseMoeBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Grok-1 Sparse MoE block.
 
@@ -378,7 +377,7 @@ class Grok1SparseMoeBlock(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -393,11 +392,11 @@ class Grok1SparseMoeBlock(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             rngs=rngs,
         )
 
-        self.experts = nn.List(
+        self.experts = nn.ModuleList(
             [
                 Grok1BLockSparseMLP(
                     config=config,
@@ -410,7 +409,7 @@ class Grok1SparseMoeBlock(nn.Module):
             ]
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass through the Sparse MoE block.
 
         Routes input tokens to top-k experts based on learned gating weights and
@@ -427,7 +426,7 @@ class Grok1SparseMoeBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         router_logits = checkpoint_name(
@@ -461,7 +460,7 @@ class Grok1SparseMoeBlock(nn.Module):
         return (checkpoint_name(final_hidden_state, "moe_expert_output"), router_logits)
 
 
-class Grok1DecoderLayer(nn.Module):
+class Grok1DecoderLayer(spx.Module):
     """Grok-1 Transformer Decoder Layer.
 
     This module represents a single decoder layer in the Grok-1 model,
@@ -473,7 +472,7 @@ class Grok1DecoderLayer(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -484,7 +483,7 @@ class Grok1DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Grok-1 decoder layer.
 
@@ -496,7 +495,7 @@ class Grok1DecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -520,28 +519,28 @@ class Grok1DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.pre_attn_norm = FlaxGrok1RMSNorm(
+        self.pre_attn_norm = Grok1RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attn_norm = FlaxGrok1RMSNorm(
+        self.post_attn_norm = Grok1RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.pre_moe_norm = FlaxGrok1RMSNorm(
+        self.pre_moe_norm = Grok1RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_moe_norm = FlaxGrok1RMSNorm(
+        self.post_moe_norm = Grok1RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=dtype,
@@ -549,7 +548,7 @@ class Grok1DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -627,7 +626,7 @@ class Grok1Model(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -637,7 +636,7 @@ class Grok1Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Grok-1 base model.
 
@@ -646,7 +645,7 @@ class Grok1Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -670,21 +669,21 @@ class Grok1Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    layer_index=layer_index,
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_index in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=layer_index):
+                self.layers.append(
+                    remat_layer_block(
+                        layer_index=layer_index,
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_index in range(self.config.num_hidden_layers)
-            ]
-        )
 
-        self.norm = FlaxGrok1RMSNorm(
+        self.norm = Grok1RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=dtype,
@@ -704,7 +703,7 @@ class Grok1Model(EasyDeLBaseModule):
             base=self.config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -717,6 +716,7 @@ class Grok1Model(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        trace: bool = False,
     ) -> MoeModelOutput:
         """Forward pass through the Grok-1 base model.
 
@@ -796,33 +796,56 @@ class Grok1Model(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=output_router_logits or needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, ar, idx = carry
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 mode=mode,
-                cache_view=past_key_values[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 frequencies=self.frequencies,
             )
-
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_self_attns += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            if output_router_logits and layer_outputs.router_logits is not None:
+                ar = (*ar, layer_outputs.router_logits)
+            return hs, cv, ah, aa, ar, idx + 1
 
-            if output_router_logits:
-                all_router_logits += (layer_outputs.router_logits,)
-
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_self_attns, all_router_logits, 0)
+        hidden_states, _, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -877,7 +900,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -891,7 +914,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Grok-1 model for causal language modeling.
 
@@ -900,7 +923,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -915,7 +938,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         )
         self.output_multiplier_scale = self.config.output_multiplier_scale
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

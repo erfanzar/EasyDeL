@@ -26,10 +26,10 @@ import warnings
 from copy import deepcopy
 from dataclasses import InitVar, dataclass, field, fields
 
-import flax.nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from eformer.paths import ePath, ePathLike
@@ -59,8 +59,9 @@ try:
 except ImportError:
     wandb = None
 
+from easydel.utils.helpers import SummaryWriter
+
 if tp.TYPE_CHECKING:
-    from flax.metrics.tensorboard import SummaryWriter
     from jax import Array
     from torch import Tensor
 else:
@@ -376,7 +377,7 @@ class TrainingArguments:
             )
         },
     )
-    straight_through_emulator: tp.Callable[[flax.nnx.GraphState], flax.nnx.GraphState] | None = field(
+    straight_through_emulator: tp.Callable[[spx.State], spx.State] | None = field(
         default=None,
         metadata={
             "help": (
@@ -585,6 +586,16 @@ class TrainingArguments:
     optimizer: AVAILABLE_OPTIMIZERS = field(
         default=EasyDeLOptimizers.ADAMW,
         metadata={"help": "The optimizer to use."},
+    )
+    trainable_selector: tp.Any = field(
+        default="parameters",
+        metadata={
+            "help": (
+                "Selector used when converting models to EasyDeLState. "
+                "Use 'parameters' for base weights, 'lora' for adapter-only training, "
+                "or a tuple like ('parameters', 'lora') in Python code for combined training."
+            )
+        },
     )
     performance_mode: bool = field(
         default=False,
@@ -1513,7 +1524,7 @@ class TrainingArguments:
             Cached property to avoid multiple initializations.
             TensorBoard doesn't support cloud storage paths directly.
         """
-        from flax.metrics.tensorboard import SummaryWriter
+        from easydel.utils.helpers import SummaryWriter
 
         path = self._get_save_directory(create=True)
         if path is None:

@@ -17,12 +17,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -46,7 +45,7 @@ from easydel.modules._base import BaseCausalLMModule, BaseEmbeddingModule, BaseS
 from .qwen3_configuration import Qwen3Config
 
 
-class Qwen3MLP(nn.Module):
+class Qwen3MLP(spx.Module):
     """Multi-Layer Perceptron module for Qwen3 models.
 
     Implements the feedforward network with SwiGLU activation function
@@ -60,7 +59,7 @@ class Qwen3MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 MLP block.
 
@@ -70,7 +69,7 @@ class Qwen3MLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -111,7 +110,7 @@ class Qwen3MLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -125,7 +124,7 @@ class Qwen3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate: Float[Array, "batch seq_len intermediate_size"] = checkpoint_name(
             self.act_fn(self.gate_proj(hidden_states)), "mlp_gate"
@@ -135,7 +134,7 @@ class Qwen3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -155,7 +154,7 @@ class Qwen3Attention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 attention layer with grouped-query attention support.
 
@@ -165,7 +164,7 @@ class Qwen3Attention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config,
@@ -175,9 +174,11 @@ class Qwen3Attention(UnifiedAttention):
             rngs=rngs,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window
-            if config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
-            else None,
+            sliding_window=(
+                config.sliding_window
+                if config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+                else None
+            ),
             use_qk_norm=True,
             layer_idx=layer_idx,
         )
@@ -196,7 +197,7 @@ class Qwen3Attention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen3DecoderLayer(spx.Module):
     """Single decoder layer for Qwen3 models.
 
     Combines multi-head attention with Q/K normalization and feedforward networks
@@ -211,7 +212,7 @@ class Qwen3DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 decoder layer.
 
@@ -221,7 +222,7 @@ class Qwen3DecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -258,7 +259,7 @@ class Qwen3DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -320,7 +321,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -351,7 +352,7 @@ class Qwen3Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 base model.
 
@@ -360,7 +361,7 @@ class Qwen3Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -384,19 +385,19 @@ class Qwen3Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -405,7 +406,7 @@ class Qwen3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -417,6 +418,7 @@ class Qwen3Model(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through the Qwen3 base model.
 
@@ -494,29 +496,53 @@ class Qwen3Model(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states: Float[Array, "batch seq_len hidden_dim"] = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -582,7 +608,7 @@ class Qwen3ForCausalLM(BaseCausalLMModule[Qwen3Model, Qwen3Config]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 model for causal language modeling.
 
@@ -591,7 +617,7 @@ class Qwen3ForCausalLM(BaseCausalLMModule[Qwen3Model, Qwen3Config]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -630,7 +656,7 @@ class Qwen3ForSequenceClassification(BaseSequenceClassificationModule[Qwen3Model
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 model for sequence classification.
 
@@ -639,7 +665,7 @@ class Qwen3ForSequenceClassification(BaseSequenceClassificationModule[Qwen3Model
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -682,7 +708,7 @@ class Qwen3ForEmbedding(BaseEmbeddingModule[Qwen3Model, Qwen3Config]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3 embedding model.
 
@@ -691,7 +717,7 @@ class Qwen3ForEmbedding(BaseEmbeddingModule[Qwen3Model, Qwen3Config]):
             dtype: Computation data type. Defaults to bfloat16.
             param_dtype: Parameter data type. Defaults to bfloat16.
             precision: JAX precision setting.
-            rngs: Flax random number generators.
+            rngs: SpecTrax random number generators.
         """
         super().__init__(
             config=config,

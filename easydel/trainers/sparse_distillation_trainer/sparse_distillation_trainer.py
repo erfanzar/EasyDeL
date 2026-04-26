@@ -26,19 +26,19 @@ import typing as tp
 import jax
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time
 
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import (
+    compile_trainer_step,
     filter_kwargs_for_callable,
     resolve_straight_through_emulator,
     sanitize_model_call_kwargs,
@@ -129,10 +129,10 @@ class SparseDistillationTrainer(Trainer):
         self.arguments = arguments
 
         if not isinstance(student_model, EasyDeLState):
-            student_model = student_model.to_state()
+            student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
 
         if teacher_model is not None and not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state()
+            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.teacher_state = teacher_model
         self.teacher_fn = teacher_fn
@@ -201,7 +201,7 @@ class SparseDistillationTrainer(Trainer):
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Configure and JIT-compile training and evaluation step functions."""
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
 
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
@@ -224,7 +224,7 @@ class SparseDistillationTrainer(Trainer):
 
         static_argnames = tuple(range(2, 10))
 
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             sparse_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -243,7 +243,7 @@ class SparseDistillationTrainer(Trainer):
             None,  # straight_through_emulator
         )
 
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             sparse_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
@@ -330,7 +330,7 @@ class SparseDistillationTrainer(Trainer):
                         "attention_mask": attention_mask_full,
                     }
                     teacher_kwargs = filter_kwargs_for_callable(
-                        self.teacher_state.model.__call__,
+                        self.teacher_state.model.forward,
                         teacher_kwargs,
                     )
                     teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)

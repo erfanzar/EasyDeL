@@ -215,7 +215,7 @@ class TriangleSolverImpl(enum.StrEnum):
         elif self == TriangleSolverImpl.JAX:
             return triangular_inverse_jax(A)
         else:
-            print(f"Unknown solver: {self.value} Using default solver." f" {TriangleSolverImpl.GAUSSIAN.value}")
+            print(f"Unknown solver: {self.value} Using default solver. {TriangleSolverImpl.GAUSSIAN.value}")
             return decompose_triangular_matrix_inverse_pallas(A, n_block_size=min(64, A.shape[-1]))
 
 
@@ -636,8 +636,15 @@ def ragged_gated_delta_rule_mixed_prefill(
 
 
 def _pallas_gdn_decode_kernel(
-    q_ref, k_ref, v_ref, beta_ref, exp_g_ref, state_ref, valid_ref,
-    out_ref, new_state_ref,
+    q_ref,
+    k_ref,
+    v_ref,
+    beta_ref,
+    exp_g_ref,
+    state_ref,
+    valid_ref,
+    out_ref,
+    new_state_ref,
 ):
     """Per-program: process `B_TOK` tokens (unrolled) with one slot's state each.
 
@@ -849,7 +856,13 @@ def ragged_gated_delta_rule_decode_only(
         # Slice the prefix for the kernel (and recompose afterwards).
         state_prefix = recurrent_state[:num_tokens]
         outputs_3d, new_state_prefix = _pallas_gdn_decode_call(
-            query, key, value, beta, exp_g, state_prefix, valid_mask,
+            query,
+            key,
+            value,
+            beta,
+            exp_g,
+            state_prefix,
+            valid_mask,
         )
         outputs = outputs_3d.reshape(num_tokens, -1)
         if num_tokens == max_reqs:

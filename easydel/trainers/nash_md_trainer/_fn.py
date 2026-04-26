@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import typing as tp
 
-import flax.nnx
 import jax
-from eformer.escale import with_sharding_constraint
+import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -35,7 +35,7 @@ from ..training_utils import (
 
 
 def _compute_policy_logps(
-    module: flax.nnx.Module,
+    module: spx.Module,
     prompt_ids: jax.Array,
     prompt_mask: jax.Array,
     completion_ids: jax.Array,
@@ -100,10 +100,10 @@ def nash_md_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
     beta = jnp.asarray(beta, dtype=jnp.float32)
 
-    def loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
+    def loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         if is_train and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)

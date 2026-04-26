@@ -18,21 +18,19 @@ from __future__ import annotations
 import typing as tp
 from functools import partial
 
-import jax
 from eformer.loggings import get_logger
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..prompt_transforms import CPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import (
     DataCollatorForPreferenceGrain,
     DataCollatorForPreferenceTFDS,
@@ -90,7 +88,7 @@ class CPOTrainer(Trainer):
         if isinstance(model, EasyDeLState):
             model_state = model
         else:
-            model_state = model.to_state()
+            model_state = model.to_state(trainable_selector=arguments.trainable_selector)
 
         if arguments.is_encoder_decoder is not None:
             self.is_encoder_decoder = arguments.is_encoder_decoder
@@ -178,7 +176,7 @@ class CPOTrainer(Trainer):
             Configuration containing compiled step functions and mesh.
         """
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -198,8 +196,9 @@ class CPOTrainer(Trainer):
             loss_type=self.arguments.loss_type,
             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
-        self.concatenated_forward = ejit(
+        self.concatenated_forward = compile_trainer_auxiliary(
             partial_concatenated_forward,
+            mesh=mesh,
             static_argnames=(
                 "is_encoder_decoder",
                 "label_pad_token_id",
@@ -227,7 +226,7 @@ class CPOTrainer(Trainer):
         )
 
         training_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             training_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -248,7 +247,7 @@ class CPOTrainer(Trainer):
         )
 
         evaluation_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,

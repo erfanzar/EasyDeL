@@ -17,15 +17,14 @@ import math
 import typing as tp
 from functools import partial
 
+import jax
 import jax.lax
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -164,7 +163,7 @@ def rwkv_linear_attention(
     return output, state
 
 
-class RwkvSelfAttention(nn.Module):
+class RwkvSelfAttention(spx.Module):
     """RWKV self-attention mechanism with linear complexity.
 
     Implements the RWKV attention mechanism, also known as the "time mixing"
@@ -193,7 +192,7 @@ class RwkvSelfAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize RWKV self-attention layer.
 
@@ -203,7 +202,7 @@ class RwkvSelfAttention(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_id = layer_id
@@ -301,17 +300,7 @@ class RwkvSelfAttention(nn.Module):
             rngs=rngs,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for temporal mixing parameters."""
-        return {
-            "time_decay": Replicated,
-            "time_first": Replicated,
-            "time_mix_key": Replicated,
-            "time_mix_value": Replicated,
-            "time_mix_receptance": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         hidden: Array,
         state: tuple[Array, Array, Array, Array],
@@ -338,12 +327,16 @@ class RwkvSelfAttention(nn.Module):
             (jnp.expand_dims(sx, 1), hidden[:, :-1, :]),
             axis=1,
         )
-        key_x = hidden * self.time_mix_key.reshape(1, 1, -1) + c_x * (1 - self.time_mix_key.reshape(1, 1, -1))
-        value_x = hidden * self.time_mix_value.reshape(1, 1, -1) + c_x * (1 - self.time_mix_value.reshape(1, 1, -1))
-        receptance_x = hidden * self.time_mix_receptance.reshape(1, 1, -1) + c_x * (
-            1 - self.time_mix_receptance.reshape(1, 1, -1)
+        key_x = hidden * self.time_mix_key.value.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_key.value.reshape(1, 1, -1)
         )
-        receptance_state = checkpoint_name(nn.sigmoid(self.receptance(receptance_x)), "attn_receptance")
+        value_x = hidden * self.time_mix_value.value.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_value.value.reshape(1, 1, -1)
+        )
+        receptance_x = hidden * self.time_mix_receptance.value.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_receptance.value.reshape(1, 1, -1)
+        )
+        receptance_state = checkpoint_name(jax.nn.sigmoid(self.receptance(receptance_x)), "attn_receptance")
         key_states = checkpoint_name(self.key(key_x), "attn_key")
         value_states = checkpoint_name(self.value(value_x), "attn_value")
 
@@ -367,13 +360,13 @@ class RwkvSelfAttention(nn.Module):
                 vector for this timestep.
             """
             (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
-            ww = self.time_first.reshape(-1) + kk
+            ww = self.time_first.value.reshape(-1) + kk
             p = jnp.maximum(inner_p, ww)
             e1 = jnp.exp(inner_p - p)
             e2 = jnp.exp(ww - p)
             next_c_x = ((e1 * inner_aa + e2 * vv) / (e1 * inner_bb + e2)).astype(dtype=receptance_state.dtype)
 
-            ww = -jnp.exp(self.time_decay.reshape(-1)) + inner_p
+            ww = -jnp.exp(self.time_decay.value.reshape(-1)) + inner_p
             p = jnp.maximum(ww, kk)
             e1 = jnp.exp(ww - p)
             e2 = jnp.exp(kk - p)
@@ -391,14 +384,14 @@ class RwkvSelfAttention(nn.Module):
         attn_prod = apply_logical_sharding(
             receptance_state * c_x,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         out = checkpoint_name(self.output(attn_prod), "attn_output")
         next_state = (hidden[:, -1, :], aa, bb, pp)
         return out, next_state
 
 
-class RwkvFeedForward(nn.Module):
+class RwkvFeedForward(spx.Module):
     """RWKV feedforward network with channel mixing.
 
     Implements the "channel mixing" block of RWKV which is analogous to
@@ -426,7 +419,7 @@ class RwkvFeedForward(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize RWKV feedforward (channel mixing) layer.
 
@@ -436,7 +429,7 @@ class RwkvFeedForward(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_id = layer_id
@@ -498,14 +491,7 @@ class RwkvFeedForward(nn.Module):
             rngs=rngs,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for channel mixing parameters."""
-        return {
-            "time_mix_key": Replicated,
-            "time_mix_receptance": Replicated,
-        }
-
-    def __call__(self, hidden, state):
+    def forward(self, hidden, state):
         """Apply channel mixing feedforward transformation.
 
         Blends current input with previous state, then applies gated
@@ -521,20 +507,22 @@ class RwkvFeedForward(nn.Module):
                 - Updated state (last hidden position for next step)
         """
         sx = jnp.concatenate((jnp.expand_dims(state, 1), hidden[:, :-1, :]), axis=1)
-        xk = hidden * self.time_mix_key.reshape(1, 1, -1) + sx * (1 - self.time_mix_key.reshape(1, 1, -1))
-        xr = hidden * self.time_mix_receptance.reshape(1, 1, -1) + sx * (1 - self.time_mix_receptance.reshape(1, 1, -1))
-        r = checkpoint_name(nn.sigmoid(self.receptance(xr)), "mlp_gate")
-        k = checkpoint_name(jnp.square(nn.relu(self.key(xk))), "mlp_up")
+        xk = hidden * self.time_mix_key.value.reshape(1, 1, -1) + sx * (1 - self.time_mix_key.value.reshape(1, 1, -1))
+        xr = hidden * self.time_mix_receptance.value.reshape(1, 1, -1) + sx * (
+            1 - self.time_mix_receptance.value.reshape(1, 1, -1)
+        )
+        r = checkpoint_name(jax.nn.sigmoid(self.receptance(xr)), "mlp_gate")
+        k = checkpoint_name(jnp.square(jax.nn.relu(self.key(xk))), "mlp_up")
         output = checkpoint_name(r * self.value(k), "mlp_output")
         output = apply_logical_sharding(
             output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return output, hidden[:, -1, :]
 
 
-class SingleStandRwkvBlock(nn.Module):
+class SingleStandRwkvBlock(spx.Module):
     """Single RWKV layer combining normalization, time mixing, and channel mixing.
 
     Implements a complete RWKV block with pre-normalization architecture.
@@ -560,7 +548,7 @@ class SingleStandRwkvBlock(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
-        rngs: nn.Rngs = None,
+        rngs: spx.Rngs = None,
     ) -> None:
         """Initialize RWKV block.
 
@@ -570,7 +558,7 @@ class SingleStandRwkvBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs, optional): Random number generator state. Defaults to None.
+            rngs (spx.Rngs, optional): Random number generator state. Defaults to None.
         """
         self.config = config
         self.layer_id = layer_id
@@ -620,7 +608,7 @@ class SingleStandRwkvBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False):
+    def forward(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False):
         """Forward pass through the RWKV block.
 
         Applies pre-normalization followed by time mixing (attention),
@@ -668,7 +656,7 @@ class SingleStandRwkvBlock(nn.Module):
         hidden = apply_logical_sharding(
             hidden,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         if uses_global_state:
@@ -689,7 +677,7 @@ class SingleStandRwkvBlock(nn.Module):
 
 
 # Use SingleStandRwkvBlock directly since nn.vmap on class constructors has issues
-# with keyword argument resolution in recent Flax versions
+# with keyword argument resolution in recent SpecTrax versions
 RwkvBlock = SingleStandRwkvBlock
 
 
@@ -721,7 +709,7 @@ class RwkvModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RWKV base model.
 
@@ -732,7 +720,7 @@ class RwkvModel(EasyDeLBaseModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16
                 but is overridden to jnp.float32 for numerical stability.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         dtype = jnp.float32
         param_dtype = jnp.float32
@@ -756,19 +744,19 @@ class RwkvModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.blocks = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    layer_id=idx,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for idx in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+                self.blocks.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_id=idx,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(self.config.num_hidden_layers)
-            ]
-        )
 
         self.layers_are_rescaled = False
         self.deterministic = True
@@ -779,7 +767,7 @@ class RwkvModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -846,8 +834,9 @@ class RwkvModel(EasyDeLBaseModule):
         all_hidden_states = ()
         all_self_attentions = ()
 
-        for idx, block in enumerate(self.blocks):
-            hidden_states, state, attentions = block(
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_self_attentions, idx = carry
+            hidden_states, _state, attentions = block(
                 hidden_states,
                 state=state,
                 use_cache=use_cache,
@@ -856,6 +845,7 @@ class RwkvModel(EasyDeLBaseModule):
 
             if self.layers_are_rescaled and self.config.rescale_every > 0 and (idx + 1) % self.config.rescale_every == 0:
                 hidden_states = hidden_states / 2
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
             if output_hidden_states:
                 all_hidden_states = (*all_hidden_states, hidden_states)
@@ -863,6 +853,16 @@ class RwkvModel(EasyDeLBaseModule):
             if output_attentions:
                 all_self_attentions = (*all_self_attentions, attentions)
 
+            return hidden_states, all_hidden_states, all_self_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_self_attentions, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_self_attentions, 0),
+            trace=output_hidden_states
+            or output_attentions
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1,
+        )
         hidden_states = checkpoint_name(self.ln_out(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -910,7 +910,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RWKV model for causal language modeling.
 
@@ -921,7 +921,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16
                 but is overridden to jnp.float32 for numerical stability.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         dtype = jnp.float32
         param_dtype = jnp.float32
@@ -1048,7 +1048,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         model_kwargs["state"] = model_outputs.state
         return model_kwargs
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,

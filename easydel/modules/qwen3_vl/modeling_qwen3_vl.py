@@ -18,13 +18,12 @@ from functools import cached_property, partial
 import jax
 import jax.numpy as jnp
 import numpy as np
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -140,7 +139,7 @@ def get_rope_index(
         attention_mask = attention_mask[:, : input_ids.shape[-1]]
 
     batch_size, seq_length = input_ids.shape[:2]
-    position_ids = np.ones((3, batch_size, seq_length), dtype=np.int32)
+    position_ids = np.zeros((3, batch_size, seq_length), dtype=np.int32)
     mrope_position_deltas: list[int] = []
     image_index, video_index = 0, 0
 
@@ -333,7 +332,7 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
     return attention_mask[None, :, :]
 
 
-class Qwen3VLVisionPatchEmbed(nn.Module):
+class Qwen3VLVisionPatchEmbed(spx.Module):
     """3D convolution-based patch embedding for Qwen3-VL vision encoder.
 
     Converts input image/video pixels into patch embeddings using a 3D convolution
@@ -347,7 +346,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL vision patch embedding layer.
 
@@ -356,7 +355,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
         self.patch_size = config.patch_size
@@ -365,19 +364,17 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.hidden_size = config.hidden_size
 
         kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv(
-            in_features=config.in_channels,
-            out_features=config.hidden_size,
+        self.proj = nn.Conv3d(
+            in_channels=config.in_channels,
+            out_channels=config.hidden_size,
             kernel_size=kernel_size,
-            strides=kernel_size,
+            stride=kernel_size,
             use_bias=True,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply 3D convolution to extract patch embeddings.
 
         Args:
@@ -401,7 +398,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Qwen3VLVisionPatchMerger(nn.Module):
+class Qwen3VLVisionPatchMerger(spx.Module):
     """Spatial patch merger with MLP gating for Qwen3-VL.
 
     Merges spatially adjacent patches to reduce sequence length while
@@ -416,7 +413,7 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         use_postshuffle_norm: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL vision patch merger.
 
@@ -427,7 +424,7 @@ class Qwen3VLVisionPatchMerger(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             use_postshuffle_norm (bool, optional): Whether to apply normalization after
                 spatial shuffling. Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.dtype = dtype
@@ -461,7 +458,7 @@ class Qwen3VLVisionPatchMerger(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Merge patches through normalization and gated MLP.
 
         Args:
@@ -471,11 +468,11 @@ class Qwen3VLVisionPatchMerger(nn.Module):
             Array: Merged patch embeddings with reduced spatial dimensions.
         """
         x = self.norm(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
-        x = self.linear_fc2(nn.gelu(self.linear_fc1(x), approximate=False))
+        x = self.linear_fc2(jax.nn.gelu(self.linear_fc1(x), approximate=False))
         return x
 
 
-class Qwen3VLVisionMLP(nn.Module):
+class Qwen3VLVisionMLP(spx.Module):
     """Feed-forward network for Qwen3-VL vision encoder.
 
     Implements a two-layer MLP with GELU activation for vision feature
@@ -490,7 +487,7 @@ class Qwen3VLVisionMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL vision MLP layer.
 
@@ -501,7 +498,7 @@ class Qwen3VLVisionMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -525,7 +522,7 @@ class Qwen3VLVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply feedforward transformation with GELU activation.
 
         Args:
@@ -552,7 +549,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL vision attention layer.
 
@@ -562,7 +559,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
@@ -587,7 +584,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Define the QKV and output projection layers for vision attention.
 
@@ -618,12 +615,12 @@ class Qwen3VLVisionAttention(UnifiedAttention):
         )
         self.attention_performer = self._create_attention_performer(config, rngs)
 
-    def _create_attention_performer(self, config, rngs: nn.Rngs):
+    def _create_attention_performer(self, config, rngs: spx.Rngs):
         """Create the attention performer module.
 
         Args:
             config: Vision configuration.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             FlexibleAttentionModule: Configured attention module.
@@ -637,7 +634,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -691,7 +688,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
         return attn_output
 
 
-class Qwen3VLVisionBlock(nn.Module):
+class Qwen3VLVisionBlock(spx.Module):
     """Transformer block for Qwen3-VL vision encoder.
 
     Combines self-attention and MLP layers with pre-normalization
@@ -706,7 +703,7 @@ class Qwen3VLVisionBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL vision transformer block.
 
@@ -716,7 +713,7 @@ class Qwen3VLVisionBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -751,7 +748,7 @@ class Qwen3VLVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -804,7 +801,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL vision transformer encoder.
 
@@ -813,7 +810,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -843,19 +840,19 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = nn.List(
-            [
-                Qwen3VLVisionBlock(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for idx in range(config.depth):
+            with spx.assign_stage(total=config.depth, current=idx):
+                self.blocks.append(
+                    Qwen3VLVisionBlock(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(config.depth)
-            ]
-        )
 
         self.merger = Qwen3VLVisionPatchMerger(
             config=config,
@@ -865,7 +862,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.deepstack_merger_list = nn.List(
+        self.deepstack_merger_list = nn.ModuleList(
             [
                 Qwen3VLVisionPatchMerger(
                     config=config,
@@ -887,7 +884,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         Returns:
             jnp.dtype: Data type of the model parameters.
         """
-        return self.blocks[0].mlp.linear_fc2.kernel.value.dtype
+        return self.blocks[0].mlp.linear_fc2.weight.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
         """Compute positional embeddings with bilinear interpolation.
@@ -1006,7 +1003,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
         return embeddings
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         grid_thw: Array,
@@ -1039,17 +1036,27 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
         deepstack_feature_lists = []
-        for layer_num, block in enumerate(self.blocks):
+
+        def _layer_loop(block, carry):
+            hidden_states, layer_num = carry
             hidden_states = block(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb=rotary_pos_emb,
             )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, layer_num, layers=self.blocks)
             if layer_num in self.config.deepstack_visual_indexes:
                 deepstack_idx = self.config.deepstack_visual_indexes.index(layer_num)
                 deepstack_feature = self.deepstack_merger_list[deepstack_idx](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
 
+            return hidden_states, layer_num + 1
+
+        hidden_states, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         hidden_states = self.merger(hidden_states)
         return hidden_states, deepstack_feature_lists
 
@@ -1086,7 +1093,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Qwen3VLTextMLP(nn.Module):
+class Qwen3VLTextMLP(spx.Module):
     """SwiGLU feed-forward network for Qwen3-VL text decoder.
 
     Implements the feedforward network with SwiGLU activation function
@@ -1100,7 +1107,7 @@ class Qwen3VLTextMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen3-VL text MLP block.
@@ -1110,7 +1117,7 @@ class Qwen3VLTextMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         self.config = config
@@ -1143,7 +1150,7 @@ class Qwen3VLTextMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -1155,7 +1162,7 @@ class Qwen3VLTextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -1163,7 +1170,7 @@ class Qwen3VLTextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -1182,7 +1189,7 @@ class Qwen3VLTextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen3-VL text attention layer.
@@ -1192,7 +1199,7 @@ class Qwen3VLTextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         super().__init__(
@@ -1222,7 +1229,7 @@ class Qwen3VLTextAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class Qwen3VLTextDecoderLayer(nn.Module):
+class Qwen3VLTextDecoderLayer(spx.Module):
     """Transformer decoder layer for Qwen3-VL text model.
 
     Combines multi-head attention with Q/K normalization and feedforward networks
@@ -1236,7 +1243,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen3-VL text decoder layer.
@@ -1246,7 +1253,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         self.config = config
@@ -1288,7 +1295,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -1345,7 +1352,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -1377,7 +1384,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL text decoder model.
 
@@ -1386,7 +1393,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1411,19 +1418,19 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -1450,7 +1457,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             base=self.config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1464,6 +1471,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         visual_pos_masks: Bool[Array, "batch seq_len"] | None = None,
         deepstack_visual_embeds: list[Array] | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through the Qwen3-VL text decoder model.
 
@@ -1549,36 +1557,61 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hs = layer_outputs.hidden_states
             if deepstack_visual_embeds is not None and idx < len(deepstack_visual_embeds):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
+                hs = self._deepstack_process(
+                    hs,
                     visual_pos_masks,
                     deepstack_visual_embeds[idx],
                 )
-
+            hs = self._mark_layer_stage_boundary(hs, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -1667,7 +1700,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL multimodal model.
 
@@ -1677,7 +1710,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -2107,7 +2140,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
 
         return special_image_mask, special_video_mask
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -2347,7 +2380,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL model for conditional generation.
 
@@ -2356,7 +2389,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -2469,7 +2502,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
         """
         return self.model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2551,7 +2584,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -2580,7 +2613,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
         """
         return self.lm_head(hidden_states)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Get the vision tower component.
 
         Returns:
@@ -2588,7 +2621,7 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
         """
         return self.model.visual
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Get the language model component.
 
         Returns:

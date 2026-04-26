@@ -23,13 +23,13 @@ UnifiedAttentionCacheView (separate K/V pages).
 from __future__ import annotations
 
 import jax
-from eformer import common_types as ct
-from eformer.escale import with_sharding_constraint
 from ejkernel.modules import flash_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
+from spectrax import common_types as ct
+from spectrax import with_sharding_constraint
 
 from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, UnifiedAttentionCacheView, unwrap_metadata
@@ -215,7 +215,7 @@ class PagedFlashAttn(OperationImpl):
             tensor=softmax_aux,
         )
 
-        resolve = self.metadata.partition_manager.resolve
+        resolve = self.metadata.runtime_sharding_resolver.with_mesh(self.metadata.mesh).resolve
         key_sharding = resolve(
             axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,

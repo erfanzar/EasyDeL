@@ -46,14 +46,14 @@ import typing as tp
 from functools import cached_property
 
 import jax
-from eformer.escale import PartitionAxis
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP, STRING_TO_DTYPE_MAP
 from eformer.paths import ePath
-from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from pydantic import BaseModel
+from spectrax import PartitionAxis
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from easydel.infra import EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState
@@ -195,9 +195,9 @@ class RayDistributedTrainer:
         "attn_mechanism": "auto",
         "attn_dtype": jnp.bfloat16,
         "attn_softmax_dtype": jnp.bfloat16,
-        "sharding_axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
-        "sharding_axis_dims": (1, -1, 1, 1, 1),
-        "sharding_dcn_axis_dims": (1, -1, 1, 1, 1),
+        "sharding_axis_names": ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        "sharding_axis_dims": (1, 1, -1, 1, 1, 1),
+        "sharding_dcn_axis_dims": (1, 1, -1, 1, 1, 1),
     }
 
     _processor_loader_class: type[PreTrainedTokenizer] = AutoTokenizer
@@ -393,7 +393,7 @@ class RayDistributedTrainer:
             return_attention_mask=True,
             truncation=True,
         )
-        return {k: (v.reshape(-1) if hasattr(v, "shape") else v) for k, v in out.items()}
+        return {k: v.reshape(-1) if hasattr(v, "shape") else v for k, v in out.items()}
 
     def process_messages_data(
         self,
@@ -421,7 +421,7 @@ class RayDistributedTrainer:
             return_dict=True,
             truncation=True,
         )
-        return {k: (v.reshape(-1) if hasattr(v, "shape") else v) for k, v in out.items()}
+        return {k: v.reshape(-1) if hasattr(v, "shape") else v for k, v in out.items()}
 
     def create_config(self, scaling_index: int) -> EasyDeLBaseConfig:
         """
@@ -496,7 +496,7 @@ class RayDistributedTrainer:
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            rngs=nn.Rngs(seed),
+            rngs=spx.Rngs(seed),
         )
 
         if lazy:
@@ -517,7 +517,7 @@ class RayDistributedTrainer:
             - Does NOT perform sharding (handled by trainer)
             - Uses the configured state_class for conversion
         """
-        return model.to_state(self.state_class)
+        return model.to_state(self.state_class, trainable_selector=self.arguments.trainable_selector)
 
     def create_model_from_config(self, scaling_index: int) -> EasyDeLBaseModule:
         """

@@ -30,7 +30,7 @@ Key Features:
 - Support for margin-based ranking losses
 - Handling of chosen/rejected response pairs
 - Gradient accumulation and mixed precision training
-- Integration with JAX/Flax for efficient computation
+- Integration with JAX/spectrax for efficient computation
 
 Example:
     >>> from easydel.trainers import RewardConfig, RewardTrainer

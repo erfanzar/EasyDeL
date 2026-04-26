@@ -4,7 +4,7 @@ EasyDeL provides robust support for audio-language models, allowing you to proce
 
 ## Whisper Speech Recognition
 
-[Whisper](https://github.com/openai/whisper) is OpenAI's versatile speech recognition model that can transcribe and translate audio in multiple languages. EasyDeL offers optimized JAX/Flax implementations of Whisper for efficient inference.
+[Whisper](https://github.com/openai/whisper) is OpenAI's versatile speech recognition model that can transcribe and translate audio in multiple languages. EasyDeL offers optimized JAX/SpecTrax implementations of Whisper for efficient inference.
 
 ## Basic Whisper Usage
 
