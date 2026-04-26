@@ -16,9 +16,10 @@
 
 import jax
 import jax.numpy as jnp
-from eformer.escale import PartitionAxis, PartitionManager
+from spectrax import PartitionAxis
 
 from easydel.caching.ragged_page import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesMetadata
+from easydel.infra.sharding import coerce_runtime_sharding_resolver
 
 
 def test_kv_cache_write():
@@ -26,12 +27,12 @@ def test_kv_cache_write():
 
     # Setup
     mesh = jax.sharding.Mesh(jax.devices(), ("tp",))
-    partition_manager = PartitionManager(PartitionAxis(kv_head_axis="tp"))
+    runtime_sharding_resolver = coerce_runtime_sharding_resolver(PartitionAxis(kv_head_axis="tp"), mesh=mesh)
 
     # Create metadata
     metadata = RaggedPagesCacheConfig.create(
         mesh=mesh,
-        partition_manager=partition_manager,
+        runtime_sharding_resolver=runtime_sharding_resolver,
         kvdtype=jnp.float32,
         num_hidden_layers=1,
         num_kv_heads=8,
@@ -50,7 +51,7 @@ def test_kv_cache_write():
     cache = RaggedPagesCache.init_cache(
         mesh=mesh,
         config=metadata,
-        partition_manager=partition_manager,
+        runtime_sharding_resolver=runtime_sharding_resolver,
     )
 
     print("\nCache initialized:")

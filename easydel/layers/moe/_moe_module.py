@@ -45,7 +45,7 @@ Example:
     ...     def __init__(self, config):
     ...         super().__init__(config)
     ...         # Initialize gate and expert layers
-    ...     def __call__(self, hidden_states):
+    ...     def forward(self, hidden_states):
     ...         # Implement forward pass using _moe_call_standard helper
     ...         return self._moe_call_standard(...)
 """
@@ -59,15 +59,15 @@ from collections.abc import Callable
 from functools import partial
 
 import jax
-from eformer import common_types
+import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax import shard_map
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types
 
 from easydel.utils.helpers import check_bool_flag
 
@@ -105,14 +105,14 @@ TP = common_types.TP
 SP = common_types.SP
 
 
-class BaseMoeModule(nn.Module, ABC):
+class BaseMoeModule(spx.Module, ABC):
     """An abstract base class for Mixture of Experts (MoE) modules.
 
     This class provides a foundational structure and common utilities for
     implementing various MoE architectures. It includes methods for token routing,
     data permutation for efficient expert computation, load balancing loss
     calculation, and sharding for distributed environments. Subclasses are
-    expected to implement the `__call__` method to define the specific MoE forward
+    expected to implement the `forward` method to define the specific MoE forward
     pass.
 
     Attributes:
@@ -160,7 +160,7 @@ class BaseMoeModule(nn.Module, ABC):
         super().__init__()
         self.config = config
         self.mesh = config.mesh
-        self.partition_manager = config.partition_manager
+        self.runtime_sharding_resolver = config.runtime_sharding_resolver
         self.n_routed_experts = n_routed_experts or config.n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok or config.num_experts_per_tok
         self.hidden_size = hidden_size or config.hidden_size
@@ -176,10 +176,6 @@ class BaseMoeModule(nn.Module, ABC):
         self.expert_abstract_mesh = self.config.expert_abstract_mesh
 
         self.dtype = getattr(self, "dtype", jnp.bfloat16)
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, tp.Any]:
-        """Return dynamic partition specs for this module's parameters."""
-        return {}
 
     def get_moe_spec(
         self,
@@ -216,7 +212,7 @@ class BaseMoeModule(nn.Module, ABC):
         """
 
         return get_moe_partition_spec(
-            partition_manager=self.partition_manager,
+            runtime_sharding_resolver=self.runtime_sharding_resolver,
             direction=direction,
             tensors_are_expert=tensors_are_expert,
             is_bias=is_bias,
@@ -258,18 +254,18 @@ class BaseMoeModule(nn.Module, ABC):
         Note:
             Sizes default to 1 if the axis doesn't exist in the mesh.
         """
-        partition_manager = self.partition_manager
-        data_axis_name = resolve_eformer_axis(DP, partition_manager)
+        runtime_sharding_resolver = self.runtime_sharding_resolver
+        data_axis_name = resolve_eformer_axis(DP, runtime_sharding_resolver)
 
         if self.config.use_expert_tensor_mode:
-            expert_axis_name = resolve_eformer_axis(TP, partition_manager)
-            tensor_axis_name = resolve_eformer_axis(EP, partition_manager)
+            expert_axis_name = resolve_eformer_axis(TP, runtime_sharding_resolver)
+            tensor_axis_name = resolve_eformer_axis(EP, runtime_sharding_resolver)
         else:
-            expert_axis_name = resolve_eformer_axis(EP, partition_manager)
-            tensor_axis_name = resolve_eformer_axis(TP, partition_manager)
+            expert_axis_name = resolve_eformer_axis(EP, runtime_sharding_resolver)
+            tensor_axis_name = resolve_eformer_axis(TP, runtime_sharding_resolver)
 
-        fsdp_axis_name = resolve_eformer_axis(FSDP, partition_manager)
-        sp_axis_name = resolve_eformer_axis(SP, partition_manager)
+        fsdp_axis_name = resolve_eformer_axis(FSDP, runtime_sharding_resolver)
+        sp_axis_name = resolve_eformer_axis(SP, runtime_sharding_resolver)
 
         dp_size = self.mesh.shape.get(data_axis_name, 1)
         ep_size = self.mesh.shape.get(expert_axis_name, 1)
@@ -640,39 +636,61 @@ class BaseMoeModule(nn.Module, ABC):
             >>> sharded_weight = _apply_expert_sharding(weight, "weight_col")
             >>> # weight is now sharded across devices according to mesh configuration
         """
-        pmag = self.partition_manager
+        runtime_sharding_resolver = self.runtime_sharding_resolver
 
         if tensor_type == "weight_col":
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape
+                )
             elif tensor.ndim == 2:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape
+                )
             else:
-                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
+                sharding_spec = runtime_sharding_resolver.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
         elif tensor_type == "weight_row":
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape
+                )
             elif tensor.ndim == 2:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape
+                )
             else:
-                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
+                sharding_spec = runtime_sharding_resolver.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
         elif tensor_type == "bias":
             if tensor.ndim == 2 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape
+                )
             else:
-                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
 
         else:
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY, EMPTY],
+                    mode=MODE_TRAIN,
+                    shape=tensor.shape,
+                )
             elif tensor.ndim == 2 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = runtime_sharding_resolver.resolve(
+                    axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape
+                )
             else:
-                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
+                sharding_spec = runtime_sharding_resolver.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
-        return jax.device_put(tensor, jax.sharding.NamedSharding(self.mesh, sharding_spec))
+        # # @erfanzar NOTE: get_corrected_named_sharding is MPMD-aware --
+        # routes through the resolver and lands on the per-stage submesh.
+        # Hand-rolling NamedSharding(self.mesh, spec) would collapse stages.
+        return jax.device_put(
+            tensor,
+            spx.get_corrected_named_sharding(tuple(tensor.shape), sharding_spec, raise_mesh_error=False),
+        )
 
     def _get_gate_layer_sharding(self, weight_shape: tuple) -> PartitionSpec:
         """Returns the partition specification for gate/router layer weights.
@@ -691,8 +709,7 @@ class BaseMoeModule(nn.Module, ABC):
             Gate weights are typically small relative to expert FFN weights and
             are usually replicated for efficient routing computation.
         """
-        pmag = self.partition_manager
-        return pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=weight_shape)
+        return self.runtime_sharding_resolver.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=weight_shape)
 
     def _get_gate_layer_bias_sharding(self, bias_shape: tuple) -> PartitionSpec:
         """Returns the partition specification for gate/router layer bias.
@@ -707,8 +724,7 @@ class BaseMoeModule(nn.Module, ABC):
         Note:
             Like gate weights, bias is usually replicated for efficient routing.
         """
-        pmag = self.partition_manager
-        return pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=bias_shape)
+        return self.runtime_sharding_resolver.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=bias_shape)
 
     def _validate_routing_inputs(
         self, hidden_states: Float[Array, "batch seq hidden_dim"], router_logits: Float[Array, "batch_seq num_experts"]
@@ -845,7 +861,7 @@ class BaseMoeModule(nn.Module, ABC):
     def _sparse_moe_call(
         self,
         hidden_state: jax.Array,  # [B, S, H]
-        gate_layer: nn.Module,  # [H, E]
+        gate_layer: spx.Module,  # [H, E]
         wi_kernel: jax.Array,  # [E, H, M]
         wu_kernel: jax.Array,  # [E, H, M]
         wd_kernel: jax.Array,  # [E, M, H]
@@ -958,12 +974,12 @@ class BaseMoeModule(nn.Module, ABC):
 
         # Use expert_mesh (3D: dp, ep, tp) for cleaner sharding
         expert_mesh = self.auto_expert_mesh
-        pm = self.partition_manager
+        runtime_sharding_resolver = self.runtime_sharding_resolver
 
-        # Resolve axis names from partition_manager (not directly from mesh)
-        dp_axis_name = resolve_eformer_axis(DP, pm)
-        expert_axis_name = resolve_eformer_axis(EP, pm)
-        tensor_axis_name = resolve_eformer_axis(TP, pm)
+        # Resolve axis names from the runtime sharding resolver rather than the mesh directly.
+        dp_axis_name = resolve_eformer_axis(DP, runtime_sharding_resolver)
+        expert_axis_name = resolve_eformer_axis(EP, runtime_sharding_resolver)
+        tensor_axis_name = resolve_eformer_axis(TP, runtime_sharding_resolver)
 
         ep_size = expert_mesh.shape[expert_axis_name]
         tp_size = expert_mesh.shape[tensor_axis_name]
@@ -1214,20 +1230,23 @@ class BaseMoeModule(nn.Module, ABC):
 
         # Reshard output back to original 5D mesh for compatibility with rest of model
         # This ensures the output can be used in residual connections
-        original_output_ps = self.partition_manager.resolve(
+        original_output_ps = self.runtime_sharding_resolver.resolve(
             axes=[DP, EMPTY, TP] if not self.config.use_expert_tensor_mode else [DP, EMPTY, EMPTY],
             mode=MODE_TRAIN,
             shape=output.shape,
         )
-        output = jax.lax.with_sharding_constraint(output, jax.sharding.NamedSharding(self.mesh, original_output_ps))
+        # # @erfanzar NOTE: spx.with_sharding_constraint (NOT jax.lax.*) so the
+        # constraint is MPMD-aware and the spec lands on the resolved
+        # stage-local submesh.
+        output = spx.with_sharding_constraint(output, original_output_ps, mesh=self.mesh)
 
         return output, prein_gate_logits
 
     def moe_call(
         self,
         hidden_state: jax.Array,  # [B, S, H]
-        gate_layer: nn.Module,
-        expert_layer: nn.Module,
+        gate_layer: spx.Module,
+        expert_layer: spx.Module,
         wi_kernel: jax.Array,  # [E, H, M]
         wu_kernel: jax.Array,  # [E, H, M]
         wd_kernel: jax.Array,  # [E, M, H]
@@ -1340,7 +1359,7 @@ class BaseMoeModule(nn.Module, ABC):
     def _moe_call_dense(
         self,
         hidden_state: jax.Array,  # [B, S, H]
-        gate_layer: nn.Module,
+        gate_layer: spx.Module,
         wi_kernel: jax.Array,  # [E, H, M]
         wu_kernel: jax.Array,  # [E, H, M]
         wd_kernel: jax.Array,  # [E, M, H]
@@ -1626,8 +1645,8 @@ class BaseMoeModule(nn.Module, ABC):
 
     def _moe_call_standard(
         self,
-        gate_layer: nn.Module,
-        expert_layer: nn.Module,
+        gate_layer: spx.Module,
+        expert_layer: spx.Module,
         hidden_state: jax.Array,
         output_metrics: bool = False,
         validate_inputs: bool = False,
@@ -1768,7 +1787,7 @@ class BaseMoeModule(nn.Module, ABC):
         return output, router_logits
 
     @abstractmethod
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq hidden_dim"],
         **kwargs,

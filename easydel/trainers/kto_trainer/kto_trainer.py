@@ -16,15 +16,13 @@ from __future__ import annotations
 
 import typing as tp
 
-import jax
 from eformer.loggings import get_logger
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.traversals import deepcopy_model
 
 from ..binary_classifier_optimization_trainer._fn import concatenated_forward
@@ -36,7 +34,7 @@ from ..prompt_utils import (
 )
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
 from ._fn import evaluation_step, training_step
 from .kto_config import KTOConfig
@@ -94,14 +92,14 @@ class KTOTrainer(Trainer):
         if isinstance(model, EasyDeLState):
             model_state = model
         else:
-            model_state = model.to_state()
+            model_state = model.to_state(trainable_selector=arguments.trainable_selector)
 
         if reference_model is None:
             reference_state = deepcopy_model(model_state)
         elif isinstance(reference_model, EasyDeLState):
             reference_state = reference_model
         elif isinstance(reference_model, EasyDeLBaseModule):
-            reference_state = reference_model.to_state()
+            reference_state = reference_model.to_state(trainable_selector=arguments.trainable_selector)
         else:
             reference_state = deepcopy_model(model_state)
 
@@ -252,7 +250,7 @@ class KTOTrainer(Trainer):
             Configuration containing compiled step functions and mesh.
         """
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -274,7 +272,7 @@ class KTOTrainer(Trainer):
                 logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
 
-        self.concatenated_forward = ejit(forward_fn, static_argnames=())
+        self.concatenated_forward = compile_trainer_auxiliary(forward_fn, mesh=mesh, static_argnames=())
 
         self._train_shared_fn_static_args = (
             self.scheduler,
@@ -294,7 +292,7 @@ class KTOTrainer(Trainer):
         ref_sharding = self.reference_state.shardings if self.reference_state is not None else empty_sharding
 
         train_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             training_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -314,7 +312,7 @@ class KTOTrainer(Trainer):
         )
 
         eval_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10)
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
             out_shardings=empty_sharding,

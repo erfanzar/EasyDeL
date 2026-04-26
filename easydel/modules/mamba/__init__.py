@@ -66,7 +66,7 @@ Example:
     ...     config=config,
     ...     dtype=jnp.bfloat16,
     ...     param_dtype=jnp.bfloat16,
-    ...     rngs=nn.Rngs(0),
+    ...     rngs=spx.Rngs(0),
     ... )
 """
 

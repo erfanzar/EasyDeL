@@ -45,7 +45,6 @@ References:
 
 import jax
 import jax.numpy as jnp
-from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
 from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule._interface import _decode_path
 from ejkernel.kernels._xla.ragged_gated_delta_rule._xla_impl_fwd import _ragged_gdr_chunked_prefill
@@ -55,6 +54,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
+from spectrax import with_sharding_constraint
 
 from easydel.caching import RecurrentCacheView
 from easydel.layers.linear_attention._conv_state import apply_manual_depthwise_conv, shift_conv_state_left
@@ -1013,7 +1013,7 @@ class GatedDeltaRuleOp(OperationImpl):
         recurrent_state = recurrent_state.astype(runtime_dtype)
 
         mesh = self.metadata.mesh
-        if mesh is not None:
+        if mesh is not None and jax.default_backend() == "tpu":
             mode = self.get_mode(query=jnp.expand_dims(query, 0), BTHD=False)
             shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
             head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None

@@ -74,7 +74,7 @@ Usage Example:
         },
     )
 
-    model = Glm4vForConditionalGeneration(config, rngs=nnx.Rngs(0))
+    model = Glm4vForConditionalGeneration(config, rngs=spx.Rngs(0))
 
     # Prepare inputs with image
     input_ids = jnp.array([[1, 2, 151859, 3, 4]])  # 151859 is boi_token_id

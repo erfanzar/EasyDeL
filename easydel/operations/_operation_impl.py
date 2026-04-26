@@ -53,14 +53,14 @@ Example:
 from __future__ import annotations
 
 import einops
-from eformer import common_types
-from eformer import escale as es
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import Array
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Bool, Float
+from spectrax import common_types
 
 from ._base_operation import BaseOperation, OperationRegistry
 from ._operation_meta import OperationMetadata
@@ -359,7 +359,7 @@ class OperationImpl(BaseOperation):
             if preserved_indices is None:
                 if tensor is None:
                     return state_ps
-                corrected: Ps = es.get_corrected_named_sharding(tensor.shape, state_ps).spec
+                corrected: Ps = spx.get_corrected_named_sharding(tensor.shape, state_ps).spec
                 return corrected
 
             num_dims: int = len(state_ps)
@@ -374,5 +374,5 @@ class OperationImpl(BaseOperation):
             if tensor is None:
                 return sharding
             else:
-                corrected_sharding: Ps = es.get_corrected_named_sharding(tensor.shape, sharding).spec
+                corrected_sharding: Ps = spx.get_corrected_named_sharding(tensor.shape, sharding).spec
                 return corrected_sharding

@@ -15,14 +15,12 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated, RowWise
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -50,7 +48,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .gpt2_configuration import GPT2Config as GPT2Config
 
 
-class Conv1D(nn.Module):
+class Conv1D(spx.Module):
     """Custom 1D Convolution layer used in GPT-2.
 
     This layer implements a 1D convolution operation often used as a substitute
@@ -66,7 +64,7 @@ class Conv1D(nn.Module):
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
             dot_general (tp.Optional[callable]): Custom dot_general function.
                 Defaults to None (uses jax.lax.dot_general).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -80,14 +78,14 @@ class Conv1D(nn.Module):
         dot_general=None,
         sharding_axis: str | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(out_features, in_features),
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": 0.02},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
         self.bias = (
@@ -95,7 +93,7 @@ class Conv1D(nn.Module):
                 shape=(in_features,),
                 dtype=param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
             )
             if use_bias
             else None
@@ -108,19 +106,7 @@ class Conv1D(nn.Module):
         self.dot_general = dot_general
         self.sharding_axis = sharding_axis
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        if self.sharding_axis == "row":
-            kernel_spec = RowWise
-        elif self.sharding_axis == "column":
-            kernel_spec = ColumnWise
-        else:
-            kernel_spec = ColumnWise
-        specs = {"kernel": kernel_spec}
-        if self.bias is not None:
-            specs["bias"] = Replicated
-        return specs  # pyright: ignore[reportReturnType]
-
-    def __call__(self, inputs):
+    def forward(self, inputs):
         """Forward pass of the Conv1D layer.
 
         Args:
@@ -131,7 +117,7 @@ class Conv1D(nn.Module):
         """
         inputs = jnp.asarray(inputs, self.dtype)
         bias = self.bias.value
-        kernel = self.kernel.value.transpose().astype(self.dtype)
+        kernel = self.weight.value.transpose().astype(self.dtype)
         if self.dot_general is not None:
             dot_general = self.dot_general
         else:
@@ -161,7 +147,7 @@ class GPT2Attention(UnifiedAttention):
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
             causal (bool): Whether the attention is causal.
             is_cross_attention (bool): Whether the attention is cross-attention.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -174,7 +160,7 @@ class GPT2Attention(UnifiedAttention):
         causal: bool = True,
         is_cross_attention: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.is_cross_attention = is_cross_attention
         self.embed_dim = config.hidden_size
@@ -201,7 +187,7 @@ class GPT2Attention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Create GPT-2 specific projection layers."""
         if self.is_cross_attention:
@@ -247,7 +233,7 @@ class GPT2Attention(UnifiedAttention):
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
         self.attention_performer = self._create_attention_performer(self.config, rngs)
 
-    def _create_attention_performer(self, config: GPT2Config, rngs: nn.Rngs) -> FlexibleAttentionModule:
+    def _create_attention_performer(self, config: GPT2Config, rngs: spx.Rngs) -> FlexibleAttentionModule:
         """Use GPT-2 specific attention dropout setting."""
         return FlexibleAttentionModule(
             rngs=rngs,
@@ -271,7 +257,7 @@ class GPT2Attention(UnifiedAttention):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -357,7 +343,7 @@ class GPT2Attention(UnifiedAttention):
         )
 
 
-class GPT2MLP(nn.Module):
+class GPT2MLP(spx.Module):
     """GPT-2 MLP module.
 
     This module implements the feed-forward network (MLP) used in the GPT-2 model.
@@ -369,7 +355,7 @@ class GPT2MLP(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -380,7 +366,7 @@ class GPT2MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__()
         self.config = config
@@ -411,7 +397,7 @@ class GPT2MLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the GPT2MLP module.
@@ -425,19 +411,19 @@ class GPT2MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act(self.c_fc(hidden_states)), "mlp_gate")
         hidden_states = checkpoint_name(self.dropout(self.c_proj(gate)), "mlp_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states
 
 
-class GPT2Block(nn.Module):
+class GPT2Block(spx.Module):
     """GPT-2 Transformer block.
 
     This module represents a single transformer block in the GPT-2 model,
@@ -449,7 +435,7 @@ class GPT2Block(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -460,7 +446,7 @@ class GPT2Block(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__()
         self.config = config
@@ -520,7 +506,7 @@ class GPT2Block(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -606,7 +592,7 @@ class GPT2Block(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -630,7 +616,7 @@ class GPT2Model(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -640,7 +626,7 @@ class GPT2Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -675,19 +661,19 @@ class GPT2Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.h = nn.List(
-            [
-                remat_layer_block(
-                    self.config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.h = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.h.append(
+                    remat_layer_block(
+                        self.config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.ln_f = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_epsilon,
@@ -696,7 +682,7 @@ class GPT2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -790,7 +776,9 @@ class GPT2Model(EasyDeLBaseModule):
             )
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.h))
-        for idx, block in enumerate(self.h):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_cross_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -799,14 +787,14 @@ class GPT2Model(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=None,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_mask_info=encoder_mask_info,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -814,12 +802,19 @@ class GPT2Model(EasyDeLBaseModule):
             if encoder_hidden_states is not None:
                 all_cross_attentions += (layer_outputs.cross_attention,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, all_cross_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_cross_attentions, _ = self.h.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_cross_attentions, 0),
+            trace=True,
+        )
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         hidden_states = checkpoint_name(self.ln_f(hidden_states), "model_output")
@@ -872,7 +867,7 @@ class GPT2LMHeadModel(BaseCausalLMModule[GPT2Model, GPT2Config]):  # type: ignor
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -888,7 +883,7 @@ class GPT2LMHeadModel(BaseCausalLMModule[GPT2Model, GPT2Config]):  # type: ignor
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,

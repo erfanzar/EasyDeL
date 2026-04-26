@@ -76,7 +76,7 @@ model = Mamba2ForCausalLM(
     config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.float32,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Forward pass for training

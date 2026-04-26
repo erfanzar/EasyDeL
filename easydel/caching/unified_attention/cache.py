@@ -33,7 +33,7 @@ Key Components:
 Example:
     >>> config = UnifiedAttentionCacheConfig.create(
     ...     mesh=mesh,
-    ...     partition_manager=pm,
+    ...     runtime_sharding_resolver=pm,
     ...     kvdtype=jnp.bfloat16,
     ...     num_hidden_layers=32,
     ...     num_kv_heads=8,
@@ -43,7 +43,7 @@ Example:
     >>> cache = UnifiedAttentionCache.init_cache(
     ...     mesh=mesh,
     ...     config=config,
-    ...     partition_manager=pm
+    ...     runtime_sharding_resolver=pm
     ... )
 """
 
@@ -53,18 +53,19 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer import escale as es
-from eformer.escale import PartitionAxis, PartitionManager
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
+from spectrax import PartitionAxis, common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
+from easydel.caching.ragged_page.cache import KV_UPDATE_WINDOW_BYTES, MAX_SLICES_PER_UPDATE_PAGE
 from easydel.caching.ragged_page.utils import kv_cache_update_jax
+from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, unwrap_metadata
 
@@ -80,9 +81,9 @@ KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
 
 
-def _attention_dp_axis(partition_manager: PartitionManager):
+def _attention_dp_axis(runtime_sharding_resolver: RuntimeShardingResolver):
     """Resolve the concrete mesh axis used for KV-page data parallelism."""
-    return resolve_attention_data_parallel_axis(partition_manager, mode=MODE_PREFILL)
+    return resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -239,7 +240,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
     Example:
         >>> config = UnifiedAttentionCacheConfig.create(
         ...     mesh=mesh,
-        ...     partition_manager=pm,
+        ...     runtime_sharding_resolver=pm,
         ...     kvdtype=jnp.bfloat16,
         ...     num_hidden_layers=32,
         ...     num_kv_heads=8,
@@ -273,24 +274,24 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
     @staticmethod
     def _compute_free_hbm(
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
     ) -> int:
         """Compute available HBM for cache allocation across mesh.
 
         Args:
             mesh: JAX device mesh.
-            partition_manager: Partition manager with axis configuration.
+            runtime_sharding_resolver: Partition manager with axis configuration.
             hbm_utilization: Target memory utilization fraction.
 
         Returns:
             int: Available bytes used for KV page-pool sizing, scaled by
                 both KV-head and data-parallel page-axis factors.
         """
-        kv_head_axis = partition_manager.paxis.kv_head_axis
+        kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
         kv_head_size = _mesh_axis_size(mesh, kv_head_axis)
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
+        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(runtime_sharding_resolver))
         available_alloc = budget * kv_head_size * page_axis_size
         logger.info(f"{kv_head_axis=} {kv_head_size=} {page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
         return available_alloc
@@ -299,7 +300,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
     def create(
         cls,
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
         num_kv_heads: int,
@@ -316,7 +317,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
 
         Args:
             mesh: JAX device mesh for distributed execution.
-            partition_manager: Manager for tensor partitioning/sharding.
+            runtime_sharding_resolver: Manager for tensor partitioning/sharding.
             kvdtype: Data type for KV cache storage (e.g., jnp.bfloat16).
             num_hidden_layers: Number of transformer layers.
             num_kv_heads: Number of key-value attention heads.
@@ -341,13 +342,13 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             raise ValueError("`page_size` must be positive")
         if max_model_length <= 0:
             raise ValueError("`max_model_length` must be positive")
-        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
+        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(runtime_sharding_resolver))
         if data_parallel_size > 1:
             logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
 
         free = cls._compute_free_hbm(
             mesh=mesh,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
@@ -368,8 +369,8 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         # A lightweight heuristic for slot-mapping padding; matches eSurge expectations.
         page_size_bytes = 2 * page_size * num_kv_heads * head_dim * bytes_av
         # Keep this conservative; it only affects padding of the update schedule.
-        slices_raw = (16 * 1024 * 1024) // max(1, int(page_size_bytes))
-        num_slices_per_page = min(64, _previous_power_of_2(int(slices_raw)))
+        slices_raw = KV_UPDATE_WINDOW_BYTES // max(1, int(page_size_bytes))
+        num_slices_per_page = min(MAX_SLICES_PER_UPDATE_PAGE, _previous_power_of_2(int(slices_raw)))
 
         return cls(
             num_hidden_layers=num_hidden_layers,
@@ -456,7 +457,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
             Shape: [num_pages, page_size, num_kv_heads, head_dim]
         value_cache (Array): Value cache tensor.
             Shape: [num_pages, page_size, num_kv_heads, head_dim]
-        partition_manager (PartitionManager): Manager for tensor sharding.
+        runtime_sharding_resolver (RuntimeShardingResolver): Manager for tensor sharding.
     """
 
     metadata: UnifiedAttentionCacheConfig
@@ -465,9 +466,9 @@ class UnifiedAttentionCacheView(BaseCacheView):
     key_cache: Float[Array, "num_pages page_size num_kv_heads head_dim"]
     value_cache: Float[Array, "num_pages page_size num_kv_heads head_dim"]
 
-    partition_manager: PartitionManager = field(
+    runtime_sharding_resolver: RuntimeShardingResolver = field(
         pytree_node=False,
-        default_factory=lambda: PartitionManager(PartitionAxis()),
+        default_factory=lambda: coerce_runtime_sharding_resolver(PartitionAxis()),
     )
 
     @classmethod
@@ -477,7 +478,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
         layer_index: int | None = None,
         *,
         mesh: Mesh | None = None,
-        partition_manager: es.PartitionManager | None = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: EasyQuantizer | None = None,
     ) -> "UnifiedAttentionCacheView":
         """Initialize a UnifiedAttentionCacheView from a cache config.
@@ -489,19 +490,18 @@ class UnifiedAttentionCacheView(BaseCacheView):
             config: UnifiedAttentionCacheConfig with cache dimensions.
             layer_index: Index of this layer in the model. Default: 0.
             mesh: JAX device mesh for sharding.
-            partition_manager: Partition manager for sharding configuration.
+            runtime_sharding_resolver: Partition manager for sharding configuration.
             quantizer: Optional quantizer to apply to cache tensors.
 
         Returns:
             UnifiedAttentionCacheView: Initialized cache view.
         """
-        if partition_manager is None:
-            partition_manager = PartitionManager(PartitionAxis())
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         key_shape = (config.num_pages, config.page_size, config.num_kv_heads, config.head_dim)
         page_axis = ATTN_DP if config.data_parallel_size > 1 else EMPTY
         axes = [page_axis, EMPTY, KV_HEAD, EMPTY]
-        sharding_spec = partition_manager.resolve(axes=axes, mode=MODE_PREFILL, shape=key_shape)
+        sharding_spec = runtime_sharding_resolver.resolve(axes=axes, mode=MODE_PREFILL, shape=key_shape)
         sharding = Ns(mesh=mesh, spec=sharding_spec)
 
         with jax.named_scope("easydel-unified-attention-cache-init"):
@@ -517,7 +517,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
             layer_index=layer_index or 0,
             key_cache=key_cache,
             value_cache=value_cache,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
         )
 
     def concatenate_to_cache(
@@ -555,7 +555,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
         key_tokens = key.reshape(-1, *key.shape[-2:]).astype(self.key_cache.dtype)
         value_tokens = value.reshape(-1, *value.shape[-2:]).astype(self.value_cache.dtype)
         data_parallel_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1)))
-        data_parallel_axis = _attention_dp_axis(self.partition_manager)
+        data_parallel_axis = _attention_dp_axis(self.runtime_sharding_resolver)
         use_shardmap = data_parallel_size > 1
 
         def _update_pages(
@@ -580,7 +580,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
             return pages_flat.reshape(original_shape)
 
         if use_shardmap:
-            resolve = self.partition_manager.resolve
+            resolve = self.runtime_sharding_resolver.resolve
             page_axis = ATTN_DP
             _update_pages = jax.shard_map(
                 _update_pages,
@@ -591,7 +591,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
                     resolve([EMPTY], mode=MODE_PREFILL, shape=cache_metadata.num_kv_update_slices.shape),
                 ),
                 out_specs=resolve([page_axis, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL, shape=self.key_cache.shape),
-                mesh=es.get_incontext_mesh(),
+                mesh=spx.to_jax_mesh(spx.get_incontext_mesh()),
                 check_vma=False,
             )
 
@@ -633,7 +633,7 @@ class UnifiedAttentionCache(BaseCache):
         >>> cache = UnifiedAttentionCache.init_cache(
         ...     mesh=mesh,
         ...     config=config,
-        ...     partition_manager=pm
+        ...     runtime_sharding_resolver=pm
         ... )
         >>> layer_view = cache.views[layer_idx]
     """
@@ -658,7 +658,7 @@ class UnifiedAttentionCache(BaseCache):
         *,
         mesh: Mesh,
         config: UnifiedAttentionCacheConfig,
-        partition_manager: es.PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
     ) -> "UnifiedAttentionCache":
         """Initialize the complete cache for all layers.
@@ -669,7 +669,7 @@ class UnifiedAttentionCache(BaseCache):
         Args:
             mesh: JAX device mesh for distributed execution.
             config: UnifiedAttentionCacheConfig with cache dimensions.
-            partition_manager: Manager for tensor sharding.
+            runtime_sharding_resolver: Manager for tensor sharding.
             quantizer: Optional quantizer to apply to cache tensors.
 
         Returns:
@@ -680,7 +680,7 @@ class UnifiedAttentionCache(BaseCache):
                 config=config,
                 layer_index=i,
                 mesh=mesh,
-                partition_manager=partition_manager,
+                runtime_sharding_resolver=runtime_sharding_resolver,
                 quantizer=quantizer,
             )
             for i in range(config.num_hidden_layers)

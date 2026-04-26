@@ -99,7 +99,8 @@ Example Usage
     ...     MoeRoutingStrategy,
     ...     MoeLoadBalancingStrategy,
     ... )
-    >>> from flax import nnx as nn
+    >>> import spectrax as spx
+from spectrax import nn
     >>>
     >>> # Configure MoE execution
     >>> config.moe_method = MoEMethods.FUSED_MOE
@@ -115,14 +116,14 @@ Example Usage
     ...         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, rngs=rngs)
     ...         # Initialize expert FFN weights...
     ...
-    ...     def __call__(self, hidden_states):
+    ...     def forward(self, hidden_states):
     ...         output, router_logits = self.moe_call(
     ...             hidden_state=hidden_states,
     ...             gate_layer=self.gate,
     ...             wi_kernel=self.wi_kernel,
     ...             wu_kernel=self.wu_kernel,
     ...             wd_kernel=self.wd_kernel,
-    ...             act_fn=nn.silu,
+    ...             act_fn=jax.nn.silu,
     ...         )
     ...         return output
 
@@ -145,7 +146,7 @@ Example Usage
 
     >>> import jax
     >>> from jax.sharding import Mesh
-    >>> from eformer.escale import PartitionManager
+    >>> from spectrax import PartitionManager
     >>>
     >>> # Create 5D mesh for model training
     >>> devices = jax.devices()
@@ -156,7 +157,7 @@ Example Usage
     >>>
     >>> # Configure partition manager
     >>> config.mesh = mesh
-    >>> config.partition_manager = PartitionManager(mesh, ...)
+    >>> config.runtime_sharding_resolver = PartitionManager(mesh, ...)
     >>>
     >>> # MoE layer automatically creates 3D expert mesh:
     >>> # Combines FSDP*EP*SP into single expert axis (4*1 = 4)

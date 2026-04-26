@@ -26,13 +26,12 @@ __all__ = (
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -67,7 +66,7 @@ from easydel.modules._base import BaseConditionalGenerationModule
 
 from .whisper_configuration import WhisperConfig as WhisperConfig
 
-remat = nn.remat
+remat = spx.remat
 
 
 def shift_tokens_right(
@@ -160,7 +159,7 @@ class WhisperAttention(AttentionModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -175,7 +174,7 @@ class WhisperAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the WhisperAttention module.
 
@@ -189,7 +188,7 @@ class WhisperAttention(AttentionModule):
             dtype (jnp.dtype): Data type for computations (default: jnp.float32).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
             precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
 
         Raises:
             ValueError: If `embed_dim` is not divisible by `num_heads`.
@@ -236,7 +235,7 @@ class WhisperAttention(AttentionModule):
             requires_cache=causal,  # Only decoder self-attention needs cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -324,7 +323,7 @@ class WhisperAttention(AttentionModule):
         return hidden_state.reshape((*hidden_state.shape[:2], self.embed_dim))
 
 
-class WhisperEncoderLayer(nn.Module):
+class WhisperEncoderLayer(spx.Module):
     """A single layer for the Whisper encoder.
 
     This layer consists of a self-attention mechanism followed by a feed-forward
@@ -342,7 +341,7 @@ class WhisperEncoderLayer(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -352,7 +351,7 @@ class WhisperEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the WhisperEncoderLayer module.
 
@@ -361,7 +360,7 @@ class WhisperEncoderLayer(nn.Module):
             dtype (jnp.dtype): Data type for computations (default: jnp.float32).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
             precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         self.dtype = dtype
@@ -409,7 +408,7 @@ class WhisperEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -457,7 +456,7 @@ class WhisperEncoderLayer(nn.Module):
         return outputs
 
 
-class WhisperDecoderLayer(nn.Module):
+class WhisperDecoderLayer(spx.Module):
     """A single layer for the Whisper decoder.
 
     This layer consists of self-attention, cross-attention (attending to encoder outputs),
@@ -477,7 +476,7 @@ class WhisperDecoderLayer(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -487,7 +486,7 @@ class WhisperDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the WhisperDecoderLayer module.
 
@@ -496,7 +495,7 @@ class WhisperDecoderLayer(nn.Module):
             dtype (jnp.dtype): Data type for computations (default: jnp.float32).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
             precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         self.dtype = dtype
@@ -573,7 +572,7 @@ class WhisperDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -661,7 +660,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         conv1 (nn.Conv): First convolutional layer.
         conv2 (nn.Conv): Second convolutional layer.
         embed_positions (Embed): Positional embedding layer.
-        layers (nn.List[WhisperEncoderLayer]): List of encoder layers.
+        layers (nn.ModuleList[WhisperEncoderLayer]): List of encoder layers.
         layer_norm (LayerNorm): Final layer normalization.
         embed_dim (int): Dimensionality of the model.
         num_mel_bins (int): Number of Mel frequency bins in the input features.
@@ -672,7 +671,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -682,7 +681,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the WhisperEncoder module.
 
@@ -691,7 +690,7 @@ class WhisperEncoder(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computations (default: jnp.float32).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
             precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -700,27 +699,21 @@ class WhisperEncoder(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.conv1 = nn.Conv(
+        self.conv1 = nn.Conv1d(
             self.config.d_model,
             self.config.d_model,
-            kernel_size=(3,),
-            padding=1,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_size=3,
+            padding="SAME",
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
-        self.conv2 = nn.Conv(
+        self.conv2 = nn.Conv1d(
             self.config.d_model,
             self.config.d_model,
-            kernel_size=(3,),
-            strides=2,
-            padding=1,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_size=3,
+            stride=2,
+            padding="SAME",
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
@@ -735,18 +728,18 @@ class WhisperEncoder(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for _ in range(self.config.encoder_layers):
+            with spx.assign_stage(total=self.config.encoder_layers, current=_):
+                self.layers.append(
+                    block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(self.config.encoder_layers)
-            ]
-        )
 
         self.embed_positions = Embed(
             self.config.max_source_positions,
@@ -766,7 +759,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         )
         self.layerdrop = self.config.decoder_layerdrop
 
-    def __call__(
+    def forward(
         self,
         input_features: jnp.ndarray,
         mask_info: MaskInfo | None = None,
@@ -808,12 +801,13 @@ class WhisperEncoder(EasyDeLBaseModule):
 
         hidden_states = self.dropout_layer(hidden_states)
 
-        for encoder_layer in self.layers:
+        def _layer_loop(encoder_layer, carry):
+            hidden_states, all_hidden_states, all_attentions = carry
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
             dropout_probability = random.uniform(0, 1)
-            if not self.dropout_layer.deterministic and (dropout_probability < self.layerdrop):
+            if self.training and (dropout_probability < self.layerdrop):
                 # skip the layer
                 layer_outputs = (None, None)
             else:
@@ -822,11 +816,18 @@ class WhisperEncoder(EasyDeLBaseModule):
                     mask_info=mask_info,
                     output_attentions=output_attentions,
                 )
-            hidden_states = layer_outputs[0]
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
             if output_attentions:
                 assert all_attentions is not None
                 all_attentions = (*all_attentions, layer_outputs[1])
 
+            return hidden_states, all_hidden_states, all_attentions
+
+        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions),
+            trace=True,
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -852,7 +853,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         config (WhisperConfig): Configuration object for the model.
         embed_tokens (Embed): Embedding layer for target tokens.
         embed_positions (Embed): Positional embedding layer.
-        layers (nn.List[WhisperDecoderLayer]): List of decoder layers.
+        layers (nn.ModuleList[WhisperDecoderLayer]): List of decoder layers.
         layer_norm (LayerNorm): Final layer normalization (applied to pre-final outputs).
         dropout (nn.Dropout): Dropout layer.
         padding_idx (int): Index of the padding token.
@@ -861,7 +862,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -871,7 +872,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the WhisperDecoder module.
 
@@ -880,7 +881,7 @@ class WhisperDecoder(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computations (default: jnp.float32).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
             precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -911,18 +912,18 @@ class WhisperDecoder(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for _ in range(self.config.decoder_layers):
+            with spx.assign_stage(total=self.config.decoder_layers, current=_):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(self.config.decoder_layers)
-            ]
-        )
 
         self.layerdrop = self.config.decoder_layerdrop
         self.dropout_layer = nn.Dropout(
@@ -938,7 +939,7 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo | None = None,
@@ -1015,14 +1016,16 @@ class WhisperDecoder(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, decoder_layer in enumerate(self.layers):
+
+        def _layer_loop(decoder_layer, carry):
+            hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
                 # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = random.uniform(0, 1)
-            if not self.dropout_layer.deterministic and (dropout_probability < self.layerdrop):
+            if self.training and (dropout_probability < self.layerdrop):
                 layer_outputs = (None, None, None, None)
             else:
                 layer_outputs = decoder_layer(
@@ -1031,18 +1034,25 @@ class WhisperDecoder(EasyDeLBaseModule):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_mask_info=encoder_mask_info,
                     mode=mode,
-                    cache_view=past_key_values[idx],
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                 )
-            past_key_values[idx] = layer_outputs[-1]
-            hidden_states = layer_outputs[0]
+            self._layer_cache_view_update(None, idx, layer_outputs[-1], enabled=True, cache=past_key_values)
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
+            return hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, 0),
+            trace=True,
+        )
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1071,7 +1081,7 @@ class WhisperModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -1081,7 +1091,7 @@ class WhisperModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the WhisperModel module.
 
@@ -1090,7 +1100,7 @@ class WhisperModel(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computations (default: jnp.float32).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
             precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -1122,7 +1132,7 @@ class WhisperModel(EasyDeLBaseModule):
         """Returns the encoder module."""
         return self.encoder
 
-    def __call__(
+    def forward(
         self,
         input_features: jnp.ndarray,
         decoder_input_ids: Int[Array, "batch seq_len"],
@@ -1348,7 +1358,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes WhisperForConditionalGeneration.
 
@@ -1363,7 +1373,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
             precision (str | lax.Precision, optional): JAX precision setting for matrix
                 multiplications. Options include 'default', 'high', 'highest', or None.
                 Default: None.
-            rngs (nn.Rngs): Random number generator state for dropout and parameter
+            rngs (spx.Rngs): Random number generator state for dropout and parameter
                 initialization.
         """
         super().__init__(
@@ -1387,7 +1397,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
     def _get_decoder_module(self):
         return self.model.decoder
 
-    def __call__(
+    def forward(
         self,
         input_features,
         decoder_input_ids,
@@ -1469,7 +1479,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         lm_logits = None
         if apply_lm_head:
@@ -1560,13 +1570,13 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = self.proj_out(
             hidden_states,
             (
-                self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
+                self.model.decoder.embed_tokens.weight.value.T.astype(self.param_dtype)
                 if self.config.tie_word_embeddings
                 else None
             ),
@@ -1990,7 +2000,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes WhisperForAudioClassification.
 
@@ -2005,7 +2015,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             precision (str | lax.Precision, optional): JAX precision setting for matrix
                 multiplications. Options include 'default', 'high', 'highest', or None.
                 Default: None.
-            rngs (nn.Rngs): Random number generator state for dropout and parameter
+            rngs (spx.Rngs): Random number generator state for dropout and parameter
                 initialization.
         """
         super().__init__(
@@ -2043,7 +2053,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_features,
         encoder_outputs=None,

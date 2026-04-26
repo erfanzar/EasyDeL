@@ -65,14 +65,15 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 
-import flax
 import jax
 import numpy as np
+import spectrax as spx
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
@@ -623,7 +624,7 @@ class eSurgeRunner:
         Returns:
             NamedSharding with empty PartitionSpec for fully replicated arrays.
         """
-        return jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+        return replicated_named_sharding(self.mesh)
 
     @staticmethod
     def _get_token_paddings(min_token_size: int, max_token_size: int, padding_gap: int) -> list[int]:
@@ -1279,7 +1280,7 @@ class eSurgeRunner:
                 raise ValueError("graphstate must not be None when model is None")
             if graphother is None:
                 raise ValueError("graphother must not be None when model is None")
-            model = flax.nnx.merge(graphdef, graphstate, graphother)
+            model = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
 
         model = model.esurge_compatible_model
         graphdef = model.graphdef

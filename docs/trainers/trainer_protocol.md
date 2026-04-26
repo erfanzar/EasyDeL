@@ -21,7 +21,7 @@ Any class implementing `BaseTrainerProtocol` must define the following methods a
 
 These methods define the core lifecycle and operations of a trainer.
 
-* **`train(self, model_parameters: Optional[FlaxPreTrainedModel.params] = None, state: Optional[EasyDeLState] = None) -> EasyDeLState`**:
+* **`train(self, model_parameters: Optional[PreTrainedModel.params] = None, state: Optional[EasyDeLState] = None) -> EasyDeLState`**:
   * **Purpose**: The main entry point to start or resume the training process.
   * **Implementation**: Must orchestrate the entire training loop, including:
     * Loading data using configured dataloaders.
@@ -81,7 +81,7 @@ These properties ensure the trainer has access to essential configuration and da
 * **`arguments: TrainingArguments`**: An instance holding all training hyperparameters and settings.
 * **`dataset_train: Dataset`**: The dataset used for training (typically a `datasets.Dataset` or compatible).
 * **`dataset_eval: Optional[Dataset]`**: The dataset used for evaluation (optional).
-* **`model: Module`**: The Flax/EasyDeL model module being trained (must be available after `configure_model` is called).
+* **`model: Module`**: The SpecTrax/EasyDeL model module being trained (must be available after `configure_model` is called).
 * **`_model_state: EasyDeLState`**: The internal `EasyDeLState` managed by the trainer (must be available after `configure_model` is called).
 * **`dtype: jnp.dtype`**: The data type used for computations (e.g., `jnp.float32`, `jnp.bfloat16`). Derived from `arguments`.
 * **`param_dtype: jnp.dtype`**: The data type used for model parameters (e.g., `jnp.float32`). Derived from `arguments`.
@@ -96,8 +96,8 @@ from typing import Optional, Dict, Callable, Any
 import jax
 import jax.numpy as jnp
 import optax
-from flax.training.train_state import TrainState
-from flax.linen import Module
+from SpecTrax.training.train_state import TrainState
+from SpecTrax.linen import Module
 from datasets import Dataset
 
 from easydel.trainers.trainer_protocol import (

@@ -280,8 +280,8 @@ def test_source_layout_signature_does_not_touch_esurge_compatible_model():
             return "dummy-model"
 
         @property
-        def graphstate_type(self):
-            return int
+        def default_trainable_selector(self):
+            return "parameters"
 
         @property
         def esurge_compatible_model(self):
@@ -538,7 +538,7 @@ def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compa
         def esurge_compatible_model(self):
             return CompatibleModel()
 
-    monkeypatch.setattr(model_runner_module.flax.nnx, "merge", lambda graphdef, graphstate, graphother: RawModel())
+    monkeypatch.setattr(model_runner_module.spx, "bind", lambda graphdef, state: RawModel())
 
     class DummyExecutorManager:
         def __init__(self):
@@ -559,18 +559,27 @@ def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compa
 
     runner = DummyRunner()
 
+    class MockState:
+        def merge(self, other, *, copy=False):
+            del copy
+            return f"{self._val}+{other}"
+
+    gs = MockState()
+    gs._val = "graphstate"
+    go = "graphother"
+
     eSurgeRunner.update_model_weights(
         runner,
         model=None,
         graphdef=raw_graphdef,
-        graphstate="graphstate",
-        graphother="graphother",
+        graphstate=gs,
+        graphother=go,
         reset_state=True,
     )
 
     assert isinstance(runner.model, CompatibleModel)
     assert runner.executor_manager.calls[0]["graphdef"] is compatible_graphdef
-    assert runner.executor_manager.calls[0]["graphstate"] == "graphstate"
+    assert runner.executor_manager.calls[0]["graphstate"] is gs
     assert runner.executor_manager.calls[0]["graphother"] == "graphother"
 
 

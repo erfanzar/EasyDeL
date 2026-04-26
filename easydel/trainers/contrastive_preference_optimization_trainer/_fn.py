@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import typing as tp
 
-import flax
-import flax.nnx
 import jax
-from eformer.escale import with_sharding_constraint
+import spectrax as spx
 from jax import numpy as jnp
 from jax.nn import log_sigmoid, relu
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -32,6 +31,7 @@ from easydel.trainers._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
+from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_kwargs
 from easydel.trainers.direct_preference_optimization_trainer._fn import concatenated_inputs
 
 from ..training_utils import (
@@ -71,16 +71,9 @@ def concatenated_forward(
     num_examples = batch["prompt_input_ids"].shape[0]
     concatenated_batch = concatenated_inputs(batch=batch, padding_value=padding_value)
 
-    model_kwargs: dict[str, jax.Array] = {}
-    if aux_loss_enabled:
-        model_kwargs["output_router_logits"] = True
-
-    if "pixel_values" in concatenated_batch:
-        model_kwargs["pixel_values"] = concatenated_batch["pixel_values"]
-    if "pixel_attention_mask" in concatenated_batch:
-        model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
-    if "image_sizes" in concatenated_batch:
-        model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
+    model_kwargs: dict[str, jax.Array] = gather_multimodal_kwargs(
+        concatenated_batch, aux_loss_enabled=aux_loss_enabled
+    )
 
     prompt_input_ids = concatenated_batch["prompt_input_ids"]
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
@@ -100,7 +93,7 @@ def concatenated_forward(
             "labels": labels,
             **model_kwargs,
         }
-        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
@@ -112,19 +105,13 @@ def concatenated_forward(
             [jnp.zeros_like(prompt_attention_mask), completion_attention_mask],
             axis=1,
         )
-        if max_length is not None:
-            if truncation_mode == "keep_end":
-                input_ids = input_ids[:, -max_length:]
-                attention_mask = attention_mask[:, -max_length:]
-                loss_mask = loss_mask[:, -max_length:]
-            elif truncation_mode == "keep_start":
-                input_ids = input_ids[:, :max_length]
-                attention_mask = attention_mask[:, :max_length]
-                loss_mask = loss_mask[:, :max_length]
-            else:
-                raise ValueError(
-                    f"Unknown truncation mode: '{truncation_mode}'. Should be one of ['keep_end', 'keep_start']."
-                )
+        input_ids, attention_mask, loss_mask = apply_paired_truncation(
+            input_ids,
+            attention_mask,
+            loss_mask,
+            max_length=max_length,
+            truncation_mode=truncation_mode,
+        )
         call_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -133,7 +120,7 @@ def concatenated_forward(
         lmhead_chunksize = resolve_lmhead_chunksize(model)
         if lmhead_chunksize is not None:
             call_kwargs["apply_lm_head"] = False
-        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
@@ -333,9 +320,9 @@ def training_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=batch_partition_spec)
+    batch = with_sharding_constraint(batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    def calculate_loss(tree: flax.nnx.GraphState, call_batch: dict[str, jax.Array]):
+    def calculate_loss(tree: spx.State, call_batch: dict[str, jax.Array]):
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         policy_model = state.merge(tree=tree)

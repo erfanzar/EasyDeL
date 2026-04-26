@@ -33,13 +33,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -84,7 +82,7 @@ from easydel.operations.kernels import KDAOutput, KernelDeltaAttnOp, fused_kda_g
 from .kimi_linear_configuration import KimiLinearConfig
 
 
-class KimiRMSNorm(nn.Module):
+class KimiRMSNorm(spx.Module):
     """RMSNorm for Kimi Linear.
 
     Standard RMSNorm implementation with configurable epsilon.
@@ -94,7 +92,7 @@ class KimiRMSNorm(nn.Module):
         eps: Small constant for numerical stability.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
         self,
@@ -103,7 +101,7 @@ class KimiRMSNorm(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize KimiRMSNorm layer.
 
@@ -112,21 +110,17 @@ class KimiRMSNorm(nn.Module):
             eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.kernel = nn.Param(
-            KimiRMSNorm.kernel_init(rngs.params(), (hidden_size,), param_dtype),
+        self.weight = spx.Parameter(
+            KimiRMSNorm.kernel_init(rngs.parameters, (hidden_size,), param_dtype),
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for normalization parameters."""
-        return {"kernel": Replicated}
-
-    def __call__(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
+    def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
         """Apply RMSNorm normalization.
 
         Args:
@@ -139,10 +133,10 @@ class KimiRMSNorm(nn.Module):
         hidden_states = hidden_states.astype(jnp.float32)
         variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
         hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
-        return (self.kernel.value * hidden_states).astype(input_dtype)
+        return (self.weight.value * hidden_states).astype(input_dtype)
 
 
-class KimiMLP(nn.Module):
+class KimiMLP(spx.Module):
     """Kimi Linear dense MLP module.
 
     Implements the feedforward network with SwiGLU activation function
@@ -158,7 +152,7 @@ class KimiMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi MLP block.
 
@@ -170,7 +164,7 @@ class KimiMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -202,7 +196,7 @@ class KimiMLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -214,7 +208,7 @@ class KimiMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -222,12 +216,12 @@ class KimiMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class KimiMoEGate(nn.Module):
+class KimiMoEGate(spx.Module):
     """Kimi Linear MoE routing gate with sigmoid activation.
 
     Implements the routing mechanism for Mixture of Experts with:
@@ -250,7 +244,7 @@ class KimiMoEGate(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi MoE routing gate.
 
@@ -259,7 +253,7 @@ class KimiMoEGate(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -277,11 +271,11 @@ class KimiMoEGate(nn.Module):
         self.norm_topk_prob = config.moe_renormalize
         self.gating_dim = config.hidden_size
 
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(self.gating_dim, self.n_routed_experts),
             dtype=param_dtype,
             init_method="kaiming_uniform",
-            key=rngs.params(),
+            key=rngs.parameters,
             init_kwargs={},
         )
 
@@ -290,17 +284,10 @@ class KimiMoEGate(nn.Module):
             dtype=param_dtype,
             init_method="constant",
             init_kwargs={"value": 0.0},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for router parameters."""
-        return {
-            "kernel": ColumnWise,
-            "e_score_correction_bias": Replicated,
-        }
-
-    def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]):
+    def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]):
         """Route tokens to experts.
 
         Args:
@@ -313,7 +300,7 @@ class KimiMoEGate(nn.Module):
 
         logits = jnp.dot(
             hidden_states.astype(jnp.float32),
-            self.kernel.value.astype(jnp.float32),
+            self.weight.value.astype(jnp.float32),
             precision=self.precision,
         )
 
@@ -346,7 +333,7 @@ class KimiMoEGate(nn.Module):
         return topk_weight * self.routed_scaling_factor
 
 
-class KimiMLPMoE(nn.Module):
+class KimiMLPMoE(spx.Module):
     """Kimi Linear MoE MLP using parallel expert linear layers.
 
     Implements a collection of expert MLPs that can be efficiently
@@ -357,13 +344,13 @@ class KimiMLPMoE(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                {"name": "gate_proj.weight", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.weight", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
             ],
             "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
         },
         "down_proj$": {
-            "splits": [{"name": "down_proj.kernel", "spliter": lambda x: x}],
+            "splits": [{"name": "down_proj.weight", "spliter": lambda x: x}],
             "inverse_spliter": lambda x: x,
         },
     }
@@ -375,7 +362,7 @@ class KimiMLPMoE(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi MoE MLP experts.
 
@@ -384,7 +371,7 @@ class KimiMLPMoE(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -401,8 +388,8 @@ class KimiMLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
@@ -413,8 +400,8 @@ class KimiMLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
@@ -425,14 +412,14 @@ class KimiMLPMoE(nn.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         group_sizes: Array,
@@ -480,7 +467,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi Sparse MoE block.
 
@@ -489,7 +476,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -534,7 +521,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Apply Sparse MoE feedforward transformation.
 
         Routes tokens to top-k experts based on router scores, combines
@@ -552,9 +539,9 @@ class KimiSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
 
@@ -604,7 +591,7 @@ class KimiMLAAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi MLA attention layer.
 
@@ -614,7 +601,7 @@ class KimiMLAAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
@@ -647,7 +634,7 @@ class KimiMLAAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Define MLA-specific network structure.
 
@@ -660,7 +647,7 @@ class KimiMLAAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
 
         if not self.use_mla_lora:
@@ -827,7 +814,7 @@ class KimiMLAAttention(UnifiedAttention):
         )
 
 
-class KimiDeltaAttention(nn.Module):
+class KimiDeltaAttention(spx.Module):
     """Kimi Linear KDA (Kernel Delta Attention) layer.
 
     Implements linear attention with O(N) complexity for efficient long-context
@@ -860,15 +847,15 @@ class KimiDeltaAttention(nn.Module):
 
     reform_param: typing.ClassVar = {
         "q_conv1d.weight$": {
-            "splits": [{"name": "q_conv1d.kernel", "spliter": lambda x: x.permute(2, 1, 0)}],
+            "splits": [{"name": "q_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
             "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
         },
         "k_conv1d.weight$": {
-            "splits": [{"name": "k_conv1d.kernel", "spliter": lambda x: x.permute(2, 1, 0)}],
+            "splits": [{"name": "k_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
             "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
         },
         "v_conv1d.weight$": {
-            "splits": [{"name": "v_conv1d.kernel", "spliter": lambda x: x.permute(2, 1, 0)}],
+            "splits": [{"name": "v_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
             "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
         },
     }
@@ -881,7 +868,7 @@ class KimiDeltaAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi KDA (Kernel Delta Attention) layer.
 
@@ -891,7 +878,7 @@ class KimiDeltaAttention(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -925,36 +912,33 @@ class KimiDeltaAttention(nn.Module):
         self.k_proj = column_linear(config.hidden_size, self.key_dim)
         self.v_proj = column_linear(config.hidden_size, self.value_dim)
 
-        self.q_conv1d = nn.Conv(
-            in_features=self.key_dim,
-            out_features=self.key_dim,
-            kernel_size=(self.d_conv,),
-            feature_group_count=self.key_dim,
+        self.q_conv1d = nn.Conv1d(
+            in_channels=self.key_dim,
+            out_channels=self.key_dim,
+            kernel_size=self.d_conv,
+            groups=self.key_dim,
             padding=((self.d_conv - 1, 0),),
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
             use_bias=False,
         )
-        self.k_conv1d = nn.Conv(
-            in_features=self.key_dim,
-            out_features=self.key_dim,
-            kernel_size=(self.d_conv,),
-            feature_group_count=self.key_dim,
+        self.k_conv1d = nn.Conv1d(
+            in_channels=self.key_dim,
+            out_channels=self.key_dim,
+            kernel_size=self.d_conv,
+            groups=self.key_dim,
             padding=((self.d_conv - 1, 0),),
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
             use_bias=False,
         )
-        self.v_conv1d = nn.Conv(
-            in_features=self.value_dim,
-            out_features=self.value_dim,
-            kernel_size=(self.d_conv,),
-            feature_group_count=self.value_dim,
+        self.v_conv1d = nn.Conv1d(
+            in_channels=self.value_dim,
+            out_channels=self.value_dim,
+            kernel_size=self.d_conv,
+            groups=self.value_dim,
             padding=((self.d_conv - 1, 0),),
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
             use_bias=False,
         )
@@ -991,14 +975,14 @@ class KimiDeltaAttention(nn.Module):
             dtype=param_dtype,
             init_method="constant",
             init_kwargs={"value": 0.0},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
         self.dt_bias = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=param_dtype,
             init_method="constant",
             init_kwargs={"value": 1.0},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
         metadata = OperationMetadata(
@@ -1008,14 +992,7 @@ class KimiDeltaAttention(nn.Module):
         )
         self.kda_op = KernelDeltaAttnOp(metadata)
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for decay parameters."""
-        return {
-            "A_log": Replicated,
-            "dt_bias": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -1085,17 +1062,17 @@ class KimiDeltaAttention(nn.Module):
         query = apply_logical_sharding(
             query,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         key = apply_logical_sharding(
             key,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         value = apply_logical_sharding(
             value,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         f_hidden = jax.nn.silu(self.f_a_proj(hidden_states))
@@ -1131,7 +1108,7 @@ class KimiDeltaAttention(nn.Module):
         output = apply_logical_sharding(
             output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         output = self.o_proj(output)
 
@@ -1151,7 +1128,7 @@ class KimiDeltaAttention(nn.Module):
         )
 
 
-class KimiDecoderLayer(nn.Module):
+class KimiDecoderLayer(spx.Module):
     """Kimi Linear transformer decoder layer.
 
     Combines attention (MLA or KDA) with feedforward (MLP or MoE) based on
@@ -1181,7 +1158,7 @@ class KimiDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi decoder layer.
 
@@ -1191,7 +1168,7 @@ class KimiDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -1255,7 +1232,7 @@ class KimiDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -1366,7 +1343,7 @@ class KimiLinearModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi Linear base model.
 
@@ -1375,7 +1352,7 @@ class KimiLinearModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1400,19 +1377,19 @@ class KimiLinearModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = KimiRMSNorm(
             config.hidden_size,
@@ -1422,7 +1399,7 @@ class KimiLinearModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1520,10 +1497,11 @@ class KimiLinearModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1532,23 +1510,30 @@ class KimiLinearModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         return MoeModelOutput(
@@ -1621,7 +1606,7 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Kimi Linear model for causal language modeling.
 
@@ -1630,7 +1615,7 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1644,7 +1629,7 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

@@ -59,9 +59,9 @@ import re
 import typing
 
 import jax
+import spectrax as spx
 from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.quantization import quantize as ej_quantize  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.utils.traversals import iter_module_search, set_module_from_path
@@ -103,7 +103,7 @@ def _extract_explicit_qmm_kwargs(kwargs: dict[str, typing.Any]) -> dict[str, typ
     return overrides
 
 
-def _extract_model_qmm_defaults(model: nn.Module) -> dict[str, typing.Any]:
+def _extract_model_qmm_defaults(model: spx.Module) -> dict[str, typing.Any]:
     config = getattr(model, "config", None)
     if config is None:
         return {}
@@ -324,6 +324,7 @@ class EasyQuantizer:
     """
 
     def __init__(self, quantization_config: QuantizationConfig | None = None) -> None:
+        super().__init__()
         """Initialize the EasyQuantizer with a configuration.
 
         Args:
@@ -459,12 +460,12 @@ class EasyQuantizer:
 
     def apply_quantization(
         self,
-        model: nn.Module,
+        model: spx.Module,
         /,
         *,
         quantization_pattern: str | None = None,
         **kwargs,
-    ) -> nn.Module:
+    ) -> spx.Module:
         """Quantize compatible modules in a model to lower precision.
 
         This method traverses the model and converts modules that support
@@ -473,7 +474,7 @@ class EasyQuantizer:
         as it replaces entire layer implementations with optimized versions.
 
         Args:
-            model: The Flax NNX model to quantize. Positional-only argument.
+            model: The spectrax model to quantize. Positional-only argument.
             quantization_pattern: Regex pattern specifying which layers to
                 quantize based on their path names. If None, uses the pattern
                 from the configuration. Defaults to None.
@@ -528,7 +529,7 @@ class EasyQuantizer:
 
         pattern = re.compile(quantization_pattern)
 
-        for path, block_instance in iter_module_search(model, nn.Module):
+        for path, block_instance in iter_module_search(model, spx.Module):
             str_path = ".".join([str(p) for p in path])
             if pattern.search(str_path):
                 if hasattr(block_instance, "to_quantized") and callable(block_instance.to_quantized):
@@ -546,7 +547,7 @@ class EasyQuantizer:
 
         return model
 
-    def dequantize_modules(self, model: nn.Module) -> nn.Module:
+    def dequantize_modules(self, model: spx.Module) -> spx.Module:
         """Restore quantized modules to their full-precision equivalents.
 
         This method traverses the model and converts quantized modules back
@@ -580,7 +581,7 @@ class EasyQuantizer:
         if hasattr(model, "config"):
             model.config.quantization_config = self.config
 
-        for path, block_instance in iter_module_search(model, nn.Module):
+        for path, block_instance in iter_module_search(model, spx.Module):
             if hasattr(block_instance, "from_quantized") and callable(block_instance.from_quantized):
                 set_module_from_path(
                     model=model,

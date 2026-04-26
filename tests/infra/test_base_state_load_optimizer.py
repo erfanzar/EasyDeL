@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import nnx as nn
+import spectrax as spx
 
 import easydel as ed
 from easydel.infra.base_state import RESUME_MODEL_SUBDIR, EasyDeLState, _is_optimizer_template_incompatibility
@@ -39,7 +39,7 @@ def _build_tiny_llama(rng_seed: int = 0):
         eos_token_id=2,
     )
     config.add_basic_configurations(
-        sharding_axis_dims=(1, 1, -1, 1, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         use_sharding_constraint=False,
     )
     with config.mesh:
@@ -48,7 +48,7 @@ def _build_tiny_llama(rng_seed: int = 0):
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
-            rngs=nn.Rngs(rng_seed),
+            rngs=spx.Rngs(rng_seed),
         )
 
 
@@ -59,7 +59,7 @@ def _build_tiny_lora_llama(rng_seed: int = 0):
             lora_rank=2,
             lora_pattern=r"lm_head",
             verbose=False,
-            rngs=nn.Rngs(rng_seed + 1),
+            rngs=spx.Rngs(rng_seed + 1),
         )
 
 
@@ -93,7 +93,7 @@ def test_load_optimizer_falls_back_to_saved_structure_when_template_init_fails(t
         np.testing.assert_array_equal(np.asarray(jax.device_get(loaded)), np.asarray(jax.device_get(original)))
 
 
-def test_create_model_respects_lora_graphstate_type():
+def test_create_model_uses_default_trainable_selector():
     model = _build_tiny_lora_llama(0)
     tx = optax.adam(1e-3)
 
@@ -159,7 +159,7 @@ def test_load_state_restores_merged_lora_checkpoint_with_optimizer(tmp_path):
         auto_shard_model=False,
         dtype=jnp.float32,
         param_dtype=jnp.float32,
-        sharding_axis_dims=(1, 1, -1, 1, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         tx_template=tx,
     )
 
@@ -182,6 +182,7 @@ def test_load_state_ignores_incompatible_optimizer_template(tmp_path, monkeypatc
     tx = optax.adam(1e-3)
     from easydel.infra import base_module as base_module_mod
     from easydel.modules.auto import auto_configuration
+
     (tmp_path / "metadata.json").write_text(json.dumps({"step": 11, "has_optimizer_state": True}))
 
     def _raise_template_mismatch(self, *args, **kwargs):
@@ -281,6 +282,7 @@ def test_load_state_ignores_shape_mismatch_from_optimizer(tmp_path, monkeypatch)
     tx = optax.adam(1e-3)
     from easydel.infra import base_module as base_module_mod
     from easydel.modules.auto import auto_configuration
+
     (tmp_path / "metadata.json").write_text(json.dumps({"step": 19, "has_optimizer_state": True}))
 
     def _raise_shape_mismatch(self, *args, **kwargs):

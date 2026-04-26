@@ -94,7 +94,6 @@ These are set during ejkernel import or profiler setup:
 | `MEGASCALE_NUM_SLICES`            | auto    | Overrides detected TPU slice count in mesh creation.                                                          | Use on multi-slice TPU setups when device introspection is insufficient. |
 | `MIN_SHARDING_SIZE`               | `16384` | Arrays smaller than this stay unsharded in sharding utilities.                                                | Avoids overhead for small tensors.                                       |
 | `LOG_SHARDING_MOVE`               | `false` | Logs warnings when sharding specs are auto-corrected.                                                         | Debug unexpected sharding adjustments.                                   |
-| `ED_DEFAULT_HARDWARE_ABSTRACTION` | `false` | Sets default `hardware_abstraction=True` in base config.                                                      | Enable custom hardware abstraction and kernels by default.               |
 | `EKERNEL_OPS`                     | `false` | Declared but not currently consumed in-tree.                                                                  | Reserved for external or future kernel-op selection.                     |
 
 ## Compilation cache

@@ -156,13 +156,13 @@ class LlamaConfig(EasyDeLBaseConfig):
         self.fcm_max_ratio = fcm_max_ratio
         self.rope_scaling = rope_scaling
         self.bits = bits
-        self.scan_layers = scan_layers
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
+            scan_layers=scan_layers,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             scan_mlp_chunk_size=scan_mlp_chunk_size,
@@ -176,7 +176,7 @@ class LlamaConfig(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
@@ -231,7 +231,7 @@ class VisionLlamaConfig(LlamaConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.

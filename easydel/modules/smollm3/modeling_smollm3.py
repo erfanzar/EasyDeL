@@ -25,12 +25,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -82,7 +81,7 @@ class SmolLM3Attention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SmolLM3 attention layer with conditional RoPE support.
 
@@ -95,7 +94,7 @@ class SmolLM3Attention(UnifiedAttention):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
                 Defaults to jax.lax.Precision.DEFAULT.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         self.layer_idx = layer_idx
 
@@ -144,7 +143,7 @@ class SmolLM3Attention(UnifiedAttention):
         return super()._create_rotary(config, dtype)
 
 
-class SmolLM3DecoderLayer(nn.Module):
+class SmolLM3DecoderLayer(spx.Module):
     """Single decoder layer for SmolLM3 models with pre-norm architecture.
 
     Implements a transformer decoder layer combining multi-head attention with
@@ -176,7 +175,7 @@ class SmolLM3DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SmolLM3 decoder layer.
 
@@ -187,7 +186,7 @@ class SmolLM3DecoderLayer(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
                 Defaults to jax.lax.Precision.DEFAULT.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -231,7 +230,7 @@ class SmolLM3DecoderLayer(nn.Module):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.Precision,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Create the MLP module for this decoder layer.
 
@@ -240,7 +239,7 @@ class SmolLM3DecoderLayer(nn.Module):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.Precision): Numerical precision for matrix operations.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             SmolLM3MLP: The initialized feedforward network module.
@@ -253,7 +252,7 @@ class SmolLM3DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -329,7 +328,7 @@ class SmolLM3DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(hidden_states, "layer_output")
 
@@ -340,7 +339,7 @@ class SmolLM3DecoderLayer(nn.Module):
         )
 
 
-class SmolLM3MLP(nn.Module):
+class SmolLM3MLP(spx.Module):
     """Multi-Layer Perceptron module for SmolLM3 models.
 
     Implements the feedforward network with SwiGLU activation function
@@ -366,7 +365,7 @@ class SmolLM3MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SmolLM3 MLP block.
 
@@ -377,7 +376,7 @@ class SmolLM3MLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
                 Defaults to jax.lax.Precision.DEFAULT.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.hidden_size = config.hidden_size
@@ -418,7 +417,7 @@ class SmolLM3MLP(nn.Module):
             out_features=self.hidden_size,
         )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
@@ -436,17 +435,17 @@ class SmolLM3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         # SwiGLU activation: silu(gate) * up
         gate = checkpoint_name(self.gate_proj(hidden_states), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
-        hidden_states = nn.silu(gate) * up
+        hidden_states = jax.nn.silu(gate) * up
         hidden_states = checkpoint_name(self.down_proj(hidden_states), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -483,7 +482,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SmolLM3 base model.
 
@@ -493,7 +492,7 @@ class SmolLM3Model(EasyDeLBaseModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
                 Defaults to jax.lax.Precision.DEFAULT.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -517,19 +516,19 @@ class SmolLM3Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             dim=config.hidden_size,
@@ -539,7 +538,7 @@ class SmolLM3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -551,6 +550,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through SmolLM3 base model.
 
@@ -628,35 +628,51 @@ class SmolLM3Model(EasyDeLBaseModule):
         # Forward pass through layers
         hidden_states = inputs_embeds
 
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                assert all_hidden_states is not None
-                all_hidden_states = (*all_hidden_states, hidden_states)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx] if past_key_values is not None else None,
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            if output_attentions:
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            hidden_states = layer_outputs.hidden_states
-
-            if past_key_values is not None:
-                past_key_values[idx] = layer_outputs.cache_view
-
-            if output_attentions and layer_outputs.attention_weight is not None:
-                assert all_attentions is not None
-                all_attentions = (
-                    *all_attentions,
-                    layer_outputs.attention_weight,
-                )
-
-        # Final layer norm
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -715,7 +731,7 @@ class SmolLM3ForCausalLM(BaseCausalLMModule[SmolLM3Model, SmolLM3Config]):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SmolLM3 model for causal language modeling.
 
@@ -726,7 +742,7 @@ class SmolLM3ForCausalLM(BaseCausalLMModule[SmolLM3Model, SmolLM3Config]):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision for matrix
                 operations. Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -768,7 +784,7 @@ class SmolLM3ForSequenceClassification(BaseSequenceClassificationModule[SmolLM3M
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SmolLM3 model for sequence classification.
 
@@ -779,7 +795,7 @@ class SmolLM3ForSequenceClassification(BaseSequenceClassificationModule[SmolLM3M
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision for matrix
                 operations. Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,

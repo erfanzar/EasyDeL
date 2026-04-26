@@ -226,6 +226,8 @@ class BaseTrainerCfg(TypedDict, total=False):
         gradient_accumulation_steps: Number of gradient accumulation steps before
             performing an optimizer update.
         optimizer: Optimizer type string (e.g., "adamw", "lion", "sgd").
+        trainable_selector: Selector used to extract trainable state from models
+            (for example "parameters", "lora", or ("parameters", "lora")).
         scheduler: Learning rate scheduler type (e.g., "linear", "cosine", "none").
         warmup_steps: Number of warmup steps for learning rate scheduling.
         weight_decay: L2 regularization coefficient for optimizer.
@@ -406,6 +408,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     gradient_accumulation_steps: NotRequired[int]
 
     optimizer: NotRequired[str]
+    trainable_selector: NotRequired[Any]
     scheduler: NotRequired[str]
     warmup_steps: NotRequired[int]
     weight_decay: NotRequired[float]
@@ -1520,6 +1523,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "total_batch_size": 32,
     "gradient_accumulation_steps": 1,
     "optimizer": "adamw",
+    "trainable_selector": "parameters",
     "scheduler": "none",
     "warmup_steps": 0,
     "weight_decay": 0.01,

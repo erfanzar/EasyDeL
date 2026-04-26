@@ -66,8 +66,6 @@ References:
 import typing as tp
 
 import jax
-from eformer import common_types
-from eformer.escale import with_sharding_constraint
 from ejkernel.modules import scaled_dot_product_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import Array
@@ -75,6 +73,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
 from jaxtyping import Float, Int
+from spectrax import common_types, with_sharding_constraint
 
 from easydel.caching import TransformerCacheView
 

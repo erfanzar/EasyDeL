@@ -59,12 +59,11 @@ import typing
 from collections.abc import Callable
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -155,7 +154,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
@@ -164,7 +163,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         lm_head_name: str = "lm_head",
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
-        lm_head_class: nn.Module = ColumnParallelLinear,
+        lm_head_class: spx.Module = ColumnParallelLinear,
     ):
         """Initialize the Causal LM module.
 
@@ -190,7 +189,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             param_dtype: Data type for parameters (weights). Defaults to bfloat16.
             precision: JAX precision setting for matrix multiplications.
                 Can be None, "high", "highest", or a Precision enum value.
-            rngs: Flax random number generators for initialization.
+            rngs: SpecTrax random number generators for initialization.
             tie_word_embeddings: Whether to tie input embeddings with the LM head.
                 When True, the LM head uses the transposed embedding matrix,
                 reducing parameters. Common in smaller models.
@@ -205,7 +204,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             lm_head_bias: Whether to include bias in the LM head.
                 Defaults to False for standard transformer LMs.
             lm_head_kernel_init: Custom initializer for LM head weights.
-                If None, uses the default Flax initializer.
+                If None, uses the default SpecTrax initializer.
             lm_head_class: Module class for the LM head.
                 Defaults to ColumnParallelLinear for tensor parallelism support.
 
@@ -216,19 +215,14 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                     config=my_config,
                     base_model_class=MyTransformerModel,
                     dtype=jnp.bfloat16,
-                    rngs=nn.Rngs(0),
+                    rngs=spx.Rngs(0),
                     tie_word_embeddings=True,
                     logit_cap=30.0,  # For numerical stability
                 )
 
             Creating an MoE model with auxiliary loss::
 
-                model = BaseCausalLMModule(
-                    config=moe_config,
-                    base_model_class=MoETransformerModel,
-                    rngs=nn.Rngs(0),
-                    router_aux_loss_coef=0.01,
-                )
+                model = BaseCausalLMModule()
         """
         # Initialize base with features
         super().__init__(
@@ -254,8 +248,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         #
         # NOTE: nn.remat on the lm_head is important for large-vocab models
         # (e.g. [B, 8192, 260k] → ~34 GB in bf16).  However, nn.remat's
-        # split/merge protocol mutates NNX Variables (update_from_state),
-        # which triggers flax.errors.TraceContextError when trainer chunked
+        # split/merge protocol mutates SpecTrax Variables (update_from_state),
+        # which triggers SpecTrax.errors.TraceContextError when trainer chunked
         # paths call lm_head.__call__ from inside jax.lax.scan / fori_loop.
         #
         # The model's make_lm_head_fn() provides a trace-safe bypass that
@@ -268,21 +262,36 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 **self._gradient_checkpointing_feature.get_config(),
             )
 
-        lm_head = lm_head_class(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=self._head_bias,
-            kernel_init=self._head_kernel_init,
-            precision=precision,
-            rngs=rngs,
-        )
+        base_layers = getattr(self.base_model, "layers", None)
+        stage_total = len(base_layers) if base_layers is not None else 0
+        if stage_total:
+            with self._assign_layer_stage(stage_total - 1, total_layers=stage_total):
+                lm_head = lm_head_class(
+                    config.hidden_size,
+                    config.vocab_size,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    use_bias=self._head_bias,
+                    kernel_init=self._head_kernel_init,
+                    precision=precision,
+                    rngs=rngs,
+                )
+        else:
+            lm_head = lm_head_class(
+                config.hidden_size,
+                config.vocab_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                use_bias=self._head_bias,
+                kernel_init=self._head_kernel_init,
+                precision=precision,
+                rngs=rngs,
+            )
         setattr(self, lm_head_name, lm_head)
         if tie_word_embeddings:
             self._tie_embeddings_feature.setup(self.get_embedding(), lm_head)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -576,7 +585,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             ),
             False,
         )
-        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+        w = self.get_embedding().weight.value.T if tie_embeddings else None
         lm_head = getattr(self, self._lm_head_name)
         return lm_head(hidden_states, w=w)
 
@@ -585,7 +594,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         return apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
     def compute_lm_logits(self, hidden_states: Array) -> Array:
@@ -600,14 +609,14 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         logits. This is the task-specific head for causal language modeling.
 
         Returns:
-            nn.Module: The LM head module (typically ColumnParallelLinear).
+            spx.Module: The LM head module (typically ColumnParallelLinear).
                 Shape of kernel: (hidden_size, vocab_size).
 
         Example:
             Accessing LM head weights::
 
                 head = model.get_task_head()
-                weights = head.kernel.value  # Shape: (hidden_size, vocab_size)
+                weights = head.weight.value  # Shape: (hidden_size, vocab_size)
         """
         return getattr(self, self._lm_head_name)
 
@@ -619,7 +628,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         API compatibility with code expecting a get_lm_head method.
 
         Returns:
-            nn.Module: The LM head module (same as get_task_head).
+            spx.Module: The LM head module (same as get_task_head).
 
         See Also:
             get_task_head: The canonical method for accessing the task head.

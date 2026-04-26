@@ -624,7 +624,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
 
                 ref_model_kwargs = normalize_generation_model_kwargs(
                     None,
-                    model_callable=self.ref_state.model.__call__,
+                    model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
                 )
 
                 if self.ref_logps_chunk_size is not None and sequences.shape[0] > self.ref_logps_chunk_size:

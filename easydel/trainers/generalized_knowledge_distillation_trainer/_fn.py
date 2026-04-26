@@ -19,9 +19,9 @@ import functools
 import typing as tp
 
 import jax
-from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -163,14 +163,16 @@ def gkd_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
     def teacher_forward(minibatch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
         teacher_call_kwargs = dict(minibatch)
         teacher_call_kwargs.pop("labels", None)
         teacher_call_kwargs.pop("completion_mask", None)
         teacher_call_kwargs.pop("assistant_masks", None)
-        teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
+        teacher_call_kwargs = filter_kwargs_for_callable(
+            getattr(teacher_state.model, "forward", teacher_state.model), teacher_call_kwargs
+        )
         teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
         teacher_static_kwargs = {
             key: teacher_call_kwargs.pop(key)
@@ -202,7 +204,7 @@ def gkd_step(
         call_kwargs.pop("completion_mask", None)
         call_kwargs.pop("assistant_masks", None)
         teacher_logits = teacher_forward(minibatch)
-        call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
 

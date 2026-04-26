@@ -17,7 +17,6 @@
 from functools import partial
 
 import jax
-from eformer import common_types as ct
 from ejkernel.modules import (
     multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
     multi_latent_ragged_page_attention_v2,  # pyright: ignore[reportMissingTypeStubs]
@@ -25,6 +24,7 @@ from ejkernel.modules import (
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
+from spectrax import common_types as ct
 
 from easydel.axis import ATTN_DP
 from easydel.caching import MLARaggedPagesCacheView, RaggedPagesMetadata
@@ -371,8 +371,8 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             )
 
         kv_pages = cache_view.kv_pages
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = self.metadata.runtime_sharding_resolver.with_mesh(self.metadata.mesh)
+        resolve = resolver.resolve
         request_distribution = _resolve_distribution(cache_metadata)
 
         request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
@@ -858,8 +858,8 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
             )
 
         kv_pages = cache_view.kv_pages
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = self.metadata.runtime_sharding_resolver.with_mesh(self.metadata.mesh)
+        resolve = resolver.resolve
         request_distribution = _resolve_distribution(cache_metadata)
         request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
         page_axis = _dp_page_axis(cache_view)

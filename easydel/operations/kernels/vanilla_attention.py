@@ -54,13 +54,12 @@ Example:
 import typing as tp
 
 import jax
-from eformer import common_types
-from eformer.escale import with_sharding_constraint
 from ejkernel.modules import attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float, PRNGKeyArray
+from spectrax import common_types, with_sharding_constraint
 
 from easydel.caching import TransformerCacheView
 
@@ -173,13 +172,13 @@ class VanillaAttn(OperationImpl):
                 bias_computed = bias
 
             # Apply sharding constraints to inputs
-            query = with_sharding_constraint(arr=query, sharding=shardings.query)
-            key = with_sharding_constraint(arr=key, sharding=shardings.key)
-            value = with_sharding_constraint(arr=value, sharding=shardings.value)
+            query = with_sharding_constraint(arr=query, sharding=shardings.query, mesh=mesh)
+            key = with_sharding_constraint(arr=key, sharding=shardings.key, mesh=mesh)
+            value = with_sharding_constraint(arr=value, sharding=shardings.value, mesh=mesh)
 
             bias: Float[Array, "batch num_heads seq_len kv_len"] | None
             if bias_computed is not None:
-                bias = with_sharding_constraint(arr=bias_computed, sharding=shardings.bias)
+                bias = with_sharding_constraint(arr=bias_computed, sharding=shardings.bias, mesh=mesh)
             else:
                 bias = None
 
@@ -219,7 +218,7 @@ class VanillaAttn(OperationImpl):
                 outputs, weights = attn_result, None
 
             # Apply output sharding
-            outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output)
+            outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
             return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:

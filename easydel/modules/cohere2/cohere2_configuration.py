@@ -134,7 +134,7 @@ class Cohere2Config(EasyDeLBaseConfig):
             attention_bias (bool): Whether to use attention bias.
             attention_dropout (float): Dropout rate for attention.
             sliding_window (int): Sliding window size for attention.
-            sliding_window_pattern (int): Pattern for sliding window attention (unused in current Flax implementation).
+            sliding_window_pattern (int): Pattern for sliding window attention (unused in current SpecTrax implementation).
             gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing strategy.
             bits (Optional[int]): Number of bits for quantization.
             **kwargs: Additional keyword arguments.
@@ -186,7 +186,7 @@ class Cohere2Config(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.

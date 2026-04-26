@@ -16,13 +16,12 @@
 import typing
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -75,7 +74,7 @@ class MixtralAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Mixtral attention with sliding window configuration.
@@ -85,7 +84,7 @@ class MixtralAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__(
@@ -105,7 +104,7 @@ class MixtralAttention(UnifiedAttention):
         return config.get_basic_rope(dtype, self.head_dim)
 
 
-class MixtralMoEMlp(nn.Module):
+class MixtralMoEMlp(spx.Module):
     """Mixture of Experts MLP module for Mixtral models.
 
     Implements the feedforward network used by each expert in the Sparse MoE block.
@@ -115,8 +114,8 @@ class MixtralMoEMlp(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "w1.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
-                {"name": "w3.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
+                {"name": "w1.weight", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "w3.weight", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda torch, gate, up: torch.cat(
                 (gate.transpose(-1, -2), up.transpose(-1, -2)),
@@ -125,7 +124,7 @@ class MixtralMoEMlp(nn.Module):
         },
         "down_proj$": {
             "splits": [
-                {"name": "w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+                {"name": "w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
@@ -138,7 +137,7 @@ class MixtralMoEMlp(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mixtral MoE MLP block.
 
@@ -148,7 +147,7 @@ class MixtralMoEMlp(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -160,9 +159,9 @@ class MixtralMoEMlp(nn.Module):
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -173,8 +172,8 @@ class MixtralMoEMlp(nn.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -185,15 +184,15 @@ class MixtralMoEMlp(nn.Module):
             out_features=config.intermediate_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         x: Array,
         group_sizes: Array,
@@ -230,7 +229,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mixtral Sparse MoE block.
 
@@ -240,7 +239,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -266,7 +265,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
         )
 
         # Expert MLPs
@@ -278,7 +277,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_state: Array) -> tuple[Array, Array]:
+    def forward(self, hidden_state: Array) -> tuple[Array, Array]:
         """Forward pass through the Sparse MoE block.
 
         Routes input tokens to selected experts and combines their outputs.
@@ -295,15 +294,15 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_state,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.w1.kernel.value,
-            wu_kernel=self.experts.w3.kernel.value,
-            wd_kernel=self.experts.w2.kernel.value,
+            wi_kernel=self.experts.w1.weight.value,
+            wu_kernel=self.experts.w3.weight.value,
+            wd_kernel=self.experts.w2.weight.value,
             act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class MixtralDecoderLayer(nn.Module):
+class MixtralDecoderLayer(spx.Module):
     """Single decoder layer for Mixtral models.
 
     Combines multi-head attention with sliding window and Sparse MoE feedforward
@@ -314,17 +313,17 @@ class MixtralDecoderLayer(nn.Module):
     # so conversion does not depend on test-only key remaps.
     reform_param: typing.ClassVar = {
         "mlp.gate.weight$": {
-            "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
         "mlp.experts.gate_up_proj$": {
             "splits": [
                 {
-                    "name": "block_sparse_moe.experts.w1.kernel",
+                    "name": "block_sparse_moe.experts.w1.weight",
                     "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 },
                 {
-                    "name": "block_sparse_moe.experts.w3.kernel",
+                    "name": "block_sparse_moe.experts.w3.weight",
                     "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 },
             ],
@@ -334,7 +333,7 @@ class MixtralDecoderLayer(nn.Module):
             ),
         },
         "mlp.experts.down_proj$": {
-            "splits": [{"name": "block_sparse_moe.experts.w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
     }
@@ -346,7 +345,7 @@ class MixtralDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Mixtral decoder layer.
@@ -356,7 +355,7 @@ class MixtralDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -399,7 +398,7 @@ class MixtralDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -436,7 +435,7 @@ class MixtralDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -479,7 +478,7 @@ class MixtralModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         embed_tokens (Embed): Embedding layer for input tokens.
         layers (tp.List[MixtralDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
@@ -493,7 +492,7 @@ class MixtralModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mixtral base model.
 
@@ -502,7 +501,7 @@ class MixtralModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -526,19 +525,19 @@ class MixtralModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                    layer_idx=idx,
+        self.layers = nn.ModuleList([])
+        for idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                        layer_idx=idx,
+                    )
                 )
-                for idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             dim=config.hidden_size,
@@ -548,7 +547,7 @@ class MixtralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -561,6 +560,7 @@ class MixtralModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        trace: bool = False,
     ) -> MoeModelOutput:
         """Forward pass through the Mixtral base model.
 
@@ -649,34 +649,57 @@ class MixtralModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=output_router_logits or needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, ar, idx = carry
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_self_attns += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            if output_router_logits and layer_outputs.router_logits is not None:
+                ar = (*ar, layer_outputs.router_logits)
+            return hs, cv, ah, aa, ar, idx + 1
 
-            if output_router_logits:
-                all_router_logits += (layer_outputs.router_logits,)
-
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_self_attns, all_router_logits, 0)
+        hidden_states, _, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         return MoeModelOutput(
@@ -739,7 +762,7 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):  # ty
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mixtral model for causal language modeling.
 
@@ -748,7 +771,7 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):  # ty
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -762,7 +785,7 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):  # ty
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -871,7 +894,7 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mixtral model for sequence classification.
 
@@ -880,7 +903,7 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -895,7 +918,7 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

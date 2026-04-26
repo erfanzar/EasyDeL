@@ -58,11 +58,11 @@ See Also:
 from collections.abc import Callable
 
 import jax
-from eformer import common_types
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types
 
 from easydel.caching import (
     HybridCache,
@@ -150,7 +150,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         # Feature flags
         pooling_strategy: str = "last",
         router_aux_loss_coef: float | None = None,
@@ -186,7 +186,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             param_dtype: Data type for parameters (weights). Defaults to bfloat16.
             precision: JAX precision setting for matrix multiplications.
                 Can be None, "high", "highest", or a Precision enum value.
-            rngs: Flax random number generators for initialization.
+            rngs: SpecTrax random number generators for initialization.
             pooling_strategy: Strategy for pooling sequence representations.
                 - "last": Use the last non-padding token (default)
                 - "first": Use the first token (CLS token style)
@@ -199,7 +199,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             score_head_bias: Whether to include bias in the classification head.
                 Defaults to False for better stability.
             score_head_kernel_init: Custom initializer for classification head weights.
-                If None, uses the default Flax initializer.
+                If None, uses the default SpecTrax initializer.
 
         Raises:
             AssertionError: If config does not have a `num_labels` attribute.
@@ -212,7 +212,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                     config=my_config,
                     base_model_class=MyTransformerModel,
                     dtype=jnp.float32,
-                    rngs=nn.Rngs(0),
+                    rngs=spx.Rngs(0),
                     pooling_strategy="mean",
                     score_head_bias=True,
                 )
@@ -271,7 +271,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         )
         setattr(self, score_head_name, score_head)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -396,7 +396,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         projects from hidden_size to num_labels dimensions.
 
         Returns:
-            nn.Module: The classification head module (typically ColumnParallelLinear).
+            spx.Module: The classification head module (typically ColumnParallelLinear).
                 The actual attribute name depends on the score_head_name parameter
                 used during initialization.
 
@@ -404,7 +404,7 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             Accessing the classification head weights::
 
                 head = model.get_task_head()
-                weights = head.kernel.value  # Shape: (hidden_size, num_labels)
+                weights = head.weight.value  # Shape: (hidden_size, num_labels)
         """
         return getattr(self, self._score_head_name)
 

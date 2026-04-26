@@ -118,13 +118,13 @@ class MyModelConfig(EasyDeLBaseConfig):
 ```python
 # easydel/modules/my_model/modeling_my_model.py
 
-import flax.nnx as nnx
+import spectrax as spx
 import jax
 import jax.numpy as jnp
 from easydel.layers import EasyAttention, RMSNorm, Linear
 
 
-class MyModelAttention(nnx.Module):
+class MyModelAttention(spx.Module):
     """Multi-head attention layer for MyModel."""
 
     def __init__(
@@ -133,7 +133,7 @@ class MyModelAttention(nnx.Module):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = None,
-        rngs: nnx.Rngs = None,
+        rngs: spx.Rngs = None,
     ):
         self.config = config
         self.dtype = dtype
@@ -251,7 +251,7 @@ class MyModelAttention(nnx.Module):
 ### MLP Layer
 
 ```python
-class MyModelMLP(nnx.Module):
+class MyModelMLP(spx.Module):
     """MLP layer for MyModel."""
 
     def __init__(
@@ -260,7 +260,7 @@ class MyModelMLP(nnx.Module):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = None,
-        rngs: nnx.Rngs = None,
+        rngs: spx.Rngs = None,
     ):
         self.config = config
         self.hidden_size = config.hidden_size
@@ -307,7 +307,7 @@ class MyModelMLP(nnx.Module):
 ### Decoder Layer
 
 ```python
-class MyModelDecoderLayer(nnx.Module):
+class MyModelDecoderLayer(spx.Module):
     """Single decoder layer for MyModel."""
 
     def __init__(
@@ -317,7 +317,7 @@ class MyModelDecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = None,
-        rngs: nnx.Rngs = None,
+        rngs: spx.Rngs = None,
     ):
         self.config = config
         self.layer_idx = layer_idx
@@ -400,7 +400,7 @@ class MyModelModel(EasyDeLBaseModule):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = None,
-        rngs: nnx.Rngs = None,
+        rngs: spx.Rngs = None,
     ):
         super().__init__(
             config=config,
@@ -410,7 +410,7 @@ class MyModelModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nnx.Embed(
+        self.embed_tokens = nn.Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -497,7 +497,7 @@ class MyModelForCausalLM(EasyDeLBaseModelForCausalLM):
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision = None,
-        rngs: nnx.Rngs = None,
+        rngs: spx.Rngs = None,
     ):
         super().__init__(
             config=config,
@@ -650,7 +650,7 @@ from .my_model import (
 
 import pytest
 import jax.numpy as jnp
-import flax.nnx as nnx
+import spectrax as spx
 from easydel.modules.my_model import MyModelConfig, MyModelForCausalLM
 
 
@@ -662,7 +662,7 @@ def test_model_creation():
         num_attention_heads=4,
         intermediate_size=512,
     )
-    model = MyModelForCausalLM(config, rngs=nnx.Rngs(0))
+    model = MyModelForCausalLM(config, rngs=spx.Rngs(0))
     assert model is not None
 
 
@@ -674,7 +674,7 @@ def test_forward_pass():
         num_attention_heads=4,
         intermediate_size=512,
     )
-    model = MyModelForCausalLM(config, rngs=nnx.Rngs(0))
+    model = MyModelForCausalLM(config, rngs=spx.Rngs(0))
 
     input_ids = jnp.ones((1, 10), dtype=jnp.int32)
     outputs = model(input_ids=input_ids)
@@ -690,7 +690,7 @@ def test_with_labels():
         num_attention_heads=4,
         intermediate_size=512,
     )
-    model = MyModelForCausalLM(config, rngs=nnx.Rngs(0))
+    model = MyModelForCausalLM(config, rngs=spx.Rngs(0))
 
     input_ids = jnp.ones((1, 10), dtype=jnp.int32)
     labels = jnp.ones((1, 10), dtype=jnp.int32)

@@ -16,15 +16,13 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import image as jimg
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -90,7 +88,7 @@ class SiglipOutput(ModelOutput):
         )
 
 
-class SiglipVisionEmbeddings(nn.Module):
+class SiglipVisionEmbeddings(spx.Module):
     """Vision embeddings module for SigLIP models.
 
     Converts image pixel values into patch embeddings with position encodings
@@ -104,7 +102,7 @@ class SiglipVisionEmbeddings(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP vision embeddings.
 
@@ -114,7 +112,7 @@ class SiglipVisionEmbeddings(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.embed_dim = config.hidden_size
@@ -129,16 +127,14 @@ class SiglipVisionEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.patch_embedding = nn.Conv(
-            in_features=config.num_channels,
-            out_features=self.embed_dim,
-            kernel_size=(self.patch_size, self.patch_size),
-            strides=(self.patch_size, self.patch_size),
+        self.patch_embedding = nn.Conv2d(
+            in_channels=config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
             padding="VALID",
             dtype=dtype,
-            param_dtype=param_dtype,
             rngs=rngs,
-            precision=precision,
         )
 
     def interpolate(self, embeddings: Array, height: int, width: int):
@@ -161,7 +157,7 @@ class SiglipVisionEmbeddings(nn.Module):
                     dtype="i4",
                 ).reshape(1, -1)
             )
-        patch_pos_embed = self.position_embedding.embedding.unsqueeze(0)
+        patch_pos_embed = self.position_embedding.weight.unsqueeze(0)
 
         dim = embeddings.shape[-1]
         new_height = height // self.patch_size
@@ -180,7 +176,7 @@ class SiglipVisionEmbeddings(nn.Module):
 
         return jnp.reshape(jnp.transpose(patch_pos_embed, (0, 2, 3, 1)), (1, -1, dim))
 
-    def __call__(self, pixel_values: Array, interpolate_pos_encoding=False):
+    def forward(self, pixel_values: Array, interpolate_pos_encoding=False):
         """Create vision embeddings from pixel values.
 
         Args:
@@ -193,7 +189,7 @@ class SiglipVisionEmbeddings(nn.Module):
             (batch_size, num_patches, hidden_size).
         """
         _, _, height, width = pixel_values.shape
-        target_dtype = self.patch_embedding.kernel.dtype
+        target_dtype = self.patch_embedding.weight.dtype
 
         pixel_values = pixel_values.transpose(0, 2, 3, 1).astype(dtype=target_dtype)
         patch_embeds = self.patch_embedding(pixel_values).transpose(0, 3, 1, 2)
@@ -207,7 +203,7 @@ class SiglipVisionEmbeddings(nn.Module):
         return checkpoint_name(embeddings, "embeddings")
 
 
-class SiglipTextEmbeddings(nn.Module):
+class SiglipTextEmbeddings(spx.Module):
     """Text embeddings module for SigLIP models.
 
     Combines token embeddings and position embeddings for text
@@ -221,7 +217,7 @@ class SiglipTextEmbeddings(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP text embeddings.
 
@@ -231,7 +227,7 @@ class SiglipTextEmbeddings(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         embed_dim = config.hidden_size
 
@@ -252,7 +248,7 @@ class SiglipTextEmbeddings(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -274,7 +270,7 @@ class SiglipTextEmbeddings(nn.Module):
             ValueError: If sequence length exceeds max_position_embeddings.
         """
         seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
-        max_position_embedding = self.position_embedding.embedding.shape[0]
+        max_position_embedding = self.position_embedding.weight.shape[0]
 
         if seq_length > max_position_embedding:
             raise ValueError(
@@ -308,7 +304,7 @@ class SiglipAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP attention layer.
 
@@ -319,7 +315,7 @@ class SiglipAttention(AttentionModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -380,7 +376,7 @@ class SiglipAttention(AttentionModule):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -422,7 +418,7 @@ class SiglipAttention(AttentionModule):
         )
 
 
-class SiglipMLP(nn.Module):
+class SiglipMLP(spx.Module):
     """Multi-Layer Perceptron module for SigLIP models.
 
     Implements the feedforward network with configurable activation function
@@ -436,7 +432,7 @@ class SiglipMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP MLP block.
 
@@ -447,7 +443,7 @@ class SiglipMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -467,7 +463,7 @@ class SiglipMLP(nn.Module):
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply feedforward transformation.
@@ -481,7 +477,7 @@ class SiglipMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
         hidden_states = self.activation_fn(hidden_states)
@@ -489,12 +485,12 @@ class SiglipMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class SiglipEncoderLayer(nn.Module):
+class SiglipEncoderLayer(spx.Module):
     """Single encoder layer for SigLIP models.
 
     Combines multi-head self-attention and feedforward networks with
@@ -508,7 +504,7 @@ class SiglipEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP encoder layer.
 
@@ -517,7 +513,7 @@ class SiglipEncoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -553,7 +549,7 @@ class SiglipEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -593,7 +589,7 @@ class SiglipEncoderLayer(nn.Module):
         )
 
 
-class SiglipEncoder(nn.Module):
+class SiglipEncoder(spx.Module):
     """Transformer encoder for SigLIP models.
 
     Stacks multiple SiglipEncoderLayer instances to form the complete
@@ -607,7 +603,7 @@ class SiglipEncoder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP encoder.
 
@@ -616,7 +612,7 @@ class SiglipEncoder(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -629,20 +625,20 @@ class SiglipEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for _ in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=_):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -667,7 +663,8 @@ class SiglipEncoder(nn.Module):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        for layer in self.layers:
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -676,11 +673,18 @@ class SiglipEncoder(nn.Module):
                 mask_info=mask_info,
                 output_attentions=output_attentions,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
+            return hidden_states, all_hidden_states, all_attentions
+
+        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions),
+            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -706,7 +710,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP text transformer.
 
@@ -715,7 +719,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -756,7 +760,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo,
@@ -853,7 +857,7 @@ class SiglipTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP text model.
 
@@ -862,7 +866,7 @@ class SiglipTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -879,7 +883,7 @@ class SiglipTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -969,7 +973,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP vision transformer.
 
@@ -978,7 +982,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1020,7 +1024,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
                 rngs=rngs,
             )
 
-    def __call__(
+    def forward(
         self,
         pixel_values,
         output_attentions: bool | None = None,
@@ -1098,7 +1102,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
         return self.embeddings
 
 
-class MultiheadAttention(nn.Module):
+class MultiheadAttention(spx.Module):
     """Multi-head attention module for SigLIP vision pooling.
 
     Implements standard multi-head attention without causal masking,
@@ -1114,7 +1118,7 @@ class MultiheadAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize multi-head attention module.
 
@@ -1125,7 +1129,7 @@ class MultiheadAttention(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Raises:
             ValueError: If embed_dim or num_heads is non-positive.
@@ -1146,13 +1150,13 @@ class MultiheadAttention(nn.Module):
             shape=(embed_dim * 3, embed_dim),
             dtype=param_dtype,
             init_method="xavier_uniform",
-            key=rngs.param(),
+            key=rngs.param,
         )
         self.in_proj_bias = ArrayParam.bound(
             shape=(3 * embed_dim,),
             dtype=param_dtype,
             init_method="zeros",
-            key=rngs.param(),
+            key=rngs.param,
         )
         self.out_proj = RowParallelLinear(
             embed_dim,
@@ -1164,14 +1168,7 @@ class MultiheadAttention(nn.Module):
             rngs=rngs,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for custom attention parameters."""
-        return {
-            "in_proj_weight": ColumnWise,
-            "in_proj_bias": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         query: Array,
         key: Array,
@@ -1212,7 +1209,7 @@ class MultiheadAttention(nn.Module):
         return checkpoint_name(self.out_proj(attn.reshape(qbs, qss, qds)), "attn_output")
 
 
-class SiglipMultiheadAttentionPoolingHead(nn.Module):
+class SiglipMultiheadAttentionPoolingHead(spx.Module):
     """Multi-head attention pooling head for SigLIP vision model.
 
     Uses a learned probe token to attend over all patch representations,
@@ -1228,7 +1225,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize attention pooling head.
 
@@ -1237,13 +1234,13 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.probe = ArrayParam.bound(
             shape=(1, 1, config.hidden_size),
             dtype=param_dtype,
             init_method="normal",
-            key=rngs.param(),
+            key=rngs.param,
         )
         self.attention = MultiheadAttention(
             config.hidden_size,
@@ -1268,11 +1265,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             rngs=rngs,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for attention pooling parameters."""
-        return {"probe": Replicated}
-
-    def __call__(self, hidden_state):
+    def forward(self, hidden_state):
         """Apply attention pooling over patch representations.
 
         Args:
@@ -1305,7 +1298,7 @@ class SiglipVisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP vision model.
 
@@ -1314,7 +1307,7 @@ class SiglipVisionModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1331,7 +1324,7 @@ class SiglipVisionModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         pixel_values,
         output_attentions: bool | None = None,
@@ -1402,7 +1395,7 @@ class SiglipModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP model.
 
@@ -1411,7 +1404,7 @@ class SiglipModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Raises:
             TypeError: If config.get_text_config() is not SiglipTextConfig or
@@ -1461,21 +1454,14 @@ class SiglipModel(EasyDeLBaseModule):
             shape=(1,),
             dtype=param_dtype,
             init_method="normal",
-            key=rngs.param(),
+            key=rngs.param,
         )
         self.logit_bias = ArrayParam.bound(
             shape=(1,),
             dtype=param_dtype,
             init_method="normal",
-            key=rngs.param(),
+            key=rngs.param,
         )
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for logit scaling parameters."""
-        return {
-            "logit_scale": Replicated,
-            "logit_bias": Replicated,
-        }
 
     def get_text_features(
         self,
@@ -1559,7 +1545,7 @@ class SiglipModel(EasyDeLBaseModule):
 
         return pooled_output
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -1711,7 +1697,7 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize SigLIP for image classification.
 
@@ -1720,7 +1706,7 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         vision_model = SiglipVisionModel(
             config.vision_config,
@@ -1743,7 +1729,7 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
         self.num_labels = config.num_labels
         self.use_classif = self.classifier is not None
 
-    def __call__(
+    def forward(
         self,
         pixel_values: Array | None = None,
         labels: Array | None = None,

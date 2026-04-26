@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
+from .._shared import normalize_logprob_vocab_chunk_size
 from ..training_configurations import TrainingArguments
 
 
@@ -157,9 +158,7 @@ class ORPOConfig(TrainingArguments):
 
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = self.max_length - self.max_prompt_length
-        if self.logprob_vocab_chunk_size is not None:
-            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
-            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
+        self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
 
         # Call the post_init of the parent class if it exists.
         if hasattr(super(), "__post_init__"):

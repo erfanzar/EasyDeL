@@ -17,12 +17,11 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -49,7 +48,7 @@ from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassification
 from .exaone4_configuration import Exaone4Config
 
 
-class Exaone4MLP(nn.Module):
+class Exaone4MLP(spx.Module):
     """Gated Multi-Layer Perceptron module for Exaone4 models.
 
     Implements a SwiGLU-style gated feedforward network with configurable activation
@@ -65,7 +64,7 @@ class Exaone4MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Exaone4 gated MLP block.
 
@@ -76,7 +75,7 @@ class Exaone4MLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision for matrix
                 operations. Defaults to None.
-            rngs (nn.Rngs): Random number generator state for initialization.
+            rngs (spx.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.dtype = dtype
@@ -119,7 +118,7 @@ class Exaone4MLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply gated feedforward transformation.
@@ -135,7 +134,7 @@ class Exaone4MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -143,7 +142,7 @@ class Exaone4MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -164,7 +163,7 @@ class Exaone4Attention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Exaone4 attention layer with conditional RoPE (NoPE).
 
@@ -175,7 +174,7 @@ class Exaone4Attention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
 
@@ -219,7 +218,7 @@ class Exaone4Attention(UnifiedAttention):
         # Sliding attention layer: Use standard RoPE
         return super()._create_rotary(config, dtype)
 
-    def _create_q_norm(self, config: Exaone4Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+    def _create_q_norm(self, config: Exaone4Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
         """Create query normalization layer using RMSNorm.
 
         Normalization is applied per-head over the head_dim dimension to stabilize
@@ -229,7 +228,7 @@ class Exaone4Attention(UnifiedAttention):
             config (Exaone4Config): Model configuration with head_dim and rms_norm_eps.
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for normalization parameters.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RMSNorm: Query normalization layer.
@@ -242,7 +241,7 @@ class Exaone4Attention(UnifiedAttention):
             rngs=rngs,
         )
 
-    def _create_k_norm(self, config: Exaone4Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+    def _create_k_norm(self, config: Exaone4Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
         """Create key normalization layer using RMSNorm.
 
         Normalization is applied per-head over the head_dim dimension to stabilize
@@ -252,7 +251,7 @@ class Exaone4Attention(UnifiedAttention):
             config (Exaone4Config): Model configuration with head_dim and rms_norm_eps.
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for normalization parameters.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RMSNorm: Key normalization layer.
@@ -295,7 +294,7 @@ class Exaone4Attention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class Exaone4DecoderLayer(nn.Module):
+class Exaone4DecoderLayer(spx.Module):
     """Single decoder layer for Exaone4 models.
 
     Implements a post-normalization architecture combining multi-head attention with
@@ -311,7 +310,7 @@ class Exaone4DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Exaone4 decoder layer.
 
@@ -321,7 +320,7 @@ class Exaone4DecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -363,7 +362,7 @@ class Exaone4DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -427,7 +426,7 @@ class Exaone4DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(hidden_states, "layer_output")
         return DecoderLayerOutput(
@@ -459,7 +458,7 @@ class Exaone4Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Exaone4 base model.
 
@@ -468,7 +467,7 @@ class Exaone4Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -491,19 +490,19 @@ class Exaone4Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -513,7 +512,7 @@ class Exaone4Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -598,9 +597,11 @@ class Exaone4Model(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -609,18 +610,25 @@ class Exaone4Model(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -677,7 +685,7 @@ class Exaone4ForCausalLM(BaseCausalLMModule[Exaone4Model, Exaone4Config]):
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Exaone4 model for causal language modeling.
 
@@ -686,7 +694,7 @@ class Exaone4ForCausalLM(BaseCausalLMModule[Exaone4Model, Exaone4Config]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -725,7 +733,7 @@ class Exaone4ForSequenceClassification(BaseSequenceClassificationModule[Exaone4M
         param_dtype: jnp.dtype = jnp.float32,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Exaone4 model for sequence classification.
 
@@ -734,7 +742,7 @@ class Exaone4ForSequenceClassification(BaseSequenceClassificationModule[Exaone4M
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

@@ -32,21 +32,18 @@ from __future__ import annotations
 import typing as tp
 from functools import partial
 
-import flax
-import flax.nnx
 import jax
 import numpy as np
-from eformer.escale import with_sharding_constraint
-from flax import nnx as nn
+import spectrax as spx
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from spectrax import with_sharding_constraint
 from transformers import AutoTokenizer
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
@@ -60,6 +57,7 @@ from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import (
+    compile_trainer_step,
     filter_kwargs_for_callable,
     resolve_straight_through_emulator,
     sanitize_model_call_kwargs,
@@ -171,11 +169,11 @@ class PPOTrainer(Trainer):
         if isinstance(model, EasyDeLState):
             module = model.model
             if not hasattr(module, "value_head"):
-                model = CausalLMWithValueHead(module).to_state()
+                model = CausalLMWithValueHead(module).to_state(trainable_selector=arguments.trainable_selector)
         else:
             if not hasattr(model, "value_head"):
                 model = CausalLMWithValueHead(model)
-            model = model.to_state()
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.ref_state = deepcopy_model(model=model)
 
@@ -201,7 +199,7 @@ class PPOTrainer(Trainer):
             if len(reward_processing_classes) != len(reward_funcs):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=model.model.mesh)
+        empty_sharding = replicated_named_sharding(model.model.mesh)
         if not isinstance(reward_processing_classes, list):
             raise TypeError(f"reward_processing_classes must be a list, got {type(reward_processing_classes)}")
 
@@ -210,25 +208,32 @@ class PPOTrainer(Trainer):
         ):
             if isinstance(reward_func, EasyDeLBaseModule | EasyDeLState):
                 if isinstance(reward_func, EasyDeLBaseModule):
-                    reward_func = reward_func.to_state()
+                    reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
                     sharding = reward_func.shardings
 
-                    @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
-                        static_argnums=(0,),
-                        in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
-                        out_shardings=empty_sharding,
-                    )
                     def apply_fn(gd, gs, gt, batch):
-                        batch = with_sharding_constraint(arr=batch, sharding=self.arguments.step_partition_spec)
                         gt = jax.tree_util.tree_map(
                             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                             gt,
                         )
-                        module = nn.merge(gd, gs, gt)
-                        call_kwargs = filter_kwargs_for_callable(module.__call__, batch)
+                        module = spx.bind(gd, gs.merge(gt, copy=True))
+                        batch = with_sharding_constraint(
+                            arr=batch,
+                            sharding=self.arguments.step_partition_spec,
+                            mesh=module.mesh,
+                            ignore_mpmd=True,
+                        )
+                        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), batch)
                         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
                         return module(**call_kwargs)
 
+                    apply_fn = compile_trainer_step(
+                        apply_fn,
+                        mesh=model.model.mesh,
+                        static_argnums=(0,),
+                        in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
+                        out_shardings=empty_sharding,
+                    )
                     reward_func = reward_func.replace(apply_fn=apply_fn)
 
                 if reward_processing_class is None:
@@ -354,7 +359,7 @@ class PPOTrainer(Trainer):
                 - checkpoint_manager: For saving checkpoints
         """
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -380,7 +385,7 @@ class PPOTrainer(Trainer):
             straight_through_emulator,
         )
         static_argnums = tuple(range(2, 14))
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -402,7 +407,7 @@ class PPOTrainer(Trainer):
             False,  # is_train
             straight_through_emulator,
         )
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
@@ -414,10 +419,20 @@ class PPOTrainer(Trainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = flax.nnx.merge(graphdef, graphtree, graphother)
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
             with apply.mesh:
-                ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
-                mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
+                ids = with_sharding_constraint(
+                    ids,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                mask = with_sharding_constraint(
+                    mask,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
                 target_ids = ids[:, prompt_length:]
                 call_kwargs = {"input_ids": ids, "attention_mask": mask}
                 lmhead_chunksize = resolve_lmhead_chunksize(apply)
@@ -448,8 +463,9 @@ class PPOTrainer(Trainer):
                 )
                 return token_log_probs
 
-        self.compute_refmodel_logps = ejit(
+        self.compute_refmodel_logps = compile_trainer_step(
             partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
+            mesh=mesh,
             static_argnames=("graphdef",),
             in_shardings=(
                 self.ref_state.shardings.graphstate,
@@ -465,10 +481,20 @@ class PPOTrainer(Trainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = flax.nnx.merge(graphdef, graphtree, graphother)
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
             with apply.mesh:
-                ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
-                mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
+                ids = with_sharding_constraint(
+                    ids,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                mask = with_sharding_constraint(
+                    mask,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
                 target_ids = ids[:, prompt_length:]
                 call_kwargs = {
                     "input_ids": ids,
@@ -511,8 +537,9 @@ class PPOTrainer(Trainer):
                 values = values_full[:, prompt_length - 1 : -1]
                 return token_log_probs, values
 
-        self.compute_rollout_logps_values = ejit(
+        self.compute_rollout_logps_values = compile_trainer_step(
             partial(_compute_rollout_logps_values, graphdef=self.model_state.graphdef),
+            mesh=mesh,
             static_argnames=("graphdef",),
             in_shardings=(
                 self.model_state.shardings.graphstate,

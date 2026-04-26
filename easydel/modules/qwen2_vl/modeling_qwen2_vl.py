@@ -19,13 +19,12 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -112,7 +111,7 @@ def get_rope_index(
         attention_mask = attention_mask[:, : input_ids.shape[-1]]
 
     batch_size, seq_length = input_ids.shape[:2]
-    position_ids = np.ones((3, batch_size, seq_length), dtype=np.int32)
+    position_ids = np.zeros((3, batch_size, seq_length), dtype=np.int32)
     mrope_position_deltas: list[int] = []
     image_index, video_index = 0, 0
 
@@ -413,7 +412,7 @@ def apply_rotary_pos_emb_vision(
     return q_embed, k_embed
 
 
-class Qwen2VLPatchEmbed(nn.Module):
+class Qwen2VLPatchEmbed(spx.Module):
     """Patch embedding layer for converting images/video frames into embeddings.
 
     Uses 3D convolution to convert image or video patches into embeddings,
@@ -430,7 +429,7 @@ class Qwen2VLPatchEmbed(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize the patch embedding layer.
 
@@ -442,7 +441,7 @@ class Qwen2VLPatchEmbed(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
         self.patch_size = patch_size
@@ -452,18 +451,17 @@ class Qwen2VLPatchEmbed(nn.Module):
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
         self.proj = nn.Conv(
-            in_features=in_channels,
-            out_features=embed_dim,
+            in_channels=in_channels,
+            out_channels=embed_dim,
             kernel_size=kernel_size,
-            strides=kernel_size,
+            stride=kernel_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply patch embedding to input pixels.
 
         Args:
@@ -488,7 +486,18 @@ class Qwen2VLPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Qwen2VLPatchMerger(nn.Module):
+class _GeluModule(spx.Module):
+    """Tiny wrapper so GELU can live inside a ModuleList."""
+
+    def __init__(self, approximate: bool = False):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x: Array) -> Array:
+        return jax.nn.gelu(x, approximate=self.approximate)
+
+
+class Qwen2VLPatchMerger(spx.Module):
     """Patch merger module to downsample visual tokens by merging spatial neighbors.
 
     Reduces the number of visual tokens by merging adjacent patches spatially,
@@ -504,7 +513,7 @@ class Qwen2VLPatchMerger(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize the patch merger.
 
@@ -516,7 +525,7 @@ class Qwen2VLPatchMerger(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.dtype = dtype
@@ -528,7 +537,7 @@ class Qwen2VLPatchMerger(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.mlp = nn.List(
+        self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
                     self.hidden_size,
@@ -539,7 +548,7 @@ class Qwen2VLPatchMerger(nn.Module):
                     precision=precision,
                     rngs=rngs,
                 ),
-                partial(nn.gelu, approximate=False),
+                _GeluModule(approximate=False),
                 RowParallelLinear(
                     self.hidden_size,
                     dim,
@@ -552,7 +561,7 @@ class Qwen2VLPatchMerger(nn.Module):
             ]
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Merge and project patches.
 
         Args:
@@ -567,7 +576,7 @@ class Qwen2VLPatchMerger(nn.Module):
         return x
 
 
-class Qwen2VLVisionMLP(nn.Module):
+class Qwen2VLVisionMLP(spx.Module):
     """Multi-Layer Perceptron module for the Qwen2-VL vision encoder.
 
     Implements a two-layer feedforward network with configurable activation function
@@ -583,7 +592,7 @@ class Qwen2VLVisionMLP(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize the vision MLP.
 
@@ -594,7 +603,7 @@ class Qwen2VLVisionMLP(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.fc1 = ColumnParallelLinear(
@@ -617,7 +626,7 @@ class Qwen2VLVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply feedforward transformation.
 
         Args:
@@ -646,7 +655,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision attention layer.
 
@@ -658,7 +667,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.embed_dim = dim
         self.num_heads = num_heads
@@ -708,7 +717,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Define network layers for vision attention.
 
@@ -720,7 +729,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.qkv = ColumnParallelLinear(
             self.embed_dim,
@@ -741,12 +750,12 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             rngs=rngs,
         )
 
-    def _create_attention_performer(self, config, rngs: nn.Rngs):
+    def _create_attention_performer(self, config, rngs: spx.Rngs):
         """Create attention performer for vision attention.
 
         Args:
             config: Configuration object.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             FlexibleAttentionModule: Configured attention module with vanilla attention
@@ -761,7 +770,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         cu_seqlens: Array,
@@ -816,7 +825,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         return attn_output
 
 
-class Qwen2VLVisionBlock(nn.Module):
+class Qwen2VLVisionBlock(spx.Module):
     """Vision transformer block combining self-attention and MLP with pre-normalization.
 
     Implements a standard ViT block architecture with pre-layer normalization,
@@ -831,7 +840,7 @@ class Qwen2VLVisionBlock(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize vision transformer block.
 
@@ -841,7 +850,7 @@ class Qwen2VLVisionBlock(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.norm1 = LayerNorm(
@@ -879,7 +888,7 @@ class Qwen2VLVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> Array:
+    def forward(self, hidden_states, cu_seqlens, position_embeddings) -> Array:
         """Forward pass through the vision block.
 
         Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
@@ -901,7 +910,7 @@ class Qwen2VLVisionBlock(nn.Module):
         return hidden_states
 
 
-class Qwen2VLMLP(nn.Module):
+class Qwen2VLMLP(spx.Module):
     """Multi-Layer Perceptron module for Qwen2-VL language decoder.
 
     Implements a SwiGLU feedforward network for the language model decoder layers,
@@ -915,7 +924,7 @@ class Qwen2VLMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen2-VL language decoder MLP.
@@ -925,7 +934,7 @@ class Qwen2VLMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder stack.
         """
         self.config = config
@@ -967,7 +976,7 @@ class Qwen2VLMLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -979,7 +988,7 @@ class Qwen2VLMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -987,7 +996,7 @@ class Qwen2VLMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return checkpoint_name(hidden_states, "mlp_output")
@@ -1008,7 +1017,7 @@ class Qwen2VLAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen2-VL language decoder attention.
@@ -1018,7 +1027,7 @@ class Qwen2VLAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder stack.
         """
         super().__init__(
@@ -1033,7 +1042,7 @@ class Qwen2VLAttention(UnifiedAttention):
             sliding_window=config.sliding_window if config.use_sliding_window else None,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -1065,7 +1074,7 @@ class Qwen2VLAttention(UnifiedAttention):
             AttentionLayerOutput: Contains attention output, optional attention weights,
                 and updated cache view.
         """
-        return super().__call__(
+        return super().forward(
             hidden_states=hidden_states,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -1077,7 +1086,7 @@ class Qwen2VLAttention(UnifiedAttention):
         )
 
 
-class Qwen2VLDecoderLayer(nn.Module):
+class Qwen2VLDecoderLayer(spx.Module):
     """Single decoder layer for Qwen2-VL language model.
 
     Combines causal self-attention with M-RoPE position encoding and SwiGLU
@@ -1091,7 +1100,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen2-VL decoder layer.
@@ -1101,7 +1110,7 @@ class Qwen2VLDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder stack.
         """
         self.config = config
@@ -1141,7 +1150,7 @@ class Qwen2VLDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -1201,7 +1210,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
@@ -1233,7 +1242,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the vision transformer.
 
@@ -1242,7 +1251,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Raises:
             AssertionError: If config is not a Qwen2VLVisionConfig instance.
@@ -1273,19 +1282,19 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         head_dim = config.embed_dim // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = nn.List(
-            [
-                Qwen2VLVisionBlock(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for idx in range(config.depth):
+            with spx.assign_stage(total=config.depth, current=idx):
+                self.blocks.append(
+                    Qwen2VLVisionBlock(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(config.depth)
-            ]
-        )
 
         self.merger = Qwen2VLPatchMerger(
             dim=config.hidden_size,
@@ -1303,7 +1312,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         Returns:
             jnp.dtype: The data type of the MLP kernel parameters.
         """
-        return self.blocks[0].mlp.fc2.kernel.value.dtype
+        return self.blocks[0].mlp.fc2.weight.value.dtype
 
     def rot_pos_emb(self, grid_thw, max_grid_size):
         """Compute 2D rotary position embeddings for vision patches.
@@ -1365,7 +1374,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
 
         return rotary_pos_emb
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         grid_thw: Array,
@@ -1397,13 +1406,23 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
         cu_seqlens = jnp.cumsum(repeated, dtype="i4")
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
-        for block in self.blocks:
+
+        def _layer_loop(block, carry):
+            hidden_states, idx = carry
             hidden_states = block(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
             )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
+            return hidden_states, idx + 1
+
+        hidden_states, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         return self.merger(hidden_states)
 
     def get_encoder(self):
@@ -1456,7 +1475,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the Qwen2-VL text model.
 
@@ -1465,7 +1484,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Raises:
             AssertionError: If config is not a Qwen2VLTextConfig instance.
@@ -1494,19 +1513,19 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for idx in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -1515,7 +1534,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1528,6 +1547,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through the Qwen2-VL text model.
 
@@ -1602,29 +1622,53 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -1694,7 +1738,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the Qwen2-VL base model.
 
@@ -1704,7 +1748,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1888,7 +1932,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
         return inputs_embeds
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2013,7 +2057,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
 
     Class Attributes:
         _task_type: IMAGE_TEXT_TO_TEXT task type
@@ -2042,7 +2086,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the Qwen2-VL model for conditional generation.
 
@@ -2052,7 +2096,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -2148,7 +2192,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2255,7 +2299,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -2449,11 +2493,11 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """Apply the language modeling head."""
         return self.lm_head(hidden_states)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Returns the vision tower component."""
         return self.base_model.visual
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Returns the language model component."""
         return self.base_model.language_model
 

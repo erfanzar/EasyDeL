@@ -23,8 +23,8 @@ import gc
 import inspect
 from typing import Any
 
+import spectrax as spx
 import transformers
-from flax import nnx as nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 import easydel as ed
@@ -287,7 +287,17 @@ def create_hf_model(
 
     # Ensure deterministic attention backend for strict parity checks.
     # HF defaults to SDPA which can introduce numerical differences vs EasyDeL/JAX.
-    if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3", "mistral3", "glm_moe_dsa"}:
+    if getattr(hf_config, "model_type", None) in {
+        "glm4v",
+        "glm4v_moe",
+        "glm46v",
+        "gemma3",
+        "mistral3",
+        "glm_moe_dsa",
+        "phi",
+        "qwen3",
+        "gpt_neox",
+    }:
 
         def _force_eager(cfg: Any) -> None:
             if cfg is None:
@@ -353,7 +363,7 @@ def create_ed_model(
         dtype=small_model_config["dtype"],
         param_dtype=small_model_config["dtype"],
         precision=small_model_config["precision"],
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     if hf_model is not None:
@@ -391,7 +401,7 @@ def create_ed_model_only(
         dtype=small_model_config["dtype"],
         param_dtype=small_model_config["dtype"],
         precision=small_model_config["precision"],
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     ed_model.eval()

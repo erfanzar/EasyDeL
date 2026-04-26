@@ -33,7 +33,7 @@ Supported Attention Types:
 
 Key Features:
     Multiple Forward Paths:
-        - forward(): Standard RoPE-based attention
+        - forward_standard(): Standard RoPE-based attention
         - forward_mla(): Multi-head Latent Attention
         - forward_alibi(): ALiBi positional bias attention
 
@@ -109,12 +109,12 @@ from typing import TYPE_CHECKING, ClassVar, Generic, Literal, TypeVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
+import spectrax as spx
 from einops import rearrange
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
+from spectrax import common_types, nn
 
 from easydel.caching import (
     MLARaggedPagesCacheView,
@@ -271,6 +271,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         "value_normalization": "v_norm",
         "output_normalization": "o_norm",
     }
+    _spx_scan_safe_static_fields: ClassVar[frozenset[str]] = frozenset({"layer_idx"})
     projection_mapping: ClassVar[dict[str, str]] = {
         "query_projection": "q_proj",
         "key_projection": "k_proj",
@@ -294,7 +295,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
         attention_type: Literal["standard", "mla", "alibi"] = "standard",
         causal: bool = True,
@@ -410,7 +411,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             )
 
         if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
-            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
     def _create_q_proj(
         self,
@@ -676,7 +677,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         )
         return alibi_bias
 
-    def _create_attention_performer(self, config: Cfg, rngs: nn.Rngs) -> FlexibleAttentionModule:
+    def _create_attention_performer(self, config: Cfg, rngs: spx.Rngs) -> FlexibleAttentionModule:
         """Create attention performer module.
 
         Override for custom attention dropout or softmax scale.
@@ -712,7 +713,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             attn_mechanism=attn_mechanism,
         )
 
-    def _create_q_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: nn.Rngs) -> RMSNorm:
+    def _create_q_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
         """Create query normalization layer.
 
         Override for custom Q normalization (LayerNorm vs RMSNorm, custom eps, etc.).
@@ -728,7 +729,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             rngs=rngs,
         )
 
-    def _create_k_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: nn.Rngs) -> RMSNorm:
+    def _create_k_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
         """Create key normalization layer.
 
         Override for custom K normalization.
@@ -744,7 +745,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             rngs=rngs,
         )
 
-    def _create_v_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: nn.Rngs) -> RMSNorm:
+    def _create_v_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
         """Create value normalization layer.
 
         Override for custom V normalization (LayerNorm vs RMSNorm, custom eps, etc.).
@@ -760,7 +761,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             rngs=rngs,
         )
 
-    def _create_o_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: nn.Rngs) -> RMSNorm:
+    def _create_o_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
         """Create output normalization layer.
 
         Override for custom output normalization.
@@ -1045,7 +1046,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         merged = hidden_states.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         return merged
 
-    def forward(
+    def forward_standard(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -1283,7 +1284,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if _use_mla_ragged:
             # Weight absorption: split kv_b_proj weight into W_k and W_v
             # kv_b_weight: [kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)]
-            kv_b_weight = self.mla_kv_b_proj.kernel.value
+            kv_b_weight = self.mla_kv_b_proj.weight.value
             kv_b_weight = kv_b_weight.reshape(self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             w_k = kv_b_weight[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, N, qk_nope_dim]
             w_v = kv_b_weight[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, N, v_head_dim]
@@ -1522,7 +1523,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -1538,7 +1539,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         Automatically selects the correct attention mechanism based on the
         attention_type set during initialization. Routes to:
-        - forward(): Standard RoPE-based attention
+        - forward_standard(): Standard RoPE-based attention
         - forward_mla(): Multi-head Latent Attention
         - forward_alibi(): ALiBi positional bias attention
 
@@ -1605,7 +1606,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 alibi,
             )
         else:
-            return self.forward(
+            return self.forward_standard(
                 hidden_states,
                 mask_info,
                 position_ids,

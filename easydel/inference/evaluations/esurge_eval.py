@@ -62,12 +62,14 @@ from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
+import spectrax as spx
 from eformer.loggings import get_logger
 from jax.scipy.special import logsumexp
 
 from easydel.infra.utils import ProcessingClassType
 
 from ..esurge import eSurge
+from ..esurge.utils import truncate_tokens
 
 if TYPE_CHECKING:
     from easydel.inference.sampling_params import SamplingParams
@@ -144,6 +146,27 @@ def _trim_stop_sequences(text: str, stop: list[str]) -> str:
         if earliest is None or idx < earliest:
             earliest = idx
     return text if earliest is None else text[:earliest]
+
+
+def _fallback_maybe_truncate(
+    prompt_token_ids: list[int],
+    *,
+    max_gen_toks: int,
+    max_model_len: int | None,
+    side: str = "left",
+    verbose: bool = False,
+) -> tuple[list[int], int]:
+    """Fallback for lm-eval's ``maybe_truncate`` when lm-eval isn't installed."""
+    del verbose
+    request_max_tokens = max(1, int(max_gen_toks))
+    if max_model_len is None:
+        return list(prompt_token_ids), request_max_tokens
+
+    model_limit = max(1, int(max_model_len))
+    request_max_tokens = min(request_max_tokens, model_limit)
+    prompt_budget = max(model_limit - request_max_tokens, 0)
+    truncated_prompt, _ = truncate_tokens(list(prompt_token_ids), prompt_budget, side)
+    return list(truncated_prompt), request_max_tokens
 
 
 def _postprocess_generation_text(
@@ -674,19 +697,24 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         if self._scoring_logits_fn is None:
             scoring_model = self._get_scoring_model()
 
-            def _forward(input_ids, attention_mask):
+            @spx.jit
+            def _forward(model, input_ids, attention_mask):
                 """Compute logits from the scoring model for the given inputs.
 
                 Args:
+                    model: SpectraX module carrying the current scoring weights.
                     input_ids: Token ID array of shape ``[batch, seq_len]``.
                     attention_mask: Boolean or integer mask of the same shape.
 
                 Returns:
                     Logits tensor of shape ``[batch, seq_len, vocab_size]``.
                 """
-                return scoring_model(input_ids=input_ids, attention_mask=attention_mask).logits
+                return model(input_ids=input_ids, attention_mask=attention_mask).logits
 
-            self._scoring_logits_fn = jax.jit(_forward)
+            def _call(input_ids, attention_mask):
+                return _forward(scoring_model, input_ids, attention_mask)
+
+            self._scoring_logits_fn = _call
         return self._scoring_logits_fn
 
     def _generate(
@@ -744,7 +772,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             from lm_eval.models.utils import handle_stop_sequences, maybe_truncate, normalize_gen_kwargs  # type: ignore
         except Exception:
             handle_stop_sequences = None
-            maybe_truncate = None
+            maybe_truncate = _fallback_maybe_truncate
             normalize_gen_kwargs = None
 
         eos_text: str | None = None
@@ -831,24 +859,23 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 request_stops = handle_stop_sequences(request_stops, eos=eos_text)
 
             prompt_text = prompts[i]
-            if maybe_truncate is not None:
-                try:
-                    prompt_token_ids = [int(tok) for tok in self.tok_encode(prompt_text)]
-                    prompt_token_ids, request_max_tokens = maybe_truncate(
-                        prompt_token_ids,
-                        max_gen_toks=int(request_max_tokens),
-                        max_model_len=self.max_length,
-                        side=self.truncation_side,
-                        verbose=False,
-                    )
-                    prompt_text = self.tok_decode(
-                        prompt_token_ids,
-                        skip_special_tokens=False,
-                        spaces_between_special_tokens=False,
-                    )
-                except Exception as trunc_exc:
-                    logger.debug("Prompt truncation failed, using original: %s", trunc_exc)
-                    prompt_text = prompts[i]
+            try:
+                prompt_token_ids = [int(tok) for tok in self.tok_encode(prompt_text)]
+                prompt_token_ids, request_max_tokens = maybe_truncate(
+                    prompt_token_ids,
+                    max_gen_toks=int(request_max_tokens),
+                    max_model_len=self.max_length,
+                    side=self.truncation_side,
+                    verbose=False,
+                )
+                prompt_text = self.tok_decode(
+                    prompt_token_ids,
+                    skip_special_tokens=False,
+                    spaces_between_special_tokens=False,
+                )
+            except Exception as trunc_exc:
+                logger.debug("Prompt truncation failed, using original: %s", trunc_exc)
+                prompt_text = prompts[i]
             prepared_prompts[i] = prompt_text
 
             if force_sampling_template:

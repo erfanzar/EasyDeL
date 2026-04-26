@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import typing as tp
 
-from eformer.common_types import DP, MODE_PREFILL, NOT_GIVEN
-from eformer.escale import PartitionAxis, PartitionManager
+from spectrax import PartitionAxis
+from spectrax.common_types import DP, MODE_PREFILL, NOT_GIVEN
+
+from easydel.infra.sharding import AxisPolicy, RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 ATTN_DP = "__ATTN_DP__"
 _DEFAULT_ATTN_DP_RULE = DP
@@ -65,7 +67,7 @@ def reset_attention_data_parallel_axis() -> None:
 
 
 def resolve_attention_data_parallel_axis(
-    partition_axis_or_manager: PartitionAxis | PartitionManager,
+    partition_axis_or_manager: PartitionAxis | AxisPolicy | RuntimeShardingResolver,
     *,
     mode: str = MODE_PREFILL,
 ) -> tp.Any:
@@ -75,11 +77,10 @@ def resolve_attention_data_parallel_axis(
     data-parallel axis. The returned value is suitable for mesh-size lookups,
     ``jax.lax.axis_index``, and other low-level sharding helpers.
     """
-    paxis = (
-        partition_axis_or_manager.paxis
-        if isinstance(partition_axis_or_manager, PartitionManager)
-        else partition_axis_or_manager
-    )
+    if isinstance(partition_axis_or_manager, PartitionAxis):
+        paxis = partition_axis_or_manager
+    else:
+        paxis = coerce_runtime_sharding_resolver(partition_axis_or_manager).paxis
     return paxis.resolve_axis([ATTN_DP], mode=mode)[0]
 
 

@@ -385,7 +385,7 @@ class OperationCacheMixin:
         - ``get_unique_cache_view_classes``: Get all unique cache view classes.
 
     Example:
-        >>> class MyModel(OperationCacheMixin, nn.Module):
+        >>> class MyModel(OperationCacheMixin, spx.Module):
         ...     def __init__(self, config):
         ...         super().__init__()
         ...         self.config = config
@@ -660,7 +660,7 @@ class OperationCacheMixin:
         operation instances, including:
 
         1. FlexibleAttentionModule instances (which contain impl and impl_decode)
-        2. BaseOperation instances stored as attributes on any nn.Module
+        2. BaseOperation instances stored as attributes on any spx.Module
 
         This comprehensive approach works because:
 
@@ -686,7 +686,7 @@ class OperationCacheMixin:
             >>> for layer in cache_info.layers:
             ...     print(f"Layer {layer.layer_index}: {layer.operation_name}")
         """
-        from flax import nnx as nn
+        import spectrax as spx
 
         from easydel.layers.attention import FlexibleAttentionModule
         from easydel.operations._base_operation import BaseOperation
@@ -748,14 +748,18 @@ class OperationCacheMixin:
 
         # Phase 2: Find BaseOperation instances stored directly on modules
         # This catches cases like Qwen3NextLinearAttention which stores GatedDeltaRuleOp as gdr_op
-        for path, module in iter_module_search(self, nn.Module):
+        for path, module in iter_module_search(self, spx.Module):
             # Skip FlexibleAttentionModule - already handled in Phase 1
             if isinstance(module, FlexibleAttentionModule):
                 continue
 
             layer_idx = self._extract_layer_index_from_path(path)
 
-            for _attr_name, attr_value in vars(module).items():
+            for _attr_name in vars(module).keys():
+                try:
+                    attr_value = getattr(module, _attr_name)
+                except Exception:
+                    continue
                 if attr_value is None:
                     continue
 
@@ -849,12 +853,18 @@ class OperationCacheMixin:
 
         for i, elem in enumerate(path):
             if isinstance(elem, str) and elem.lower() in layer_containers:
-                if i + 1 < len(path) and isinstance(path[i + 1], int):
-                    return path[i + 1]
+                if i + 1 < len(path):
+                    nxt = path[i + 1]
+                    if isinstance(nxt, int):
+                        return nxt
+                    elif isinstance(nxt, str) and nxt.isdigit():
+                        return int(nxt)
 
         for elem in path:
             if isinstance(elem, int):
                 return elem
+            elif isinstance(elem, str) and elem.isdigit():
+                return int(elem)
 
         return 0
 

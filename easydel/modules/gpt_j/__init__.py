@@ -41,7 +41,8 @@ Usage Example
 -------------
 ```python
 from easydel import GPTJConfig, GPTJForCausalLM
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 
 # Create configuration
 config = GPTJConfig(
@@ -58,7 +59,7 @@ model = GPTJForCausalLM(
     config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Generate text

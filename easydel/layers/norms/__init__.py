@@ -15,7 +15,7 @@
 """EasyDeL normalization layers package.
 
 This package provides efficient normalization layer implementations optimized
-for JAX/Flax, with support for mixed precision training and float8 data types.
+for JAX/spectrax, with support for mixed precision training and float8 data types.
 
 Modules:
     _norms: Core normalization layer implementations.
@@ -38,11 +38,11 @@ Example:
     >>> normalized = rms(jnp.ones((2, 512, 768)))
     >>>
     >>> # LayerNorm for standard normalization
-    >>> ln = LayerNorm(num_features=768, rngs=nn.Rngs(0))
+    >>> ln = LayerNorm(num_features=768, rngs=spx.Rngs(0))
     >>> normalized = ln(jnp.ones((2, 512, 768)))
     >>>
     >>> # BatchNorm for convolutional or dense layers
-    >>> bn = BatchNorm(num_features=64, rngs=nn.Rngs(0))
+    >>> bn = BatchNorm(num_features=64, rngs=spx.Rngs(0))
     >>> normalized = bn(jnp.ones((8, 64)), use_running_average=False)
 
 See Also:

@@ -64,7 +64,8 @@ Usage Example:
     ```python
     from easydel import Grok1Config, Grok1ForCausalLM
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration (smaller variant for demonstration)
     config = Grok1Config(
@@ -82,7 +83,7 @@ Usage Example:
     )
 
     # Create causal language model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = Grok1ForCausalLM(
         config=config,
         dtype=jnp.bfloat16,

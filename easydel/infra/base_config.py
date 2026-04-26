@@ -26,7 +26,7 @@ Key Features:
     - Multiple attention mechanism support (flash, ring, etc.)
     - Quantization configuration
     - Gradient checkpointing policies
-    - Hardware abstraction and optimization
+    - Scan and runtime sharding controls
     - RoPE (Rotary Position Embedding) configuration
     - Custom kernel support
 
@@ -37,7 +37,7 @@ Example:
     ...     num_attention_heads=12,
     ...     attention_mechanism="flash",
     ...     gradient_checkpointing_policy="",
-    ...     use_hardware_abstraction=True
+    ...     scan_layers=True,
     ... )
 """
 
@@ -45,63 +45,36 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import hashlib
 import json
 import os
 import re
 import typing as tp
+import urllib.request
 import warnings
 from typing import Any, NotRequired
+from urllib.parse import urlparse
 
 import jax
 import jax.extend
 import numpy as np
+import spectrax as spx
 import transformers
-from eformer import common_types
-from eformer.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
-from eformer.escale import PartitionAxis, PartitionManager
 from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
+from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from jax import numpy as jnp
 from jax.sharding import AxisType
-from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array
+from spectrax import PartitionAxis, common_types
+from spectrax.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
 
 # .venv/lib/python3.13/site-packages/transformers/configuration_utils.py
 from transformers.configuration_utils import PretrainedConfig, recursive_diff_dict
 from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
 from transformers.utils import CONFIG_NAME, cached_file
-
-try:
-    from transformers.utils import download_url, is_remote_url
-except ImportError:  # transformers>=5 removed helpers
-    import hashlib
-    import os
-    import urllib.request
-    from urllib.parse import urlparse
-
-    from huggingface_hub.constants import HF_HUB_CACHE
-
-    def is_remote_url(url_or_filename: str) -> bool:
-        try:
-            return urlparse(url_or_filename).scheme in {"http", "https"}
-        except Exception:
-            return False
-
-    def download_url(url: str, cache_dir: str | None = None) -> str:
-        cache_dir = cache_dir or HF_HUB_CACHE
-        os.makedirs(cache_dir, exist_ok=True)
-        parsed = urlparse(url)
-        filename = os.path.basename(parsed.path) or "download"
-        _, ext = os.path.splitext(filename)
-        hashed = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        cached_path = os.path.join(cache_dir, f"{hashed}{ext}")
-        if not os.path.exists(cached_path):
-            urllib.request.urlretrieve(url, cached_path)
-        return cached_path
-
-
 from transformers.utils.generic import is_timm_config_dict
 
 from easydel.layers import QuantizationConfig
@@ -119,6 +92,7 @@ from .etils import (
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
 )
+from .sharding import AxisPolicy, LogicalAxisRules, RuntimeShardingResolver
 
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
@@ -130,10 +104,11 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+DEFAULT_SHARDING_AXIS_DIMS: tuple[int, ...] = (1, 1, -1, 1, 1, 1)
+DEFAULT_SHARDING_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
+
 # Model weight file name constants for different frameworks.
 # These are used when loading/saving models in various formats.
-FLAX_WEIGHTS_NAME = "easydel-model.parameters"
-"""Default filename for EasyDeL/Flax model parameters."""
 
 WEIGHTS_NAME = "pytorch_model.bin"
 """Default filename for PyTorch model weights."""
@@ -149,9 +124,6 @@ TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
 
 TF_WEIGHTS_NAME = "model.ckpt"
 """Default filename for TensorFlow 1 model checkpoints."""
-
-FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
-"""Index file for sharded Flax model weights."""
 
 SAFE_WEIGHTS_NAME = "model.safetensors"
 """Default filename for SafeTensors format model weights."""
@@ -177,21 +149,6 @@ GENERATION_CONFIG_NAME = "generation_config.json"
 MODEL_CARD_NAME = "modelcard.json"
 """Model card metadata file."""
 
-# Default block sizes for Pallas matmul kernels.
-# These control the tiling strategy for custom GPU/TPU kernels.
-DEFAULT_PALLAS_M_BLOCK_SIZE = 128
-"""Default M dimension block size for Pallas matmul kernels."""
-
-DEFAULT_PALLAS_K_BLOCK_SIZE = 128
-"""Default K dimension block size for Pallas matmul kernels."""
-
-DEFAULT_PALLAS_N_BLOCK_SIZE = 128
-"""Default N dimension block size for Pallas matmul kernels."""
-
-# Default configuration values for hardware and MoE settings.
-DEFAULT_HARDWARE_ABSTRACTION = False
-"""Whether hardware abstraction is enabled by default."""
-
 DEFAULT_MOE_METHOD = "fused_moe"
 """Default Mixture of Experts implementation method."""
 
@@ -208,19 +165,60 @@ RING_EXPERTS = False
 """Whether to use ring topology for expert dispatch by default."""
 
 # Environment variable flags for runtime configuration.
-ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag("ED_DEFAULT_HARDWARE_ABSTRACTION", default=False)
-"""Hardware abstraction override from ED_DEFAULT_HARDWARE_ABSTRACTION environment variable."""
-
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
 """Flag indicating whether EKernel operations are enabled via EKERNEL_OPS environment variable."""
 
+_REMOVED_BASE_CONFIG_KEYS = frozenset(
+    {
+        "hardware_abstraction",
+        "pallas_m_block_size",
+        "pallas_k_block_size",
+        "pallas_n_block_size",
+    }
+)
+"""Config keys intentionally removed from EasyDeL's public base surface."""
 
-if ED_DEFAULT_HARDWARE_ABSTRACTION:
-    DEFAULT_HARDWARE_ABSTRACTION = True  # pyright: ignore[reportConstantRedefinition]
+
+def is_remote_url(url_or_filename: str) -> bool:
+    try:
+        return urlparse(url_or_filename).scheme in {"http", "https"}
+    except Exception:
+        return False
 
 
-if DEFAULT_HARDWARE_ABSTRACTION:
-    logger.info("HARDWARE_ABSTRACTION is ON by default")
+def download_url(url: str, cache_dir: str | None = None) -> str:
+    cache_dir = cache_dir or HF_HUB_CACHE
+    os.makedirs(cache_dir, exist_ok=True)
+    parsed = urlparse(url)
+    filename = os.path.basename(parsed.path) or "download"
+    _, ext = os.path.splitext(filename)
+    hashed = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cached_path = os.path.join(cache_dir, f"{hashed}{ext}")
+    if not os.path.exists(cached_path):
+        urllib.request.urlretrieve(url, cached_path)
+    return cached_path
+
+
+def _compute_mpmd_axis(jax_mesh: jax.sharding.Mesh) -> str | None:
+    """Return ``"pp"`` iff the mesh has a real pipeline axis (named AND dim > 1).
+
+    The decision is made off the *resolved* mesh shape (``mesh.shape["pp"]``),
+    not pre-creation axis dims -- the latter still contain spectrax's ``-1``
+    auto-fill placeholder so we can't tell from them whether ``pp`` will end
+    up as 1 or the full chip count.
+
+    Naming ``"pp"`` with ``dim=1`` would otherwise route every ``spx.jit``
+    through the heavy single-stage MPMD pipeline runtime, which does not honor
+    caller-allocated array layouts and forces XLA to insert layout-reformat
+    copies at the JIT boundary (e.g. ~4 x 4 GB cache copies for paged-attention
+    KV pages on a 27B run with tp=4, pp=1).
+    """
+    if "pp" not in getattr(jax_mesh, "axis_names", ()):
+        return None
+    try:
+        return "pp" if int(jax_mesh.shape["pp"]) > 1 else None
+    except (KeyError, TypeError):
+        return None
 
 
 def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
@@ -228,7 +226,7 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
 
     Args:
         mesh: JAX device mesh to extract dimensions from.
-        pm: PartitionManager instance for axis name resolution.
+        pm: Runtime sharding resolver instance for axis name resolution.
         fsdp_is_ep_bound: Whether to fold FSDP axis into expert-parallel axis.
         sp_is_ep_bound: Whether to fold sequence-parallel axis into expert-parallel axis.
 
@@ -275,25 +273,25 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
     return (odpsize, epsize, otpsize), (dpname, epname, tpname)
 
 
-def _resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
+def _resolve_eformer_axis(axis: str | list[str], manager: RuntimeShardingResolver):
     """Resolve logical axis name(s) to the concrete mesh axis names for training.
 
     Axis labels such as ``"tp"`` or ``"ep"`` are symbolic and need to be translated
-    into the actual mesh axis names chosen by the `PartitionManager`. This helper
+    into the actual mesh axis names chosen by the runtime sharding resolver. This helper
     keeps the caller agnostic to how axes are laid out on the physical device mesh.
 
     Args:
         axis: Single axis name or a list/tuple of axis names to resolve (for example
             ``"tp"``, ``"ep"``, ``"dp"``, ``"fsdp"``, ``"sp"``).
-        manager: Partition manager that owns the axis resolution rules.
+        manager: Runtime sharding resolver that owns the axis resolution rules.
 
     Returns:
         Resolved axis name(s). A string is returned for a single input, otherwise a
         list preserving the provided order.
 
     Example:
-        >>> _resolve_eformer_axis("tp", partition_manager)
-        >>> _resolve_eformer_axis(["tp", "ep"], partition_manager)
+        >>> _resolve_eformer_axis("tp", runtime_sharding_resolver)
+        >>> _resolve_eformer_axis(["tp", "ep"], runtime_sharding_resolver)
     """
     was_list = isinstance(axis, (list, tuple))
     if not was_list:
@@ -423,6 +421,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_tiling_size_seqlen: NotRequired[int]
     moe_tiling_size_dim: NotRequired[int]
     partition_axis: NotRequired[PartitionAxis]
+    axis_policy: NotRequired[AxisPolicy]
     use_sharded_kv_caching: NotRequired[bool]
     use_sharding_constraint: NotRequired[bool]
     backend: NotRequired[EasyDeLBackends | str | None]
@@ -431,6 +430,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     bits: NotRequired[int | None]
     scan_ring_attention: NotRequired[bool]
     scan_attention_layers: NotRequired[bool]
+    scan_layers: NotRequired[bool]
+    pipeline_virtual_stages: NotRequired[int]
+    pipeline_stage_layout: NotRequired[tp.Literal["contiguous", "interleaved", "loop"]]
     use_scan_mlp: NotRequired[bool]
     scan_mlp_chunk_size: NotRequired[int]
     sequence_axis_name: NotRequired[str]
@@ -447,10 +449,6 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     attn_softmax_dtype: NotRequired[jnp.dtype]
     fcm_max_ratio: NotRequired[float]
     fcm_min_ratio: NotRequired[float]
-    hardware_abstraction: NotRequired[bool]
-    pallas_m_block_size: NotRequired[int]
-    pallas_k_block_size: NotRequired[int]
-    pallas_n_block_size: NotRequired[int]
     use_expert_tensor_mode: NotRequired[bool]
     moe_method: NotRequired[AVAILABLE_MOE_METHODS]
     moe_force_xla_gmm: NotRequired[bool]
@@ -473,12 +471,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
     abstraction flags used for both training and serving.
 
     Args:
-        sharding_axis_dims: Parallelism sizes for ``(dp, fsdp, ep, tp, sp)``.
-            ``-1`` consumes all remaining devices. Defaults to ``(1, -1, 1, 1, 1)``.
+        sharding_axis_dims: Parallelism sizes for ``(pp, dp, fsdp, ep, tp, sp)``.
+            ``-1`` consumes all remaining devices. Defaults to ``(1, 1, -1, 1, 1, 1)``.
         sharding_dcn_axis_dims: Optional mesh sizes for DCN slices when running
             multi-host or multi-slice setups.
         sharding_axis_names: Logical mesh axis names, defaults to
-            ``("dp", "fsdp", "ep", "tp", "sp")``.
+            ``("pp", "dp", "fsdp", "ep", "tp", "sp")``.
         attn_mechanism: Attention implementation to use during training/forward passes.
         decode_attn_mechanism: Attention implementation to use during decoding
             (falls back to ``attn_mechanism`` if left as ``None``).
@@ -505,6 +503,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         bits: Optional quantization bit width for weights.
         scan_ring_attention: Use scanning for ring attention implementations.
         scan_attention_layers: Apply scan to attention blocks to save memory.
+        scan_layers: Apply scan to repeated model layers when the model supports it.
         use_scan_mlp: Apply scan to MLP blocks.
         scan_mlp_chunk_size: Chunk size when scanning MLPs. Defaults to ``1024``.
         sequence_axis_name: Name of the sequence/attention axis. Defaults to ``"sp"``.
@@ -531,10 +530,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         attn_softmax_dtype: Softmax computation dtype. Defaults to ``jnp.float32``.
         fcm_max_ratio: Maximum ratio used when sampling forgetful causal masks.
         fcm_min_ratio: Minimum ratio used when sampling forgetful causal masks.
-        hardware_abstraction: Enable EasyDeL hardware abstraction and custom kernels.
-        pallas_m_block_size: Matmul M dimension block size for Pallas kernels.
-        pallas_k_block_size: Matmul K dimension block size for Pallas kernels.
-        pallas_n_block_size: Matmul N dimension block size for Pallas kernels.
         moe_method: Mixture-of-experts implementation to use.
         moe_force_xla_gmm: Force XLA GMM kernels for MoE even when fused kernels exist.
         use_ring_of_experts: Whether to dispatch experts with a ring topology.
@@ -551,17 +546,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
     # Set to True for debugging to see all configuration values.
     _show_private_attrs: bool = False
 
-    # Cached JAX device mesh with automatic axis types.
+    # Cached SpectraX device mesh with automatic axis types.
     # Set via set_model_mesh() or lazily created on first access to `mesh` property.
-    _hidden_mesh: common_types.Mesh | None = None
+    _hidden_mesh: spx.SpxMesh | None = None
 
-    # Cached JAX device mesh with explicit axis types.
+    # Cached SpectraX device mesh with explicit axis types.
     # Set via set_explicit_mesh() or lazily created on first access to `explicit_mesh` property.
-    _hidden_explicit_mesh: common_types.Mesh | None = None
+    _hidden_explicit_mesh: spx.SpxMesh | None = None
 
-    # Cached JAX device mesh with manual axis types.
+    # Cached SpectraX device mesh with manual axis types.
     # Set via set_manual_mesh() or lazily created on first access to `manual_mesh` property.
-    _hidden_manual_mesh: common_types.Mesh | None = None
+    _hidden_manual_mesh: spx.SpxMesh | None = None
 
     # Backward-compat defaults that were implicitly available in older
     # transformers.PreTrainedConfig versions.
@@ -790,9 +785,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     def __init__(
         self,
-        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: collections.abc.Sequence[int] = DEFAULT_SHARDING_AXIS_DIMS,
         sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
-        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: collections.abc.Sequence[str] = DEFAULT_SHARDING_AXIS_NAMES,
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
         mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_MLA_ATTENTION_MECHANISM,
@@ -804,6 +799,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_batch: int = 4,
         moe_tiling_size_seqlen: int = 128,
         moe_tiling_size_dim: int = 128,
+        axis_policy: AxisPolicy | dict[str, tp.Any] | None = None,
         partition_axis: PartitionAxis | None = None,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
@@ -813,6 +809,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         bits: int | None = None,
         scan_ring_attention: bool = True,
         scan_attention_layers: bool = False,
+        scan_layers: bool = False,
+        pipeline_virtual_stages: int = 1,
+        pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = "loop",
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         sequence_axis_name: str = "sp",
@@ -832,10 +831,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         attn_softmax_dtype: jnp.dtype = jnp.float32,
         fcm_max_ratio: float = 0.0,
         fcm_min_ratio: float = 0.0,
-        hardware_abstraction: bool = DEFAULT_HARDWARE_ABSTRACTION,
-        pallas_m_block_size: int = DEFAULT_PALLAS_M_BLOCK_SIZE,
-        pallas_k_block_size: int = DEFAULT_PALLAS_K_BLOCK_SIZE,
-        pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
         moe_method: AVAILABLE_MOE_METHODS = DEFAULT_MOE_METHOD,
         moe_force_xla_gmm: bool = False,
         use_expert_tensor_mode: bool = EXPERT_TP_MODE,
@@ -854,6 +849,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         See class docstring for detailed parameter descriptions.
         """
+        for key in _REMOVED_BASE_CONFIG_KEYS:
+            kwargs.pop(key, None)
+
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
         self.sharding_dcn_axis_dims = getattr(self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims)
         self.sharding_axis_names = getattr(self, "sharding_axis_names", sharding_axis_names)
@@ -884,14 +882,36 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_tiling_size_batch = getattr(self, "moe_tiling_size_batch", moe_tiling_size_batch)
         self.moe_tiling_size_seqlen = getattr(self, "moe_tiling_size_seqlen", moe_tiling_size_seqlen)
         self.moe_tiling_size_dim = getattr(self, "moe_tiling_size_dim", moe_tiling_size_dim)
+        resolved_axis_policy = axis_policy if axis_policy is not None else getattr(self, "axis_policy", None)
+        if isinstance(resolved_axis_policy, dict):
+            resolved_axis_policy = AxisPolicy.from_dict(resolved_axis_policy)
+        if resolved_axis_policy is None:
+            resolved_axis_policy = AxisPolicy.from_partition_axis(partition_axis)
+        self.axis_policy = getattr(self, "axis_policy", resolved_axis_policy)
+        if isinstance(self.axis_policy, dict):
+            self.axis_policy = AxisPolicy.from_dict(self.axis_policy)
+        if not isinstance(self.axis_policy, AxisPolicy):
+            self.axis_policy = AxisPolicy.from_partition_axis(self.axis_policy)
+
         if partition_axis is None:
-            partition_axis = PartitionAxis()
+            partition_axis = self.axis_policy.to_partition_axis()
         if isinstance(partition_axis, dict):
             partition_axis = PartitionAxis(**partition_axis)
         self.partition_axis = getattr(self, "partition_axis", partition_axis)
+        if isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
+        self.axis_policy = AxisPolicy.from_partition_axis(self.partition_axis)
         self.bits = getattr(self, "bits", bits)
         self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
         self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
+        self.scan_layers = getattr(self, "scan_layers", scan_layers)
+        self.pipeline_virtual_stages = getattr(self, "pipeline_virtual_stages", pipeline_virtual_stages)
+        self.pipeline_stage_layout = getattr(self, "pipeline_stage_layout", pipeline_stage_layout)
+        if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
+            raise ValueError(
+                "`pipeline_stage_layout` must be one of 'contiguous', 'interleaved', or 'loop'. "
+                f"Got {self.pipeline_stage_layout!r}."
+            )
         self.use_sharded_kv_caching = getattr(self, "use_sharded_kv_caching", use_sharded_kv_caching)
         self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
         self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
@@ -940,10 +960,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self._coerce_runtime_dtype_fields()
         self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
         self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
-        self.hardware_abstraction = getattr(self, "hardware_abstraction", hardware_abstraction)
-        self.pallas_m_block_size = getattr(self, "pallas_m_block_size", pallas_m_block_size)
-        self.pallas_k_block_size = getattr(self, "pallas_k_block_size", pallas_k_block_size)
-        self.pallas_n_block_size = getattr(self, "pallas_n_block_size", pallas_n_block_size)
         self.moe_method = getattr(self, "moe_method", moe_method)
         self.moe_force_xla_gmm = getattr(self, "moe_force_xla_gmm", moe_force_xla_gmm)
         self.use_ring_of_experts = getattr(self, "use_ring_of_experts", use_ring_of_experts)
@@ -972,8 +988,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def create_mesh(
-        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: collections.abc.Sequence[int] = DEFAULT_SHARDING_AXIS_DIMS,
+        sharding_axis_names: collections.abc.Sequence[str] = DEFAULT_SHARDING_AXIS_NAMES,
         sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
         process_is_granule: bool = False,
         should_sort_granules_by_key: bool = True,
@@ -990,6 +1006,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         model parameters and computations are distributed across hardware. The mesh axes
         correspond to different parallelism strategies:
 
+        - pp (pipeline parallel): Split model stages across devices
         - dp (data parallel): Replicate model across data batches
         - fsdp (fully sharded data parallel): Shard parameters and optimizer states
         - ep (expert parallel): Distribute experts in MoE models
@@ -998,10 +1015,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         Args:
             sharding_axis_dims: Size of each parallelism dimension. Use -1 to automatically
-                fill remaining devices. Default: (1, -1, 1, 1, 1) means all devices go
-                to FSDP axis.
+                fill remaining devices. Default: (1, 1, -1, 1, 1, 1) means all remaining
+                devices go to FSDP after reserving single pp and dp slots.
             sharding_axis_names: Names for each mesh axis. Must match length of
-                sharding_axis_dims. Default: ("dp", "fsdp", "ep", "tp", "sp").
+                sharding_axis_dims. Default: ("pp", "dp", "fsdp", "ep", "tp", "sp").
             sharding_dcn_axis_dims: Dimensions for data center network (DCN) sharding.
                 Used for multi-host/multi-slice setups. Default: None.
             process_is_granule: Deprecated parameter, not used.
@@ -1020,19 +1037,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 axes; a sequence must match `sharding_axis_names`. Default: "auto".
 
         Returns:
-            A JAX Mesh object configured for distributed execution with the specified
-            parallelism dimensions.
+            A SpectraX mesh configured for distributed execution with the specified
+            parallelism dimensions. The ``pp`` axis is registered as the MPMD
+            pipeline axis when present.
 
         Example:
             >>> # Create mesh with DP=4, TP=2 on 8 GPUs
             >>> mesh = EasyDeLBaseConfig.create_mesh(
-            ...     sharding_axis_dims=(4, 1, 1, 2, 1),
-            ...     sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp"),
+            ...     sharding_axis_dims=(1, 4, 1, 1, 2, 1),
+            ...     sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
             ... )
-            >>> # mesh.shape = {'dp': 4, 'fsdp': 1, 'ep': 1, 'tp': 2, 'sp': 1}
+            >>> # mesh.shape = {'pp': 1, 'dp': 4, 'fsdp': 1, 'ep': 1, 'tp': 2, 'sp': 1}
         """
-        from eformer.escale import create_mesh
-
         if backend == "":
             backend = None
         if eformer_craft_mesh is None:
@@ -1058,9 +1074,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 )
                 axis_dims = normalized_axis_dims
 
-        mesh = create_mesh(
+        # Create the mesh first WITHOUT an mpmd guess so spectrax resolves
+        # ``-1`` axis dims against the device count.  Then read the resolved
+        # ``pp`` size from ``mesh.shape`` and re-wrap with ``mpmd_axis`` only
+        # when there's a real pipeline (>1 stages).
+        mesh = spx.create_mesh(
             axis_dims=axis_dims,
             axis_names=sharding_axis_names,
+            mpmd_axis=None,
             dcn_mesh_dims=sharding_dcn_axis_dims,
             should_sort_granules_by_key=should_sort_granules_by_key,
             allow_split_physical_axes=allow_split_physical_axes,
@@ -1068,14 +1089,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
             use_jax=not eformer_craft_mesh,
             axis_types=axis_types,
         )
-        return mesh
+        return spx.SpxMesh(jax_mesh=mesh.jax_mesh, mpmd_axis=_compute_mpmd_axis(mesh.jax_mesh))
 
     def _build_mesh(
         self,
         axis_types: (
             collections.abc.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
         ) = None,
-    ) -> common_types.Mesh:
+    ) -> spx.SpxMesh:
         """Create a JAX mesh using the config sharding settings.
 
         Internal helper that normalizes sharding axis dimensions and names from
@@ -1087,7 +1108,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 axes; a sequence must match `sharding_axis_names`. Default: None (auto).
 
         Returns:
-            JAX Mesh object configured with the normalized sharding parameters.
+            SpectraX mesh configured with the normalized sharding parameters.
         """
         sharding_axis_dims = (
             [v for _k, v in self.sharding_axis_dims.items()]
@@ -1140,7 +1161,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         Returns:
             JAX Mesh object defining the device topology for distributed execution.
-            The mesh axes correspond to parallelism strategies (dp, fsdp, ep, tp, sp).
+            The mesh axes correspond to parallelism strategies (pp, dp, fsdp, ep, tp, sp).
 
         Note:
             If a custom mesh was set via `set_model_mesh()`, that mesh is returned
@@ -1148,11 +1169,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         Example:
             >>> config = EasyDeLBaseConfig(
-            ...     sharding_axis_dims=(2, 1, 1, 4, 1),
-            ...     sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp"),
+            ...     sharding_axis_dims=(1, 2, 1, 1, 4, 1),
+            ...     sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
             ... )
             >>> mesh = config.mesh
-            >>> # mesh.shape = {'dp': 2, 'fsdp': 1, 'ep': 1, 'tp': 4, 'sp': 1}
+            >>> # mesh.shape = {'pp': 1, 'dp': 2, 'fsdp': 1, 'ep': 1, 'tp': 4, 'sp': 1}
         """
         if self._hidden_mesh is not None:
             return self._hidden_mesh
@@ -1190,7 +1211,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return self._hidden_manual_mesh
 
     @property
-    def expert_mesh(self) -> jax.sharding.Mesh:
+    def expert_mesh(self) -> spx.SpxMesh:
         """Get the mesh configuration for expert parallelism.
 
         Creates a mesh with expert-parallel axes folded according to the
@@ -1199,19 +1220,26 @@ class EasyDeLBaseConfig(PretrainedConfig):
         across devices with explicit axis types.
 
         Returns:
-            jax.sharding.Mesh: A mesh with explicit axis types configured for
+            spx.SpxMesh: A mesh with explicit axis types configured for
                 expert parallelism with (dp, ep, tp) axis ordering.
         """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
-            self.partition_manager,
+            self.runtime_sharding_resolver,
             self.fsdp_is_ep_bound,
             self.sp_is_ep_bound,
         )
-        return jax.sharding.Mesh(
-            self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
-            axis_names=(dpname, epname, tpname),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+        return spx.SpxMesh(
+            jax_mesh=jax.sharding.Mesh(
+                self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
+                axis_names=(dpname, epname, tpname),
+                axis_types=(
+                    jax.sharding.AxisType.Explicit,
+                    jax.sharding.AxisType.Explicit,
+                    jax.sharding.AxisType.Explicit,
+                ),
+            ),
+            mpmd_axis=None,
         )
 
     @property
@@ -1228,7 +1256,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
-            self.partition_manager,
+            self.runtime_sharding_resolver,
             self.fsdp_is_ep_bound,
             self.sp_is_ep_bound,
         )
@@ -1238,7 +1266,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
 
     @property
-    def auto_expert_mesh(self) -> jax.sharding.Mesh:
+    def auto_expert_mesh(self) -> spx.SpxMesh:
         """Get the mesh for expert parallelism with automatic axis types.
 
         Similar to `expert_mesh`, but uses `jax.sharding.AxisType.Auto` for
@@ -1246,24 +1274,33 @@ class EasyDeLBaseConfig(PretrainedConfig):
         strategy based on the computation graph.
 
         Returns:
-            jax.sharding.Mesh: A mesh with auto axis types configured for
+            spx.SpxMesh: A mesh with auto axis types configured for
                 expert parallelism with (dp, ep, tp) axis ordering.
         """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
-            self.partition_manager,
+            self.runtime_sharding_resolver,
             self.fsdp_is_ep_bound,
             self.sp_is_ep_bound,
         )
-        return jax.sharding.Mesh(
-            self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
-            axis_names=(dpname, epname, tpname),
-            axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
+        return spx.SpxMesh(
+            jax_mesh=jax.sharding.Mesh(
+                self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
+                axis_names=(dpname, epname, tpname),
+                axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
+            ),
+            mpmd_axis=None,
         )
+
+    @staticmethod
+    def _as_spx_mesh(mesh: common_types.Mesh | spx.SpxMesh) -> spx.SpxMesh:
+        if isinstance(mesh, spx.SpxMesh):
+            return mesh
+        return spx.SpxMesh(jax_mesh=mesh, mpmd_axis=_compute_mpmd_axis(mesh))
 
     def _propagate_mesh_to_sub_configs(
         self,
-        mesh: common_types.Mesh,
+        mesh: common_types.Mesh | spx.SpxMesh,
         attr_name_on_self: str,
         setter_method_name: str,
     ):
@@ -1274,7 +1311,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             attr_name_on_self: The hidden attribute name to set (e.g. '_hidden_mesh').
             setter_method_name: The setter method name on sub-configs (e.g. 'set_model_mesh').
         """
-        setattr(self, attr_name_on_self, mesh)
+        spx_mesh = self._as_spx_mesh(mesh)
+        setattr(self, attr_name_on_self, spx_mesh)
 
         sub_configs = getattr(self, "sub_configs", None)
         if not isinstance(sub_configs, dict):
@@ -1286,16 +1324,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 continue
             try:
                 if hasattr(sub_cfg, setter_method_name):
-                    getattr(sub_cfg, setter_method_name)(mesh)
+                    getattr(sub_cfg, setter_method_name)(spx_mesh)
                 else:
-                    setattr(sub_cfg, attr_name_on_self, mesh)
+                    setattr(sub_cfg, attr_name_on_self, spx_mesh)
             except (AttributeError, TypeError):
                 try:
-                    setattr(sub_cfg, attr_name_on_self, mesh)
+                    setattr(sub_cfg, attr_name_on_self, spx_mesh)
                 except (AttributeError, TypeError):
                     pass
 
-    def set_model_mesh(self, mesh: common_types.Mesh):
+    def set_model_mesh(self, mesh: common_types.Mesh | spx.SpxMesh):
         """Sets a custom mesh for the model, overriding the auto-generated one.
 
         Args:
@@ -1303,7 +1341,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh")
 
-    def set_explicit_mesh(self, mesh: common_types.Mesh):
+    def set_explicit_mesh(self, mesh: common_types.Mesh | spx.SpxMesh):
         """Sets a custom explicit-axis mesh for the model.
 
         Args:
@@ -1311,7 +1349,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh")
 
-    def set_manual_mesh(self, mesh: common_types.Mesh):
+    def set_manual_mesh(self, mesh: common_types.Mesh | spx.SpxMesh):
         """Sets a custom manual-axis mesh for the model.
 
         Args:
@@ -1351,7 +1389,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         resolution, as it gives full control over how parameters are distributed.
 
         Returning ``None`` signals that partition rules should be resolved
-        automatically from module-level ``craft_sharding`` hooks.
+        automatically from spectrax parameter metadata.
 
         Args:
             *args: Positional arguments (model-specific).
@@ -1394,13 +1432,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         Returns:
             Sequence of strings naming each parallelism axis.
-            Typically ("dp", "fsdp", "ep", "tp", "sp") for data parallel,
-            fully sharded data parallel, expert parallel, tensor parallel,
-            and sequence parallel respectively.
+            Typically ("pp", "dp", "fsdp", "ep", "tp", "sp") for pipeline,
+            data parallel, fully sharded data parallel, expert parallel,
+            tensor parallel, and sequence parallel respectively.
 
         Example:
             >>> names = config.get_axis_names()
-            >>> # names = ('dp', 'fsdp', 'ep', 'tp', 'sp')
+            >>> # names = ('pp', 'dp', 'fsdp', 'ep', 'tp', 'sp')
         """
         return self.sharding_axis_names
 
@@ -1448,6 +1486,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_tiling_size_batch",
             "moe_tiling_size_seqlen",
             "moe_tiling_size_dim",
+            "axis_policy",
             "partition_axis",
             "use_sharded_kv_caching",
             "backend",
@@ -1456,6 +1495,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "bits",
             "scan_ring_attention",
             "scan_attention_layers",
+            "scan_layers",
+            "pipeline_virtual_stages",
+            "pipeline_stage_layout",
             "use_sharding_constraint",
             "use_scan_mlp",
             "scan_mlp_chunk_size",
@@ -1474,10 +1516,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "attn_dtype",
             "kvdtype",
             "attn_softmax_dtype",
-            "hardware_abstraction",
-            "pallas_m_block_size",
-            "pallas_k_block_size",
-            "pallas_n_block_size",
             "moe_method",
             "moe_force_xla_gmm",
             "use_ring_of_experts",
@@ -1506,6 +1544,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_batch: int = NOT_GIVEN,
         moe_tiling_size_seqlen: int = NOT_GIVEN,
         moe_tiling_size_dim: int = NOT_GIVEN,
+        axis_policy: AxisPolicy | dict[str, tp.Any] = NOT_GIVEN,
         partition_axis: PartitionAxis = NOT_GIVEN,
         use_sharded_kv_caching: bool = NOT_GIVEN,
         backend: EasyDeLBackends | None = NOT_GIVEN,
@@ -1514,6 +1553,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         bits: int | None = NOT_GIVEN,
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
+        scan_layers: bool = NOT_GIVEN,
+        pipeline_virtual_stages: int = NOT_GIVEN,
+        pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
         use_scan_mlp: bool = NOT_GIVEN,
         scan_mlp_chunk_size: int = NOT_GIVEN,
@@ -1531,10 +1573,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         attn_dtype: jnp.dtype = NOT_GIVEN,
         kvdtype: jnp.dtype | None = NOT_GIVEN,
         attn_softmax_dtype: jnp.dtype = NOT_GIVEN,
-        hardware_abstraction: bool = NOT_GIVEN,
-        pallas_m_block_size: int = NOT_GIVEN,
-        pallas_k_block_size: int = NOT_GIVEN,
-        pallas_n_block_size: int = NOT_GIVEN,
         moe_method: AVAILABLE_MOE_METHODS = NOT_GIVEN,
         moe_force_xla_gmm: bool = NOT_GIVEN,
         use_ring_of_experts: bool = NOT_GIVEN,
@@ -1554,10 +1592,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sync without re-implementing initialization logic.
 
         Args:
-            sharding_axis_dims: Fallback mesh sizes for ``(dp, fsdp, ep, tp, sp)``,
-                defaulting to ``(1, -1, 1, 1, 1)``.
+            sharding_axis_dims: Fallback mesh sizes for ``(pp, dp, fsdp, ep, tp, sp)``,
+                defaulting to ``(1, 1, -1, 1, 1, 1)``.
             sharding_dcn_axis_dims: Optional DCN mesh sizes (default ``None``).
-            sharding_axis_names: Mesh axis labels, default ``("dp", "fsdp", "ep", "tp", "sp")``.
+            sharding_axis_names: Mesh axis labels, default ``("pp", "dp", "fsdp", "ep", "tp", "sp")``.
             attn_mechanism: Attention mechanism to use (default ``"vanilla"``).
             decode_attn_mechanism: Optional decode-time attention mechanism.
             mla_attn_mechanism: MLA-layer-specific attention mechanism override
@@ -1580,6 +1618,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             bits: Optional quantization bit width, default ``None``.
             scan_ring_attention: Enable scan for ring attention (default ``True``).
             scan_attention_layers: Enable scan for attention blocks (default ``True``).
+            scan_layers: Enable scan for repeated model layers when supported.
+            pipeline_virtual_stages: Logical virtual pipeline stages per physical pipeline rank.
+            pipeline_stage_layout: Virtual-stage to physical PP-rank layout.
             use_sharding_constraint: Insert sharding constraints (default ``False``).
             use_scan_mlp: Enable scan for MLPs (default ``False``).
             scan_mlp_chunk_size: Chunk size for scanned MLPs (default ``1024``).
@@ -1598,10 +1639,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             attn_dtype: Attention activation dtype (default ``jnp.float32``).
             kvdtype: KV cache dtype (defaults to `attn_dtype` when unset).
             attn_softmax_dtype: Softmax computation dtype (default ``jnp.float32``).
-            hardware_abstraction: Toggle EasyDeL hardware abstraction (default ``DEFAULT_HARDWARE_ABSTRACTION``).
-            pallas_m_block_size: Pallas matmul M block size (default ``DEFAULT_PALLAS_M_BLOCK_SIZE``).
-            pallas_k_block_size: Pallas matmul K block size (default ``DEFAULT_PALLAS_K_BLOCK_SIZE``).
-            pallas_n_block_size: Pallas matmul N block size (default ``DEFAULT_PALLAS_N_BLOCK_SIZE``).
             moe_method: MoE implementation to use (default ``DEFAULT_MOE_METHOD``).
             moe_force_xla_gmm: Force XLA GMM kernels for MoE (default ``False``).
             use_ring_of_experts: Dispatch experts with a ring topology (default ``RING_EXPERTS``).
@@ -1611,16 +1648,26 @@ class EasyDeLBaseConfig(PretrainedConfig):
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
 
-        set_attrs_smartly(self, "sharding_axis_dims", (1, -1, 1, 1, 1), sharding_axis_dims)
+        set_attrs_smartly(self, "sharding_axis_dims", DEFAULT_SHARDING_AXIS_DIMS, sharding_axis_dims)
         set_attrs_smartly(self, "sharding_dcn_axis_dims", None, sharding_dcn_axis_dims)
-        set_attrs_smartly(self, "sharding_axis_names", ("dp", "fsdp", "ep", "tp", "sp"), sharding_axis_names)
+        set_attrs_smartly(self, "sharding_axis_names", DEFAULT_SHARDING_AXIS_NAMES, sharding_axis_names)
         set_attrs_smartly(self, "blocksize_q", 512, blocksize_q)
         set_attrs_smartly(self, "blocksize_k", 512, blocksize_k)
         set_attrs_smartly(self, "blocksize_b", 1, blocksize_b)
         set_attrs_smartly(self, "moe_tiling_size_batch", 4, moe_tiling_size_batch)
         set_attrs_smartly(self, "moe_tiling_size_seqlen", 128, moe_tiling_size_seqlen)
         set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
-        set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
+        if axis_policy is NOT_GIVEN:
+            set_attrs_smartly(self, "axis_policy", AxisPolicy(), NOT_GIVEN)
+        else:
+            normalized_axis_policy = AxisPolicy.from_partition_axis(axis_policy)
+            set_attrs_smartly(self, "axis_policy", AxisPolicy(), normalized_axis_policy)
+        if partition_axis is NOT_GIVEN:
+            partition_axis = self.axis_policy.to_partition_axis()
+        set_attrs_smartly(self, "partition_axis", self.axis_policy.to_partition_axis(), partition_axis)
+        if isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
+        self.axis_policy = AxisPolicy.from_partition_axis(self.partition_axis)
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
 
         set_attrs_smartly(self, "backend", None, backend)
@@ -1634,6 +1681,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "bits", None, bits)
         set_attrs_smartly(self, "scan_attention_layers", False, scan_attention_layers)
         set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
+        set_attrs_smartly(self, "scan_layers", False, scan_layers)
+        set_attrs_smartly(self, "pipeline_virtual_stages", 1, pipeline_virtual_stages)
+        set_attrs_smartly(self, "pipeline_stage_layout", "loop", pipeline_stage_layout)
+        if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
+            raise ValueError(
+                "`pipeline_stage_layout` must be one of 'contiguous', 'interleaved', or 'loop'. "
+                f"Got {self.pipeline_stage_layout!r}."
+            )
         set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
         set_attrs_smartly(self, "sequence_axis_name", "sp", sequence_axis_name)
@@ -1653,10 +1708,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
         set_attrs_smartly(self, "mla_attn_softmax_dtype", self.attn_softmax_dtype, mla_attn_softmax_dtype)
         self._coerce_runtime_dtype_fields()
-        set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
-        set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
-        set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
-        set_attrs_smartly(self, "pallas_n_block_size", DEFAULT_PALLAS_N_BLOCK_SIZE, pallas_n_block_size)
         set_attrs_smartly(self, "moe_method", DEFAULT_MOE_METHOD, moe_method)
         set_attrs_smartly(self, "moe_force_xla_gmm", False, moe_force_xla_gmm)
         set_attrs_smartly(self, "use_ring_of_experts", RING_EXPERTS, use_ring_of_experts)
@@ -1665,11 +1716,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
 
         for key_, value_ in kwargs.items():
+            if key_ in _REMOVED_BASE_CONFIG_KEYS:
+                continue
             setattr(self, key_, value_)
         if getattr(self, "sub_configs", None) is not None:
             for name, _ in getattr(self, "sub_configs", {}).items():
                 getattr(self, name).read_basics_from_config(self)
                 for key_, value_ in kwargs.items():
+                    if key_ in _REMOVED_BASE_CONFIG_KEYS:
+                        continue
                     setattr(getattr(self, name), key_, value_)
 
     # Attributes to hide from __repr__ and __str__ output.
@@ -1692,6 +1747,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "moe_tiling_size_batch",
         "moe_tiling_size_seqlen",
         "moe_tiling_size_dim",
+        "axis_policy",
         "partition_axis",
         "use_sharded_kv_caching",
         "use_sharding_constraint",
@@ -1701,6 +1757,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "bits",
         "scan_ring_attention",
         "scan_attention_layers",
+        "scan_layers",
+        "pipeline_virtual_stages",
+        "pipeline_stage_layout",
         "use_scan_mlp",
         "scan_mlp_chunk_size",
         "sequence_axis_name",
@@ -1719,10 +1778,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "attn_softmax_dtype",
         "fcm_max_ratio",
         "fcm_min_ratio",
-        "hardware_abstraction",
-        "pallas_m_block_size",
-        "pallas_k_block_size",
-        "pallas_n_block_size",
         "moe_method",
         "moe_force_xla_gmm",
         "use_expert_tensor_mode",
@@ -2683,7 +2738,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             partial_rotary_factor=partial_rotary_factor,
         ).astype(jnp.bfloat16)
 
-        return ModuleCaches(jax.device_put(frequencies, Ns(self.mesh, Ps())))
+        return ModuleCaches(spx.with_sharding_constraint(frequencies, Ps(), mesh=self.mesh, ignore_mpmd=True))
 
     @staticmethod
     def _create_causal_mask(target_length):
@@ -2790,7 +2845,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         target_length = self.granted_mask_max_position_embedding
 
-        return ModuleCaches(jax.device_put(self._create_causal_mask(target_length), Ns(self.mesh, Ps())))
+        mask = self._create_causal_mask(target_length)
+        return ModuleCaches(spx.with_sharding_constraint(mask, Ps(), mesh=self.mesh, ignore_mpmd=True))
 
     def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
         """Generate a Forgetful Causal Mask (FCM) for training.
@@ -2916,28 +2972,34 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return tuple(prefixed)
 
     @property
-    def partition_manager(self) -> PartitionManager:
-        """Gets the partition manager for this configuration.
+    def runtime_sharding_resolver(self) -> RuntimeShardingResolver:
+        """Return the canonical runtime sharding resolver for this config."""
+        if not isinstance(getattr(self, "axis_policy", None), AxisPolicy):
+            self.axis_policy = AxisPolicy.from_partition_axis(getattr(self, "partition_axis", None))
+        if not isinstance(getattr(self, "partition_axis", None), PartitionAxis):
+            self.partition_axis = self.axis_policy.to_partition_axis()
+        return RuntimeShardingResolver(axis_policy=self.axis_policy, mesh=self.mesh)
 
-        The PartitionManager handles translation between logical axis names (like 'dp', 'tp')
-        and their actual configurations in the device mesh. It provides utilities for
-        resolving partition specifications and managing distributed execution.
+    def logical_axis_rules(
+        self,
+        *,
+        mode: str | int | object = MODE_TRAIN,
+        shape: tuple[int, ...] | object = NOT_GIVEN,
+        overrides: LogicalAxisRules | None = None,
+    ):
+        """Open a spectrax logical-axis-rules scope derived from ``axis_policy``."""
+        return self.runtime_sharding_resolver.logical_axis_rules(mode=mode, shape=shape, overrides=overrides)
 
-        Returns:
-            PartitionManager instance configured with this config's partition_axis.
-            If partition_axis is None, creates a default PartitionAxis() first.
+    @property
+    def partition_manager(self) -> RuntimeShardingResolver:
+        """Compatibility view returning the runtime sharding resolver.
 
-        Example:
-            >>> config = EasyDeLBaseConfig()
-            >>> pm = config.partition_manager
-            >>> # Use partition manager to resolve sharding specs
-            >>> spec = pm.resolve(axes=["dp", "tp"], mode="train", shape=(8, 1024))
+        EasyDeL now uses ``RuntimeShardingResolver`` internally. The historical
+        ``partition_manager`` property remains available so existing model and
+        trainer code can keep calling ``resolve(...)`` / ``shard(...)`` while the
+        rest of the stack migrates to ``axis_policy``.
         """
-        if self.partition_axis is None:
-            self.partition_axis = PartitionAxis()
-        elif isinstance(self.partition_axis, dict):
-            self.partition_axis = PartitionAxis(**self.partition_axis)
-        return PartitionManager(self.partition_axis)
+        return self.runtime_sharding_resolver
 
     __hash__ = hash_fn
 

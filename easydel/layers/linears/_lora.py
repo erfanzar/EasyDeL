@@ -23,7 +23,7 @@ calling contract. In particular:
 - chunked scoring / generation paths may call ``native_forward`` directly to
   avoid trace-context issues caused by rematerialization wrappers.
 
-Flax NNX's stock ``nn.LoRA`` implementation is perfectly fine as a generic LoRA
+Spectrax's stock ``nn.LoRA`` implementation is perfectly fine as a generic LoRA
 layer, but it does not preserve those EasyDeL-specific conventions. ``eLoRA``
 is therefore a thin compatibility wrapper rather than a different LoRA
 algorithm.
@@ -31,8 +31,12 @@ algorithm.
 
 from __future__ import annotations
 
+import typing as tp
+
 import jax
-from flax import nnx as nn
+import jax.numpy as jnp
+import spectrax as spx
+from spectrax import nn
 
 
 class eLoRA(nn.LoRA):
@@ -42,23 +46,57 @@ class eLoRA(nn.LoRA):
     update ``x @ A @ B`` and, when a base module is present, adds the base
     module output. The value this subclass adds is interface compatibility:
 
-    - ``__call__`` forwards ``*args`` / ``**kwargs`` to the wrapped module.
+    - ``forward`` forwards ``*args`` / ``**kwargs`` to the wrapped module.
     - ``native_forward`` is exposed for trace-safe LM-head projection paths.
 
     This lets a LoRA-wrapped ``ParallelLinear`` keep working in places that
     assume they are still talking to an EasyDeL linear layer.
     """
 
-    def __call__(self, x: jax.Array, *args, **kwargs):
+    dtype: jnp.dtype | None = None
+
+    def __init__(
+        self,
+        d_in: int,
+        rank: int,
+        d_out: int,
+        *,
+        base_module: tp.Callable[..., tp.Any] | None = None,
+        alpha: float | None = None,
+        rngs: spx.Rngs | int | None = None,
+        a_init: tp.Callable | None = None,
+        b_init: tp.Callable | None = None,
+        dtype: jnp.dtype | None = None,
+    ) -> None:
+        super().__init__(
+            d_in=d_in,
+            rank=rank,
+            d_out=d_out,
+            base_module=base_module,
+            alpha=alpha,
+            rngs=rngs,
+            a_init=a_init,
+            b_init=b_init,
+            dtype=dtype,
+        )
+        self.dtype = dtype
+
+    @staticmethod
+    def _maybe_cast(x: jax.Array, dtype: jnp.dtype | None) -> jax.Array:
+        return x.astype(dtype) if dtype is not None else x
+
+    def forward(self, x: jax.Array, *args, **kwargs):
         """Apply the LoRA update and delegate extra call arguments to the base module.
 
-        Flax's stock ``nn.LoRA.__call__`` only accepts the input array. EasyDeL
+        Spectrax's stock ``nn.LoRA.forward`` only accepts the input array. EasyDeL
         sometimes passes additional arguments through linear layers, most notably
         ``w=...`` when reusing embedding weights for tied LM-head projection.
         Forwarding the extra arguments here keeps the wrapped base module's API
         intact while still adding the LoRA residual.
         """
-        x, lora_a, lora_b = self.promote_dtype((x, self.lora_a[...], self.lora_b[...]), dtype=self.dtype)
+        x = self._maybe_cast(x, self.dtype)
+        lora_a = self._maybe_cast(self.lora_a[...], self.dtype)
+        lora_b = self._maybe_cast(self.lora_b[...], self.dtype)
         out = x @ lora_a @ lora_b
         if self.base_module is not None:
             if not callable(self.base_module):
@@ -75,10 +113,10 @@ class eLoRA(nn.LoRA):
         """Project through LoRA using EasyDeL's trace-safe linear-layer contract.
 
         EasyDeL's chunked LM-head utilities call ``native_forward`` directly
-        because that path avoids the NNX module-call machinery used by
+        because that path avoids the module-call machinery used by
         rematerialized heads inside nested JAX traces. A LoRA wrapper around the
         LM head therefore also needs to provide ``native_forward`` so those
-        utilities can continue to bypass the regular ``__call__`` path.
+        utilities can continue to bypass the regular module-call path.
 
         Args:
             inputs: Hidden states or activations to project.
@@ -90,7 +128,9 @@ class eLoRA(nn.LoRA):
             The sum of the LoRA residual projection and the wrapped base-module
             projection.
         """
-        inputs, lora_a, lora_b = self.promote_dtype((inputs, self.lora_a[...], self.lora_b[...]), dtype=self.dtype)
+        inputs = self._maybe_cast(inputs, self.dtype)
+        lora_a = self._maybe_cast(self.lora_a[...], self.dtype)
+        lora_b = self._maybe_cast(self.lora_b[...], self.dtype)
         out = inputs @ lora_a @ lora_b
         if self.base_module is not None:
             if hasattr(self.base_module, "native_forward"):

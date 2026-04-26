@@ -50,11 +50,11 @@ See Also:
 from collections.abc import Callable
 
 import jax
-from eformer import common_types
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types
 
 from easydel.caching import (
     HybridCache,
@@ -132,7 +132,7 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         qa_head_bias: bool = True,
         qa_head_kernel_init: Callable | None = None,
     ):
@@ -156,11 +156,11 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
             param_dtype: Data type for parameters (weights). Defaults to bfloat16.
             precision: JAX precision setting for matrix multiplications.
                 Higher precision may improve numerical stability.
-            rngs: Flax random number generators for initialization.
+            rngs: SpecTrax random number generators for initialization.
             qa_head_bias: Whether to include bias in the QA output layer.
                 Defaults to True for standard QA behavior.
             qa_head_kernel_init: Custom initializer for QA head weights.
-                If None, uses the default Flax initializer.
+                If None, uses the default SpecTrax initializer.
 
         Example:
             Creating a QA model::
@@ -170,7 +170,7 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
                     config=config,
                     base_model_class=BertModel,
                     dtype=jnp.float32,
-                    rngs=nn.Rngs(0),
+                    rngs=spx.Rngs(0),
                     qa_head_bias=True,
                 )
 
@@ -212,7 +212,7 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -328,14 +328,14 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
         The head projects from hidden_size to 2 dimensions.
 
         Returns:
-            nn.Module: The QA outputs module (typically ColumnParallelLinear).
+            spx.Module: The QA outputs module (typically ColumnParallelLinear).
                 Shape of kernel: (hidden_size, 2).
 
         Example:
             Accessing QA head weights::
 
                 head = model.get_task_head()
-                weights = head.kernel.value  # Shape: (hidden_size, 2)
+                weights = head.weight.value  # Shape: (hidden_size, 2)
         """
         return self.qa_outputs
 

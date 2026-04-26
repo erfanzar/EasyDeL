@@ -17,13 +17,11 @@ import typing
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -78,7 +76,7 @@ class GptOssRMSNorm(RMSNorm):
     ...
 
 
-class GptOssExperts(nn.Module):
+class GptOssExperts(spx.Module):
     """Grouped expert feed-forward network used inside GPT-OSS MoE layers.
 
     This module implements the expert network for Mixture-of-Experts (MoE) routing
@@ -111,8 +109,8 @@ class GptOssExperts(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., 0::2]},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[..., 1::2]},
+                {"name": "gate_proj.weight", "spliter": lambda x: x[..., 0::2]},
+                {"name": "up_proj.weight", "spliter": lambda x: x[..., 1::2]},
             ],
             "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
         },
@@ -125,7 +123,7 @@ class GptOssExperts(nn.Module):
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x},
+                {"name": "down_proj.weight", "spliter": lambda x: x},
             ],
             "inverse_spliter": lambda x: x,
         },
@@ -144,7 +142,7 @@ class GptOssExperts(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the GptOssExperts module.
 
@@ -154,7 +152,7 @@ class GptOssExperts(nn.Module):
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         self.dtype = dtype
@@ -171,9 +169,9 @@ class GptOssExperts(nn.Module):
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=True,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -184,8 +182,8 @@ class GptOssExperts(nn.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=True,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -196,8 +194,8 @@ class GptOssExperts(nn.Module):
             out_features=config.intermediate_size,
             rngs=rngs,
             use_bias=True,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -205,7 +203,7 @@ class GptOssExperts(nn.Module):
         self.alpha = 1.702
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         group_sizes: Array,
@@ -267,7 +265,7 @@ class GptOssMLP(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the GptOssMLP module.
 
@@ -280,7 +278,7 @@ class GptOssMLP(BaseMoeModule):
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -301,7 +299,7 @@ class GptOssMLP(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
         self.experts = GptOssExperts(
             config=config,
@@ -326,7 +324,7 @@ class GptOssMLP(BaseMoeModule):
             refine_weights_hook=_softmax_topk_weights,
         )
 
-    def __call__(self, hidden_states, training=False, layer_idx=None):
+    def forward(self, hidden_states, training=False, layer_idx=None):
         """Forward pass through the MoE MLP.
 
         Routes input hidden states through the expert network based on router
@@ -359,9 +357,9 @@ class GptOssMLP(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.router,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             wi_bias=self.experts.gate_proj.bias.value,
             wu_bias=self.experts.up_proj.bias.value,
             wd_bias=self.experts.down_proj.bias.value,
@@ -399,7 +397,7 @@ class GptOssAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize GPT-OSS attention with sink tokens.
@@ -410,7 +408,7 @@ class GptOssAttention(UnifiedAttention):
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
             layer_idx (int): Index of this layer in the model. Used to determine
                 whether this layer uses sliding window attention.
         """
@@ -438,15 +436,11 @@ class GptOssAttention(UnifiedAttention):
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": config.initializer_range},
-            key=rngs.param(),
+            key=rngs.param,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for sink parameters."""
-        return {"sinks": Replicated}
 
-
-class GptOssDecoderLayer(nn.Module):
+class GptOssDecoderLayer(spx.Module):
     """GPT-OSS decoder layer with attention and Mixture-of-Experts MLP.
 
     This module represents a single transformer decoder block in GPT-OSS,
@@ -479,7 +473,7 @@ class GptOssDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize the GPT-OSS decoder layer.
@@ -490,7 +484,7 @@ class GptOssDecoderLayer(nn.Module):
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
             layer_idx (int): Index of this layer in the model.
         """
         self.config = config
@@ -531,7 +525,7 @@ class GptOssDecoderLayer(nn.Module):
         )
         self.attention_type = config.layer_types[layer_idx] if config.layer_types is not None else "standard"
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -591,7 +585,7 @@ class GptOssDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -614,7 +608,7 @@ class GptOssModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         embed_tokens (Embed): Embedding layer for input tokens.
         layers (tp.List[GptOssDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
@@ -628,7 +622,7 @@ class GptOssModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the GptOssModel.
 
@@ -637,7 +631,7 @@ class GptOssModel(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -661,19 +655,19 @@ class GptOssModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = GptOssRMSNorm(
             dim=config.hidden_size,
@@ -683,7 +677,7 @@ class GptOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -794,10 +788,11 @@ class GptOssModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
@@ -805,14 +800,14 @@ class GptOssModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_self_attns += (layer_outputs.attention_weight,)
@@ -820,8 +815,15 @@ class GptOssModel(EasyDeLBaseModule):
             if output_router_logits:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_self_attns, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         return MoeModelOutput(
@@ -876,7 +878,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):  # type:
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         base_model (GptOssModel): The underlying GPT-OSS transformer model.
         lm_head: Linear layer projecting hidden states to vocabulary logits.
     """
@@ -892,7 +894,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):  # type:
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the GPT-OSS Causal LM module.
 
@@ -915,7 +917,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):  # type:
             router_aux_loss_coef=config.router_aux_loss_coef,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1017,7 +1019,7 @@ class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssMod
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         model (GptOssModel): The core GptOss transformer model.
         score (ParallelLinear): The linear layer for classification.
         num_experts (int): Total number of experts.
@@ -1035,7 +1037,7 @@ class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssMod
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the GptOssForSequenceClassification model.
 
@@ -1045,7 +1047,7 @@ class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssMod
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
 
         Raises:
             AssertionError: If `config.num_labels` is not defined.
@@ -1062,7 +1064,7 @@ class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssMod
             score_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

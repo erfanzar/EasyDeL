@@ -15,8 +15,8 @@
 """Tests for Gemma3 text-only model."""
 
 import pytest
+import spectrax as spx
 import transformers
-from flax import nnx as nn
 from jax import numpy as jnp
 
 import easydel as ed
@@ -74,7 +74,7 @@ class TestGemma3Text:
         gemma3_text_config.final_logit_softcapping = 7.5
         model = ed.Gemma3ForCausalLM(
             config=gemma3_text_config,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
         hidden_states = jnp.ones((1, 2, gemma3_text_config.hidden_size), dtype=jnp.float32)
 

@@ -14,7 +14,7 @@
 
 """Neural network modules for Rotary Position Embeddings (RoPE).
 
-This module provides Flax NNX Module classes that implement various RoPE
+This module provides spectrax Module classes that implement various RoPE
 scaling methods for use in transformer attention layers. Each class computes
 and applies rotary positional embeddings to query and key tensors.
 
@@ -56,7 +56,7 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
 
 from easydel.layers.norms import lowfloats
 
@@ -128,7 +128,7 @@ def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
 
 
 @rope_wrapper("default")
-class RotaryEmbedding(nn.Module):
+class RotaryEmbedding(spx.Module):
     """
     Standard Rotary Positional Embedding (RoPE) module.
 
@@ -171,7 +171,7 @@ class RotaryEmbedding(nn.Module):
         self.dtype = dtype
 
     @jax.named_scope("easydel-rope-embedding")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,
@@ -221,10 +221,6 @@ class RotaryEmbedding(nn.Module):
                 offsets=offsets,
                 dtype=self.dtype,
             )
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return dynamic partition specs for this module's parameters."""
-        return {}
 
 
 @rope_wrapper("mrope")
@@ -373,7 +369,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         return freqs_t
 
     @jax.named_scope("easydel-mrope")
-    def __call__(
+    def forward(
         self,
         positions: jax.Array,
         query: jax.Array,
@@ -553,7 +549,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         self.scaling_factors = scaling_factors
 
     @jax.named_scope("easydel-rope-linear-scaling")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,
@@ -647,7 +643,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         self.scaling_factor = scaling_factor
 
     @jax.named_scope("easydel-rope-dynamic-ntk-scaling")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,
@@ -767,7 +763,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_slow = beta_slow
 
     @jax.named_scope("easydel-rope-yarn-scaling")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,
@@ -822,13 +818,13 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
 
 @rope_wrapper("deepseek_yarn")
-class DeepseekScalingRotaryEmbedding(nn.Module):
+class DeepseekScalingRotaryEmbedding(spx.Module):
     """
     RotaryEmbedding implementing a YaRN-like scaling method, potentially from Deepseek models.
 
     Uses YaRN parameters (`beta_fast`, `beta_slow`, `extrapolation_factor`) and includes
     additional m-scale parameters (`mscale`, `mscale_all_dim`). This version has a custom
-    `__call__` method differing slightly from `apply_basic_rope`.
+    `forward` method differing slightly from `apply_basic_rope`.
 
     Attributes:
         head_size (int): Dimension of each attention head.
@@ -898,7 +894,7 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         self.mscale_all_dim = mscale_all_dim
 
     @jax.named_scope("easydel-rope-deepseek")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,
@@ -968,7 +964,7 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
 
 
 @rope_wrapper("longrope")
-class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
+class Phi3LongRoPEScaledRotaryEmbedding(spx.Module):
     """
     RotaryEmbedding using the Phi-3 LongRoPE scaling method.
 
@@ -1032,7 +1028,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         self.long_factor = long_factor
 
     @jax.named_scope("easydel-rope-phi3-long")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,
@@ -1146,7 +1142,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         self.orig_max_position = orig_max_position
 
     @jax.named_scope("easydel-rope-llama3")
-    def __call__(
+    def forward(
         self,
         positions: jnp.ndarray,
         query: jnp.ndarray,

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import pytest
-from flax import nnx as nn
+import spectrax as spx
 
 import easydel as ed
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
@@ -933,11 +933,11 @@ def test_create_mesh_normalizes_multi_device_axis_dims_on_single_device(monkeypa
         return object()
 
     monkeypatch.setattr(jax, "device_count", lambda backend=None: 1)
-    monkeypatch.setattr("eformer.escale.create_mesh", _fake_create_mesh)
+    monkeypatch.setattr("spectrax.create_mesh", _fake_create_mesh)
 
-    ed.EasyDeLBaseConfig.create_mesh(sharding_axis_dims=(1, 4, 1, -1, 1))
+    ed.EasyDeLBaseConfig.create_mesh(sharding_axis_dims=(1, 1, 4, 1, -1, 1))
 
-    assert captured["axis_dims"] == (1, 1, 1, -1, 1)
+    assert captured["axis_dims"] == (1, 1, 1, 1, -1, 1)
 
 
 def _build_tiny_qwen35(attn_mechanism: str):
@@ -958,7 +958,7 @@ def _build_tiny_qwen35(attn_mechanism: str):
             config=config,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
     return model
 
@@ -1004,7 +1004,7 @@ def _build_tiny_qwen35_vlm(attn_mechanism: str):
             config=config,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
     return model
 

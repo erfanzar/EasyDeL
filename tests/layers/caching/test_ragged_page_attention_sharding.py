@@ -15,7 +15,7 @@
 from types import SimpleNamespace
 
 import numpy as np
-from eformer import common_types as ct
+from spectrax import common_types as ct
 
 import easydel.operations.kernels.ragged_page_attention as ragged_page_mod
 

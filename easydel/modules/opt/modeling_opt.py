@@ -14,7 +14,7 @@
 
 
 # coding=utf-8
-# Copyright 2022 The Fairseq Authors and The Google Flax Team Authors And The HuggingFace Inc. team. All rights reserved.
+# Copyright 2022 The Fairseq Authors and The Google SpecTrax Team Authors And The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,20 +28,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # THIS SCRIPT IS EDITED FROM ORIGINAL IMPLEMENTATION OF TRANSFORMERS OPT
-"""Flax OPT model."""
+"""SpecTrax OPT model."""
 
 from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -101,7 +99,7 @@ class OPTAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the OPTAttention module.
 
@@ -115,7 +113,7 @@ class OPTAttention(AttentionModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
 
         Raises:
             ValueError: If `embed_dim` is not divisible by `num_heads`.
@@ -144,7 +142,7 @@ class OPTAttention(AttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(config.init_std),
+            kernel_init=jax.nn.initializers.normal(config.init_std),
         )
 
         self.q_proj, self.k_proj, self.v_proj = (
@@ -182,7 +180,7 @@ class OPTAttention(AttentionModule):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -260,7 +258,7 @@ class OPTAttention(AttentionModule):
         )
 
 
-class OPTDecoderLayer(nn.Module):
+class OPTDecoderLayer(spx.Module):
     """OPT Decoder Layer.
 
     This module represents a single layer in the OPT decoder stack.
@@ -290,7 +288,7 @@ class OPTDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize OPT decoder layer.
 
@@ -299,7 +297,7 @@ class OPTDecoderLayer(nn.Module):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__()
 
@@ -336,7 +334,7 @@ class OPTDecoderLayer(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(config.init_std),
+            kernel_init=jax.nn.initializers.normal(config.init_std),
             rngs=rngs,
         )
         self.fc2 = RowParallelLinear(
@@ -345,7 +343,7 @@ class OPTDecoderLayer(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(config.init_std),
+            kernel_init=jax.nn.initializers.normal(config.init_std),
             rngs=rngs,
         )
         self.final_layer_norm = LayerNorm(
@@ -356,7 +354,7 @@ class OPTDecoderLayer(nn.Module):
             epsilon=1e-05,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -406,7 +404,7 @@ class OPTDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         if not self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -434,7 +432,7 @@ class OPTDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -443,7 +441,7 @@ class OPTDecoderLayer(nn.Module):
         )
 
 
-class OPTLearnedPositionalEmbedding(nn.Module):
+class OPTLearnedPositionalEmbedding(spx.Module):
     """Learned positional embedding for OPT.
 
     This module learns positional embeddings up to a maximum specified length.
@@ -462,7 +460,7 @@ class OPTLearnedPositionalEmbedding(nn.Module):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.float32,
         embedding_init=None,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the OPTLearnedPositionalEmbedding module.
 
@@ -474,7 +472,7 @@ class OPTLearnedPositionalEmbedding(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for the parameters. Defaults to jnp.float32.
             embedding_init (callable, optional): Initializer function for the embeddings.
                 Defaults to `jax.nn.initializers.normal(stddev=1.0)`.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         self.offset = offset
         self.num_embeddings = num_embeddings
@@ -483,36 +481,27 @@ class OPTLearnedPositionalEmbedding(nn.Module):
         self.param_dtype = param_dtype
 
         # Create embedding parameter directly to match HuggingFace structure
-        # HuggingFace uses 'weight' (PyTorch) which becomes 'kernel' in Flax
+        # HuggingFace uses 'weight' (PyTorch) which becomes 'kernel' in SpecTrax
         if embedding_init is not None:
-            value = embedding_init(rngs.params(), (num_embeddings + offset, features), param_dtype)
-            self.kernel = ArrayParam.bound(
+            value = embedding_init(rngs.parameters, (num_embeddings + offset, features), param_dtype)
+            self.weight = ArrayParam.bound(
                 shape=(num_embeddings + offset, features),
                 dtype=param_dtype,
                 init_method="variance_scaling",
                 init_kwargs={"scale": 1.0, "mode": "fan_in", "distribution": "normal"},
-                key=rngs.params(),
+                key=rngs.parameters,
                 value=value,
             )
         else:
-            self.kernel = ArrayParam.bound(
+            self.weight = ArrayParam.bound(
                 shape=(num_embeddings + offset, features),
                 dtype=param_dtype,
                 init_method="variance_scaling",
                 init_kwargs={"scale": 1.0, "mode": "fan_in", "distribution": "normal"},
-                key=rngs.params(),
+                key=rngs.parameters,
             )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specifications for positional embedding parameters.
-
-        Returns:
-            dict[str, object]: Mapping of parameter names to sharding specs.
-                The kernel is replicated across all devices.
-        """
-        return {"kernel": Replicated}
-
-    def __call__(self, inputs: Array) -> Array:
+    def forward(self, inputs: Array) -> Array:
         """Apply learned positional embeddings with offset.
 
         Args:
@@ -524,7 +513,7 @@ class OPTLearnedPositionalEmbedding(nn.Module):
         # Add offset to inputs and lookup embeddings
         indices = inputs + self.offset
         # Use take for embedding lookup, matching Embed behavior
-        embedded = jnp.take(self.kernel.value, indices, axis=0)
+        embedded = jnp.take(self.weight.value, indices, axis=0)
         # Cast to output dtype if needed
         if self.dtype != self.param_dtype:
             embedded = embedded.astype(self.dtype)
@@ -564,7 +553,7 @@ class OPTDecoder(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the OPTDecoder.
 
@@ -576,7 +565,7 @@ class OPTDecoder(EasyDeLBaseModule):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__(
             config=config,
@@ -595,7 +584,7 @@ class OPTDecoder(EasyDeLBaseModule):
         self.embed_tokens = Embed(
             config.vocab_size,
             config.word_embed_proj_dim,
-            embedding_init=nn.initializers.normal(config.init_std),
+            embedding_init=jax.nn.initializers.normal(config.init_std),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -608,7 +597,7 @@ class OPTDecoder(EasyDeLBaseModule):
         self.embed_positions = Embed(
             self.config.max_position_embeddings + offset,
             embed_dim,
-            embedding_init=nn.initializers.normal(config.init_std),
+            embedding_init=jax.nn.initializers.normal(config.init_std),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -655,20 +644,20 @@ class OPTDecoder(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for _ in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=_):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -747,9 +736,11 @@ class OPTDecoder(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, decoder_layer in enumerate(self.layers):
+
+        def _layer_loop(decoder_layer, carry):
+            hidden_states, all_hidden_states, all_self_attns, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -757,17 +748,24 @@ class OPTDecoder(EasyDeLBaseModule):
                 hidden_states=hidden_states,
                 mask_info=mask_info,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:
                 all_self_attns += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_self_attns, idx + 1
+
+        hidden_states, all_hidden_states, all_self_attns, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_self_attns, 0),
+            trace=True,
+        )
         if self.final_layer_norm is not None:
             hidden_state = checkpoint_name(self.final_layer_norm(hidden_states), "model_output")
         else:
@@ -815,7 +813,7 @@ class OPTModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the OPTModel.
 
@@ -827,7 +825,7 @@ class OPTModel(EasyDeLBaseModule):
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         super().__init__(
             config=config,
@@ -853,7 +851,7 @@ class OPTModel(EasyDeLBaseModule):
         """
         return self.decoder
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -974,7 +972,7 @@ class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):  # type: ignore
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initializes the OPTForCausalLM model.
 
@@ -986,7 +984,7 @@ class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):  # type: ignore
             dtype: Data type for computations (default: jnp.bfloat16).
             param_dtype: Data type for parameters (default: jnp.bfloat16).
             precision: JAX precision setting for matrix operations (default: None).
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
         """
         # Pre-instantiate base model with OPT-specific offset parameter
         base_model = OPTModel(
@@ -1026,7 +1024,7 @@ class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):  # type: ignore
                 (batch_size, sequence_length, vocab_size).
         """
         if self.config.tie_word_embeddings:
-            shared_kernel = self.base_model.decoder.embed_tokens.embedding.value.T
+            shared_kernel = self.base_model.decoder.embed_tokens.weight.value.T
             return self.lm_head(hidden_states, w=shared_kernel)
         return self.lm_head(hidden_states)
 

@@ -22,7 +22,7 @@ os.environ["HF_DATASETS_OFFLINE"] = "0"
 os.environ["EASYDEL_AUTO"] = "1"
 
 import jax
-from flax import nnx as nn
+import spectrax as spx
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
@@ -34,7 +34,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
 def main():
-    sharding_axis_dims = (1, 1, 1, -1, 1)
+    sharding_axis_dims = (1, 1, 1, 1, -1, 1)
     max_model_len = 2048
 
     pretrained_model_name_or_path = "tiiuae/falcon-mamba-7b"
@@ -80,7 +80,7 @@ def main():
         attention_mask,
         generation_config,
     ):
-        module = nn.merge(graphdef, graphstate, graphother)
+        module = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
         with module.mesh:
             return module.generate(
                 input_ids=input_ids,

@@ -153,7 +153,7 @@ def create_causal_lm_class(
             dtype: Computation dtype. Defaults to jnp.bfloat16.
             param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
             precision: JAX precision setting.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             **kwargs: Additional kwargs merged with default_feature_kwargs.
         """
         # Merge default kwargs with instance kwargs (instance overrides defaults)
@@ -249,7 +249,7 @@ def create_sequence_classification_class(
             dtype: Computation dtype. Defaults to jnp.bfloat16.
             param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
             precision: JAX precision setting.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             **kwargs: Additional kwargs merged with default_feature_kwargs.
         """
         merged_kwargs = {**default_feature_kwargs, **kwargs}
@@ -337,7 +337,7 @@ def create_token_classification_class(
             dtype: Computation dtype. Defaults to jnp.bfloat16.
             param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
             precision: JAX precision setting.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             **kwargs: Additional kwargs merged with default_feature_kwargs.
         """
         merged_kwargs = {**default_feature_kwargs, **kwargs}
@@ -425,7 +425,7 @@ def create_question_answering_class(
             dtype: Computation dtype. Defaults to jnp.bfloat16.
             param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
             precision: JAX precision setting.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             **kwargs: Additional kwargs merged with default_feature_kwargs.
         """
         merged_kwargs = {**default_feature_kwargs, **kwargs}
@@ -513,7 +513,7 @@ def create_conditional_generation_class(
             dtype: Computation dtype. Defaults to jnp.bfloat16.
             param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
             precision: JAX precision setting.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             **kwargs: Additional kwargs merged with default_feature_kwargs.
         """
         merged_kwargs = {**default_feature_kwargs, **kwargs}
@@ -605,7 +605,7 @@ def create_image_classification_class(
             dtype: Computation dtype. Defaults to jnp.bfloat16.
             param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
             precision: JAX precision setting.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             **kwargs: Additional kwargs merged with default_feature_kwargs.
         """
         merged_kwargs = {**default_feature_kwargs, **kwargs}

@@ -33,6 +33,7 @@ def _make_min_executor(*, bind_graphstate_for_aot: bool) -> ModelStepExecutor:
     executor._cache = OrderedDict()
     executor._backbone_cache = OrderedDict()
     executor._lm_head_cache = OrderedDict()
+    executor.mesh = SimpleNamespace(is_mpmd=False)
     executor.graphdef = 0
     # Minimal backbone: output depends on graphstate + kv_pages.
     executor._backbone_fn = jax.jit(
@@ -106,3 +107,30 @@ def test_model_executor_aot_unbound_graphstate_uses_runtime_weights():
 
     # backbone: kv_pages(3.0) + runtime_graphstate(10.0) = 13.0
     np.testing.assert_allclose(np.asarray(out.kv_pages), np.asarray(jnp.array([13.0], dtype=jnp.float32)))
+
+
+def test_model_executor_mpmd_uses_first_call_compile_mode_not_aot_lower():
+    from easydel.inference.esurge.runners.execution_types import BackboneOutputs
+
+    executor = _make_min_executor(bind_graphstate_for_aot=False)
+    executor.mesh = SimpleNamespace(is_mpmd=True)
+    executor._backbone_fn = lambda graphdef, graphstate, graphother, kv_pages, metadata: BackboneOutputs(
+        kv_pages=kv_pages + graphstate,
+        hidden_states=kv_pages,
+    )
+    inputs = SimpleNamespace(
+        kv_pages=jnp.array([1.0], dtype=jnp.float32),
+        batch_metadata=jnp.array([0], dtype=jnp.int32),
+    )
+
+    out = executor.compile_backbone(
+        num_tokens=1,
+        graphdef=0,
+        graphstate=jnp.array([2.0], dtype=jnp.float32),
+        graphother=jnp.array([0.0], dtype=jnp.float32),
+        inputs=inputs,
+    )
+
+    assert executor.has_backbone(1)
+    assert list(executor._backbone_cache) == [(1, "backbone", "mpmd")]
+    np.testing.assert_allclose(np.asarray(out.kv_pages), np.asarray(jnp.array([3.0], dtype=jnp.float32)))

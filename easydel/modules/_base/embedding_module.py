@@ -57,11 +57,11 @@ See Also:
 """
 
 import jax
-from eformer import common_types
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types
 
 from easydel.caching import (
     HybridCache,
@@ -124,7 +124,7 @@ class BaseEmbeddingModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         pooling_strategy: str = "last",
         router_aux_loss_coef: float | None = None,
         normalize_embeddings: bool = True,
@@ -144,7 +144,7 @@ class BaseEmbeddingModule(BaseTaskModule[ModelT, ConfigT]):
             dtype: Data type for computations.
             param_dtype: Data type for parameters.
             precision: JAX precision setting.
-            rngs: Flax random number generators.
+            rngs: SpecTrax random number generators.
             pooling_strategy: Strategy for pooling sequence representations.
                 One of ``"last"``, ``"first"``, ``"mean"``, ``"weighted_mean"``,
                 ``"max"``. Defaults to ``"last"`` (standard for decoder-only
@@ -170,7 +170,7 @@ class BaseEmbeddingModule(BaseTaskModule[ModelT, ConfigT]):
         self._normalize_embeddings = normalize_embeddings
         self._embedding_dim = embedding_dim
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

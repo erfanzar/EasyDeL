@@ -15,7 +15,7 @@
 """Core training functionality for EasyDeL.
 
 This module provides the main Trainer class for training neural network models
-with JAX/Flax. The Trainer handles:
+with JAX/spectrax. The Trainer handles:
 
 - Model initialization and management
 - Training loop execution

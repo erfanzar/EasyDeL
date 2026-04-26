@@ -326,7 +326,7 @@ from easydel import eLargeModel
 
 elm = eLargeModel.from_pretrained(repo_id)
 elm.set_dtype("bf16")
-elm.set_sharding(axis_names=("dp", "fsdp", "ep", "tp", "sp"), axis_dims=(1, -1, 1, 1, 1))
+elm.set_sharding(axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"), axis_dims=(1, 1, -1, 1, 1, 1))
 
 model = elm.build_model()
 # engine = elm.build_esurge()
@@ -428,8 +428,8 @@ model = ed.{{ auto_class }}.from_pretrained(
     dtype=dtype,
     param_dtype=dtype,
     precision=lax.Precision("fastest"),
-    sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp"),
-    sharding_axis_dims=(1, -1, 1, 1, 1),
+    sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
+    sharding_axis_dims=(1, 1, -1, 1, 1, 1),
     config_kwargs=ed.EasyDeLBaseConfigDict(
         attn_dtype=dtype,
         attn_mechanism=ed.AttentionMechanisms.{{ attn_enum }},
@@ -446,7 +446,7 @@ If the repository only provides PyTorch weights, pass `from_torch=True` to `from
 
 ## Sharding & Parallelism (Multi-Device)
 
-EasyDeL can scale to multiple devices by creating a logical device mesh. Most EasyDeL loaders use a 5D mesh:
+EasyDeL can scale to multiple devices by creating a logical device mesh. Most EasyDeL loaders use a 6D mesh:
 
 - `dp`: data parallel (replicated parameters, different batch shards)
 - `fsdp`: parameter sharding (memory saver; often the biggest axis)
@@ -454,7 +454,7 @@ EasyDeL can scale to multiple devices by creating a logical device mesh. Most Ea
 - `tp`: tensor parallel (splits large matmuls)
 - `sp`: sequence parallel (splits sequence dimension)
 
-Use `sharding_axis_names=("dp","fsdp","ep","tp","sp")` and choose `sharding_axis_dims` so that their product equals your device count.
+Use `sharding_axis_names=("pp","dp","fsdp","ep","tp","sp")` and choose `sharding_axis_dims` so that their product equals your device count.
 You can use `-1` in `sharding_axis_dims` to let EasyDeL infer the remaining dimension.
 
 <details>
@@ -483,7 +483,7 @@ repo_id = "{{ model.repo_id }}"
 
 elm = eLargeModel.from_pretrained(repo_id)  # task is auto-detected
 elm.set_dtype("bf16")
-elm.set_sharding(axis_names=("dp", "fsdp", "ep", "tp", "sp"), axis_dims=(1, -1, 1, 1, 1))
+elm.set_sharding(axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"), axis_dims=(1, 1, -1, 1, 1, 1))
 
 model = elm.build_model()
 # Optional: build an inference engine

@@ -60,7 +60,7 @@ See Also:
 from collections.abc import Callable
 
 import jax
-from flax import nnx as nn
+import spectrax as spx
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 
@@ -129,7 +129,7 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         pooling_strategy: str = "first",  # For ViT, use first token ([CLS])
         classifier_bias: bool = True,
         classifier_kernel_init: Callable | None = None,
@@ -153,7 +153,7 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             dtype: Data type for computations. Defaults to jnp.bfloat16.
             param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
             precision: JAX precision setting for matrix operations.
-            rngs: Flax NNX random number generators.
+            rngs: spectrax random number generators.
             pooling_strategy: How to pool vision features to a single vector:
                 - "first": Use first token (CLS token). Default for ViT.
                 - "mean": Average all tokens.
@@ -180,7 +180,7 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                 config=config,
                 base_model_class=ViTModel,
                 dtype=jnp.float32,
-                rngs=nn.Rngs(0),
+                rngs=spx.Rngs(0),
                 pooling_strategy="first",  # Use CLS token
             )
             ```
@@ -229,7 +229,7 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                 rngs=rngs,
             )
 
-    def __call__(
+    def forward(
         self,
         pixel_values: Float[Array, "batch channels height width"],
         output_attentions: bool | None = None,

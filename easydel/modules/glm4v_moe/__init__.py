@@ -74,7 +74,7 @@ Usage Example:
         },
     )
 
-    model = Glm4vMoeForConditionalGeneration(config, rngs=nnx.Rngs(0))
+    model = Glm4vMoeForConditionalGeneration(config, rngs=spx.Rngs(0))
 
     # Forward pass with router logits
     input_ids = jnp.array([[1, 2, 151859, 3, 4]])  # Special token for image

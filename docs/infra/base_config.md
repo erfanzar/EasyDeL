@@ -58,8 +58,8 @@ config = MyModelConfig(
     fsdp_is_ep_bound=False,               # Bind FSDP to expert parallelism
     sp_is_ep_bound=False,                 # Bind SP to expert parallelism
 
-    # Hardware optimization
-    hardware_abstraction=True,
+    # Layer scan policy
+    scan_layers=True,
 )
 ```
 

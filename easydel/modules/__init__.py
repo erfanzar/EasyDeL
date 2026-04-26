@@ -14,7 +14,7 @@
 
 """EasyDeL model modules.
 
-This package provides JAX/Flax implementations of various transformer and
+This package provides JAX/spectrax implementations of various transformer and
 state-space model architectures. Each submodule contains configuration,
 base model, and task-specific variants (causal LM, sequence classification,
 vision-language, etc.).

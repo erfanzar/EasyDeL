@@ -15,7 +15,7 @@
 """Main Trainer implementation for EasyDeL.
 
 This module contains the core Trainer class that orchestrates the complete
-training pipeline for neural network models using JAX/Flax. The trainer
+training pipeline for neural network models using JAX/spectrax. The trainer
 provides a high-level interface for:
 
 - Distributed training across multiple devices and hosts
@@ -35,19 +35,18 @@ import collections.abc
 import typing as tp
 
 import jax
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 
 from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from ..trainer_protocol import TrainerOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import evaluation_step, training_step
 
 logger = get_logger(__name__)
@@ -220,7 +219,7 @@ class Trainer(BaseTrainer):
             - The donate_argnums=(0,) for training allows in-place updates
             - Empty sharding specs indicate replication across devices
         """
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
+        empty_sharding = replicated_named_sharding(self.model.mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -235,7 +234,7 @@ class Trainer(BaseTrainer):
             self.arguments.gradient_accumulation_steps,
             straight_through_emulator,
         )
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             training_step,
             static_argnums=(2, 3, 4, 5, 6),
             in_shardings=(self.state_shardings, empty_sharding),
@@ -247,7 +246,7 @@ class Trainer(BaseTrainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
         )
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),

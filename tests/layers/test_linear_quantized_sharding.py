@@ -18,10 +18,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from eformer.common_types import ColumnWise, Replicated, RowWise
-from flax import nnx as nn
+import spectrax as spx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax.common_types import ColumnWise, RowWise
 
+from easydel.infra.sharding import AxisPolicy, TensorLayout
+from easydel.layers._sharding import resolve_safe_sharding
 from easydel.layers.linears._linear import ColumnParallelLinear
 from easydel.layers.linears._linear_quantized import (
     ColumnParallelLinearQuantized,
@@ -32,71 +34,83 @@ from easydel.layers.quantization._configs import QuantizationConfig, Quantizatio
 from easydel.layers.quantization._quants import EasyQuantizer
 
 
+def _variable_layout_axes(var) -> tuple[object | None, ...] | None:
+    sharding = var.metadata.get("sharding")
+    if sharding is not None and getattr(sharding, "axis_names", None) is not None:
+        return tuple(sharding.axis_names)
+    tensor_layout = TensorLayout.from_any(var.metadata.get("tensor_layout"))
+    if tensor_layout is None:
+        return None
+    return tensor_layout.axes
+
+
 def test_effective_ejkernel_group_size_rejects_non_divisible_local_shards():
     with pytest.raises(ValueError, match="No supported ejkernel group_size divides the local grouping axis"):
         _effective_ejkernel_group_size("affine", 64, (8, 24))
 
 
-def test_row_parallel_affine_quantized_craft_sharding():
+def test_row_parallel_affine_quantized_metadata_layout():
     layer = RowParallelLinearQuantized(
         in_features=128,
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.INT8, group_size=64),
         use_bias=True,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
-    specs = layer.craft_sharding()
-    assert specs["quant_kernel"] is RowWise
-    assert specs["quant_scales"] is RowWise
-    assert specs["quant_biases"] is RowWise
-    assert specs["bias"] is Replicated
+    assert _variable_layout_axes(layer.quant_kernel) == TensorLayout.from_any(RowWise).axes
+    assert _variable_layout_axes(layer.quant_scales) == TensorLayout.from_any(RowWise).axes
+    assert _variable_layout_axes(layer.quant_biases) == TensorLayout.from_any(RowWise).axes
+    assert _variable_layout_axes(layer.bias) == TensorLayout.from_any((None,)).axes
 
 
-def test_column_parallel_nf4_quantized_craft_sharding():
+def test_column_parallel_nf4_quantized_metadata_layout():
     layer = ColumnParallelLinearQuantized(
         in_features=128,
         out_features=256,
-        config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
+        config=QuantizationConfig(dtype=QuantizationType.INT8, group_size=64),
         use_bias=True,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
-    specs = layer.craft_sharding()
-    assert specs["quant_kernel"] is ColumnWise
-    assert specs["quant_scales"] is ColumnWise
-    assert "quant_biases" not in specs
-    assert specs["bias"] is Replicated
+    assert _variable_layout_axes(layer.quant_kernel) == TensorLayout.from_any(ColumnWise).axes
+    assert _variable_layout_axes(layer.quant_scales) == TensorLayout.from_any(ColumnWise).axes
+    assert _variable_layout_axes(layer.quant_biases) == TensorLayout.from_any(ColumnWise).axes
+    assert _variable_layout_axes(layer.bias) == TensorLayout.from_any((None,)).axes
 
 
-def test_quantized_craft_sharding_keeps_kernel_sharded_when_scales_fallback():
-    class _FakePartitionManager:
-        def resolve(self, axes=None, mode=None, shape=None):
-            rank = len(shape or ())
-            if axes is Replicated:
-                return PartitionSpec(*((None,) * rank))
-            if axes is ColumnWise:
-                return PartitionSpec(None, "tp") if rank == 2 else PartitionSpec("tp")
-            if axes is RowWise:
-                return PartitionSpec("tp", None) if rank == 2 else PartitionSpec("tp")
-            return axes
-
+def test_quantized_metadata_layout_keeps_kernel_sharded_when_scales_fallback():
     layer = ColumnParallelLinearQuantized(
         in_features=128,
         out_features=96,
         config=QuantizationConfig(dtype=QuantizationType.INT8, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
-    specs = layer.craft_sharding(
-        partition_manager=_FakePartitionManager(),
-        mesh=SimpleNamespace(shape={"tp": 4}, empty=False),
+    mesh = SimpleNamespace(shape={"tp": 4}, empty=False)
+    kernel_spec = resolve_safe_sharding(
+        axes=_variable_layout_axes(layer.quant_kernel),
+        shape=tuple(layer.quant_kernel.value.shape),
+        axis_policy=AxisPolicy(),
+        mesh=mesh,
+    )
+    scales_spec = resolve_safe_sharding(
+        axes=_variable_layout_axes(layer.quant_scales),
+        shape=tuple(layer.quant_scales.value.shape),
+        axis_policy=AxisPolicy(),
+        mesh=mesh,
+    )
+    biases_spec = resolve_safe_sharding(
+        axes=_variable_layout_axes(layer.quant_biases),
+        shape=tuple(layer.quant_biases.value.shape),
+        axis_policy=AxisPolicy(),
+        mesh=mesh,
     )
 
-    assert specs["quant_kernel"] == PartitionSpec(None, "tp")
-    assert specs["quant_scales"] == PartitionSpec(None, None)
-    assert specs["quant_biases"] == PartitionSpec(None, None)
+    assert tuple(kernel_spec)[-1] == "tp"
+    assert tuple(scales_spec)[-1] is None
+    assert tuple(biases_spec)[-1] is None
 
 
 def test_quantized_linear_uses_shard_map_for_sharded_params(monkeypatch):
@@ -116,7 +130,7 @@ def test_quantized_linear_uses_shard_map_for_sharded_params(monkeypatch):
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
@@ -156,7 +170,7 @@ def test_quantized_linear_falls_back_when_k_axis_uses_non_tp_sharding(monkeypatc
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("fsdp", "tp"))
@@ -196,7 +210,7 @@ def test_quantized_linear_falls_back_when_aux_params_not_co_sharded(monkeypatch)
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
@@ -237,7 +251,7 @@ def test_row_quantized_linear_falls_back_when_k_axis_uses_non_tp_sharding(monkey
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("fsdp", "tp"))
@@ -278,7 +292,7 @@ def test_row_quantized_linear_falls_back_when_tp_shards_batch_axis(monkeypatch):
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
@@ -359,7 +373,7 @@ def test_quantized_linear_tpu_forces_shard_map_without_named_sharding(monkeypatc
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
         qmm_fuse=True,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     mode, group_size, bits, _ = layer._resolve_ejkernel_params()
@@ -385,7 +399,7 @@ def test_quantized_linear_tpu_default_qmm_kwargs_use_xla_unfused():
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.AFFINE, bits=4, group_size=64),
         use_bias=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", quant_mode="affine")
@@ -403,7 +417,7 @@ def test_quantized_linear_tpu_auto_low_m_uses_xla_unfused():
         use_bias=False,
         qmm_platform="auto",
         qmm_tpu_auto_xla_max_m=1024,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", m_tokens=4, quant_mode="affine")
@@ -421,7 +435,7 @@ def test_quantized_linear_tpu_auto_low_m_non_affine_uses_fused_path():
         use_bias=False,
         qmm_platform="auto",
         qmm_tpu_auto_xla_max_m=1024,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", m_tokens=4, quant_mode="nf4")
@@ -439,7 +453,7 @@ def test_quantized_linear_tpu_auto_high_m_uses_fused_path():
         use_bias=False,
         qmm_platform="auto",
         qmm_tpu_auto_xla_max_m=1024,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", m_tokens=2048, quant_mode="nf4")
@@ -468,7 +482,7 @@ def test_quantized_linear_tpu_custom_policy_table_is_used():
         use_bias=False,
         qmm_platform="auto",
         qmm_policy_table=custom_policy,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", m_tokens=4, quant_mode="nf4")
@@ -485,7 +499,7 @@ def test_quantized_linear_tpu_fused_qmm_kwargs_use_predecode():
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
         qmm_fuse=True,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", quant_mode="nf4")
@@ -505,7 +519,7 @@ def test_quantized_linear_tpu_path_requires_fused_qmm():
         use_bias=False,
         qmm_fuse=False,
         qmm_tpu_path="predecode",
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     try:
@@ -523,7 +537,7 @@ def test_quantized_linear_qmm_use_best_config_can_be_disabled():
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=False,
         qmm_use_best_config=False,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     kwargs = layer._qmm_runtime_kwargs("tpu", quant_mode="nf4")
@@ -538,14 +552,15 @@ class _DummyModelConfig:
         self.quantization_config = None
 
 
-class _DummyLinearModel(nn.Module):
+class _DummyLinearModel(spx.Module):
     def __init__(self, config: _DummyModelConfig):
+        super().__init__()
         self.config = config
         self.linear = ColumnParallelLinear(
             in_features=16,
             out_features=16,
             use_bias=False,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
 
 
@@ -591,7 +606,7 @@ def test_quantized_linear_tpu_forced_layout_keeps_vector_bias_specs_rank_1():
         out_features=256,
         config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=64),
         use_bias=True,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     resolved = layer._resolve_shard_specs(
@@ -608,7 +623,7 @@ def test_quantized_linear_tpu_forced_layout_keeps_vector_bias_specs_rank_1():
     assert bias_spec == PartitionSpec("tp")
 
 
-class _TypeErrorOnOverridesLinear(nn.Module):
+class _TypeErrorOnOverridesLinear(spx.Module):
     def to_quantized(self, config: QuantizationConfig, **kwargs):
         del config
         if kwargs:
@@ -616,8 +631,9 @@ class _TypeErrorOnOverridesLinear(nn.Module):
         return self
 
 
-class _DummyTypeErrorModel(nn.Module):
+class _DummyTypeErrorModel(spx.Module):
     def __init__(self):
+        super().__init__()
         self.config = _DummyModelConfig(use_best=True, platform="xla", tpu_path="predecode")
         self.linear = _TypeErrorOnOverridesLinear()
 

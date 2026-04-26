@@ -36,7 +36,8 @@ Usage Example:
     ```python
     import jax
     from easydel import GptOssConfig, GptOssForCausalLM
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration
     config = GptOssConfig(
@@ -62,7 +63,7 @@ Usage Example:
         config=config,
         dtype=jax.numpy.bfloat16,
         param_dtype=jax.numpy.bfloat16,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     # Prepare inputs

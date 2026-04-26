@@ -80,7 +80,6 @@ from dataclasses import replace as dataclass_replace
 from functools import partial
 
 import jax
-from eformer import common_types as ct
 from ejkernel.loggings import get_logger
 from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     ragged_page_attention_v2,
@@ -90,6 +89,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, DTypeLike, Float
+from spectrax import common_types as ct
 
 from easydel.axis import ATTN_DP
 from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
@@ -199,6 +199,23 @@ def _kv_axis(cache_view: RaggedPagesCacheView, sharded_axis: str):
     return sharded_axis if kv_head_shards > 1 else ct.EMPTY
 
 
+def _runtime_sharding_resolver(metadata, cache_view):
+    """Resolve the sharding resolver from op metadata or the active cache view."""
+    resolver = getattr(metadata, "runtime_sharding_resolver", None)
+    if resolver is None:
+        resolver = getattr(cache_view, "runtime_sharding_resolver", None)
+    if resolver is None:
+        resolver = getattr(metadata, "partition_manager", None)
+    if resolver is None:
+        resolver = getattr(cache_view, "partition_manager", None)
+    if resolver is None:
+        raise AttributeError("Ragged page attention requires a runtime sharding resolver or partition manager.")
+    mesh = getattr(metadata, "mesh", None)
+    if hasattr(resolver, "with_mesh"):
+        return resolver.with_mesh(mesh)
+    return resolver
+
+
 class _RaggedPageAttn(OperationImpl):
     """
     Attention implementation using the Paged Attention mechanism with TPU Pallas kernels.
@@ -252,8 +269,8 @@ class _RaggedPageAttn(OperationImpl):
                 softmax_aux=softmax_aux,
             )
         kv_pages: Float[Array, "num_pages page_size num_kv_heads head_dim"] = cache_view.kv_pages
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = _runtime_sharding_resolver(self.metadata, cache_view)
+        resolve = resolver.resolve
         num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
         page_axis = _dp_page_axis(cache_view)
         kv_page_axis = _kv_axis(cache_view, ct.HEAD)
@@ -338,8 +355,8 @@ class _RaggedPageAttn(OperationImpl):
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
         num_seqs_flat = cache_metadata.num_seqs.reshape(-1)
 
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = _runtime_sharding_resolver(self.metadata, cache_view)
+        resolve = resolver.resolve
         page_axis = _dp_page_axis(cache_view)
         kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
 
@@ -461,8 +478,8 @@ class _RaggedPageAttn(OperationImpl):
         qjl_dim = constants.qjl_dim
         request_distribution = cache_metadata.request_distribution
 
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = _runtime_sharding_resolver(self.metadata, cache_view)
+        resolve = resolver.resolve
         page_axis = _dp_page_axis(cache_view)
 
         sinks_axis = None
@@ -578,8 +595,8 @@ class _RaggedPageAttn(OperationImpl):
                 )
             key = key.astype(kv_cache_dtype)
             value = value.astype(kv_cache_dtype)
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
+        resolver = _runtime_sharding_resolver(self.metadata, cache_view)
+        resolve = resolver.resolve
         request_distribution = cache_metadata.request_distribution
         page_axis = _dp_page_axis(cache_view)
         kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)

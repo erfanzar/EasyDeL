@@ -72,7 +72,7 @@ Usage Example:
         },
     )
 
-    model = KimiVLForConditionalGeneration(config, rngs=nnx.Rngs(0))
+    model = KimiVLForConditionalGeneration(config, rngs=spx.Rngs(0))
 
     # Forward pass with image
     input_ids = jnp.array([[1, 2, 163605, 3, 4]])  # 163605 is media_placeholder_token_id

@@ -57,7 +57,6 @@ from functools import cached_property, partial
 
 import jax
 import numpy as np
-from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree
@@ -65,6 +64,7 @@ from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array
+from spectrax import PartitionAxis
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.axis import resolve_attention_data_parallel_axis
@@ -446,13 +446,13 @@ def _create_mixed_standard_ragged_page_cache_configs(
     )
 
     geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
-    partition_manager = text_config.partition_manager
+    runtime_sharding_resolver = text_config.runtime_sharding_resolver
     mesh = text_config.mesh
 
     kvdtype = _canonicalize_dtype(dtype)
     requested_kvdtype = kvdtype
-    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
-    physical_kv_head_shards = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+    physical_kv_head_shards = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
     effective_kv_head_shards = physical_kv_head_shards
 
     if version == "v3":
@@ -505,7 +505,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
     if num_pages_override is None:
         free = RaggedPagesCacheConfig._compute_free_hbm(
             mesh=mesh,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
         )
@@ -624,16 +624,16 @@ def _create_mixed_standard_unified_attention_cache_configs(
     from easydel.caching.unified_attention.cache import _mesh_axis_size, _previous_power_of_2, cdiv
 
     geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
-    partition_manager = text_config.partition_manager
+    runtime_sharding_resolver = text_config.runtime_sharding_resolver
     mesh = text_config.mesh
     kvdtype = dtype
-    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
     bytes_av = jnp.finfo(kvdtype).bits // 8
 
     if num_pages_override is None:
         free = UnifiedAttentionCacheConfig._compute_free_hbm(
             mesh=mesh,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
         )
         page_bytes = (
@@ -747,10 +747,10 @@ def _create_mixed_turboquant_ragged_page_cache_configs(
     from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig
 
     geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
-    partition_manager = text_config.partition_manager
+    runtime_sharding_resolver = text_config.runtime_sharding_resolver
     mesh = text_config.mesh
-    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
-    kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+    kv_head_size = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
 
     def _page_bytes(num_kv_heads: int, head_dim: int) -> int:
         """Estimate bytes consumed by one page of TurboQuant KV cache.
@@ -870,7 +870,7 @@ def _materialize_mixed_standard_ragged_cache(
             config=config,
             layer_index=layer_index,
             mesh=text_config.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             quantizer=quantizer,
         )
         for layer_index, config in enumerate(ordered_configs)
@@ -928,7 +928,7 @@ def _materialize_mixed_unified_attention_cache(
             config=config,
             layer_index=layer_index,
             mesh=text_config.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             quantizer=quantizer,
         )
         for layer_index, config in enumerate(ordered_configs)
@@ -964,7 +964,7 @@ def _materialize_mixed_turboquant_ragged_cache(
             config=config,
             layer_index=layer_index,
             mesh=text_config.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
         )
         for layer_index, config in enumerate(ordered_configs)
     ]
@@ -1138,7 +1138,7 @@ class EasyGenerationMixin:
 
     Example:
         >>> # Model class inherits from EasyGenerationMixin
-        >>> class MyModel(EasyGenerationMixin, nn.Module):
+        >>> class MyModel(EasyGenerationMixin, spx.Module):
         ...     pass
         >>>
         >>> # Generate text using the model
@@ -1152,7 +1152,7 @@ class EasyGenerationMixin:
         >>> print(output.sequences)
 
     Note:
-        This mixin expects the model to have a `__call__` method that accepts
+        This mixin expects the model to have a `forward` method that accepts
         `input_ids` and returns logits, as well as a `config` attribute.
     """
 
@@ -1233,14 +1233,14 @@ class EasyGenerationMixin:
             return UnifiedAttentionCache.init_cache(
                 mesh=text_config.mesh,
                 config=config,
-                partition_manager=text_config.partition_manager,
+                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                 quantizer=quantizer,
             )
         if isinstance(config, MLARaggedPagesCacheConfig):
             return MLARaggedPagesCache.init_cache(
                 mesh=text_config.mesh,
                 config=config,
-                partition_manager=text_config.partition_manager,
+                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                 quantizer=quantizer,
             )
 
@@ -1272,7 +1272,7 @@ class EasyGenerationMixin:
             return TurboQuantRaggedPagesCache.init_cache(
                 mesh=text_config.mesh,
                 config=config,
-                partition_manager=text_config.partition_manager,
+                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                 quantizer=quantizer,
             )
 
@@ -1318,7 +1318,7 @@ class EasyGenerationMixin:
         return RaggedPagesCache.init_cache(
             mesh=text_config.mesh,
             config=config,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             quantizer=quantizer,
         )
 
@@ -1393,7 +1393,7 @@ class EasyGenerationMixin:
         return UnifiedAttentionCache.init_cache(
             mesh=text_config.mesh,
             config=config,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             quantizer=quantizer,
         )
 
@@ -1438,7 +1438,7 @@ class EasyGenerationMixin:
                     max_length=max_length,
                     pad_token_id=pad_token_id,
                 ),
-                partition_manager=text_config.partition_manager,
+                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                 dtype=text_config.kvdtype,
                 starts=starts,
                 quantizer=self._quant_class(
@@ -1896,7 +1896,7 @@ class EasyGenerationMixin:
 
         return RaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=dtype,
             num_hidden_layers=int(num_hidden_layers),
             num_kv_heads=int(num_kv_heads),
@@ -1959,7 +1959,7 @@ class EasyGenerationMixin:
 
         return MLARaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=dtype,
             num_hidden_layers=int(num_hidden_layers),
             num_kv_heads=int(mla_num_heads),
@@ -2030,7 +2030,7 @@ class EasyGenerationMixin:
         num_kv_heads, head_dim = _resolve_standard_ragged_layer_geometry(text_config=text_config, layer_idx=None)
         return UnifiedAttentionCacheConfig.create(
             mesh=text_config.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=dtype,
             num_hidden_layers=_count_kv_layers(text_config),
             num_kv_heads=num_kv_heads,
@@ -2233,7 +2233,7 @@ class EasyGenerationMixin:
             elif shared_ragged_config is None:
                 shared_ragged_config = TurboQuantRaggedPagesCacheConfig.create(
                     mesh=text_config.mesh,
-                    partition_manager=text_config.partition_manager,
+                    runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                     turboquant_config=kv_quant_cfg,
                     num_hidden_layers=max(1, num_standard_ragged_layers),
                     num_kv_heads=text_config.num_key_value_heads,
@@ -2514,7 +2514,7 @@ class EasyGenerationMixin:
                         config=_group[0][1],
                         num_layers=len(_group),
                         mesh=text_config.mesh,
-                        partition_manager=text_config.partition_manager,
+                        runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                         layer_indices=_layer_indices,
                     )
                     for (_li, _), _bv in zip(_group, _batch_views, strict=False):
@@ -2556,7 +2556,7 @@ class EasyGenerationMixin:
                             config=t_config,
                             layer_index=idx,
                             mesh=text_config.mesh,
-                            partition_manager=text_config.partition_manager,
+                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                         )
                     elif isinstance(t_config, RaggedPagesCacheConfig):
@@ -2564,7 +2564,7 @@ class EasyGenerationMixin:
                             config=t_config,
                             layer_index=idx,
                             mesh=text_config.mesh,
-                            partition_manager=text_config.partition_manager,
+                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                         )
                     elif isinstance(t_config, UnifiedAttentionCacheConfig):
@@ -2572,7 +2572,7 @@ class EasyGenerationMixin:
                             config=t_config,
                             layer_index=idx,
                             mesh=text_config.mesh,
-                            partition_manager=text_config.partition_manager,
+                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                         )
                     else:
@@ -2581,7 +2581,7 @@ class EasyGenerationMixin:
                             layer_index=idx,
                             mesh=text_config.mesh,
                             dtype=dtype,
-                            partition_manager=text_config.partition_manager,
+                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                             masking_details=_resolve_masking_details(idx),
                             starts=starts,
@@ -2604,7 +2604,7 @@ class EasyGenerationMixin:
                         layer_index=idx,
                         mesh=text_config.mesh,
                         dtype=dtype,
-                        partition_manager=text_config.partition_manager,
+                        runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                         quantizer=quantizer,
                         masking_details=_resolve_masking_details(idx),
                         starts=starts,
@@ -2632,14 +2632,14 @@ class EasyGenerationMixin:
                             config=config_classes,
                             layer_index=idx,
                             mesh=text_config.mesh,
-                            partition_manager=text_config.partition_manager,
+                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                         )
                     else:
                         view = view_class.init(
                             config=config_classes,
                             layer_index=idx,
                             mesh=text_config.mesh,
-                            partition_manager=text_config.partition_manager,
+                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                         )
                 elif view_class is UnifiedAttentionCacheView:
@@ -2647,7 +2647,7 @@ class EasyGenerationMixin:
                         config=config_classes,
                         layer_index=idx,
                         mesh=text_config.mesh,
-                        partition_manager=text_config.partition_manager,
+                        runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                         quantizer=quantizer,
                     )
                 elif view_class is LightningCacheView:
@@ -2672,7 +2672,7 @@ class EasyGenerationMixin:
         *,
         postpadded: bool = False,
         starts: jnp.ndarray | None = None,
-        indexs: jnp.ndarray | None = None,
+        indexes: jnp.ndarray | None = None,
         pages_tables: jnp.ndarray | None = None,
         context_lens: jnp.ndarray | None = None,
         query_start_loc: jnp.ndarray | None = None,
@@ -2688,13 +2688,13 @@ class EasyGenerationMixin:
         - RaggedPagesCache: Uses RaggedPagesMetadata (when ragged params provided)
 
         For HybridCache (the default), the metadata includes fields needed by
-        TransformerCacheView layers (postpadded, starts, indexs). Recurrent
+        TransformerCacheView layers (postpadded, starts, indexes). Recurrent
         layers use their own internal state management.
 
         Args:
             postpadded: Whether sequences are post-padded (for transformer views).
             starts: Starting positions for sequences (for transformer views).
-            indexs: Current position indices (for transformer views).
+            indexes: Current position indices (for transformer views).
             pages_tables: Page tables mapping (for ragged pages).
             context_lens: Context lengths per sequence (for ragged pages).
             query_start_loc: Query start locations (for ragged pages).
@@ -2735,7 +2735,7 @@ class EasyGenerationMixin:
         return OperationsMetadata.for_hybrid(
             postpadded=postpadded,
             starts=starts,
-            indexs=indexs,
+            indexes=indexes,
         )
 
     @cached_property
@@ -3004,13 +3004,13 @@ class EasyGenerationMixin:
         return model_kwargs
 
     @staticmethod
-    def _extract_generation_cache_indexs(past_key_values) -> jnp.ndarray | None:
+    def _extract_generation_cache_indexes(past_key_values) -> jnp.ndarray | None:
         """Return the current KV length vector from the first index-bearing cache view.
 
         Generation stores cache state inside different containers depending on the
         model and attention implementation. For one-token decode steps we only need
         a single per-batch index vector, and all transformer-like layers should
-        advance in lockstep, so the first available ``indexs`` is sufficient.
+        advance in lockstep, so the first available ``indexes`` is sufficient.
         """
         views = getattr(past_key_values, "views", None)
         if views is None:
@@ -3020,14 +3020,14 @@ class EasyGenerationMixin:
             if view is None:
                 continue
 
-            indexs = getattr(view, "indexs", None)
-            if indexs is not None:
-                return indexs
+            indexes = getattr(view, "indexes", None)
+            if indexes is not None:
+                return indexes
 
             transformer = getattr(view, "transformer", None)
-            indexs = getattr(transformer, "indexs", None)
-            if indexs is not None:
-                return indexs
+            indexes = getattr(transformer, "indexes", None)
+            if indexes is not None:
+                return indexes
 
         return None
 
@@ -3053,12 +3053,12 @@ class EasyGenerationMixin:
         if getattr(running_token, "ndim", 0) < 2 or running_token.shape[1] != 1:
             return call_kwargs
 
-        cache_indexs = self._extract_generation_cache_indexs(past_key_values)
-        if cache_indexs is None:
+        cache_indexes = self._extract_generation_cache_indexes(past_key_values)
+        if cache_indexes is None:
             return call_kwargs
 
         q_len = int(running_token.shape[1])
-        decode_end_index = cache_indexs + q_len
+        decode_end_index = cache_indexes + q_len
         prepared_kwargs = dict(call_kwargs)
         decode_mask_info = mask_info.apply_kv_lengths(
             kv_lengths=decode_end_index,
@@ -3319,7 +3319,7 @@ class EasyGenerationMixin:
             The adapted logits for beam search.
 
         Note:
-            Currently only FlaxMarianMTModel overrides this method.
+            Currently only MarianMTModel overrides this method.
         """
         return logits
 
@@ -3339,7 +3339,7 @@ class EasyGenerationMixin:
         model_args = set(inspect.signature(self.prepare_inputs_for_generation).parameters)
 
         if "kwargs" in model_args or "model_kwargs" in model_args:
-            model_args |= set(inspect.signature(self.__call__).parameters)
+            model_args |= set(inspect.signature(self.forward).parameters)
         for key, value in model_kwargs.items():
             if value is not None and key not in model_args:
                 unused_model_args.append(key)
@@ -4152,8 +4152,8 @@ class EasyGenerationMixin:
         of the sequence space than greedy search while remaining computationally
         tractable.
 
-        This implementation is inspired by Flax's official beam search example:
-        https://github.com/google/flax/blob/main/examples/wmt/decode.py
+        This implementation is inspired by SpecTrax's official beam search example:
+        https://github.com/google/SpecTrax/blob/main/examples/wmt/decode.py
 
         Args:
             input_ids: Initial input token IDs of shape (batch_size, num_beams, seq_length).
@@ -4549,7 +4549,7 @@ class EasyGenerationMixin:
         (ragged v3 on TPU/CPU-like backends, unified attention on GPU).
 
         Returns:
-            nn.GraphDef: Graph definition with eSurge-compatible attention mechanism.
+            spx.GraphDef: Graph definition with eSurge-compatible attention mechanism.
 
         Note:
             This creates only the graph structure, not a complete model. Use
@@ -4663,7 +4663,7 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _graphdef_layout_fingerprint(graphdef) -> int | None:
-        """Return a stable fingerprint for an NNX graph layout when possible."""
+        """Return a stable fingerprint for an SpecTrax graph layout when possible."""
         if graphdef is None:
             return None
         try:
@@ -4693,7 +4693,7 @@ class EasyGenerationMixin:
         Raw ``graphdef`` hashes can differ across equivalent reconstructed model
         objects in long training loops. Keep a second signature that captures the
         aspects of model layout we care about for safe graphdef reuse: wrapper
-        delegation, LoRA enablement, graphstate variable type, and config shape.
+        delegation, LoRA enablement, default trainable selector, and config shape.
         """
         payload: dict[str, tp.Any] = {
             "model_class": f"{type(self).__module__}.{type(self).__qualname__}",
@@ -4701,11 +4701,11 @@ class EasyGenerationMixin:
         }
 
         try:
-            graphstate_type = self.graphstate_type
+            trainable_selector = self.default_trainable_selector
         except Exception:
-            graphstate_type = None
-        if graphstate_type is not None:
-            payload["graphstate_type"] = f"{graphstate_type.__module__}.{graphstate_type.__qualname__}"
+            trainable_selector = None
+        if trainable_selector is not None:
+            payload["default_trainable_selector"] = repr(trainable_selector)
 
         try:
             payload["lora_is_enabled"] = bool(self.lora_is_enabled)

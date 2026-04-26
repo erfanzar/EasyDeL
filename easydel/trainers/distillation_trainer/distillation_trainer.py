@@ -17,18 +17,17 @@ import typing as tp
 
 import numpy as np
 from eformer.loggings import get_logger
-from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import distillation_step
 from .distillation_config import DistillationConfig
@@ -102,9 +101,9 @@ class DistillationTrainer(Trainer):
         self.arguments = arguments
 
         if not isinstance(student_model, EasyDeLState):
-            student_model = student_model.to_state()
+            student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
         if not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state()
+            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.teacher_state = teacher_model
 
@@ -131,7 +130,7 @@ class DistillationTrainer(Trainer):
         """
         mesh = self.model.mesh
 
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
 
         hidden_layers = self.arguments.hidden_state_layers
         attention_layers = self.arguments.attention_layers
@@ -162,7 +161,7 @@ class DistillationTrainer(Trainer):
         )
 
         static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -188,7 +187,7 @@ class DistillationTrainer(Trainer):
             self.arguments.logits_chunk_size,
         )
 
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,

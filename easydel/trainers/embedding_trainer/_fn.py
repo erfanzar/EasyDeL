@@ -22,15 +22,16 @@ import jax
 import optax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
-from easydel.trainers.trainer._fn import (
+
+from ..training_utils import (
     make_assertions_and_get_sizes,
     minibatch_call,
     update_metrics,
     update_state_respectfully,
-    with_sharding_constraint,
 )
 
 
@@ -238,7 +239,7 @@ def embedding_training_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     loss_fns = {
         "infonce": infonce_loss,

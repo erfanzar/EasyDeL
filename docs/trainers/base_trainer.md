@@ -13,7 +13,7 @@ For details on the abstract interface that `BaseTrainer` implements, refer to th
 Understanding these core concepts is crucial for effectively using `BaseTrainer`:
 
 * **`TrainingArguments`**: A dataclass holding all hyperparameters and configuration settings for the training process (e.g., learning rate, batch size, number of epochs, checkpointing strategy, logging options). You initialize the trainer with an instance of this class.
-* **`EasyDeLState`**: A Flax `TrainState` subclass that bundles the model parameters, optimizer state, and potentially other training-related variables (like PRNG keys). `BaseTrainer` manages this state throughout the training process.
+* **`EasyDeLState`**: A SpecTrax `TrainState` subclass that bundles the model parameters, optimizer state, and potentially other training-related variables (like PRNG keys). `BaseTrainer` manages this state throughout the training process.
 * **Training Loop**: The core process orchestrated by the `train()` method. It involves iterating over epochs and steps, fetching data batches, executing the training step function, logging metrics, and handling checkpointing.
 * **Checkpointing**: `BaseTrainer` automatically saves the `EasyDeLState` (model parameters, optimizer state) and `TrainingArguments` at specified intervals (e.g., every N steps or epochs) to allow resuming training later. It also manages a configurable limit on the number of checkpoints to keep.
 * **Distributed Training**: `BaseTrainer` is designed with JAX's `pmap` and `shmap` in mind, enabling efficient training across multiple devices (GPUs/TPUs) with minimal code changes required from the user for standard setups.

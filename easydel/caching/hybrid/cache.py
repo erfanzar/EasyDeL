@@ -69,19 +69,18 @@ from __future__ import annotations
 
 import typing as tp
 
-from eformer import escale as es
-from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field, xTree
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
+from spectrax import PartitionAxis, with_sharding_constraint
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
-    from eformer.escale import PartitionManager
+    from spectrax import PartitionManager
 
     from ..kda.cache import KDACacheView
     from ..ragged_page.cache import RaggedPagesCacheView
@@ -126,7 +125,7 @@ class HybridCacheConfig(BaseCacheConfig):
 
     # Required fields
     num_hidden_layers: int = field(pytree_node=False)
-    partition_axis: es.PartitionAxis = field(pytree_node=False)
+    partition_axis: PartitionAxis = field(pytree_node=False)
     batch_size: int = field(pytree_node=False)
     sequence_length: int = field(pytree_node=False)
 
@@ -147,7 +146,7 @@ class HybridCacheConfig(BaseCacheConfig):
     def create(
         cls,
         num_hidden_layers: int,
-        partition_axis: es.PartitionAxis,
+        partition_axis: PartitionAxis,
         batch_size: int,
         sequence_length: int,
         num_key_value_heads: int,
@@ -911,8 +910,8 @@ class ParallelHybridCacheView(BaseCacheView):
         return self._require_transformer_attr("value")
 
     @property
-    def indexs(self):
-        return self._require_transformer_attr("indexs")
+    def indexes(self):
+        return self._require_transformer_attr("indexes")
 
     @property
     def starts(self):
@@ -1247,7 +1246,7 @@ class HybridCache(BaseCache):
                     {
                         "key": view.key,
                         "value": view.value,
-                        "indexs": getattr(view, "indexs", None),
+                        "indexes": getattr(view, "indexes", None),
                         "starts": getattr(view, "starts", None),
                         "positions": getattr(view, "positions", None),
                     }
@@ -1305,7 +1304,7 @@ class HybridCache(BaseCache):
                     TransformerCacheView(
                         key=data["key"],
                         value=data["value"],
-                        indexs=data.get("indexs"),
+                        indexes=data.get("indexes"),
                         starts=data.get("starts"),
                         metadata=None,  # Metadata needs to be provided separately
                         layer_index=idx,
@@ -1387,8 +1386,8 @@ class HybridCache(BaseCache):
 
                 update_dict = {"key": new_key, "value": new_value}
 
-                if hasattr(view, "indexs") and view.indexs is not None:
-                    update_dict["indexs"] = lax.dynamic_update_slice_in_dim(view.indexs, oview.indexs, slot, 0)
+                if hasattr(view, "indexes") and view.indexes is not None:
+                    update_dict["indexes"] = lax.dynamic_update_slice_in_dim(view.indexes, oview.indexes, slot, 0)
                 if hasattr(view, "starts") and view.starts is not None:
                     update_dict["starts"] = lax.dynamic_update_slice_in_dim(view.starts, oview.starts, slot, 0)
 
@@ -1453,16 +1452,16 @@ class HybridMetadata(BaseRunTimeMetadata):
     Attributes:
         postpadded: Whether sequences are post-padded.
         starts: Starting positions for sequences.
-        indexs: Current position indices.
+        indexes: Current position indices.
     """
 
     postpadded: bool = False
     starts: tp.Any | None = None  # jnp.ndarray
-    indexs: tp.Any | None = None  # jnp.ndarray
+    indexes: tp.Any | None = None  # jnp.ndarray
 
 
 if __name__ == "__main__":
-    from eformer.escale import PartitionAxis
+    from spectrax import PartitionAxis
 
     print("Testing HybridCache...")
 

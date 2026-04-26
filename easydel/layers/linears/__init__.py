@@ -55,11 +55,12 @@ Example:
     ...     ColumnParallelLinear,
     ...     RowParallelLinear,
     ... )
-    >>> from flax import nnx as nn
+    >>> import spectrax as spx
+from spectrax import nn
     >>>
     >>> # Create a two-layer MLP with tensor parallelism
-    >>> up_proj = ColumnParallelLinear(768, 3072, rngs=nn.Rngs(0))
-    >>> down_proj = RowParallelLinear(3072, 768, rngs=nn.Rngs(1))
+    >>> up_proj = ColumnParallelLinear(768, 3072, rngs=spx.Rngs(0))
+    >>> down_proj = RowParallelLinear(3072, 768, rngs=spx.Rngs(1))
     >>>
     >>> # Forward pass
     >>> x = jnp.ones((32, 768))
@@ -76,7 +77,7 @@ Example:
     ...     in_features=768,
     ...     out_features=3072,
     ...     config=config,
-    ...     rngs=nn.Rngs(0)
+    ...     rngs=spx.Rngs(0)
     ... )
 
     MoE linear layers:

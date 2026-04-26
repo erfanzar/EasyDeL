@@ -1,6 +1,6 @@
 # EasyDeL Infrastructure Overview
 
-The `easydel.infra` module is the foundation upon which all EasyDeL models are built. It provides the core abstractions, utilities, and patterns that enable efficient distributed training and inference of large language models on JAX/Flax.
+The `easydel.infra` module is the foundation upon which all EasyDeL models are built. It provides the core abstractions, utilities, and patterns that enable efficient distributed training and inference of large language models on JAX/SpecTrax.
 
 ## Architecture Overview
 
@@ -182,7 +182,7 @@ Everything is inspectable and modifiable:
 ```python
 # Access internals easily
 model.config                    # Configuration
-model.graphdef                  # Flax NNX graph definition
+model.graphdef                  # SpecTrax SpecTrax graph definition
 model.graphstate                # Current state
 model._get_partition_rules()    # Sharding rules
 ```

@@ -72,8 +72,8 @@ from functools import cached_property
 from typing import Any
 
 import jax
-from eformer.common_types import NOT_GIVEN, _Empty
 from jax import numpy as jnp
+from spectrax.common_types import NOT_GIVEN, _Empty
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.axis import register_attention_data_parallel_axis
@@ -463,7 +463,7 @@ class eSurge(
         bind_graphstate_for_aot: bool = False,
         enable_prefix_caching: bool = True,
         auto_shard_model: bool = True,
-        sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
+        sharding_axis_dims: tuple[int, ...] = (1, 1, 1, 1, -1, 1),
         compile_runner: bool = True,
         runner_verbose: bool = False,
         overlap_execution: bool = True,
@@ -858,7 +858,7 @@ class eSurge(
                         f"got attn_mechanism={attn_value!r}."
                     )
 
-            sharding_axis_names = tuple(kwargs.pop("sharding_axis_names", ("dp", "fsdp", "ep", "tp", "sp")))
+            sharding_axis_names = tuple(kwargs.pop("sharding_axis_names", ("pp", "dp", "fsdp", "ep", "tp", "sp")))
             sharding_axis_dims_resolved = tuple(int(v) for v in sharding_axis_dims)
             sharding_axis_names_resolved = tuple(str(v) for v in sharding_axis_names)
             if self.data_parallelism_axis not in sharding_axis_names_resolved:

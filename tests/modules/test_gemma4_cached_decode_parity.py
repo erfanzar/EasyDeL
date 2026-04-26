@@ -15,7 +15,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx as nn
+import spectrax as spx
 from jax.sharding import Mesh
 
 from easydel.modules.gemma4 import Gemma4ForCausalLM, Gemma4TextConfig
@@ -71,7 +71,7 @@ def _run_cached_decode_parity(
             dtype=dtype,
             param_dtype=dtype,
             precision=precision,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
 
         model_kwargs = model.prepare_inputs_for_generation(

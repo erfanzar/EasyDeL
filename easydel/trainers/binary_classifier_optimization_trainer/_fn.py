@@ -17,10 +17,10 @@ import collections.abc
 import typing as tp
 
 import jax
-from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.nn import log_sigmoid
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -30,6 +30,7 @@ from easydel.trainers._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
+from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_kwargs
 
 from ..training_utils import (
     filter_kwargs_for_callable,
@@ -132,16 +133,7 @@ def concatenated_forward(
     completion_attention_mask = batch["completion_attention_mask"]
     completion_labels = batch["completion_labels"]
 
-    model_kwargs: dict[str, jax.Array] = {}
-    if aux_loss_enabled:
-        model_kwargs["output_router_logits"] = True
-
-    if "pixel_values" in batch:
-        model_kwargs["pixel_values"] = batch["pixel_values"]
-    if "pixel_attention_mask" in batch:
-        model_kwargs["pixel_attention_mask"] = batch["pixel_attention_mask"]
-    if "image_sizes" in batch:
-        model_kwargs["image_sizes"] = batch["image_sizes"]
+    model_kwargs: dict[str, jax.Array] = gather_multimodal_kwargs(batch, aux_loss_enabled=aux_loss_enabled)
 
     lmhead_chunksize = None
 
@@ -153,7 +145,7 @@ def concatenated_forward(
             "labels": completion_labels,
             **model_kwargs,
         }
-        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
@@ -173,20 +165,13 @@ def concatenated_forward(
         token_counts = jnp.sum(loss_mask.astype(jnp.float32), axis=1)
         mean_logits = token_logit_sums.sum() / jnp.maximum(token_counts.sum(), 1.0)
     else:
-        input_ids = completion_input_ids
-        attention_mask = completion_attention_mask
-
-        if max_length is not None:
-            if truncation_mode == "keep_end":
-                input_ids = input_ids[:, -max_length:]
-                attention_mask = attention_mask[:, -max_length:]
-                completion_labels = completion_labels[:, -max_length:]
-            elif truncation_mode == "keep_start":
-                input_ids = input_ids[:, :max_length]
-                attention_mask = attention_mask[:, :max_length]
-                completion_labels = completion_labels[:, :max_length]
-            else:
-                raise ValueError(f"Unsupported truncation mode: {truncation_mode}")
+        input_ids, attention_mask, completion_labels = apply_paired_truncation(
+            completion_input_ids,
+            completion_attention_mask,
+            completion_labels,
+            max_length=max_length,
+            truncation_mode=truncation_mode,
+        )
         call_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -195,7 +180,7 @@ def concatenated_forward(
         lmhead_chunksize = resolve_lmhead_chunksize(model)
         if lmhead_chunksize is not None:
             call_kwargs["apply_lm_head"] = False
-        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
@@ -346,7 +331,7 @@ def training_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    step_batch = with_sharding_constraint(arr=step_batch, sharding=batch_partition_spec)
+    step_batch = with_sharding_constraint(step_batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: jax.ArrayTree, call_batch: dict[str, jax.Array]):
         if straight_through_emulator is not None:

@@ -31,12 +31,12 @@ Push later by re-running with `--push-to-hub` (or omitting `--no-push-to-hub`).
 
 Sharding
 
-`--sharding-axis-dims` and `--sharding-axis-names` define the 5D mesh as:
-  dp,fsdp,ep,tp,sp
+`--sharding-axis-dims` and `--sharding-axis-names` define the 6D mesh as:
+  pp,dp,fsdp,ep,tp,sp
 
 Use -1 in axis dims to auto-infer that axis from available devices.
 Example (single host; auto-choose FSDP):
-  --sharding-axis-dims 1,-1,1,1,1
+  --sharding-axis-dims 1,1,-1,1,1,1
 
 Disk usage tips
 
@@ -147,7 +147,7 @@ def _parse_int_list(value: str, *, expected_len: int | None = None) -> tuple[int
     """Parse a comma-separated string of integers.
 
     Args:
-        value: Comma-separated integer string (e.g. ``"1,-1,1,1,1"``).
+        value: Comma-separated integer string (e.g. ``"1,1,-1,1,1,1"``).
         expected_len: If set, validate that exactly this many ints are present.
 
     Returns:
@@ -170,7 +170,7 @@ def _parse_str_list(value: str, *, expected_len: int | None = None) -> tuple[str
     """Parse a comma-separated string into a tuple of strings.
 
     Args:
-        value: Comma-separated string (e.g. ``"dp,fsdp,ep,tp,sp"``).
+        value: Comma-separated string (e.g. ``"pp,dp,fsdp,ep,tp,sp"``).
         expected_len: If set, validate that exactly this many items are present.
 
     Returns:
@@ -256,12 +256,12 @@ class ConvertArgs:
     param_dtype: str = field(default="bf16", metadata={"help": "Param dtype (bf16|fp16|fp32)"})
 
     sharding_axis_dims: str = field(
-        default="1,-1,1,1,1",
-        metadata={"help": "5D mesh dims: dp,fsdp,ep,tp,sp (use -1 for auto), e.g. 1,-1,1,1,1"},
+        default="1,1,-1,1,1,1",
+        metadata={"help": "6D mesh dims: pp,dp,fsdp,ep,tp,sp (use -1 for auto), e.g. 1,1,-1,1,1,1"},
     )
     sharding_axis_names: str = field(
-        default="dp,fsdp,ep,tp,sp",
-        metadata={"help": "5 axis names: dp,fsdp,ep,tp,sp"},
+        default="pp,dp,fsdp,ep,tp,sp",
+        metadata={"help": "6 axis names: pp,dp,fsdp,ep,tp,sp"},
     )
     auto_shard_model: bool = field(default=True, metadata={"help": "Enable/disable automatic sharding"})
 
@@ -319,8 +319,8 @@ def main(argv: list[str] | None = None) -> None:
 
     dtype = _parse_dtype(args.dtype)
     param_dtype = _parse_dtype(args.param_dtype)
-    sharding_axis_dims = _parse_int_list(args.sharding_axis_dims, expected_len=5)
-    sharding_axis_names = _parse_str_list(args.sharding_axis_names, expected_len=5)
+    sharding_axis_dims = _parse_int_list(args.sharding_axis_dims, expected_len=6)
+    sharding_axis_names = _parse_str_list(args.sharding_axis_names, expected_len=6)
 
     hf_kwargs = {
         "cache_dir": args.cache_dir,

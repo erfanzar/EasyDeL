@@ -41,7 +41,8 @@ Usage Example:
     ```python
     from easydel.modules.falcon import FalconConfig, FalconForCausalLM
     import jax
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Configure Falcon with parallel attention and MQA
     config = FalconConfig(
@@ -55,7 +56,7 @@ Usage Example:
     )
 
     # Initialize model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = FalconForCausalLM(config, rngs=rngs)
 
     # Generate text

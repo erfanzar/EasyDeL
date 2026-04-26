@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.3.0"
+version = "0.4.0"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -37,7 +37,7 @@ dependencies = [
 	"einops~=0.8.0",
 	"transformers~=5.5.0",
 	"sentencepiece>=0.2.0",
-	"flax==0.12.3",
+	"spectrax-lib>=0.0.3",
 	"fastapi>=0.115.2",
 	"wandb>=0.22.2",
 	"uvloop==0.21.0",

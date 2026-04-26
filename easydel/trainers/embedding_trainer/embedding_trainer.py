@@ -33,20 +33,18 @@ from __future__ import annotations
 import typing as tp
 from functools import partial
 
-import jax
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..prompt_transforms import EmbeddingPreprocessTransform
 from ..trainer import Trainer
 from ..trainer._fn import evaluation_step
 from ..trainer.trainer import TrainerConfigureFunctionOutput
+from ..training_utils import compile_trainer_step
 from ..utils import EmbeddingDataCollatorGrain, EmbeddingDataCollatorTFDS
 from ._fn import embedding_training_step
 from .embedding_config import EmbeddingConfig
@@ -169,7 +167,7 @@ class EmbeddingTrainer(Trainer):
         Overrides the default ``training_step`` with
         ``embedding_training_step`` which handles the contrastive loss.
         """
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
+        empty_sharding = replicated_named_sharding(self.model.mesh)
 
         _step_fn = partial(
             embedding_training_step,
@@ -186,7 +184,7 @@ class EmbeddingTrainer(Trainer):
         self._train_shared_fn_extra_args = ()
         self._train_shared_fn_static_args = ()
 
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             _step_fn,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -197,7 +195,7 @@ class EmbeddingTrainer(Trainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
         )
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),

@@ -13,7 +13,7 @@ loader:
   trust_remote_code: true
 
 sharding:
-  axis_dims: [1, -1, 1, 1, 1]
+  axis_dims: [1, 1, -1, 1, 1, 1]
   auto_shard_model: true
 
 base_config:
@@ -48,4 +48,3 @@ trainer:
 actions:
   - validate
   - train
-

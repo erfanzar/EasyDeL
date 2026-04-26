@@ -52,18 +52,18 @@ Example:
     >>> # Use with cache during generation
     >>> cache_metadata = TransformerMetadata(
     ...     starts=jnp.array([0, 0, 0, 0]),  # Start indices per batch
-    ...     indexs=jnp.array([10, 15, 8, 12])  # Current lengths per batch
+    ...     indexes=jnp.array([10, 15, 8, 12])  # Current lengths per batch
     ... )
     >>> output = decode_attn(query, cached_keys, cached_values, cache_metadata)
 """
 
 import jax
-from eformer import common_types
 from ejkernel.modules import ragged_decode_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
@@ -110,8 +110,8 @@ def _slice_decode_window_for_vanilla_fallback(
         return key, value, mask_info
 
     width = min(left_window + right_window + 1, kv_len)
-    cache_indexs = jnp.asarray(cache_metadata.indexs, dtype=jnp.int32).reshape(-1)
-    current_rows = jnp.maximum(cache_indexs - 1, 0)
+    cache_indexes = jnp.asarray(cache_metadata.indexes, dtype=jnp.int32).reshape(-1)
+    current_rows = jnp.maximum(cache_indexes - 1, 0)
     start_k = jnp.clip(current_rows - left_window, 0, jnp.maximum(kv_len - width, 0))
 
     key = jax.vmap(
@@ -245,7 +245,7 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 All previous values in the sequence.
             cache_metadata: Cache metadata containing:
                 - starts: Start indices for valid cache entries per batch [batch].
-                - indexs: Current sequence lengths per batch [batch].
+                - indexes: Current sequence lengths per batch [batch].
             softmax_scale: Scaling factor for attention logits. Defaults to 1/sqrt(head_dim).
             sliding_window: Window bounds (left, right) for local attention. Optional.
             logits_soft_cap: Soft capping value to prevent extreme attention logits. Optional.
@@ -296,12 +296,12 @@ class AutoRegressiveDecodeAttn(OperationImpl):
 
         # Reshape cache metadata for processing
         starts_2d = cache_metadata.starts.reshape(-1, 1)
-        indexs_2d = cache_metadata.indexs.reshape(-1, 1)
+        indexes_2d = cache_metadata.indexes.reshape(-1, 1)
 
         # Extract last query token and flatten cache metadata
         query_squeezed: Float[Array, "batch num_q_heads head_dim"] = query[:, -1, :, :]
         starts_flat = starts_2d.reshape(-1)
-        indexs_flat = indexs_2d.reshape(-1)
+        indexes_flat = indexes_2d.reshape(-1)
 
         # Create sharding specs for all inputs
         query_sharding: Ps | None = self.create_stable_sharding(
@@ -328,10 +328,10 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             tensor=starts_flat,
             preserved_indices=[0],
         )
-        indexs_sharding: Ps | None = self.create_stable_sharding(
+        indexes_sharding: Ps | None = self.create_stable_sharding(
             views_sharding,
-            dep=indexs_flat,
-            tensor=indexs_flat,
+            dep=indexes_flat,
+            tensor=indexes_flat,
             preserved_indices=[0],
         )
         softmax_aux_sharding: Ps | None = self.create_stable_sharding(
@@ -352,7 +352,7 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             key,
             value,
             starts_flat,
-            indexs_flat,
+            indexes_flat,
             softmax_aux,
             softmax_scale=softmax_scale_computed,
             sliding_window=sliding_window,
@@ -363,7 +363,7 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 key_sharding,
                 value_sharding,
                 starts_sharding,
-                indexs_sharding,
+                indexes_sharding,
                 softmax_aux_sharding,
             ),
             out_specs=output_sharding,

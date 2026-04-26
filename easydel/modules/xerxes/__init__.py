@@ -67,7 +67,8 @@ Usage Example:
     ```python
     from easydel import XerxesConfig, XerxesForCausalLM
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration with MoE enabled
     config = XerxesConfig(
@@ -85,7 +86,7 @@ Usage Example:
     )
 
     # Create causal language model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = XerxesForCausalLM(
         config=config,
         dtype=jnp.bfloat16,

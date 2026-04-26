@@ -17,12 +17,11 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -50,7 +49,7 @@ from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassification
 from .olmo3_configuration import Olmo3Config
 
 
-class Olmo3MLP(nn.Module):
+class Olmo3MLP(spx.Module):
     """OLMo-3 MLP module.
 
     This module implements the feed-forward network (MLP) used in the OLMo-3 model.
@@ -74,7 +73,7 @@ class Olmo3MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the Olmo3MLP module.
 
@@ -83,7 +82,7 @@ class Olmo3MLP(nn.Module):
                 dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
                 param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
                 precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-                rngs (nn.Rngs): Random number generators.
+                rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         self.dtype = dtype
@@ -124,7 +123,7 @@ class Olmo3MLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the Olmo3MLP module implementing a Gated Linear Unit structure.
@@ -151,7 +150,7 @@ class Olmo3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -159,7 +158,7 @@ class Olmo3MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -189,7 +188,7 @@ class Olmo3Attention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize OLMo-3 attention with Q/K normalization and per-layer attention type.
@@ -200,7 +199,7 @@ class Olmo3Attention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model, used to determine attention type
                 from config.layer_types.
 
@@ -229,14 +228,14 @@ class Olmo3Attention(UnifiedAttention):
             use_qk_norm=True,  # Enable Q/K normalization
         )
 
-    def _create_q_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+    def _create_q_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
         """Create query normalization layer using RMSNorm.
 
         Args:
             config (Olmo3Config): Model configuration with normalization parameters.
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RMSNorm: Normalization layer for query projections with dimension
@@ -250,14 +249,14 @@ class Olmo3Attention(UnifiedAttention):
             rngs=rngs,
         )
 
-    def _create_k_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+    def _create_k_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
         """Create key normalization layer using RMSNorm.
 
         Args:
             config (Olmo3Config): Model configuration with normalization parameters.
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RMSNorm: Normalization layer for key projections with dimension
@@ -290,7 +289,7 @@ class Olmo3Attention(UnifiedAttention):
         return query_states, key_states, value_states
 
 
-class Olmo3DecoderLayer(nn.Module):
+class Olmo3DecoderLayer(spx.Module):
     """OLMo-3 Transformer Decoder Layer.
 
     This module represents a single decoder layer in the OLMo-3 model,
@@ -303,7 +302,7 @@ class Olmo3DecoderLayer(nn.Module):
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
             self_attn (Olmo3Attention): The self-attention module.
             mlp (Olmo3MLP): The feed-forward (MLP) module.
             post_attention_layernorm (RMSNorm): Layer normalization after the attention layer.
@@ -317,7 +316,7 @@ class Olmo3DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initializes the Olmo3DecoderLayer.
@@ -328,7 +327,7 @@ class Olmo3DecoderLayer(nn.Module):
                 dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
                 param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
                 precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-                rngs (nn.Rngs): Random number generators.
+                rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -367,7 +366,7 @@ class Olmo3DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -471,7 +470,7 @@ class Olmo3Model(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
             embed_tokens (Embed): Embedding layer for input tokens.
             layers (tp.List[Olmo3DecoderLayer]): List of decoder layers.
             norm (RMSNorm): Final layer normalization.
@@ -485,7 +484,7 @@ class Olmo3Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the Olmo3Model.
 
@@ -494,7 +493,7 @@ class Olmo3Model(EasyDeLBaseModule):
                 dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
                 param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
                 precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-                rngs (nn.Rngs): Random number generators.
+                rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -519,19 +518,19 @@ class Olmo3Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -540,7 +539,7 @@ class Olmo3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -552,6 +551,7 @@ class Olmo3Model(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass of the Olmo3Model base transformer.
 
@@ -640,29 +640,53 @@ class Olmo3Model(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
-
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
-            past_key_values[idx] = layer_outputs.cache_view
-
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -729,7 +753,7 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize OLMo-3 model for causal language modeling.
 
@@ -738,7 +762,7 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -751,7 +775,7 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -822,7 +846,7 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -890,7 +914,7 @@ class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize OLMo-3 model for sequence classification.
 
@@ -899,7 +923,7 @@ class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -913,7 +937,7 @@ class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model
             score_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,

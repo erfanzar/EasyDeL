@@ -32,7 +32,8 @@ Key Features:
 
 Example:
     >>> from easydel.layers.linears import ParallelLinear
-    >>> from flax import nnx as nn
+    >>> import spectrax as spx
+from spectrax import nn
     >>>
     >>> # Create a parallel linear layer
     >>> layer = ParallelLinear(
@@ -40,7 +41,7 @@ Example:
     ...     out_features=3072,
     ...     use_bias=True,
     ...     dtype=jnp.bfloat16,
-    ...     rngs=nn.Rngs(0)
+    ...     rngs=spx.Rngs(0)
     ... )
     >>> output = layer(input_tensor)
 """
@@ -52,81 +53,88 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from eformer.common_types import ColumnWise, Replicated, RowWise
-from flax import nnx as nn
-from flax.nnx.nn.dtypes import promote_dtype
+import spectrax as spx
 from jax import lax
 from jaxtyping import Array, Shaped
+from spectrax.common_types import ColumnWise, Replicated, RowWise, SRowWise
 
-from easydel.layers._sharding import resolve_safe_sharding
+from easydel.infra.sharding import TensorLayout, sharding_for_layout
 from easydel.layers.quantization._configs import QuantizationConfig
+
+
+def promote_dtype(values, *, dtype=None):
+    if dtype is None:
+        return values
+    return tuple(jnp.asarray(v, dtype=dtype) for v in values)
+
 
 if tp.TYPE_CHECKING:
     from ._linear_quantized import ColumnParallelLinearQuantized, RowParallelLinearQuantized
 
 Dtype = jnp.dtype
-Initializer = nn.initializers.Initializer
+Initializer = jax.nn.initializers.Initializer
 PrecisionLike = lax.PrecisionLike
 Shape = collections.abc.Sequence[int]
 AxisNames = str | collections.abc.Sequence[str] | tuple[str, ...]
 
 # Default initializers
-default_kernel_init = nn.initializers.lecun_normal()
-default_bias_init = nn.initializers.zeros
+default_kernel_init = jax.nn.initializers.lecun_normal()
+default_bias_init = jax.nn.initializers.zeros
 
 
-class ParallelLinear(nn.Module):
+class ParallelLinear(spx.Module):
     """A linear transformation layer with optional parallelism support.
 
-    Behaves like `nnx.Linear` but supports distributed computation and parameters
-    across multiple devices. This layer implements the transformation:
+        Behaves like `nn.Linear` but supports distributed computation and parameters
+        across multiple devices. This layer implements the transformation:
 
-        y = x @ W + b
+            y = x @ W + b
 
-    where W has shape (in_features, out_features) and b has shape (out_features,).
+        where W has shape (in_features, out_features) and b has shape (out_features,).
 
-    The layer supports optional scaling of the output, which can be specified as
-    a fixed value or computed from the fan-in or fan-out dimensions.
+        The layer supports optional scaling of the output, which can be specified as
+        a fixed value or computed from the fan-in or fan-out dimensions.
 
-    Attributes:
-        in_features: Number of input features.
-        out_features: Number of output features.
-        use_bias: Whether to include a bias term. Default is True.
-        dtype: The dtype of the computation (defaults to inferred from input).
-        param_dtype: The dtype of the parameters. Default is float32.
-        precision: JAX precision for the dot product. Default is None.
-        kernel_init: Initializer for the kernel weights.
-        bias_init: Initializer for the bias.
-        kernel: Weight matrix parameter of shape (in_features, out_features).
-        bias: Optional bias parameter of shape (out_features,).
-        tp_merged: Number of tensor parallel merged outputs.
-        distributed_matmul: Optional distributed matrix multiplication function.
-        _direction: Parallelism direction ("row", "column", or None).
+        Attributes:
+            in_features: Number of input features.
+            out_features: Number of output features.
+            use_bias: Whether to include a bias term. Default is True.
+            dtype: The dtype of the computation (defaults to inferred from input).
+            param_dtype: The dtype of the parameters. Default is float32.
+            precision: JAX precision for the dot product. Default is None.
+            kernel_init: Initializer for the kernel weights.
+            bias_init: Initializer for the bias.
+            kernel: Weight matrix parameter of shape (in_features, out_features).
+            bias: Optional bias parameter of shape (out_features,).
+            tp_merged: Number of tensor parallel merged outputs.
+            distributed_matmul: Optional distributed matrix multiplication function.
+            _direction: Parallelism direction ("row", "column", or None).
 
-    Example:
-        >>> from easydel.layers.linears import ParallelLinear
-        >>> import jax.numpy as jnp
-        >>> from flax import nnx as nn
-        >>>
-        >>> # Create a basic linear layer
-        >>> layer = ParallelLinear(
-        ...     in_features=768,
-        ...     out_features=3072,
-        ...     rngs=nn.Rngs(0)
-        ... )
-        >>>
-        >>> # Forward pass
-        >>> x = jnp.ones((32, 768))
-        >>> y = layer(x)
-        >>> # y.shape = (32, 3072)
-        >>>
-        >>> # With fan-in scaling (useful for certain architectures)
-        >>> layer_scaled = ParallelLinear(
-        ...     in_features=768,
-        ...     out_features=3072,
-        ...     scale="fan_in",
-        ...     rngs=nn.Rngs(0)
-        ... )
+        Example:
+            >>> from easydel.layers.linears import ParallelLinear
+            >>> import jax.numpy as jnp
+            >>> import spectrax as spx
+    from spectrax import nn
+            >>>
+            >>> # Create a basic linear layer
+            >>> layer = ParallelLinear(
+            ...     in_features=768,
+            ...     out_features=3072,
+            ...     rngs=spx.Rngs(0)
+            ... )
+            >>>
+            >>> # Forward pass
+            >>> x = jnp.ones((32, 768))
+            >>> y = layer(x)
+            >>> # y.shape = (32, 3072)
+            >>>
+            >>> # With fan-in scaling (useful for certain architectures)
+            >>> layer_scaled = ParallelLinear(
+            ...     in_features=768,
+            ...     out_features=3072,
+            ...     scale="fan_in",
+            ...     rngs=spx.Rngs(0)
+            ... )
     """
 
     _direction: tp.Literal["row", "column"] | None = None
@@ -143,7 +151,7 @@ class ParallelLinear(nn.Module):
         precision: PrecisionLike = None,
         kernel_init: Initializer = default_kernel_init,
         bias_init: Initializer = default_bias_init,
-        rngs: nn.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ):
         """Initialize a parallel linear layer.
 
@@ -174,9 +182,9 @@ class ParallelLinear(nn.Module):
             rngs: Random number generators for initialization. If None,
                 creates a default Rngs with seed 0.
         """
-        rngs_computed: nn.Rngs
+        rngs_computed: spx.Rngs
         if rngs is None:
-            rngs_computed = nn.Rngs(0)
+            rngs_computed = spx.Rngs(0)
         else:
             rngs_computed = rngs
 
@@ -228,24 +236,42 @@ class ParallelLinear(nn.Module):
         else:
             out_features_sum = out_features
 
-        kernel_key: tp.Any = rngs_computed.params()
-        kernel_shape: tuple[int, int] = (in_features, out_features_sum)
-        kernel_initialized: Array = kernel_init(kernel_key, kernel_shape, param_dtype)
-        self.kernel: nn.Param = nn.Param(kernel_initialized)
+        weight_key: tp.Any = rngs_computed.parameters
+        weight_shape: tuple[int, int] = (in_features, out_features_sum)
+        weight_initialized: Array = kernel_init(weight_key, weight_shape, param_dtype)
+        weight_layout = None
+        if self._direction == "row":
+            weight_layout = TensorLayout.from_any(RowWise)
+        elif self._direction == "column":
+            weight_layout = TensorLayout.from_any(ColumnWise)
+        self.weight: spx.Parameter = spx.Parameter(weight_initialized, sharding=sharding_for_layout(weight_layout))
 
         if use_bias:
-            bias_key: tp.Any = rngs_computed.params()
+            bias_key: tp.Any = rngs_computed.parameters
             bias_shape: tuple[int] = (out_features,)
             bias_initialized: Array = bias_init(bias_key, bias_shape, param_dtype)
-            self.bias: nn.Param | None = nn.Param(bias_initialized)
+            # Bias sharding must match the weight's output-axis sharding:
+            #  * column-parallel weight is ([FSDP,SP], TP) — output (column)
+            #    dim is TP-sharded, so the 1-D bias along that dim must be
+            #    sharded by TP (`SRowWise`). Replicating it would add the
+            #    full bias to each rank's partial output.
+            #  * row-parallel weight is (TP, [FSDP,SP]) — output is the
+            #    second axis, replicated across TP, so bias is replicated.
+            #  * unspecified direction: replicated (safe default).
+            if self._direction == "column":
+                bias_layout = TensorLayout.from_any(SRowWise)
+            else:
+                bias_layout = TensorLayout.from_any(Replicated)
+            self.bias: spx.Parameter | None = spx.Parameter(
+                bias_initialized,
+                sharding=sharding_for_layout(bias_layout),
+            )
         else:
             self.bias = None
         self.distributed_matmul: tp.Any | None = None
 
-    def native_forward(
-        self,
-        inputs: Shaped[Array, "... in_features"],
-        w: Array | None = None,
+    def forward(
+        self, inputs: Shaped[Array, "... in_features"], w: Array | None = None
     ) -> Shaped[Array, "... out_features"]:
         """Apply the linear transformation using native JAX operations.
 
@@ -255,9 +281,9 @@ class ParallelLinear(nn.Module):
         Args:
             inputs: The input array of shape (..., in_features). The batch
                 dimensions can be arbitrary.
-            w: Optional weight matrix to use instead of self.kernel. This is
+            w: Optional weight matrix to use instead of self.weight. This is
                 useful for weight sharing or external weight injection.
-                Defaults to None (uses self.kernel).
+                Defaults to None (uses self.weight).
 
         Returns:
             The transformed output array of shape (..., out_features).
@@ -266,7 +292,7 @@ class ParallelLinear(nn.Module):
         w_is_none: bool = w is None
         kernel: Array
         if w_is_none:
-            kernel = self.kernel.value
+            kernel = self.weight.value
         else:
             kernel = w
         if kernel is None:
@@ -321,61 +347,14 @@ class ParallelLinear(nn.Module):
 
         return y_final
 
-    def __call__(
+    def native_forward(
         self,
         inputs: Shaped[Array, "... in_features"],
+        *,
         w: Array | None = None,
     ) -> Shaped[Array, "... out_features"]:
-        """Apply the linear transformation to inputs.
-
-        This is the main entry point for the layer. It delegates to
-        native_forward for the actual computation.
-
-        Args:
-            inputs: The input array of shape (..., in_features).
-            w: Optional weight matrix override. Defaults to None.
-
-        Returns:
-            The transformed output array of shape (..., out_features).
-
-        Example:
-            >>> layer = ParallelLinear(768, 3072, rngs=nn.Rngs(0))
-            >>> x = jnp.ones((32, 768))
-            >>> y = layer(x)  # Shape: (32, 3072)
-        """
-        return self.native_forward(inputs=inputs, w=w)
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, tp.Any]:
-        """Return dynamic partition specs for this module's parameters.
-
-        Uses the configured parallelism direction to pick a sharding pattern
-        for the kernel. Bias is replicated when present.
-        """
-        if self._direction is None:
-            return {}
-        if self._direction == "row":
-            kernel_spec = RowWise
-        elif self._direction == "column":
-            kernel_spec = ColumnWise
-        else:
-            return {}
-        mesh = _kwargs.get("mesh")
-        specs: dict[str, tp.Any] = {}
-        if self.kernel.value is not None:
-            specs["kernel"] = resolve_safe_sharding(
-                axes=kernel_spec,
-                shape=tuple(self.kernel.value.shape),
-                partition_manager=partition_manager,
-                mesh=mesh,
-            )
-        if self.use_bias and self.bias is not None and self.bias.value is not None:
-            specs["bias"] = resolve_safe_sharding(
-                axes=Replicated,
-                shape=tuple(self.bias.value.shape),
-                partition_manager=partition_manager,
-                mesh=mesh,
-            )
-        return specs
+        """Trace-safe alias used by LM-head projection helpers."""
+        return self.forward(inputs=inputs, w=w)
 
     def to_quantized(
         self,
@@ -404,7 +383,7 @@ class ParallelLinear(nn.Module):
 
         Example:
             >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
-            >>> layer = ColumnParallelLinear(768, 3072, rngs=nn.Rngs(0))
+            >>> layer = ColumnParallelLinear(768, 3072, rngs=spx.Rngs(0))
             >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
             >>> quantized_layer = layer.to_quantized(config)
         """
@@ -423,13 +402,13 @@ class ParallelLinear(nn.Module):
                 **kwargs,
                 rngs=rngs,
             ),
-            nn.Rngs(0),
+            spx.Rngs(0),
         )
 
-        if isinstance(self.kernel.value, jax.ShapeDtypeStruct):
+        if isinstance(self.weight.value, jax.ShapeDtypeStruct):
             return lazy_module
 
-        return lazy_module.restage(kernel=self.kernel, bias=self.bias)
+        return lazy_module.restage(kernel=self.weight, bias=self.bias)
 
     @property
     def _quantized_friend(self) -> type[RowParallelLinearQuantized] | type[ColumnParallelLinearQuantized]:
@@ -474,7 +453,7 @@ class RowParallelLinear(ParallelLinear):
         >>> layer = RowParallelLinear(
         ...     in_features=3072,
         ...     out_features=768,
-        ...     rngs=nn.Rngs(0)
+        ...     rngs=spx.Rngs(0)
         ... )
     """
 
@@ -503,7 +482,7 @@ class ColumnParallelLinear(ParallelLinear):
         >>> layer = ColumnParallelLinear(
         ...     in_features=768,
         ...     out_features=3072,
-        ...     rngs=nn.Rngs(0)
+        ...     rngs=spx.Rngs(0)
         ... )
     """
 

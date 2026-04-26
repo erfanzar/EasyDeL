@@ -66,13 +66,11 @@ from functools import cached_property, partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -103,6 +101,7 @@ from easydel.layers import (
     Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    ParallelLinear,
     RowParallelLinear,
     RowParallelMoELinear,
 )
@@ -137,7 +136,7 @@ def _gemma4_vision_pixel_values_to_nhwc(pixel_values: Array) -> Array:
     return pixel_values
 
 
-class Gemma4RMSNorm(nn.Module):
+class Gemma4RMSNorm(spx.Module):
     """Root Mean Square Layer Normalization for Gemma4 models.
 
     Implements Hugging Face Gemma4 RMS normalization with ``kernel * norm(x)``
@@ -163,7 +162,7 @@ class Gemma4RMSNorm(nn.Module):
             output is simply ``norm(x)`` with no learned parameters.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
         self,
@@ -178,20 +177,12 @@ class Gemma4RMSNorm(nn.Module):
         self.with_scale = with_scale
         if with_scale:
             dim = (config.hidden_size if config is not None else dim) if dim is None else dim
-            self.kernel = ArrayParam.bound(
+            self.weight = ArrayParam.bound(
                 shape=(dim,),
                 dtype=param_dtype,
                 init_method="ones",
                 key=None,
             )
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specifications for normalization parameters.
-
-        The kernel (when present) is always replicated across all devices since
-        it is a small 1-D vector applied element-wise.
-        """
-        return {"kernel": Replicated} if self.with_scale else {}
 
     def _norm(self, x: jax.Array) -> jax.Array:
         """Apply RMS normalization without any learnable parameters.
@@ -208,7 +199,7 @@ class Gemma4RMSNorm(nn.Module):
         """
         return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
 
-    def __call__(self, hidden_states: Array) -> jax.Array:
+    def forward(self, hidden_states: Array) -> jax.Array:
         """Apply RMS normalization with optional learnable scale.
 
         The input is upcast to float32 for the normalization computation, then
@@ -227,7 +218,7 @@ class Gemma4RMSNorm(nn.Module):
         """
         variance = self._norm(hidden_states.astype(jnp.float32))
         if self.with_scale:
-            out = self.kernel.value.astype(jnp.float32) * variance
+            out = self.weight.value.astype(jnp.float32) * variance
         else:
             out = variance
         target_dtype = hidden_states.dtype
@@ -311,7 +302,7 @@ def _gemma4_vision_prepare_inputs(
     return patches, pixel_position_ids, padding_positions
 
 
-class Gemma4VisionPatchEmbedder(nn.Module):
+class Gemma4VisionPatchEmbedder(spx.Module):
     """Project flat image patches and add learned 2-D position embeddings."""
 
     def __init__(
@@ -321,7 +312,7 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         patch_dim = 3 * config.patch_size * config.patch_size
@@ -343,10 +334,6 @@ class Gemma4VisionPatchEmbedder(nn.Module):
             key=None,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Keep the small learned position table replicated across devices."""
-        return {"position_embedding_table": Replicated}
-
     def _position_embeddings(self, pixel_position_ids: Array, padding_positions: Array) -> Array:
         """Gather per-axis position embeddings and zero them on padded patches."""
         clamped_positions = jnp.clip(
@@ -364,16 +351,16 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         position_embeddings = x_embeddings + y_embeddings
         return jnp.where(padding_positions[..., None], 0.0, position_embeddings)
 
-    def __call__(self, pixel_values: Array, pixel_position_ids: Array, padding_positions: Array) -> Array:
+    def forward(self, pixel_values: Array, pixel_position_ids: Array, padding_positions: Array) -> Array:
         """Embed already patchified pixel inputs using the HF-compatible stem."""
         pixel_values = 2.0 * (pixel_values.astype(jnp.float32) - 0.5)
-        hidden_states = self.input_proj(pixel_values.astype(self.input_proj.kernel.dtype))
+        hidden_states = self.input_proj(pixel_values.astype(self.input_proj.weight.dtype))
         position_embeddings = self._position_embeddings(pixel_position_ids, padding_positions)
         return checkpoint_name(hidden_states + position_embeddings.astype(hidden_states.dtype), "vision_embeddings")
 
 
-class Gemma4VisionClippableLinear(nn.Module):
-    """Wrapper that preserves the HF `*.linear.kernel` parameter layout."""
+class Gemma4VisionClippableLinear(spx.Module):
+    """Wrapper that preserves the HF `*.linear.weight` parameter layout."""
 
     def __init__(
         self,
@@ -386,7 +373,7 @@ class Gemma4VisionClippableLinear(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
         linear_cls = RowParallelLinear if parallel_mode == "row" else ColumnParallelLinear
@@ -401,11 +388,11 @@ class Gemma4VisionClippableLinear(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         return self.linear(hidden_states)
 
 
-class Gemma4VisionRotaryEmbedding(nn.Module):
+class Gemma4VisionRotaryEmbedding(spx.Module):
     """2-D rotary embedding shared across all Gemma4 vision encoder layers."""
 
     def __init__(self, config: Gemma4VisionConfig, dtype: jnp.dtype = jnp.bfloat16):
@@ -416,13 +403,14 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
         self.rotary_dim_per_axis = 2 * (self.head_dim // 4)
         if self.rotary_dim_per_axis <= 0:
             raise ValueError(f"Gemma4 vision head_dim must be at least 4, got {self.head_dim}.")
-        self.frequencies = get_frequencies(
-            head_size=self.rotary_dim_per_axis,
-            rotary_dim=self.rotary_dim_per_axis,
-            max_position=config.max_position_embeddings,
-            base=self.base,
-            rope_scaling=None,
-        ).astype(dtype)
+        with jax.ensure_compile_time_eval():
+            self.frequencies = get_frequencies(
+                head_size=self.rotary_dim_per_axis,
+                rotary_dim=self.rotary_dim_per_axis,
+                max_position=config.max_position_embeddings,
+                base=self.base,
+                rope_scaling=None,
+            ).astype(dtype)
 
     def _apply_axis(self, query: Array, key: Array, positions: Array) -> tuple[Array, Array]:
         from easydel.layers.rotary._compute_fns import apply_basic_rope
@@ -437,7 +425,7 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
             dtype=query.dtype,
         )
 
-    def __call__(self, query: Array, key: Array, pixel_position_ids: Array | None) -> tuple[Array, Array]:
+    def forward(self, query: Array, key: Array, pixel_position_ids: Array | None) -> tuple[Array, Array]:
         """Apply independent RoPE rotations for the x and y patch coordinates."""
         if pixel_position_ids is None:
             return query, key
@@ -464,7 +452,7 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
         return query, key
 
 
-class Gemma4VisionAttention(nn.Module):
+class Gemma4VisionAttention(spx.Module):
     """HF-compatible bidirectional vision attention block for Gemma4."""
 
     def __init__(
@@ -475,7 +463,7 @@ class Gemma4VisionAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.layer_idx = layer_idx
@@ -549,7 +537,7 @@ class Gemma4VisionAttention(nn.Module):
             requires_cache=False,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         rotary_emb: Gemma4VisionRotaryEmbedding,
@@ -561,7 +549,7 @@ class Gemma4VisionAttention(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -595,7 +583,7 @@ class Gemma4VisionAttention(nn.Module):
         attention_output = apply_logical_sharding(
             attention_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return EncoderLayerOutput(
             hidden_states=checkpoint_name(attention_output, "vision_attn_output"),
@@ -603,8 +591,8 @@ class Gemma4VisionAttention(nn.Module):
         )
 
 
-class Gemma4VisionMLP(nn.Module):
-    """HF-compatible Gemma4 vision MLP using `*.linear.kernel` wrappers."""
+class Gemma4VisionMLP(spx.Module):
+    """HF-compatible Gemma4 vision MLP using `*.linear.weight` wrappers."""
 
     def __init__(
         self,
@@ -613,7 +601,7 @@ class Gemma4VisionMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.act = ACT2FN[config.hidden_activation]
@@ -651,11 +639,11 @@ class Gemma4VisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "vision_mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "vision_mlp_up")
@@ -663,12 +651,12 @@ class Gemma4VisionMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "vision_mlp_output")
 
 
-class Gemma4VisionEncoderLayer(nn.Module):
+class Gemma4VisionEncoderLayer(spx.Module):
     """HF-compatible vision transformer block for Gemma4."""
 
     def __init__(
@@ -679,7 +667,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.layer_idx = layer_idx
@@ -703,7 +691,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         rotary_emb: Gemma4VisionRotaryEmbedding,
@@ -741,7 +729,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
         )
 
 
-class Gemma4VisionEncoder(nn.Module):
+class Gemma4VisionEncoder(spx.Module):
     """Shared rotary embedding plus stacked Gemma4 vision encoder layers."""
 
     def __init__(
@@ -751,7 +739,7 @@ class Gemma4VisionEncoder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.rotary_emb = Gemma4VisionRotaryEmbedding(config=config, dtype=dtype)
@@ -761,21 +749,21 @@ class Gemma4VisionEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Array,
         attention_mask: Array | None,
@@ -793,7 +781,9 @@ class Gemma4VisionEncoder(nn.Module):
             mask_info = MaskInfo(_attention_mask=bidirectional_mask)
 
         hidden_states = inputs_embeds
-        for layer in self.layers:
+
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -805,11 +795,18 @@ class Gemma4VisionEncoder(nn.Module):
                 attention_mask=attention_mask,
                 output_attentions=output_attentions,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
+            return hidden_states, all_hidden_states, all_attentions
+
+        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions),
+            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -820,7 +817,7 @@ class Gemma4VisionEncoder(nn.Module):
         )
 
 
-class Gemma4VisionPooler(nn.Module):
+class Gemma4VisionPooler(spx.Module):
     """Spatial pooling and hidden-size scaling for Gemma4 vision tokens."""
 
     def __init__(self, config: Gemma4VisionConfig):
@@ -851,7 +848,7 @@ class Gemma4VisionPooler(nn.Module):
         mask = jnp.any(weights != 0, axis=1)
         return output, mask
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         pixel_position_ids: Array,
@@ -888,7 +885,7 @@ class Gemma4VisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -926,16 +923,7 @@ class Gemma4VisionModel(EasyDeLBaseModule):
                 key=None,
             )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for optional Gemma4 standardization tensors."""
-        if not self.config.standardize:
-            return {}
-        return {
-            "std_bias": Replicated,
-            "std_scale": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         pixel_values: Array,
         pixel_position_ids: Array | None = None,
@@ -1036,7 +1024,7 @@ class Gemma4Attention(UnifiedAttention):
         precision: JAX numerical precision for matrix multiplications.
         causal: Whether to apply causal (autoregressive) attention masking.
         is_cross_attention: Whether this layer performs cross-attention.
-        rngs: Flax random number generator state for parameter initialization.
+        rngs: SpecTrax random number generator state for parameter initialization.
     """
 
     def __init__(
@@ -1049,7 +1037,7 @@ class Gemma4Attention(UnifiedAttention):
         causal: bool = True,
         is_cross_attention: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.layer_type = config.layer_types[layer_idx] if config.layer_types else None
         self.is_sliding = self.layer_type == "sliding_attention"
@@ -1336,7 +1324,7 @@ class Gemma4Attention(UnifiedAttention):
 
         # Capture post-norm, post-RoPE K/V for potential downstream sharing.
         # Stored temporarily on the object to be harvested by the model loop.
-        # Using object.__setattr__ to bypass NNX pytree validation.
+        # Using object.__setattr__ to bypass SpecTrax pytree validation.
         object.__setattr__(self, "_captured_kv", (key_states, value_states))
 
         causal_for_kernel = self.causal
@@ -1400,7 +1388,7 @@ class Gemma4Attention(UnifiedAttention):
             cache_view=cache_view,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states,
         mask_info,
@@ -1548,7 +1536,7 @@ class Gemma4Attention(UnifiedAttention):
         )
 
 
-class Gemma4MLP(nn.Module):
+class Gemma4MLP(spx.Module):
     """Gated feed-forward network for Gemma4 decoder layers.
 
     Implements the standard gated MLP: ``down_proj(act(gate_proj(x)) * up_proj(x))``
@@ -1579,7 +1567,7 @@ class Gemma4MLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.dtype = dtype
@@ -1618,7 +1606,7 @@ class Gemma4MLP(nn.Module):
         self.up_proj = column(embed_dim, inner_dim)
         self.down_proj = row(inner_dim, embed_dim)
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply the gated MLP transformation.
 
         Computes ``down_proj(activation(gate_proj(x)) * up_proj(x))`` with
@@ -1635,7 +1623,7 @@ class Gemma4MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = self.gate_proj(hidden_states)
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -1647,12 +1635,12 @@ class Gemma4MLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Gemma4TextMLPStack(nn.Module):
+class Gemma4TextMLPStack(spx.Module):
     """Expert MLP stack for Gemma4 using ``ColumnParallelMoELinear`` / ``RowParallelMoELinear``.
 
     Each expert implements a gated MLP: ``down_proj(act(gate_proj(x)) * up_proj(x))``.
@@ -1679,11 +1667,11 @@ class Gemma4TextMLPStack(nn.Module):
         "gate_up_proj$": {
             "splits": [
                 {
-                    "name": "gate_proj.kernel",
+                    "name": "gate_proj.weight",
                     "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 },
                 {
-                    "name": "up_proj.kernel",
+                    "name": "up_proj.weight",
                     "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 },
             ],
@@ -1694,7 +1682,7 @@ class Gemma4TextMLPStack(nn.Module):
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
@@ -1707,7 +1695,7 @@ class Gemma4TextMLPStack(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__()
         self.config = config
@@ -1719,9 +1707,9 @@ class Gemma4TextMLPStack(nn.Module):
             ColumnParallelMoELinear,
             num_experts=config.num_experts,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=getattr(config, "use_expert_tensor_mode", False),
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1730,9 +1718,9 @@ class Gemma4TextMLPStack(nn.Module):
             RowParallelMoELinear,
             num_experts=config.num_experts,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=getattr(config, "use_expert_tensor_mode", False),
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1743,7 +1731,7 @@ class Gemma4TextMLPStack(nn.Module):
         self.down_proj = moe_linear_row(in_features=config.moe_intermediate_size, out_features=config.hidden_size)
         self.act_fn = ACT2FN[config.hidden_activation]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         group_sizes: Array,
@@ -1786,7 +1774,7 @@ class Gemma4TextRouter(BaseMoeModule):
 
     - ``layers.*.router.norm``
     - ``layers.*.router.proj``
-    - ``layers.*.router.scale``
+    - ``layers.*.router.weight``
     - ``layers.*.router.per_expert_scale``
     - ``layers.*.experts.*``
 
@@ -1823,7 +1811,7 @@ class Gemma4TextRouter(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -1846,7 +1834,7 @@ class Gemma4TextRouter(BaseMoeModule):
             dim=config.hidden_size,
             with_scale=False,
         )
-        self.scale = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(config.hidden_size,),
             dtype=param_dtype,
             init_method="ones",
@@ -1868,7 +1856,7 @@ class Gemma4TextRouter(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
 
     @staticmethod
@@ -1896,7 +1884,7 @@ class Gemma4TextRouter(BaseMoeModule):
         router_dtype = hidden_states.dtype
         return (
             hidden_states
-            * self.scale.value.astype(router_dtype)
+            * self.weight.value.astype(router_dtype)
             * jnp.asarray(self.router_scalar_root_size, dtype=router_dtype)
         )
 
@@ -1928,7 +1916,7 @@ class Gemma4TextRouter(BaseMoeModule):
         top_k_weights = top_k_weights * self.per_expert_scale.value[top_k_indices].astype(top_k_weights.dtype)
         return top_k_weights, top_k_indices
 
-    def __call__(
+    def forward(
         self,
         router_hidden_states: Array,
         expert_hidden_states: Array,
@@ -1961,16 +1949,16 @@ class Gemma4TextRouter(BaseMoeModule):
             gate_hidden_state=router_hidden_states,
             gate_layer=self.proj,
             expert_layer=expert_layer,
-            wi_kernel=expert_layer.gate_proj.kernel.value,
-            wu_kernel=expert_layer.up_proj.kernel.value,
-            wd_kernel=expert_layer.down_proj.kernel.value,
+            wi_kernel=expert_layer.gate_proj.weight.value,
+            wu_kernel=expert_layer.up_proj.weight.value,
+            wd_kernel=expert_layer.down_proj.weight.value,
             hooks=runtime_hooks,
             act_fn=expert_layer.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class Gemma4DecoderLayer(nn.Module):
+class Gemma4DecoderLayer(spx.Module):
     """Single transformer decoder layer for Gemma4.
 
     Implements the full Gemma4 decoder block with the following sequential
@@ -2006,7 +1994,7 @@ class Gemma4DecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.layer_idx = layer_idx
@@ -2041,7 +2029,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.per_layer_input_gate = nn.Linear(
+            self.per_layer_input_gate = ParallelLinear(
                 config.hidden_size,
                 self.hidden_size_per_layer_input,
                 use_bias=False,
@@ -2049,7 +2037,7 @@ class Gemma4DecoderLayer(nn.Module):
                 param_dtype=param_dtype,
                 rngs=rngs,
             )
-            self.per_layer_projection = nn.Linear(
+            self.per_layer_projection = ParallelLinear(
                 self.hidden_size_per_layer_input,
                 config.hidden_size,
                 use_bias=False,
@@ -2072,7 +2060,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         self.is_sliding = self.self_attn.is_sliding
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -2118,7 +2106,7 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -2137,7 +2125,7 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         residual = hidden_states
@@ -2173,7 +2161,7 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -2211,7 +2199,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         dtype: Computation data type. Defaults to bfloat16.
         param_dtype: Parameter storage data type. Defaults to bfloat16.
         precision: JAX precision setting for matrix operations.
-        rngs: Flax random number generator state.
+        rngs: SpecTrax random number generator state.
     """
 
     def __init__(
@@ -2221,7 +2209,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -2247,19 +2235,19 @@ class Gemma4TextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -2273,7 +2261,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = nn.Linear(
+            self.per_layer_model_projection = ParallelLinear(
                 config.hidden_size,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
                 use_bias=False,
@@ -2289,7 +2277,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
             )
 
         # Keep the cached layer-type summary hashable so split graphdefs can
-        # flow through static JAX/NNX compilation paths.
+        # flow through static JAX/SpecTrax compilation paths.
         self.unique_layer_types = tuple(dict.fromkeys(config.layer_types))
 
     def get_per_layer_inputs(self, input_ids: Array) -> Array:
@@ -2442,7 +2430,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
             )
         return ModuleCaches(frequencies)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -2552,7 +2540,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -2564,7 +2552,8 @@ class Gemma4TextModel(EasyDeLBaseModule):
         shared_kv: dict[int, tuple[Array, Array]] = {}
         donor_cache_views: dict[int, typing.Any] = {}
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2577,7 +2566,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
             shared_key_value = shared_kv.get(attn.kv_shared_layer_index) if attn.is_kv_shared_layer else None
 
             # Shared layers use the donor's cache view; their own slot is None.
-            cache_view = past_key_values.views[idx]
+            cache_view = self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values)
             if cache_view is None and attn.is_kv_shared_layer:
                 cache_view = donor_cache_views.get(attn.kv_shared_layer_index)
 
@@ -2594,7 +2583,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 per_layer_input=per_layer_input,
                 shared_key_value=shared_key_value,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             # Store captured K/V for potential downstream sharing.
             captured = getattr(attn, "_captured_kv", None)
@@ -2602,13 +2591,22 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 shared_kv[idx] = captured
                 object.__setattr__(attn, "_captured_kv", None)
                 # Track the donor's (potentially updated) cache view.
-                donor_cache_views[idx] = layer_outputs.cache_view
+                self._layer_cache_view_update(
+                    donor_cache_views, idx, layer_outputs.cache_view, enabled=True
+                )
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
             if not attn.is_kv_shared_layer:
-                past_key_values[idx] = layer_outputs.cache_view
+                self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
         if output_hidden_states:
@@ -2652,7 +2650,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         dtype: Computation data type. Defaults to bfloat16.
         param_dtype: Parameter data type. Defaults to bfloat16.
         precision: JAX precision setting for matrix operations.
-        rngs: Flax random number generator state.
+        rngs: SpecTrax random number generator state.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -2666,7 +2664,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -2680,7 +2678,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -2793,6 +2791,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
                     cap = jnp.array(cap_value, dtype=lm_logits.dtype)
                     lm_logits = cap * jax.nn.tanh(lm_logits / cap)
                 return lm_logits
+
         else:
             # Untied: delegate to base (native_forward bypass) + add capping.
             base_fn = super().make_lm_head_fn()
@@ -2823,7 +2822,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         return self.model.get_embedding()
 
 
-class Gemma4MultimodalEmbedder(nn.Module):
+class Gemma4MultimodalEmbedder(spx.Module):
     """Projects multimodal (vision or audio) features into the language model's embedding space.
 
     Applies scale-free RMSNorm followed by a linear projection to transform
@@ -2848,7 +2847,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.embedding_pre_projection_norm = Gemma4RMSNorm(
             dim=multimodal_hidden_size,
@@ -2857,7 +2856,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
             with_scale=False,
         )
         kernel_init = jax.nn.initializers.normal(0.02)
-        self.embedding_projection = nn.Linear(
+        self.embedding_projection = ParallelLinear(
             multimodal_hidden_size,
             text_hidden_size,
             use_bias=False,
@@ -2867,7 +2866,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, inputs_embeds: Array) -> Array:
+    def forward(self, inputs_embeds: Array) -> Array:
         """Normalize and project multimodal features to text embedding space.
 
         Args:
@@ -2911,7 +2910,7 @@ class Gemma4Model(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -3049,7 +3048,7 @@ class Gemma4Model(EasyDeLBaseModule):
             return inputs_embeds, None
         return inputs_embeds, EmbeddingInfo(per_layer_inputs=per_layer_inputs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         pixel_values: Array | None = None,
@@ -3167,7 +3166,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -3273,7 +3272,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
 
         return _project
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         pixel_values: Array | None = None,

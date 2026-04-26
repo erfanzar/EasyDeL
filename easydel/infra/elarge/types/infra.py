@@ -24,7 +24,7 @@ import collections.abc
 import typing as tp
 from typing import Any, NotRequired, TypedDict
 
-from eformer.escale import PartitionAxis
+from spectrax import PartitionAxis
 
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 

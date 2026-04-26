@@ -17,13 +17,11 @@ from functools import cached_property, partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -75,7 +73,7 @@ def clip_loss(similarity: jax.Array) -> jax.Array:
     return (caption_loss + image_loss) / 2.0
 
 
-class CLIPVisionEmbeddings(nn.Module):
+class CLIPVisionEmbeddings(spx.Module):
     """Vision embeddings module for CLIP models.
 
     Converts image pixel values into patch embeddings with position encodings
@@ -89,7 +87,7 @@ class CLIPVisionEmbeddings(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP vision embeddings.
 
@@ -99,7 +97,7 @@ class CLIPVisionEmbeddings(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         embed_dim = config.hidden_size
@@ -111,20 +109,17 @@ class CLIPVisionEmbeddings(nn.Module):
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": 0.02},
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
-        self.patch_embedding = nn.Conv(
+        self.patch_embedding = nn.Conv2d(
             config.num_channels,
             embed_dim,
-            kernel_size=(patch_size, patch_size),
-            strides=(patch_size, patch_size),
+            kernel_size=patch_size,
+            stride=patch_size,
             padding="VALID",
             use_bias=False,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(),
             rngs=rngs,
         )
 
@@ -139,11 +134,7 @@ class CLIPVisionEmbeddings(nn.Module):
             rngs=rngs,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for custom embedding parameters."""
-        return {"class_embedding": Replicated}
-
-    def __call__(self, pixel_values):
+    def forward(self, pixel_values):
         """Create vision embeddings from pixel values.
 
         Args:
@@ -170,7 +161,7 @@ class CLIPVisionEmbeddings(nn.Module):
         return checkpoint_name(embeddings, name="embeddings")
 
 
-class CLIPTextEmbeddings(nn.Module):
+class CLIPTextEmbeddings(spx.Module):
     """Text embeddings module for CLIP models.
 
     Combines token embeddings and position embeddings for text
@@ -184,7 +175,7 @@ class CLIPTextEmbeddings(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP text embeddings.
 
@@ -194,7 +185,7 @@ class CLIPTextEmbeddings(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         embed_dim = config.hidden_size
 
@@ -215,7 +206,7 @@ class CLIPTextEmbeddings(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, input_ids, position_ids):
+    def forward(self, input_ids, position_ids):
         """Create text embeddings from token IDs.
 
         Args:
@@ -247,7 +238,7 @@ class CLIPAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP attention layer.
 
@@ -258,7 +249,7 @@ class CLIPAttention(AttentionModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -319,7 +310,7 @@ class CLIPAttention(AttentionModule):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -363,7 +354,7 @@ class CLIPAttention(AttentionModule):
         )
 
 
-class CLIPMLP(nn.Module):
+class CLIPMLP(spx.Module):
     """Multi-Layer Perceptron module for CLIP models.
 
     Implements the feedforward network with configurable activation function
@@ -377,7 +368,7 @@ class CLIPMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP MLP block.
 
@@ -387,7 +378,7 @@ class CLIPMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -407,7 +398,7 @@ class CLIPMLP(nn.Module):
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply feedforward transformation.
@@ -421,7 +412,7 @@ class CLIPMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         hidden_states = checkpoint_name(self.fc1(hidden_states), name="mlp_up")
         hidden_states = self.activation_fn(hidden_states)
@@ -429,12 +420,12 @@ class CLIPMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, name="mlp_output")
 
 
-class CLIPEncoderLayer(nn.Module):
+class CLIPEncoderLayer(spx.Module):
     """Single encoder layer for CLIP models.
 
     Combines multi-head self-attention and feedforward networks with
@@ -448,7 +439,7 @@ class CLIPEncoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP encoder layer.
 
@@ -457,7 +448,7 @@ class CLIPEncoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -493,7 +484,7 @@ class CLIPEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -534,7 +525,7 @@ class CLIPEncoderLayer(nn.Module):
         )
 
 
-class CLIPEncoder(nn.Module):
+class CLIPEncoder(spx.Module):
     """Transformer encoder for CLIP models.
 
     Stacks multiple CLIPEncoderLayer instances to form the complete
@@ -548,7 +539,7 @@ class CLIPEncoder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP encoder.
 
@@ -557,7 +548,7 @@ class CLIPEncoder(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -570,18 +561,18 @@ class CLIPEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for _ in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=_):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
 
     @cached_property
     def causal_mask(self):
@@ -594,7 +585,7 @@ class CLIPEncoder(nn.Module):
             return self.config.get_basic_causal_mask()
         return None
 
-    def __call__(
+    def forward(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
@@ -619,7 +610,8 @@ class CLIPEncoder(nn.Module):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        for layer in self.layers:
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -628,11 +620,18 @@ class CLIPEncoder(nn.Module):
                 mask_info=mask_info,
                 output_attentions=output_attentions,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
+            return hidden_states, all_hidden_states, all_attentions
+
+        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions),
+            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -657,7 +656,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP text transformer.
 
@@ -666,7 +665,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -699,7 +698,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 
         self.eos_token_id = self.config.eos_token_id
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo,
@@ -800,7 +799,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP vision transformer.
 
@@ -809,7 +808,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -847,7 +846,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         pixel_values: Array | None = None,
         output_attentions=None,
@@ -939,7 +938,7 @@ class CLIPTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP text model.
 
@@ -948,7 +947,7 @@ class CLIPTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -965,7 +964,7 @@ class CLIPTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo | None = None,
@@ -1050,7 +1049,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP text model with projection.
 
@@ -1059,7 +1058,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1085,7 +1084,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo,
@@ -1168,7 +1167,7 @@ class CLIPVisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP vision model.
 
@@ -1177,7 +1176,7 @@ class CLIPVisionModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1194,7 +1193,7 @@ class CLIPVisionModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         pixel_values: Array,
         output_attentions: bool = False,
@@ -1261,7 +1260,7 @@ class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransfo
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP for image classification.
 
@@ -1270,7 +1269,7 @@ class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransfo
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1283,7 +1282,7 @@ class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransfo
             pooling_strategy="mean",
         )
 
-    def __call__(
+    def forward(
         self,
         pixel_values: Array | None = None,
         output_attentions: bool | None = None,
@@ -1374,7 +1373,7 @@ class CLIPModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize CLIP model.
 
@@ -1383,7 +1382,7 @@ class CLIPModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1432,11 +1431,7 @@ class CLIPModel(EasyDeLBaseModule):
             value=jnp.ones((), dtype=jnp.float32) * self.config.logit_scale_init_value,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for custom scalar parameters."""
-        return {"logit_scale": Replicated}
-
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None,
         pixel_values: Array,
@@ -1592,7 +1587,7 @@ class CLIPModel(EasyDeLBaseModule):
         """
         forward_batch = batch
         try:
-            call_signature = inspect.signature(self.__call__)
+            call_signature = inspect.signature(self.forward)
         except (TypeError, ValueError):
             call_signature = None
         if call_signature is not None:

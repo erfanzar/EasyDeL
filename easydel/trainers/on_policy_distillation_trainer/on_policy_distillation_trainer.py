@@ -17,19 +17,18 @@ import typing as tp
 
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time
 
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import on_policy_distillation_step
 from .on_policy_distillation_config import OnPolicyDistillationConfig
 
@@ -102,9 +101,9 @@ class OnPolicyDistillationTrainer(Trainer):
         self.arguments = arguments
 
         if not isinstance(student_model, EasyDeLState):
-            student_model = student_model.to_state()
+            student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
         if not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state()
+            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.teacher_state = teacher_model
         self.processing_class = processing_class
@@ -176,7 +175,7 @@ class OnPolicyDistillationTrainer(Trainer):
             TrainerConfigureFunctionOutput with compiled step functions.
         """
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
 
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
@@ -200,7 +199,7 @@ class OnPolicyDistillationTrainer(Trainer):
 
         static_argnames = tuple(range(3, 12))
 
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             on_policy_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -220,7 +219,7 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.logits_chunk_size,
         )
 
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             on_policy_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,

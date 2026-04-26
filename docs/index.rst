@@ -1,11 +1,11 @@
 EasyDeL 🔮
 ==========
-EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. Built on modern Flax NNX, it provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/SpecTrax. Built on modern SpecTrax SpecTrax, it provides convenient and effective solutions for training and serving SpecTrax/Jax models on TPU/GPU at scale.
 
 Key Features
 ============
 
-- **Modern Architecture**: Built on Flax NNX for better integration, modularity, and performance
+- **Modern Architecture**: Built on SpecTrax SpecTrax for better integration, modularity, and performance
 - **Diverse Model Support**: Seamlessly support for Transformers, Mamba, RWKV, Vision Models and more
 - **Advanced Trainers**: Specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer
 - **Vision Model Support**: Comprehensive support for vision-to-vision tasks, image-text-to-image generation, and image-to-text processing
@@ -33,7 +33,7 @@ Advanced Customization and Optimization 🔧
 
 EasyDeL provides unparalleled flexibility in customizing and optimizing your models:
 
-- **Custom Module System**: Built on Flax NNX, allowing easy creation and integration of custom modules
+- **Custom Module System**: Built on SpecTrax SpecTrax, allowing easy creation and integration of custom modules
 - **Transparent Architecture**: Every component is open for inspection and modification
 - **Dynamic Configuration**: Easily customize model architecture, training pipeline, and inference settings
 
@@ -75,7 +75,7 @@ Why Choose EasyDeL?
 ====================
 
 1. **Flexibility**: EasyDeL offers a modular design that allows researchers and developers to easily mix and match components, experiment with different architectures (e.g., Transformers, Mamba, RWKV), and adapt models to specific use cases.
-2. **Performance**: Leveraging the power of JAX and Flax, EasyDeL provides high-performance implementations of state-of-the-art models and training techniques, optimized for both TPUs and GPUs.
+2. **Performance**: Leveraging the power of JAX and SpecTrax, EasyDeL provides high-performance implementations of state-of-the-art models and training techniques, optimized for both TPUs and GPUs.
 3. **Scalability**: From small experiments to large-scale model training, EasyDeL provides tools and optimizations to efficiently scale your models and workflows.
 4. **Ease of Use**: Despite its powerful features, EasyDeL maintains an intuitive API, making it accessible for both beginners and experienced practitioners.
 5. **Cutting-Edge Research**: Quickly implement the latest advancements in model architectures, training techniques, and optimization methods.
@@ -89,7 +89,7 @@ To cite this Project
 
 .. _EasyDeL:
 
-Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes." 2023. https://github.com/erfanzar/EasyDeL
+Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/SpecTrax and aims to provide convenient and effective solutions for training SpecTrax/Jax Models on TPU/GPU for both Serving and Training purposes." 2023. https://github.com/erfanzar/EasyDeL
 
 .. toctree::
    :maxdepth: 2
@@ -173,7 +173,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 .. code-block:: bibtex
 
   @misc{Zare Chavoshi_2023,
-      title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
+      title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/SpecTrax and aims to provide convenient and effective solutions for training SpecTrax/Jax Models on TPU/GPU for both Serving and Training purposes.},
       url={https://github.com/erfanzar/EasyDeL},
       journal={EasyDeL Easy and Fast DeepLearning with JAX},
       publisher={Erfan Zare Chavoshi},

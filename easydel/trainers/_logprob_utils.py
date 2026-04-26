@@ -297,8 +297,8 @@ def compute_sequence_scores_from_hidden_states(
     token_chunk_size = max(1, min(int(token_chunk_size), int(seq_len)))
 
     # Obtain the trace-safe projection callable once, before entering the
-    # fori_loop / checkpoint region.  This avoids calling NNX-module
-    # __call__ methods (which may carry nn.remat wrappers) from inside
+    # fori_loop / checkpoint region.  This avoids calling SpecTrax-module
+    # forward methods (which may carry nn.remat wrappers) from inside
     # nested JAX traced regions, preventing TraceContextError.
     _lm_head_fn = (
         projection_model.make_lm_head_fn()

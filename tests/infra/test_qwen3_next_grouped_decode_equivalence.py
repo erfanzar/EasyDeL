@@ -16,15 +16,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from eformer.escale import PartitionAxis, PartitionManager
 from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax import PartitionAxis, PartitionManager
 
 import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
-    _apply_qwen3_next_packed_slow_updates,
+    _apply_qwen3_next_depthwise_conv_sequence,
     _apply_qwen3_next_packed_updates,
     _apply_qwen3_next_packed_updates_unified,
+    _finalize_qwen3_next_conv_state_from_combined,
     _preserve_array_sharding,
     apply_grouped_single_step_gdr,
 )
@@ -56,6 +57,81 @@ def _legacy_single_step(query, key, value, beta, decay, recurrent_state):
         recurrent_state=recurrent_state,
     )
     return legacy_output.transpose(0, 2, 1, 3), legacy_state
+
+
+def _reference_packed_updates(
+    *,
+    conv_states,
+    recurrent_states,
+    conv_input,
+    beta,
+    decay,
+    kernel,
+    query_start_loc,
+    num_requests,
+    key_dim,
+    num_k_heads,
+    head_k_dim,
+    num_v_heads,
+    head_v_dim,
+    expand_ratio,
+    conv_output_dtype,
+    gdr_op,
+    **_unused,
+):
+    """Straight-line per-request reference for packed Qwen3-Next state updates."""
+    seq_len = conv_input.shape[1]
+    d_conv = kernel.shape[1]
+    num_slots = min(conv_states.shape[0], query_start_loc.shape[0] - 1)
+    request_count = int(np.asarray(num_requests))
+    updated_conv_states = conv_states
+    updated_recurrent_states = recurrent_states
+    token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
+
+    for slot in range(num_slots):
+        start = int(np.asarray(query_start_loc[slot]))
+        end = int(np.asarray(query_start_loc[slot + 1]))
+        length = end - start
+        if slot >= request_count or length <= 0:
+            continue
+
+        combined_inputs = jnp.concatenate(
+            [conv_states[slot].T[None, :, :], conv_input[:, start:end, :]],
+            axis=1,
+        )
+        conv_output = _apply_qwen3_next_depthwise_conv_sequence(
+            combined_inputs,
+            kernel,
+            output_dtype=conv_output_dtype,
+        )[:, d_conv:, :]
+        query = conv_output[:, :, :key_dim].reshape(1, length, num_k_heads, head_k_dim)
+        key = conv_output[:, :, key_dim : key_dim * 2].reshape(1, length, num_k_heads, head_k_dim)
+        value = conv_output[:, :, key_dim * 2 :].reshape(1, length, num_v_heads, head_v_dim)
+        if expand_ratio > 1:
+            query = jnp.repeat(query, expand_ratio, axis=2)
+            key = jnp.repeat(key, expand_ratio, axis=2)
+
+        gdr_output = gdr_op(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta[:, start:end, :],
+            decay=decay[:, start:end, :],
+            recurrent_state=recurrent_states[slot : slot + 1],
+        )
+        updated_conv = _finalize_qwen3_next_conv_state_from_combined(
+            combined_inputs,
+            jnp.asarray([length + d_conv], dtype=jnp.int32),
+            d_conv=d_conv,
+            output_dtype=conv_states.dtype,
+        )[0]
+        updated_conv_states = updated_conv_states.at[slot].set(updated_conv)
+        updated_recurrent_states = updated_recurrent_states.at[slot].set(
+            gdr_output.recurrent_state[0].astype(updated_recurrent_states.dtype)
+        )
+        token_outputs = token_outputs.at[start:end].set(gdr_output.attention_outputs[0].astype(token_outputs.dtype))
+
+    return updated_conv_states, updated_recurrent_states, token_outputs
 
 
 def _make_packed_decode_inputs(dtype=jnp.bfloat16):
@@ -328,14 +404,14 @@ def _make_tp_grouped_decode_inputs(dtype=jnp.bfloat16, batch: int = 8):
     return query, key, value, beta, decay, recurrent_state
 
 
-def _make_runtime_mesh(axis_dims: tuple[int, ...] = (1, -1, 1, 1, 1)) -> Mesh:
+def _make_runtime_mesh(axis_dims: tuple[int, ...] = (1, 1, -1, 1, 1, 1)) -> Mesh:
     return Qwen3NextConfig(
         sharding_axis_dims=axis_dims,
         backend=jax.default_backend(),
     ).mesh
 
 
-def _make_gdr_op(mesh: Mesh, runtime_dtype=jnp.bfloat16, axis_dims: tuple[int, ...] = (1, -1, 1, 1, 1)):
+def _make_gdr_op(mesh: Mesh, runtime_dtype=jnp.bfloat16, axis_dims: tuple[int, ...] = (1, 1, -1, 1, 1, 1)):
     base_config = Qwen3NextConfig(
         sharding_axis_dims=axis_dims,
         backend=jax.default_backend(),
@@ -420,8 +496,9 @@ def test_packed_updates_match_reference_loop_for_decode_like_schedule():
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
+            ragged_gdr_op=object(),
         )
-        ref_conv, ref_rec, ref_out = _apply_qwen3_next_packed_slow_updates(
+        ref_conv, ref_rec, ref_out = _reference_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
         )
@@ -459,8 +536,9 @@ def test_packed_updates_match_reference_loop_for_large_bucket_decode_like_schedu
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
+            ragged_gdr_op=object(),
         )
-        ref_conv, ref_rec, ref_out = _apply_qwen3_next_packed_slow_updates(
+        ref_conv, ref_rec, ref_out = _reference_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
         )
@@ -470,23 +548,24 @@ def test_packed_updates_match_reference_loop_for_large_bucket_decode_like_schedu
     assert jnp.allclose(unified_out.astype(jnp.float32), ref_out.astype(jnp.float32), rtol=0.02, atol=0.05)
 
 
-def test_packed_updates_fall_back_to_unified_for_partial_prefill_bucket(monkeypatch):
+def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_bucket(monkeypatch):
     packed_inputs = _make_partial_bucket_prefill_inputs(bucket=512, actual_tokens=454)
     mesh = _make_runtime_mesh()
 
-    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
+    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "0")
 
     with mesh, set_inference_mode(True):
         gdr_op = _make_gdr_op(mesh)
         dispatched_conv, dispatched_rec, dispatched_out = _apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
+            ragged_gdr_op=object(),
         )
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates_unified(
             **packed_inputs,
             gdr_op=gdr_op,
         )
-        ref_conv, ref_rec, _ref_out = _apply_qwen3_next_packed_slow_updates(
+        ref_conv, ref_rec, _ref_out = _reference_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
         )
@@ -535,6 +614,7 @@ def test_packed_updates_keep_ragged_for_partial_decode_bucket(monkeypatch):
         dispatched = qwen3_next_modeling._apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=object(),
+            ragged_gdr_op=object(),
         )
 
     assert int(dispatched[0][0]) == 2
@@ -582,6 +662,7 @@ def test_packed_prefill_updates_match_reference_loop_for_mixed_schedule():
                     expand_ratio=packed_inputs["expand_ratio"],
                     conv_output_dtype=packed_inputs["conv_output_dtype"],
                     gdr_op=gdr_op,
+                    ragged_gdr_op=object(),
                 )
             )
         )
@@ -589,6 +670,7 @@ def test_packed_prefill_updates_match_reference_loop_for_mixed_schedule():
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
+            ragged_gdr_op=object(),
         )
         jitted_conv, jitted_rec, jitted_out = jitted_prefill(
             packed_inputs["conv_states"],
@@ -600,7 +682,7 @@ def test_packed_prefill_updates_match_reference_loop_for_mixed_schedule():
             packed_inputs["query_start_loc"],
             packed_inputs["num_requests"],
         )
-        ref_conv, ref_rec, ref_out = _apply_qwen3_next_packed_slow_updates(
+        ref_conv, ref_rec, ref_out = _reference_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
         )
@@ -641,8 +723,9 @@ def test_packed_prefill_updates_match_reference_loop_for_many_prefills():
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
+            ragged_gdr_op=object(),
         )
-        ref_conv, ref_rec, ref_out = _apply_qwen3_next_packed_slow_updates(
+        ref_conv, ref_rec, ref_out = _reference_packed_updates(
             **packed_inputs,
             gdr_op=gdr_op,
         )
@@ -657,10 +740,10 @@ def test_packed_prefill_updates_match_reference_loop_for_many_prefills():
     reason="Requires a 4-device TPU mesh",
 )
 def test_tp_mesh_helper_uses_tensor_parallel_axis():
-    mesh = _make_runtime_mesh((1, 1, 1, 4, 1))
+    mesh = _make_runtime_mesh((1, 1, 1, 1, 4, 1))
 
     with mesh:
-        gdr_op = _make_gdr_op(mesh, axis_dims=(1, 1, 1, 4, 1))
+        gdr_op = _make_gdr_op(mesh, axis_dims=(1, 1, 1, 1, 4, 1))
         mode = gdr_op.get_mode(query=jnp.zeros((2, 1, 4, 128), dtype=jnp.bfloat16), BTHD=True)
         shardings = gdr_op.metadata.get_shardings(mode, layout="bthd")
 
@@ -673,11 +756,11 @@ def test_tp_mesh_helper_uses_tensor_parallel_axis():
     reason="Requires a 4-device TPU mesh",
 )
 def test_grouped_gdr_decode_shard_map_pallas_matches_jax_on_tp_mesh():
-    mesh = _make_runtime_mesh((1, 1, 1, 4, 1))
+    mesh = _make_runtime_mesh((1, 1, 1, 1, 4, 1))
     query, key, value, beta, decay, recurrent_state = _make_tp_grouped_decode_inputs()
 
     with mesh:
-        gdr_op = _make_gdr_op(mesh, axis_dims=(1, 1, 1, 4, 1))
+        gdr_op = _make_gdr_op(mesh, axis_dims=(1, 1, 1, 1, 4, 1))
         pallas_out, pallas_state = gdr_op.grouped_gdr_decode_shard_map_pallas(
             query=query,
             key=key,

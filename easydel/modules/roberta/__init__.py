@@ -53,7 +53,8 @@ Usage Example
 -------------
 ```python
 from easydel import RobertaConfig, RobertaForSequenceClassification
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 import jax.numpy as jnp
 
 # Create configuration
@@ -72,7 +73,7 @@ model = RobertaForSequenceClassification(
     num_labels=2,
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Classify text

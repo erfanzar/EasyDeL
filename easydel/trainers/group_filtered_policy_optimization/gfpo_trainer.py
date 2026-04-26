@@ -339,7 +339,9 @@ class GFPOTrainer(GRPOTrainer):
             reward_batch = batch
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
-            prompt_model_kwargs = extract_generation_model_kwargs(batch, model_callable=state.model.__call__)
+            prompt_model_kwargs = extract_generation_model_kwargs(
+                batch, model_callable=getattr(state.model, "forward", state.model)
+            )
             scoring_prompt_model_kwargs = strip_prompt_only_scoring_model_kwargs(prompt_model_kwargs)
             validate_prompt_aligned_generation_model_kwargs(
                 scoring_prompt_model_kwargs,
@@ -381,7 +383,7 @@ class GFPOTrainer(GRPOTrainer):
             )
             normalized_repeated_model_kwargs = normalize_generation_model_kwargs(
                 repeated_prompt_model_kwargs,
-                model_callable=self.ref_state.model.__call__,
+                model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
             )
             prompt_completion_mask = jnp.concatenate([ridmask, completion_mask], -1)
 

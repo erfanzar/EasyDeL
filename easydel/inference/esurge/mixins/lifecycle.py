@@ -21,8 +21,8 @@ import time
 import traceback
 import typing
 
-import flax
 import jax
+import spectrax as spx
 
 from ..logger import logger
 from ..scheduler import Scheduler, SchedulerOutput
@@ -652,7 +652,7 @@ class EngineLifecycleMixin:
             )
 
         if model is None:
-            model = flax.nnx.merge(graphdef, graphstate, graphother)
+            model = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
         if using_compatible_split and graphdef is None:
             if graphstate is None:
                 graphstate = split_graphstate

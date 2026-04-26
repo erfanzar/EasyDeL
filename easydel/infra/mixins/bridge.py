@@ -21,7 +21,7 @@ the HuggingFace Hub.
 
 The bridge supports:
 - Loading models from HuggingFace Hub or local paths
-- Converting between PyTorch and JAX/Flax formats
+- Converting between PyTorch and JAX/spectrax formats
 - Saving models in EasyDeL or HuggingFace formats
 - Pushing models to HuggingFace Hub
 - Automatic weight format detection and loading
@@ -32,7 +32,6 @@ Classes:
     EasyBridgeMixin: Main mixin class providing bridge functionality
 
 Constants:
-    FLAX_WEIGHTS_NAME: Standard name for Flax model weights
     SAFE_WEIGHTS_NAME: Standard name for SafeTensors weights
     CANDIDATE_FILENAMES: List of possible weight file names to search
 
@@ -60,9 +59,12 @@ import gc
 import json
 import os
 import re
+import shutil
 import tempfile
+import time
 import typing as tp
 import warnings
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -70,41 +72,27 @@ import huggingface_hub
 import huggingface_hub.errors
 import jax
 import numpy as np
-from eformer.escale import PartitionAxis
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from eformer.serialization import Checkpointer
 from eformer.serialization.checkpointer import find_latest_checkpoint
-from flax import nnx as nn
 from huggingface_hub import CommitOperationAdd, create_branch, create_commit, create_repo
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-
-try:
-    from transformers.utils.generic import working_or_temp_dir
-except ImportError:  # transformers>=5 removed helper
-    import shutil
-    import tempfile
-    from contextlib import contextmanager
-
-    @contextmanager
-    def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_dir: bool = False):
-        if use_temp_dir or working_dir is None:
-            temp_dir = tempfile.mkdtemp()
-            try:
-                yield temp_dir
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        else:
-            os.makedirs(working_dir, exist_ok=True)
-            yield working_dir
-
-
+from spectrax import PartitionAxis, match_partition_rules, nn
 from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers import QuantizationConfig, eLoRA
+from easydel.utils.checkpoint_compat import (
+    adapt_legacy_checkpoint_collections as _adapt_legacy_checkpoint_collections,
+)
+from easydel.utils.checkpoint_compat import (
+    rename_legacy_checkpoint_leaves as _rename_legacy_checkpoint_leaves,
+)
 from easydel.utils.helpers import is_remote_path
+from easydel.utils.instrumentation import phase_timer as _phase_timer
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import (
     flatten_dict,
@@ -120,18 +108,17 @@ from easydel.utils.traversals import (
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from ..base_config import download_url as _download_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
+from ..sharding import sanitize_partition_spec_for_shape
 
 if tp.TYPE_CHECKING:
     from ..base_module import EasyDeLBaseModule
 logger = get_logger(__name__)
 
-FLAX_WEIGHTS_NAME = "easydel-model.parameters"
 WEIGHTS_NAME = "pytorch_model.bin"
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 TF2_WEIGHTS_NAME = "tf_model.h5"
 TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
 TF_WEIGHTS_NAME = "model.ckpt"
-FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
 SAFE_WEIGHTS_NAME = "model.safetensors"
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 ED_SAFE_WEIGHTS_INDEX_NAME = "easydel-model.parameters.safetensors.index.json"
@@ -148,56 +135,21 @@ CANDIDATE_FILENAMES = [
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
     ED_SAFE_WEIGHTS_INDEX_NAME,
-    FLAX_WEIGHTS_NAME,
     TENSORSTORE_INDEX_NAME,
 ]
 
 
-def _mesh_partition_product(mesh: jax.sharding.Mesh, axis_spec: object) -> int:
-    """Return shard multiplicity implied by a PartitionSpec entry."""
-    if axis_spec is None:
-        return 1
-    if isinstance(axis_spec, (tuple, list)):
-        product = 1
-        for axis_name in axis_spec:
-            if axis_name is None:
-                continue
-            try:
-                product *= int(mesh.shape[str(axis_name)])
-            except Exception:
-                product *= 1
-        return int(product)
-    try:
-        return int(mesh.shape[str(axis_spec)])
-    except Exception:
-        return 1
-
-
-def _sanitize_partition_spec_for_shape(
-    spec: PartitionSpec,
-    shape: tuple[int, ...],
-    mesh: jax.sharding.Mesh,
-) -> PartitionSpec:
-    """Drop non-divisible sharding axes for a concrete tensor shape."""
-    axes = list(tuple(spec))
-    changed = False
-    ndim = len(shape)
-
-    if len(axes) > ndim:
-        axes = axes[:ndim]
-        changed = True
-
-    for dim_index, axis_spec in enumerate(axes):
-        if axis_spec is None:
-            continue
-        shard_factor = _mesh_partition_product(mesh, axis_spec)
-        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
-            axes[dim_index] = None
-            changed = True
-
-    if not changed:
-        return spec
-    return PartitionSpec(*axes)
+@contextmanager
+def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_dir: bool = False):
+    if use_temp_dir or working_dir is None:
+        temp_dir = tempfile.mkdtemp()
+        try:
+            yield temp_dir
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        os.makedirs(working_dir, exist_ok=True)
+        yield working_dir
 
 
 def _tree_key_to_path(key: tp.Any) -> str:
@@ -212,11 +164,11 @@ def _path_match_variants(path: str) -> tuple[str, ...]:
     normalized = path.strip("/")
     slash_variants = {normalized}
 
-    if normalized.startswith("model/params/"):
-        slash_variants.add(normalized[len("model/params/") :])
+    if normalized.startswith("model/parameters/"):
+        slash_variants.add(normalized[len("model/parameters/") :])
         slash_variants.add(normalized[len("model/") :])
-    if normalized.startswith("params/"):
-        slash_variants.add(normalized[len("params/") :])
+    if normalized.startswith("parameters/"):
+        slash_variants.add(normalized[len("parameters/") :])
     if normalized.startswith("model/"):
         slash_variants.add(normalized[len("model/") :])
 
@@ -248,7 +200,7 @@ def _normalize_checkpoint_leaf_to_jax(
 
 
 def _collect_lora_checkpoint_paths(
-    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+    flat_state: dict[tuple[tp.Any, ...], tp.Any]
 ) -> dict[tuple[tp.Any, ...], dict[str, tp.Any]]:
     """Extract LoRA adapter locations from a flattened checkpoint state.
 
@@ -266,12 +218,15 @@ def _collect_lora_checkpoint_paths(
     """
     lora_paths: dict[tuple[tp.Any, ...], dict[str, tp.Any]] = {}
     for key, value in flat_state.items():
-        if not isinstance(key, tuple) or not key:
+        if not isinstance(key, tuple) or len(key) < 2:
             continue
         leaf_name = str(key[-1])
         if leaf_name not in {"lora_a", "lora_b"}:
             continue
-        entry = lora_paths.setdefault(key[:-1], {})
+        # Strip the leading collection name (e.g. "lora") so the path
+        # points to the actual module location inside the model.
+        module_path = key[1:-1]
+        entry = lora_paths.setdefault(module_path, {})
         entry[leaf_name] = value
     return {path: values for path, values in lora_paths.items() if {"lora_a", "lora_b"} <= set(values)}
 
@@ -333,13 +288,12 @@ def _rebuild_lora_modules_from_checkpoint(
             model=model,
             path=path,
             new_value=eLoRA(
+                int(in_features),
+                int(rank),
+                int(out_features),
                 base_module=module,
-                rngs=nn.Rngs(0),
+                rngs=spx.Rngs(0),
                 dtype=getattr(module, "dtype", None),
-                param_dtype=getattr(module, "param_dtype", getattr(lora_a, "dtype", jnp.float32)),
-                in_features=int(in_features),
-                lora_rank=int(rank),
-                out_features=int(out_features),
             ),
         )
         rebuilt += 1
@@ -365,11 +319,10 @@ def _build_safe_checkpoint_partition_rules(
         return partition_rules
 
     try:
-        from eformer.escale import match_partition_rules
 
-        specs_tree = match_partition_rules(list(partition_rules), model.graphtree_params_shape, strict=False)
+        specs_tree = match_partition_rules(list(partition_rules), model.graphtree_parameters_shape, strict=False)
         flat_specs = flatten_dict(specs_tree)
-        flat_shapes = flatten_dict(model.graphtree_params_shape)
+        flat_shapes = flatten_dict(model.graphtree_parameters_shape)
     except Exception:
         return tuple(partition_rules)
 
@@ -383,7 +336,7 @@ def _build_safe_checkpoint_partition_rules(
         if not shape:
             continue
 
-        safe_spec = _sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+        safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
         if safe_spec != spec:
             path = _tree_key_to_path(key)
             for variant in _path_match_variants(path):
@@ -625,8 +578,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 if self.generation_config is not None:
                     _save_generation_config(self.generation_config, save_directory)
 
-        state = nn.split(self, nn.Param, ...)[1]
-        state_dict = state.to_pure_dict()
+        state = spx.export(self)[1]
+        state_dict = state.raw()
         cpu_device = _checkpoint_cpu_device()
         numpy_leaf_paths: list[str] = []
         state_dict = jax.tree_util.tree_map_with_path(
@@ -984,13 +937,13 @@ class EasyBridgeMixin(PushToHubMixin):
             quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
             pattern_str: str | None = quantizer_for_modules.pattern
             pattern = re.compile(pattern_str) if pattern_str is not None else None
-            for path, module in iter_module_search(model, nn.Module):
+            for path, module in iter_module_search(model, spx.Module):
                 if not hasattr(module, "to_quantized") or not callable(module.to_quantized):
                     continue
                 path_str = ".".join([str(p) for p in path])
                 if pattern is not None and not pattern.search(path_str):
                     continue
-                kernel_key = (*path, "kernel")
+                kernel_key = (*path, "weight")
                 kernel_map[kernel_key] = ((*path, "quant_kernel"), (*path, "quant_scales"), (*path, "quant_biases"))
 
         def _apply_shard_fn(x, p):
@@ -1010,33 +963,37 @@ class EasyBridgeMixin(PushToHubMixin):
             extraargs["callback"] = callback
             if itwas_tensorstore and apply_quantization:
                 extraargs["chunk_size"] = 32
-            checkpoint_partition_rules = _build_safe_checkpoint_partition_rules(
-                model=model,
-                mesh=mesh,
-                partition_rules=model._get_partition_rules(None),
-            )
-            state, _ = Checkpointer(
-                base_path=str(resolved_archive_file),
-                save_interval=None,
-                step_policies=[],
-            ).load_pytree(
-                mesh=mesh,
-                dtype=param_dtype,  # legacy
-                partition_rules=checkpoint_partition_rules,
-                prefix="model",
-                discover_latest=True,
-                discover_raise=False,
-                load_treedef=False,
-                **extraargs,
-            )
-            params = state.get("params", None)
-
-            if params is not None:
-                state = params
-
-            state = flatten_dict(state)
-            state = string_key_to_int(state)
-            model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
+            with _phase_timer("  load: build_safe_checkpoint_partition_rules"):
+                checkpoint_partition_rules = _build_safe_checkpoint_partition_rules(
+                    model=model,
+                    mesh=mesh,
+                    partition_rules=model._get_partition_rules(None),
+                )
+                print(checkpoint_partition_rules)
+            with _phase_timer("  load: Checkpointer.load_pytree"):
+                state, _ = Checkpointer(
+                    base_path=str(resolved_archive_file),
+                    save_interval=None,
+                    step_policies=[],
+                ).load_pytree(
+                    mesh=mesh,
+                    dtype=param_dtype,  # legacy
+                    partition_rules=checkpoint_partition_rules,
+                    prefix="model",
+                    discover_latest=True,
+                    discover_raise=False,
+                    load_treedef=False,
+                    **extraargs,
+                )
+            with _phase_timer("  load: flatten + legacy rename + lora rebuild"):
+                if isinstance(state, spx.State):
+                    state = state.raw()
+                # Keep all collections (params, lora, buffers, rng, ...) —
+                # downstream flatten/unflatten handles the nested structure.
+                state = flatten_dict(state)
+                state = string_key_to_int(state)
+                state = _rename_legacy_checkpoint_leaves(state)
+                model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
             has_quantized_keys = any(
                 isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
@@ -1124,13 +1081,24 @@ class EasyBridgeMixin(PushToHubMixin):
                             quant_kernel.block_until_ready()
                         del kernel_value
 
-            # Use the full nn.Param tree here instead of model.graphtree_params_shape:
-            # LoRA-enabled models expose only LoRAParam leaves via graphstate_type,
-            # but checkpoints still contain the untouched base weights.
-            required_params = set(flatten_dict(nn.split(model, nn.Param, ...)[1].to_pure_dict()))
-            unexpected_keys = set(state.keys()) - required_params
-            for unexpected_key in unexpected_keys:
-                del state[unexpected_key]
+            with _phase_timer("  load: build required_params (spx.export)"):
+                # Use the full spx.Parameter tree here instead of model.graphtree_parameters_shape:
+                # the default trainable selector may exclude other live weight
+                # collections, but checkpoints still contain the untouched base weights.
+                model_state_raw = spx.export(model)[1].raw()
+                # Strip the leading collection segment from checkpoint keys so
+                # they can be compared against the model's parameter paths.
+                required_params: set[tuple[tp.Any, ...]] = set()
+                for c, d in model_state_raw.items():
+                    for path_tuple in flatten_dict(d):
+                        required_params.add((c, *path_tuple))
+            with _phase_timer("  load: adapt legacy collections + drop unexpected"):
+                # Old EasyDeL saves either omitted the collection wrapper or used
+                # the legacy `params` collection name; align them to the live model.
+                state = _adapt_legacy_checkpoint_collections(state, required_params)
+                unexpected_keys = set(state.keys()) - required_params
+                for unexpected_key in unexpected_keys:
+                    del state[unexpected_key]
 
             cpu_device = _checkpoint_cpu_device()
 
@@ -1145,27 +1113,31 @@ class EasyBridgeMixin(PushToHubMixin):
                     return x.astype(param_dtype)
                 return x
 
-            # Convert in-place to avoid holding both the original and converted
-            # parameter trees in memory at the same time (important for large
-            # dtype downcasts like bf16 -> fp8).
-            if isinstance(state, dict):
-                for k in list(state.keys()):
-                    v = state[k]
-                    if isinstance(k, tuple) and k and str(k[-1]) == "quant_kernel":
-                        new_v = v
-                    else:
-                        new_v = _convert(v)
-                    state[k] = new_v
-                    # JAX is async; force completion so the old buffer can be freed
-                    # before converting the next leaf to reduce peak memory.
-                    if new_v is not v and hasattr(new_v, "block_until_ready"):
-                        new_v.block_until_ready()
-                    del v
-            else:
-                state = jax.tree_util.tree_map(_convert, state)
+            with _phase_timer("  load: dtype-cast leaves"):
+                # Convert in-place to avoid holding both the original and converted
+                # parameter trees in memory at the same time (important for large
+                # dtype downcasts like bf16 -> fp8).
+                if isinstance(state, dict):
+                    for k in list(state.keys()):
+                        v = state[k]
+                        if isinstance(k, tuple) and k and str(k[-1]) == "quant_kernel":
+                            new_v = v
+                        else:
+                            new_v = _convert(v)
+                        state[k] = new_v
+                        # JAX is async; force completion so the old buffer can be freed
+                        # before converting the next leaf to reduce peak memory.
+                        if new_v is not v and hasattr(new_v, "block_until_ready"):
+                            new_v.block_until_ready()
+                        del v
+                else:
+                    state = jax.tree_util.tree_map(_convert, state)
 
             silence_merge = quantized_checkpoint or modules_quantized_on_load
-            return merge_model_and_tree(model=model, tree=unflatten_dict(state), silence=silence_merge)
+            with _phase_timer("  load: merge_model_and_tree"):
+                model = merge_model_and_tree(model=model, tree=unflatten_dict(state), silence=silence_merge)
+            with _phase_timer("  load: assert_parameters_materialized"):
+                return model.assert_parameters_materialized(context=f"loading weights from {resolved_archive_file}")
 
         else:
             return model
@@ -1174,9 +1146,9 @@ class EasyBridgeMixin(PushToHubMixin):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str | os.PathLike | None,
-        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
-        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: collections.abc.Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -1206,11 +1178,11 @@ class EasyBridgeMixin(PushToHubMixin):
             pretrained_model_name_or_path (str | PathLike | None): The name or path of the
                 pretrained model. Can be a HuggingFace Hub model ID or a local directory path.
             sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
-                Defaults to (1, -1, 1, 1, 1).
+                Defaults to (1, 1, -1, 1, 1, 1).
             sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN (Data Center
                 Network) sharding axes for multi-host setups. Defaults to None.
             sharding_axis_names (Sequence[str]): The names of sharding axes.
-                Defaults to ("dp", "fsdp", "ep", "tp", "sp").
+                Defaults to ("pp", "dp", "fsdp", "ep", "tp", "sp").
             partition_axis (PartitionAxis): The partition axis configuration for model sharding.
                 Defaults to PartitionAxis().
             dtype (jnp.dtype): The data type for model computations. Defaults to jnp.bfloat16.
@@ -1284,7 +1256,6 @@ class EasyBridgeMixin(PushToHubMixin):
         else:
             snapshot_max_workers = max(int(snapshot_max_workers), 1)
 
-        # Not relevant for Flax Models
         _ = kwargs.pop("adapter_kwargs", None)
 
         if trust_remote_code is True:
@@ -1298,17 +1269,21 @@ class EasyBridgeMixin(PushToHubMixin):
 
         config_path = config if config is not None else pretrained_model_name_or_path
 
-        config = AutoEasyDeLConfig.from_pretrained(
-            config_path,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            from_torch=False,
-            backend=backend,
-            platform=platform,
-            model_task=cls._model_task,
-        )
+        timings: dict[str, float] = {}
+        total_start = time.perf_counter()
+
+        with _phase_timer("AutoEasyDeLConfig.from_pretrained", accumulator=timings):
+            config = AutoEasyDeLConfig.from_pretrained(
+                config_path,
+                sharding_axis_dims=sharding_axis_dims,
+                sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+                sharding_axis_names=sharding_axis_names,
+                partition_axis=partition_axis,
+                from_torch=False,
+                backend=backend,
+                platform=platform,
+                model_task=cls._model_task,
+            )
         config_kwargs = {} if config_kwargs is None else config_kwargs
         config.add_basic_configurations(
             sharding_axis_dims=sharding_axis_dims,
@@ -1327,19 +1302,22 @@ class EasyBridgeMixin(PushToHubMixin):
         if commit_hash is None:
             commit_hash = getattr(config, "_commit_hash", None)
         if auto_shard_model and shard_fns is None:
-            shard_fns, _ = AutoShardAndGatherFunctions.from_config(
-                config=config,
-                flatten=False,
-                partition_rules=partition_rules,
-                model_task=cls._model_task,
-            )
-            fns = {"params": shard_fns}
-            fns.update(shard_fns)
-            shard_fns = fns
+            with _phase_timer("AutoShardAndGatherFunctions.from_config", accumulator=timings):
+                shard_fns, _ = AutoShardAndGatherFunctions.from_config(
+                    config=config,
+                    flatten=False,
+                    partition_rules=partition_rules,
+                    model_task=cls._model_task,
+                )
+                fns = {"parameters": shard_fns}
+                fns.update(shard_fns)
+                shard_fns = fns
 
         resolved_archive_file = None
         archive_file: ePath | None = None  # pyright: ignore[reportInvalidTypeForm]
         filename: str | None = None
+        _resolve_phase = _phase_timer("resolve+download checkpoint files", accumulator=timings)
+        _resolve_phase.__enter__()
         if pretrained_model_name_or_path:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 
@@ -1446,54 +1424,65 @@ class EasyBridgeMixin(PushToHubMixin):
                 filename = os.path.basename(str(archive_file))
             else:
                 logger.debug(f"loading weights file {filename} from cache at {resolved_archive_file}")
+        _resolve_phase.__exit__(None, None, None)
 
         cls = get_modules_by_type(config.model_type, cls._model_task)[1]
-        model = cls.lazy_init(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=nn.Rngs(0),
-        )
-        model = cls._load_model_weights(
-            resolved_archive_file,
-            model,
-            param_dtype,
-            model.mesh,
-            shard_fns,
-            quantization_config,
-            apply_quantization,
-            verbose,
-        )
-        model = model.quantize(
-            quantization_config=quantization_config,
-            apply_quantization=apply_quantization,
-            verbose=verbose,
-            raise_error=False,
-        )
-        if model.can_generate():
-            model.generation_config = _load_generation_config(
-                pretrained_model_name_or_path,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                proxies=proxies,
-                local_files_only=local_files_only,
-                token=token,
-                revision=revision,
-                subfolder=subfolder,
-                _from_auto=from_auto_class,
-                _from_pipeline=from_pipeline,
-                log_missing=True,
-                **kwargs,
+        with _phase_timer("cls.lazy_init", accumulator=timings):
+            model = cls.lazy_init(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=spx.Rngs(0),
             )
-            if model.generation_config is None:
-                try:
-                    model.generation_config = GenerationConfig.from_model_config(model.config)
-                except Exception:
-                    logger.debug("Failed to build fallback generation config from model.config", exc_info=True)
+        with _phase_timer("cls._load_model_weights", accumulator=timings):
+            model = cls._load_model_weights(
+                resolved_archive_file,
+                model,
+                param_dtype,
+                model.mesh,
+                shard_fns,
+                quantization_config,
+                apply_quantization,
+                verbose,
+            )
+        with _phase_timer("model.quantize", accumulator=timings):
+            model = model.quantize(
+                quantization_config=quantization_config,
+                apply_quantization=apply_quantization,
+                verbose=verbose,
+                raise_error=False,
+            )
+        if model.can_generate():
+            with _phase_timer("_load_generation_config", accumulator=timings):
+                model.generation_config = _load_generation_config(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                    _from_auto=from_auto_class,
+                    _from_pipeline=from_pipeline,
+                    log_missing=True,
+                    **kwargs,
+                )
+                if model.generation_config is None:
+                    try:
+                        model.generation_config = GenerationConfig.from_model_config(model.config)
+                    except Exception:
+                        logger.debug("Failed to build fallback generation config from model.config", exc_info=True)
         if auto_shard_model:
             # double check to make sure weights are correct or just a simple non-op.
-            model = model.shard_model(partition_rules=partition_rules)
+            model.assert_parameters_materialized(context="before shard_model in from_pretrained")
+            with _phase_timer("model.shard_model", accumulator=timings):
+                model = model.shard_model(partition_rules=partition_rules)
+
+        total_elapsed = time.perf_counter() - total_start
+        breakdown = ", ".join(f"{k}={v:.2f}s" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))
+        logger.debug(f"[from_pretrained] TOTAL={total_elapsed:.2f}s  ({breakdown})")
         return model
 
     @classmethod
@@ -1504,9 +1493,9 @@ class EasyBridgeMixin(PushToHubMixin):
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
-        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: collections.abc.Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         shard_fns: collections.abc.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
@@ -1535,11 +1524,11 @@ class EasyBridgeMixin(PushToHubMixin):
                 Defaults to jax.numpy.float32.
             precision (jax.lax.Precision | None): The computation precision. Defaults to None.
             sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
-                Defaults to (1, -1, 1, 1, 1).
+                Defaults to (1, 1, -1, 1, 1, 1).
             sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN sharding axes
                 for multi-host setups. Defaults to None.
             sharding_axis_names (Sequence[str]): The names of sharding axes.
-                Defaults to ("dp", "fsdp", "ep", "tp", "sp").
+                Defaults to ("pp", "dp", "fsdp", "ep", "tp", "sp").
             partition_axis (PartitionAxis | None): The partition axis configuration.
                 Defaults to None.
             shard_fns (Mapping[tuple, Callable] | dict | None): Custom shard functions for
@@ -1640,7 +1629,7 @@ class EasyBridgeMixin(PushToHubMixin):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
         model.generation_config = generation_config
 
@@ -1711,6 +1700,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         logger.debug("merging model and parameters pytree.")
         model = merge_model_and_tree(model=model, tree=params)
+        model.assert_parameters_materialized(context=f"converting torch checkpoint {pretrained_model_name_or_path}")
         logger.debug("model and parameters pytree merged.")
 
         model = model.quantize(
@@ -2275,9 +2265,9 @@ class EasyBridgeMixin(PushToHubMixin):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
-        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: collections.abc.Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -2310,11 +2300,11 @@ class EasyBridgeMixin(PushToHubMixin):
             param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.Precision | None): The computation precision. Defaults to None.
             sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
-                Defaults to (1, -1, 1, 1, 1).
+                Defaults to (1, 1, -1, 1, 1, 1).
             sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN sharding axes
                 for multi-host setups. Defaults to None.
             sharding_axis_names (Sequence[str]): The names of sharding axes.
-                Defaults to ("dp", "fsdp", "ep", "tp", "sp").
+                Defaults to ("pp", "dp", "fsdp", "ep", "tp", "sp").
             partition_axis (PartitionAxis | None): The partition axis configuration.
                 Defaults to None.
             backend (EasyDeLBackends | None): The backend to use. Defaults to None.
@@ -2342,10 +2332,10 @@ class EasyBridgeMixin(PushToHubMixin):
         from datetime import datetime
 
         import tensorstore as ts
-        from eformer.escale import match_partition_rules
         from huggingface_hub.errors import EntryNotFoundError
         from jax.experimental.array_serialization import serialization as jax_ser
         from jax.experimental.array_serialization import tensorstore_impl as ts_impl
+        from spectrax import match_partition_rules
         from transformers import AutoConfig
 
         from easydel.modules.auto.auto_configuration import get_modules_by_type
@@ -2433,15 +2423,15 @@ class EasyBridgeMixin(PushToHubMixin):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
 
-        required_params = set(flatten_dict(model.graphtree_params_shape))
+        required_params = set(flatten_dict(model.graphtree_parameters_shape))
         partition_rules = model._get_partition_rules(partition_rules)
         spec_map: dict[tuple, PartitionSpec] = {}
         if partition_rules is not None:
             try:
-                specs_tree = match_partition_rules(partition_rules, model.graphtree_params_shape)
+                specs_tree = match_partition_rules(partition_rules, model.graphtree_parameters_shape)
                 spec_map = flatten_dict(specs_tree)
             except Exception:
                 spec_map = {}
@@ -2765,7 +2755,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 return moe_handles[target_path]
 
             stacked_key = f"{target_path}.weight"
-            out_key = stacked_key[:-7] + ".kernel" if stacked_key.endswith(".weight") else stacked_key + ".kernel"
+            out_key = stacked_key[:-7] + ".weight" if stacked_key.endswith(".weight") else stacked_key + ".weight"
             key_tuple = tuple(int(n) if n.isdigit() else n for n in out_key.split("."))
             if key_tuple not in required_params:
                 return None

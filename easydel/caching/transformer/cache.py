@@ -75,8 +75,6 @@ from enum import Enum
 from functools import partial
 
 import jax
-from eformer import common_types
-from eformer.escale import PartitionManager, apply_logical_sharding
 from eformer.jaximus import ImplicitArray, register
 from eformer.pytree import auto_pytree, field
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -87,7 +85,9 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array as JAXArray
 from jaxtyping import Float, Int
+from spectrax import PartitionManager, apply_logical_sharding, common_types
 
+from ...infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
 from .._abstracts import (
     BaseCache,
     BaseCacheConfig,
@@ -190,7 +190,7 @@ def _mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
 def _sanitize_sharding_axes_for_shape(
     *,
     mesh: Mesh,
-    partition_manager: PartitionManager,
+    runtime_sharding_resolver: RuntimeShardingResolver,
     axes: list[object | None],
     mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
     shape: tuple[int, ...],
@@ -204,7 +204,7 @@ def _sanitize_sharding_axes_for_shape(
 
     Args:
         mesh: JAX device mesh for axis size lookups.
-        partition_manager: Manager to resolve logical axes to PartitionSpec.
+        runtime_sharding_resolver: Resolver that maps logical axes to concrete shardings.
         axes: List of logical axis names (or None for replicated dims).
         mode: Runtime mode (e.g., MODE_PREFILL) for partition resolution.
         shape: Tensor shape to validate axis compatibility against.
@@ -212,7 +212,7 @@ def _sanitize_sharding_axes_for_shape(
     Returns:
         tuple: Sanitized axes with incompatible entries replaced by None.
     """
-    spec = partition_manager.resolve(axes=axes, mode=mode, shape=shape)
+    spec = runtime_sharding_resolver.resolve(axes=axes, mode=mode, shape=shape)
     safe: list[object | None] = []
     for logical_axis, axis_spec, dim in zip(axes, spec, shape, strict=False):
         if logical_axis is None or axis_spec is None:
@@ -472,7 +472,7 @@ class TransformerCacheView(BaseCacheView):
             Shape: [batch_size, seq_length, num_key_heads, key_dim]
         value (cx.Array | ImplicitArray): Cached value states.
             Shape: [batch_size, seq_length, num_value_heads, value_dim]
-        indexs (cx.Array | ImplicitArray): Current position index per sequence.
+        indexes (cx.Array | ImplicitArray): Current position index per sequence.
             Shape: [batch_size]
         starts (cx.Array | ImplicitArray): Starting position per sequence.
             Shape: [batch_size]
@@ -484,7 +484,7 @@ class TransformerCacheView(BaseCacheView):
 
     key: Float[JAXArray, "batch seq_len num_key_heads key_dim"] | ImplicitArray | None
     value: Float[JAXArray, "batch seq_len num_value_heads value_dim"] | ImplicitArray | None
-    indexs: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
+    indexes: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
     starts: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
 
     metadata: TransformerCacheConfig
@@ -506,7 +506,8 @@ class TransformerCacheView(BaseCacheView):
         *,
         mesh: Mesh | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
-        partition_manager: PartitionManager | None = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
         quantizer: EasyQuantizer | None = None,
         masking_details: AttnMaskDetail | None = None,
         starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
@@ -521,7 +522,9 @@ class TransformerCacheView(BaseCacheView):
             layer_index: Index of this layer in the model.
             mesh: JAX device mesh for sharding.
             dtype: Data type for cache tensors.
-            partition_manager: Partition manager for sharding.
+            runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
             quantizer: Quantization configuration.
             masking_details: Attention mask configuration.
             starts: Initial starting positions per sequence.
@@ -534,6 +537,10 @@ class TransformerCacheView(BaseCacheView):
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager,
+            mesh=mesh,
+        )
 
         with jax.named_scope("easydel-transformer-cacheview-init"):
             mt = config
@@ -546,10 +553,18 @@ class TransformerCacheView(BaseCacheView):
                     vshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.value_heads, mt.value_dim)
 
             kv_safe_k = _sanitize_sharding_axes_for_shape(
-                mesh=mesh, partition_manager=partition_manager, axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape
+                mesh=mesh,
+                runtime_sharding_resolver=runtime_sharding_resolver,
+                axes=kv_sharding_axes,
+                mode=MODE_PREFILL,
+                shape=kshape,
             )
             kv_safe_v = _sanitize_sharding_axes_for_shape(
-                mesh=mesh, partition_manager=partition_manager, axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape
+                mesh=mesh,
+                runtime_sharding_resolver=runtime_sharding_resolver,
+                axes=kv_sharding_axes,
+                mode=MODE_PREFILL,
+                shape=vshape,
             )
             kv_sharding_axes = [
                 axis if (kv_safe_k[i] is not None and kv_safe_v[i] is not None) else None
@@ -559,7 +574,7 @@ class TransformerCacheView(BaseCacheView):
             batch_axes: list[object | None] = [BATCH]
             batch_safe = _sanitize_sharding_axes_for_shape(
                 mesh=mesh,
-                partition_manager=partition_manager,
+                runtime_sharding_resolver=runtime_sharding_resolver,
                 axes=batch_axes,
                 mode=MODE_PREFILL,
                 shape=(mt.batch_size,),
@@ -567,21 +582,33 @@ class TransformerCacheView(BaseCacheView):
             if batch_safe[0] is None:
                 batch_axes = [None]
 
-            kshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape))
-            vshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape))
-            ishardings = Ns(mesh, partition_manager.resolve(axes=batch_axes, mode=MODE_PREFILL, shape=(mt.batch_size,)))
+            kshardings = Ns(
+                mesh,
+                runtime_sharding_resolver.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape),
+            )
+            vshardings = Ns(
+                mesh,
+                runtime_sharding_resolver.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape),
+            )
+            ishardings = Ns(
+                mesh,
+                runtime_sharding_resolver.resolve(axes=batch_axes, mode=MODE_PREFILL, shape=(mt.batch_size,)),
+            )
 
             if starts is None:
                 starts = jnp.zeros((mt.batch_size,), dtype=jnp.int32)
 
             starts = apply_logical_sharding(
-                starts, axes=batch_axes, mode=MODE_PREFILL, partition_manager=partition_manager
+                starts,
+                axes=batch_axes,
+                mode=MODE_PREFILL,
+                partition_manager=runtime_sharding_resolver,
             )
 
             out = cls(
                 key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=kshardings)),
                 value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=vshardings)),
-                indexs=jnp.zeros((config.batch_size,), dtype=jnp.int32, device=ishardings),
+                indexes=jnp.zeros((config.batch_size,), dtype=jnp.int32, device=ishardings),
                 starts=starts,
                 metadata=config,
                 layer_index=layer_index,
@@ -602,7 +629,8 @@ class TransformerCacheView(BaseCacheView):
         quantizer: EasyQuantizer,
         cache_metadata: "TransformerMetadata | OperationsMetadata | HybridMetadata | None",
         mask_info: MaskInfo,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
     ) -> tuple[
         Float[JAXArray, "batch seq_len num_key_heads key_dim"],
         Float[JAXArray, "batch seq_len num_value_heads value_dim"],
@@ -629,7 +657,9 @@ class TransformerCacheView(BaseCacheView):
                 OperationsMetadata, or HybridMetadata). Unwrapped internally.
             mask_info: MaskInfo object with attention mask configuration.
                 KV dimension is expanded automatically if needed.
-            partition_manager: Manager for tensor sharding.
+            runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
 
         Returns:
             tuple: Five-element tuple containing:
@@ -647,8 +677,11 @@ class TransformerCacheView(BaseCacheView):
         runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
         masking_details = self.masking_details
-        indexs = self.indexs
-        sharding_statics = dict(mode=MODE_PREFILL, partition_manager=partition_manager)
+        indexes = self.indexes
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
+        sharding_statics = dict(mode=MODE_PREFILL, partition_manager=runtime_sharding_resolver)
 
         # Expand mask KV dimension if it doesn't match cache size
         # This is needed when using HybridCache with TransformerCacheView
@@ -656,7 +689,7 @@ class TransformerCacheView(BaseCacheView):
         cache_kv_len = key_shape[1] if key_shape is not None else 0
         mask_kv_len = mask_info.kv_len
         if mask_kv_len is not None and mask_kv_len < cache_kv_len:
-            mask_info = _expand_mask_kv_dim(mask_info, cache_kv_len, indexs, num_updated_cache_vectors)
+            mask_info = _expand_mask_kv_dim(mask_info, cache_kv_len, indexes, num_updated_cache_vectors)
 
         def _kv_struct_shard(
             x: Float[JAXArray, "batch seq_len num_heads head_dim"],
@@ -697,18 +730,18 @@ class TransformerCacheView(BaseCacheView):
         sliding_window = None
 
         if masking_details is not None and masking_details.mask_type == AttnMaskType.SLIDING:
-            value_cache_updated = _update_kv_sliding(_maybe_materialize(self.value), value, indexs)
-            key_cache_updated = _update_kv_sliding(_maybe_materialize(self.key), key, indexs)
+            value_cache_updated = _update_kv_sliding(_maybe_materialize(self.value), value, indexes)
+            key_cache_updated = _update_kv_sliding(_maybe_materialize(self.key), key, indexes)
             sliding_window = masking_details.size
         else:
-            value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexs)
-            key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexs)
+            value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexes)
+            key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexes)
 
-        indexs = indexs + num_updated_cache_vectors
+        indexes = indexes + num_updated_cache_vectors
         mask_info = mask_info.apply_kv_lengths(
-            kv_lengths=indexs,
+            kv_lengths=indexes,
             q_len=num_updated_cache_vectors,
-            end_index=indexs,
+            end_index=indexes,
             sliding_window=sliding_window,
         )
 
@@ -717,7 +750,7 @@ class TransformerCacheView(BaseCacheView):
         value_cache_storage = _kv_struct_shard(value_cache_updated)
         key_cache_storage = _kv_struct_shard(key_cache_updated)
         batch_axes = getattr(self, "batch_sharding_axes", (BATCH,))
-        indexs_updated = apply_logical_sharding(indexs, axes=batch_axes, **sharding_statics)
+        indexes_updated = apply_logical_sharding(indexes, axes=batch_axes, **sharding_statics)
 
         value_cache_out = value_cache_storage.astype(runtime_dtype)
         key_cache_out = key_cache_storage.astype(runtime_dtype)
@@ -729,7 +762,7 @@ class TransformerCacheView(BaseCacheView):
             self.replace(
                 key=quantizer(key_cache_storage),
                 value=quantizer(value_cache_storage),
-                indexs=indexs_updated,
+                indexes=indexes_updated,
             ),
             masking_details,
         )
@@ -776,7 +809,8 @@ class TransformerCache(BaseCache):
         cls,
         mesh: Mesh,
         config: TransformerCacheConfig,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
         dtype: jnp.dtype | None = None,
         starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
         quantizer: EasyQuantizer | None = None,
@@ -790,7 +824,9 @@ class TransformerCache(BaseCache):
         Args:
             mesh: JAX device mesh for distributed execution.
             config: TransformerCacheConfig with cache dimensions and behavior.
-            partition_manager: Manager for tensor partitioning/sharding.
+            runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
             dtype: Data type for cache tensors. Defaults to jnp.bfloat16.
             starts: Initial starting positions per batch sequence.
             quantizer: Optional quantizer to apply to cache tensors.
@@ -805,6 +841,10 @@ class TransformerCache(BaseCache):
         quantizer = quantizer or EasyQuantizer(quantization_config=None)
         if dtype is None:
             dtype = jnp.bfloat16
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager,
+            mesh=mesh,
+        )
         with mesh:
             return cls(
                 views=[
@@ -816,7 +856,7 @@ class TransformerCache(BaseCache):
                         starts=starts,
                         quantizer=quantizer,
                         masking_details=mask_type_details.get(layer_index) if mask_type_details is not None else None,
-                        partition_manager=partition_manager,
+                        runtime_sharding_resolver=runtime_sharding_resolver,
                     )
                     for layer_index in range(config.num_hidden_layers)
                 ]
@@ -830,11 +870,11 @@ class TransformerCache(BaseCache):
 
         Returns:
             tuple: Pair of (cache_data, metadata) where:
-                - cache_data: List of [key, value, indexs, starts] per layer
+                - cache_data: List of [key, value, indexes, starts] per layer
                 - metadata: Cache configuration metadata
         """
         return (
-            [[layer.key, layer.value, layer.indexs, layer.starts] for layer in self.views],
+            [[layer.key, layer.value, layer.indexes, layer.starts] for layer in self.views],
             self.views[-1].metadata,
         )
 
@@ -848,7 +888,7 @@ class TransformerCache(BaseCache):
         typically after loading from disk or receiving from transfer.
 
         Args:
-            pure: List of [key, value, indexs, starts] per layer.
+            pure: List of [key, value, indexes, starts] per layer.
             metadata: Cache configuration metadata.
 
         Returns:
@@ -859,7 +899,7 @@ class TransformerCache(BaseCache):
                 TransformerCacheView(
                     key=layer[0],
                     value=layer[1],
-                    indexs=layer[2],
+                    indexes=layer[2],
                     starts=layer[3],
                     metadata=metadata,
                 )
@@ -868,7 +908,11 @@ class TransformerCache(BaseCache):
         )
 
     def insert_starts(
-        self, starts: Int[JAXArray, "..."], slot: int, partition_manager: PartitionManager
+        self,
+        starts: Int[JAXArray, "..."],
+        slot: int,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
     ) -> TransformerCache:
         """Insert starting positions at specified batch slot.
 
@@ -878,11 +922,16 @@ class TransformerCache(BaseCache):
         Args:
             starts: New starting positions to insert.
             slot (int): Batch slot index to update.
-            partition_manager (PartitionManager): Sharding configuration.
+            runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
 
         Returns:
             TransformerCache: Updated cache instance.
         """
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
         for idx in range(len(self.views)):
             view = self.views[idx]
             starts = jnp.array(starts).reshape(-1)
@@ -892,13 +941,17 @@ class TransformerCache(BaseCache):
                     lax.dynamic_update_slice_in_dim(view.starts, starts, slot, 0),
                     axes=[BATCH],
                     mode=MODE_PREFILL,
-                    partition_manager=partition_manager,
+                    partition_manager=runtime_sharding_resolver,
                 )
             )
         return self
 
     def insert_index(
-        self, index: Int[JAXArray, "..."], slot: int, partition_manager: PartitionManager
+        self,
+        index: Int[JAXArray, "..."],
+        slot: int,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
     ) -> TransformerCache:
         """Insert position indices at specified batch slot.
 
@@ -908,20 +961,25 @@ class TransformerCache(BaseCache):
         Args:
             index: New position index to insert.
             slot (int): Batch slot index to update.
-            partition_manager (PartitionManager): Sharding configuration.
+            runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
 
         Returns:
             TransformerCache: Updated cache instance.
         """
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
         for idx in range(len(self.views)):
             view = self.views[idx]
             index = jnp.array(index).reshape(-1)
             self.views[idx] = self.views[idx].replace(
-                indexs=apply_logical_sharding(
-                    lax.dynamic_update_slice_in_dim(view.indexs, index, slot, 0),
+                indexes=apply_logical_sharding(
+                    lax.dynamic_update_slice_in_dim(view.indexes, index, slot, 0),
                     axes=[BATCH],
                     mode=MODE_PREFILL,
-                    partition_manager=partition_manager,
+                    partition_manager=runtime_sharding_resolver,
                 )
             )
         return self
@@ -931,7 +989,8 @@ class TransformerCache(BaseCache):
         other: TransformerCache,
         slot: int,
         quantizer: EasyQuantizer,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
+        partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
     ):
         """Insert another cache's contents at specified batch slot.
 
@@ -943,11 +1002,16 @@ class TransformerCache(BaseCache):
             other (TransformerCache): Source cache to copy from.
             slot (int): Batch slot index to insert into.
             quantizer (EasyQuantizer): Quantization configuration.
-            partition_manager (PartitionManager): Sharding configuration.
+            runtime_sharding_resolver: Runtime sharding resolver for cache tensors.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
 
         Returns:
             TransformerCache: Updated cache instance.
         """
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
 
         for idx in range(len(self.views)):
             view = self.views[idx]
@@ -970,7 +1034,7 @@ class TransformerCache(BaseCache):
                         new_key,
                         axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
                         mode=MODE_PREFILL,
-                        partition_manager=partition_manager,
+                        partition_manager=runtime_sharding_resolver,
                     )
                 ),
                 value=quantizer(
@@ -978,20 +1042,20 @@ class TransformerCache(BaseCache):
                         new_val,
                         axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
                         mode=MODE_PREFILL,
-                        partition_manager=partition_manager,
+                        partition_manager=runtime_sharding_resolver,
                     )
                 ),
-                indexs=apply_logical_sharding(
-                    lax.dynamic_update_slice_in_dim(view.indexs, oview.indexs, slot, 0),
+                indexes=apply_logical_sharding(
+                    lax.dynamic_update_slice_in_dim(view.indexes, oview.indexes, slot, 0),
                     axes=[BATCH],
                     mode=MODE_PREFILL,
-                    partition_manager=partition_manager,
+                    partition_manager=runtime_sharding_resolver,
                 ),
                 starts=apply_logical_sharding(
                     lax.dynamic_update_slice_in_dim(view.starts, oview.starts, slot, 0),
                     axes=[BATCH],
                     mode=MODE_PREFILL,
-                    partition_manager=partition_manager,
+                    partition_manager=runtime_sharding_resolver,
                 ),
                 metadata=view.metadata,
             )
@@ -1030,10 +1094,10 @@ class TransformerMetadata(BaseRunTimeMetadata):
             Affects mask generation and position calculations.
         starts (jax.Array | None): Starting positions for sequences.
             Used for relative position calculations.
-        indexs (jax.Array | None): Current position indices.
+        indexes (jax.Array | None): Current position indices.
             Tracks generation progress per sequence.
     """
 
     postpadded: bool = field(pytree_node=False, default=False)
     starts: Int[JAXArray, "batch"] | None = None  # noqa: F821
-    indexs: Int[JAXArray, "batch"] | None = None  # noqa: F821
+    indexes: Int[JAXArray, "batch"] | None = None  # noqa: F821

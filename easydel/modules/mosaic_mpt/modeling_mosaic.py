@@ -17,14 +17,13 @@ import math
 from functools import cached_property, partial
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from einops import rearrange
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -48,7 +47,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .mosaic_configuration import MptConfig as MptConfig
 
 
-class MptMLP(nn.Module):
+class MptMLP(spx.Module):
     """MPT MLP module.
 
     This module implements the feed-forward network (MLP) used in the MPT model.
@@ -71,7 +70,7 @@ class MptMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initializes the MptMLP module.
@@ -81,7 +80,7 @@ class MptMLP(nn.Module):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         linear_class = partial(
@@ -107,7 +106,7 @@ class MptMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         residual: Float[Array, "batch seq_len hidden_dim"],
@@ -128,7 +127,7 @@ class MptMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         up = jax.nn.gelu(checkpoint_name(self.up_proj(hidden_states), name="mlp_up"), approximate=False)
         hidden_states = checkpoint_name(self.down_proj(up), name="mlp_down")
@@ -136,7 +135,7 @@ class MptMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return self.hidden_dropout(hidden_states) + residual
 
@@ -165,7 +164,7 @@ class MptAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize MPT attention with ALiBi support.
@@ -195,7 +194,7 @@ class MptAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Define MPT-specific network with fused QKV projection.
 
@@ -239,7 +238,7 @@ class MptAttention(UnifiedAttention):
         self.attention_performer = self._create_attention_performer(config, rngs)
         self._create_alibi_slopes(config)
 
-    def _create_attention_performer(self, config: MptConfig, rngs: nn.Rngs):
+    def _create_attention_performer(self, config: MptConfig, rngs: spx.Rngs):
         """Create attention performer with MPT-specific settings.
 
         Args:
@@ -389,7 +388,7 @@ class MptAttention(UnifiedAttention):
         )
 
 
-class MptBlock(nn.Module):
+class MptBlock(spx.Module):
     """MPT Transformer block.
 
     This module represents a single transformer block in the MPT model,
@@ -401,7 +400,7 @@ class MptBlock(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         norm_1 (LayerNorm): Layer normalization before the attention layer.
         attn (MptAttention): The self-attention module.
         norm_2 (LayerNorm): Layer normalization before the MLP layer.
@@ -416,7 +415,7 @@ class MptBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initializes the MptBlock module.
@@ -426,7 +425,7 @@ class MptBlock(nn.Module):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         self.config = config
         self.dtype = dtype
@@ -471,7 +470,7 @@ class MptBlock(nn.Module):
         self.dropout_rate = self.config.attn_config.attn_pdrop
         self.resid_attn_dropout = nn.Dropout(self.dropout_rate, rngs=rngs)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -585,7 +584,7 @@ class MptModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         wte (Embed): Token embedding layer.
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
@@ -600,7 +599,7 @@ class MptModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the MptModel.
 
@@ -609,7 +608,7 @@ class MptModel(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -632,19 +631,19 @@ class MptModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.blocks = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for i in range(self.config.n_layers):
+            with spx.assign_stage(total=self.config.n_layers, current=i):
+                self.blocks.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.n_layers)
-            ]
-        )
 
         self.norm_f = LayerNorm(
             config.hidden_size,
@@ -668,7 +667,7 @@ class MptModel(EasyDeLBaseModule):
             num_heads=self.config.n_heads,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -746,24 +745,32 @@ class MptModel(EasyDeLBaseModule):
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.blocks))
 
-        for idx, block in enumerate(self.blocks):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             layer_outputs = block(
                 hidden_states=hidden_states,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=None,
                 position_bias=self.alibi,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.blocks)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = self.norm_f(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -815,7 +822,7 @@ class MptForCausalLM(BaseCausalLMModule[MptModel, MptConfig]):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         transformer (MptModel): The base MPT transformer model.
         lm_head (nn.Linear): Linear layer for language modeling predictions.
     """
@@ -831,7 +838,7 @@ class MptForCausalLM(BaseCausalLMModule[MptModel, MptConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the MPT causal language model.
 

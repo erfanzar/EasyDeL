@@ -23,11 +23,12 @@ __all__ = ["AttnShardingRules", "OperationMetadata"]
 
 import jax
 import jaxtyping
-from eformer import common_types
-from eformer.escale import PartitionAxis, PartitionManager
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
+from spectrax import PartitionAxis, common_types
+
+from easydel.infra.sharding import AxisPolicy, RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
@@ -103,8 +104,7 @@ class OperationMetadata:
             or inferred from context.
         platform: The target hardware platform (e.g., TPU, GPU).
         backend: The specific JAX backend being used (e.g., TPU, CUDA, ROCM).
-        partition_axis: Configuration for partitioning axes in distributed settings.
-            (Likely from `eformer.escale`).
+        axis_policy: Semantic sharding configuration used for distributed settings.
         base_config: An optional reference to the base model configuration object
             for sourcing default values.
         scan_ring_attention: Boolean flag indicating whether to use ring attention
@@ -124,8 +124,9 @@ class OperationMetadata:
     platform: EasyDeLPlatforms = NOT_GIVEN
     backend: EasyDeLBackends | None = NOT_GIVEN
 
+    axis_policy: AxisPolicy | PartitionAxis = NOT_GIVEN
     partition_axis: PartitionAxis = NOT_GIVEN
-    partition_manager: PartitionManager = NOT_GIVEN
+    runtime_sharding_resolver: RuntimeShardingResolver = NOT_GIVEN
 
     base_config: EasyDeLBaseConfig | None = None
     operation_configs: dict[str, BaseOperationConfig] | None = None
@@ -157,7 +158,9 @@ class OperationMetadata:
         self.set_attrs_carefully("partition_axis", PartitionAxis())
         if isinstance(self.partition_axis, dict):
             self.partition_axis = PartitionAxis(**self.partition_axis)
-        self.set_attrs_carefully("partition_manager", PartitionManager(self.partition_axis))
+        self.set_attrs_carefully("axis_policy", AxisPolicy.from_partition_axis(self.partition_axis))
+        self.axis_policy = AxisPolicy.from_partition_axis(self.axis_policy)
+        self.partition_axis = self.axis_policy.to_partition_axis()
         # DON'T READ FROM CONFIG
         self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
@@ -172,6 +175,10 @@ class OperationMetadata:
                     "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
                 )
             self._stored_mesh = mesh
+        self.runtime_sharding_resolver = coerce_runtime_sharding_resolver(
+            self.runtime_sharding_resolver if self.runtime_sharding_resolver is not NOT_GIVEN else self.axis_policy,
+            mesh=self.mesh,
+        )
         self._safety_check()
         if self.backend is None:
             current_backend: str = jax.default_backend()
@@ -208,7 +215,7 @@ class OperationMetadata:
             sequence_axis_name=config.sequence_axis_name,
             platform=config.platform,
             backend=config.backend,
-            partition_axis=config.partition_axis,
+            axis_policy=config.axis_policy,
             base_config=config,
             operation_configs=getattr(config, "operation_configs", None),
         )
@@ -217,8 +224,10 @@ class OperationMetadata:
     def mesh(self) -> jax.sharding.Mesh | None:
         """Get current mesh from base_config if available, otherwise return stored mesh."""
         if self.base_config is not None:
-            return self.base_config.mesh
-        return self._stored_mesh
+            mesh = self.base_config.mesh
+        else:
+            mesh = self._stored_mesh
+        return getattr(mesh, "jax_mesh", mesh)
 
     @mesh.setter
     def mesh(self, value: jax.sharding.Mesh | None):
@@ -255,7 +264,7 @@ class OperationMetadata:
                 - softmax_aux: Optional 2D softmax auxiliary output sharding
         """
 
-        pama: PartitionManager = self.partition_manager
+        resolver = self.runtime_sharding_resolver.with_mesh(self.mesh)
 
         _h: common_types.DynamicShardingAxes = HEAD if qkv_mni_sharding else KV_HEAD
         _kvh: common_types.DynamicShardingAxes = HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM
@@ -267,17 +276,17 @@ class OperationMetadata:
         kv_segment_ids_sharding: jax.sharding.PartitionSpec
 
         if layout == "bthd":
-            q_sharding = pama.resolve(axes=[BATCH, QUERY_LENGTH, HEAD, HEAD_DIM], mode=mode)
-            k_sharding = pama.resolve(axes=[BATCH, KV_LENGTH, _h, _kvh], mode=mode)
-            v_sharding = pama.resolve(axes=[BATCH, KV_LENGTH, _h, _kvh], mode=mode)
-            q_segment_ids_sharding = pama.resolve(axes=[BATCH, QUERY_LENGTH], mode=mode)
-            kv_segment_ids_sharding = pama.resolve(axes=[BATCH, KV_LENGTH], mode=mode)
+            q_sharding = resolver.resolve(axes=[BATCH, QUERY_LENGTH, HEAD, HEAD_DIM], mode=mode)
+            k_sharding = resolver.resolve(axes=[BATCH, KV_LENGTH, _h, _kvh], mode=mode)
+            v_sharding = resolver.resolve(axes=[BATCH, KV_LENGTH, _h, _kvh], mode=mode)
+            q_segment_ids_sharding = resolver.resolve(axes=[BATCH, QUERY_LENGTH], mode=mode)
+            kv_segment_ids_sharding = resolver.resolve(axes=[BATCH, KV_LENGTH], mode=mode)
         elif layout == "bhtd":
-            q_sharding = pama.resolve(axes=[BATCH, HEAD, QUERY_LENGTH, HEAD_DIM], mode=mode)
-            k_sharding = pama.resolve(axes=[BATCH, _h, KV_LENGTH, _kvh], mode=mode)
-            v_sharding = pama.resolve(axes=[BATCH, _h, KV_LENGTH, _kvh], mode=mode)
-            q_segment_ids_sharding = pama.resolve(axes=[BATCH, QUERY_LENGTH], mode=mode)
-            kv_segment_ids_sharding = pama.resolve(axes=[BATCH, KV_LENGTH], mode=mode)
+            q_sharding = resolver.resolve(axes=[BATCH, HEAD, QUERY_LENGTH, HEAD_DIM], mode=mode)
+            k_sharding = resolver.resolve(axes=[BATCH, _h, KV_LENGTH, _kvh], mode=mode)
+            v_sharding = resolver.resolve(axes=[BATCH, _h, KV_LENGTH, _kvh], mode=mode)
+            q_segment_ids_sharding = resolver.resolve(axes=[BATCH, QUERY_LENGTH], mode=mode)
+            kv_segment_ids_sharding = resolver.resolve(axes=[BATCH, KV_LENGTH], mode=mode)
         else:
             raise NotImplementedError(f"Layout '{layout}' is not implemented")
 
@@ -286,19 +295,19 @@ class OperationMetadata:
             BIAS_KV_SEQ,
         )
 
-        b_sharding: jax.sharding.PartitionSpec = pama.resolve(axes=[BATCH, BIAS_HEAD_SEQ, *qk_extern], mode=mode)
-        m_sharding: jax.sharding.PartitionSpec = pama.resolve(axes=[BATCH, None, *qk_extern], mode=mode)
+        b_sharding: jax.sharding.PartitionSpec = resolver.resolve(axes=[BATCH, BIAS_HEAD_SEQ, *qk_extern], mode=mode)
+        m_sharding: jax.sharding.PartitionSpec = resolver.resolve(axes=[BATCH, None, *qk_extern], mode=mode)
 
         # Softmax auxiliary output sharding (e.g., LSE, max) - 2D: [batch, num_heads]
         softmax_aux_sharding: jax.sharding.PartitionSpec | None = None
         if softmax_aux is not None:
             num_dims: int = softmax_aux.ndim
             if num_dims == 2:
-                softmax_aux_sharding = pama.resolve(axes=[EMPTY, KV_HEAD], mode=mode)
+                softmax_aux_sharding = resolver.resolve(axes=[EMPTY, KV_HEAD], mode=mode)
             else:
-                softmax_aux_sharding = pama.resolve(axes=[HEAD], mode=mode)
+                softmax_aux_sharding = resolver.resolve(axes=[HEAD], mode=mode)
 
-        query3d_sharding: jax.sharding.PartitionSpec = pama.resolve(axes=[BATCH, HEAD, HEAD_DIM], mode=mode)
+        query3d_sharding: jax.sharding.PartitionSpec = resolver.resolve(axes=[BATCH, HEAD, HEAD_DIM], mode=mode)
         rules: AttnShardingRules = AttnShardingRules(
             query3d=query3d_sharding,
             query=q_sharding,

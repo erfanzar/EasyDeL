@@ -26,7 +26,6 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 intersphinx_mapping = {
     "jax": ("https://jax.readthedocs.io/en/latest/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
-    "flax": ("https://flax.readthedocs.io/en/latest/", None),
 }
 
 html_theme = "sphinx_book_theme"

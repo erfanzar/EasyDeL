@@ -17,21 +17,18 @@ import typing as tp
 from collections import defaultdict
 from functools import partial
 
-import jax
 from eformer.loggings import get_logger
-from jax import jit
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..prompt_transforms import ORPOPreprocessTransform
 from ..trainer.trainer import Trainer
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DPODataCollatorWithPaddingGrain, DPODataCollatorWithPaddingTFDS
 from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
@@ -145,7 +142,7 @@ class ORPOTrainer(Trainer):
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
         if not isinstance(model, EasyDeLState):
-            model = model.to_state()
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
 
         super().__init__(
             model_state=model,
@@ -183,7 +180,7 @@ class ORPOTrainer(Trainer):
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Configure and JIT-compile training and evaluation step functions."""
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -200,8 +197,9 @@ class ORPOTrainer(Trainer):
             max_length=self.arguments.max_length,
             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
-        jited_concatenated_forward = ejit(
+        jited_concatenated_forward = compile_trainer_auxiliary(
             partial_concatenated_forward,
+            mesh=mesh,
             static_argnames=("is_encoder_decoder", "label_pad_token_id", "padding_value", "max_length"),
         )
 
@@ -218,7 +216,7 @@ class ORPOTrainer(Trainer):
 
         static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
 
-        sharded_training_step_function = jit(
+        sharded_training_step_function = compile_trainer_step(
             orpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -237,7 +235,7 @@ class ORPOTrainer(Trainer):
             None,
         )
 
-        sharded_evaluation_step_function = jit(
+        sharded_evaluation_step_function = compile_trainer_step(
             orpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,

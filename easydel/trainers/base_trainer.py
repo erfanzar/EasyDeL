@@ -28,19 +28,16 @@ from functools import cached_property
 from typing import NamedTuple
 
 import contextlib2
-import flax
-import flax.nnx
 import grain.python as grain  # pyright: ignore[reportMissingTypeStubs]
 import jax
 import jax.extend
 import numpy as np
-from eformer import common_types
-from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from jax import numpy as jnp
 from jax._src.stages import Compiled
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
+from spectrax import common_types, with_sharding_constraint
 from tqdm.autonotebook import tqdm
 from transformers import GenerationConfig, ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -61,9 +58,9 @@ from easydel.infra.elarge.benchmarking import (
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, EasyDeLTimerError
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import CompilationTracker
 from easydel.utils import Timers, is_remote_path, readme_generator
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -79,6 +76,7 @@ from .training_configurations import MetricsType, TrainingArguments
 from .training_utils import (
     GENERATION_MODEL_INPUT_KEYS,
     compact_generation_model_kwargs,
+    compile_trainer_step,
     filter_kwargs_for_callable,
     normalize_generation_model_kwargs,
     prepare_generation_model_kwargs_for_call,
@@ -260,7 +258,7 @@ class BaseTrainer(BaseTrainerProtocol):
         elif model_state is None and model is None:
             raise ValueError("Either model or model_state should be passed.")
         elif model_state is None:
-            model_state = model.to_state()
+            model_state = model.to_state(trainable_selector=arguments.trainable_selector)
         if arguments.model_name is None:
             arguments.model_name = getattr(model_state.model, "_model_type", "module")
         self.arguments = arguments
@@ -304,7 +302,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.model_state = model_state
         self._apply_runtime_model_config_overrides()
         self._apply_step_start_point()
-        self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
+        self._model = jax.eval_shape(lambda: self.model_state.model)
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
         self.data_collator = data_collator
@@ -2118,15 +2116,11 @@ class BaseTrainer(BaseTrainerProtocol):
                     setattr(config_copy, key, value)
 
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(spec=jax.sharding.PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
 
         if accept_model_kwargs:
             model_kwargs_sharding = {key: None for key in GENERATION_MODEL_INPUT_KEYS}
 
-            @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
-                in_shardings=(self.state_shardings, empty_sharding, empty_sharding, model_kwargs_sharding),
-                out_shardings=(empty_sharding, empty_sharding, empty_sharding),
-            )
             def generate(
                 state: EasyDeLState,
                 input_ids: jax.Array,
@@ -2151,15 +2145,15 @@ class BaseTrainer(BaseTrainerProtocol):
                     shard_input_ids = input_ids
                     shard_attention_mask = attention_mask
                     if shard_inputs:
-                        partition_manager = getattr(module.config, "partition_manager", None)
-                        if partition_manager is not None:
+                        runtime_sharding_resolver = getattr(module.config, "runtime_sharding_resolver", None)
+                        if runtime_sharding_resolver is not None:
                             axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
-                            shard_input_ids = partition_manager.shard(
+                            shard_input_ids = runtime_sharding_resolver.shard(
                                 shard_input_ids,
                                 axes=axes,
                                 mode=common_types.MODE_PREFILL,
                             )
-                            shard_attention_mask = partition_manager.shard(
+                            shard_attention_mask = runtime_sharding_resolver.shard(
                                 shard_attention_mask,
                                 axes=axes,
                                 mode=common_types.MODE_PREFILL,
@@ -2192,12 +2186,13 @@ class BaseTrainer(BaseTrainerProtocol):
                     sequences: jax.Array = outputs.sequences if hasattr(outputs, "sequences") else outputs
                     return sequences, shard_input_ids, shard_attention_mask
 
-            return generate
+            return compile_trainer_step(
+                generate,
+                mesh=mesh,
+                in_shardings=(self.state_shardings, empty_sharding, empty_sharding, model_kwargs_sharding),
+                out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+            )
 
-        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
-            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
-            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
-        )
         def generate(state: EasyDeLState, input_ids: jax.Array, attention_mask: jax.Array):
             """Run model generation from input_ids and attention_mask only.
 
@@ -2215,15 +2210,15 @@ class BaseTrainer(BaseTrainerProtocol):
                 shard_input_ids = input_ids
                 shard_attention_mask = attention_mask
                 if shard_inputs:
-                    partition_manager = getattr(module.config, "partition_manager", None)
-                    if partition_manager is not None:
+                    runtime_sharding_resolver = getattr(module.config, "runtime_sharding_resolver", None)
+                    if runtime_sharding_resolver is not None:
                         axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
-                        shard_input_ids = partition_manager.shard(
+                        shard_input_ids = runtime_sharding_resolver.shard(
                             shard_input_ids,
                             axes=axes,
                             mode=common_types.MODE_PREFILL,
                         )
-                        shard_attention_mask = partition_manager.shard(
+                        shard_attention_mask = runtime_sharding_resolver.shard(
                             shard_attention_mask,
                             axes=axes,
                             mode=common_types.MODE_PREFILL,
@@ -2243,10 +2238,15 @@ class BaseTrainer(BaseTrainerProtocol):
                         **effective_generate_kwargs,
                     )
 
-                sequences: jax.Array = outputs.sequences if hasattr(outputs, "sequences") else outputs
-                return sequences, shard_input_ids, shard_attention_mask
+            sequences: jax.Array = outputs.sequences if hasattr(outputs, "sequences") else outputs
+            return sequences, shard_input_ids, shard_attention_mask
 
-        return generate
+        return compile_trainer_step(
+            generate,
+            mesh=mesh,
+            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
+            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+        )
 
     def generate_aio(
         self,
@@ -3450,7 +3450,12 @@ class BaseTrainer(BaseTrainerProtocol):
             for record in records:
                 prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
 
-            if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
+            if (
+                wandb is not None
+                and getattr(args, "use_wandb", False)
+                and args.can_log_metrics
+                and args.generation_log_to_wandb
+            ):
                 if self.preview_log_table is None:
                     self.preview_log_table = wandb.Table(
                         columns=["step", "prompt", "completion_id", "completion", "reasoning", "tool_calls"],
@@ -3788,7 +3793,7 @@ class BaseTrainer(BaseTrainerProtocol):
         """Log benchmark summaries to W&B as an incremental table."""
 
         args = self.arguments
-        if args is None or wandb is None or not args.use_wandb or not args.can_log_metrics:
+        if args is None or wandb is None or not getattr(args, "use_wandb", False) or not args.can_log_metrics:
             return
 
         if self.benchmark_log_table is None:
@@ -3853,7 +3858,7 @@ class BaseTrainer(BaseTrainerProtocol):
         if (
             args is None
             or wandb is None
-            or not args.use_wandb
+            or not getattr(args, "use_wandb", False)
             or not args.can_log_metrics
             or not args.log_training_generations_to_wandb
         ):
@@ -3963,7 +3968,7 @@ class BaseTrainer(BaseTrainerProtocol):
             Array distributed across devices.
         """
         with self.mesh:
-            arr = with_sharding_constraint(arr, PartitionSpec(None))
+            arr = with_sharding_constraint(arr, PartitionSpec(None), mesh=self.mesh, ignore_mpmd=True)
         return arr
 
     def _all_gather(self, arr: jax.Array) -> jax.Array:
@@ -3975,7 +3980,7 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             Array replicated across all devices.
         """
-        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
+        return jax.device_put(arr, replicated_named_sharding(self.model.mesh))
 
     def initialize_trainer_utils(self):
         """
@@ -4010,7 +4015,7 @@ class BaseTrainer(BaseTrainerProtocol):
         This method sets up the Weights & Biases runtime for experiment
         tracking and logging when use_wandb is True in arguments.
         """
-        if self.arguments.use_wandb:
+        if getattr(self.arguments, "use_wandb", False):
             self.wandb_runtime = self.arguments.get_wandb_init()
 
     def _initialize_timer(self):
@@ -4628,10 +4633,12 @@ class BaseTrainer(BaseTrainerProtocol):
             step = self._get_current_step(state)
             directory_name = self.arguments._get_save_directory_milestone(step=step, create=False)
         else:
-            directory_name = ePath(save_directory)
+            directory_name = save_directory
 
         should_single_writer = is_remote_path(directory_name)
-        if not should_single_writer or jax.process_index() == 0:
+        should_write_rank_zero_artifacts = not should_single_writer or jax.process_index() == 0
+        if should_write_rank_zero_artifacts:
+            directory_name = ePath(directory_name)
             logger.info(f"saving state {directory_name}.")
             directory_name.mkdir(parents=True, exist_ok=True)
             self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)

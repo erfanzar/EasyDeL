@@ -30,7 +30,7 @@ Key Features:
 - Support for multiple reward models and ensemble averaging
 - KL divergence regularization from reference policy
 - Adaptive clipping and normalization strategies
-- Integration with JAX/Flax for distributed training
+- Integration with JAX/spectrax for distributed training
 
 Example:
     >>> from easydel.trainers import GRPOConfig, GRPOTrainer

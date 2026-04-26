@@ -15,8 +15,8 @@
 """Tests for Cohere model."""
 
 import pytest
+import spectrax as spx
 import transformers
-from flax import nnx as nn
 from jax import numpy as jnp
 
 import easydel as ed
@@ -72,7 +72,7 @@ class TestCohere:
         cohere_config.logit_scale = 0.5
         model = ed.CohereForCausalLM(
             config=cohere_config,
-            rngs=nn.Rngs(0),
+            rngs=spx.Rngs(0),
         )
         hidden_states = jnp.ones((1, 2, cohere_config.hidden_size), dtype=jnp.float32)
 

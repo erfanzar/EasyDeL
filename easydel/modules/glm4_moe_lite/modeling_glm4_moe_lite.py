@@ -19,13 +19,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -61,7 +59,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
 
 
-class Glm4MoeLiteMLP(nn.Module):
+class Glm4MoeLiteMLP(spx.Module):
     """Dense MLP block for GLM-4-MoE-Lite layers.
 
     Implements the standard gated feedforward network with separate gate and up
@@ -78,7 +76,7 @@ class Glm4MoeLiteMLP(nn.Module):
         hidden_size: int | None = None,
         intermediate_size: int | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.dtype = dtype
@@ -109,11 +107,11 @@ class Glm4MoeLiteMLP(nn.Module):
         self.down_proj = row(self.intermediate_size, self.hidden_size)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -121,12 +119,12 @@ class Glm4MoeLiteMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Glm4MoeLiteMLPStack(nn.Module):
+class Glm4MoeLiteMLPStack(spx.Module):
     """Expert MLP stack for GLM-4-MoE-Lite using parallel MoE linear layers.
 
     Implements the feedforward network for multiple experts using efficient
@@ -138,8 +136,8 @@ class Glm4MoeLiteMLPStack(nn.Module):
         "gate_up_proj$": {
             "splits": [
                 # HF layout: [E, 2M, H] -> ED layout: [E, H, M]
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
+                {"name": "gate_proj.weight", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "up_proj.weight", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
             ],
             # Reverse after ED kernels are converted to torch layout [E, M, H].
             "inverse_spliter": lambda torch, gate, up: torch.cat((gate, up), dim=1),
@@ -147,7 +145,7 @@ class Glm4MoeLiteMLPStack(nn.Module):
         "down_proj$": {
             "splits": [
                 # HF layout: [E, H, M] -> ED layout: [E, M, H]
-                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x,
         },
@@ -160,7 +158,7 @@ class Glm4MoeLiteMLPStack(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.dtype = dtype
@@ -171,9 +169,9 @@ class Glm4MoeLiteMLPStack(nn.Module):
             in_features=config.hidden_size,
             out_features=config.moe_intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -183,9 +181,9 @@ class Glm4MoeLiteMLPStack(nn.Module):
             in_features=config.hidden_size,
             out_features=config.moe_intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -195,16 +193,16 @@ class Glm4MoeLiteMLPStack(nn.Module):
             in_features=config.moe_intermediate_size,
             out_features=config.hidden_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         group_sizes: Array,
@@ -213,7 +211,7 @@ class Glm4MoeLiteMLPStack(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return apply_logical_sharding(
             checkpoint_name(
@@ -228,11 +226,11 @@ class Glm4MoeLiteMLPStack(nn.Module):
                 name="mlp_down",
             ),
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
 
-class Glm4MoeLiteTopKRouter(nn.Module):
+class Glm4MoeLiteTopKRouter(spx.Module):
     """Top-K expert router for GLM-4-MoE-Lite with grouped expert selection.
 
     Implements routing using a learned weight matrix and e-score correction bias
@@ -247,30 +245,26 @@ class Glm4MoeLiteTopKRouter(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
         self.n_routed_experts = config.n_routed_experts
-        self.kernel = nn.Param(
+        self.weight = spx.Parameter(
             jax.nn.initializers.normal(config.initializer_range)(
-                rngs.param(),
+                rngs.param,
                 (config.hidden_size, self.n_routed_experts),
                 param_dtype,
             )
         )
-        self.e_score_correction_bias = nn.Param(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
+        self.e_score_correction_bias = spx.Parameter(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
-        return {"kernel": kernel_spec, "e_score_correction_bias": Replicated}
-
-    def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
+    def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
         hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
         return checkpoint_name(
-            jnp.matmul(hidden_states.astype(jnp.float32), self.kernel.value.astype(jnp.float32)),
+            jnp.matmul(hidden_states.astype(jnp.float32), self.weight.value.astype(jnp.float32)),
             "moe_router_logits",
         )
 
@@ -291,7 +285,7 @@ class Glm4MoeLiteMoE(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -387,14 +381,14 @@ class Glm4MoeLiteMoE(BaseMoeModule):
         topk_weights = topk_weights * routed_scaling_factor
         return topk_weights, topk_indices
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
         if self.shared_experts is not None:
@@ -429,7 +423,7 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         self.config = config
@@ -458,7 +452,7 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.Precision,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         if not self.use_mla_lora:
             setattr(
@@ -697,7 +691,7 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         mla_kwargs: dict = {}
         _absorbed_W_v = None
         if isinstance(cache_view, MLARaggedPagesCacheView):
-            W = self.mla_kv_b_proj.kernel.value  # [kv_lora_rank, local_heads*(nope+v)]
+            W = self.mla_kv_b_proj.weight.value  # [kv_lora_rank, local_heads*(nope+v)]
             local_heads = W.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
             W = W.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
             W_nope = W[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, local_heads, nope]
@@ -778,7 +772,7 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         )
 
 
-class Glm4MoeLiteDecoderLayer(nn.Module):
+class Glm4MoeLiteDecoderLayer(spx.Module):
     """Single decoder layer for GLM-4-MoE-Lite.
 
     Combines Multi-head Latent Attention (MLA) and either dense MLP or MoE
@@ -795,7 +789,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         self.config = config
         self.dtype = dtype
@@ -853,7 +847,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -869,7 +863,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_outputs = self.self_attn(
@@ -894,7 +888,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -922,7 +916,7 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -951,19 +945,19 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    layer_idx=i,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_idx=i,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -980,7 +974,7 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
             base=self.config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1035,10 +1029,11 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1047,13 +1042,13 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -1061,8 +1056,15 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -1097,7 +1099,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         super().__init__(
             config=config,
@@ -1157,7 +1159,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
-            partition_manager=text_config.partition_manager,
+            partition_manager=text_config.runtime_sharding_resolver,
             kvdtype=text_config.kvdtype if dtype is None else dtype,
             max_model_length=max_length,
             num_hidden_layers=self.config.num_hidden_layers,
@@ -1192,7 +1194,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         # ``compressed_kv`` with width ``kv_lora_rank`` plus the RoPE branch.
         return MLARaggedPagesCacheConfig.create(
             mesh=self.mesh,
-            partition_manager=text_config.partition_manager,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=kvdtype,
             max_model_length=max_length,
             num_hidden_layers=num_hidden_layers,

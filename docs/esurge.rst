@@ -705,8 +705,6 @@ Performance characteristics compared to other inference engines:
 +------------------+----------+----------+-----------+
 | Prefix Caching   | ✅ Yes   | ✅ Yes   | ⚠️ Limited|
 +------------------+----------+----------+-----------+
-| JAX/Flax Native  | ✅ Yes   | ❌ No    | ❌ No     |
-+------------------+----------+----------+-----------+
 | Continuous Batch | ✅ Yes   | ✅ Yes   | ✅ Yes    |
 +------------------+----------+----------+-----------+
 

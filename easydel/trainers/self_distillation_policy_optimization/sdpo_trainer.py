@@ -42,18 +42,17 @@ from __future__ import annotations
 import typing as tp
 from functools import partial
 
-import flax
 import jax
 import numpy as np
-from eformer.escale import with_sharding_constraint
+import spectrax as spx
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
@@ -62,7 +61,7 @@ from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..prompt_utils import apply_chat_template
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import sdpo_step
 from .sdpo_config import SDPOConfig
 
@@ -249,7 +248,7 @@ class SDPOTrainer(GRPOTrainer):
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Configure and JIT-compile the SDPO training / evaluation steps."""
         mesh = self.model.mesh
-        empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
 
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
@@ -276,7 +275,7 @@ class SDPOTrainer(GRPOTrainer):
 
         self._train_shared_fn_static_args = (*shared_static, True, straight_through_emulator)
 
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             sdpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -286,7 +285,7 @@ class SDPOTrainer(GRPOTrainer):
 
         self._eval_shared_fn_static_args = (*shared_static, False, straight_through_emulator)
 
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             sdpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
@@ -298,10 +297,20 @@ class SDPOTrainer(GRPOTrainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = flax.nnx.merge(graphdef, graphtree, graphother)
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
             with apply.mesh:
-                ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
-                mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
+                ids = with_sharding_constraint(
+                    ids,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                mask = with_sharding_constraint(
+                    mask,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
                 return get_per_token_logps(
                     apply,
                     ids,
@@ -310,8 +319,9 @@ class SDPOTrainer(GRPOTrainer):
                     logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                 )
 
-        self.compute_refmodel_logps = ejit(
+        self.compute_refmodel_logps = compile_trainer_step(
             partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
+            mesh=mesh,
             static_argnames=("graphdef",),
             in_shardings=(
                 self.model_state.shardings.graphstate,

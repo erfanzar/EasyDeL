@@ -49,11 +49,11 @@ See Also:
 from collections.abc import Callable
 
 import jax
-from eformer import common_types
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -132,7 +132,7 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         classifier_dropout: float | None = None,
         classifier_bias: bool = True,
         classifier_kernel_init: Callable | None = None,
@@ -161,7 +161,7 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             precision: JAX precision setting for matrix multiplications.
                 Higher precision may improve numerical stability at the cost
                 of speed.
-            rngs: Flax random number generators for parameter initialization
+            rngs: SpecTrax random number generators for parameter initialization
                 and dropout.
             classifier_dropout: Dropout probability applied to hidden states
                 before the classifier. If None or 0, no dropout is applied.
@@ -169,7 +169,7 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             classifier_bias: Whether to include bias in the classifier linear
                 layer. Defaults to True for standard classification behavior.
             classifier_kernel_init: Custom initializer for classifier weights.
-                If None, uses the default Flax initializer.
+                If None, uses the default SpecTrax initializer.
 
         Raises:
             AssertionError: If config does not have a `num_labels` attribute.
@@ -183,7 +183,7 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                     config=config,
                     base_model_class=BertModel,
                     dtype=jnp.float32,
-                    rngs=nn.Rngs(0),
+                    rngs=spx.Rngs(0),
                     classifier_dropout=0.1,
                 )
         """
@@ -224,7 +224,7 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -331,14 +331,14 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         projects from hidden_size to num_labels dimensions for each token.
 
         Returns:
-            nn.Module: The classifier module (typically ColumnParallelLinear).
+            spx.Module: The classifier module (typically ColumnParallelLinear).
                 Shape of kernel: (hidden_size, num_labels).
 
         Example:
             Accessing classifier weights::
 
                 head = model.get_task_head()
-                weights = head.kernel.value  # Shape: (hidden_size, num_labels)
+                weights = head.weight.value  # Shape: (hidden_size, num_labels)
         """
         return self.classifier
 

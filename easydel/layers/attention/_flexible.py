@@ -50,11 +50,9 @@ from enum import StrEnum
 from functools import cached_property, partial
 
 import einops
-import flax.nnx as nn
 import jax
+import spectrax as spx
 from chex import Array  # pyright: ignore[reportMissingTypeStubs]
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import NamedSharding, lax
@@ -63,6 +61,7 @@ from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
 from jaxtyping import Array as JArray
 from jaxtyping import Bool, Complex, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     OperationsMetadata,
@@ -239,7 +238,7 @@ def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
 DEFAULT_ATTENTION_MECHANISM = "auto"
 
 
-class FlexibleAttentionModule(nn.Module):
+class FlexibleAttentionModule(spx.Module):
     """Unified interface for various attention mechanisms.
 
     Central hub for managing different attention implementations,
@@ -293,7 +292,7 @@ class FlexibleAttentionModule(nn.Module):
         softmax_scale: float,
         dropout_prob: float = 0.0,
         *,
-        rngs: nn.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
         attn_mechanism: AttentionMechanisms | None = None,
         requires_cache: bool | None = None,
     ):
@@ -635,19 +634,15 @@ Cfg = tp.TypeVar("Cfg", bound=EasyDeLBaseConfig)
 """Type variable for configuration objects."""
 
 
-class AttentionModule(nn.Module, tp.Generic[Cfg]):
-    """
-    Base class for Flax attention modules in EasyDeL, providing common utilities.
+class AttentionModule(spx.Module, tp.Generic[Cfg]):
+    """Base class for attention modules in EasyDeL, providing common utilities.
 
-    This class offers helper functions and attributes commonly needed by attention
-    implementations within Flax, such as handling KV caching, sharding, mask manipulation,
-    and head manipulation. Concrete attention implementations often inherit from this class.
+    Offers helpers for sharding, mask manipulation, and head manipulation that
+    concrete attention implementations inherit. KV caching itself is handled
+    by the cache backends in :mod:`easydel.caching`, not by this class.
 
     Attributes:
-        config (Cfg | EasyDeLBaseConfig): Configuration object for the attention module.
-        cached_key (nn.Cache[Array] | None): Flax Cache for storing past key states (wont be used).
-        cached_value (nn.Cache[Array] | None): Flax Cache for storing past value states (wont be used).
-        cache_index (nn.Cache[Array] | None): Flax Cache for tracking the current index in the cache (wont be used).
+        config: Configuration object for the attention module.
     """
 
     def __init__(self, config: Cfg):
@@ -660,10 +655,6 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         """
         super().__init__()
         self.config = config
-
-        self.cached_key: nn.Cache[Array] | None = None
-        self.cached_value: nn.Cache[Array] | None = None
-        self.cache_index: nn.Cache[Array] | None = None
 
     @staticmethod
     def apply_complex_rotary(
@@ -737,12 +728,12 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         k_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             k,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return q_sharded, k_sharded
 
@@ -776,17 +767,17 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         k_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             k,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         v_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             v,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return q_sharded, k_sharded, v_sharded
 
@@ -811,11 +802,11 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         end_index: int | Int[JArray, "batch 1"] = 0
         is_decode: bool = mode == common_types.MODE_DECODE
         # Support transformer-like composite cache views (e.g., ParallelHybridCacheView)
-        has_indexs: bool = cache_view is not None and hasattr(cache_view, "indexs")
-        should_use_cache_index: bool = has_indexs and is_decode
+        has_indexes: bool = cache_view is not None and hasattr(cache_view, "indexes")
+        should_use_cache_index: bool = has_indexes and is_decode
         if should_use_cache_index:
-            cache_indexs = cache_view.indexs
-            end_index = jnp.reshape(cache_indexs, (-1, 1))
+            cache_indexes = cache_view.indexes
+            end_index = jnp.reshape(cache_indexes, (-1, 1))
         mask_any_kv: Bool[JArray, "batch heads seq_q"] = jnp.any(attention_mask, -1)
         mask_last_head: Bool[JArray, "batch seq_q"] = mask_any_kv[:, -1, :]
         inipos: Int[JArray, "batch seq_q"] = jnp.cumsum(mask_last_head, axis=-1)
@@ -959,7 +950,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             quantizer=self.quantizer,
             mask_info=mask_info,
             cache_metadata=cache_metadata,
-            partition_manager=self.config.partition_manager,
+            runtime_sharding_resolver=self.config.runtime_sharding_resolver,
         )
 
         return key, value, mask_info, cache_view, masking_details  # pyright: ignore[reportReturnType]
@@ -1027,11 +1018,11 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             query_length = Q
 
         if mode == common_types.MODE_DECODE and cache_view is not None:
-            indexs = cache_view.indexs.reshape(-1)  # (B,)
+            indexes = cache_view.indexes.reshape(-1)  # (B,)
         elif mode == common_types.MODE_PREFILL:
-            indexs = jnp.full((B,), Q - 1, dtype=jnp.int32)  # last query row
+            indexes = jnp.full((B,), Q - 1, dtype=jnp.int32)  # last query row
         else:
-            indexs = jnp.zeros((B,), dtype=jnp.int32)
+            indexes = jnp.zeros((B,), dtype=jnp.int32)
 
         offsets = jnp.zeros((B,), dtype=jnp.int32)
         width = min(left_window + right_window + 1, K)
@@ -1073,20 +1064,20 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             else:
                 return ikey, ival, imsk
 
-        key, value, attn = _select_slices(key, value, attn, offsets, indexs, mode)
+        key, value, attn = _select_slices(key, value, attn, offsets, indexes, mode)
 
         mask_info = mask_info.replace(attention_mask=attn, sliding_window_baked_in=True)
 
         if cache_metadata is not None and mode == common_types.MODE_DECODE:
-            passed = cache_metadata.indexs - cache_metadata.starts
+            passed = cache_metadata.indexes - cache_metadata.starts
             cache_metadata = TransformerMetadata(
                 starts=jax.lax.max(0, width - passed),
-                indexs=jnp.full((attn.shape[0],), attn.shape[-1]),
+                indexes=jnp.full((attn.shape[0],), attn.shape[-1]),
             )
 
         return key, value, mask_info, cache_metadata
 
-    @jax.named_scope("easydel-flax-attention-concatenate")
+    @jax.named_scope("easydel-spx-attention-concatenate")
     def concatenate(
         self,
         *,
@@ -1204,8 +1195,8 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
 
         if should_create_metadata:
             starts = cache_view.starts
-            indexs = cache_view.indexs
-            cache_metadata = TransformerMetadata(starts=starts, indexs=indexs)
+            indexes = cache_view.indexes
+            cache_metadata = TransformerMetadata(starts=starts, indexes=indexes)
         else:
             cache_metadata = cache_metadata
 
@@ -1274,7 +1265,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         return apply_logical_sharding(
             x=attn_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
     def _merge_heads(self, hidden_states: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch seq hidden"]:
@@ -1310,7 +1301,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             tp.Tuple[Array, Array]: Repeated key and value tensors, each with shape
                                     [Batch, Seq, NumKVHeads * num_reps, Dim].
         """
-        with jax.named_scope("easydel-flax-attention-repeat-kvheads"):
+        with jax.named_scope("easydel-attention-repeat-kvheads"):
             key = einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps)
             value = einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps)
         return key, value

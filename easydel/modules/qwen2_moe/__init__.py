@@ -57,7 +57,8 @@ Example Usage:
     from easydel import Qwen2MoeConfig, Qwen2MoeForCausalLM
     from jax import random
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration with MoE settings
     config = Qwen2MoeConfig(
@@ -73,7 +74,7 @@ Example Usage:
     )
 
     # Create model for causal language modeling
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = Qwen2MoeForCausalLM(config, rngs=rngs)
 
     # Generate text

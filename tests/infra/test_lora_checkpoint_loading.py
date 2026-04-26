@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
-from flax import nnx
+import spectrax as spx
+from spectrax import nn
 
 import easydel  # noqa: F401
 from easydel.modules.llama.llama_configuration import LlamaConfig
 from easydel.modules.llama.modeling_llama import LlamaForCausalLM
+
 
 def _make_model(*, tie_word_embeddings: bool) -> LlamaForCausalLM:
     cfg = LlamaConfig(
@@ -34,7 +35,7 @@ def _make_model(*, tie_word_embeddings: bool) -> LlamaForCausalLM:
         tie_word_embeddings=tie_word_embeddings,
     )
     cfg.add_basic_configurations(
-        sharding_axis_dims=(1, 1, -1, 1, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         use_sharding_constraint=False,
     )
     with cfg.mesh:
@@ -42,12 +43,12 @@ def _make_model(*, tie_word_embeddings: bool) -> LlamaForCausalLM:
             config=cfg,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
-            rngs=nnx.Rngs(0),
+            rngs=spx.Rngs(0),
         )
         return model.apply_lora_to_layers(
             lora_rank=2,
             lora_pattern=r"lm_head",
-            rngs=nnx.Rngs(1),
+            rngs=spx.Rngs(1),
         )
 
 
@@ -65,7 +66,7 @@ def test_lora_checkpoint_round_trip_supports_from_pretrained(tmp_path):
         outputs = loaded(input_ids=jnp.ones((2, 4), dtype=jnp.int32))
 
     assert loaded.lora_is_enabled
-    assert isinstance(loaded.get_lm_head(), nnx.LoRA)
+    assert isinstance(loaded.get_lm_head(), nn.LoRA)
     assert outputs.logits is not None
     assert outputs.logits.shape == (2, 4, loaded.config.vocab_size)
 

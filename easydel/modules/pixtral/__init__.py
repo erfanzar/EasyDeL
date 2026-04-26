@@ -38,7 +38,7 @@ Key Features:
     - 2D Rotary Position Embeddings for spatial structure preservation
     - Block-diagonal attention for efficient multi-image batching
     - Flexible attention mechanisms with dropout support
-    - JAX/Flax implementation with automatic gradient checkpointing
+    - JAX/spectrax implementation with automatic gradient checkpointing
     - Distributed training support via tensor parallelism
     - Configurable precision (bfloat16, float32, etc.)
 
@@ -55,7 +55,8 @@ Usage Example:
     ```python
     from easydel import PixtralVisionConfig, PixtralVisionModel
     import jax.numpy as jnp
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
 
     # Initialize configuration
     config = PixtralVisionConfig(
@@ -67,7 +68,7 @@ Usage Example:
     )
 
     # Create model
-    rngs = nn.Rngs(0)
+    rngs = spx.Rngs(0)
     model = PixtralVisionModel(
         config=config,
         dtype=jnp.bfloat16,

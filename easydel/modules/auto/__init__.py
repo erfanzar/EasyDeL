@@ -34,14 +34,15 @@ Usage Examples:
 
     # Load model for causal LM
     from easydel.modules.auto import AutoEasyDeLModelForCausalLM
-    from flax import nnx as nn
+    import spectrax as spx
+from spectrax import nn
     import jax
 
     model = AutoEasyDeLModelForCausalLM.from_pretrained(
         "meta-llama/Llama-3.1-8B",
         dtype=jax.numpy.bfloat16,
         param_dtype=jax.numpy.bfloat16,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     # Load vision-language model
@@ -50,7 +51,7 @@ Usage Examples:
         "CohereForAI/aya-vision-8b",
         dtype=jax.numpy.bfloat16,
         param_dtype=jax.numpy.bfloat16,
-        rngs=nn.Rngs(0),
+        rngs=spx.Rngs(0),
     )
 
     # Query available models by type

@@ -18,7 +18,7 @@ Implements:
     - `FalconMambaForCausalLM`: causal LM head on top of the backbone.
 
 The implementation mirrors the HuggingFace reference (PyTorch) but uses
-EasyDeL's NNX modules, sharding-aware linear layers, and the unified
+EasyDeL's spectrax modules, sharding-aware linear layers, and the unified
 `RecurrentCache` interface for decoding.
 
 HuggingFace reference:
@@ -29,15 +29,13 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from einops import repeat
-from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import OperationsMetadata, RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -124,7 +122,7 @@ class FalconMambaCausalLMOutput(BaseModelOutput):
     hidden_states: tuple[Array] | None = None
 
 
-class Conv1D(nn.Module):
+class Conv1D(spx.Module):
     """Depthwise causal 1D convolution used by the FalconMamba mixer.
 
     This module implements a 1D convolution layer with depthwise separable
@@ -162,7 +160,7 @@ class Conv1D(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the 1D convolution layer.
 
@@ -182,11 +180,11 @@ class Conv1D(nn.Module):
             rngs: Random number generator state for parameter initialization.
         """
         kernel_shape = (kernel_size, 1, features)
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=kernel_shape,
             dtype=param_dtype,
             init_method="lecun_normal",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
         if use_bias:
@@ -194,7 +192,7 @@ class Conv1D(nn.Module):
                 shape=(features,),
                 dtype=param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
             )
 
         self.features = features
@@ -209,14 +207,7 @@ class Conv1D(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for convolution parameters."""
-        specs = {"kernel": Replicated}
-        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
-            specs["bias"] = Replicated
-        return specs  # pyright: ignore[reportReturnType]
-
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply 1D convolution to the input tensor.
 
         Args:
@@ -237,7 +228,7 @@ class Conv1D(nn.Module):
             )
 
         org_x_dtype = x.dtype
-        rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
+        rhs = jnp.asarray(jnp.swapaxes(self.weight.value, 0, 2), dtype=self.dtype)
         x = lax.conv_general_dilated(
             lhs=x.astype(self.dtype),
             rhs=rhs,
@@ -254,7 +245,7 @@ class Conv1D(nn.Module):
         return x.astype(org_x_dtype)
 
 
-class FalconMambaMixer(nn.Module):
+class FalconMambaMixer(spx.Module):
     """Selective state space model (SSM) mixer used by FalconMamba blocks.
 
     This module implements the core Mamba selective SSM mechanism adapted for
@@ -299,7 +290,7 @@ class FalconMambaMixer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize the FalconMamba selective SSM mixer.
 
@@ -342,7 +333,7 @@ class FalconMambaMixer(nn.Module):
 
         dt_init_std = time_step_rank**-0.5 * config.time_step_scale
         if config.time_step_init_scheme == "constant":
-            init_kernel_dt = nn.initializers.constant(dt_init_std, dtype=param_dtype)
+            init_kernel_dt = jax.nn.initializers.constant(dt_init_std, dtype=param_dtype)
         elif config.time_step_init_scheme == "random":
 
             def init_kernel_dt(key, shape, dtype):
@@ -352,7 +343,7 @@ class FalconMambaMixer(nn.Module):
                 )
 
         else:
-            init_kernel_dt = nn.initializers.normal(config.initializer_range, param_dtype)
+            init_kernel_dt = jax.nn.initializers.normal(config.initializer_range, param_dtype)
 
         def init_bias_dt(key, shape, dtype):
             # Match HF init: sample dt uniformly in [min, max] then invert softplus.
@@ -436,14 +427,7 @@ class FalconMambaMixer(nn.Module):
         )
         self.ssm_op = SSM1Op(metadata)
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for state space parameters."""
-        return {
-            "A_log": Replicated,
-            "D": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         input_states: Array,
         cache_params: RecurrentCacheView | None = None,
@@ -504,9 +488,9 @@ class FalconMambaMixer(nn.Module):
 
             A_real = -jnp.exp(self.A_log.value.astype(jnp.float32))
             D_val = self.D.value.astype(jnp.float32)
-            conv_kernel = self.conv1d.kernel.value  # [kernel_size, 1, I]
+            conv_kernel = self.conv1d.weight  # [kernel_size, 1, I]
             conv_bias = (
-                self.conv1d.bias.value
+                self.conv1d.bias
                 if self.config.use_conv_bias
                 else jnp.zeros(self.intermediate_size, dtype=conv_kernel.dtype)
             )
@@ -634,7 +618,7 @@ class FalconMambaMixer(nn.Module):
         hidden_states_t = apply_logical_sharding(
             hidden_states_t,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         ssm_output = self.ssm_op(
@@ -658,13 +642,13 @@ class FalconMambaMixer(nn.Module):
         y_t = apply_logical_sharding(
             y_t,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         contextualized_states = checkpoint_name(self.out_proj(y_t), name="ssm_output_proj")
         return contextualized_states, cache_view
 
 
-class FalconMambaBlock(nn.Module):
+class FalconMambaBlock(spx.Module):
     """Single FalconMamba layer applying normalization, mixer, and residual connection.
 
     This block constitutes one layer of the FalconMamba model, combining:
@@ -691,7 +675,7 @@ class FalconMambaBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize a FalconMamba block.
 
@@ -730,7 +714,7 @@ class FalconMambaBlock(nn.Module):
             layer_idx=layer_idx,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cache_params: RecurrentCacheView | None = None,
@@ -773,7 +757,7 @@ class FalconMambaBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states, cache_params
 
@@ -800,14 +784,15 @@ class FalconMambaModel(EasyDeLBaseModule):
     Example:
         ```python
         from easydel.modules.falcon_mamba import FalconMambaConfig, FalconMambaModel
-        from flax import nnx as nn
+        import spectrax as spx
+        from spectrax import nn
 
         config = FalconMambaConfig(
             vocab_size=32000,
             hidden_size=2560,
             num_hidden_layers=64,
         )
-        model = FalconMambaModel(config, rngs=nn.Rngs(0))
+        model = FalconMambaModel(config, rngs=spx.Rngs(0))
         ```
     """
 
@@ -818,7 +803,7 @@ class FalconMambaModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize the FalconMamba base model.
 
@@ -843,19 +828,19 @@ class FalconMambaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List(
-            [
-                FalconMambaBlock(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    FalconMambaBlock(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
         self.norm_f = FalconMambaRMSNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
@@ -863,7 +848,7 @@ class FalconMambaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
@@ -939,7 +924,9 @@ class FalconMambaModel(EasyDeLBaseModule):
                 attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
 
         hidden_states = inputs_embeds
-        for idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, idx = carry
             hidden_states, cache_view = block(
                 hidden_states=hidden_states,
                 cache_params=cache_params.views[idx],
@@ -947,11 +934,19 @@ class FalconMambaModel(EasyDeLBaseModule):
                 attention_mask=attention_mask,
                 cache_metadata=cache_metadata,
             )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             cache_params[idx] = cache_view
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
+            return hidden_states, all_hidden_states, idx + 1
+
+        hidden_states, all_hidden_states, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, 0),
+            trace=True,
+        )
         hidden_states = self.norm_f(hidden_states)
         if output_hidden_states:
             assert all_hidden_states is not None
@@ -1015,14 +1010,15 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
     Example:
         ```python
         from easydel.modules.falcon_mamba import FalconMambaConfig, FalconMambaForCausalLM
-        from flax import nnx as nn
+        import spectrax as spx
+        from spectrax import nn
 
         config = FalconMambaConfig(
             vocab_size=32000,
             hidden_size=2560,
             num_hidden_layers=64,
         )
-        model = FalconMambaForCausalLM(config, rngs=nn.Rngs(0))
+        model = FalconMambaForCausalLM(config, rngs=spx.Rngs(0))
 
         # Generate text
         output = model(input_ids)
@@ -1041,7 +1037,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize the FalconMamba causal language model.
 
@@ -1063,7 +1059,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
@@ -1167,7 +1163,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         Returns:
             Dictionary of prepared inputs for the model call.
         """
-        from eformer.escale import PartitionAxis
+        from spectrax import PartitionAxis
 
         cache_params = kwargs.get("cache_params", None)
         attention_mask = kwargs.get("attention_mask", None)

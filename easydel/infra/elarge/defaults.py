@@ -37,7 +37,7 @@ Example:
         default_dtype = DEFAULTS["loader"]["dtype"]  # Returns "bf16"
 
         # Get default axis dimensions for sharding
-        axis_dims = DEFAULTS["sharding"]["axis_dims"]  # Returns (1, 1, 1, -1, 1)
+        axis_dims = DEFAULTS["sharding"]["axis_dims"]  # Returns (1, 1, 1, 1, -1, 1)
 
 Note:
     These defaults can be overridden by providing explicit values when
@@ -68,19 +68,19 @@ DEFAULTS: eLMConfig = {
     # - verbose: Whether to print loading progress and diagnostics.
     "loader": {"dtype": "bf16", "param_dtype": "bf16", "verbose": True},
     # Sharding configuration: Defines how the model is distributed across devices.
-    # - axis_dims: Tuple defining parallelism dimensions (dp, fsdp, ep, tp, sp).
+    # - axis_dims: Tuple defining parallelism dimensions (pp, dp, fsdp, ep, tp, sp).
     #   Values of 1 mean no parallelism; -1 means infer from available devices.
-    #   Default (1, 1, 1, -1, 1) uses tensor parallelism across all devices.
+    #   Default (1, 1, 1, 1, -1, 1) uses tensor parallelism across all devices.
     # - axis_names: Names for each parallelism axis:
-    #   dp=data parallel, fsdp=fully sharded data parallel, ep=expert parallel,
-    #   tp=tensor parallel, sp=sequence parallel.
+    #   pp=pipeline parallel, dp=data parallel, fsdp=fully sharded data parallel,
+    #   ep=expert parallel, tp=tensor parallel, sp=sequence parallel.
     # - auto_shard_model: Automatically apply sharding rules to model parameters.
     # - use_ring_of_experts: Use ring communication for MoE expert parallelism.
     # - fsdp_is_ep_bound: Bind FSDP axis to expert parallel axis for MoE models.
     # - sp_is_ep_bound: Bind sequence parallel axis to expert parallel axis.
     "sharding": {
-        "axis_dims": (1, 1, 1, -1, 1),
-        "axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
+        "axis_dims": (1, 1, 1, 1, -1, 1),
+        "axis_names": ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         "auto_shard_model": True,
         "use_ring_of_experts": False,
         "fsdp_is_ep_bound": True,
@@ -108,8 +108,7 @@ DEFAULTS: eLMConfig = {
     },
     # Base configuration: Overrides for the underlying model configuration.
     # - values: Dictionary of config values to set on the base model config.
-    # - hardware_abstraction: Enable hardware-agnostic operations for portability.
-    "base_config": {"values": {"hardware_abstraction": True}},
+    "base_config": {"values": {}},
     # ESurge configuration: Settings for the ESurge inference serving engine.
     # - min_input_pad: Minimum padding for input sequences (for efficient batching).
     # - max_num_seqs: Maximum number of sequences to batch together.

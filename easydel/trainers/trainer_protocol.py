@@ -660,7 +660,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
             int: Total number of parameters in the model.
 
         Note:
-            Handles both frozen and unfrozen Flax parameter dictionaries.
+            Handles both frozen and unfrozen SpecTrax parameter dictionaries.
         """
         ...
 

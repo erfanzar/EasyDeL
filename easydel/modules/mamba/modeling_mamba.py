@@ -20,16 +20,14 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from einops import repeat
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -89,16 +87,16 @@ def create_tuple_parser(
     return parse
 
 
-class Lambda(nn.Module):
+class Lambda(spx.Module):
     """Convenience wrapper to insert callables into module pipelines."""
 
     fn: tp.Callable
 
-    def __call__(self, x, **kwargs):
+    def forward(self, x, **kwargs):
         return self.fn(x, **kwargs)
 
 
-class MambaConv1D(nn.Module):
+class MambaConv1D(spx.Module):
     """Minimal 1D convolution layer for Mamba mixer implementation.
 
     Implements a depthwise separable 1D convolution used in the Mamba
@@ -120,7 +118,7 @@ class MambaConv1D(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mamba 1D convolution layer.
 
@@ -136,14 +134,14 @@ class MambaConv1D(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         kernel_shape = (kernel_size, 1, features)
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=kernel_shape,
             dtype=param_dtype,
             init_method="lecun_normal",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
         if use_bias:
@@ -151,7 +149,7 @@ class MambaConv1D(nn.Module):
                 shape=(features,),
                 dtype=param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
             )
 
         self.features = features
@@ -166,14 +164,7 @@ class MambaConv1D(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for convolution parameters."""
-        specs = {"kernel": Replicated}
-        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
-            specs["bias"] = Replicated
-        return specs  # pyright: ignore[reportReturnType]
-
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply 1D convolution to input tensor.
 
         Args:
@@ -193,7 +184,7 @@ class MambaConv1D(nn.Module):
         org_x_dtype = x.dtype
         x = lax.conv_general_dilated(
             lhs=x.astype(self.dtype),
-            rhs=jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype),
+            rhs=jnp.asarray(jnp.swapaxes(self.weight.value, 0, 2), dtype=self.dtype),
             window_strides=(self.stride,),
             padding=((self.padding, self.padding),),
             rhs_dilation=(self.dilation,),
@@ -206,7 +197,7 @@ class MambaConv1D(nn.Module):
         return x.astype(org_x_dtype)
 
 
-class MambaMixer(nn.Module):
+class MambaMixer(spx.Module):
     """Core selective state space mixer for Mamba blocks.
 
     Implements the selective state space model (SSM) with input-dependent
@@ -230,7 +221,7 @@ class MambaMixer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Mamba selective state space mixer.
 
@@ -240,7 +231,7 @@ class MambaMixer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -269,7 +260,7 @@ class MambaMixer(nn.Module):
 
         dt_init_std = time_step_rank**-0.5 * config.time_step_scale
         if config.time_step_init_scheme == "constant":
-            init_kernel_dt = nn.initializers.constant(dt_init_std, dtype=param_dtype)
+            init_kernel_dt = jax.nn.initializers.constant(dt_init_std, dtype=param_dtype)
         elif config.time_step_init_scheme == "random":
 
             def init_kernel_dt(key, shape, dtype):
@@ -279,7 +270,7 @@ class MambaMixer(nn.Module):
                 )
 
         else:
-            init_kernel_dt = nn.initializers.normal(config.initializer_range, param_dtype)
+            init_kernel_dt = jax.nn.initializers.normal(config.initializer_range, param_dtype)
 
         def init_bias_dt(key, shape, dtype):
             dt = jax.lax.clamp(
@@ -358,14 +349,7 @@ class MambaMixer(nn.Module):
         )
         self.ssm_op = SSM1Op(metadata)
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for state space parameters."""
-        return {
-            "A_log": Replicated,
-            "D": Replicated,
-        }
-
-    def __call__(
+    def forward(
         self,
         input_states: Array,
         cache: RecurrentCacheView | None = None,
@@ -414,11 +398,11 @@ class MambaMixer(nn.Module):
             new_hidden = hidden_states[:, :, 0]
             conv_state, _, cache_view = cache.concatenate_to_cache(conv_state=new_hidden)
 
-            kernel = jnp.asarray(jnp.swapaxes(self.conv1d.kernel.value, 0, 2), dtype=dtype)
+            kernel = jnp.swapaxes(self.conv1d.weight, 0, 2).astype(dtype)
             kernel = kernel[:, 0, :]
             hidden_states = jnp.sum(conv_state * kernel[None, :, :], axis=-1)
             if self.conv1d.use_bias:
-                hidden_states = hidden_states + jnp.asarray(self.conv1d.bias.value, dtype=dtype)[None, :]
+                hidden_states = hidden_states + self.conv1d.bias.astype(dtype)[None, :]
             hidden_states = jnp.expand_dims(self.act(hidden_states).astype(dtype), -1)
         else:
             conv_input = hidden_states
@@ -456,7 +440,7 @@ class MambaMixer(nn.Module):
         hidden_states_t = apply_logical_sharding(
             hidden_states_t,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         ssm_output = self.ssm_op(
@@ -480,13 +464,13 @@ class MambaMixer(nn.Module):
         scan_output_t = apply_logical_sharding(
             scan_output_t,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         contextualized_states = checkpoint_name(self.out_proj(scan_output_t), name="ssm_output_proj")
         return contextualized_states, cache_view
 
 
-class MambaBlock(nn.Module):
+class MambaBlock(spx.Module):
     """Single Mamba layer combining normalization, SSM mixer, and residual connections.
 
     Implements a complete Mamba block with pre-normalization architecture,
@@ -509,7 +493,7 @@ class MambaBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mamba block.
 
@@ -519,7 +503,7 @@ class MambaBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -548,7 +532,7 @@ class MambaBlock(nn.Module):
             layer_idx=layer_idx,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cache: RecurrentCacheView | None = None,
@@ -587,7 +571,7 @@ class MambaBlock(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return hidden_states, cache
 
@@ -615,7 +599,7 @@ class MambaModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Mamba base model.
 
@@ -624,7 +608,7 @@ class MambaModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -640,19 +624,19 @@ class MambaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List(
-            [
-                MambaBlock(
-                    config=config,
-                    layer_idx=layer_idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    MambaBlock(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
         self.norm_f = MambaRMSNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
@@ -660,7 +644,7 @@ class MambaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
@@ -730,18 +714,28 @@ class MambaModel(EasyDeLBaseModule):
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
-        for idx, block in enumerate(self.layers):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, idx = carry
             hidden_states, cache_view = block(
                 hidden_states=hidden_states,
                 cache=cache.views[idx],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             cache[idx] = cache_view
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
+            return hidden_states, all_hidden_states, idx + 1
+
+        hidden_states, all_hidden_states, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, 0),
+            trace=True,
+        )
         hidden_states = self.norm_f(hidden_states)
 
         if output_hidden_states:
@@ -807,7 +801,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Mamba model for causal language modeling.
 
@@ -816,7 +810,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -829,7 +823,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
             lm_head_bias=False,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Array | None = None,
         inputs_embeds: Array | None = None,
@@ -933,7 +927,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
         Returns:
             dict: Prepared inputs including cache, attention_mask, and position_ids.
         """
-        from eformer.escale import PartitionAxis
+        from spectrax import PartitionAxis
 
         from easydel.caching import RecurrentCache
 

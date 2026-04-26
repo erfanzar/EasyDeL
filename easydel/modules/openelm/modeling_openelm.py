@@ -13,18 +13,18 @@
 # limitations under the License.
 
 
+import importlib
 import types
 import typing
 from functools import cached_property
 
 import jax
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -74,6 +74,14 @@ def _openelm_decoder_layer_block(config: OpenELMConfig) -> type["OpenELMDecoderL
         (OpenELMDecoderLayer,),
     )
     remat_layer_block.__module__ = OpenELMDecoderLayer.__module__
+    # Register the dynamic class in its module so spectrax can resolve it
+    # during jax.eval_shape / bind round-trips.
+    try:
+        parent_module = importlib.import_module(remat_layer_block.__module__)
+        if not hasattr(parent_module, remat_layer_block.__name__):
+            setattr(parent_module, remat_layer_block.__name__, remat_layer_block)
+    except ImportError:
+        pass
     return auto_remat(
         remat_layer_block,
         policy=policy,
@@ -105,7 +113,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize OpenELM attention layer with per-layer head configuration.
@@ -115,7 +123,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer, used to determine head counts.
         """
         self.layer_idx = layer_idx
@@ -161,7 +169,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Define the attention network components.
 
@@ -173,7 +181,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision for operations.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.qkv_proj = ColumnParallelLinear(
             config.model_dim,
@@ -359,7 +367,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         )
 
 
-class OpenELMFeedForwardNetwork(nn.Module):
+class OpenELMFeedForwardNetwork(spx.Module):
     """OpenELM Feed-Forward Network (FFN) module.
 
     This module implements the FFN layer used in the OpenELM model.
@@ -371,7 +379,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         ffn_with_glu (bool): Whether the FFN uses a Gated Linear Unit.
         proj_1 (ParallelLinear): First linear projection layer (or gate projection in GLU).
         proj_2 (ParallelLinear): Second linear projection layer (down projection).
@@ -386,7 +394,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initializes the OpenELMFeedForwardNetwork module.
@@ -397,7 +405,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__()
         self.config = config
@@ -461,7 +469,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
 
         self.act = ACT2FN[config.activation_fn_name]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply feedforward transformation with optional gated linear unit.
@@ -475,7 +483,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         if self.ffn_with_glu:
@@ -489,12 +497,12 @@ class OpenELMFeedForwardNetwork(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class OpenELMDecoderLayer(nn.Module):
+class OpenELMDecoderLayer(spx.Module):
     """OpenELM Transformer Decoder Layer.
 
     This module represents a single decoder layer in the OpenELM model,
@@ -507,7 +515,7 @@ class OpenELMDecoderLayer(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         attn (OpenELMMultiHeadCausalAttention): The self-attention module.
         ffn (OpenELMFeedForwardNetwork): The feed-forward network (FFN) module.
         attn_norm (RMSNorm): Layer normalization before the attention layer.
@@ -521,7 +529,7 @@ class OpenELMDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initializes the OpenELMDecoderLayer.
@@ -532,7 +540,7 @@ class OpenELMDecoderLayer(nn.Module):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__()
         self.config = config
@@ -573,7 +581,7 @@ class OpenELMDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -633,7 +641,7 @@ class OpenELMDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -655,7 +663,7 @@ class OpenELMModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         token_embeddings (Embed): Embedding layer for input tokens.
         layers (tp.List[OpenELMDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
@@ -669,7 +677,7 @@ class OpenELMModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the OpenELMModel.
 
@@ -678,7 +686,7 @@ class OpenELMModel(EasyDeLBaseModule):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -696,19 +704,19 @@ class OpenELMModel(EasyDeLBaseModule):
         )
 
         remat_layer_block = _openelm_decoder_layer_block(config)
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    layer_idx=i,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_transformer_layers):
+            with spx.assign_stage(total=self.config.num_transformer_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_idx=i,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.num_transformer_layers)
-            ]
-        )
         self.norm = RMSNorm(
             config.model_dim,
             dtype=self.dtype,
@@ -743,7 +751,7 @@ class OpenELMModel(EasyDeLBaseModule):
             base=self.config.rope_freq_constant,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -825,29 +833,37 @@ class OpenELMModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             inputs_embeds,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, layer in enumerate(self.layers):
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             layer_outputs = layer(
                 hidden_states=hidden_states,
                 mask_info=mask_info,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 position_ids=position_ids,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
-                output_attentions += (layer_outputs.attention_weight,)
+                all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
@@ -913,7 +929,7 @@ class OpenELMForCausalLM(BaseCausalLMModule[OpenELMModel, OpenELMConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize OpenELM model for causal language modeling.
 
@@ -922,7 +938,7 @@ class OpenELMForCausalLM(BaseCausalLMModule[OpenELMModel, OpenELMConfig]):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

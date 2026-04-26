@@ -85,7 +85,8 @@ Usage Example
 ```python
 from easydel import LlavaConfig, LlavaForConditionalGeneration
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 
 # Initialize configuration with vision and text components
 config = LlavaConfig(
@@ -110,7 +111,7 @@ model = LlavaForConditionalGeneration(
     config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.float32,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Prepare inputs

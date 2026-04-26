@@ -19,13 +19,12 @@ from functools import cached_property, partial
 import jax
 import jax.numpy as jnp
 import numpy as np
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -360,7 +359,7 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
     return attention_mask[None, :, :]
 
 
-class Qwen3VLMoeVisionPatchEmbed(nn.Module):
+class Qwen3VLMoeVisionPatchEmbed(spx.Module):
     """3D convolution-based patch embedding for Qwen3-VL-MoE vision encoder.
 
     Converts input image/video pixels into patch embeddings using a 3D convolution
@@ -374,7 +373,7 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL-MoE vision patch embedding layer.
 
@@ -383,7 +382,7 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
         self.patch_size = config.patch_size
@@ -392,19 +391,17 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
         self.hidden_size = config.hidden_size
 
         kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv(
-            in_features=config.in_channels,
-            out_features=config.hidden_size,
+        self.proj = nn.Conv3d(
+            in_channels=config.in_channels,
+            out_channels=config.hidden_size,
             kernel_size=kernel_size,
-            strides=kernel_size,
+            stride=kernel_size,
             use_bias=True,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply 3D convolution to extract patch embeddings.
 
         Args:
@@ -428,7 +425,7 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Qwen3VLMoeVisionPatchMerger(nn.Module):
+class Qwen3VLMoeVisionPatchMerger(spx.Module):
     """Spatial patch merger with MLP gating for Qwen3-VL-MoE.
 
     Merges spatially adjacent patches to reduce sequence length while
@@ -443,7 +440,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         use_postshuffle_norm: bool = False,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL-MoE vision patch merger.
 
@@ -454,7 +451,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             use_postshuffle_norm (bool, optional): Whether to apply normalization after
                 spatial shuffling. Defaults to False.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.dtype = dtype
@@ -488,7 +485,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Merge patches through normalization and gated MLP.
 
         Args:
@@ -498,11 +495,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             Array: Merged patch embeddings with reduced spatial dimensions.
         """
         x = self.norm(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
-        x = self.linear_fc2(nn.gelu(self.linear_fc1(x), approximate=False))
+        x = self.linear_fc2(jax.nn.gelu(self.linear_fc1(x), approximate=False))
         return x
 
 
-class Qwen3VLMoeVisionMLP(nn.Module):
+class Qwen3VLMoeVisionMLP(spx.Module):
     """Feed-forward network for Qwen3-VL-MoE vision encoder.
 
     Implements a two-layer MLP with GELU activation for vision feature
@@ -517,7 +514,7 @@ class Qwen3VLMoeVisionMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL-MoE vision MLP layer.
 
@@ -528,7 +525,7 @@ class Qwen3VLMoeVisionMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -552,7 +549,7 @@ class Qwen3VLMoeVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply feedforward transformation with GELU activation.
 
         Args:
@@ -579,7 +576,7 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL-MoE vision attention layer.
 
@@ -589,7 +586,7 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
@@ -614,7 +611,7 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Define the QKV and output projection layers for vision attention.
 
@@ -645,12 +642,12 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         )
         self.attention_performer = self._create_attention_performer(config, rngs)
 
-    def _create_attention_performer(self, config, rngs: nn.Rngs):
+    def _create_attention_performer(self, config, rngs: spx.Rngs):
         """Create the attention performer module.
 
         Args:
             config: Vision configuration.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             FlexibleAttentionModule: Configured attention module.
@@ -664,7 +661,7 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -715,7 +712,7 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         return attn_output
 
 
-class Qwen3VLMoeVisionBlock(nn.Module):
+class Qwen3VLMoeVisionBlock(spx.Module):
     """Transformer block for Qwen3-VL-MoE vision encoder.
 
     Combines self-attention and MLP layers with pre-normalization
@@ -730,7 +727,7 @@ class Qwen3VLMoeVisionBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize Qwen3-VL-MoE vision transformer block.
 
@@ -740,7 +737,7 @@ class Qwen3VLMoeVisionBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -775,7 +772,7 @@ class Qwen3VLMoeVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -828,7 +825,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL-MoE vision transformer encoder.
 
@@ -837,7 +834,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -867,19 +864,19 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = nn.List(
-            [
-                Qwen3VLMoeVisionBlock(
-                    config=config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for idx in range(config.depth):
+            with spx.assign_stage(total=config.depth, current=idx):
+                self.blocks.append(
+                    Qwen3VLMoeVisionBlock(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(config.depth)
-            ]
-        )
 
         self.merger = Qwen3VLMoeVisionPatchMerger(
             config=config,
@@ -889,7 +886,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.deepstack_merger_list = nn.List(
+        self.deepstack_merger_list = nn.ModuleList(
             [
                 Qwen3VLMoeVisionPatchMerger(
                     config=config,
@@ -911,7 +908,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         Returns:
             jnp.dtype: Data type of the model parameters.
         """
-        return self.blocks[0].mlp.linear_fc2.kernel.value.dtype
+        return self.blocks[0].mlp.linear_fc2.weight.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
         """Compute positional embeddings with bilinear interpolation.
@@ -1034,7 +1031,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         embeddings = embeddings.reshape(pos_ids.shape[0], -1)
         return embeddings
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         grid_thw: Array,
@@ -1067,17 +1064,27 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
         deepstack_feature_lists = []
-        for layer_num, block in enumerate(self.blocks):
+
+        def _layer_loop(block, carry):
+            hidden_states, layer_num = carry
             hidden_states = block(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb=rotary_pos_emb,
             )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, layer_num, layers=self.blocks)
             if layer_num in self.config.deepstack_visual_indexes:
                 merger_idx = self.config.deepstack_visual_indexes.index(layer_num)
                 deepstack_feature = self.deepstack_merger_list[merger_idx](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
 
+            return hidden_states, layer_num + 1
+
+        hidden_states, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         return self.merger(hidden_states), deepstack_feature_lists
 
     def get_encoder(self):
@@ -1113,7 +1120,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Qwen3VLMoeTextMLP(nn.Module):
+class Qwen3VLMoeTextMLP(spx.Module):
     """SwiGLU feed-forward network for Qwen3-VL-MoE text decoder (dense MLP).
 
     Implements the feedforward network with SwiGLU activation function
@@ -1127,7 +1134,7 @@ class Qwen3VLMoeTextMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen3-VL-MoE text MLP block.
@@ -1137,7 +1144,7 @@ class Qwen3VLMoeTextMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         self.config = config
@@ -1169,7 +1176,7 @@ class Qwen3VLMoeTextMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -1181,7 +1188,7 @@ class Qwen3VLMoeTextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
@@ -1189,12 +1196,12 @@ class Qwen3VLMoeTextMLP(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen3VLMoeMLPStack(nn.Module):
+class Qwen3VLMoeMLPStack(spx.Module):
     """Qwen3-VL-MoE MoE MLP using the new ParallelMoELinear layers.
 
     Implements the expert MLP stack for Mixture of Experts, where each expert
@@ -1205,11 +1212,11 @@ class Qwen3VLMoeMLPStack(nn.Module):
         "gate_up_proj$": {
             "splits": [
                 {
-                    "name": "gate_proj.kernel",
+                    "name": "gate_proj.weight",
                     "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 },
                 {
-                    "name": "up_proj.kernel",
+                    "name": "up_proj.weight",
                     "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 },
             ],
@@ -1220,7 +1227,7 @@ class Qwen3VLMoeMLPStack(nn.Module):
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
+                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
@@ -1233,7 +1240,7 @@ class Qwen3VLMoeMLPStack(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL-MoE MLP stack for MoE.
 
@@ -1242,7 +1249,7 @@ class Qwen3VLMoeMLPStack(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -1254,9 +1261,9 @@ class Qwen3VLMoeMLPStack(nn.Module):
             in_features=config.hidden_size,
             out_features=config.moe_intermediate_size,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(),
+            kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1267,8 +1274,8 @@ class Qwen3VLMoeMLPStack(nn.Module):
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1279,15 +1286,15 @@ class Qwen3VLMoeMLPStack(nn.Module):
             out_features=config.moe_intermediate_size,
             rngs=rngs,
             use_bias=False,
-            kernel_init=nn.initializers.normal(),
-            partition_manager=config.partition_manager,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         group_sizes: Array,
@@ -1315,7 +1322,7 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
     """
 
     def __init__(
@@ -1325,7 +1332,7 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the Qwen3VLMoeTextSparseBlock module.
 
@@ -1334,7 +1341,7 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
             dtype (jnp.dtype): Data type for computations (default: jnp.bfloat16).
             param_dtype (jnp.dtype): Data type for parameters (default: jnp.bfloat16).
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -1358,7 +1365,7 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
 
         self.experts = Qwen3VLMoeMLPStack(
@@ -1370,7 +1377,7 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
         )
         self.layer_idx: int | None = None
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
@@ -1385,9 +1392,9 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.kernel.value,
-            wu_kernel=self.experts.up_proj.kernel.value,
-            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_kernel=self.experts.gate_proj.weight.value,
+            wu_kernel=self.experts.up_proj.weight.value,
+            wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
@@ -1407,7 +1414,7 @@ class Qwen3VLMoeTextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen3-VL-MoE text attention layer.
@@ -1417,7 +1424,7 @@ class Qwen3VLMoeTextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         super().__init__(
@@ -1447,7 +1454,7 @@ class Qwen3VLMoeTextAttention(UnifiedAttention):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
-class Qwen3VLMoeTextDecoderLayer(nn.Module):
+class Qwen3VLMoeTextDecoderLayer(spx.Module):
     """Transformer decoder layer for Qwen3-VL-MoE text model with conditional MoE/dense MLP.
 
     Combines multi-head attention with Q/K normalization and feedforward networks
@@ -1461,7 +1468,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize Qwen3-VL-MoE text decoder layer.
@@ -1471,7 +1478,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         self.config = config
@@ -1527,7 +1534,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         mask_info: MaskInfo,
@@ -1592,7 +1599,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -1625,7 +1632,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL-MoE text decoder model.
 
@@ -1634,7 +1641,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         assert isinstance(config, Qwen3VLMoeTextConfig), (
             f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
@@ -1662,19 +1669,19 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -1701,7 +1708,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             base=self.config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1805,10 +1812,11 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1817,13 +1825,13 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if deepstack_visual_embeds is not None and idx < len(deepstack_visual_embeds):
                 hidden_states = self._deepstack_process(
@@ -1838,8 +1846,15 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -1940,7 +1955,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL-MoE multimodal model.
 
@@ -1949,7 +1964,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -2383,7 +2398,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
         return special_image_mask, special_video_mask
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -2627,7 +2642,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3-VL-MoE for conditional generation.
 
@@ -2636,7 +2651,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -2762,7 +2777,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         """
         return self.model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2886,7 +2901,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -2916,7 +2931,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         """
         return self.lm_head(hidden_states)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Get the vision tower component.
 
         Returns:
@@ -2924,7 +2939,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         """
         return self.model.visual
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Get the language model component.
 
         Returns:

@@ -25,14 +25,15 @@ Available Components:
 
 Example:
     >>> from easydel.layers.embeddings import Embed
-    >>> from flax import nnx as nn
+    >>> import spectrax as spx
+from spectrax import nn
     >>> import jax.numpy as jnp
     >>>
     >>> # Create embedding layer with 32K vocabulary and 512-dim embeddings
     >>> embed = Embed(
     ...     num_embeddings=32000,
     ...     features=512,
-    ...     rngs=nn.Rngs(0)
+    ...     rngs=spx.Rngs(0)
     ... )
     >>>
     >>> # Embed token sequences
@@ -41,7 +42,7 @@ Example:
 
 See Also:
     - easydel.layers.components.embeddings._embeddings: Implementation module
-    - flax.nnx.nn.Embed: Flax's native embedding implementation
+    - spectrax.nn.Embed: SpecTrax's native embedding implementation
 """
 
 from ._embeddings import Embed

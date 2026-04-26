@@ -49,12 +49,12 @@ from functools import cached_property
 from typing import Annotated, Any
 
 import jax
-from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from eformer.pytree import field as pytree_field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import with_sharding_constraint
 from transformers import AutoTokenizer
 
 from .logits_process import (

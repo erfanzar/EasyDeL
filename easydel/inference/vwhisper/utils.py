@@ -268,7 +268,7 @@ def process_audio_input(
         stride = audio_input.get("stride", None)
         if not ("sampling_rate" in audio_input and "array" in audio_input):
             raise ValueError(
-                "When passing a dictionary to FlaxWhisperPipline, the dict needs to contain an 'array' key "
+                "When passing a dictionary to WhisperPipline, the dict needs to contain an 'array' key "
                 "containing the numpy array representing the audio, and a 'sampling_rate' key "
                 "containing the sampling rate associated with the audio array."
             )

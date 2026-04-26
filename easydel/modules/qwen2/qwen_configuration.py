@@ -182,7 +182,6 @@ class Qwen2Config(EasyDeLBaseConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.scan_layers = scan_layers
         self.embd_pdrop = embd_pdrop
         self.number_rep_kv = number_rep_kv
         self.resid_pdrop = resid_pdrop
@@ -209,6 +208,7 @@ class Qwen2Config(EasyDeLBaseConfig):
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            scan_layers=scan_layers,
             use_scan_mlp=use_scan_mlp,
             scan_mlp_chunk_size=scan_mlp_chunk_size,
             bits=bits,
@@ -221,7 +221,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         Providing explicit partition rules is preferred over automatic sharding resolution,
         as it gives full control over parameter distribution across the device mesh.
         Returns ``None`` by default, which triggers automatic sharding via
-        module-level ``craft_sharding`` hooks.
+        spectrax parameter metadata.
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.

@@ -20,19 +20,18 @@ import jax
 import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils.compiling_utils import ejit
 from easydel.utils.registery import Registry
 from easydel.utils.traversals import deepcopy_model
 
 from ..prompt_transforms import BCOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
 from ._fn import RunningMoments, concatenated_forward, evaluation_step, training_step
 from .bco_config import BCOConfig
@@ -98,14 +97,14 @@ class BCOTrainer(Trainer):
         if isinstance(model, EasyDeLState):
             model_state = model
         else:
-            model_state = model.to_state()
+            model_state = model.to_state(trainable_selector=arguments.trainable_selector)
 
         if reference_model is None:
             reference_state = deepcopy_model(model_state)
         elif isinstance(reference_model, EasyDeLState):
             reference_state = reference_model
         else:
-            reference_state = reference_model.to_state()
+            reference_state = reference_model.to_state(trainable_selector=arguments.trainable_selector)
 
         if arguments.is_encoder_decoder is not None:
             self.is_encoder_decoder = arguments.is_encoder_decoder
@@ -350,7 +349,7 @@ class BCOTrainer(Trainer):
             Configuration containing compiled step functions and mesh.
         """
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
@@ -372,7 +371,7 @@ class BCOTrainer(Trainer):
                 logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
 
-        self.concatenated_forward = ejit(forward_fn, static_argnames=())
+        self.concatenated_forward = compile_trainer_auxiliary(forward_fn, mesh=mesh, static_argnames=())
 
         self._train_shared_fn_static_args = (
             self.scheduler,
@@ -387,7 +386,7 @@ class BCOTrainer(Trainer):
         ref_sharding = self.reference_state.shardings if self.reference_state is not None else empty_sharding
 
         train_static_argnums = (3, 4, 5, 6, 7, 8, 9)
-        sharded_training_step_function = ejit(
+        sharded_training_step_function = compile_trainer_step(
             training_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -397,7 +396,7 @@ class BCOTrainer(Trainer):
 
         self._eval_shared_fn_static_args = (forward_fn, self.arguments.beta)
         eval_static_argnums = (3, 4)
-        sharded_evaluation_step_function = ejit(
+        sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
             out_shardings=empty_sharding,

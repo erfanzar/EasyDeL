@@ -83,7 +83,8 @@ Usage Example
 ```python
 from easydel import OlmoConfig, OlmoForCausalLM
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 
 # Initialize OLMo-7B configuration
 config = OlmoConfig(
@@ -102,7 +103,7 @@ model = OlmoForCausalLM(
     config=config,
     dtype=jnp.bfloat16,
     param_dtype=jnp.float32,
-    rngs=nn.Rngs(0),
+    rngs=spx.Rngs(0),
 )
 
 # Forward pass for training

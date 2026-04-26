@@ -35,11 +35,11 @@ import collections.abc
 import typing as tp
 
 import jax
-from eformer.escale import with_sharding_constraint
-from flax import nnx as nn
+import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics, dynamic_cross_entropy_loss
@@ -125,7 +125,7 @@ def concatenated_forward(
         "attention_mask": concatenated_batch["concatenated_attention_mask"],
         **model_kwargs,
     }
-    call_kwargs = filter_kwargs_for_callable(state.model.__call__, call_kwargs)
+    call_kwargs = filter_kwargs_for_callable(getattr(state.model, "forward", state.model), call_kwargs)
     call_kwargs = sanitize_model_call_kwargs(call_kwargs)
     outputs = state.model(**call_kwargs)
     all_logits = outputs.logits
@@ -500,9 +500,9 @@ def orpo_step(
     )
 
     # Apply sharding constraints to the batch.
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    def calculate_loss(tree: nn.GraphState, batch: dict):
+    def calculate_loss(tree: spx.State, batch: dict):
         """
         Computes the loss and metrics for a given minibatch.
 
@@ -510,7 +510,7 @@ def orpo_step(
         computes the odds ratio loss, and aggregates various metrics.
 
         Args:
-            tree (nn.GraphState): The current state of the model graph.
+            tree (spx.State): The current state of the model graph.
             batch (tp.Dict): The input batch data.
 
         Returns:

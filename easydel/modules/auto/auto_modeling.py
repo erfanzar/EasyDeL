@@ -15,13 +15,12 @@ import contextlib
 import os
 from collections.abc import Callable, Mapping, Sequence
 
-import flax
-import flax.nnx
 import jax
-from eformer.escale import PartitionAxis
+import spectrax as spx
 from eformer.paths import ePath
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from spectrax import PartitionAxis
 
 from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -54,7 +53,7 @@ class BaseAutoEasyModel:
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: flax.nnx.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ) -> EasyDeLBaseModule:
         """Instantiates a model module directly from a configuration object.
 
@@ -63,14 +62,14 @@ class BaseAutoEasyModel:
                 dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
                 param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
                 precision (Optional[jax.lax.Precision]): JAX precision level. Defaults to None.
-                rngs (Optional[flax.nnx.Rngs]): Random number generators. Defaults to Rngs(42).
+                rngs (Optional[spx.Rngs]): Random number generators. Defaults to Rngs(42).
 
         Returns:
                 EasyDeLBaseModule: An instance of the specific EasyDeL model module.
         """
         registration = registry.get_module_registration(cls.model_task, config.model_type)
         if rngs is None:
-            rngs = flax.nnx.Rngs(42)
+            rngs = spx.Rngs(42)
         return registration.module(
             config=config,
             dtype=dtype,
@@ -87,9 +86,9 @@ class BaseAutoEasyModel:
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
@@ -112,7 +111,7 @@ class BaseAutoEasyModel:
             dtype: Data type of the model. Defaults to jnp.float32.
             param_dtype: Data type of the model parameters. Defaults to jnp.float32.
             precision: Precision for computations. Defaults to jax.lax.Precision("fastest").
-            sharding_axis_dims: Dimensions of each sharding axis. Defaults to (1, -1, 1, 1, 1).
+            sharding_axis_dims: Dimensions of each sharding axis. Defaults to (1, 1, -1, 1, 1, 1).
             sharding_axis_names: Names of the sharding axes.
             partition_axis: PartitionAxis for partitioning arrays.
             shard_fns: Sharding functions for the model.
@@ -194,9 +193,9 @@ class BaseAutoEasyModel:
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
@@ -221,7 +220,7 @@ class BaseAutoEasyModel:
             param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
             sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
-                Defaults to (1, -1, 1, 1, 1).
+                Defaults to (1, 1, -1, 1, 1, 1).
             sharding_dcn_axis_dims (tp.Optional[Sequence[int]], optional): Dimensions for DCN sharding.
                 Defaults to None.
             sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
@@ -277,9 +276,9 @@ class BaseAutoEasyModel:
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
@@ -304,7 +303,7 @@ class BaseAutoEasyModel:
             param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
             sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
-                Defaults to (1, -1, 1, 1, 1).
+                Defaults to (1, 1, -1, 1, 1, 1).
             sharding_dcn_axis_dims (tp.Optional[Sequence[int]], optional): Dimensions for DCN sharding.
                 Defaults to None.
             sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
@@ -356,7 +355,7 @@ class BaseAutoEasyModel:
     def _is_easydel(
         cls,
         pretrained_model_name_or_path,
-        FLAX_WEIGHTS_NAME="easydel-model.parameters",
+        SPX_WEIGHTS_NAME="easydel-model.parameters",
         MULTI_PART_NAME="easydel-model.parameters.safetensors.index.json",
         cache_dir: str | os.PathLike | None = None,
         force_download: bool = False,
@@ -368,7 +367,7 @@ class BaseAutoEasyModel:
 
         Args:
             pretrained_model_name_or_path: Identifier or path to check.
-            FLAX_WEIGHTS_NAME (str): The standard filename for EasyDeL weights.
+            SPX_WEIGHTS_NAME (str): The standard filename for EasyDeL weights.
             cache_dir (Optional[Union[str, os.PathLike]]): Cache directory.
             force_download (bool): Force download even if cached.
             local_files_only (bool): Only check local files.
@@ -392,9 +391,9 @@ class BaseAutoEasyModel:
                 return True
             if (epath / subfolder / MULTI_PART_NAME).exists():
                 return True
-            if not (epath / subfolder / FLAX_WEIGHTS_NAME).is_file():
+            if not (epath / subfolder / SPX_WEIGHTS_NAME).is_file():
                 raise OSError(
-                    f"Error no file named {FLAX_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path}"
+                    f"Error no file named {SPX_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path}"
                 )
             if oo := (epath / subfolder).glob("run-*"):
                 if len(list(oo)) != 0:
@@ -420,7 +419,7 @@ class BaseAutoEasyModel:
                     "_commit_hash": commit_hash,
                 }
                 resolved_archive_file = None
-                for filename in [FLAX_WEIGHTS_NAME, MULTI_PART_NAME, TENSORSTORE_INDEX_NAME, MODEL_INDEX_NAME]:
+                for filename in [SPX_WEIGHTS_NAME, MULTI_PART_NAME, TENSORSTORE_INDEX_NAME, MODEL_INDEX_NAME]:
                     resolved_archive_file = _cached_file(pretrained_model_name_or_path, filename, **cached_file_kwargs)
                     if resolved_archive_file is not None:
                         break
@@ -458,7 +457,7 @@ class BaseAutoEasyState:
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
         *,
-        rngs: flax.nnx.Rngs | None = None,
+        rngs: spx.Rngs | None = None,
     ) -> EasyDeLState:
         """Creates an EasyDeLState directly from a configuration object.
 
@@ -467,7 +466,7 @@ class BaseAutoEasyState:
                 dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
                 param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
                 precision (Optional[jax.lax.Precision]): JAX precision level. Defaults to None.
-                rngs (Optional[flax.nnx.Rngs]): Random number generators. Defaults to Rngs(42).
+                rngs (Optional[spx.Rngs]): Random number generators. Defaults to Rngs(42).
 
         Returns:
                 EasyDeLState: An initialized EasyDeLState for the model.
@@ -488,9 +487,9 @@ class BaseAutoEasyState:
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
         sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
@@ -513,7 +512,7 @@ class BaseAutoEasyState:
             precision (jax.lax.Precision, optional): Precision for computations.
                 Defaults to jax.lax.Precision("fastest").
             sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
-                Defaults to (1, -1, 1, 1, 1).
+                Defaults to (1, 1, -1, 1, 1, 1).
             sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
@@ -592,8 +591,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
         >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
         ...  "gpt2",
-        ...  sharding_axis_dims=(1, 8, 1, 1, 1),
-        ...  sharding_axis_names=("dp", "fsdp",  "ep", "tp", "sp"),
+        ...  sharding_axis_dims=(1, 1, 8, 1, 1, 1),
+        ...  sharding_axis_names=("pp", "dp", "fsdp",  "ep", "tp", "sp"),
         ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
         ...  from_torch=True,
         >>> )
@@ -676,8 +675,8 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
         >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
         ...  "openai/whisper-large-v3-turbo",
-        ...  sharding_axis_dims=(1, 8, 1, 1, 1),
-        ...  sharding_axis_names=("dp", "fsdp",  "ep", "tp", "sp"),
+        ...  sharding_axis_dims=(1, 1, 8, 1, 1, 1),
+        ...  sharding_axis_names=("pp", "dp", "fsdp",  "ep", "tp", "sp"),
         ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
         ...  from_torch=True,
         >>> )

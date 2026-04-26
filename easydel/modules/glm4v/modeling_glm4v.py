@@ -18,13 +18,12 @@ from itertools import groupby
 import jax
 import jax.numpy as jnp
 import numpy as np
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -133,7 +132,7 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
     return attention_mask[None, :, :]
 
 
-class Glm4vVisionPatchEmbed(nn.Module):
+class Glm4vVisionPatchEmbed(spx.Module):
     """3D convolution-based patch embedding for GLM4V vision encoder.
 
     Converts image/video patches into embeddings using a 3D convolution that
@@ -148,7 +147,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize vision patch embedding layer.
 
@@ -157,7 +156,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
         self.patch_size = config.patch_size
@@ -166,19 +165,17 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.hidden_size = config.hidden_size
 
         kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv(
-            in_features=config.in_channels,
-            out_features=config.hidden_size,
+        self.proj = nn.Conv3d(
+            in_channels=config.in_channels,
+            out_channels=config.hidden_size,
             kernel_size=kernel_size,
-            strides=kernel_size,
+            stride=kernel_size,
             use_bias=True,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Convert image/video patches to embeddings.
 
         Args:
@@ -202,7 +199,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Glm4vVisionMLP(nn.Module):
+class Glm4vVisionMLP(spx.Module):
     """SwiGLU-style MLP for GLM4V vision encoder blocks.
 
     Implements a gated feedforward network with SiLU activation
@@ -216,7 +213,7 @@ class Glm4vVisionMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize vision encoder MLP block.
 
@@ -225,7 +222,7 @@ class Glm4vVisionMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -258,7 +255,7 @@ class Glm4vVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> Array:
+    def forward(self, x: Array) -> Array:
         """Apply gated feedforward transformation.
 
         Args:
@@ -285,7 +282,7 @@ class Glm4vVisionAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize vision attention layer.
 
@@ -295,7 +292,7 @@ class Glm4vVisionAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
@@ -320,7 +317,7 @@ class Glm4vVisionAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Define the attention network components.
 
@@ -332,7 +329,7 @@ class Glm4vVisionAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision for operations.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.qkv = ColumnParallelLinear(
             self.hidden_size,
@@ -354,12 +351,12 @@ class Glm4vVisionAttention(UnifiedAttention):
         )
         self.attention_performer = self._create_attention_performer(config, rngs)
 
-    def _create_attention_performer(self, config, rngs: nn.Rngs):
+    def _create_attention_performer(self, config, rngs: spx.Rngs):
         """Create the attention performer for vision encoding.
 
         Args:
             config: Vision encoder configuration.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             FlexibleAttentionModule: Configured attention performer.
@@ -373,7 +370,7 @@ class Glm4vVisionAttention(UnifiedAttention):
             requires_cache=False,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Array,
         cu_seqlens: Array,
@@ -425,7 +422,7 @@ class Glm4vVisionAttention(UnifiedAttention):
         return checkpoint_name(self.proj(attn_output), "vision_attn_output")
 
 
-class Glm4vVisionBlock(nn.Module):
+class Glm4vVisionBlock(spx.Module):
     """Transformer block for GLM4V vision encoder.
 
     Implements a standard transformer block with pre-normalization,
@@ -440,7 +437,7 @@ class Glm4vVisionBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize vision encoder transformer block.
 
@@ -450,7 +447,7 @@ class Glm4vVisionBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.norm1 = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
@@ -474,7 +471,7 @@ class Glm4vVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Array, *, cu_seqlens: Array, rotary_pos_emb: Array) -> Array:
+    def forward(self, hidden_states: Array, *, cu_seqlens: Array, rotary_pos_emb: Array) -> Array:
         """Forward pass through the vision encoder block.
 
         Applies pre-normalized attention and MLP with residual connections.
@@ -494,7 +491,7 @@ class Glm4vVisionBlock(nn.Module):
         return hidden_states
 
 
-class Glm4vVisionPatchMerger(nn.Module):
+class Glm4vVisionPatchMerger(spx.Module):
     """Projection + gated MLP merger for GLM4V vision features.
 
     Merges vision patch embeddings using a projection layer followed by
@@ -510,7 +507,7 @@ class Glm4vVisionPatchMerger(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> None:
         """Initialize patch merger module.
 
@@ -521,7 +518,7 @@ class Glm4vVisionPatchMerger(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.proj = ColumnParallelLinear(
             dim,
@@ -573,7 +570,7 @@ class Glm4vVisionPatchMerger(nn.Module):
             }
         }
 
-    def __call__(self, hidden_state: Array) -> Array:
+    def forward(self, hidden_state: Array) -> Array:
         """Merge and project vision patch embeddings.
 
         Args:
@@ -612,7 +609,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V vision encoder.
 
@@ -621,7 +618,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -668,29 +665,27 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = (head_dim // 2) // 2
 
-        self.blocks = nn.List(
-            [
-                Glm4vVisionBlock(
-                    config,
-                    layer_idx=idx,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for idx in range(config.depth):
+            with spx.assign_stage(total=config.depth, current=idx):
+                self.blocks.append(
+                    Glm4vVisionBlock(
+                        config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for idx in range(config.depth)
-            ]
-        )
 
-        self.downsample = nn.Conv(
-            in_features=config.hidden_size,
-            out_features=config.out_hidden_size,
-            kernel_size=(config.spatial_merge_size, config.spatial_merge_size),
-            strides=(config.spatial_merge_size, config.spatial_merge_size),
+        self.downsample = nn.Conv2d(
+            in_channels=config.hidden_size,
+            out_channels=config.out_hidden_size,
+            kernel_size=config.spatial_merge_size,
+            stride=config.spatial_merge_size,
             use_bias=True,
             dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
             rngs=rngs,
         )
         self.merger = Glm4vVisionPatchMerger(
@@ -709,7 +704,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         Returns:
             jnp.dtype: The data type of the position embedding parameters.
         """
-        return self.pos_embed.embedding.value.dtype
+        return self.pos_embed.weight.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
         """Bilinear-interpolate 2D position embeddings and apply merge-size permutation.
@@ -832,7 +827,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         embeddings = embeddings.reshape(pos_ids.shape[0], -1)
         return embeddings
 
-    def __call__(self, hidden_states: Array, *, grid_thw: Array) -> Array:
+    def forward(self, hidden_states: Array, *, grid_thw: Array) -> Array:
         """Encode image/video pixel values to vision features.
 
         Processes input pixel values through patch embedding, transformer blocks
@@ -861,9 +856,18 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size=max_grid_size)
         rotary_pos_emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
 
-        for block in self.blocks:
+        def _layer_loop(block, carry):
+            hidden_states, idx = carry
             hidden_states = block(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
+            return hidden_states, idx + 1
+
+        hidden_states, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, 0),
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+        )
         hidden_states = self.post_layernorm(hidden_states)
 
         merge_size = self.spatial_merge_size
@@ -906,7 +910,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Glm4vTextMLP(nn.Module):
+class Glm4vTextMLP(spx.Module):
     """SwiGLU feed-forward network for GLM4V text decoder.
 
     Implements a gated feedforward network with fused gate-up projections
@@ -920,7 +924,7 @@ class Glm4vTextMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize text decoder MLP block.
 
@@ -929,7 +933,7 @@ class Glm4vTextMLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -958,7 +962,7 @@ class Glm4vTextMLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def forward(self, hidden_states: Array) -> Array:
         """Apply gated feedforward transformation.
 
         Args:
@@ -987,7 +991,7 @@ class Glm4vTextAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize text decoder attention layer.
@@ -997,7 +1001,7 @@ class Glm4vTextAttention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         super().__init__(
@@ -1036,7 +1040,7 @@ class Glm4vTextAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ) -> RowParallelLinear:
         """Create the output projection layer without bias.
 
@@ -1045,7 +1049,7 @@ class Glm4vTextAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation.
             param_dtype (jnp.dtype): Data type for parameters.
             precision (jax.lax.PrecisionLike): Numerical precision for operations.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
 
         Returns:
             RowParallelLinear: Output projection layer.
@@ -1062,7 +1066,7 @@ class Glm4vTextAttention(UnifiedAttention):
         )
 
 
-class Glm4vTextDecoderLayer(nn.Module):
+class Glm4vTextDecoderLayer(spx.Module):
     """Single GLM4V text decoder block combining attention and MLP.
 
     Implements a transformer decoder layer with pre-normalization,
@@ -1077,7 +1081,7 @@ class Glm4vTextDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize text decoder layer.
@@ -1087,7 +1091,7 @@ class Glm4vTextDecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the decoder.
         """
         self.config = config
@@ -1125,7 +1129,7 @@ class Glm4vTextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -1184,7 +1188,7 @@ class Glm4vTextDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -1217,7 +1221,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V text decoder.
 
@@ -1226,7 +1230,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1249,22 +1253,22 @@ class Glm4vTextModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                    layer_idx=i,
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                        layer_idx=i,
+                    )
                 )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1276,6 +1280,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        trace: bool = False,
     ) -> BaseModelOutput:
         """Forward pass through the GLM4V text decoder.
 
@@ -1349,28 +1354,54 @@ class Glm4vTextModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
 
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
             layer_outputs = block(
-                hidden_states=hidden_states,
+                hidden_states=hs,
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
-            hidden_states = layer_outputs.hidden_states
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-            past_key_values[idx] = layer_outputs.cache_view
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
 
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1435,7 +1466,7 @@ class Glm4vModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V multimodal model.
 
@@ -1444,7 +1475,7 @@ class Glm4vModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1810,7 +1841,7 @@ class Glm4vModel(EasyDeLBaseModule):
         )
         return inputs_embeds, EmbeddingInfo(position_ids=position_ids, rope_deltas=rope_deltas)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -1973,7 +2004,7 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GLM4V for conditional generation.
 
@@ -1983,7 +2014,7 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -2062,7 +2093,7 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2141,7 +2172,7 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
         hidden_states = apply_logical_sharding(
             outputs.last_hidden_state,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None

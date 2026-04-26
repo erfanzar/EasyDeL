@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
 
 import easydel as ed
 
@@ -130,7 +130,7 @@ class BaseTester:
 
             @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
             def jited(ids, gd, gs, go, attention_mask, **kwargs):
-                model = nn.merge(gd, gs, go)
+                model = spx.bind(gd, gs.merge(go, copy=True))
                 return model.compute_loss(
                     input_ids=ids,
                     attention_mask=attention_mask,
@@ -161,7 +161,7 @@ class BaseTester:
 
             @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
             def jited_fallback(ids, gd, gs, go, attention_mask, **kwargs):
-                model = nn.merge(gd, gs, go)
+                model = spx.bind(gd, gs.merge(go, copy=True))
                 return model.compute_loss(
                     input_ids=ids,
                     attention_mask=attention_mask,
@@ -513,7 +513,7 @@ class BaseModuleTester(BaseTester):
 
                 @ed.ejit(static_argnums=(0,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(gd, gs, go, **kwargs):
-                    model = nn.merge(gd, gs, go)
+                    model = spx.bind(gd, gs.merge(go, copy=True))
                     return model(**kwargs, output_hidden_states=True)
 
                 _ = jited(*ed_model.split_module(), **ed_inputs)
@@ -821,6 +821,7 @@ class VisionLanguageTester(BaseTester):
                     mm_token_type_ids=vlm_config.get("use_mm_token_type_ids", False),
                     image_grid_hws=vlm_config.get("image_grid_hws"),
                     image_grid_thw=vlm_config.get("image_grid_thw"),
+                    image_position_ids=vlm_config.get("image_position_ids"),
                     video_grid_thw=vlm_config.get("video_grid_thw"),
                 )
 
@@ -840,7 +841,7 @@ class VisionLanguageTester(BaseTester):
 
                     @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
-                        model = nn.merge(gd, gs, go)
+                        model = spx.bind(gd, gs.merge(go, copy=True))
                         return model.compute_loss(
                             labels=labels,
                             inputs_embeds=embeds,
@@ -907,7 +908,7 @@ class VisionLanguageTester(BaseTester):
 
                 @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
-                    model = nn.merge(gd, gs, go)
+                    model = spx.bind(gd, gs.merge(go, copy=True))
                     return model.compute_loss(
                         labels=labels,
                         inputs_embeds=embeds,
@@ -1024,7 +1025,7 @@ class Seq2SeqTester(BaseTester):
 
                     @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(input_features, gd, gs, go, decoder_input_ids):
-                        model = nn.merge(gd, gs, go)
+                        model = spx.bind(gd, gs.merge(go, copy=True))
                         return model.compute_loss(
                             labels=decoder_input_ids,
                             input_features=input_features,
@@ -1065,7 +1066,7 @@ class Seq2SeqTester(BaseTester):
 
                     @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(input_ids, gd, gs, go, attention_mask, labels, **kwargs):
-                        model = nn.merge(gd, gs, go)
+                        model = spx.bind(gd, gs.merge(go, copy=True))
                         return model.compute_loss(
                             labels=labels,
                             input_ids=input_ids,
@@ -1275,7 +1276,7 @@ class EasyDeLOnlyTester:
 
                     @ed.ejit(static_argnums=(0,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(gd, gs, go, input_ids, attention_mask):
-                        model = nn.merge(gd, gs, go)
+                        model = spx.bind(gd, gs.merge(go, copy=True))
                         return model(
                             input_ids=input_ids,
                             attention_mask=attention_mask,

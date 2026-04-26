@@ -45,8 +45,8 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from flax import nnx as nn
 from jaxtyping import Array, Float
+from spectrax import nn
 
 from easydel.layers.norms import lowfloats
 
@@ -97,7 +97,7 @@ def apply_manual_depthwise_conv(
     Args:
         conv_state: Convolution state of shape ``[batch, dim, d_conv]``.
         kernel: Depthwise convolution kernel of shape ``[dim, d_conv]``
-            (already transposed from Flax's ``[kernel_size, 1, dim]`` layout).
+            (already transposed from SpecTrax's ``[kernel_size, 1, dim]`` layout).
         output_dtype: Data type to cast the output to.
         activation: Pointwise activation applied after the dot product.
             Defaults to ``jax.nn.silu``.  Pass ``None`` to skip.
@@ -120,7 +120,7 @@ def apply_manual_depthwise_conv(
 
 def apply_conv_with_state(
     x: Float[Array, "batch seq_len dim"],
-    conv_layer: nn.Conv,
+    conv_layer: nn.Conv1d | nn.Conv2d,
     conv_state: Float[Array, "batch dim d_conv"] | None,
     *,
     is_inference: bool,
@@ -154,7 +154,7 @@ def apply_conv_with_state(
 
     Args:
         x: Input tensor of shape ``[batch, seq_len, dim]``.
-        conv_layer: A Flax ``nn.Conv`` module configured for depthwise causal
+        conv_layer: A Spectrux ``nn.Conv1d`` or ``nn.Conv2d`` module configured for depthwise causal
             convolution.
         conv_state: Previous convolution state of shape
             ``[batch, dim, d_conv]``, or ``None`` if no cache exists yet.
@@ -178,7 +178,7 @@ def apply_conv_with_state(
 
     if is_inference and conv_state is not None:
         new_state = shift_conv_state_left(conv_state, x[:, 0, :].astype(conv_state.dtype))
-        kernel = conv_layer.kernel.value.squeeze(1).T
+        kernel = conv_layer.weight.value.squeeze(1).T
         output = apply_manual_depthwise_conv(
             new_state,
             kernel,

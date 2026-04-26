@@ -223,6 +223,7 @@ class StateDictConverter:
 
                             new_config = config.copy()
                             new_config["reform_param"] = {}
+                            new_config["_reform_processed"] = True
 
                             for split in splits:
                                 split_name = split["name"]
@@ -238,16 +239,11 @@ class StateDictConverter:
                                     results.extend(sub_results)
                             return results
 
-        if any(layer_name in key for layer_name in config["embedding_layer_names"]):
-            new_key = f"{key[: -len('.weight')]}.embedding"
-
-        elif any(layer_norm in key for layer_norm in config["layernorm_names"]):
-            new_key = key.replace(".weight", ".scale")
-
-        elif "weight" in key:
+        if "weight" in key and not config.get("_reform_processed", False):
+            is_embedding = any(layer_name in key for layer_name in config.get("embedding_layer_names", []))
             is_moe_expert = key in config.get("consolidated_moe_keys", set())
             ndim = len(tensor.shape)
-            if not is_moe_expert:
+            if not is_embedding and not is_moe_expert:
                 if ndim == 2:
                     tensor = tensor.permute(1, 0)
                 elif ndim == 3:
@@ -258,10 +254,10 @@ class StateDictConverter:
                     tensor = tensor.permute(2, 3, 4, 1, 0)
                 elif ndim == 6:
                     tensor = tensor.permute(4, 5, 3, 2, 1, 0)
-            else:
+            elif is_moe_expert:
                 if ndim == 3:
                     tensor = tensor.permute(0, 2, 1)
-            new_key = key.replace(".weight", ".kernel")
+            # Everything now uses .weight; no key renaming needed
 
         key_tuple = tuple(int(n) if n.isdigit() else n for n in new_key.split("."))
 
@@ -345,7 +341,7 @@ class StateDictConverter:
         }
 
         with jax.default_device(device) if device is not None and shard_fns is None else contextlib.nullcontext():
-            flax_dict = {}
+            parameters_dict = {}
             with tqdm(total=len(state_dict), disable=not verbose, desc="Converting Model") as pbar:
                 keys = sorted(state_dict.keys())
                 for key in keys:
@@ -371,7 +367,7 @@ class StateDictConverter:
                                 usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
                                 strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
                                 logger.debug(strm)
-                                flax_dict[key_tuple] = jax_array
+                                parameters_dict[key_tuple] = jax_array
                     except Exception as e:
                         logger.error(f"Error processing key {key}: {e!s}")
                     pbar.update(1)
@@ -380,7 +376,7 @@ class StateDictConverter:
                 del state_dict
                 _clear()
 
-            return unflatten_dict(flax_dict)
+            return unflatten_dict(parameters_dict)
 
     @staticmethod
     def apply_moe_transformations(

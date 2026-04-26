@@ -52,8 +52,6 @@ Example:
 import typing as tp
 
 import jax
-from eformer import common_types
-from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from ejkernel.modules import flash_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -62,6 +60,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
+from spectrax import common_types, with_sharding_constraint
 
 from easydel.caching import TransformerCacheView
 
@@ -226,10 +225,17 @@ class FlashAttn(OperationImpl):
                 fallback_kwargs.update(ignore)
             return fallback_attn(**fallback_kwargs)
 
+        is_packed_attention = cum_seqlens_q is not None or cum_seqlens_k is not None
         if dims_incompatible:
             return _fallback_attention()
 
-        dtype: jnp.dtype = self.metadata.runtime_dtype
+        if jax.default_backend() == "tpu" and jax.process_count() > 1:
+            return _fallback_attention(
+                warning_message="FLASH_ATTN2 is not supported on multi-host TPU; falling back to a portable attention kernel.",
+                preserve_varlen_semantics=is_packed_attention,
+            )
+
+        dtype: jnp.dtype = getattr(self.metadata, "runtime_dtype", query.dtype)
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
@@ -471,7 +477,7 @@ if __name__ == "__main__":
     a = jnp.astype(jr.randint(jr.key(3), (b, 1, qs, ks), 0, 4) > 2, "b1")
     metadata = OperationMetadata(
         runtime_dtype=jnp.bfloat16,
-        base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, -1, 1)),
+        base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, 1, -1, 1)),
     )
     attn = FlashAttn(metadata)
     vanilla = VanillaAttn(metadata)

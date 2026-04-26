@@ -18,13 +18,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import ColumnWise, RowWise
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -47,7 +45,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import ColumnParallelLinear, Embed, ParallelLinear, RowParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -103,7 +101,7 @@ class DbrxAttention(UnifiedAttention):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
+        rngs (spx.Rngs): Random number generators.
         Wqkv (ColumnParallelLinear): Fused linear layer for query, key, and value projections.
         out_proj (RowParallelLinear): Linear layer for the output projection.
         attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
@@ -123,7 +121,7 @@ class DbrxAttention(UnifiedAttention):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initializes the DbrxAttention module.
@@ -133,7 +131,7 @@ class DbrxAttention(UnifiedAttention):
             dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            rngs (spx.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -152,7 +150,7 @@ class DbrxAttention(UnifiedAttention):
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Override to create fused QKV projection instead of separate Q/K/V.
 
@@ -209,7 +207,7 @@ class DbrxAttention(UnifiedAttention):
             base=config.attn_config.rope_theta,
         )
 
-    def _create_attention_performer(self, config: DbrxConfig, rngs: nn.Rngs):
+    def _create_attention_performer(self, config: DbrxConfig, rngs: spx.Rngs):
         """Create attention performer module with DBRX specific settings.
 
         Args:
@@ -325,7 +323,7 @@ class DbrxAttention(UnifiedAttention):
         return self.out_proj
 
 
-class DbrxNormAttentionNorm(nn.Module):
+class DbrxNormAttentionNorm(spx.Module):
     """Normalization-Attention-Normalization module for DBRX models.
 
     Implements a unique architecture pattern with normalization layers
@@ -344,7 +342,7 @@ class DbrxNormAttentionNorm(nn.Module):
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
         self,
@@ -353,7 +351,7 @@ class DbrxNormAttentionNorm(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize the DbrxNormAttentionNorm module.
@@ -363,7 +361,7 @@ class DbrxNormAttentionNorm(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -400,7 +398,7 @@ class DbrxNormAttentionNorm(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -462,7 +460,7 @@ class DbrxNormAttentionNorm(nn.Module):
         )
 
 
-class DbrxExpertGLU(nn.Module):
+class DbrxExpertGLU(spx.Module):
     """Gated Linear Unit expert module for DBRX mixture of experts.
 
     Implements a single expert network with gated activation for
@@ -488,7 +486,7 @@ class DbrxExpertGLU(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int | None = None,
     ):
         """Initialize the DbrxExpertGLU module.
@@ -498,7 +496,7 @@ class DbrxExpertGLU(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int | None, optional): Index of this layer. Defaults to None.
         """
         super().__init__()
@@ -511,24 +509,12 @@ class DbrxExpertGLU(nn.Module):
             self.config.ffn_config.moe_num_experts * self.config.ffn_config.ffn_hidden_size,
             self.config.d_model,
         )
-        self.w1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
-        self.v1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
-        self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
+        self.w1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.parameters)
+        self.v1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.parameters)
+        self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.parameters)
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specifications for DbrxExpertGLU parameters.
-
-        Gate (w1) and up (v1) projections are sharded column-wise to
-        split the intermediate dimension across devices. The down
-        projection (w2) is sharded row-wise to reduce across devices.
-
-        Returns:
-            dict[str, object]: Mapping of parameter names to sharding specs.
-        """
-        return {"w1": ColumnWise, "v1": ColumnWise, "w2": RowWise}
-
-    def __call__(self, x: Array, expert_idx: int) -> Array:
+    def forward(self, x: Array, expert_idx: int) -> Array:
         """Apply the gated linear unit transformation for a specific expert.
 
         Computes SwiGLU-style transformation: (act(x @ w1) * (x @ v1)) @ w2
@@ -572,7 +558,7 @@ class DbrxExpertGLU(nn.Module):
         return x1
 
 
-class DbrxExperts(nn.Module):
+class DbrxExperts(spx.Module):
     """Collection of expert networks for DBRX mixture of experts.
 
     Manages multiple expert networks that can be selected and combined
@@ -594,7 +580,7 @@ class DbrxExperts(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the DbrxExperts module.
 
@@ -603,7 +589,7 @@ class DbrxExperts(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -619,7 +605,7 @@ class DbrxExperts(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         x: Array,
         top_weights: Array,
@@ -647,7 +633,7 @@ class DbrxExperts(nn.Module):
         return final_hidden_state
 
 
-class DbrxRouter(nn.Module):
+class DbrxRouter(spx.Module):
     """Router module for DBRX mixture of experts.
 
     Determines which experts to activate for each input token,
@@ -675,7 +661,7 @@ class DbrxRouter(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the DbrxRouter module.
 
@@ -684,7 +670,7 @@ class DbrxRouter(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -699,7 +685,7 @@ class DbrxRouter(nn.Module):
         self.moe_normalize_expert_weights = self.config.ffn_config.moe_normalize_expert_weights
         self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-        self.layer = nn.Linear(
+        self.layer = ParallelLinear(
             config.hidden_size,
             self.moe_num_experts,
             use_bias=False,
@@ -729,10 +715,10 @@ class DbrxRouter(nn.Module):
             raise RuntimeError("The router does not have moe_jitter_eps set.")
         low = 1.0 - self.moe_jitter_eps
         high = 1.0 + self.moe_jitter_eps
-        noise = jax.random.normal(self.make_rng("params"), x.shape, dtype=x.dtype)
+        noise = jax.random.normal(self.make_rng("parameters"), x.shape, dtype=x.dtype)
         return low + noise * (high - low)
 
-    def __call__(self, x: Array, deterministic: bool = True) -> tuple[Array, Array, Array]:
+    def forward(self, x: Array, deterministic: bool = True) -> tuple[Array, Array, Array]:
         """Route tokens to experts using top-k selection.
 
         Computes routing scores for all experts, selects top-k experts for each token,
@@ -789,7 +775,7 @@ class DbrxRouter(nn.Module):
         return router_logits, top_weights, top_experts
 
 
-class DbrxFFN(nn.Module):
+class DbrxFFN(spx.Module):
     """Feedforward network with mixture of experts for DBRX models.
 
     Combines router and expert networks to implement sparse MoE
@@ -813,7 +799,7 @@ class DbrxFFN(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the DbrxFFN module.
 
@@ -822,7 +808,7 @@ class DbrxFFN(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__()
         self.config = config
@@ -846,7 +832,7 @@ class DbrxFFN(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array) -> tuple[Array, Array]:
+    def forward(self, x: Array) -> tuple[Array, Array]:
         """Forward pass through the MoE feedforward network.
 
         Routes input tokens to selected experts and combines their outputs.
@@ -862,7 +848,7 @@ class DbrxFFN(nn.Module):
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         router_logits, top_weights, top_experts = self.router(x)
         router_logits = checkpoint_name(router_logits, name="moe_router_logits")
@@ -870,12 +856,12 @@ class DbrxFFN(nn.Module):
         out = apply_logical_sharding(
             out,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         return out, router_logits
 
 
-class DbrxBlock(nn.Module):
+class DbrxBlock(spx.Module):
     """Single transformer block for DBRX models.
 
     Integrates attention mechanisms with mixture of experts feedforward
@@ -900,7 +886,7 @@ class DbrxBlock(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize a DBRX decoder block.
@@ -910,7 +896,7 @@ class DbrxBlock(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
         super().__init__()
@@ -939,7 +925,7 @@ class DbrxBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -1027,7 +1013,7 @@ class DbrxModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the DBRX base model.
 
@@ -1036,7 +1022,7 @@ class DbrxModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1062,19 +1048,19 @@ class DbrxModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.blocks = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    layer_idx=i,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.blocks = nn.ModuleList([])
+        for i in range(self.config.n_layers):
+            with spx.assign_stage(total=self.config.n_layers, current=i):
+                self.blocks.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for i in range(self.config.n_layers)
-            ]
-        )
         self.norm_f = LayerNorm(
             self.config.hidden_size,
             use_bias=False,
@@ -1096,7 +1082,7 @@ class DbrxModel(EasyDeLBaseModule):
             base=self.config.attn_config.rope_theta,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -1185,7 +1171,9 @@ class DbrxModel(EasyDeLBaseModule):
             )
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.blocks))
-        for idx, block in enumerate(self.blocks):
+
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             outputs = block(
@@ -1193,25 +1181,32 @@ class DbrxModel(EasyDeLBaseModule):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
-            hidden_states = outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.blocks)
 
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.partition_manager,
+                partition_manager=self.config.runtime_sharding_resolver,
             )
 
             if output_attentions:
                 all_attentions += (outputs.attention_weight,)
             if output_router_logits:
                 all_router_logits += (outputs.router_logits,)
-            past_key_values[idx] = outputs.cache_view
+            self._layer_cache_view_update(None, idx, outputs.cache_view, enabled=True, cache=past_key_values)
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.blocks.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm_f(hidden_states)
 
         if output_hidden_states:
@@ -1224,28 +1219,28 @@ class DbrxModel(EasyDeLBaseModule):
             router_logits=all_router_logits,
         )
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """
         Returns the encoder part of the model's graph definition.
         For DbrxModel (decoder-only), this is not applicable.
         """
         raise NotImplementedError("DbrxModel is a decoder-only model and does not have a separate encoder.")
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """
         Returns the decoder part of the model's graph definition.
         For DbrxModel, this is the model itself.
         """
         return self
 
-    def get_lm_head(self) -> nn.Module:
+    def get_lm_head(self) -> spx.Module:
         """
         Returns the language model head of the module.
         DbrxModel does not include the lm_head.
         """
         raise NotImplementedError("DbrxModel does not include the language model head. See DbrxForCausalLM.")
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """
         Returns the embedding layer of the module.
         """
@@ -1277,7 +1272,7 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignor
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DBRX model for causal language modeling.
 
@@ -1286,7 +1281,7 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignor
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1300,7 +1295,7 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignor
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -1410,7 +1405,7 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize DBRX model for sequence classification.
 
@@ -1419,7 +1414,7 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1434,7 +1429,7 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,

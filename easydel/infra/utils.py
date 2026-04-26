@@ -61,14 +61,14 @@ import jax
 import jax.extend
 import jax.tree_util
 import numpy as np
-from eformer.escale import with_sharding_constraint
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
+from spectrax import nn, with_sharding_constraint
 from tqdm.auto import tqdm
 
 from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig, eLoRA
@@ -78,10 +78,7 @@ from easydel.utils.traversals import flatten_dict, unflatten_dict
 from .errors import EasyDeLBlockWiseFFNError
 from .etils import AVAILABLE_SPARSE_MODULE_TYPES, GRADIENT_CHECKPOINT_TARGETS, EasyDeLGradientCheckPointers
 
-warnings.filterwarnings(
-    "ignore",
-    message="Primitive dynamic_update_slice was not handled by class",
-)
+warnings.filterwarnings("ignore", message="Primitive dynamic_update_slice was not handled by class")
 logger = get_logger(__name__)
 
 _ATTN_CHECKPOINT_NAME_PATTERN = re.compile(r"^attn_")
@@ -119,18 +116,18 @@ def quick_gelu(x):
 
 
 ACT2FN = {
-    "gelu": partial(nn.gelu, approximate=False),
-    "relu": nn.relu,
-    "silu": nn.swish,
-    "swish": nn.swish,
-    "gelu_new": partial(nn.gelu, approximate=True),
-    "gelu_pytorch_tanh": partial(nn.gelu, approximate=True),
-    "tanh": nn.tanh,
-    "sigmoid": nn.sigmoid,
-    "leaky_relu": partial(nn.leaky_relu, negative_slope=0.01),
-    "glu": nn.glu,
-    "elu": nn.elu,
-    "softmax": nn.softmax,
+    "gelu": partial(jax.nn.gelu, approximate=False),
+    "relu": jax.nn.relu,
+    "silu": jax.nn.silu,
+    "swish": jax.nn.silu,
+    "gelu_new": partial(jax.nn.gelu, approximate=True),
+    "gelu_pytorch_tanh": partial(jax.nn.gelu, approximate=True),
+    "tanh": jax.nn.tanh,
+    "sigmoid": jax.nn.sigmoid,
+    "leaky_relu": partial(jax.nn.leaky_relu, negative_slope=0.01),
+    "glu": jax.nn.glu,
+    "elu": jax.nn.elu,
+    "softmax": jax.nn.softmax,
     "quick_gelu": quick_gelu,
 }
 """Registry of activation functions by name.
@@ -416,12 +413,12 @@ def is_flatten(pytree: dict):
 
 
 def quantize_linear_layers(
-    model: nn.Module,
+    model: spx.Module,
     /,
     *,
     quantization_config: QuantizationConfig | None = None,
     verbose: bool = True,
-) -> nn.Module:
+) -> spx.Module:
     """
     Quantize parameters to requested precision, excluding specified layers.
 
@@ -441,14 +438,14 @@ def quantize_linear_layers(
 
 
 def apply_lora_to_layers(
-    model: nn.Module,
+    model: spx.Module,
     /,
     *,
     lora_rank: int,
     lora_pattern: str | None = None,
     verbose: bool = True,
-    rngs: nn.Rngs | None = None,
-) -> nn.Module:
+    rngs: spx.Rngs | None = None,
+) -> spx.Module:
     """Wrap matching ``ParallelLinear`` modules with EasyDeL's LoRA adapter.
 
     Args:
@@ -459,14 +456,14 @@ def apply_lora_to_layers(
             every ``ParallelLinear`` encountered is wrapped.
         verbose: Whether to display a progress bar while traversing modules.
         rngs: Random source used to initialize the LoRA adapter weights. When
-            omitted, ``nn.Rngs(0)`` is used.
+            omitted, ``spx.Rngs(0)`` is used.
 
     Returns:
         The input model after matching layers have been replaced in-place by
         :class:`eLoRA` wrappers.
 
     Notes:
-        The wrapper used here is EasyDeL's ``eLoRA`` instead of Flax's raw
+        The wrapper used here is EasyDeL's ``eLoRA`` instead of SpecTrax's raw
         ``nn.LoRA`` so the adapted layers continue to support EasyDeL-specific
         call conventions such as keyword forwarding and ``native_forward``.
     """
@@ -477,7 +474,7 @@ def apply_lora_to_layers(
     if lora_pattern is None:
         lora_pattern = ".*"
     if rngs is None:
-        rngs = nn.Rngs(0)
+        rngs = spx.Rngs(0)
     pattern = re.compile(lora_pattern)
 
     with tqdm(
@@ -492,13 +489,12 @@ def apply_lora_to_layers(
                     model=model,
                     path=path,
                     new_value=eLoRA(
+                        base_module.in_features,
+                        lora_rank,
+                        base_module.out_features,
                         base_module=base_module,
                         rngs=rngs,
                         dtype=base_module.dtype,
-                        param_dtype=base_module.param_dtype,
-                        in_features=base_module.in_features,
-                        lora_rank=lora_rank,
-                        out_features=base_module.out_features,
                     ),
                 )
             pbar.update(1)
@@ -506,7 +502,7 @@ def apply_lora_to_layers(
     return model
 
 
-def split_lora_params(model: nn.Module) -> tp.Any:
+def split_lora_parameters(model: spx.Module) -> tp.Any:
     """
     get LoRA (Low-Rank Adaptation) from layers within a model.
 
@@ -529,7 +525,7 @@ def split_lora_params(model: nn.Module) -> tp.Any:
     return unflatten_dict(od)
 
 
-def merge_lora_params(model: nn.Module, lora_tree: dict) -> nn.Module:
+def merge_lora_parameters(model: spx.Module, lora_tree: dict) -> spx.Module:
     """
     get LoRA (Low-Rank Adaptation) from layers within a model.
 
@@ -555,11 +551,11 @@ def merge_lora_params(model: nn.Module, lora_tree: dict) -> nn.Module:
 
 
 def unwrap_lora_to_layers(
-    model: nn.Module,
+    model: spx.Module,
     /,
     *,
     verbose: bool = True,
-) -> nn.Module:
+) -> spx.Module:
     """
     UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model.
     """
@@ -574,8 +570,8 @@ def unwrap_lora_to_layers(
         for path, _ in iter_module_search(model, nn.LoRA):
             base_module: nn.LoRA = get_module_from_path(model=model, path=path)
             with jax.default_matmul_precision("float32"):
-                base_module.base_module.kernel.value = (
-                    base_module.base_module.kernel.value + base_module.lora_a.value @ base_module.lora_b.value
+                base_module.base_module.weight.value = (
+                    base_module.base_module.weight.value + base_module.lora_a.value @ base_module.lora_b.value
                 )
             del base_module.lora_a, base_module.lora_b
             set_module_from_path(
@@ -622,7 +618,7 @@ def apply_sparsity_to_params(
 
     def filter_params(path, array):
         layer_name = _path_to_str(path)
-        if layer_name.endswith("kernel") and 4 > array.ndim > 1:
+        if layer_name.endswith("weight") and 4 > array.ndim > 1:
             array = sparser.fromdense(array)
         return array
 
@@ -666,8 +662,13 @@ def extract_static_parameters(module):
         "output_router_logits",
         "mode",
     ]
-    obj = getattr(module, "__call__", None)  # noqa
-    if isinstance(obj, (types.FunctionType, types.MethodType)):
+    obj = None
+    for candidate_name in ("forward", "__call__"):
+        candidate = getattr(module, candidate_name, None)
+        if isinstance(candidate, (types.FunctionType, types.MethodType)):
+            obj = candidate
+            break
+    if obj is not None:
         static_args = ()
         try:
             # Avoid inspect.unwrap() here; decorated callables can have cyclic
@@ -682,7 +683,7 @@ def extract_static_parameters(module):
     return None
 
 
-M = tp.TypeVar("M", bound=nn.Module)
+M = tp.TypeVar("M", bound=spx.Module)
 
 
 @tp.overload
@@ -729,7 +730,7 @@ def auto_remat(
 ) -> type[M] | tuple[type[M], ...]:
     """Apply gradient checkpointing (rematerialization) to module(s).
 
-    Wraps module __call__ methods with JAX's remat (rematerialization) to trade
+    Wraps module ``forward`` methods with JAX's remat (rematerialization) to trade
     compute for memory during training. Supports fine-grained control via
     checkpoint_name annotations added to models.
 
@@ -784,8 +785,8 @@ def auto_remat(
 
     outs = ()
     for module in modules:
-        assert issubclass(module, nn.Module)
-        if getattr(module.__call__, "_easydel_auto_remat_wrapped", False):
+        assert issubclass(module, spx.Module)
+        if getattr(module.forward, "_easydel_auto_remat_wrapped", False):
             outs += (module,)
             continue
 
@@ -793,14 +794,14 @@ def auto_remat(
         if static_argnums is None:
             static_argnums = ()
 
-        rematted_call = nn.remat(
-            f=module.__call__,
+        rematted_forward = spx.remat(
+            fn=module.forward,
             prevent_cse=prevent_cse,
-            static_argnums=static_argnums,
             policy=policy,
+            mutable=["rng"],
         )
-        setattr(rematted_call, "_easydel_auto_remat_wrapped", True)  # noqa
-        module.__call__ = rematted_call
+        setattr(rematted_forward, "_easydel_auto_remat_wrapped", True)  # noqa
+        module.forward = rematted_forward
 
         outs += (module,)
 
@@ -1663,16 +1664,19 @@ def trace_functions():
         tracer.new_executables = [TraceResult(exe) for exe in new]
 
 
-class ModuleCaches(nn.Cache):
+class ModuleCaches(spx.Buffer):
     """Cache container for module-level cached values.
 
-    Extends flax.nnx.Cache to provide caching functionality for
-    EasyDeL modules, particularly for caching computed values like
+    Uses spectrax.Buffer with kind="cache" to provide caching functionality
+    for EasyDeL modules, particularly for caching computed values like
     frequencies, masks, and other reusable tensors.
     """
 
+    def __init__(self, value, **kwargs):
+        super().__init__(value, kind="cache", **kwargs)
 
-class OverWriteWithGradient(nn.Param):
+
+class OverWriteWithGradient(spx.Parameter):
     """Parameter type that allows gradient overwrites.
 
     Special parameter container that permits gradients to directly
@@ -1685,13 +1689,20 @@ class hashable_dict(dict):
     __hash__ = hash_fn
 
 
-class ArrayParam(nn.Param):
+class ArrayParam(spx.Parameter):
     """Parameterized array with serializable initialization.
 
     A parameter container that stores initialization metadata (method name
     and kwargs) as strings/dicts instead of functions, making it pickleable
     and serializable. This is particularly useful for checkpointing and
     distributed training.
+
+    Use ``ArrayParam.bound(...)`` for any parameter that should round-trip
+    through checkpoints — the init metadata travels with the parameter so
+    it can be re-materialized lazily. Reach for raw ``spx.Parameter`` only
+    when the value is computed at construction time and you do not need
+    init-method introspection (e.g. all-zero biases, hand-rolled state in
+    linear-attention/SSM modules).
 
     Attributes:
         shape: The shape of the parameter array.
@@ -1705,6 +1716,34 @@ class ArrayParam(nn.Param):
     init_method: str = "normal"
     init_kwargs: hashable_dict | None = None
 
+    def __init__(
+        self,
+        value: Array,
+        *,
+        shape: Sequence[int] | None = None,
+        dtype: DTypeLike | None = None,
+        init_method: str = "normal",
+        init_kwargs: hashable_dict | None = None,
+        sharding: spx.Sharding | tuple[object | None, ...] | None = None,
+        axis_names: tuple[object | None, ...] | None = None,
+        **kwargs,
+    ):
+        if init_kwargs is None:
+            init_kwargs = hashable_dict()
+        elif not isinstance(init_kwargs, hashable_dict):
+            init_kwargs = hashable_dict(init_kwargs)
+        kwargs.pop("use_ref", None)
+        meta = kwargs.pop("metadata", {}) or {}
+        meta.update(
+            {
+                "shape": tuple(shape) if shape is not None else tuple(value.shape),
+                "dtype": jnp.dtype(dtype) if dtype is not None else value.dtype,
+                "init_method": init_method,
+                "init_kwargs": init_kwargs,
+            }
+        )
+        super().__init__(value, metadata=meta, sharding=sharding, axis_names=axis_names, **kwargs)
+
     @classmethod
     def bound(
         cls,
@@ -1716,6 +1755,8 @@ class ArrayParam(nn.Param):
         key: PRNGKeyArray | None = None,
         value: Array | None = None,
         use_ref: bool | None = None,
+        sharding: spx.Sharding | tuple[object | None, ...] | None = None,
+        axis_names: tuple[object | None, ...] | None = None,
         **metadata,
     ):
         """Create an ArrayParam with initialized value.
@@ -1747,12 +1788,14 @@ class ArrayParam(nn.Param):
         if value is None:
             value = init_fn(key, shape, dtype)
         return cls(
+            value=value,
             shape=shape,
             dtype=dtype,
             init_method=init_method,
             init_kwargs=init_kwargs,
-            value=value,
             use_ref=use_ref,
+            sharding=sharding,
+            axis_names=axis_names,
             **metadata,
         )
 
@@ -1794,51 +1837,10 @@ else:
     ProcessingClassType = tp.Any
 
 
-def mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
-    """Return shard multiplicity implied by a PartitionSpec entry."""
-    if axis_spec is None:
-        return 1
-    if isinstance(axis_spec, (tuple, list)):
-        product = 1
-        for axis_name in axis_spec:
-            if axis_name is None:
-                continue
-            try:
-                product *= int(mesh.shape[str(axis_name)])
-            except Exception:
-                product *= 1
-        return int(product)
-    try:
-        return int(mesh.shape[str(axis_spec)])
-    except Exception:
-        return 1
-
-
-def sanitize_partition_spec_for_shape(
-    spec: PartitionSpec,
-    shape: tuple[int, ...],
-    mesh: Mesh,
-) -> PartitionSpec:
-    """Drop non-divisible sharding axes for a concrete tensor shape."""
-    axes = list(tuple(spec))
-    changed = False
-    ndim = len(shape)
-
-    if len(axes) > ndim:
-        axes = axes[:ndim]
-        changed = True
-
-    for dim_index, axis_spec in enumerate(axes):
-        if axis_spec is None:
-            continue
-        shard_factor = mesh_partition_product(mesh, axis_spec)
-        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
-            axes[dim_index] = None
-            changed = True
-
-    if not changed:
-        return spec
-    return PartitionSpec(*axes)
+# Canonical implementation lives in `easydel.infra.sharding`. This re-export
+# preserves the `from easydel.infra.utils import sanitize_partition_spec_for_shape`
+# import path used by `base_module.py` and `base_state.py`.
+from .sharding import sanitize_partition_spec_for_shape  # noqa: E402
 
 
 def sanitize_partition_specs_for_shape_tree(
@@ -1868,26 +1870,63 @@ def sanitize_partition_specs_for_shape_tree(
     return unflatten_dict(flat_specs), adjusted
 
 
+def device_put_or_shard_abstract(leaf: tp.Any, sharding: tp.Any) -> tp.Any:
+    """Place concrete leaves, or attach sharding to abstract shape leaves.
+
+    ``jax.ShapeDtypeStruct`` is metadata used by lazy/abstract loading paths.
+    It is not a valid value for :func:`jax.device_put`, but it can carry the
+    same sharding annotation directly so later materialization knows the
+    intended placement.
+    """
+    if isinstance(leaf, jax.ShapeDtypeStruct):
+        kwargs = {
+            "sharding": sharding,
+            "weak_type": getattr(leaf, "weak_type", False),
+        }
+        if hasattr(leaf, "manual_axis_type"):
+            kwargs["manual_axis_type"] = leaf.manual_axis_type
+        if hasattr(leaf, "is_ref"):
+            kwargs["is_ref"] = leaf.is_ref
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, **kwargs)
+    return jax.device_put(leaf, sharding)
+
+
 def materialize_meta_leaves(tree: tp.Any, *, seed: int = 0) -> tp.Any:
     """Replace ShapeDtypeStruct placeholder leaves with concrete values."""
+    import spectrax as spx
+
+    if isinstance(tree, spx.State):
+        changed = False
+        rng = jax.random.PRNGKey(seed)
+
+        new_data: dict[str, dict[str, tp.Any]] = {}
+        for collection, path, value in tree.items():
+            if isinstance(value, jax.ShapeDtypeStruct):
+                if collection == "rng":
+                    value = rng
+                    rng, _ = jax.random.split(rng)
+                else:
+                    value = jnp.zeros(value.shape, dtype=value.dtype)
+                changed = True
+            new_data.setdefault(collection, {})[path] = value
+
+        if not changed:
+            return tree
+        return spx.State(new_data)
+
+    # Fallback for regular dict trees (legacy path).
     flat_tree = flatten_dict(tree)
     changed = False
     rng = jax.random.PRNGKey(seed)
-    count = 0
 
     for leaf in flat_tree.values():
         value = getattr(leaf, "value", None)
         if not isinstance(value, jax.ShapeDtypeStruct):
             continue
-        leaf_type = type(leaf)
-        if issubclass(leaf_type, nn.RngCount):
-            leaf.value = jnp.asarray(count, dtype=value.dtype)
-            count += 1
-        elif issubclass(leaf_type, nn.RngKey):
-            leaf.value = rng
-            rng, _ = jax.random.split(rng)
-        else:
-            leaf.value = jnp.zeros(value.shape, dtype=value.dtype)
+        # Spectrax does not use RngCount / RngKey objects; rng leaves are
+        # plain uint32 arrays in the ``rng`` collection.  If we encounter
+        # a ShapeDtypeStruct in a generic dict tree, zero-fill it.
+        leaf.value = jnp.zeros(value.shape, dtype=value.dtype)
         changed = True
 
     if not changed:

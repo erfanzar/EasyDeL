@@ -1,6 +1,6 @@
 # EasyDeL Whisper API Server
 
-The EasyDeL Whisper API Server provides an API compatible with OpenAI's Whisper API for audio transcription and translation. This allows you to run your own Whisper service using JAX/Flax via EasyDeL.
+The EasyDeL Whisper API Server provides an API compatible with OpenAI's Whisper API for audio transcription and translation. This allows you to run your own Whisper service using JAX/SpecTrax via EasyDeL.
 
 ## Installation
 

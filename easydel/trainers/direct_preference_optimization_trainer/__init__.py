@@ -30,7 +30,7 @@ Key Features:
 - Support for encoder-decoder and decoder-only architectures
 - Gradient accumulation and mixed precision training
 - Precomputed reference model log probabilities for efficiency
-- Integration with JAX/Flax for distributed training
+- Integration with JAX/spectrax for distributed training
 
 Example:
     >>> from easydel.trainers import DPOConfig, DPOTrainer

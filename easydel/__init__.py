@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-"""EasyDeL: JAX/Flax library for training and serving large language models.
+"""EasyDeL: JAX/spectrax library for training and serving large language models.
 
 Provides lazy-loaded access to all EasyDeL modules, model implementations,
 trainers, inference engines, and utilities. Configures default environment
@@ -28,7 +28,7 @@ to load on newer Transformers versions or in environments lacking
 optional dependencies (e.g. ``deepspeed``).
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import os as _os
 import pickle as _pickle
@@ -55,6 +55,32 @@ from .utils import check_bool_flag as _check_bool_flag
 from .utils import is_package_available as _is_package_available
 
 _logger = _get_logger("EasyDeL")
+
+
+def _patch_removed_jax_config_flags() -> None:
+    """Ignore config flags that older dependencies may set on newer JAX."""
+    try:
+        import jax as _jax
+    except Exception:
+        return
+
+    config = getattr(_jax, "config", None)
+    update = getattr(config, "update", None)
+    if update is None or getattr(update, "_easydel_removed_flag_patch", False):
+        return
+
+    removed_flags = {"jax_pmap_shmap_merge"}
+
+    def _patched_update(name, value):
+        if name in removed_flags:
+            return None
+        return update(name, value)
+
+    _patched_update._easydel_removed_flag_patch = True  # type: ignore[attr-defined]
+    config.update = _patched_update
+
+
+_patch_removed_jax_config_flags()
 
 
 def _ensure_optional_deepspeed_stub() -> None:
@@ -410,8 +436,8 @@ _import_structure = {
         "auto_pytree",
         "eLargeModel",
         "BenchmarkConfig",
-        "escale",
         "init_cluster",
+        "sharding",
     ],
     "infra.errors": [
         "EasyDeLRuntimeError",
@@ -1049,8 +1075,8 @@ if _tp.TYPE_CHECKING:
         Rngs,
         auto_pytree,
         eLargeModel,
-        escale,
         init_cluster,
+        sharding,
     )
     from .infra.errors import EasyDeLRuntimeError, EasyDeLSyntaxRuntimeError, EasyDeLTimerError
     from .infra.etils import (

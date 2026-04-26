@@ -74,7 +74,7 @@ class TestFalconMamba:
         from tests.modules.test_utils.model_factory import create_ed_model_only, setup_config
 
         config = setup_config(falcon_mamba_config, small_model_config)
-        config.sharding_axis_dims = (1, 1, -1, 1, 1)
+        config.sharding_axis_dims = (1, 1, -1, 1, 1, 1)
 
         with config.mesh:
             ed_model = create_ed_model_only(

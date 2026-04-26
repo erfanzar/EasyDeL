@@ -31,13 +31,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -59,7 +57,7 @@ from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from .gidd_configuration import GiddConfig
 
 
-class GiddMLP(nn.Module):
+class GiddMLP(spx.Module):
     """Multi-Layer Perceptron module for GIDD models.
 
     Implements the feedforward network with squared ReLU activation function
@@ -73,7 +71,7 @@ class GiddMLP(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GIDD MLP block.
 
@@ -83,7 +81,7 @@ class GiddMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -114,7 +112,7 @@ class GiddMLP(nn.Module):
         self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
 
-    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
+    def forward(self, h: jnp.ndarray) -> jnp.ndarray:
         """Apply squared ReLU feedforward transformation.
 
         Args:
@@ -126,7 +124,7 @@ class GiddMLP(nn.Module):
         h = apply_logical_sharding(
             h,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         h = checkpoint_name(self.up_proj(h), name="mlp_up")
@@ -137,7 +135,7 @@ class GiddMLP(nn.Module):
         h = apply_logical_sharding(
             h,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return h
@@ -156,7 +154,7 @@ class GiddAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GIDD attention layer with optional query-key normalization.
 
@@ -165,7 +163,7 @@ class GiddAttention(AttentionModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -192,7 +190,7 @@ class GiddAttention(AttentionModule):
                 shape=(1, 1, self.config.num_attention_heads, 1),
                 dtype=self.param_dtype,
                 init_method="zeros",
-                key=rngs.params(),
+                key=rngs.parameters,
                 value=qk_scale_value,
             )
         else:
@@ -248,12 +246,7 @@ class GiddAttention(AttentionModule):
             dropout_prob=0.0,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        if isinstance(self.qk_scale, ArrayParam):
-            return {"qk_scale": Replicated}
-        return {}
-
-    @jax.named_scope("gidd-flax-attention-concatenate")
+    @jax.named_scope("gidd-SpecTrax-attention-concatenate")
     def concatenate(
         self,
         *,
@@ -331,7 +324,7 @@ class GiddAttention(AttentionModule):
         """
         return x * jax.lax.rsqrt(jnp.square(x).sum(-1, keepdims=True) + self.qk_norm_eps)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -446,13 +439,13 @@ class GiddAttention(AttentionModule):
         )
 
 
-class GiddRMSNorm(nn.Module):
+class GiddRMSNorm(spx.Module):
     """Root Mean Square Layer Normalization for GIDD models.
 
     A simplified variant of LayerNorm that normalizes by RMS value with learnable scale.
     """
 
-    kernel_init = staticmethod(nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
         self,
@@ -471,14 +464,14 @@ class GiddRMSNorm(nn.Module):
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.kernel = ArrayParam.bound(
+        self.weight = ArrayParam.bound(
             shape=(self.config.hidden_size,),
             dtype=param_dtype,
             init_method="zeros",
             key=None,
         )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply RMSNorm to the input tensor.
@@ -495,10 +488,10 @@ class GiddRMSNorm(nn.Module):
 
         # Normalize and apply scale
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        return (1 + self.kernel.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
+        return (1 + self.weight.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
 
 
-class GiddLayer(nn.Module):
+class GiddLayer(spx.Module):
     """Single transformer layer for GIDD models.
 
     Combines multi-head attention and feedforward networks with
@@ -512,7 +505,7 @@ class GiddLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         resid_scale: float = 1.0,
     ):
         """Initialize GIDD transformer layer.
@@ -522,7 +515,7 @@ class GiddLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
             resid_scale (float, optional): Scaling factor for residual connections. Defaults to 1.0.
         """
         self.config = config
@@ -548,7 +541,7 @@ class GiddLayer(nn.Module):
         self.input_layernorm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
         self.post_attention_layernorm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -610,7 +603,7 @@ class GiddLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -641,7 +634,7 @@ class GiddModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GIDD base model.
 
@@ -650,7 +643,7 @@ class GiddModel(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -678,23 +671,23 @@ class GiddModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                    resid_scale=self.resid_scale,
+        self.layers = nn.ModuleList([])
+        for _ in range(self.config.num_hidden_layers):
+            with spx.assign_stage(total=self.config.num_hidden_layers, current=_):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                        resid_scale=self.resid_scale,
+                    )
                 )
-                for _ in range(self.config.num_hidden_layers)
-            ]
-        )
 
         self.norm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -794,10 +787,11 @@ class GiddModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -807,19 +801,26 @@ class GiddModel(EasyDeLBaseModule):
                 position_ids=position_ids,
                 noise_mask=noise_mask,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=True,
+        )
         # Apply final normalization
         hidden_states = self.norm(hidden_states)
 
@@ -891,7 +892,7 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize GIDD model for diffusion language modeling.
 
@@ -900,7 +901,7 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (nn.Rngs): Random number generator state.
+            rngs (spx.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -931,7 +932,7 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -999,7 +1000,7 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         # Apply language modeling head if requested

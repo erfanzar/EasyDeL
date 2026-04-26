@@ -14,14 +14,13 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.caching import (
     HybridCache,
@@ -89,7 +88,7 @@ class AyaVisionCausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-class AyaVisionMultiModalProjector(nn.Module):
+class AyaVisionMultiModalProjector(spx.Module):
     """Multi-modal projector module for AyaVision models.
 
     Transforms vision encoder outputs to the language model's hidden dimension
@@ -105,7 +104,7 @@ class AyaVisionMultiModalProjector(nn.Module):
         dtype (jnp.dtype): Data type for computation (e.g., jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for parameters (e.g., jnp.bfloat16).
         precision (jax.lax.PrecisionLike): JAX precision level for matrix operations.
-        rngs (nn.Rngs): Random number generators for parameter initialization.
+        rngs (spx.Rngs): Random number generators for parameter initialization.
         downsample_factor (int): Factor by which to reduce spatial dimensions.
         alignment_intermediate_size (int): Intermediate projection dimension.
     """
@@ -117,7 +116,7 @@ class AyaVisionMultiModalProjector(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the AyaVisionMultiModalProjector.
 
@@ -127,7 +126,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             param_dtype (jnp.dtype): Parameter storage dtype for weights. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): JAX matmul precision setting (e.g., jax.lax.Precision.DEFAULT).
                 None uses default precision.
-            rngs (nn.Rngs): Flax NNX random number generators for parameter initialization.
+            rngs (spx.Rngs): spectrax random number generators for parameter initialization.
         """
         self.config = config
         self.dtype = dtype
@@ -154,7 +153,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             config.vision_config.hidden_size * (config.downsample_factor**2),
             self.alignment_intermediate_size,
             use_bias=True,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
             param_dtype=param_dtype,
             dtype=dtype,
             precision=precision,
@@ -166,14 +165,14 @@ class AyaVisionMultiModalProjector(nn.Module):
             self.alignment_intermediate_size // 2,
             config.get_text_config().hidden_size,
             use_bias=True,
-            kernel_init=nn.initializers.normal(0.02),
+            kernel_init=jax.nn.initializers.normal(0.02),
             param_dtype=param_dtype,
             dtype=dtype,
             precision=precision,
             rngs=rngs,
         )
 
-    def __call__(self, image_features: jax.Array) -> jax.Array:
+    def forward(self, image_features: jax.Array) -> jax.Array:
         """Forward pass through the projector.
 
         Applies pixel shuffling for spatial downsampling, layer normalization, and gated
@@ -281,7 +280,7 @@ class AyaVisionModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the AyaVisionModel (base model without LM head).
 
@@ -290,7 +289,7 @@ class AyaVisionModel(EasyDeLBaseModule):
             dtype (jnp.dtype): Computation dtype for activations. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype): Parameter storage dtype for weights. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): JAX matmul precision. Defaults to None (uses default precision).
-            rngs (nn.Rngs): Flax NNX random number generators for initializing all submodules.
+            rngs (spx.Rngs): spectrax random number generators for initializing all submodules.
         """
         super().__init__(
             config=config,
@@ -408,7 +407,7 @@ class AyaVisionModel(EasyDeLBaseModule):
 
         return inputs_embeds
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -593,29 +592,29 @@ class AyaVisionModel(EasyDeLBaseModule):
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
 
-    def get_encoder(self) -> nn.Module:
+    def get_encoder(self) -> spx.Module:
         """Return the encoder component of the model.
 
         In this multimodal architecture, the vision tower (SigLIP) serves as
         the encoder, processing images into feature representations.
 
         Returns:
-            nn.Module: The vision tower module (SigLIP vision encoder).
+            spx.Module: The vision tower module (SigLIP vision encoder).
         """
         return self.vision_tower
 
-    def get_decoder(self) -> nn.Module:
+    def get_decoder(self) -> spx.Module:
         """Return the decoder component of the model.
 
         The Cohere2 language model serves as the decoder, processing the
         combined vision-text embeddings autoregressively.
 
         Returns:
-            nn.Module: The language model module (Cohere2).
+            spx.Module: The language model module (Cohere2).
         """
         return self.language_model
 
-    def get_lm_head(self) -> nn.Module:
+    def get_lm_head(self) -> spx.Module:
         """Return the language modeling head.
 
         Delegates to the underlying language model's LM head. Note that
@@ -623,18 +622,18 @@ class AyaVisionModel(EasyDeLBaseModule):
         AyaVisionForConditionalGeneration.
 
         Returns:
-            nn.Module: The language modeling head from the underlying Cohere2 model.
+            spx.Module: The language modeling head from the underlying Cohere2 model.
         """
         return self.language_model.get_lm_head()
 
-    def get_embedding(self) -> nn.Module:
+    def get_embedding(self) -> spx.Module:
         """Return the token embedding layer.
 
         Returns the embedding layer from the underlying language model
         used to convert token IDs to dense vectors.
 
         Returns:
-            nn.Module: The token embedding layer from the Cohere2 model.
+            spx.Module: The token embedding layer from the Cohere2 model.
         """
         return self.language_model.get_embedding()
 
@@ -696,7 +695,7 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initializes the AyaVisionForConditionalGeneration model with LM head.
 
@@ -705,7 +704,7 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
             dtype (jnp.dtype): Computation dtype for activations. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype): Parameter storage dtype for weights. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): JAX matmul precision. Defaults to None (uses default precision).
-            rngs (nn.Rngs): Flax NNX random number generators for initializing all submodules.
+            rngs (spx.Rngs): spectrax random number generators for initializing all submodules.
         """
         super().__init__(
             config=config,
@@ -769,7 +768,7 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: Array | None = None,
@@ -862,7 +861,7 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         lm_logits = None
@@ -920,34 +919,34 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         """
         return self.lm_head(hidden_states)
 
-    def get_vision_tower(self) -> nn.Module:
+    def get_vision_tower(self) -> spx.Module:
         """Return the vision encoder component.
 
         Provides access to the SigLIP vision tower for image feature extraction.
 
         Returns:
-            nn.Module: The SigLIP vision encoder module.
+            spx.Module: The SigLIP vision encoder module.
         """
         return self.base_model.vision_tower
 
-    def get_projector(self) -> nn.Module:
+    def get_projector(self) -> spx.Module:
         """Return the multimodal projector component.
 
         Provides access to the pixel-shuffle based projector that aligns
         vision features to the language model's hidden dimension.
 
         Returns:
-            nn.Module: The AyaVisionMultiModalProjector module.
+            spx.Module: The AyaVisionMultiModalProjector module.
         """
         return self.base_model.multi_modal_projector
 
-    def get_language_model(self) -> nn.Module:
+    def get_language_model(self) -> spx.Module:
         """Return the language model component.
 
         Provides access to the underlying Cohere2 language model for
         text generation and hidden state computation.
 
         Returns:
-            nn.Module: The Cohere2 language model module.
+            spx.Module: The Cohere2 language model module.
         """
         return self.base_model.language_model

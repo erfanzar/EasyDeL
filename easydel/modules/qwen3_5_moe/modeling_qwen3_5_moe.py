@@ -16,8 +16,8 @@
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import common_types
 
 from easydel.caching import (
     HybridCache,
@@ -79,7 +79,7 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3.5-MoE text causal LM.
 
@@ -129,7 +129,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3.5-MoE multimodal model with vision encoder and MoE text decoder.
 
@@ -206,7 +206,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: jax.Array | None = None,
         inputs_embeds: jax.Array | None = None,
@@ -349,7 +349,7 @@ class Qwen3_5MoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5MoeMode
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize Qwen3.5 MoE vision-language model for conditional generation.
 

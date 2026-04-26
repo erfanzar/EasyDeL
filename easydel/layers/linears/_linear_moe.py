@@ -38,7 +38,8 @@ with per-expert weight shards using grouped matmul kernels.
 Example Workflow:
     >>> # Complete MoE FFN example with row/column parallelism
     >>> from easydel.layers import ColumnParallelMoELinear, RowParallelMoELinear
-    >>> from flax import nnx as nn
+    >>> import spectrax as spx
+from spectrax import nn
     >>>
     >>> # Column-parallel layers (W_i and W_u)
     >>> wi_layer = ColumnParallelMoELinear(8, 768, 3072, rngs=rngs)
@@ -58,14 +59,22 @@ from __future__ import annotations
 
 import typing
 
-from eformer import common_types
-from eformer.escale import PartitionManager
+import jax
+import spectrax as spx
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
-from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
+from spectrax import common_types
+
+from easydel.infra.sharding import RuntimeShardingResolver, TensorLayout, sharding_for_layout
+
+
+def promote_dtype(values, *, dtype=None):
+    if dtype is None:
+        return values
+    return tuple(jnp.asarray(v, dtype=dtype) for v in values)
+
 
 if typing.TYPE_CHECKING:
     pass
@@ -82,77 +91,95 @@ TP = common_types.TP
 SP = common_types.SP
 
 
-default_kernel_init = nn.initializers.lecun_normal()
-default_bias_init = nn.initializers.zeros
-Initializer = nn.initializers.Initializer
+default_kernel_init = jax.nn.initializers.lecun_normal()
+default_bias_init = jax.nn.initializers.zeros
+Initializer = jax.nn.initializers.Initializer
 
 
-class ParallelMoELinear(nn.Module):
+def _moe_parameter_layout(
+    *,
+    direction: typing.Literal["row", "column"] | None,
+    use_expert_tensor_mode: bool,
+    is_bias: bool = False,
+) -> TensorLayout | None:
+    if direction is None:
+        return None
+    if use_expert_tensor_mode:
+        return TensorLayout((TP, None) if is_bias else (TP, None, None))
+    if is_bias:
+        return TensorLayout((EP, TP))
+    if direction == "column":
+        return TensorLayout((EP, None, TP))
+    return TensorLayout((EP, TP, None))
+
+
+class ParallelMoELinear(spx.Module):
     """A batched linear transformation layer for Mixture of Experts (MoE) models.
 
-    This layer applies separate linear transformations for each expert in a MoE setup.
-    The inputs are assumed to be sorted and grouped by expert, with `group_sizes`
-    specifying how many tokens belong to each expert. It supports:
-    - **Ragged Matrix Multiplication** via `jax.lax.ragged_dot_general`.
-    - **Grouped Matrix Multiplication (GMM)** via a Pallas kernel for TPUs.
+        This layer applies separate linear transformations for each expert in a MoE setup.
+        The inputs are assumed to be sorted and grouped by expert, with `group_sizes`
+        specifying how many tokens belong to each expert. It supports:
+        - **Ragged Matrix Multiplication** via `jax.lax.ragged_dot_general`.
+        - **Grouped Matrix Multiplication (GMM)** via a Pallas kernel for TPUs.
 
-    Can optionally integrate with a `PartitionManager` to shard parameters and
-    use `shard_map` for distributed execution.
+        Can optionally integrate with a runtime sharding resolver to shard parameters and
+        use `shard_map` for distributed execution.
 
-    **Distributed Execution:**
+        **Distributed Execution:**
 
-        This layer supports multiple parallelism strategies:
+            This layer supports multiple parallelism strategies:
 
-        - **Expert Parallelism (EP)**: Partition experts across devices on the expert axis
-        - **Tensor Parallelism (TP)**: Partition weight matrices within each expert
-        - **Data Parallelism (DP)**: Replicate across data batches
-        - **Row/Column Parallelism**: Control which dimension is partitioned (input vs output)
+            - **Expert Parallelism (EP)**: Partition experts across devices on the expert axis
+            - **Tensor Parallelism (TP)**: Partition weight matrices within each expert
+            - **Data Parallelism (DP)**: Replicate across data batches
+            - **Row/Column Parallelism**: Control which dimension is partitioned (input vs output)
 
-        The sharding strategy is controlled by:
-        1. `direction`: "row" or "column" determines which dimension is partitioned
-        2. `use_expert_tensor_mode`: Whether experts are on TP axis (True) or EP axis (False)
-        3. `partition_manager`: Provides mesh and axis resolution for sharding
+            The sharding strategy is controlled by:
+            1. `direction`: "row" or "column" determines which dimension is partitioned
+            2. `use_expert_tensor_mode`: Whether experts are on TP axis (True) or EP axis (False)
+            3. `runtime_sharding_resolver`: Provides mesh and axis resolution for sharding
 
-    Attributes:
-        num_experts: Number of experts.
-        in_features: Input feature dimension.
-        out_features: Output feature dimension.
-        out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
-            otherwise `(num_experts, in_features, out_features)`.
-        dtype: Data type for computation. None means inherits from inputs.
-        param_dtype: Data type for parameters (weights, biases).
-        kernel_init: Initializer function for the kernel weights.
-        bias_init: Initializer function for the bias.
-        kernel: Weight matrix parameter for the transformation.
-            Shape: (num_experts, out_features, in_features) if out_first else
-            (num_experts, in_features, out_features).
-        bias: Optional bias parameter. Shape: (num_experts, out_features) if out_first
-            else (num_experts, in_features). None if use_bias=False.
-        partition_manager: Handles sharding of parameters for distributed execution.
-        _direction: Sharding direction for ALT sharding ("row", "column", or None).
+        Attributes:
+            num_experts: Number of experts.
+            in_features: Input feature dimension.
+            out_features: Output feature dimension.
+            out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
+                otherwise `(num_experts, in_features, out_features)`.
+            dtype: Data type for computation. None means inherits from inputs.
+            param_dtype: Data type for parameters (weights, biases).
+            kernel_init: Initializer function for the kernel weights.
+            bias_init: Initializer function for the bias.
+            kernel: Weight matrix parameter for the transformation.
+                Shape: (num_experts, out_features, in_features) if out_first else
+                (num_experts, in_features, out_features).
+            bias: Optional bias parameter. Shape: (num_experts, out_features) if out_first
+                else (num_experts, in_features). None if use_bias=False.
+            runtime_sharding_resolver: Handles sharding metadata for distributed execution.
+            _direction: Sharding direction for ALT sharding ("row", "column", or None).
 
 
-    Example:
-        >>> from easydel.layers import ParallelMoELinear
-        >>> from flax import nnx as nn
-        >>>
-        >>> # Create a column-parallel MoE linear layer
-        >>> layer = ParallelMoELinear(
-        ...     num_experts=8,
-        ...     in_features=768,
-        ...     out_features=3072,
-        ...     direction="column",
-        ...     rngs=rngs
-        ... )
-        >>>
-        >>> # Inputs are sorted tokens grouped by expert
-        >>> sorted_tokens = jnp.ones((1024, 768))  # 1024 tokens, 768 features
-        >>> group_sizes = jnp.array([128, 132, 125, 130, 127, 129, 126, 127])  # per expert
-        >>> sorted_experts = jnp.repeat(jnp.arange(8), group_sizes)
-        >>>
-        >>> # Apply expert FFN
-        >>> output = layer(sorted_tokens, group_sizes, sorted_experts)
-        >>> # output.shape = (1024, 3072)
+        Example:
+            >>> from easydel.layers import ParallelMoELinear
+            >>> import spectrax as spx
+    from spectrax import nn
+            >>>
+            >>> # Create a column-parallel MoE linear layer
+            >>> layer = ParallelMoELinear(
+            ...     num_experts=8,
+            ...     in_features=768,
+            ...     out_features=3072,
+            ...     direction="column",
+            ...     rngs=rngs
+            ... )
+            >>>
+            >>> # Inputs are sorted tokens grouped by expert
+            >>> sorted_tokens = jnp.ones((1024, 768))  # 1024 tokens, 768 features
+            >>> group_sizes = jnp.array([128, 132, 125, 130, 127, 129, 126, 127])  # per expert
+            >>> sorted_experts = jnp.repeat(jnp.arange(8), group_sizes)
+            >>>
+            >>> # Apply expert FFN
+            >>> output = layer(sorted_tokens, group_sizes, sorted_experts)
+            >>> # output.shape = (1024, 3072)
     """
 
     _direction: typing.Literal["row", "column"] | None = None
@@ -169,11 +196,12 @@ class ParallelMoELinear(nn.Module):
         bias_init: Initializer = default_bias_init,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        partition_manager: PartitionManager | None = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
+        partition_manager: RuntimeShardingResolver | None = None,
         direction: typing.Literal["row", "column"] | None = None,
         use_expert_tensor_mode: bool = False,
         weight_modif_fn: typing.Callable[[Array], Array] | None = None,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize a ParallelMoELinear layer.
 
@@ -196,9 +224,12 @@ class ParallelMoELinear(nn.Module):
             dtype: Data type for computation. Defaults to jnp.bfloat16.
             param_dtype: Data type for parameters (weights, biases).
                 Defaults to jnp.bfloat16.
-            partition_manager: Partition manager for parameter sharding and mapping.
+            runtime_sharding_resolver: Runtime sharding resolver for parameter
+                placement and axis mapping.
                 When provided, enables distributed execution with shard_map.
                 Defaults to None.
+            partition_manager: Deprecated compatibility alias for
+                ``runtime_sharding_resolver``.
             direction: ALT-sharding direction, either `"row"`, `"column"`, or None.
                 - "row": Input features are partitioned across TP axis
                 - "column": Output features are partitioned across TP axis
@@ -218,7 +249,9 @@ class ParallelMoELinear(nn.Module):
         self.out_first = out_first
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.partition_manager = partition_manager
+        self.runtime_sharding_resolver = (
+            runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager
+        )
         self.use_expert_tensor_mode = use_expert_tensor_mode
 
         self.kernel_init = kernel_init
@@ -229,10 +262,26 @@ class ParallelMoELinear(nn.Module):
                 raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
             self._direction = direction
         kshape = (num_experts, out_features, in_features) if out_first else (num_experts, in_features, out_features)
-        self.kernel = nn.Param(kernel_init(rngs.param(), kshape, param_dtype))
+        weight_layout = _moe_parameter_layout(
+            direction=self._direction,
+            use_expert_tensor_mode=use_expert_tensor_mode,
+            is_bias=False,
+        )
+        self.weight = spx.Parameter(
+            kernel_init(rngs.param, kshape, param_dtype),
+            sharding=sharding_for_layout(weight_layout),
+        )
         if use_bias:
             bshape = (num_experts, out_features)
-            self.bias = nn.Param(bias_init(rngs.param(), bshape, self.param_dtype))
+            bias_layout = _moe_parameter_layout(
+                direction=self._direction,
+                use_expert_tensor_mode=use_expert_tensor_mode,
+                is_bias=True,
+            )
+            self.bias = spx.Parameter(
+                bias_init(rngs.param, bshape, self.param_dtype),
+                sharding=sharding_for_layout(bias_layout),
+            )
         else:
             self.bias = None
 
@@ -252,10 +301,10 @@ class ParallelMoELinear(nn.Module):
         """Checks if this layer can use shard_map for distributed execution.
 
         Returns:
-            True if both a partition manager and parallelism direction are configured,
+            True if both a runtime sharding resolver and parallelism direction are configured,
             indicating the layer is ready for distributed execution with shard_map.
         """
-        return self.partition_manager is not None and self._direction is not None
+        return self.runtime_sharding_resolver is not None and self._direction is not None
 
     @property
     def alt_sharding(self) -> PartitionSpec | None:
@@ -270,11 +319,11 @@ class ParallelMoELinear(nn.Module):
         if self.direction is None:
             return None
         if self.use_expert_tensor_mode:
-            return get_moe_partition_spec(self.partition_manager, "column", self.use_expert_tensor_mode, True)
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "column", self.use_expert_tensor_mode, True)
         elif self.direction == "row":
-            return get_moe_partition_spec(self.partition_manager, "row", self.use_expert_tensor_mode, False)
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "row", self.use_expert_tensor_mode, False)
         elif self.direction == "column":
-            return get_moe_partition_spec(self.partition_manager, "column", self.use_expert_tensor_mode, False)
+            return get_moe_partition_spec(self.runtime_sharding_resolver, "column", self.use_expert_tensor_mode, False)
         else:
             direction = self.direction
             raise NotImplementedError(f"ALT-Sharding Rule for {direction=} is not implemented!.")
@@ -290,39 +339,6 @@ class ParallelMoELinear(nn.Module):
         if self.alt_sharding is None:
             return None
         return self.alt_sharding.axes
-
-    def craft_sharding(self, *, partition_manager=None, **kwargs) -> dict[str, PartitionSpec]:
-        """Return dynamic partition specs for this module's parameters."""
-        pm = partition_manager or self.partition_manager
-        if pm is None or self._direction is None:
-            return {}
-        from easydel.layers.moe._communication_utils import get_moe_partition_spec
-
-        fsdp_is_ep_bound = kwargs.get("fsdp_is_ep_bound", True)
-        sp_is_ep_bound = kwargs.get("sp_is_ep_bound", True)
-        module_view = kwargs.get("module_view", False)
-
-        kernel_spec = get_moe_partition_spec(
-            pm,
-            self._direction,
-            self.use_expert_tensor_mode,
-            is_bias=False,
-            fsdp_is_ep_bound=fsdp_is_ep_bound,
-            sp_is_ep_bound=sp_is_ep_bound,
-            module_view=module_view,
-        )
-        specs: dict[str, PartitionSpec] = {"kernel": kernel_spec}
-        if self.bias is not None:
-            specs["bias"] = get_moe_partition_spec(
-                pm,
-                self._direction,
-                self.use_expert_tensor_mode,
-                is_bias=True,
-                fsdp_is_ep_bound=fsdp_is_ep_bound,
-                sp_is_ep_bound=sp_is_ep_bound,
-                module_view=module_view,
-            )
-        return specs
 
     @property
     def expert_axis(self) -> str:
@@ -386,7 +402,7 @@ class ParallelMoELinear(nn.Module):
             return [DP, [EP, TP]]
         return [DP, EMPTY]
 
-    def __call__(
+    def forward(
         self,
         inputs: Float[Array, "tokens_ragged hidden_dim"],
         group_sizes: Int[Array, "num_groups"],  # noqa
@@ -406,7 +422,7 @@ class ParallelMoELinear(nn.Module):
             The output array after the linear transformation.
             Shape: `(total_tokens, out_features)`.
         """
-        weight = self.kernel.value
+        weight = self.weight.value
         if self.weight_modif_fn is not None:
             weight = self.weight_modif_fn(weight)
         if weight.dtype in (

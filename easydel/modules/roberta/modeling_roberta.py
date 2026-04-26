@@ -14,16 +14,13 @@
 
 
 import jax
-from eformer import common_types
-from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
-from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -63,7 +60,22 @@ from easydel.modules._base import (
 from .roberta_configuration import RobertaConfig as RobertaConfig
 
 
-class RobertaEmbeddings(nn.Module):
+def dot_product_attention_weights(
+    query, key, *, init_bias=None, dropout_rate=0.0, broadcast_dropout=False, dtype=None, precision=None
+):
+    depth = query.shape[-1]
+    attn_scores = jnp.einsum("...qhd,...khd->...hqk", query, key) / jnp.sqrt(depth).astype(query.dtype)
+    if init_bias is not None:
+        attn_scores = attn_scores + init_bias
+    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+    if dropout_rate > 0.0:
+        keep_prob = 1.0 - dropout_rate
+        mask = jax.random.bernoulli(jax.random.PRNGKey(0), keep_prob, attn_weights.shape)
+        attn_weights = jnp.where(mask, attn_weights / keep_prob, 0)
+    return attn_weights
+
+
+class RobertaEmbeddings(spx.Module):
     """Embedding layer for RoBERTa model.
 
     This layer constructs the combined embeddings from word, position, and
@@ -89,7 +101,7 @@ class RobertaEmbeddings(nn.Module):
         param_dtype: jnp.dtype = jnp.float32,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa embeddings layer.
 
@@ -140,7 +152,7 @@ class RobertaEmbeddings(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids,
         token_type_ids,
@@ -205,7 +217,7 @@ class RobertaSelfAttention(AttentionModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa self-attention module.
 
@@ -286,7 +298,7 @@ class RobertaSelfAttention(AttentionModule):
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.config.hidden_size))
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -392,7 +404,7 @@ class RobertaSelfAttention(AttentionModule):
         )
 
 
-class RobertaSelfOutput(nn.Module):
+class RobertaSelfOutput(spx.Module):
     """Output projection layer following RoBERTa self-attention.
 
     This module applies a dense projection, dropout, and residual connection
@@ -415,7 +427,7 @@ class RobertaSelfOutput(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa self-output projection layer.
 
@@ -448,7 +460,7 @@ class RobertaSelfOutput(nn.Module):
         )
         self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob, rngs=rngs)
 
-    def __call__(self, hidden_states, input_tensor):
+    def forward(self, hidden_states, input_tensor):
         """Forward pass of the RobertaSelfOutput layer.
 
         Args:
@@ -467,7 +479,7 @@ class RobertaSelfOutput(nn.Module):
         return hidden_states
 
 
-class RobertaAttention(nn.Module):
+class RobertaAttention(spx.Module):
     """Full attention module combining self-attention and output projection.
 
     This module wraps the self-attention mechanism and its output projection,
@@ -491,7 +503,7 @@ class RobertaAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa attention module.
 
@@ -524,7 +536,7 @@ class RobertaAttention(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         hidden_states,
         mask_info: MaskInfo | None,
@@ -569,7 +581,7 @@ class RobertaAttention(nn.Module):
         return attn_outputs.replace(attention_output=hidden_states)
 
 
-class RobertaIntermediate(nn.Module):
+class RobertaIntermediate(spx.Module):
     """Intermediate (up-projection) layer of the RoBERTa feed-forward network.
 
     This module implements the first dense layer of the two-layer MLP used
@@ -592,7 +604,7 @@ class RobertaIntermediate(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa intermediate (up-projection) layer.
 
@@ -618,7 +630,7 @@ class RobertaIntermediate(nn.Module):
         )
         self.activation = ACT2FN[self.config.hidden_act]
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the RobertaIntermediate layer.
@@ -636,7 +648,7 @@ class RobertaIntermediate(nn.Module):
         return hidden_states
 
 
-class RobertaOutput(nn.Module):
+class RobertaOutput(spx.Module):
     """Output (down-projection) layer of the RoBERTa feed-forward network.
 
     This module implements the second dense layer of the two-layer MLP,
@@ -660,7 +672,7 @@ class RobertaOutput(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa output (down-projection) layer.
 
@@ -696,7 +708,7 @@ class RobertaOutput(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, attention_output):
+    def forward(self, hidden_states, attention_output):
         """Forward pass of the RobertaOutput layer.
 
         Args:
@@ -715,7 +727,7 @@ class RobertaOutput(nn.Module):
         return hidden_states
 
 
-class RobertaLayer(nn.Module):
+class RobertaLayer(spx.Module):
     """Single RoBERTa transformer encoder layer.
 
     This module represents a complete encoder layer in the RoBERTa model,
@@ -741,7 +753,7 @@ class RobertaLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize a single RoBERTa encoder layer.
 
@@ -788,7 +800,7 @@ class RobertaLayer(nn.Module):
                 rngs=rngs,
             )
 
-    def __call__(
+    def forward(
         self,
         hidden_states,
         mask_info: MaskInfo | None,
@@ -864,7 +876,7 @@ class RobertaLayer(nn.Module):
         )
 
 
-class RobertaEncoder(nn.Module):
+class RobertaEncoder(spx.Module):
     """Stack of RoBERTa encoder layers.
 
     This module contains the stack of transformer encoder layers that form
@@ -886,7 +898,7 @@ class RobertaEncoder(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the RoBERTa encoder layer stack.
 
@@ -908,20 +920,20 @@ class RobertaEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layer = nn.List(
-            [
-                block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
+        self.layer = nn.ModuleList([])
+        for _ in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=_):
+                self.layer.append(
+                    block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
                 )
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
 
-    def __call__(
+    def forward(
         self,
         hidden_states,
         mask_info: MaskInfo | None,
@@ -979,7 +991,9 @@ class RobertaEncoder(nn.Module):
                 )
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.layer))
-        for i, layer in enumerate(self.layer):
+
+        def _layer_loop(layer, carry):
+            hidden_states, all_hidden_states, all_attentions, all_cross_attentions, i = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -995,7 +1009,7 @@ class RobertaEncoder(nn.Module):
                 output_attentions=output_attentions,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layer)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -1005,6 +1019,13 @@ class RobertaEncoder(nn.Module):
             if encoder_hidden_states is not None:
                 all_cross_attentions += (layer_outputs.cross_attention,)
 
+            return hidden_states, all_hidden_states, all_attentions, all_cross_attentions, i + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_cross_attentions, _ = self.layer.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_cross_attentions, 0),
+            trace=True,
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1017,7 +1038,7 @@ class RobertaEncoder(nn.Module):
         )
 
 
-class RobertaPooler(nn.Module):
+class RobertaPooler(spx.Module):
     """Pooling layer for sequence-level representations.
 
     This module extracts the representation of the first token ([CLS] token)
@@ -1039,7 +1060,7 @@ class RobertaPooler(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa pooler layer.
 
@@ -1064,7 +1085,7 @@ class RobertaPooler(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the RobertaPooler layer.
@@ -1082,10 +1103,10 @@ class RobertaPooler(nn.Module):
         """
         cls_hidden_state = hidden_states[:, 0]
         cls_hidden_state = self.dense(cls_hidden_state)
-        return nn.tanh(cls_hidden_state)
+        return jax.nn.tanh(cls_hidden_state)
 
 
-class RobertaLMHead(nn.Module):
+class RobertaLMHead(spx.Module):
     """Language modeling head for masked language modeling.
 
     This module implements the prediction head for masked language modeling (MLM)
@@ -1110,7 +1131,7 @@ class RobertaLMHead(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa language modeling head.
 
@@ -1155,14 +1176,10 @@ class RobertaLMHead(nn.Module):
             shape=(self.config.vocab_size,),
             dtype=self.param_dtype,
             init_method="zeros",
-            key=rngs.params(),
+            key=rngs.parameters,
         )
 
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for LM head bias."""
-        return {"bias": Replicated}
-
-    def __call__(self, hidden_states, shared_embedding=None):
+    def forward(self, hidden_states, shared_embedding=None):
         """Forward pass of the RobertaLMHead.
 
         Transforms hidden states through dense layer, GELU activation,
@@ -1182,7 +1199,7 @@ class RobertaLMHead(nn.Module):
         hidden_states = self.layer_norm(hidden_states)
 
         if shared_embedding is not None:
-            self.decoder.kernel.value = shared_embedding.T
+            self.decoder.weight.value = shared_embedding.T
         hidden_states = self.decoder(hidden_states)
 
         bias = self.bias.astype(self.dtype)
@@ -1190,7 +1207,7 @@ class RobertaLMHead(nn.Module):
         return hidden_states
 
 
-class RobertaClassificationHead(nn.Module):
+class RobertaClassificationHead(spx.Module):
     """Classification head for sequence-level classification tasks.
 
     This module implements the classification head used for sequence
@@ -1215,7 +1232,7 @@ class RobertaClassificationHead(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa classification head.
 
@@ -1258,7 +1275,7 @@ class RobertaClassificationHead(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the RobertaClassificationHead.
@@ -1275,7 +1292,7 @@ class RobertaClassificationHead(nn.Module):
         hidden_states = hidden_states[:, 0, :]
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense(hidden_states)
-        hidden_states = nn.tanh(hidden_states)
+        hidden_states = jax.nn.tanh(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.out_proj(hidden_states)
         return hidden_states
@@ -1309,7 +1326,7 @@ class RobertaModel(EasyDeLBaseModule):
         precision: lax.Precision | None = None,
         add_pooling_layer: bool = True,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the RoBERTa base model.
 
@@ -1355,7 +1372,7 @@ class RobertaModel(EasyDeLBaseModule):
         )
         self.add_pooling_layer = add_pooling_layer
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -1468,7 +1485,7 @@ class RobertaModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         pooled = self.pooler(hidden_states) if self.add_pooling_layer else None
@@ -1532,7 +1549,7 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
         param_dtype: jnp.dtype = jnp.float32,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa for sequence classification.
 
@@ -1570,7 +1587,7 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -1670,7 +1687,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.float32,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa for multiple-choice classification.
 
@@ -1708,7 +1725,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids,
         attention_mask,
@@ -1816,7 +1833,7 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         param_dtype: jnp.dtype = jnp.float32,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa for token classification.
 
@@ -1850,7 +1867,7 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
             classifier_bias=True,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids,
         attention_mask,
@@ -1893,7 +1910,7 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         hidden_states = self.dropout(hidden_states)
@@ -1957,7 +1974,7 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
         param_dtype: jnp.dtype = jnp.float32,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa for extractive question answering.
 
@@ -1987,7 +2004,7 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids,
         attention_mask,
@@ -2031,7 +2048,7 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         logits = self.qa_outputs(hidden_states)
@@ -2103,7 +2120,7 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
         param_dtype: jnp.dtype = jnp.float32,
         precision: lax.Precision | None = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize RoBERTa for causal language modeling.
 
@@ -2159,11 +2176,11 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
             Array: Vocabulary logits of shape (batch, seq_len, vocab_size).
         """
         shared_embedding = (
-            self.roberta.embeddings.word_embeddings.embedding.value if self.config.tie_word_embeddings else None
+            self.roberta.embeddings.word_embeddings.weight.value if self.config.tie_word_embeddings else None
         )
         return self.lm_head(hidden_states, shared_embedding=shared_embedding)
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
@@ -2219,7 +2236,7 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         logits = self.compute_lm_logits(hidden_states)

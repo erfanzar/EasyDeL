@@ -50,7 +50,7 @@ class TestSDPOConfig:
         assert cfg.distillation_type == "jsd"
         assert cfg.beta == 0.0
         assert cfg.max_feedback_length == 256
-        assert cfg.trainer_prefix == "sdpotrainer"
+        assert cfg.trainer_prefix == "SDPO"
 
     def test_max_length_derived(self):
         cfg = SDPOConfig(max_prompt_length=128, max_completion_length=64)

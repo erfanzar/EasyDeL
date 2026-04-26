@@ -18,12 +18,11 @@ import typing
 
 import jax
 import jax.numpy as jnp
-from eformer import common_types
-from eformer.escale import apply_logical_sharding
+import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
@@ -57,7 +56,7 @@ from easydel.modules._base import BaseCausalLMModule
 from .minimax_configuration import MiniMaxConfig
 
 
-class MiniMaxLightningAttention(nn.Module):
+class MiniMaxLightningAttention(spx.Module):
     """Lightning Attention module for MiniMax models.
 
     This module implements a linear attention mechanism with exponential decay,
@@ -82,7 +81,7 @@ class MiniMaxLightningAttention(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize the MiniMaxLightningAttention module.
@@ -93,7 +92,7 @@ class MiniMaxLightningAttention(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
             layer_idx (int): Index of this layer in the transformer stack.
         """
         super().__init__()
@@ -185,7 +184,7 @@ class MiniMaxLightningAttention(nn.Module):
 
         return query_decay, key_decay, diagonal_decay
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         attention_mask: Bool[Array, "batch seq_len"] | None,
@@ -217,17 +216,17 @@ class MiniMaxLightningAttention(nn.Module):
         query_states = apply_logical_sharding(
             query_states,
             dynamic_axes=common_types.AttnQSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         key_states = apply_logical_sharding(
             key_states,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         value_states = apply_logical_sharding(
             value_states,
             dynamic_axes=common_types.AttnKVSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         query_states = jnp.transpose(query_states, (0, 2, 1, 3))
@@ -300,7 +299,7 @@ class MiniMaxLightningAttention(nn.Module):
         attn_output = apply_logical_sharding(
             attn_output,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
 
@@ -328,7 +327,7 @@ class MiniMaxAttention(UnifiedAttention[MiniMaxConfig]):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize the MiniMaxAttention module.
@@ -339,7 +338,7 @@ class MiniMaxAttention(UnifiedAttention[MiniMaxConfig]):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
             layer_idx (int): Index of this layer in the transformer stack.
         """
         super().__init__(
@@ -355,7 +354,7 @@ class MiniMaxAttention(UnifiedAttention[MiniMaxConfig]):
         )
 
 
-class MiniMaxExperts(nn.Module):
+class MiniMaxExperts(spx.Module):
     """Expert feed-forward networks for MiniMax Mixture-of-Experts layers.
 
     This module implements the expert networks used in the sparse MoE architecture.
@@ -376,8 +375,8 @@ class MiniMaxExperts(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "w1.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
-                {"name": "w3.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
+                {"name": "w1.weight", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "w3.weight", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda torch, gate, up: torch.cat(
                 (gate.transpose(-1, -2), up.transpose(-1, -2)),
@@ -385,7 +384,7 @@ class MiniMaxExperts(nn.Module):
             ),
         },
         "down_proj$": {
-            "splits": [{"name": "w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "splits": [{"name": "w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
     }
@@ -397,7 +396,7 @@ class MiniMaxExperts(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the MiniMaxExperts module.
 
@@ -407,14 +406,14 @@ class MiniMaxExperts(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
 
-        init = nn.initializers.normal(config.initializer_range)
+        init = jax.nn.initializers.normal(config.initializer_range)
         self.w1 = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.hidden_size,
@@ -422,7 +421,7 @@ class MiniMaxExperts(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=init,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -434,7 +433,7 @@ class MiniMaxExperts(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=init,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -446,14 +445,14 @@ class MiniMaxExperts(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=init,
-            partition_manager=config.partition_manager,
+            partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
             param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "tokens hidden_dim"],
         group_sizes: Array,
@@ -504,7 +503,7 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the MiniMaxSparseMoeBlock module.
 
@@ -514,7 +513,7 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
         """
         super().__init__(
             config=config,
@@ -541,7 +540,7 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
         self.experts = MiniMaxExperts(
             config=config,
@@ -558,7 +557,7 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
 
         self.jitter_noise = config.router_jitter_noise
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         training: bool = False,
@@ -581,7 +580,7 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
         """
         if training and self.jitter_noise > 0:
             hidden_states = hidden_states * jax.random.uniform(
-                self.rngs.param(),
+                self.rngs.param,
                 shape=hidden_states.shape,
                 minval=1.0 - self.jitter_noise,
                 maxval=1.0 + self.jitter_noise,
@@ -591,16 +590,16 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.w1.kernel.value,
-            wu_kernel=self.experts.w3.kernel.value,
-            wd_kernel=self.experts.w2.kernel.value,
+            wi_kernel=self.experts.w1.weight.value,
+            wu_kernel=self.experts.w3.weight.value,
+            wd_kernel=self.experts.w2.weight.value,
             act_fn=self.experts.act_fn,
             layer_idx=layer_idx,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class MiniMaxDecoderLayer(nn.Module):
+class MiniMaxDecoderLayer(spx.Module):
     """Single decoder layer for MiniMax transformer models.
 
     Each layer consists of an attention block (either lightning or standard attention)
@@ -624,17 +623,17 @@ class MiniMaxDecoderLayer(nn.Module):
     # so conversion does not depend on test-only key remaps.
     reform_param: typing.ClassVar = {
         "mlp.gate.weight$": {
-            "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
         "mlp.experts.gate_up_proj$": {
             "splits": [
                 {
-                    "name": "block_sparse_moe.experts.w1.kernel",
+                    "name": "block_sparse_moe.experts.w1.weight",
                     "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
                 },
                 {
-                    "name": "block_sparse_moe.experts.w3.kernel",
+                    "name": "block_sparse_moe.experts.w3.weight",
                     "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
                 },
             ],
@@ -644,7 +643,7 @@ class MiniMaxDecoderLayer(nn.Module):
             ),
         },
         "mlp.experts.down_proj$": {
-            "splits": [{"name": "block_sparse_moe.experts.w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
             "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
     }
@@ -656,7 +655,7 @@ class MiniMaxDecoderLayer(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
         layer_idx: int,
     ):
         """Initialize the MiniMaxDecoderLayer module.
@@ -667,7 +666,7 @@ class MiniMaxDecoderLayer(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
             layer_idx (int): Index of this layer in the transformer stack.
         """
         self.config = config
@@ -678,7 +677,7 @@ class MiniMaxDecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_idx] if config.layer_types is not None else "full_attention"
 
         if self.layer_type == "linear_attention":
-            attn_block: type[nn.Module] = MiniMaxLightningAttention
+            attn_block: type[spx.Module] = MiniMaxLightningAttention
             self.attn_alpha_factor = config.linear_attn_alpha_factor
             self.attn_beta_factor = config.linear_attn_beta_factor
         else:
@@ -686,7 +685,7 @@ class MiniMaxDecoderLayer(nn.Module):
             self.attn_alpha_factor = config.full_attn_alpha_factor
             self.attn_beta_factor = config.full_attn_beta_factor
 
-        mlp_block: type[nn.Module] = MiniMaxSparseMoeBlock
+        mlp_block: type[spx.Module] = MiniMaxSparseMoeBlock
 
         self.self_attn = attn_block(
             config=config,
@@ -721,7 +720,7 @@ class MiniMaxDecoderLayer(nn.Module):
         self.mlp_alpha_factor = config.mlp_alpha_factor
         self.mlp_beta_factor = config.mlp_beta_factor
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
@@ -763,7 +762,7 @@ class MiniMaxDecoderLayer(nn.Module):
         residual = apply_logical_sharding(
             residual,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         attn_weights = None
@@ -802,7 +801,7 @@ class MiniMaxDecoderLayer(nn.Module):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
         return DecoderLayerOutput(
@@ -840,7 +839,7 @@ class MiniMaxModel(EasyDeLBaseModule):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the MiniMaxModel.
 
@@ -850,7 +849,7 @@ class MiniMaxModel(EasyDeLBaseModule):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
         """
         super().__init__(
             config=config,
@@ -875,19 +874,19 @@ class MiniMaxModel(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = nn.List(
-            [
-                remat_layer_block(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                    layer_idx=layer_idx,
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                        layer_idx=layer_idx,
+                    )
                 )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -897,7 +896,7 @@ class MiniMaxModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -994,10 +993,11 @@ class MiniMaxModel(EasyDeLBaseModule):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        for idx, block in enumerate(self.layers):
+        def _layer_loop(block, carry):
+            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1007,14 +1007,14 @@ class MiniMaxModel(EasyDeLBaseModule):
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
                 cache_metadata=cache_metadata,
                 output_attentions=bool(output_attentions),
                 output_router_logits=bool(output_router_logits),
                 frequencies=self.frequencies,
             )
 
-            hidden_states = layer_outputs.hidden_states
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -1022,8 +1022,15 @@ class MiniMaxModel(EasyDeLBaseModule):
             if output_router_logits:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            past_key_values[idx] = layer_outputs.cache_view
+            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
 
+            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=True,
+        )
         hidden_states = self.norm(hidden_states)
 
         router_losses = None
@@ -1108,7 +1115,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # ty
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
-        rngs: nn.Rngs,
+        rngs: spx.Rngs,
     ):
         """Initialize the MiniMaxForCausalLM model.
 
@@ -1118,7 +1125,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # ty
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
                 Defaults to None.
-            rngs (nn.Rngs): Random number generators for initialization.
+            rngs (spx.Rngs): Random number generators for initialization.
         """
         super().__init__(
             config=config,
@@ -1132,7 +1139,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # ty
             router_aux_loss_coef=config.router_aux_loss_coef,
         )
 
-    def __call__(
+    def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -1233,7 +1240,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # ty
             RecurrentCacheConfig: Configuration with appropriate dimensions for the
                 model's lightning attention layers.
         """
-        from eformer.escale import PartitionAxis
+        from spectrax import PartitionAxis
 
         from easydel.caching import RecurrentCacheConfig
 

@@ -68,7 +68,7 @@ from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from jax import numpy as jnp
 
-from easydel.infra.base_config import EasyDeLBaseConfigDict
+from easydel.infra.base_config import _REMOVED_BASE_CONFIG_KEYS, EasyDeLBaseConfigDict
 from easydel.infra.factory import TaskType
 from easydel.layers.quantization._quants import QuantizationConfig  # pyright: ignore[reportPrivateLocalImportUsage]
 
@@ -814,7 +814,6 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
             - quantization_config: Model layer quantization settings
             - mask_max_position_embeddings, freq_max_position_embeddings: Sequence limits
             - operation_configs: ejkernel operation overrides
-            - hardware_abstraction: Always set to True
 
     Note:
         This function calls normalize() internally, so it can accept both
@@ -834,7 +833,11 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
         >>> base_cfg = materialize_base_config(cfg, prefer="sections")
     """
     cfg = normalize(cfg)
-    raw_base = dict(cfg.get("base_config", {}).get("values", {}) or {})
+    raw_base = {
+        k: v
+        for k, v in dict(cfg.get("base_config", {}).get("values", {}) or {}).items()
+        if k not in _REMOVED_BASE_CONFIG_KEYS
+    }
 
     # Coerce dtype fields in base_config.values
     dtype_fields = {"attn_dtype", "kvdtype", "attn_softmax_dtype", "mla_attn_dtype", "mla_attn_softmax_dtype"}
@@ -889,8 +892,6 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
     set_maybe("use_qmm_best_config", quant.get("use_qmm_best_config"))
     set_maybe("qmm_platform_override", quant.get("qmm_platform_override"))
     set_maybe("qmm_tpu_path_override", quant.get("qmm_tpu_path_override"))
-
-    base.setdefault("hardware_abstraction", True)
 
     max_model_len = esurge.get("max_model_len")
     if max_model_len is not None:

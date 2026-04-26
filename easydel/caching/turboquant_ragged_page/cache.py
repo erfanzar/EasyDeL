@@ -31,15 +31,15 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 import numpy as np
-from eformer import common_types
-from eformer.escale import PartitionAxis, PartitionManager
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
+from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
 from easydel.layers.quantization import TurboQuantConfig, TurboQuantConstants
 
 from .._abstracts import OperationsMetadata
@@ -80,7 +80,7 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
     def create(
         cls,
         mesh: Mesh,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         turboquant_config: TurboQuantConfig,
         num_hidden_layers: int,
         num_kv_heads: int,
@@ -96,7 +96,7 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
         Args:
             mesh: JAX device mesh.
-            partition_manager: For sharding resolution.
+            runtime_sharding_resolver: Resolves runtime shardings for cache tensors.
             turboquant_config: TurboQuant algorithm configuration.
             num_hidden_layers: Number of transformer layers.
             num_kv_heads: Number of KV attention heads.
@@ -108,8 +108,9 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
         Returns:
             Configured TurboQuantRaggedPagesCacheConfig.
         """
-        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
-        kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
+        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+        kv_head_size = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
 
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
         page_axis_size = data_parallel_size if data_parallel_size > 1 else 1
@@ -193,7 +194,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         layer_index: int | None = None,
         *,
         mesh: "Mesh | None" = None,
-        partition_manager: "PartitionManager | None" = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: "EasyQuantizer | None" = None,
         constants: TurboQuantConstants | None = None,
     ) -> "TurboQuantRaggedPagesCacheView":
@@ -203,7 +204,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
             config: TurboQuant cache configuration.
             layer_index: Transformer layer index.
             mesh: JAX device mesh for sharding.
-            partition_manager: Partition manager.
+            runtime_sharding_resolver: Runtime sharding resolver.
             quantizer: Ignored (TurboQuant handles its own compression).
             constants: Precomputed TurboQuant constants. If None, generated
                 from config.
@@ -211,8 +212,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         Returns:
             Initialized TurboQuantRaggedPagesCacheView.
         """
-        if partition_manager is None:
-            partition_manager = PartitionManager(PartitionAxis())
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         layer_idx = layer_index or 0
         tq_config = config.turboquant_config
@@ -228,7 +228,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         page_axis = ATTN_DP if config.data_parallel_size > 1 else common_types.EMPTY
 
         def _make_pages(shape, np_dtype, axes):
-            spec = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=shape)
+            spec = runtime_sharding_resolver.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=shape)
             sharding = Ns(mesh=mesh, spec=spec)
             return jax.device_put(np.zeros(shape, dtype=np_dtype), sharding)
 
@@ -253,7 +253,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
             metadata=config,
             layer_index=layer_idx,
             kv_pages=dummy_kv,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
             key_indices_pages=ki,
             key_signs_pages=ks,
             key_norms_pages=kn,
@@ -269,7 +269,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         num_layers: int,
         *,
         mesh: "Mesh | None" = None,
-        partition_manager: "PartitionManager | None" = None,
+        runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         layer_indices: list[int] | None = None,
     ) -> list["TurboQuantRaggedPagesCacheView"]:
         """Batch-allocate cache views for all layers at once.
@@ -284,7 +284,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
             config: TurboQuant cache configuration.
             num_layers: Number of transformer layers.
             mesh: JAX device mesh for sharding.
-            partition_manager: Partition manager.
+            runtime_sharding_resolver: Runtime sharding resolver.
             layer_indices: Optional transformer layer indices. When provided,
                 generated constants and view metadata keep the original layer
                 numbering instead of using ``range(num_layers)``.
@@ -292,8 +292,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         Returns:
             List of ``num_layers`` initialized TurboQuantRaggedPagesCacheView.
         """
-        if partition_manager is None:
-            partition_manager = PartitionManager(PartitionAxis())
+        runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
         if layer_indices is None:
             layer_indices = list(range(num_layers))
         elif len(layer_indices) != int(num_layers):
@@ -323,7 +322,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         }
         resolved_shardings = {}
         for name, (shape, _, axes) in shapes_and_shardings.items():
-            spec = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=shape)
+            spec = runtime_sharding_resolver.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=shape)
             resolved_shardings[name] = Ns(mesh=mesh, spec=spec)
 
         logger.info(f"Batch-allocating TurboQuant cache for {num_layers} layers via device_put")
@@ -350,7 +349,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
                     metadata=config,
                     layer_index=int(layer_index),
                     kv_pages=dummy_kv,
-                    partition_manager=partition_manager,
+                    runtime_sharding_resolver=runtime_sharding_resolver,
                     key_indices_pages=ki,
                     key_signs_pages=ks,
                     key_norms_pages=kn,
@@ -414,7 +413,7 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
         cls,
         mesh: Mesh,
         config: TurboQuantRaggedPagesCacheConfig,
-        partition_manager: PartitionManager,
+        runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
     ) -> "TurboQuantRaggedPagesCache":
         """Allocate TurboQuant cache for all transformer layers.
@@ -422,7 +421,7 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
         Args:
             mesh: JAX device mesh.
             config: TurboQuant cache configuration.
-            partition_manager: For sharding resolution.
+            runtime_sharding_resolver: Resolves runtime shardings for cache tensors.
             quantizer: Ignored (TurboQuant handles its own compression).
 
         Returns:
@@ -432,6 +431,6 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
             config=config,
             num_layers=config.num_hidden_layers,
             mesh=mesh,
-            partition_manager=partition_manager,
+            runtime_sharding_resolver=runtime_sharding_resolver,
         )
         return cls(views=views)
