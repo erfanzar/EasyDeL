@@ -82,7 +82,7 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module, registry
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
@@ -338,8 +338,8 @@ class Gemma4VisionPatchEmbedder(spx.Module):
         """Gather per-axis position embeddings and zero them on padded patches."""
         clamped_positions = jnp.clip(
             pixel_position_ids.astype(jnp.int32),
-            a_min=0,
-            a_max=self.config.position_embedding_size - 1,
+            min=0,
+            max=self.config.position_embedding_size - 1,
         )
         if clamped_positions.shape[-1] != 2:
             raise ValueError(
@@ -430,7 +430,7 @@ class Gemma4VisionRotaryEmbedding(spx.Module):
         if pixel_position_ids is None:
             return query, key
 
-        pixel_position_ids = jnp.clip(pixel_position_ids.astype(jnp.int32), a_min=0)
+        pixel_position_ids = jnp.clip(pixel_position_ids.astype(jnp.int32), min=0)
         ndim = pixel_position_ids.shape[-1]
         num_rotated_channels_per_dim = 2 * (query.shape[-1] // (2 * ndim))
         rotated_channels = num_rotated_channels_per_dim * ndim
@@ -729,7 +729,7 @@ class Gemma4VisionEncoderLayer(spx.Module):
         )
 
 
-class Gemma4VisionEncoder(spx.Module):
+class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
     """Shared rotary embedding plus stacked Gemma4 vision encoder layers."""
 
     def __init__(
@@ -783,7 +783,7 @@ class Gemma4VisionEncoder(spx.Module):
         hidden_states = inputs_embeds
 
         def _layer_loop(layer, carry):
-            hidden_states, all_hidden_states, all_attentions = carry
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -800,12 +800,15 @@ class Gemma4VisionEncoder(spx.Module):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            return hidden_states, all_hidden_states, all_attentions
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions),
-            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=output_hidden_states
+            or output_attentions
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1,
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -839,7 +842,7 @@ class Gemma4VisionPooler(spx.Module):
                 f"{kernel_size=}^2 times {length=} must equal {input_seq_len}."
             )
 
-        clamped_positions = jnp.clip(pixel_position_ids.astype(jnp.int32), a_min=0)
+        clamped_positions = jnp.clip(pixel_position_ids.astype(jnp.int32), min=0)
         max_x = jnp.max(clamped_positions[..., 0], axis=-1, keepdims=True) + 1
         kernel_indices = clamped_positions // kernel_size
         kernel_indices = kernel_indices[..., 0] + (max_x // kernel_size) * kernel_indices[..., 1]
@@ -2591,9 +2594,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 shared_kv[idx] = captured
                 object.__setattr__(attn, "_captured_kv", None)
                 # Track the donor's (potentially updated) cache view.
-                self._layer_cache_view_update(
-                    donor_cache_views, idx, layer_outputs.cache_view, enabled=True
-                )
+                self._layer_cache_view_update(donor_cache_views, idx, layer_outputs.cache_view, enabled=True)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)

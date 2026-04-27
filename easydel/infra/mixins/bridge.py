@@ -200,7 +200,7 @@ def _normalize_checkpoint_leaf_to_jax(
 
 
 def _collect_lora_checkpoint_paths(
-    flat_state: dict[tuple[tp.Any, ...], tp.Any]
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
 ) -> dict[tuple[tp.Any, ...], dict[str, tp.Any]]:
     """Extract LoRA adapter locations from a flattened checkpoint state.
 
@@ -319,7 +319,6 @@ def _build_safe_checkpoint_partition_rules(
         return partition_rules
 
     try:
-
         specs_tree = match_partition_rules(list(partition_rules), model.graphtree_parameters_shape, strict=False)
         flat_specs = flatten_dict(specs_tree)
         flat_shapes = flatten_dict(model.graphtree_parameters_shape)

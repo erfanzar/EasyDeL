@@ -36,7 +36,7 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
@@ -1621,7 +1621,7 @@ class Llama4VisionEncoderLayer(spx.Module):
         )
 
 
-class Llama4VisionEncoder(spx.Module):
+class Llama4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
     """Vision encoder stack for Llama4 models.
 
     Stacks multiple vision encoder layers to progressively encode
@@ -1700,7 +1700,7 @@ class Llama4VisionEncoder(spx.Module):
         all_attentions = () if output_attentions else None
 
         def _layer_loop(encoder_layer, carry):
-            hidden_states, encoder_states, all_attentions = carry
+            hidden_states, encoder_states, all_attentions, idx = carry
             if output_hidden_states:
                 assert encoder_states is not None
                 encoder_states = (*encoder_states, hidden_states)
@@ -1716,12 +1716,15 @@ class Llama4VisionEncoder(spx.Module):
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            return hidden_states, encoder_states, all_attentions
+            return hidden_states, encoder_states, all_attentions, idx + 1
 
-        hidden_states, encoder_states, all_attentions = self.layers.scan(
+        hidden_states, encoder_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, encoder_states, all_attentions),
-            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+            (hidden_states, encoder_states, all_attentions, 0),
+            trace=output_hidden_states
+            or output_attentions
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1,
         )
         if output_hidden_states:
             assert encoder_states is not None

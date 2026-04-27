@@ -802,7 +802,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         hidden_states = self.dropout_layer(hidden_states)
 
         def _layer_loop(encoder_layer, carry):
-            hidden_states, all_hidden_states, all_attentions = carry
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
@@ -821,11 +821,11 @@ class WhisperEncoder(EasyDeLBaseModule):
                 assert all_attentions is not None
                 all_attentions = (*all_attentions, layer_outputs[1])
 
-            return hidden_states, all_hidden_states, all_attentions
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions),
+            (hidden_states, all_hidden_states, all_attentions, 0),
             trace=True,
         )
         if output_hidden_states:

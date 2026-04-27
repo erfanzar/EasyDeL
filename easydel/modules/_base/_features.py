@@ -641,7 +641,7 @@ class SequenceLengthPoolingFeature:
         elif self.strategy == "mean":
             if attention_mask is not None:
                 weights = attention_mask[:, :, None].astype(hidden_states.dtype)
-                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), a_min=1e-9)
+                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), min=1e-9)
             return jnp.mean(hidden_states, axis=1)
 
         elif self.strategy == "weighted_mean":
@@ -650,7 +650,7 @@ class SequenceLengthPoolingFeature:
                 pos_weights = jnp.arange(1, seq_len + 1, dtype=hidden_states.dtype)[None, :, None]
                 mask = attention_mask[:, :, None].astype(hidden_states.dtype)
                 weights = pos_weights * mask
-                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), a_min=1e-9)
+                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), min=1e-9)
             return jnp.mean(hidden_states, axis=1)
 
         elif self.strategy == "max":

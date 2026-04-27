@@ -706,7 +706,7 @@ class ExecutionManager:
 
         if graphstate is not None:
             template_graphstate = self.graphstate if self.graphstate is not None else graphstate
-            shardings = spx.extract_sharding_structure(template_graphstate,  mesh=self.mesh)
+            shardings = spx.extract_sharding_structure(template_graphstate, mesh=self.mesh)
             self.graphstate = jax.tree_util.tree_map(
                 lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
                 graphstate,

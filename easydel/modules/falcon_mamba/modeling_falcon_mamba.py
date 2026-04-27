@@ -356,7 +356,7 @@ class FalconMambaMixer(spx.Module):
                 * (jnp.log(config.time_step_max) - jnp.log(config.time_step_min))
                 + jnp.log(config.time_step_min)
             )
-            dt = jnp.clip(dt, a_min=config.time_step_floor)
+            dt = jnp.clip(dt, min=config.time_step_floor)
             inv_dt = dt + jnp.log(-jnp.expm1(-dt))
             return inv_dt.astype(dtype)
 
