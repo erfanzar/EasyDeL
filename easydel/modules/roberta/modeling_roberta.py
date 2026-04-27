@@ -32,7 +32,7 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
@@ -876,7 +876,7 @@ class RobertaLayer(spx.Module):
         )
 
 
-class RobertaEncoder(spx.Module):
+class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
     """Stack of RoBERTa encoder layers.
 
     This module contains the stack of transformer encoder layers that form
@@ -1009,7 +1009,7 @@ class RobertaEncoder(spx.Module):
                 output_attentions=output_attentions,
             )
 
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layer)
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, i, layers=self.layer)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)

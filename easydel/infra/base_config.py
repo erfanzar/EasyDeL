@@ -70,6 +70,7 @@ from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array
 from spectrax import PartitionAxis, common_types
 from spectrax.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
+from spectrax.core.stage_assignment import current_stage_assignment, resolve_stage_rank
 
 # .venv/lib/python3.13/site-packages/transformers/configuration_utils.py
 from transformers.configuration_utils import PretrainedConfig, recursive_diff_dict
@@ -1210,6 +1211,54 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.set_manual_mesh(mesh)
         return self._hidden_manual_mesh
 
+    def _stage_spmd_devices(self) -> np.ndarray:
+        """Return the SPMD device array for the layer's pipeline stage.
+
+        When ``self.mesh`` carries an MPMD axis (pp > 1), the global device
+        grid spans every pipeline stage; expert parallelism lives *inside*
+        a stage, so we slice down to the owning stage and let
+        ``_mesh_shape_ep`` lay (dp, ep, tp) over its SPMD sub-mesh.
+
+        ``BaseMoeModule.__init__`` evaluates ``config.auto_expert_mesh``
+        and ``config.expert_mesh`` while the calling model is in a
+        ``spx.assign_stage(total=num_layers, current=layer_idx)`` block
+        (see e.g. ``modeling_qwen3_moe.py``). ``current_stage_assignment``
+        therefore returns this layer's ``(current, total)`` hint, which
+        ``resolve_stage_rank`` projects onto the live ``mpmd_dim``. Each
+        layer caches its own stage's expert mesh, so per-layer
+        ``shard_map`` calls see the devices their stage actually runs on.
+
+        Outside an ``assign_stage`` scope there's no per-layer hint, and
+        stage 0 is the only sensible fallback.
+        """
+        parent: spx.SpxMesh = self.mesh
+        if not parent.is_mpmd:
+            return parent.devices.flatten()
+
+        mpmd = parent.mpmd_mesh
+        owner = resolve_stage_rank(current_stage_assignment(), mpmd.mpmd_dim)
+        if owner is None:
+            owner = 0
+        return mpmd.submesh(owner).devices.flatten()
+
+    def _build_expert_mesh(self, axis_types: tuple[jax.sharding.AxisType, ...]) -> spx.SpxMesh:
+        """Construct the (dp, ep, tp) expert mesh on the current stage's sub-mesh."""
+        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
+            self.mesh,
+            self.runtime_sharding_resolver,
+            self.fsdp_is_ep_bound,
+            self.sp_is_ep_bound,
+        )
+        stage_devices = self._stage_spmd_devices()
+        return spx.SpxMesh(
+            jax_mesh=jax.sharding.Mesh(
+                stage_devices.reshape(odpsize, epsize, otpsize),
+                axis_names=(dpname, epname, tpname),
+                axis_types=axis_types,
+            ),
+            mpmd_axis=None,
+        )
+
     @property
     def expert_mesh(self) -> spx.SpxMesh:
         """Get the mesh configuration for expert parallelism.
@@ -1217,29 +1266,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Creates a mesh with expert-parallel axes folded according to the
         `fsdp_is_ep_bound` and `sp_is_ep_bound` configuration flags. This mesh
         is used for MoE (Mixture of Experts) models to distribute experts
-        across devices with explicit axis types.
+        across devices with explicit axis types. When the parent mesh carries
+        an MPMD pipeline axis, the expert mesh is built from a single stage's
+        sub-mesh so (dp, ep, tp) lay over SPMD devices only.
 
         Returns:
             spx.SpxMesh: A mesh with explicit axis types configured for
                 expert parallelism with (dp, ep, tp) axis ordering.
         """
-        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
-            self.mesh,
-            self.runtime_sharding_resolver,
-            self.fsdp_is_ep_bound,
-            self.sp_is_ep_bound,
-        )
-        return spx.SpxMesh(
-            jax_mesh=jax.sharding.Mesh(
-                self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
-                axis_names=(dpname, epname, tpname),
-                axis_types=(
-                    jax.sharding.AxisType.Explicit,
-                    jax.sharding.AxisType.Explicit,
-                    jax.sharding.AxisType.Explicit,
-                ),
+        return self._build_expert_mesh(
+            axis_types=(
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
+                jax.sharding.AxisType.Explicit,
             ),
-            mpmd_axis=None,
         )
 
     @property
@@ -1277,19 +1317,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             spx.SpxMesh: A mesh with auto axis types configured for
                 expert parallelism with (dp, ep, tp) axis ordering.
         """
-        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
-            self.mesh,
-            self.runtime_sharding_resolver,
-            self.fsdp_is_ep_bound,
-            self.sp_is_ep_bound,
-        )
-        return spx.SpxMesh(
-            jax_mesh=jax.sharding.Mesh(
-                self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
-                axis_names=(dpname, epname, tpname),
-                axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
+        return self._build_expert_mesh(
+            axis_types=(
+                jax.sharding.AxisType.Auto,
+                jax.sharding.AxisType.Auto,
+                jax.sharding.AxisType.Auto,
             ),
-            mpmd_axis=None,
         )
 
     @staticmethod

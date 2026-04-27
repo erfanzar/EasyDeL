@@ -988,6 +988,15 @@ class BaseMoeModule(spx.Module, ABC):
             if tp_size != 1:
                 raise ValueError("if using `ExpertTensorMode` Expert Parallel size should be 1.")
 
+        if self.config.use_ring_of_experts and self.n_routed_experts % ep_size != 0:
+            owned = (self.n_routed_experts // ep_size) * ep_size
+            raise ValueError(
+                f"use_ring_of_experts=True requires n_routed_experts "
+                f"({self.n_routed_experts}) to be divisible by ep_size ({ep_size}); "
+                f"otherwise experts [{owned}..{self.n_routed_experts - 1}] are silently "
+                f"dropped from compute."
+            )
+
         # Simplified partition specs using 3D expert_mesh
         input_ps = jax.sharding.PartitionSpec(dp_axis_name, None, None)
         glps = jax.sharding.PartitionSpec(dp_axis_name, None)
@@ -1042,7 +1051,7 @@ class BaseMoeModule(spx.Module, ABC):
 
         @partial(
             shard_map,
-            mesh=expert_mesh,  # Use 3D expert_mesh instead of 5D mesh
+            mesh=expert_mesh.jax_mesh,
             in_specs=(input_ps, glps, wikps, wukps, wdkps, wibps, wubps, wdbps),
             out_specs=output_ps,
             check_vma=False,

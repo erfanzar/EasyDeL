@@ -71,9 +71,7 @@ def concatenated_forward(
     num_examples = batch["prompt_input_ids"].shape[0]
     concatenated_batch = concatenated_inputs(batch=batch, padding_value=padding_value)
 
-    model_kwargs: dict[str, jax.Array] = gather_multimodal_kwargs(
-        concatenated_batch, aux_loss_enabled=aux_loss_enabled
-    )
+    model_kwargs: dict[str, jax.Array] = gather_multimodal_kwargs(concatenated_batch, aux_loss_enabled=aux_loss_enabled)
 
     prompt_input_ids = concatenated_batch["prompt_input_ids"]
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]

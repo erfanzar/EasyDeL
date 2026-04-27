@@ -235,6 +235,8 @@ def setup_config(
         if hasattr(config, "hidden_size") and hasattr(config, "num_attention_heads"):
             config.head_dim = config.hidden_size // config.num_attention_heads
 
+    if hasattr(config, "scan_layers"):
+        config.scan_layers = small_model_config.get("scan_layers", False)
     config.attach_custom_arguments()
     config.add_basic_configurations(
         use_sharding_constraint=small_model_config.get("use_sharding_constraint", False),

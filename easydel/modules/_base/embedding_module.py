@@ -231,7 +231,7 @@ class BaseEmbeddingModule(BaseTaskModule[ModelT, ConfigT]):
         if self._normalize_embeddings:
             embeddings = embeddings / jnp.clip(
                 jnp.linalg.norm(embeddings, axis=-1, keepdims=True),
-                a_min=1e-12,
+                min=1e-12,
             )
 
         return EmbeddingOutput(
@@ -347,8 +347,8 @@ class BaseEmbeddingModule(BaseTaskModule[ModelT, ConfigT]):
             Similarity matrix ``(n, m)`` where each entry ``[i, j]`` is the
             cosine similarity between ``a[i]`` and ``b[j]``.
         """
-        a_norm = a / jnp.clip(jnp.linalg.norm(a, axis=-1, keepdims=True), a_min=1e-12)
-        b_norm = b / jnp.clip(jnp.linalg.norm(b, axis=-1, keepdims=True), a_min=1e-12)
+        a_norm = a / jnp.clip(jnp.linalg.norm(a, axis=-1, keepdims=True), min=1e-12)
+        b_norm = b / jnp.clip(jnp.linalg.norm(b, axis=-1, keepdims=True), min=1e-12)
         return a_norm @ b_norm.T
 
     @staticmethod

@@ -23,7 +23,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.modeling_outputs import (
@@ -525,7 +525,7 @@ class CLIPEncoderLayer(spx.Module):
         )
 
 
-class CLIPEncoder(spx.Module):
+class CLIPEncoder(EasyDeLLayerStackMixin, spx.Module):
     """Transformer encoder for CLIP models.
 
     Stacks multiple CLIPEncoderLayer instances to form the complete
@@ -611,7 +611,7 @@ class CLIPEncoder(spx.Module):
         all_hidden_states = () if output_hidden_states else None
 
         def _layer_loop(layer, carry):
-            hidden_states, all_hidden_states, all_attentions = carry
+            hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -625,12 +625,15 @@ class CLIPEncoder(spx.Module):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            return hidden_states, all_hidden_states, all_attentions
+            return hidden_states, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions = self.layers.scan(
+        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions),
-            trace=output_hidden_states or output_attentions or not self.config.scan_layers,
+            (hidden_states, all_hidden_states, all_attentions, 0),
+            trace=output_hidden_states
+            or output_attentions
+            or not self.config.scan_layers
+            or self._pipeline_stage_count() > 1,
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

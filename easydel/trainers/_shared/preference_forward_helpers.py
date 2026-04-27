@@ -73,9 +73,7 @@ def apply_paired_truncation(
         return tuple(arr[:, -max_length:] for arr in arrays)
     if truncation_mode == "keep_start":
         return tuple(arr[:, :max_length] for arr in arrays)
-    raise ValueError(
-        f"Unknown truncation mode: {truncation_mode!r}. Expected 'keep_end' or 'keep_start'."
-    )
+    raise ValueError(f"Unknown truncation mode: {truncation_mode!r}. Expected 'keep_end' or 'keep_start'.")
 
 
 __all__ = [

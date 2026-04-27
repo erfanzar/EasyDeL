@@ -162,10 +162,10 @@ def matryoshka_loss(
         p = positive_embeds[:, :dim]
         n = negative_embeds[:, :dim] if negative_embeds is not None else None
 
-        q = q / jnp.clip(jnp.linalg.norm(q, axis=-1, keepdims=True), a_min=1e-12)
-        p = p / jnp.clip(jnp.linalg.norm(p, axis=-1, keepdims=True), a_min=1e-12)
+        q = q / jnp.clip(jnp.linalg.norm(q, axis=-1, keepdims=True), min=1e-12)
+        p = p / jnp.clip(jnp.linalg.norm(p, axis=-1, keepdims=True), min=1e-12)
         if n is not None:
-            n = n / jnp.clip(jnp.linalg.norm(n, axis=-1, keepdims=True), a_min=1e-12)
+            n = n / jnp.clip(jnp.linalg.norm(n, axis=-1, keepdims=True), min=1e-12)
 
         dim_loss, dim_metrics = loss_fn(q, p, n, **loss_kwargs) if n is not None else loss_fn(q, p, **loss_kwargs)
         total_loss = total_loss + dim_loss
@@ -196,7 +196,7 @@ def _embed_batch(
     outputs = module(input_ids=input_ids, attention_mask=attention_mask)
     embeds = outputs.embeddings
     if normalize:
-        embeds = embeds / jnp.clip(jnp.linalg.norm(embeds, axis=-1, keepdims=True), a_min=1e-12)
+        embeds = embeds / jnp.clip(jnp.linalg.norm(embeds, axis=-1, keepdims=True), min=1e-12)
     return embeds
 
 
