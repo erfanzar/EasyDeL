@@ -11,6 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Spectrax implementation of THUDM's GLM-4 decoder-only language model.
+
+GLM-4 extends GLM with dual post-normalization (additional RMSNorm after both
+the attention and feedforward sub-blocks) for improved training stability,
+while keeping grouped-query attention with partial rotary embeddings and a
+gated SwiGLU MLP.
+
+Architectural traits:
+    - Pre- and post-normalization with RMSNorm around attention and MLP.
+    - Grouped-query attention with optional bias on Q/K/V/O projections.
+    - Partial rotary position embeddings (``partial_rotary_factor``).
+    - Gated MLP using a fused ``gate_up_proj`` with SwiGLU activation.
+
+Exports:
+    - :class:`Glm4Model`: Backbone returning hidden states.
+    - :class:`Glm4ForCausalLM`: Decoder LM with optional tied LM head.
+    - :class:`Glm4ForSequenceClassification`: Pooled classifier head.
+"""
+
 from functools import partial
 
 import jax
@@ -43,11 +63,15 @@ from .glm4_configuration import Glm4Config
 
 
 class Glm4MLP(spx.Module):
-    """Multi-Layer Perceptron module for GLM-4 models.
+    """Gated MLP with a fused ``[gate; up]`` first projection (GLM-4 layout).
 
-    Implements the feedforward network with gated activation function
-    using fused gate-up projections for enhanced representation learning
-    in the GLM-4 architecture.
+    Same fused-projection design as :class:`GlmMLP` (see that class for the
+    rationale): the gate and up projections share a single
+    ``(hidden, 2 * intermediate)`` weight named ``gate_up_proj`` to match
+    the HF GLM-4 checkpoint layout, with the trailing axis split at apply
+    time. The activation is applied to the gate half only and the result
+    is multiplied by the up half before the RowParallel ``down_proj``
+    contracts back to ``hidden_size``.
     """
 
     def __init__(
@@ -123,7 +147,15 @@ class Glm4MLP(spx.Module):
 
 
 class Glm4Attention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for GLM-4 models."""
+    """Causal GQA attention with biasless output projection (GLM-4).
+
+    Same configuration as :class:`GlmAttention` — the only override is
+    :meth:`_create_o_proj` which forces the output projection to be
+    biasless to match the GLM-4 checkpoint layout (Q/K/V keep their
+    biases). RoPE is partial: only the first
+    ``partial_rotary_factor * head_dim`` channels are rotated, configured
+    via ``Glm4Config``.
+    """
 
     def __init__(
         self,
@@ -177,11 +209,21 @@ class Glm4Attention(UnifiedAttention):
 
 
 class Glm4DecoderLayer(spx.Module):
-    """Single decoder layer for GLM-4 models.
+    """Sandwich-norm decoder block: pre-norm + post-sublayer norm pairs.
 
-    Combines multi-head attention and feedforward networks with
-    RMS normalization and residual connections. Includes additional
-    post-attention and post-MLP layer normalization for improved stability.
+    GLM-4 strengthens the pre-norm decoder of GLM by adding **post-norms
+    on each sub-layer's output**, producing a "sandwich" pattern around
+    both attention and MLP:
+
+    1. ``input_layernorm`` (pre-attn) → ``self_attn`` →
+       ``post_self_attn_layernorm`` (post-attn) → residual add.
+    2. ``post_attention_layernorm`` (pre-mlp) → ``mlp`` →
+       ``post_mlp_layernorm`` (post-mlp) → residual add.
+
+    All four norms are RMSNorm at ``config.rms_norm_eps``. The extra
+    post-sublayer norms keep the residual stream's variance bounded
+    layer-by-layer, which is the GLM-4 fix for the slow drift of
+    activation magnitudes that plagued deep pure pre-norm stacks.
     """
 
     def __init__(

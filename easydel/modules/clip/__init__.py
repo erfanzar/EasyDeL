@@ -54,7 +54,7 @@ Usage Example:
     import jax
     import jax.numpy as jnp
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
 
     # Configure CLIP with ViT-B/32 vision and text encoders
     vision_config = CLIPVisionConfig(

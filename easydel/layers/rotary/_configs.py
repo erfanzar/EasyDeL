@@ -46,32 +46,73 @@ import chex  # pyright: ignore[reportMissingTypeStubs]
 
 @chex.dataclass
 class RopeConfig:
-    """
-    Configuration class for RoPE (Rotary Position Embedding) parameters.
+    """Discriminated union of every RoPE scaling-method configuration EasyDeL supports.
 
-    Stores the configuration related to RoPE type and its scaling parameters,
-    making it easy to manage and pass around RoPE settings.
+    A single dataclass deliberately covers all rotary-embedding variants
+    (default, linear, dynamic NTK, YaRN, Llama-3, Phi-3 long-RoPE, Deepseek
+    YaRN, multimodal MRoPE) so that model configs can carry one field —
+    ``rope_scaling`` — and downstream :func:`get_rope` / :func:`get_frequencies`
+    dispatchers can branch on ``rope_type`` while pulling only the fields
+    they need. Fields that don't apply to the active scaling method are
+    simply left as ``None`` and dropped by :meth:`to_dict`.
+
+    The HuggingFace ecosystem uses two different field names depending on the
+    model (``type`` vs ``rope_type``, ``scaling_factor`` vs ``factor``);
+    :meth:`from_dict` and :meth:`update` normalize both forms so loaders
+    don't need per-architecture branches.
 
     Attributes:
-        rope_type (str): The type of RoPE scaling to use (e.g., "default", "linear", "yarn", "llama3").
-                         Defaults to "default".
-        factor (tp.Optional[float]): General scaling factor used by some types (linear, dynamic, yarn, llama3).
-        low_freq_factor (tp.Optional[float]): Specific factor for Llama3 scaling.
-        high_freq_factor (tp.Optional[float]): Specific factor for Llama3 scaling.
-        original_max_position_embeddings (tp.Optional[int]): Original context window size,
-                                                            required by some scaling methods
-                                                            (yarn, llama3, phi3, deepseek).
-        long_factor (tp.Optional[float]): Specific factor for Phi3 LongRoPE scaling (used for lengths > original).
-        short_factor (tp.Optional[float]): Specific factor for Phi3 LongRoPE scaling (used for lengths <= original).
-        long_mscale (tp.Optional[float]): Potentially used by variants like Phi3. (Not used in current `get_rope`).
-        short_mscale (tp.Optional[float]): Potentially used by variants like Phi3. (Not used in current `get_rope`).
-        # Add other potential scaling parameters here as needed (e.g., from YaRN, Deepseek)
-        extrapolation_factor (tp.Optional[float]): YaRN/Deepseek parameter.
-        attn_factor (tp.Optional[float]): YaRN/Deepseek parameter.
-        beta_fast (tp.Optional[int]): YaRN/Deepseek parameter.
-        beta_slow (tp.Optional[int]): YaRN/Deepseek parameter.
-        mscale (tp.Optional[float]): Deepseek parameter.
-        mscale_all_dim (tp.Optional[float]): Deepseek parameter.
+        rope_type (str): Discriminator that selects the scaling routine in
+            :mod:`easydel.layers.rotary._compute_fns`. One of
+            ``"default" | "linear" | "dynamic" | "yarn" | "llama3" | "phi3" |
+            "longrope" | "deepseek_yarn" | "mrope"``. Defaults to
+            ``"default"`` (vanilla RoPE, no scaling).
+        factor (float | None): Generic scaling factor. For ``"linear"`` it
+            divides the position index; for ``"dynamic"`` it scales the base;
+            for ``"yarn"`` and ``"deepseek_yarn"`` it is the target
+            context-length multiplier; for ``"llama3"`` it gates the
+            piecewise frequency rescale. Required by every method except
+            ``"default"`` and ``"phi3"``.
+        low_freq_factor (float | None): Llama-3 piecewise frequency cutoff
+            (low-frequency boundary in wavelengths-per-original-context).
+        high_freq_factor (float | None): Llama-3 piecewise frequency cutoff
+            (high-frequency boundary).
+        original_max_position_embeddings (int | None): Original training
+            context length. Required by every length-extending method
+            (``yarn``, ``llama3``, ``phi3`` / ``longrope``, ``deepseek_yarn``)
+            so the scaler can compute the *ratio* between deployed and
+            trained context.
+        long_factor (float | None): Phi-3 LongRoPE per-frequency scaling
+            list applied when the runtime sequence exceeds
+            ``original_max_position_embeddings``.
+        short_factor (float | None): Phi-3 LongRoPE per-frequency scaling
+            list applied within the original context window.
+        long_mscale (float | None): Phi-3 / DeepSeek post-rotation magnitude
+            scale applied for long contexts (``sqrt(1 + log(s)/log(orig))``).
+        short_mscale (float | None): Phi-3 / DeepSeek magnitude scale used
+            for short contexts.
+        extrapolation_factor (float | None): YaRN extrapolation mix factor
+            (interpolates between linear-PI and NTK regimes).
+        attn_factor (float | None): YaRN attention temperature multiplier
+            applied after rotation; compensates for log-scaled softmax.
+        beta_fast (int | None): YaRN/DeepSeek "fast" boundary in
+            wavelengths-per-original-context (rotations beyond which we
+            extrapolate as-is).
+        beta_slow (int | None): YaRN/DeepSeek "slow" boundary
+            (rotations within which we apply linear-PI scaling).
+        mscale (float | None): DeepSeek magnitude scale parameter (default 1.0).
+        mscale_all_dim (float | None): DeepSeek magnitude scale applied to
+            every head-dim coordinate (vs. only the rotated half).
+        mrope_interleaved (bool | None): Multimodal-RoPE flag: when ``True``
+            the temporal/height/width axes are interleaved coordinate-wise,
+            when ``False`` (the Qwen2-VL default) they are concatenated
+            into contiguous halves.
+        mrope_section (list[int] | None): Multimodal-RoPE per-axis section
+            sizes, e.g. ``[t, h, w]`` summing to ``head_dim // 2``.
+        repetition_style (bool | None): Selects between Llama-style
+            ``[cos, sin]`` interleaving and GPT-NeoX-style halved layout
+            for the trailing rotation; consumed by
+            :func:`apply_rotary_emb`.
     """
 
     rope_type: str = "default"

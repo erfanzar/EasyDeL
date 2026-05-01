@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Phi model implementation for EasyDeL.
+
+This module implements Microsoft's Phi family of small but capable
+transformer language models. Phi uses a compact decoder-only architecture
+with the following notable features:
+
+- Partial rotary position embeddings (RoPE applied to a fraction of head dims)
+- Optional query/key layer normalization (``qk_layernorm``)
+- Standard ``LayerNorm`` (rather than RMSNorm) on the full hidden size
+- Two-layer feedforward block with configurable activation
+- Attention output projection named ``dense`` (legacy Phi convention)
+
+The module exposes :class:`PhiModel` (encoder of hidden states) and the
+task-specific wrapper :class:`PhiForCausalLM` (causal language modeling).
+"""
 
 import functools
 from typing import ClassVar
@@ -611,6 +626,13 @@ class PhiModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

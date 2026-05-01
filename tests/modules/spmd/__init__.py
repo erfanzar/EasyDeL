@@ -1,2 +1,1 @@
 """SPMD module runtime tests."""
-

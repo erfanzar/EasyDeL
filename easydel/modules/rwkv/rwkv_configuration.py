@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the RWKV model family.
+
+Defines :class:`RwkvConfig`, the EasyDeL configuration object for the
+RWKV recurrent-attention architecture (linear-time time-mix + channel-mix
+blocks parameterized by per-channel decay/key/receptance vectors). The
+configuration captures embedding dimension, number of layers, intermediate
+size, attention/feed-forward hidden sizes, and rescaling/init factors.
+"""
 
 import typing
 
@@ -82,6 +90,14 @@ class RwkvConfig(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
     ) -> None:
+        """Initialize RwkvConfig.
+
+        See the class docstring for parameter semantics. Note that
+        ``attention_hidden_size`` defaults to ``hidden_size`` and
+        ``intermediate_size`` defaults to ``4 * hidden_size`` when left
+        unspecified. ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
         self.vocab_size = vocab_size

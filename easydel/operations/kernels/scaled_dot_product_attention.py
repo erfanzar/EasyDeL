@@ -135,7 +135,24 @@ class ScaledDotProductAttn(OperationImpl):
         dropout_prob: float = 0.0,
         normalize_output: bool = True,
     ) -> tuple[str, ...]:
-        """Returns attention features that the SDPA fallback cannot preserve."""
+        """Return attention features that the SDPA fallback cannot preserve.
+
+        Used by other operators (e.g. Flash Attention) before delegating to
+        SDPA as a multi-host fallback so they can fail loudly rather than
+        silently lose semantics.
+
+        Args:
+            softmax_aux: Sink-token logits; SDPA does not support these.
+            logits_soft_cap: Logit soft-cap value; not preserved by SDPA.
+            dropout_prob: Dropout probability; non-zero is not preserved.
+            normalize_output: When ``False`` SDPA still normalizes, hence
+                the inconsistency.
+
+        Returns:
+            tuple[str, ...]: Names of features that would be silently
+            dropped by an SDPA fallback. Empty when SDPA can faithfully
+            reproduce the requested behaviour.
+        """
         unsupported_features: list[str] = []
         if softmax_aux is not None:
             unsupported_features.append("softmax_aux")
@@ -163,26 +180,39 @@ class ScaledDotProductAttn(OperationImpl):
         cum_seqlens_k: Int[Array, "batch"] | None = None,  # noqa
         **ignore,
     ) -> AttentionOutput:
-        """
-        Computes attention using `jax.nn.dot_product_attention` with the "xla" implementation.
+        """Run scaled dot-product attention via the ejkernel SDPA wrapper.
 
-        This is typically used for CPU and TPU backends. It applies sharding via `shard_map`.
+        Dispatches to ``jax.nn.dot_product_attention`` (or its cuDNN /
+        Flash-Attention specialization) under ``shard_map`` so that the
+        choice of underlying implementation is left to JAX.
 
         Args:
-            query: Query tensor (B, T, H, D).
-            key: Key tensor (B, S, H_kv, D).
-            value: Value tensor (B, S, H_kv, D_v).
-            attention_mask: Optional boolean attention_mask (broadcastable to B, 1, T, S).
-                Passed directly to the primitive.
-            bias: Optional attention bias tensor (broadcastable to B, H, T, S).
-                Passed directly to the primitive. If bias is provided, `causal` is forced to False.
-            init_bias: Optional callable to initialize bias if attention_mask/bias are None.
-            causal: If True and `bias` is None, applies causal masking within the primitive.
-            **ignore: Ignored keyword arguments.
+            query: Query tensor of shape ``(batch, seq_len, num_q_heads,
+                head_dim)``.
+            key: Key tensor of shape ``(batch, kv_len, num_kv_heads,
+                head_dim)``.
+            value: Value tensor with the same shape convention as ``key``.
+            mask_info: Optional :class:`MaskInfo` describing the attention
+                pattern.
+            bias: Optional attention-bias tensor ``(batch, num_heads,
+                seq_len, kv_len)`` added to logits before softmax.
+            init_bias: Optional zero-arg callable used to lazily build a
+                bias when neither ``mask_info`` nor ``bias`` is provided.
+            softmax_scale: Logits scaling factor; defaults to
+                ``1 / sqrt(head_dim)``.
+            causal: Whether to apply causal masking. Forced ``False`` in
+                decode mode.
+            sliding_window: Sliding-window size or ``(left, right)`` tuple.
+            cum_seqlens_q: Cumulative query sequence lengths for variable-
+                length packing, shape ``(batch + 1,)``.
+            cum_seqlens_k: Cumulative key/value sequence lengths for
+                variable-length packing, shape ``(batch + 1,)``.
+            **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
-            An `AttentionOutput` object. Note that `jax.nn.dot_product_attention`
-            typically does not return attention weights.
+            AttentionOutput: ``attention_outputs`` of shape ``(batch,
+            seq_len, num_q_heads, head_dim)``. ``attention_weights`` is
+            ``None`` (SDPA does not materialize them).
         """
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
@@ -296,14 +326,17 @@ class ScaledDotProductAttn(OperationImpl):
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-        """CPU forward pass. Delegates to `forward_native` (AUTO-DETECT implementation).
+        """CUDA forward pass; delegates to :meth:`forward_native`.
+
+        ``jax.nn.dot_product_attention`` will auto-detect cuDNN / Flash
+        Attention support on the underlying device.
 
         Args:
-            *args: Positional arguments for attention calculation.
-            **kwargs: Keyword arguments for attention calculation.
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
 
         Returns:
-            AttentionOutput: Result from XLA-optimized implementation.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
@@ -336,24 +369,27 @@ class ScaledDotProductAttn(OperationImpl):
         cum_seqlens_k: Int[Array, "batch"] | None = None,  # noqa
         **ignore,
     ) -> AttentionOutput:
-        """
-        Executes the Scaled Dot Product Attention computation using the appropriate backend.
-
-        Calls the relevant backend-specific forward method (`forward_cuda`, `forward_native`)
-        via the `super().__call__` dispatch mechanism based on the metadata's backend setting.
+        """Run SDPA, dispatching to the backend-specific forward method.
 
         Args:
-            query: Query tensor.
-            key: Key tensor.
-            value: Value tensor.
-            attention_mask: Optional attention_mask.
-            bias: Optional attention bias.
-            init_bias: Optional callable to initialize bias.
-            causal: Boolean indicating if causal masking should be applied.
-            **ignore: Additional ignored keyword arguments.
+            query: Query tensor ``(batch, seq_len, num_q_heads, head_dim)``.
+            key: Key tensor ``(batch, kv_len, num_kv_heads, head_dim)``.
+            value: Value tensor with the same shape convention as ``key``.
+            mask_info: Optional :class:`MaskInfo`.
+            bias: Optional attention-bias tensor.
+            init_bias: Optional zero-arg callable used to materialize a bias
+                tensor when none was supplied.
+            softmax_scale: Logits scaling factor.
+            causal: Whether to apply causal masking.
+            sliding_window: Sliding-window size or ``(left, right)`` tuple.
+            cum_seqlens_q: Cumulative query sequence lengths for packed
+                attention.
+            cum_seqlens_k: Cumulative key/value sequence lengths for packed
+                attention.
+            **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return super().__call__(
             query=query,

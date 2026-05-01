@@ -165,6 +165,24 @@ class AgenticMoshPitConfig(GRPOConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Finalize Agentic-MoshPit-specific config invariants.
+
+        Aligns ``num_generations`` and ``num_return_sequences`` with the
+        configured ``group_size`` when they were left at their defaults,
+        delegates to the GRPO base for shared validation, then validates
+        ``reward_mode`` and ``advantage_estimator`` against the supported
+        choices.
+
+        Args:
+            max_sequence_length: Forwarded to the GRPO ``__post_init__``
+                for legacy alias handling.
+            quantization_block: Forwarded to the GRPO ``__post_init__``
+                for legacy alias handling.
+
+        Raises:
+            ValueError: If ``reward_mode`` or ``advantage_estimator`` is
+                not one of the supported values.
+        """
         if self.num_generations is None and self.num_return_sequences == 4:
             self.num_return_sequences = self.group_size
             self.num_generations = self.group_size

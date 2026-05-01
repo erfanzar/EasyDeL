@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Contrastive Preference Optimization (CPO) trainer entry point.
+
+CPO drops the reference model entirely and minimises a max-margin
+preference loss with an auxiliary supervised log-likelihood term on the
+chosen response.  This package re-exports :class:`CPOConfig` and
+:class:`CPOTrainer`; algorithm internals live in :mod:`._fn`.
+"""
 
 from .cpo_config import CPOConfig
 from .cpo_trainer import CPOTrainer

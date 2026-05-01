@@ -59,6 +59,21 @@ PromoteDtypeFn = tp.Callable[..., tuple]
 
 
 def _promote_dtype(values, *, dtype=None, inexact=None):
+    """Cast a tuple of arrays to a common dtype.
+
+    Used by :class:`Embed` to align embedding weights with the queried
+    inputs before performing the lookup or matrix multiply.
+
+    Args:
+        values: Iterable of arrays (or array-like values) to promote.
+        dtype: Target dtype. If ``None``, the values are returned unchanged.
+        inexact: Unused; kept for compatibility with the upstream ``flax``/
+            ``spectrax`` ``promote_dtype`` signature.
+
+    Returns:
+        Tuple of arrays cast to ``dtype`` if it was provided, otherwise the
+        original ``values`` argument unchanged.
+    """
     if dtype is None:
         return values
     return tuple(jnp.asarray(v, dtype=dtype) for v in values)
@@ -75,11 +90,45 @@ which is standard practice for embedding layers to maintain proper gradient flow
 class Embed(spx.Module):
     """Embedding layer that converts integer indices to dense vector representations.
 
-    Note: overrides ``__setattr__`` to allow JAX dtype values (e.g. ``jnp.float32``)
-    which are not recognised as static scalars by the base :class:`spectrax.Module`.
+    Maps integer token indices in the range ``[0, num_embeddings)`` into a
+    learnable dense matrix of shape ``(num_embeddings, features)``. The forward
+    pass is a straightforward gather (``jnp.take``) and the :meth:`attend`
+    method exposes the same matrix as a logit projection so the layer can be
+    used in weight-tied language model heads.
+
+    The embedding weight is registered as a column-wise sharded
+    :class:`spectrax.Parameter` so that vocabulary-parallel embedding tables
+    work transparently across model-parallel meshes.
+
+    Attributes:
+        weight: Parameter of shape ``(num_embeddings, features)`` holding the
+            embedding lookup table. Sharded column-wise.
+        num_embeddings: Vocabulary size (number of distinct tokens).
+        features: Embedding dimensionality.
+        dtype: Computation dtype; weights are cast to this dtype before lookup.
+        param_dtype: Storage dtype for the parameter (may differ from ``dtype``
+            for mixed-precision training; e.g. fp4/fp8 storage).
+        embedding_init: Initializer used to populate the weight matrix.
+        promote_dtype: Callable used to promote tensors to a common dtype
+            before lookup or attend.
+
+    Note:
+        Overrides ``__setattr__`` to allow JAX dtype values (e.g.
+        ``jnp.float32``) which are not recognised as static scalars by the
+        base :class:`spectrax.Module`.
     """
 
     def __setattr__(self, name: str, value: tp.Any) -> None:
+        """Set an attribute, falling back to ``object.__setattr__`` for JAX dtypes.
+
+        Args:
+            name: Attribute name to set.
+            value: Value to assign. JAX dtype values are accepted even though
+                the parent ``spectrax.Module`` rejects them as non-static.
+
+        Returns:
+            None.
+        """
         if name.startswith("_"):
             object.__setattr__(self, name, value)
             return
@@ -99,7 +148,6 @@ class Embed(spx.Module):
         promote_dtype: PromoteDtypeFn = _promote_dtype,
         rngs: spx.Rngs,
     ):
-        super().__init__()
         """Initialize the embedding layer.
 
         Args:
@@ -124,6 +172,7 @@ class Embed(spx.Module):
             When param_dtype is jnp.float4_e2m1fn, the embedding is initialized
             in float32 to avoid numerical issues during initialization.
         """
+        super().__init__()
         param_to_init = param_dtype
         if param_dtype in [jnp.float4_e2m1fn]:
             param_to_init = jnp.float32

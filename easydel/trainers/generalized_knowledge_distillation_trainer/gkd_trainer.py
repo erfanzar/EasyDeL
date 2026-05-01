@@ -47,21 +47,35 @@ logger = get_logger(__name__)
 
 @Registry.register("trainer", "gkd")
 class GKDTrainer(SFTTrainer):
-    """Generalized Knowledge Distillation trainer with optional on-policy sampling.
+    """Trainer for Generalized Knowledge Distillation (GKD).
 
-    Implements GKD training which distills knowledge from a teacher model to a student
-    model using a generalized Jensen-Shannon divergence objective. Supports on-policy
-    sampling where student-generated completions are used for training.
+    Implements the GKD objective from Agarwal et al. 2024: a
+    generalized Jensen-Shannon divergence loss between the student
+    and teacher next-token distributions, interpolated by ``beta``
+    (``0`` -> forward KL, ``1`` -> reverse KL, ``0.5`` -> standard
+    JSD). Optionally injects *on-policy* training data by sampling
+    student completions with probability ``lmbda`` and replacing the
+    supervised batch with those rollouts, mitigating the
+    distribution-shift problem of offline distillation. With
+    ``seq_kd=True`` the trainer also pre-generates the batch with
+    the teacher (sequence-level KD) before any student-side
+    processing.
 
-    Args:
-        arguments: GKD-specific training configuration.
-        processing_class: Tokenizer or processor for text encoding.
-        model: Student model to train (EasyDeLBaseModule or EasyDeLState).
-        teacher_model: Teacher model for distillation.
-        train_dataset: Training dataset.
-        eval_dataset: Optional evaluation dataset.
-        formatting_func: Optional function to format dataset examples.
-        data_collator: Optional custom data collator.
+    Inherits the SFT data plumbing (chat-template tokenisation,
+    packing, ``response_template`` masking, ...) from
+    :class:`SFTTrainer`.
+
+    See :func:`generalized_jsd_loss` for the loss form and
+    :func:`gkd_step` for the per-step pipeline.
+
+    Attributes:
+        arguments: :class:`GKDConfig` controlling JSD/teacher knobs and
+            the inherited ``SFTConfig``/``TrainingArguments`` surface.
+        teacher_state: Frozen teacher :class:`EasyDeLState`. Required
+            for the loss; constructed from ``teacher_model`` in
+            ``__init__``.
+        lmbda: Cached on-policy sampling probability per batch.
+        seq_kd: Cached sequence-level KD flag.
     """
 
     arguments: GKDConfig
@@ -77,6 +91,27 @@ class GKDTrainer(SFTTrainer):
         formatting_func: tp.Callable | None = None,
         data_collator: DataCollatorForCompletionOnlyLM | None = None,
     ):
+        """Initialize the GKD trainer.
+
+        Resolves the student and teacher into :class:`EasyDeLState`
+        objects, configures the on-policy mixing ratio ``lmbda``, the
+        sequence-KD flag, and forwards construction to the SFT trainer
+        which provides completion-only-loss preprocessing.
+
+        Args:
+            arguments: GKD-specific training configuration.
+            processing_class: Tokenizer/processor for SFT preprocessing.
+            model: Student module or state.
+            teacher_model: Frozen teacher module/state.
+            train_dataset: SFT-style training dataset.
+            eval_dataset: Optional evaluation dataset.
+            formatting_func: Optional formatting callable forwarded to
+                the SFT preprocessing pipeline.
+            data_collator: Optional custom completion-only collator.
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`GKDConfig`.
+        """
         if not isinstance(arguments, GKDConfig):
             raise TypeError(f"`arguments` must be a `GKDConfig`, received {type(arguments)}.")
 
@@ -139,10 +174,20 @@ class GKDTrainer(SFTTrainer):
             logger.warning("Failed to initialize GKD generation function, on-policy sampling disabled: %s", exc)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure JIT-compiled training and evaluation functions.
+        """Build the JIT-compiled GKD training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, captures
+        the JSD ``beta`` / ``temperature`` plus loss / partition spec
+        arguments, and compiles :func:`gkd_step` once for training
+        (with student state donation and the active MPMD pipeline
+        schedule) and once for evaluation. The teacher state's
+        sharding spec is threaded into the input shardings so the
+        compiled step can run the teacher forward in place.
 
         Returns:
-            Configuration containing compiled step functions and mesh.
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)

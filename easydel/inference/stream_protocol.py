@@ -590,6 +590,20 @@ class ResponsesStreamAccumulator:
         final_response_overrides: ResponsesFinalizationOptions | dict[str, tp.Any] | None = None,
         created_at: int | None = None,
     ):
+        """Initialize a single-use Responses-API streaming accumulator.
+
+        Args:
+            response_id: Identifier embedded in every emitted event so the
+                client can correlate frames with the response.
+            model: Model name echoed in the response object.
+            include_reasoning_summary: Whether to surface reasoning text as
+                its own ``reasoning`` output item.
+            final_response_overrides: Optional finalization overrides applied
+                via ``model_copy`` to the completed :class:`ResponsesResponse`.
+                Accepts a typed object or a dict.
+            created_at: Unix timestamp embedded in the skeleton response;
+                defaults to the current time.
+        """
         self.response_id = response_id
         self.model = model
         self.include_reasoning_summary = include_reasoning_summary
@@ -616,10 +630,28 @@ class ResponsesStreamAccumulator:
 
     @staticmethod
     def _primary_output(output: RequestOutputLike) -> CompletionOutputLike | None:
+        """Return the first beam/sample of an engine snapshot, or ``None``.
+
+        Args:
+            output: The engine snapshot to inspect.
+
+        Returns:
+            The first :class:`CompletionOutputLike` if present, else ``None``.
+        """
         return output.outputs[0] if output.outputs else None
 
     @staticmethod
     def _json_dump_arguments(arguments: tp.Any) -> str:
+        """Serialize tool-call arguments into a stable JSON string.
+
+        Args:
+            arguments: The arguments payload (string, dict, list, or other).
+
+        Returns:
+            A JSON-encoded string for dict/list inputs, the original string
+            when given one, or ``str(arguments)`` for scalars; ``""`` for
+            ``None``.
+        """
         if isinstance(arguments, str):
             return arguments
         if isinstance(arguments, (dict, list)):
@@ -627,6 +659,15 @@ class ResponsesStreamAccumulator:
         return "" if arguments is None else str(arguments)
 
     def _frame(self, event: str, payload: tp.Any) -> StreamEventFrame:
+        """Wrap an event name and payload as a :class:`StreamEventFrame`.
+
+        Args:
+            event: SSE event name (for example ``"response.created"``).
+            payload: Event payload object.
+
+        Returns:
+            A :class:`StreamEventFrame` ready to be serialized.
+        """
         return StreamEventFrame(event=event, payload=payload)
 
     def initial_frames(self) -> list[StreamEventFrame]:
@@ -648,6 +689,16 @@ class ResponsesStreamAccumulator:
         return [self._frame("response.created", ResponseCreatedEvent(response=response))]
 
     def _ensure_reasoning_item(self, initial_text: str = "") -> list[StreamEventFrame]:
+        """Lazily create the reasoning output item and emit its ``added`` frame.
+
+        Args:
+            initial_text: Optional initial reasoning text to seed the summary.
+
+        Returns:
+            A list with the single ``response.output_item.added`` frame on
+            first call, or an empty list when the reasoning item already
+            exists.
+        """
         if self.reasoning_state is not None:
             return []
 
@@ -667,6 +718,13 @@ class ResponsesStreamAccumulator:
         ]
 
     def _ensure_message_item(self) -> list[StreamEventFrame]:
+        """Lazily create the assistant message item and emit its opening frames.
+
+        Returns:
+            A list of frames containing ``response.output_item.added`` and
+            ``response.content_part.added`` on first call, or an empty list
+            when the message item already exists.
+        """
         if self.message_state is not None:
             return []
 
@@ -699,6 +757,23 @@ class ResponsesStreamAccumulator:
         call_index: int,
         call_id: str | None,
     ) -> tuple[FunctionCallStreamState, list[StreamEventFrame]]:
+        """Return (or create) the state tracker for a streaming function call.
+
+        Function-call state is keyed by ``call_id`` when one is supplied
+        (most engines emit stable IDs after the first chunk) and otherwise
+        by the positional ``call_index`` so partial-name deltas stay
+        attached to the right item.
+
+        Args:
+            call_index: Positional index of the call within the engine's
+                ``delta_tool_calls`` array.
+            call_id: Optional stable identifier emitted by the engine.
+
+        Returns:
+            Tuple of (state, frames). ``frames`` contains the
+            ``response.output_item.added`` event when this call was
+            encountered for the first time and is otherwise empty.
+        """
         if isinstance(call_id, str) and call_id:
             call_key = call_id
             resolved_call_id = call_id

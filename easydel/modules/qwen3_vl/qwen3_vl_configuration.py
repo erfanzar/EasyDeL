@@ -71,6 +71,12 @@ class Qwen3VLVisionConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize Qwen3VLVisionConfig.
+
+        See the class docstring for parameter semantics; ``**kwargs`` are
+        forwarded to :class:`EasyDeLBaseConfig` for the standard EasyDeL
+        configuration plumbing (sharding, dtype, etc.).
+        """
         super().__init__(**kwargs)
         self.depth = depth
         self.hidden_size = hidden_size
@@ -149,6 +155,14 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize Qwen3VLTextConfig.
+
+        See the class docstring for parameter semantics. ``layer_types``
+        controls per-layer attention type (e.g. ``"full_attention"`` vs
+        ``"sliding_attention"``); when ``None`` it defaults to all
+        full-attention layers. ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -177,7 +191,22 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
             self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
-        """Get attention mask details for sliding window attention."""
+        """Build the per-layer sliding-window mask metadata.
+
+        Qwen3-VL applies a sliding-window causal mask to the first
+        ``max_window_layers`` decoder layers, then switches to plain
+        causal (full) attention for the remaining layers. This method
+        returns the explicit ``layer_idx -> AttnMaskDetail`` mapping
+        for the sliding-window layers; layers omitted from the mapping
+        fall back to the default full-causal mask.
+
+        The mapping is consumed by EasyDeL's attention dispatcher to
+        select between sliding-window and full kernels at JIT-time.
+
+        Returns:
+            dict[int, AttnMaskDetail]: One entry per sliding layer,
+            empty when sliding windowing is disabled by config.
+        """
         mapping = {}
         if self.sliding_window is not None and self.use_sliding_window:
             for layer_idx in range(self.num_hidden_layers):
@@ -224,6 +253,15 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize Qwen3VLConfig.
+
+        Accepts ``vision_config`` and ``text_config`` either as dicts (in
+        which case they are constructed via the registered sub-config
+        classes) or as already-built configuration objects. Token IDs
+        identify the placeholder positions where image/video features are
+        merged into the text token sequence. ``**kwargs`` are forwarded
+        to :class:`EasyDeLBaseConfig`.
+        """
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Qwen3 model family.
+
+Defines :class:`Qwen3Config`, the EasyDeL configuration object for
+Alibaba's Qwen3 dense decoder-only architecture. Builds on Qwen2 with
+RMSNorm-based per-head Q/K normalization, refined RoPE/scaling options,
+and per-layer attention type controls (e.g. sliding-window vs. full).
+"""
 
 from eformer.loggings import get_logger
 

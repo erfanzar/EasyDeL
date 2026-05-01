@@ -111,6 +111,14 @@ class _PyTreeNode:
     """
 
     def __init_subclass__(cls, **kwargs):
+        """Register subclasses as frozen dataclasses and JAX pytrees.
+
+        Args:
+            **kwargs: Forwarded to ``super().__init_subclass__``.
+
+        Returns:
+            None.
+        """
         super().__init_subclass__(**kwargs)
         dataclasses.dataclass(cls, frozen=True)
         jax.tree_util.register_pytree_with_keys(
@@ -121,6 +129,17 @@ class _PyTreeNode:
 
     @classmethod
     def _tree_flatten_with_keys(cls, obj):
+        """Flatten *obj* into pytree children plus typed auxiliary metadata.
+
+        Args:
+            obj: A frozen dataclass instance of this class.
+
+        Returns:
+            tuple: ``(children, aux)`` where ``children`` is a list of
+            ``(GetAttrKey, value)`` pairs for pytree-node fields and ``aux``
+            is a tuple of ``(name, static_value, pytree_node_bool)`` triples
+            preserving static-field values and ordering.
+        """
         fields = dataclasses.fields(obj)
         children = []
         aux = []
@@ -136,6 +155,16 @@ class _PyTreeNode:
 
     @classmethod
     def _tree_unflatten(cls, aux, children):
+        """Reconstruct an instance from auxiliary metadata and pytree children.
+
+        Args:
+            aux: Auxiliary tuple produced by :meth:`_tree_flatten_with_keys`.
+            children: Sequence of pytree-leaf values matching ``aux``'s
+                pytree-node positions.
+
+        Returns:
+            An instance of ``cls`` with all fields restored.
+        """
         kwargs = {}
         child_idx = 0
         for name, val, pytree_node in aux:
@@ -147,10 +176,35 @@ class _PyTreeNode:
         return cls(**kwargs)
 
     def replace(self, **kwargs):
+        """Return a copy of this dataclass with selected fields overridden.
+
+        Args:
+            **kwargs: Field overrides forwarded to :func:`dataclasses.replace`.
+
+        Returns:
+            A new instance with the requested fields replaced.
+        """
         return dataclasses.replace(self, **kwargs)
 
 
 def _field(pytree_node=True, default=dataclasses.MISSING, default_factory=dataclasses.MISSING, **kwargs):
+    """Build a dataclass field tagged with ``pytree_node`` metadata.
+
+    Mirrors the SpecTrax ``struct.field`` API used elsewhere in EasyDeL so
+    that :class:`_PyTreeNode` subclasses can declare which fields participate
+    in pytree flattening.
+
+    Args:
+        pytree_node: If ``True`` the field is a pytree leaf; if ``False`` it
+            is treated as static auxiliary data.
+        default: Optional default value (passed straight to
+            :func:`dataclasses.field`).
+        default_factory: Optional zero-arg factory for default values.
+        **kwargs: Extra arguments forwarded to :func:`dataclasses.field`.
+
+    Returns:
+        dataclasses.Field: A configured dataclass field descriptor.
+    """
     metadata = dict(kwargs.pop("metadata", {}))
     metadata["pytree_node"] = pytree_node
     if default_factory is not dataclasses.MISSING:
@@ -632,6 +686,16 @@ class EasyDeLState(_PyTreeNode):
 
     @staticmethod
     def _materialized_tree_partition_specs(tree: tp.Any) -> tp.Any:
+        """Materialize meta-leaves and return matching replicated PartitionSpecs.
+
+        Args:
+            tree: A pytree that may contain ``MetaArray`` placeholders.
+
+        Returns:
+            Any: A pytree with the same structure where each shape-bearing
+            leaf is mapped to ``PartitionSpec()`` (fully replicated) and
+            non-shape leaves are mapped to ``None``.
+        """
         tree = materialize_meta_leaves(tree, seed=42)
         return jax.tree_util.tree_map(
             lambda leaf: PartitionSpec() if hasattr(leaf, "shape") else None,
@@ -1055,6 +1119,16 @@ class EasyDeLState(_PyTreeNode):
         tx_template = tx_template if tx_template is not None else self.tx
 
         def _load_tensorstore(template):
+            """Restore optimizer state from a TensorStore-format checkpoint.
+
+            Args:
+                template: Optional pytree template guiding the restore. May
+                    be ``None`` when the checkpoint carries its own tree
+                    definition.
+
+            Returns:
+                Any: The restored optimizer-state pytree.
+            """
             return checkpointer.load_pytree(
                 mesh=self.model.mesh,
                 path=str(load_directory),

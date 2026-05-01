@@ -99,23 +99,65 @@ _QUANT_UNSET = object()
 
 
 class BuildTrainerKws(typing.TypedDict, total=False):
-    """Type hints for optional keyword arguments when building trainers.
+    """Optional, trainer-specific kwargs accepted by :meth:`eLargeModel.train` and friends.
+
+    Every field is ``NotRequired`` and may be safely omitted. The relevance of each
+    field depends on which trainer flavor (``trainer_type``) is selected on the ELM
+    config; supplying a kwarg that the chosen trainer does not understand is simply
+    forwarded to the underlying trainer constructor, which may ignore or reject it.
 
     Attributes:
-        data_collator: Custom data collator for batching examples
-        formatting_func: Function to format examples for SFT training
-        reward_processing_classes: Processing classes for reward models in GRPO
-        data_tokenize_fn: Custom tokenization function for data preprocessing
-        reference_model: Reference model for DPO/preference optimization
-        reward_model: Reward model for GRPO training
-        teacher_model: Teacher model for distillation training
-        reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers
-        external_reward_funcs: Additional external reward functions for RLVR
-        external_reward_processing_classes: Processing classes for RLVR external reward functions
-        external_reward_weights: Weights for RLVR external reward functions
-        feedback_func: Optional textual feedback callback for SDPO
-        env_factory: Environment factory for AgenticMoshPit trainer
-        tools: Tool instances for AgenticMoshPit trainer
+        data_collator: Callable invoked by the trainer's data loader to assemble
+            a batch of pre-tokenized examples into a single padded/packed dict of
+            ``jax.Array``-shaped tensors. Falls back to the trainer's built-in
+            collator (typically :class:`DataCollatorForCompletionOnlyLM` for SFT,
+            preference-pair collator for DPO/ORPO, etc.) when omitted.
+        formatting_func: SFT-specific callable mapping a single dataset row to
+            the rendered string used for tokenization. Useful when the dataset
+            does not already contain a ``text`` field and the user wants to
+            inject a chat template or instruction wrapper.
+        reward_processing_classes: List of HuggingFace ``PreTrainedTokenizer``
+            (or compatible) processors aligned with each entry in
+            ``reward_funcs``. Each processor tokenizes generated completions
+            before the matching reward function scores them; required when a
+            reward function expects pre-tokenized inputs.
+        data_tokenize_fn: Override for the dataset preprocessing step. When set,
+            replaces the trainer's default tokenization pipeline with this
+            callable for every example.
+        reference_model: Frozen reference :class:`EasyDeLBaseModule` used to
+            compute reference log-probabilities for KL/preference objectives
+            (DPO, ORPO, KTO, BCO, CPO, GRPO, ...). When ``None``, the trainer
+            either lazily reuses the policy snapshot or raises if a reference
+            is mandatory.
+        reward_model: Trained scalar :class:`EasyDeLBaseModule` whose forward
+            produces a per-sequence reward used by PPO and GRPO-style trainers.
+            Only consumed when no ``reward_funcs`` list is provided.
+        teacher_model: :class:`EasyDeLBaseModule` whose logits drive the
+            distillation losses in distillation/on-policy-distillation/SeqKD
+            and sparse distillation trainers.
+        reward_funcs: Single callable or list of callables of signature
+            ``(prompts, completions, **kwargs) -> list[float]`` consumed by
+            GRPO/SDPO/PPO-flavored trainers in lieu of (or in addition to) a
+            learned reward model.
+        external_reward_funcs: Auxiliary list of callables that augment the
+            primary RLVR/GRPO reward signal (e.g. format-checkers, math
+            verifiers, code-test runners) without replacing it.
+        external_reward_processing_classes: Tokenizers/processors paired
+            element-wise with ``external_reward_funcs`` for RLVR scoring.
+        external_reward_weights: Per-function scalar weights, aligned with
+            ``external_reward_funcs``, used to mix the external reward signals
+            into the final reward.
+        feedback_func: Callable returning textual feedback strings for SDPO.
+            Invoked once per (prompt, completion) pair after rollout to build
+            the self-distillation feedback context.
+        env_factory: Callable returning fresh agent environments for the
+            AgenticMoshPit trainer. Each call must return a new environment
+            instance so per-rollout seeding/state remains independent across
+            workers.
+        tools: List of tool implementations exposed to the agent under the
+            AgenticMoshPit trainer; typically aligned with ``tool_names`` on
+            the trainer config so that the registered names resolve to these
+            objects.
     """
 
     data_collator: NotRequired[typing.Callable]
@@ -891,12 +933,24 @@ class eLargeModel:
                 Can be int or "auto" (backend-dependent). Higher values
                 increase throughput but use more memory.
             use_tqdm: Show progress bar during evaluation (default: True)
-            **kwargs: Additional evaluation options:
-                - top_k: Top-k sampling parameter
-                - repetition_penalty: Penalty for repeated tokens
-                - num_beams: Beam search width (1 = greedy)
-                - do_sample: Whether to use sampling
-                - early_stopping: Stop generation at first EOS
+            **kwargs: Additional evaluation options typed by ``EvalKwargs``
+                (consumed via ``Unpack[EvalKwargs]``). All keys are stored on
+                the ``"eval"`` config section. Recognized keys include
+                ``num_fewshot``, ``chat_template_args``, ``think_start_token``,
+                ``think_end_token``, ``sampling_params``,
+                ``normalize_math_answers``, ``math_answer_task_hints``,
+                ``code_eval_num_workers``, ``code_eval_timeout``,
+                ``max_batch_size``, ``device``, ``use_cache``, ``limit``,
+                ``cache_requests``, ``rewrite_requests_cache``,
+                ``delete_requests_cache``, ``check_integrity``, ``write_out``,
+                ``log_samples``, ``evaluation_tracker``,
+                ``system_instruction``, ``apply_chat_template``,
+                ``fewshot_as_multiturn``, ``gen_kwargs``, ``task_manager``,
+                ``verbosity``, ``predict_only``, ``samples``,
+                ``bootstrap_iters``, ``random_seed``, ``numpy_random_seed``,
+                ``torch_random_seed``, ``fewshot_random_seed``,
+                ``confirm_run_unsafe_code``, ``metadata``, ``include_path``,
+                and ``include_defaults``.
 
         Returns:
             Self for method chaining
@@ -1534,18 +1588,36 @@ class eLargeModel:
                 auto-select based on trainer_type.
             trainer_class: Optional custom Trainer class. If None, will auto-select
                 based on trainer_type.
-            **build_kwargs: Additional kwargs for trainer building:
-                - data_collator: Custom data collator function
-                - formatting_func: Function to format examples (SFT)
-                - reward_processing_classes: Processing classes for rewards (GRPO)
-                - data_tokenize_fn: Custom tokenization function
-                - reference_model: Override reference model
-                - reward_model: Override reward model
-                - teacher_model: Override teacher model
-                - reward_funcs: Custom reward functions
-                - external_reward_funcs: Additional RLVR reward functions appended after built-in verifiers
-                - external_reward_processing_classes: Processing classes for RLVR external reward functions
-                - external_reward_weights: Weights for RLVR external reward functions
+            **build_kwargs: Trainer-construction overrides typed by
+                ``BuildTrainerKws`` (consumed via ``Unpack[BuildTrainerKws]``):
+
+                data_collator (Callable): Custom data collator for batching.
+                formatting_func (Callable): Function that formats examples
+                    for SFT training.
+                reward_processing_classes (list[Callable]): Processing classes
+                    for reward models in GRPO.
+                data_tokenize_fn (Callable): Custom tokenization function for
+                    data preprocessing.
+                reference_model (EasyDeLBaseModule | None): Reference model
+                    for DPO/preference optimization.
+                reward_model (EasyDeLBaseModule | None): Reward model for
+                    GRPO training.
+                teacher_model (EasyDeLBaseModule | None): Teacher model for
+                    distillation training.
+                reward_funcs (Any | None): Custom reward functions for
+                    GRPO/SDPO/PPO-style trainers.
+                external_reward_funcs (Any | None): Additional RLVR reward
+                    functions appended after built-in verifiers.
+                external_reward_processing_classes (list[Callable] | None):
+                    Processing classes for RLVR external reward functions.
+                external_reward_weights (list[float] | None): Weights for
+                    RLVR external reward functions.
+                feedback_func (Callable | None): Optional textual feedback
+                    callback for SDPO.
+                env_factory (Callable | None): Environment factory for the
+                    AgenticMoshPit trainer.
+                tools (list | None): Tool instances for the AgenticMoshPit
+                    trainer.
 
         Returns:
             Training results from the trainer, including metrics and final model state
@@ -2029,8 +2101,78 @@ class eLargeModel:
                 - HellaSwag: typically 0-shot
             output_path: Optional path to save evaluation results as JSON.
                 Results include detailed metrics, task versions, and configuration.
-            **eval_overrides: Additional lm-eval keyword arguments. These override
-                values from `set_eval()`/`config["eval"]` for this call only.
+            **eval_overrides: Per-call lm-eval overrides typed by
+                ``EvalKwargs`` (consumed via ``Unpack[EvalKwargs]``). These
+                override values from ``set_eval()``/``config["eval"]`` for
+                this call only. Recognized keys are:
+
+                num_fewshot (int | None): Number of few-shot examples; ``None``
+                    keeps the task default.
+                max_new_tokens (int): Maximum tokens to generate per prompt.
+                hard_max_new_tokens (bool): Strictly enforce
+                    ``max_new_tokens`` even when the task asks for more.
+                enable_thinking (bool): Enable chain-of-thought reasoning mode.
+                chat_template_args (dict | None): Extra args forwarded to the
+                    chat template formatter.
+                think_start_token (str | None): Token marking the start of a
+                    thinking block.
+                think_end_token (str | None): Token marking the end of a
+                    thinking block.
+                ignore_benchmark_eos_flags (bool): Ignore EOS flags from the
+                    benchmark task definitions.
+                temperature (float): Sampling temperature (``0.0`` = greedy).
+                top_p (float): Nucleus sampling probability threshold.
+                sampling_params (SamplingParams | dict | None): Optional fixed
+                    SamplingParams template used for all generations.
+                normalize_math_answers (bool): Normalize math answers before
+                    comparison.
+                math_answer_task_hints (Sequence[str] | str | None): Task name
+                    patterns where math normalization should apply.
+                code_eval_num_workers (int | None): Parallel worker count for
+                    code evaluation.
+                code_eval_timeout (float | int | None): Per-sample timeout for
+                    code execution.
+                batch_size (int | str | None): Evaluation batch size; can be
+                    ``"auto"``.
+                max_batch_size (int | None): Upper bound on auto batch size.
+                device (str | None): Device string for lm-eval.
+                use_cache (str | None): Path to cache evaluation requests.
+                limit (int | float | None): Limit number of examples (int) or
+                    fraction (float).
+                cache_requests (bool): Cache individual evaluation requests.
+                rewrite_requests_cache (bool): Overwrite existing request
+                    cache.
+                delete_requests_cache (bool): Delete request cache after
+                    evaluation.
+                check_integrity (bool): Verify dataset integrity before
+                    evaluation.
+                write_out (bool): Write detailed evaluation outputs.
+                log_samples (bool): Log individual sample results.
+                evaluation_tracker (Any | None): Optional evaluation tracker.
+                system_instruction (str | None): System instruction prepended
+                    to all prompts.
+                apply_chat_template (bool | str): Whether/which chat template
+                    to apply.
+                fewshot_as_multiturn (bool): Format few-shot as multi-turn.
+                gen_kwargs (str | dict | None): Additional generation kwargs.
+                task_manager (Any | None): Custom lm-eval TaskManager.
+                verbosity (Any): lm-eval logging verbosity level.
+                predict_only (bool): Run prediction only, skip scoring.
+                samples (dict | None): Pre-computed samples dict.
+                bootstrap_iters (int): Bootstrap iterations for confidence
+                    intervals.
+                random_seed (int | None): Global random seed.
+                numpy_random_seed (int | None): NumPy random seed.
+                torch_random_seed (int | None): PyTorch random seed.
+                fewshot_random_seed (int | None): Few-shot example selection
+                    seed.
+                confirm_run_unsafe_code (bool): Allow execution of untrusted
+                    code in evaluation.
+                metadata (dict | None): Additional metadata attached to
+                    results.
+                include_path (str | None): Path to additional lm-eval task
+                    definitions.
+                include_defaults (bool): Include built-in lm-eval tasks.
 
         Returns:
             Dictionary containing evaluation results with structure:
@@ -2175,9 +2317,27 @@ class eLargeModel:
             engine_instance: Provided eSurge engine and if it's None eLargeModel will build a new one.
                 This is useful if the caller wants to manage the engine lifecycle themselves
                 (e.g., for running multiple benchmark suites sequentially without restarting the engine each time).
-            **default_eval_overrides: Additional :class:`EvalKwargs` that serve as
-                defaults for every benchmark (individual benchmark entries can
-                still override them).
+            **default_eval_overrides: Suite-wide defaults typed by
+                ``EvalKwargs`` (consumed via ``Unpack[EvalKwargs]``); individual
+                benchmark entries may still override them. Recognized keys
+                mirror :meth:`eval`'s ``eval_overrides`` and include
+                ``num_fewshot``, ``max_new_tokens``, ``hard_max_new_tokens``,
+                ``enable_thinking``, ``chat_template_args``,
+                ``think_start_token``, ``think_end_token``,
+                ``ignore_benchmark_eos_flags``, ``temperature``, ``top_p``,
+                ``sampling_params``, ``normalize_math_answers``,
+                ``math_answer_task_hints``, ``code_eval_num_workers``,
+                ``code_eval_timeout``, ``batch_size``, ``max_batch_size``,
+                ``device``, ``use_cache``, ``limit``, ``cache_requests``,
+                ``rewrite_requests_cache``, ``delete_requests_cache``,
+                ``check_integrity``, ``write_out``, ``log_samples``,
+                ``evaluation_tracker``, ``system_instruction``,
+                ``apply_chat_template``, ``fewshot_as_multiturn``,
+                ``gen_kwargs``, ``task_manager``, ``verbosity``,
+                ``predict_only``, ``samples``, ``bootstrap_iters``,
+                ``random_seed``, ``numpy_random_seed``, ``torch_random_seed``,
+                ``fewshot_random_seed``, ``confirm_run_unsafe_code``,
+                ``metadata``, ``include_path``, and ``include_defaults``.
 
         Returns:
             A dict of the form ``{"benchmarks": {<name>: <lm-eval result dict>, ...}}``.

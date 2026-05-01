@@ -140,6 +140,19 @@ class DelegatingParser:
         tool_parser: ToolParser | None = None,
         tool_request: ChatCompletionRequest | None = None,
     ):
+        """Initialize the orchestrator with optional reasoning/tool parsers.
+
+        Args:
+            reasoning_parser: Parser used to detect and extract a reasoning
+                section from the model output. ``None`` disables reasoning
+                extraction and starts the state machine in
+                :attr:`ParsePhase.CONTENT`.
+            tool_parser: Parser used to detect tool calls in the visible
+                content. ``None`` disables tool-call extraction.
+            tool_request: Original chat-completion request used to look up
+                ``tools``/``tool_choice`` and decide whether tool calls are
+                actually permitted.
+        """
         self.reasoning_parser = reasoning_parser
         self.tool_parser = tool_parser
         self.tool_request = tool_request
@@ -162,11 +175,30 @@ class DelegatingParser:
         previous_text: str,
         fallback_delta: str = "",
     ) -> str:
-        """Compute a canonical visible-text delta from accumulated snapshots."""
+        """Compute a canonical visible-text delta from accumulated snapshots.
+
+        Thin wrapper around :func:`compute_stream_delta_text` exposed as a
+        method so subclasses can override the strategy.
+
+        Args:
+            current_text: Current cumulative visible content.
+            previous_text: Visible content prior to this delta.
+            fallback_delta: Engine-supplied delta used when prefix matching
+                fails.
+
+        Returns:
+            The newly visible text since ``previous_text``.
+        """
         return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
     def _merge_streamed_tool_call_state(self, delta_tool_calls: list | None) -> None:
-        """Accumulate streamed tool-call metadata for final delta synthesis."""
+        """Accumulate streamed tool-call metadata for final delta synthesis.
+
+        Args:
+            delta_tool_calls: Iterable of :class:`DeltaToolCall` instances or
+                raw dicts emitted during streaming. Invalid entries are
+                silently skipped.
+        """
 
         if not delta_tool_calls:
             return
@@ -196,7 +228,20 @@ class DelegatingParser:
                     state.function_arguments += tool_call.function.arguments
 
     def _build_missing_final_tool_deltas(self, tool_calls: list | None) -> list[DeltaToolCall] | None:
-        """Build final delta_tool_calls for any tool data not streamed earlier."""
+        """Build final delta_tool_calls for any tool data not streamed earlier.
+
+        Compares the tracked streaming state against the batch-extracted
+        tool calls and synthesizes a delta covering any missing function
+        names or arguments. This guarantees clients receive the full call
+        even when the streaming parser missed a portion.
+
+        Args:
+            tool_calls: Final batch-extracted tool calls.
+
+        Returns:
+            A list of synthesized :class:`DeltaToolCall` objects, or ``None``
+            when no catch-up deltas are required.
+        """
 
         if not tool_calls:
             return None
@@ -249,7 +294,17 @@ class DelegatingParser:
         accumulated_text: str,
         fallback_content: str,
     ) -> tuple[str, str | None]:
-        """Return the canonical visible content after reasoning extraction."""
+        """Return the canonical visible content after reasoning extraction.
+
+        Args:
+            accumulated_text: Full accumulated text from the engine.
+            fallback_content: Visible content to fall back to when the
+                reasoning parser cannot infer the visible portion.
+
+        Returns:
+            Tuple ``(visible_content, reasoning_text)`` where ``reasoning_text``
+            may be ``None`` when no reasoning section was detected.
+        """
 
         if self.reasoning_parser is None:
             return fallback_content, None
@@ -393,6 +448,19 @@ class DelegatingParser:
         Handles both REASONING phase and non-REASONING phase (where the model
         may start reasoning mid-stream). Transitions phase to CONTENT when the
         end token is detected.
+
+        Args:
+            result: Mutable :class:`ParseResult` updated in place with the
+                reasoning/content deltas and accumulated state.
+            accumulated_text: Full decoded text seen so far.
+            delta_text: Newly added text in this engine snapshot.
+            token_ids: All token IDs decoded so far.
+            prev_text: Decoded text up to the previous snapshot.
+            prev_token_ids: Token IDs up to the previous snapshot.
+
+        Returns:
+            Tuple ``(content_text, content_delta)`` describing the visible
+            content after reasoning has been peeled off.
         """
         content_text = self._raw_content_text
         content_delta = ""
@@ -493,7 +561,12 @@ class DelegatingParser:
         return content_text, content_delta
 
     def _get_tool_request(self) -> ChatCompletionRequest:
-        """Return the tool request, creating a dummy one if needed."""
+        """Return the tool request, creating a dummy one if needed.
+
+        Returns:
+            The original :class:`ChatCompletionRequest` if available, else
+            a minimal dummy request that satisfies tool-parser interfaces.
+        """
         if self.tool_request is not None:
             return self.tool_request
         return ChatCompletionRequest(
@@ -502,7 +575,12 @@ class DelegatingParser:
         )
 
     def _is_tools_enabled(self) -> bool:
-        """Check whether tool calling is actually enabled for this request."""
+        """Check whether tool calling is actually enabled for this request.
+
+        Returns:
+            ``True`` when the request declares tools and ``tool_choice`` is
+            not ``"none"``; ``False`` otherwise.
+        """
         if self.tool_request is None:
             return False
         tools = getattr(self.tool_request, "tools", None)
@@ -520,7 +598,15 @@ class DelegatingParser:
         content_delta: str,
         token_ids: list[int],
     ) -> None:
-        """Run tool parser on a streaming content delta. Mutates *result* in place."""
+        """Run tool parser on a streaming content delta. Mutates *result* in place.
+
+        Args:
+            result: Mutable :class:`ParseResult` updated in place with content
+                and tool-call deltas.
+            content_text: Cumulative visible content (post reasoning).
+            content_delta: Newly produced visible text since the last call.
+            token_ids: All token IDs decoded so far.
+        """
         tool_request = self._get_tool_request()
         tools_enabled = self._is_tools_enabled()
         previous_visible_content = self._accumulated_content
@@ -596,7 +682,13 @@ class DelegatingParser:
             result.delta_content = content_delta
 
     def _process_tool_final(self, result: ParseResult, content_for_tools: str) -> None:
-        """Run tool parser batch extraction on the final content. Mutates *result*."""
+        """Run tool parser batch extraction on the final content. Mutates *result*.
+
+        Args:
+            result: Mutable :class:`ParseResult` updated with batch-extracted
+                tool calls and any catch-up deltas.
+            content_for_tools: Final visible content fed to the tool parser.
+        """
         tool_request = self._get_tool_request()
         tools_enabled = self._is_tools_enabled()
         previous_visible_content = self._accumulated_content
@@ -627,7 +719,20 @@ class DelegatingParser:
             )
 
     def _tokenize_for_tool_view(self, text: str) -> list[int]:
-        """Tokenize text for the tool parser's independent view."""
+        """Tokenize text for the tool parser's independent view.
+
+        Tool parsers maintain their own token-id view starting after the
+        reasoning boundary. This helper encodes ``text`` with the parser's
+        tokenizer (when available) and gracefully handles tokenizers whose
+        ``encode`` method does not accept ``add_special_tokens``.
+
+        Args:
+            text: Visible content to tokenize.
+
+        Returns:
+            List of integer token IDs, or an empty list when no tokenizer
+            is available or encoding fails.
+        """
         if not text:
             return []
 

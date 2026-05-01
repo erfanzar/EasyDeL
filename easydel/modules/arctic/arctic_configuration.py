@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration definitions for the Arctic model.
+
+Defines :class:`ArcticConfig`, the configuration class for Snowflake Arctic — a
+hybrid dense/MoE transformer that interleaves dense layers with sparse MoE
+layers (default: every 2nd layer is MoE, 8 local experts, top-1 routing) on top
+of grouped-query attention with RoPE.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -147,6 +154,70 @@ class ArcticConfig(EasyDeLBaseConfig):
         rope_scaling: dict[str, str | float] | None = None,
         **kwargs,
     ):
+        """Initialize an :class:`ArcticConfig`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``32000``.
+            hidden_size (int, optional): Hidden dimension. Defaults to ``4096``.
+            intermediate_size (int, optional): Dense FFN intermediate width.
+                Defaults to ``14336``.
+            num_hidden_layers (int, optional): Number of decoder layers.
+                Defaults to ``32``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``32``.
+            num_key_value_heads (int | None, optional): KV heads for GQA.
+                ``None`` falls back to ``num_attention_heads``. Defaults to ``None``.
+            head_dim (int | None, optional): Per-head dimension. ``None`` derives
+                ``hidden_size // num_attention_heads``.
+            hidden_act (str, optional): Activation. Defaults to ``"silu"``.
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``4096``.
+            initializer_range (float, optional): Truncated-normal init stddev.
+                Defaults to ``0.02``.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-5``.
+            use_cache (bool, optional): Return KV caches. Defaults to ``True``.
+            pad_token_id (int | None, optional): Padding token id. Defaults to ``None``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``1``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``2``.
+            tie_word_embeddings (bool, optional): Tie embeddings. Defaults to ``False``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``1e6``.
+            sliding_window (int | None, optional): Sliding-window size, or ``None``
+                for full attention. Defaults to ``None``.
+            attention_dropout (float, optional): Attention dropout probability.
+                Defaults to ``0.0``.
+            num_experts_per_tok (int, optional): Top-k experts per token.
+                Defaults to ``1``.
+            num_local_experts (int, optional): Total experts per MoE layer.
+                Defaults to ``8``.
+            router_aux_loss_coef (float, optional): Weight on the router auxiliary
+                load-balancing loss. Defaults to ``0.001``.
+            moe_layer_frequency (int, optional): Insert one MoE layer every Nth
+                position. Defaults to ``2``.
+            parallel_attn_mlp_res (bool, optional): Use the parallel
+                attention/MLP residual path on MoE layers. Defaults to ``False``.
+            moe_train_capacity_factor (float, optional): Train-mode expert capacity
+                factor. Defaults to ``1``.
+            moe_eval_capacity_factor (float, optional): Eval-mode expert capacity
+                factor. Defaults to ``1``.
+            enable_expert_tensor_parallelism (bool, optional): Shard experts via
+                EP x TP. Defaults to ``False``.
+            moe_min_capacity (int, optional): Floor on per-expert capacity.
+                Defaults to ``0``.
+            moe_token_dropping (bool, optional): Drop overflow tokens at capacity.
+                Defaults to ``True``.
+            quantization (str | None, optional): Quantization tag. Defaults to ``None``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                Checkpointing strategy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            use_scan_mlp (bool, optional): Use ``scan`` over MLP chunks.
+                Defaults to ``False``.
+            scan_mlp_chunk_size (int, optional): Chunk size for MLP scan.
+                Defaults to ``1024``.
+            layer_types (list[str] | None, optional): Per-layer attention types.
+                ``None`` derives from ``sliding_window``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            rope_scaling (dict | None, optional): RoPE scaling spec. Defaults to ``None``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

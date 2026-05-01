@@ -31,11 +31,19 @@ from .base import ExpandTransform, Transform
 
 
 class TransformedShardedSource(ShardedDataSource[dict]):
-    """ShardedDataSource wrapper that applies transforms during iteration.
+    """:class:`ShardedDataSource` wrapper that applies a transform lazily on iteration.
 
-    Supports lazy evaluation - transforms are applied as examples are yielded.
-    Handles filter transforms by skipping filtered examples.
-    Handles expand transforms that yield multiple examples from one input.
+    Pass-through for shard discovery, metadata, and resumption — only
+    iteration is intercepted so the wrapped source's distributed/
+    checkpointable properties survive. Distinguishes the two
+    transform shapes at call time: regular :class:`Transform` instances
+    have their single result forwarded (or dropped on ``None``), while
+    :class:`ExpandTransform` instances have every yielded item
+    forwarded individually so a 1-to-many transform integrates
+    transparently.
+
+    Built by :meth:`ShardedDataSource.transform` /
+    :meth:`ShardedDataSource.filter` and friends.
 
     Example:
         >>> source = JsonShardedSource("data.jsonl")
@@ -46,22 +54,35 @@ class TransformedShardedSource(ShardedDataSource[dict]):
     """
 
     def __init__(self, source: ShardedDataSource[dict], transform: Transform | ExpandTransform):
-        """Initialize TransformedShardedSource.
+        """Capture the underlying source and the transform to apply on iteration.
 
         Args:
-            source: Underlying data source.
-            transform: Transform (or chain of transforms) to apply.
+            source: Wrapped :class:`ShardedDataSource`. All
+                shard-discovery and metadata calls are forwarded to
+                it unchanged.
+            transform: Either a :class:`Transform` (one-in / one-out
+                or filter) or an :class:`ExpandTransform` (one-in /
+                many-out). The shape is detected at iteration time
+                via ``isinstance``.
         """
         self._source = source
         self._transform = transform
 
     @property
     def shard_names(self) -> Sequence[str]:
-        """Return shard names from underlying source."""
+        """Return shard names from the underlying source.
+
+        Returns:
+            Pass-through of ``self._source.shard_names``.
+        """
         return self._source.shard_names
 
     def num_shards(self) -> int:
-        """Return number of shards from underlying source."""
+        """Return the number of shards from the underlying source.
+
+        Returns:
+            Pass-through of ``self._source.num_shards()``.
+        """
         return self._source.num_shards()
 
     def open_shard(self, shard_name: str) -> Iterator[dict]:
@@ -107,17 +128,34 @@ class TransformedShardedSource(ShardedDataSource[dict]):
                     yield result
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
-        """Get shard info from underlying source."""
+        """Pass through ``ShardInfo`` from the underlying source.
+
+        Args:
+            shard_name: Shard identifier to look up.
+
+        Returns:
+            ``ShardInfo`` for the shard, or whatever the underlying
+            source returns (potentially ``None``).
+        """
         return self._source.get_shard_info(shard_name)
 
     def __len__(self) -> int:
-        """Return length of underlying source.
+        """Return length of the underlying source.
 
-        Warning: This may be inaccurate if filter transforms are applied.
+        Warning:
+            May overcount when filter transforms are applied.
+
+        Returns:
+            ``len(self._source)``.
         """
         return len(self._source)
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"TransformedShardedSource(<source>, <transform>)"``.
+        """
         return f"TransformedShardedSource({self._source!r}, {self._transform!r})"
 
 
@@ -134,6 +172,13 @@ class LimitedShardedSource(ShardedDataSource[dict]):
     """
 
     def __init__(self, source: ShardedDataSource[dict], max_rows: int):
+        """Initialize a ``LimitedShardedSource`` wrapper.
+
+        Args:
+            source: Underlying data source whose iteration is bounded.
+            max_rows: Maximum total number of rows to expose across all
+                shards (clamped to ``>= 0``).
+        """
         self._source = source
         self._max_rows = max(int(max_rows), 0)
         self._shard_names = tuple(source.shard_names)
@@ -144,12 +189,17 @@ class LimitedShardedSource(ShardedDataSource[dict]):
         self._remaining_before_index = [self._max_rows]
 
     def _count_shard_rows_up_to(self, shard_name: str, limit: int) -> int:
-        """Count rows in *shard_name*, stopping early once we exceed *limit*.
+        """Count rows in ``shard_name``, stopping early once ``limit`` is exceeded.
 
-        Returns the exact row count when the shard has <= *limit* rows,
-        or *limit + 1* as a sentinel meaning "at least *limit + 1* rows"
-        (avoids iterating the entire shard when we only need to know it
-        exceeds the budget).
+        Args:
+            shard_name: Shard whose rows are counted.
+            limit: Maximum number of rows to count exactly.
+
+        Returns:
+            Exact row count when the shard has ``<= limit`` rows,
+            or ``limit + 1`` as a sentinel meaning "at least ``limit + 1``
+            rows" (avoids iterating the entire shard when we only need
+            to know it exceeds the budget).
         """
         if limit <= 0:
             return 0
@@ -161,6 +211,14 @@ class LimitedShardedSource(ShardedDataSource[dict]):
         return count
 
     def _get_known_shard_size(self, shard_name: str) -> int | None:
+        """Return the cached or metadata-reported row count for a shard.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            Exact row count when known, otherwise ``None``.
+        """
         if shard_name in self._exact_shard_sizes:
             return self._exact_shard_sizes[shard_name]
         info = self._source.get_shard_info(shard_name)
@@ -171,6 +229,16 @@ class LimitedShardedSource(ShardedDataSource[dict]):
         return size
 
     def _resolve_prefix_until(self, shard_index: int) -> None:
+        """Compute exposed row counts for shards ``[0, shard_index)``.
+
+        Walks earlier shards in order, consulting metadata or counting
+        rows when necessary, and updates ``_remaining_before_index`` so
+        later lookups can be answered cheaply.
+
+        Args:
+            shard_index: Stop after resolving the prefix up to (but not
+                including) this index.
+        """
         target = min(max(shard_index, 0), len(self._shard_names))
         while self._resolved_prefix_count < target:
             shard_name = self._shard_names[self._resolved_prefix_count]
@@ -193,6 +261,15 @@ class LimitedShardedSource(ShardedDataSource[dict]):
             self._remaining_before_index.append(max(0, remaining - exposed_rows))
 
     def _get_shard_limit(self, shard_name: str) -> int:
+        """Compute the maximum rows exposable for a single shard.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            Number of rows allowed from this shard, accounting for the
+            global ``max_rows`` budget consumed by earlier shards.
+        """
         shard_index = self._shard_name_to_index[shard_name]
         self._resolve_prefix_until(shard_index)
         remaining = self._remaining_before_index[shard_index]
@@ -207,21 +284,61 @@ class LimitedShardedSource(ShardedDataSource[dict]):
 
     @property
     def shard_names(self) -> Sequence[str]:
+        """Return the underlying source's shard names verbatim.
+
+        Returns:
+            Tuple of shard identifiers captured at construction time.
+        """
         return self._shard_names
 
     def num_shards(self) -> int:
+        """Return the number of shards exposed by this source.
+
+        Returns:
+            Length of the captured shard-name list.
+        """
         return len(self._shard_names)
 
     def open_shard(self, shard_name: str) -> Iterator[dict]:
+        """Open a shard, capping iteration at this shard's row budget.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            Iterator yielding at most ``_get_shard_limit(shard_name)``
+            rows.
+        """
         return itertools.islice(self._source.open_shard(shard_name), self._get_shard_limit(shard_name))
 
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
+        """Open a shard at ``row`` while respecting the row budget.
+
+        Args:
+            shard_name: Shard identifier.
+            row: Row offset within the shard.
+
+        Returns:
+            Iterator yielding remaining rows from ``row`` up to the
+            shard's exposed limit; an empty iterator when ``row`` is
+            already past the limit.
+        """
         shard_limit = self._get_shard_limit(shard_name)
         if row >= shard_limit:
             return iter(())
         return itertools.islice(self._source.open_shard_at_row(shard_name, row), shard_limit - row)
 
     def get_shard_info(self, shard_name: str) -> ShardInfo | None:
+        """Return shard metadata adjusted for this source's row budget.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            ``ShardInfo`` whose ``num_rows`` reflects the truncated
+            count, falling back to a plain ``ShardInfo`` if the
+            underlying source provides no metadata.
+        """
         shard_index = self._shard_name_to_index[shard_name]
         self._resolve_prefix_until(shard_index)
         base_info = self._source.get_shard_info(shard_name)
@@ -252,8 +369,18 @@ class LimitedShardedSource(ShardedDataSource[dict]):
             )
 
     def __len__(self) -> int:
+        """Return the actual number of rows this wrapper will yield.
+
+        Returns:
+            ``min(max_rows, total source rows)``.
+        """
         self._resolve_prefix_until(len(self._shard_names))
         return self._max_rows - self._remaining_before_index[-1]
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"LimitedShardedSource(<source>, max_rows=N)"``.
+        """
         return f"LimitedShardedSource({self._source!r}, max_rows={self._max_rows})"

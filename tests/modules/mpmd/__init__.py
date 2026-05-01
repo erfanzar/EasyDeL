@@ -1,2 +1,1 @@
 """MPMD module runtime tests."""
-

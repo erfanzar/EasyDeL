@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""StableLM model implementation for EasyDeL.
+
+This module implements Stability AI's StableLM family of dense
+decoder-only language models. Architectural traits:
+
+- LayerNorm normalization (rather than RMSNorm).
+- Partial rotary position embeddings — RoPE is applied to only a
+  fraction of each head's dimensions, controlled by
+  ``partial_rotary_factor``.
+- Optional query/key LayerNorm (``qk_layernorm``) for stability.
+- SwiGLU MLP with optional bias on linear layers.
+
+Exposes :class:`StableLmModel` (transformer trunk) and the task wrappers
+:class:`StableLmForCausalLM` and :class:`StableLmForSequenceClassification`.
+"""
 
 from functools import cached_property, partial
 from typing import ClassVar
@@ -762,6 +777,13 @@ class StableLmModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

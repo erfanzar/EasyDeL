@@ -82,7 +82,20 @@ _T = tp.TypeVar("_T")
 
 
 def _promote_rotary_operands(*operands: jax.Array) -> tuple[jax.Array, ...]:
-    """Promote rotary operands explicitly when low-precision dtypes are involved."""
+    """Promote rotary operands to a common dtype, escalating to float32 for low-precision.
+
+    Mixed-precision (fp8/fp4) cos/sin or query/key tensors lose accuracy if
+    the rotary multiply runs in their native dtype, so this helper bumps the
+    computation up to ``float32`` whenever any operand is in
+    :data:`lowfloats`. Otherwise it picks the standard NumPy promoted dtype.
+
+    Args:
+        *operands: Two or more JAX arrays to be cast to a shared dtype.
+
+    Returns:
+        Tuple of arrays cast to the chosen common dtype, in the original
+        argument order.
+    """
     if any(operand.dtype in lowfloats for operand in operands):
         compute_dtype = jnp.float32
     else:

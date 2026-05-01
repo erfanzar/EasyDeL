@@ -136,40 +136,57 @@ class FlashAttn(OperationImpl):
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         **ignore,
     ) -> AttentionOutput:
-        """
-        Performs Flash Attention V2 using optimized kernels (TPU Pallas or GPU Triton).
+        """Run Flash Attention V2 via the Pallas (TPU) or Triton (GPU) kernel.
 
-        Flash Attention V2 is a memory-efficient attention mechanism that reduces memory usage
-        from O(N²) to O(N) by computing attention in blocks and avoiding materialization of
-        the full attention matrix. This implementation uses specialized kernels for different
-        hardware backends.
+        Flash Attention V2 is a memory-efficient attention mechanism that
+        reduces peak memory from ``O(N^2)`` to ``O(N)`` by streaming the
+        softmax denominator and avoiding materialization of the full
+        attention matrix. Variable-length packing, sliding windows,
+        attention sinks, and soft-cap logits are all supported.
 
         Args:
-            query: Query tensor [batch, seq_len_q, num_heads, head_dim].
-            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
-            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
-            attention_mask: Optional boolean attention mask [batch, num_heads_or_1, seq_len_q, seq_len_k].
-                Used by the kernel if bias is not provided.
-            bias: Optional attention bias tensor [batch, num_heads, seq_len_q, seq_len_k].
-                Added to attention logits before softmax. Takes precedence over attention_mask.
-            softmax_scale: Scaling factor for attention logits. Defaults to 1/sqrt(head_dim).
-            dropout_prob: Dropout probability for attention weights. Defaults to 0.0.
-            causal: If True, applies causal (autoregressive) masking. Defaults to False.
-            dropout_seed: Random seed for dropout. Optional.
-            cum_seqlens_q: Cumulative sequence lengths for queries (for variable-length sequences).
-            cum_seqlens_k: Cumulative sequence lengths for keys (for variable-length sequences).
-            sliding_window: Sliding window size for local attention. Optional.
-            logits_soft_cap: Soft capping value for attention logits. Optional.
-            softmax_aux: Auxiliary softmax tensor (e.g., for sink tokens). Optional.
-            normalize_output: Whether to normalize the output. Defaults to True.
-            precision: JAX precision setting for matmul operations.
-            q_segment_ids: Segment IDs for queries. Optional.
-            kv_segment_ids: Segment IDs for keys/values. Optional.
-            **ignore: Additional ignored keyword arguments.
+            query: Query tensor of shape ``(batch, seq_len_q, num_heads,
+                head_dim)``.
+            key: Key tensor of shape ``(batch, seq_len_k, num_kv_heads,
+                head_dim)``.
+            value: Value tensor of shape ``(batch, seq_len_k, num_kv_heads,
+                head_dim)``.
+            mask_info: Optional :class:`MaskInfo` describing the attention
+                pattern (segment ids, positions, custom mask). Axis names
+                are stamped from the resolved query/key sharding.
+            bias: Optional attention-bias tensor of shape
+                ``(batch, num_heads, seq_len_q, seq_len_k)`` added to logits
+                before softmax.
+            softmax_scale: Scaling factor for attention logits. Defaults to
+                ``1 / sqrt(head_dim)`` when ``None``.
+            dropout_prob: Dropout probability applied to attention weights.
+                Defaults to 0.0.
+            causal: If ``True`` apply causal masking. Forced to ``False`` in
+                decode mode.
+            dropout_seed: Optional integer seed for dropout PRNG.
+            cum_seqlens_q: Cumulative query sequence lengths (length
+                ``batch + 1``) for variable-length packing.
+            cum_seqlens_k: Cumulative key/value sequence lengths (length
+                ``batch + 1``) for variable-length packing.
+            sliding_window: ``int`` for symmetric window or ``(left, right)``
+                tuple. ``None`` disables sliding-window masking.
+            logits_soft_cap: Optional logits soft-cap.
+            softmax_aux: Optional sink-token logits of shape
+                ``(num_heads, num_sinks)`` or ``(num_sinks,)``.
+            normalize_output: When ``False``, skip the final ``1/Z``
+                normalization. Defaults to ``True``.
+            precision: JAX precision setting forwarded to the matmul ops.
+            **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
-            AttentionOutput: Object containing attention outputs [batch, seq_len_q, num_heads, head_dim].
-                Attention weights are not computed for efficiency.
+            AttentionOutput: ``attention_outputs`` of shape ``(batch,
+            seq_len_q, num_heads, head_dim)``. ``attention_weights`` is
+            ``None`` because Flash Attention does not materialize them.
+
+        Raises:
+            ValueError: If a fallback path is requested for a packed-attention
+                multi-host TPU configuration whose features are unsupported by
+                the chosen fallback.
         """
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
@@ -337,52 +354,62 @@ class FlashAttn(OperationImpl):
         return output
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-        """
-        GPU forward pass. Delegates to the CUDA-specific implementation.
+        """CUDA dispatch path. Forwards to :meth:`forward_gpu`.
 
         Args:
             *args: Positional arguments for the attention calculation.
             **kwargs: Keyword arguments for the attention calculation.
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return self.forward_gpu(*args, **kwargs)
 
     @jax.named_scope("easydel-flash-attnimpl-tpu")
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-        """
-        GPU forward pass. Delegates to the CUDA-specific implementation.
+        """TPU dispatch path. Forwards to :meth:`forward_native`.
+
+        On TPU, ``forward_native`` runs the Pallas Flash Attention kernel
+        through ``ejkernel.modules.flash_attention``.
 
         Args:
             *args: Positional arguments for the attention calculation.
             **kwargs: Keyword arguments for the attention calculation.
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """
-        CPU forward pass. Delegates to `forward_native`, which raises an error.
+        """CPU dispatch path. Forwards to :meth:`forward_native`.
 
-        Raises:
-            NotImplementedError: Via `forward_native`.
+        Flash Attention does not have a true CPU kernel; ``forward_native``
+        will fall back to a portable kernel (vanilla or SDPA) when the
+        underlying ``flash_attention`` implementation is unavailable.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
     @jax.named_scope("easydel-flash-attnimpl-gpu-cuda-rocm")
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """
-        GPU forward pass. Delegates to the CUDA-specific implementation.
+        """GPU dispatch path. Forwards to :meth:`forward_native`.
+
+        On GPU, ``forward_native`` runs the Triton Flash Attention V2 kernel
+        through ``ejkernel.modules.flash_attention``.
 
         Args:
             *args: Positional arguments for the attention calculation.
             **kwargs: Keyword arguments for the attention calculation.
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
@@ -423,35 +450,41 @@ class FlashAttn(OperationImpl):
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         **ignore,
     ) -> AttentionOutput:
-        """
-        Executes Flash Attention V2 by dispatching to the appropriate backend implementation.
+        """Execute Flash Attention V2, dispatching to the backend impl.
 
-        This method automatically selects the optimal backend (TPU, GPU, CPU) based on the
-        runtime environment and calls the corresponding forward method.
+        Selects the optimal forward path (``forward_native``,
+        ``forward_gpu`` or ``forward_tpu``) based on
+        ``jax.default_backend()`` via :meth:`OperationImpl.__call__`.
 
         Args:
-            query: Query tensor [batch, seq_len_q, num_heads, head_dim].
-            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
-            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
-            attention_mask: Optional boolean mask [batch, num_heads_or_1, seq_len_q, seq_len_k].
-            bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k].
-            softmax_scale: Scaling factor for attention logits.
-            dropout_prob: Dropout probability.
-            causal: Apply causal masking.
-            dropout_seed: Random seed for dropout.
-            cum_seqlens_q: Cumulative sequence lengths for queries.
-            cum_seqlens_k: Cumulative sequence lengths for keys.
-            sliding_window: Sliding window size.
-            logits_soft_cap: Soft capping value.
-            softmax_aux: Auxiliary softmax tensor.
-            normalize_output: Normalize output flag.
-            precision: JAX precision setting.
-            q_segment_ids: Query segment IDs.
-            kv_segment_ids: Key/value segment IDs.
-            **ignore: Additional ignored arguments.
+            query: Query tensor ``(batch, seq_len_q, num_heads, head_dim)``.
+            key: Key tensor ``(batch, seq_len_k, num_kv_heads, head_dim)``.
+            value: Value tensor ``(batch, seq_len_k, num_kv_heads, head_dim)``.
+            mask_info: Optional :class:`MaskInfo` describing the attention
+                pattern.
+            bias: Optional attention bias ``(batch, num_heads, seq_len_q,
+                seq_len_k)``.
+            softmax_scale: Logit scaling factor; defaults to
+                ``1 / sqrt(head_dim)`` when ``None``.
+            dropout_prob: Dropout probability on attention weights.
+            causal: Whether to apply causal masking.
+            dropout_seed: Optional dropout PRNG seed.
+            cum_seqlens_q: Cumulative query sequence lengths for packed
+                attention.
+            cum_seqlens_k: Cumulative key sequence lengths for packed
+                attention.
+            sliding_window: Window size or ``(left, right)`` tuple for
+                local attention.
+            logits_soft_cap: Optional soft-cap applied to logits.
+            softmax_aux: Optional sink-token logits.
+            normalize_output: Whether to apply the final ``1/Z`` softmax
+                normalization.
+            precision: JAX precision for matmul ops.
+            **ignore: Additional kwargs accepted for forward-compatibility.
 
         Returns:
-            AttentionOutput: Contains attention outputs and optionally attention weights.
+            AttentionOutput: ``attention_outputs`` carrying the attended
+            representations. ``attention_weights`` is always ``None``.
         """
         return super().__call__(
             query=query,

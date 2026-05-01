@@ -71,7 +71,20 @@ class FastIncrementalDecoder:
         skip_special_tokens: bool,
         spaces_between_special_tokens: bool,
     ) -> str:
-        """Wrapper around `tokenizer.decode` that works with all HF versions."""
+        """Call ``tokenizer.decode`` portably across HuggingFace versions.
+
+        Older tokenizer implementations do not accept the
+        ``spaces_between_special_tokens`` or ``clean_up_tokenization_spaces``
+        kwargs, so this helper retries with progressively smaller kwarg sets.
+
+        Args:
+            token_ids: Token id stream to decode.
+            skip_special_tokens: Forwarded to the tokenizer.
+            spaces_between_special_tokens: Forwarded when supported.
+
+        Returns:
+            str: The decoded text.
+        """
         try:
             return self.tokenizer.decode(
                 list(token_ids),
@@ -102,17 +115,30 @@ class FastIncrementalDecoder:
         spaces_between_special_tokens: bool = True,
         context_tokens: Iterable[int] | None = None,
     ) -> tuple[str, list[int], bool]:
-        """
-        Incrementally decode `new_tokens` with optional token context.
+        """Incrementally decode ``new_tokens`` with optional token context.
 
-        * We decode ``context_tokens + buffered_tokens + new_tokens`` and
-          subtract the decoded context so tokenizers that need preceding
-          context (e.g., WordPiece) still stream correctly.
-        * If the resulting delta contains the UTF-8 replacement character
-          (“�”), we buffer the tokens and emit nothing to avoid corrupt output.
+        Decodes ``context_tokens + buffered_tokens + new_tokens`` and
+        subtracts the decoded context so tokenizers that need preceding
+        context (e.g. WordPiece) still stream correctly. If the resulting
+        delta contains the UTF-8 replacement character (``\\ufffd``) the
+        tokens are kept as ``buffered_tokens`` and an empty delta is
+        returned to avoid emitting corrupt text.
+
+        Args:
+            new_tokens: Tokens produced since the last call.
+            previous_text: Unused; kept for backwards-compatible API.
+            buffered_tokens: Tokens that were buffered from previous calls
+                because they decoded to incomplete UTF-8 sequences.
+            skip_special_tokens: Forwarded to the underlying tokenizer.
+            spaces_between_special_tokens: Forwarded when supported.
+            context_tokens: Optional tokens that come immediately before
+                ``buffered_tokens``; their decoded prefix is stripped from
+                the result.
 
         Returns:
-            delta_text, buffered (the same list that was passed in), has_buffer
+            tuple[str, list[int], bool]: ``(delta_text, new_buffered,
+            has_buffer)`` where ``has_buffer`` is ``True`` whenever tokens
+            still need to be retained for the next call.
         """
         del previous_text
         context = list(context_tokens) if context_tokens else []
@@ -157,8 +183,17 @@ class FastIncrementalDecoder:
 def _compute_suffix_delta(current_text: str, previous_text: str) -> str:
     """Return the append-only delta from ``previous_text`` to ``current_text``.
 
-    Falls back to suffix-prefix overlap when strict prefix alignment fails to
-    avoid replaying already streamed text.
+    Falls back to suffix-prefix overlap when strict prefix alignment fails
+    to avoid replaying already-streamed text in the final ``finished``
+    detokenization step.
+
+    Args:
+        current_text: The complete text after final detokenization.
+        previous_text: The text already streamed to the client.
+
+    Returns:
+        str: Substring that should be emitted next. May be empty when
+        ``current_text`` is fully contained in ``previous_text``.
     """
 
     if not current_text:
@@ -246,6 +281,10 @@ def _detokenizer_worker(
     states: OrderedDict[str, dict] = OrderedDict()
 
     def evict():
+        """Drop oldest decoder states until ``len(states) <= max_states``.
+
+        Used to bound memory growth when many requests stream concurrently.
+        """
         while len(states) > max_states:
             states.popitem(last=False)
 

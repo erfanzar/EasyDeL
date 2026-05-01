@@ -24,7 +24,9 @@ import types
 from dataclasses import dataclass, field
 from typing import Any
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
 
 import easydel as ed
@@ -64,6 +66,82 @@ class BaseTester:
     """Base class for task-specific testers."""
 
     @staticmethod
+    def _scheduled_static_metadata_kwargs(
+        kwargs: dict[str, Any],
+        schedule: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Split shape metadata from tensor batch args for scheduled tracing."""
+        microbatches = int(getattr(schedule, "microbatches", 1) or 1)
+        dynamic_kwargs: dict[str, Any] = {}
+        static_kwargs: dict[str, Any] = {}
+        for name, value in kwargs.items():
+            if name == "position_ids" and hasattr(value, "shape") and len(value.shape) == 3:
+                if value.shape[1] % microbatches != 0:
+                    raise ValueError(
+                        f"{name} batch dimension {value.shape[1]} is not divisible by "
+                        f"the schedule microbatch count {microbatches}."
+                    )
+                static_kwargs[name] = np.asarray(jax.device_get(value)).reshape(
+                    value.shape[0],
+                    microbatches,
+                    value.shape[1] // microbatches,
+                    *value.shape[2:],
+                )[:, 0]
+            elif name == "position_ids" and hasattr(value, "shape") and len(value.shape) == 2:
+                if value.shape[0] % microbatches != 0:
+                    raise ValueError(
+                        f"{name} batch dimension {value.shape[0]} is not divisible by "
+                        f"the schedule microbatch count {microbatches}."
+                    )
+                static_kwargs[name] = np.asarray(jax.device_get(value)).reshape(
+                    microbatches,
+                    value.shape[0] // microbatches,
+                    *value.shape[1:],
+                )[0]
+            elif (
+                (name.endswith("_grid_thw") or name.endswith("_grid_hws"))
+                and hasattr(value, "shape")
+                and len(value.shape) > 0
+            ):
+                if value.shape[0] % microbatches != 0:
+                    raise ValueError(
+                        f"{name} leading dimension {value.shape[0]} is not divisible by "
+                        f"the schedule microbatch count {microbatches}."
+                    )
+                static_kwargs[name] = np.asarray(jax.device_get(value)).reshape(
+                    microbatches,
+                    value.shape[0] // microbatches,
+                    *value.shape[1:],
+                )[0]
+            else:
+                dynamic_kwargs[name] = value
+        return dynamic_kwargs, static_kwargs
+
+    @staticmethod
+    def _with_precomputed_rope_positions(ed_model: Any, loss_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Precompute host-defined multimodal RoPE positions before scheduled tracing."""
+        if "position_ids" in loss_kwargs or "input_ids" not in loss_kwargs:
+            return loss_kwargs
+        rope_owner = getattr(ed_model, "model", None)
+        get_rope_index = getattr(rope_owner, "get_rope_index", None)
+        if get_rope_index is None:
+            return loss_kwargs
+        try:
+            position_ids, _rope_deltas = get_rope_index(
+                input_ids=loss_kwargs.get("input_ids"),
+                image_grid_thw=loss_kwargs.get("image_grid_thw")
+                if loss_kwargs.get("pixel_values") is not None
+                else None,
+                video_grid_thw=loss_kwargs.get("video_grid_thw")
+                if loss_kwargs.get("pixel_values_videos") is not None
+                else None,
+                attention_mask=loss_kwargs.get("attention_mask"),
+            )
+        except Exception:
+            return loss_kwargs
+        return {**loss_kwargs, "position_ids": position_ids}
+
+    @staticmethod
     def _assert_scheduled_loss(output: Any) -> None:
         assert hasattr(output, "loss"), "Scheduled MPMD output missing scalar loss"
         assert bool(jnp.isfinite(output.loss).all()), "Scheduled MPMD loss is not finite"
@@ -94,30 +172,57 @@ class BaseTester:
         ``batch_argnums``. Only tensor inputs from ``loss_kwargs`` are
         microbatched, matching the true MPMD training path.
         """
-        graphdef, graphstate, graphother = ed_model.split_module()
-        names = tuple(loss_kwargs)
-        values = tuple(loss_kwargs.values())
-        batch_argnums = tuple(range(2, 2 + len(values)))
+        previous_lmhead_chunksize = getattr(ed_model.config, "lmhead_chunksize", None)
+        previous_partition_axis = getattr(ed_model.config, "partition_axis", None)
+        if previous_lmhead_chunksize is not None:
+            ed_model.config.lmhead_chunksize = None
+        if previous_partition_axis is not None:
+            ed_model.config.partition_axis = None
+        try:
+            graphdef, graphstate, graphother = ed_model.split_module()
+            loss_kwargs = self._with_precomputed_rope_positions(ed_model, loss_kwargs)
+            dynamic_loss_kwargs, static_loss_kwargs = self._scheduled_static_metadata_kwargs(loss_kwargs, schedule)
+            names = tuple(dynamic_loss_kwargs)
+            values = tuple(dynamic_loss_kwargs.values())
+            batch_argnums = tuple(range(2, 2 + len(values)))
 
-        @spx.jit(
-            mesh=ed_model.mesh,
-            schedule=schedule,
-            batch_argnums=batch_argnums,
-        )
-        def jited(gs, go, *args):
-            model = spx.bind(graphdef, gs.merge(go, copy=False))
-            kwargs = dict(zip(names, args, strict=True))
-            outputs, _metrics = model.compute_loss(
-                output_router_logits=output_router_logits,
-                output_hidden_states=output_hidden_states,
-                **kwargs,
-            )
-            return jnp.mean(outputs.loss)
+            def make_jited(include_router_logits: bool):
+                @spx.jit(
+                    mesh=ed_model.mesh,
+                    schedule=schedule,
+                    batch_argnums=batch_argnums,
+                )
+                def jited(gs, go, *args):
+                    model = spx.bind(graphdef, gs.merge(go, copy=False))
+                    kwargs = dict(zip(names, args, strict=True))
+                    compute_loss_kwargs = {"output_hidden_states": output_hidden_states}
+                    if include_router_logits:
+                        compute_loss_kwargs["output_router_logits"] = True
+                    outputs, _metrics = model.compute_loss(
+                        **compute_loss_kwargs,
+                        **static_loss_kwargs,
+                        **kwargs,
+                    )
+                    return jnp.mean(outputs.loss)
 
-        _ = jited(graphstate, graphother, *values)
-        with ed.utils.capture_time() as timer:
-            loss = jited(graphstate, graphother, *values)
-        return types.SimpleNamespace(loss=loss), timer()
+                return jited
+
+            jited = make_jited(output_router_logits)
+            try:
+                _ = jited(graphstate, graphother, *values)
+            except TypeError as exc:
+                if not output_router_logits or "output_router_logits" not in str(exc):
+                    raise
+                jited = make_jited(False)
+                _ = jited(graphstate, graphother, *values)
+            with ed.utils.capture_time() as timer:
+                loss = jited(graphstate, graphother, *values)
+            return types.SimpleNamespace(loss=loss), timer()
+        finally:
+            if previous_lmhead_chunksize is not None:
+                ed_model.config.lmhead_chunksize = previous_lmhead_chunksize
+            if previous_partition_axis is not None:
+                ed_model.config.partition_axis = previous_partition_axis
 
     def _run_scheduled_forward_scalar(
         self,
@@ -127,8 +232,9 @@ class BaseTester:
         output_hidden_states: bool = False,
     ) -> tuple[Any, float]:
         graphdef, graphstate, graphother = ed_model.split_module()
-        names = tuple(forward_kwargs)
-        values = tuple(forward_kwargs.values())
+        dynamic_forward_kwargs, static_forward_kwargs = self._scheduled_static_metadata_kwargs(forward_kwargs, schedule)
+        names = tuple(dynamic_forward_kwargs)
+        values = tuple(dynamic_forward_kwargs.values())
         batch_argnums = tuple(range(2, 2 + len(values)))
 
         @spx.jit(
@@ -139,10 +245,12 @@ class BaseTester:
         def jited(gs, go, *args):
             model = spx.bind(graphdef, gs.merge(go, copy=False))
             kwargs = dict(zip(names, args, strict=True))
-            outputs = model(**kwargs, output_hidden_states=output_hidden_states)
+            outputs = model(**static_forward_kwargs, **kwargs, output_hidden_states=output_hidden_states)
             tensor = getattr(outputs, "last_hidden_state", None)
             if tensor is None:
                 tensor = getattr(outputs, "embeddings", None)
+            if tensor is None:
+                tensor = getattr(outputs, "logits", None)
             if tensor is None:
                 tensor = outputs[0] if isinstance(outputs, tuple | list) else outputs
             return jnp.mean(tensor)
@@ -224,7 +332,7 @@ class BaseTester:
                 loss_kwargs=dict(inputs),
                 schedule=schedule,
                 output_hidden_states=output_hidden_states,
-                output_router_logits=output_router_logits,
+                output_router_logits=False,
             )
 
         try:
@@ -323,7 +431,7 @@ class CausalLMTester(BaseTester):
                         task=task,
                         config=config,
                         small_model_config=small_model_config,
-                    )
+                    ).shard_model()
 
                     # Generate inputs
                     inputs = make_text_inputs(
@@ -365,7 +473,7 @@ class CausalLMTester(BaseTester):
                     config=config,
                     small_model_config=small_model_config,
                     hf_model=hf_model,
-                )
+                ).shard_model()
 
                 # Generate inputs
                 inputs = make_text_inputs(
@@ -1009,20 +1117,20 @@ class VisionLanguageTester(BaseTester):
 
                     # Run ED forward only
                     ed_inputs = inputs["jax"]
-                    forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
                     schedule = small_model_config.get("mpmd_schedule")
                     if schedule is not None:
                         ed_output, ed_time = self._run_scheduled_compute_loss(
                             ed_model=ed_model,
                             loss_kwargs={
-                                **forward_kwargs,
-                                **loss_kwargs,
+                                **ed_inputs,
+                                "labels": ed_inputs["input_ids"],
                             },
                             schedule=schedule,
                         )
                         self._assert_scheduled_loss(ed_output)
                         return self._scheduled_result(ed_time, easydel_only=True)
                     else:
+                        forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
 
                         @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                         def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
@@ -1076,7 +1184,7 @@ class VisionLanguageTester(BaseTester):
                     config=config,
                     small_model_config=small_model_config,
                     hf_model=hf_model,
-                )
+                ).shard_model()
 
                 # Run HF forward
                 hf_inputs = {
@@ -1093,14 +1201,13 @@ class VisionLanguageTester(BaseTester):
 
                 # Run ED forward
                 ed_inputs = inputs["jax"]
-                forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
                 schedule = small_model_config.get("mpmd_schedule")
                 if schedule is not None:
                     ed_output, ed_time = self._run_scheduled_compute_loss(
                         ed_model=ed_model,
                         loss_kwargs={
-                            **forward_kwargs,
-                            **loss_kwargs,
+                            **ed_inputs,
+                            "labels": ed_inputs["input_ids"],
                         },
                         schedule=schedule,
                     )
@@ -1108,6 +1215,7 @@ class VisionLanguageTester(BaseTester):
                     cleanup_models(hf_model)
                     return self._scheduled_result(ed_time, hf_time)
                 else:
+                    forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
 
                     @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
@@ -1134,9 +1242,7 @@ class VisionLanguageTester(BaseTester):
                             *ed_model.split_module(),
                             attention_mask=forward_kwargs["attention_mask"],
                             labels=loss_kwargs["labels"],
-                            **{
-                                k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]
-                            },
+                            **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
                         )
                     ed_time = timer()
 

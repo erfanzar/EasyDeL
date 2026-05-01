@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OLMo (Open Language Model) implementation.
+
+Implements AI2's OLMo decoder family — a LLaMA-like architecture with
+non-parametric LayerNorm (no learnable affine), SwiGLU MLPs, RoPE, optional
+grouped-query attention, and optional QKV clipping (``clip_qkv``).
+
+Exports:
+    - ``OlmoMLP``: SwiGLU feed-forward block.
+    - ``OlmoAttention``: standard attention with optional QKV clipping.
+    - ``OlmoDecoderLayer``: a single transformer block.
+    - ``OlmoModel``: base transformer trunk.
+    - ``OlmoForCausalLM``: causal LM head wrapper.
+    - ``OlmoForSequenceClassification``: classification head wrapper.
+"""
 
 import functools
 
@@ -46,10 +60,19 @@ from .olmo_configuration import OlmoConfig
 
 
 class OlmoMLP(spx.Module):
-    """Multi-Layer Perceptron module for OLMo models.
+    """SwiGLU FFN for OLMo decoder layers.
 
-    Implements the feedforward network with SwiGLU activation function
-    for enhanced representation learning in OLMo architecture.
+    Same gate / up / down SwiGLU shape as LLaMA's MLP, but with biases
+    forced off on every linear (consistent with OLMo-1's "no learnable
+    affine" stance — see :class:`OlmoDecoderLayer`'s ``LayerNorm``
+    instantiation that also drops both bias and scale).
+
+    Attributes:
+        gate_proj, up_proj (ColumnParallelLinear): Bias-free expansion
+            projections, ``hidden_size -> intermediate_size``.
+        down_proj (RowParallelLinear): Bias-free contraction
+            projection, ``intermediate_size -> hidden_size``.
+        act_fn (Callable): SiLU (or whatever ``hidden_act`` selects).
     """
 
     def __init__(
@@ -140,9 +163,24 @@ class OlmoMLP(spx.Module):
 
 
 class OlmoAttention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for OLMo models.
+    """OLMo attention: standard MHA + RoPE + optional QKV clipping.
 
-    Extends UnifiedAttention with optional QKV clipping for improved training stability.
+    OLMo-1's distinguishing trick is **QKV clipping** — symmetric clamp of
+    the Q, K, V projection outputs to ``[-clip_qkv, clip_qkv]`` to bound
+    the dynamic range that flows into the softmax. This is OLMo-1's
+    answer to the activation outliers that LLaMA-style training without
+    QK-norm sometimes accumulates. Clipping is implemented in
+    :meth:`_preprocess_qkv` *before* the head reshape so the clamp is
+    applied to the raw projections; it is a no-op when ``config.clip_qkv``
+    is ``None``.
+
+    Inherits the standard ``"standard"`` attention path from
+    :class:`UnifiedAttention` for everything else (causal mask, RoPE,
+    GQA support).
+
+    Attributes:
+        clip_qkv (float | None): Clip threshold mirrored from
+            ``config.clip_qkv``; absent on most checkpoints.
     """
 
     def __init__(
@@ -206,10 +244,25 @@ class OlmoAttention(UnifiedAttention):
 
 
 class OlmoDecoderLayer(spx.Module):
-    """Single decoder layer for OLMo models.
+    """One OLMo-1 block: pre-norm attention + SwiGLU FFN with parameter-free LayerNorm.
 
-    Combines multi-head attention and feedforward networks with
-    LayerNorm normalization and residual connections.
+    OLMo-1's defining choice at the block level is the **non-parametric
+    LayerNorm** — both ``input_layernorm`` and ``post_attention_layernorm``
+    are constructed with ``use_bias=False, use_scale=False``, so they
+    perform plain ``(x - mean(x)) / sqrt(var(x) + eps)`` with neither a
+    learnable affine nor a bias. The intuition (per the OLMo-1 report) is
+    that the redundancy with the surrounding linear layers' biases hurt
+    training stability more than the affine helped representational
+    capacity. Pre-norm residual layout otherwise follows LLaMA::
+
+        x = x + self_attn(input_layernorm(x))
+        x = x + mlp(post_attention_layernorm(x))
+
+    Attributes:
+        self_attn (OlmoAttention): Optionally-clipped MHA / GQA attention.
+        mlp (OlmoMLP): Bias-free SwiGLU FFN.
+        input_layernorm, post_attention_layernorm (LayerNorm): Parameter-free
+            LayerNorms (no scale, no bias).
     """
 
     def __init__(
@@ -327,16 +380,20 @@ class OlmoDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=OlmoConfig, model_type="olmo")
 class OlmoModel(EasyDeLBaseModule):
-    """OLMo model implementation.
+    """OLMo-1 base trunk: token embeddings + decoder stack + parameter-free final LayerNorm.
 
-    This implements the OLMo (Open Language Model) architecture, utilizing transformer blocks
-    with LayerNorm, rotary position embeddings, and grouped-query attention.
+    Implements AI2's OLMo-1 architecture — a LLaMA-style decoder where
+    every LayerNorm is non-parametric (no scale, no bias), every linear is
+    bias-free, and attention optionally clips Q/K/V to bound activation
+    outliers. Unlike OLMo-2 there is no Q/K-norm and the residual layout
+    is the standard pre-norm.
 
     Attributes:
-        config (OlmoConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        embed_tokens (Embed): Token embedding ``(vocab_size, hidden_size)``.
+        layers (nn.ModuleList[OlmoDecoderLayer]): Decoder blocks assigned
+            to pipeline stages via :func:`spx.assign_stage`; stacked into a
+            single scanned op when ``config.scan_layers`` is set.
+        norm (LayerNorm): Parameter-free final LayerNorm.
     """
 
     def __init__(
@@ -578,16 +635,12 @@ class OlmoModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=OlmoConfig, model_type="olmo")
 class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
-    """OLMo model with a language modeling head for causal language modeling tasks.
+    """Causal LM head wrapper around :class:`OlmoModel` for next-token prediction.
 
-    This model is a transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation.
-
-    Attributes:
-        config (OlmoConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-        precision: Precision setting for JAX operations.
+    Adds a bias-free LM projection and the standard ``compute_lm_logits``
+    helper from :class:`BaseCausalLMModule`. Tied embeddings are governed
+    by ``config.tie_word_embeddings`` (default false on OLMo-1, matching
+    upstream).
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -626,16 +679,13 @@ class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=OlmoConfig, model_type="olmo")
 class OlmoForSequenceClassification(BaseSequenceClassificationModule[OlmoModel, OlmoConfig]):
-    """OLMo model for sequence classification tasks.
+    """Sequence classification head on top of :class:`OlmoModel`.
 
-    This class extends the base OLMo model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
-
-    Attributes:
-        config (OlmoConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+    Pools the trunk's last hidden state at the position of the last
+    non-padded token (``pooling_strategy="last"``) and feeds it into a
+    bias-free linear ``score`` projecting to ``config.num_labels``. The
+    pooling step requires ``config.pad_token_id`` to be set when
+    ``batch_size > 1`` so the pooled token can be located unambiguously.
     """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION

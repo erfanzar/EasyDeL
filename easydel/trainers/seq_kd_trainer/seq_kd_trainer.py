@@ -99,6 +99,38 @@ class SeqKDTrainer(Trainer):
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
     ):
+        """Initialize the SeqKD trainer.
+
+        Exactly one of ``teacher_model`` or ``teacher_fn`` must be
+        provided.
+
+        Args:
+            arguments (SeqKDConfig): SeqKD configuration. Must be a
+                :class:`SeqKDConfig`.
+            processing_class (ProcessingClassType): Tokenizer / processor.
+                If ``pad_token`` is unset and ``eos_token`` is available,
+                pad is set to eos in place.
+            student_model (EasyDeLBaseModule | EasyDeLState | None):
+                Student model (the one being trained).
+            teacher_model (EasyDeLBaseModule | EasyDeLState | None):
+                Optional in-process teacher model used via
+                ``generate_unified``. Mutually exclusive with
+                ``teacher_fn``.
+            teacher_fn (tp.Callable[[list[str]], list[str]] | None):
+                Optional API-style teacher callable mapping a list of
+                prompts to a list of completions. Mutually exclusive
+                with ``teacher_model``.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset of prompts.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation
+                dataset(s).
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`SeqKDConfig`.
+            ValueError: If neither ``teacher_model`` nor ``teacher_fn``
+                is supplied.
+        """
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
             tokenizer = processing_class.tokenizer
@@ -137,7 +169,22 @@ class SeqKDTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
-        """Get preprocessing transform for prompt-only datasets."""
+        """Build the lazy prompt-only preprocessing transform for SeqKD.
+
+        SeqKD trains the student on completions sampled from a teacher;
+        the dataset only needs to provide prompts. This hook returns the
+        same GRPO-style transform used by other prompt-only trainers,
+        which renders the chat template (with optional tool schemas in
+        ``arguments.tools``) and tokenises to
+        ``arguments.max_prompt_length``. The transform runs lazily
+        inside the data loader.
+
+        Returns:
+            A :class:`GRPOPreprocessTransform` configured against the
+            tokenizer / prompt budget / chat template flags, or ``None``
+            when :meth:`_is_pretokenized` reports the source already
+            emits ``input_ids``.
+        """
         if self._is_pretokenized():
             return None
         return GRPOPreprocessTransform(
@@ -148,7 +195,19 @@ class SeqKDTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check whether the source already yields token IDs."""
+        """Detect whether the bound training source already exposes tokenised prompts.
+
+        Peeks at the first row of the first shard of
+        ``self._train_source`` and reports whether it carries an
+        ``"input_ids"`` field. Defensive against unset sources, empty
+        shard lists, and shards that yield no rows -- in all those
+        cases the method returns ``False`` so the trainer attaches the
+        preprocessing transform as a safe default.
+
+        Returns:
+            ``True`` only when the first row of the first shard
+            contains ``"input_ids"``.
+        """
         if self._train_source is None:
             return False
         try:
@@ -162,7 +221,24 @@ class SeqKDTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create Grain data collator for prompt-only batches."""
+        """Construct the Grain collator that left-pads prompt-only SeqKD batches.
+
+        SeqKD batches prompts only; teacher completions are produced
+        inside :meth:`_preprocess_batch_input`. The collator left-pads
+        tokenised prompts to ``arguments.max_prompt_length`` using the
+        resolved ``self.padding_value`` so that teacher generation
+        always receives a contiguous, right-aligned prefix.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored -- the GRPO collator left-pads
+                rather than truncating.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorGrain`.
+        """
         from ..utils import GRPODataCollatorGrain
 
         return GRPODataCollatorGrain(
@@ -175,7 +251,23 @@ class SeqKDTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create TFDS data collator for prompt-only batches."""
+        """Construct the TFDS collator that left-pads prompt-only SeqKD batches.
+
+        TFDS analogue of :meth:`create_grain_collect_function`. The
+        collator pads tokenised prompts to
+        ``arguments.max_prompt_length`` with ``self.padding_value`` and
+        produces no completion tensors -- those are filled in by the
+        teacher generation step.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorTFDS`.
+        """
         from ..utils import GRPODataCollatorTFDS
 
         return GRPODataCollatorTFDS(
@@ -195,6 +287,25 @@ class SeqKDTrainer(Trainer):
         repeated per prompt when ``num_generations_per_prompt > 1``, passed to
         the callable, and the returned completions are re-tokenized.  Otherwise
         ``generate_unified`` is called on the local teacher model.
+
+        Args:
+            state (EasyDeLState): Current student state (unused for
+                generation; passed only for logging hooks).
+            batch (dict[str, tp.Any]): Raw input batch with prompt
+                ``input_ids`` and ``attention_mask``.
+            is_train (bool): Whether preprocessing runs for training
+                (currently behavior-equivalent for eval).
+
+        Returns:
+            tuple[dict[str, tp.Any], dict[str, float | int | str]]: A
+            pair of (training_batch, auxiliary_metrics). The training
+            batch contains ``input_ids``, ``attention_mask`` and
+            ``labels`` (with prompt and pad positions masked to
+            ``-100``).
+
+        Raises:
+            ValueError: If ``teacher_fn`` returns a list whose length
+                does not match the expected number of repeated prompts.
         """
         batch = self._purify_batch(batch)
 

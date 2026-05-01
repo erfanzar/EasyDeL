@@ -12,7 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Auth worker process for handling authentication operations via ZMQ."""
+"""Subprocess entry point for the eSurge auth ZMQ worker.
+
+Hosts a single :class:`EnhancedApiKeyManager` instance behind a ZMQ REP
+socket and dispatches one auth command per request
+(``generate_api_key``, ``validate_key``, ``authorize_request``,
+``record_usage``, key lifecycle commands, audit-log fetch, statistics,
+and ``shutdown``). The serving loop translates manager exceptions back
+into a wire payload (``status="error"`` with ``exception_type`` set)
+that :class:`AuthWorkerClient` re-raises locally as
+:class:`PermissionDenied`, :class:`RateLimitExceeded` or
+:class:`QuotaExceeded`.
+
+Designed to be spawned by :class:`AuthWorkerManager` under a CPU-only
+JAX configuration (the worker does no model work) so the API server
+can keep authentication state, audit logs and rate-limit windows in a
+single process even when multiple FastAPI workers serve requests.
+"""
 
 from __future__ import annotations
 

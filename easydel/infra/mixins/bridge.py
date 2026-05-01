@@ -140,6 +140,18 @@ CANDIDATE_FILENAMES = [
 
 @contextmanager
 def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_dir: bool = False):
+    """Yield either *working_dir* or a fresh temp dir, cleaning up the temp.
+
+    Args:
+        working_dir: Persistent directory to use. Created if it does not
+            exist.
+        use_temp_dir: When ``True`` (or when *working_dir* is ``None``), a
+            ``tempfile.mkdtemp()`` directory is yielded and removed on exit.
+
+    Yields:
+        str | os.PathLike: The working directory path for use inside the
+        ``with`` block.
+    """
     if use_temp_dir or working_dir is None:
         temp_dir = tempfile.mkdtemp()
         try:
@@ -152,6 +164,17 @@ def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_d
 
 
 def _tree_key_to_path(key: tp.Any) -> str:
+    """Normalize a pytree key into a slash-delimited path string.
+
+    Tuples are joined with ``/``; strings containing ``.`` are converted to
+    slash form for consistency with checkpoint indices.
+
+    Args:
+        key: A pytree key (tuple of segments or string).
+
+    Returns:
+        str: Slash-delimited path representation.
+    """
     if isinstance(key, tuple):
         return "/".join(str(k) for k in key)
     s = str(key)
@@ -352,7 +375,28 @@ def _build_safe_checkpoint_partition_rules(
 
 @dataclass
 class TorchLoadOptions:
-    """Options for torch_load_mode in _from_torch_pretrained."""
+    """Parsed ``torch_load_mode`` options consumed by :meth:`EasyBridgeMixin._from_torch_pretrained`.
+
+    Produced by :func:`_parse_torch_load_options` from the user-facing
+    ``torch_load_mode``/``streaming_*`` kwargs of ``from_pretrained``. Carries
+    every decision that the streaming/eager PyTorch loader needs without
+    forcing the loader to keep re-parsing the kwargs dict.
+
+    Attributes:
+        mode: Loading strategy. ``"streaming"`` materializes one HuggingFace
+            shard at a time and converts it on the fly to keep host memory
+            bounded; ``"eager"`` downloads/loads the full state dict before
+            conversion.
+        streaming_cache: Disk-cache policy for streaming mode. ``"auto"``
+            keeps shards under the standard HF cache, ``"copy"`` forces a
+            local copy, and ``"none"`` reads through fsspec without caching.
+        streaming_tmp_dir: Optional explicit directory used to stage
+            intermediate shard copies in streaming mode. ``None`` defers to
+            ``streaming_cache`` to choose a location.
+        hub_kwargs: Extra keyword arguments forwarded to the underlying
+            HuggingFace Hub download helper (``revision``, ``token``,
+            ``proxies``, etc.).
+    """
 
     mode: str
     streaming_cache: str
@@ -362,7 +406,34 @@ class TorchLoadOptions:
 
 @dataclass
 class StreamingCheckpointInfo:
-    """Metadata for streaming PyTorch checkpoint conversion."""
+    """Streaming-conversion handle bundling everything needed to load PyTorch shards lazily.
+
+    Built once at the start of :meth:`EasyBridgeMixin._from_torch_pretrained`
+    when ``torch_load_mode="streaming"`` so the per-shard worker has a single
+    object to consult instead of juggling several parallel mappings.
+
+    Attributes:
+        ckpt_weight_format: Serialization format of the source shards —
+            ``"safetensors"`` or PyTorch's ``"bin"`` (pickle).
+        ckpt_key_to_filename: Mapping from each parameter key in the source
+            checkpoint to the shard filename that holds its tensor data.
+            Drives shard-prefetch ordering.
+        ckpt_filename_to_path: Mapping from shard filename to a fully
+            resolved local path (already-downloaded or fsspec-cached). Used
+            by the per-shard loader to find the bytes.
+        ed_config: The EasyDeL configuration produced from the HF config so
+            converters can derive shapes, dtypes, and partition rules
+            without re-parsing the upstream config.
+        generation_config: Optional ``transformers.GenerationConfig``-like
+            object discovered alongside the model. ``None`` when the
+            checkpoint doesn't ship one.
+        pretrained_model_name_or_path: Original Hub repo id or local path
+            the user passed in. Used for logging and for any follow-up
+            shard fetches that need to re-resolve the source.
+        resolve_shard: Callable accepting ``(filename, optional_subfolder)``
+            that returns a usable local path to that shard, transparently
+            downloading if the shard hasn't been seen yet.
+    """
 
     ckpt_weight_format: tp.Literal["safetensors", "bin"]
     ckpt_key_to_filename: dict[str, str]
@@ -490,6 +561,15 @@ def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
 def _normalize_quantization_config(
     quantization_config: QuantizationConfig | dict[str, tp.Any] | None,
 ) -> QuantizationConfig | None:
+    """Coerce a quantization-config dict into a :class:`QuantizationConfig`.
+
+    Args:
+        quantization_config: ``None``, an existing config, or a dict of
+            field overrides.
+
+    Returns:
+        QuantizationConfig | None: A typed config or ``None``.
+    """
     if quantization_config is None:
         return None
     if isinstance(quantization_config, QuantizationConfig):
@@ -500,14 +580,72 @@ def _normalize_quantization_config(
 
 
 def _strip_trailing_separators(path: str) -> str:
+    """Drop any trailing forward- or back-slashes from a path string.
+
+    Args:
+        path: Filesystem path or URL fragment.
+
+    Returns:
+        str: ``path`` with trailing ``/`` and ``\\`` removed.
+    """
     while path.endswith("/") or path.endswith("\\"):
         path = path[:-1]
     return path
 
 
 class EasyBridgeMixin(PushToHubMixin):
-    """
-    Mixin class for adding bridging functionalities like saving, loading, and pushing models to Hugging Face Hub.
+    """Cross-framework persistence and Hub-publishing layer mixed into every :class:`EasyDeLBaseModule`.
+
+    ``EasyBridgeMixin`` is the bridge between EasyDeL's SpecTrax-based runtime
+    representation and the wider model ecosystem. It owns three responsibilities
+    that the rest of the codebase consistently delegates to it instead of
+    reimplementing per-architecture:
+
+    1. **Saving and loading EasyDeL-native weights.**
+       :meth:`save_pretrained` writes the SpecTrax graphstate alongside an HF
+       ``config.json`` (with EasyDeL-specific extensions stripped), an
+       optional ``generation_config.json``, and a generated README/model
+       card. :meth:`from_pretrained` restores that artifact, creating a lazy
+       module under the configured mesh, sharding the weights according to
+       the partition rules, and (optionally) quantizing them on the fly.
+    2. **Importing PyTorch checkpoints.**
+       The ``_from_torch_pretrained`` family supports both ``"eager"`` and
+       ``"streaming"`` loading via :class:`TorchLoadOptions` /
+       :class:`StreamingCheckpointInfo`. Streaming mode converts one shard
+       at a time using ``ParameterTransformRule`` rules registered on the
+       model class, which lets EasyDeL load larger-than-RAM checkpoints
+       without materializing the whole HF state dict.
+    3. **HuggingFace Hub publishing.**
+       Inherits :class:`transformers.utils.PushToHubMixin` so subclasses
+       expose ``push_to_hub(...)``. EasyDeL augments this with concurrency
+       resolution, async upload helpers, and ``ePath``-based remote-write
+       support so checkpoints can be saved directly to GCS/S3 without a
+       local round-trip.
+
+    The mixin only reads attributes (``config``, ``base_model_prefix``,
+    ``_model_task``, ``_model_type``, ``config_class``) from its host class —
+    those are populated by :class:`EasyDeLBaseModule` and the registry
+    decorators in :mod:`easydel.infra.factory` — so nothing in this mixin
+    depends on a particular architecture.
+
+    Attributes:
+        config (EasyDeLBaseConfig): Active model configuration. Read for
+            partition rules, attention mechanism, and quantization knobs
+            during save/load.
+        hf_torch_auto_loader (Any | None): Optional HuggingFace AutoModel
+            class used as a fallback path when a direct EasyDeL converter is
+            not registered for the source checkpoint.
+        config_class (type[EasyDeLBaseConfig] | None): Configuration class
+            used to instantiate ``config`` when loading; populated by
+            ``register_module``.
+        base_model_prefix (str | None): Module prefix used when adapting
+            HuggingFace checkpoint keys to the EasyDeL parameter tree.
+        _model_task (str | None): Task identifier ("CausalLM",
+            "SequenceClassification", ...) embedded into model cards and
+            checkpoint metadata.
+        _model_type (str | None): Architecture identifier ("llama",
+            "qwen3", ...) embedded into model cards and used to look up
+            the converter registry.
     """
 
     config: EasyDeLBaseConfig
@@ -938,6 +1076,16 @@ class EasyBridgeMixin(PushToHubMixin):
                 kernel_map[kernel_key] = ((*path, "quant_kernel"), (*path, "quant_scales"), (*path, "quant_biases"))
 
         def _apply_shard_fn(x, p):
+            """Apply a per-path shard function from ``shard_fns``, if any.
+
+            Args:
+                x: The tensor leaf being loaded.
+                p: Path tuple or dotted string identifying the leaf.
+
+            Returns:
+                Any: The transformed tensor, or *x* unchanged when no
+                matching shard function exists.
+            """
             if shard_fns is not None:
                 key_get = p
                 if isinstance(p, str):
@@ -948,6 +1096,15 @@ class EasyBridgeMixin(PushToHubMixin):
             return x
 
         def callback(x, p):
+            """Checkpointer per-tensor callback that delegates to ``_apply_shard_fn``.
+
+            Args:
+                x: Tensor leaf being loaded from the checkpoint.
+                p: Path tuple/string identifying the leaf.
+
+            Returns:
+                Any: ``_apply_shard_fn(x, p)``.
+            """
             return _apply_shard_fn(x, p)
 
         if resolved_archive_file:
@@ -1104,6 +1261,16 @@ class EasyBridgeMixin(PushToHubMixin):
             cpu_device = _checkpoint_cpu_device()
 
             def _convert(x):
+                """Normalize a single checkpoint leaf to JAX with target dtype.
+
+                Args:
+                    x: A checkpoint leaf (NumPy or JAX array, possibly other).
+
+                Returns:
+                    Any: A JAX array cast to ``param_dtype`` if it is
+                    floating-point and differs from the target; non-array
+                    leaves pass through.
+                """
                 x = _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device)
                 if not hasattr(x, "astype"):
                     return x
@@ -1321,6 +1488,16 @@ class EasyBridgeMixin(PushToHubMixin):
             is_local = ePath(pretrained_model_name_or_path).is_dir()
 
             def _pick_first_existing(dir_path: ePath) -> tuple[ePath | None, str | None]:  # type:ignore
+                """Return the first ``CANDIDATE_FILENAMES`` entry present in *dir_path*.
+
+                Args:
+                    dir_path: Directory to probe.
+
+                Returns:
+                    tuple: ``(path, filename)`` for the first existing
+                    candidate, or ``(None, None)`` when none of the
+                    candidates exist.
+                """
                 for cand in CANDIDATE_FILENAMES:
                     p = dir_path / cand
                     if p.is_file():
@@ -1559,6 +1736,11 @@ class EasyBridgeMixin(PushToHubMixin):
             import torch
 
             def _clear():
+                """Drop CUDA cached memory and run a Python GC pass.
+
+                Returns:
+                    None.
+                """
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
@@ -1751,6 +1933,16 @@ class EasyBridgeMixin(PushToHubMixin):
         cache_dir = kwargs.get("cache_dir", None)
 
         def _strip_or_keep_subfolder(filename: str) -> tuple[str, str]:
+            """Decide whether *filename* already includes the configured subfolder.
+
+            Args:
+                filename: Candidate filename, possibly already prefixed with
+                    the subfolder.
+
+            Returns:
+                tuple: ``(filename, effective_subfolder)`` to forward to
+                ``hf_hub_download``.
+            """
             if not subfolder:
                 return filename, ""
             normalized = subfolder.strip("/").replace("\\", "/")
@@ -1759,6 +1951,16 @@ class EasyBridgeMixin(PushToHubMixin):
             return filename, normalized
 
         def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
+            """Download a file from the HF Hub, honoring the configured subfolder.
+
+            Args:
+                filename: Repo-relative filename.
+                cache_dir_override: Optional cache override (otherwise
+                    ``cache_dir`` from the enclosing scope is used).
+
+            Returns:
+                str: Local path to the downloaded file.
+            """
             filename, effective_subfolder = _strip_or_keep_subfolder(filename)
             return huggingface_hub.hf_hub_download(
                 repo_id=pretrained_model_name_or_path,
@@ -1773,6 +1975,15 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         def _find_local(filename: str) -> str | None:
+            """Locate *filename* under a local pretrained-model directory.
+
+            Args:
+                filename: Repo-relative filename.
+
+            Returns:
+                str | None: Absolute local path when the file exists, else
+                ``None``.
+            """
             if not os.path.isdir(pretrained_model_name_or_path):
                 return None
             filename, effective_subfolder = _strip_or_keep_subfolder(filename)
@@ -1790,6 +2001,14 @@ class EasyBridgeMixin(PushToHubMixin):
             return _hf_download(fname, cache_dir_override=cache_dir_override)
 
         def _load_index(path: str) -> dict[str, tp.Any]:
+            """Read a JSON checkpoint index file from *path*.
+
+            Args:
+                path: Filesystem path to the JSON file.
+
+            Returns:
+                dict: Parsed JSON contents.
+            """
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
 
@@ -1944,6 +2163,15 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_expert_keys: set[str] = set()
 
         def _register_moe_key(k: str):
+            """Group an HF expert weight key under its consolidated MoE target path.
+
+            Args:
+                k: A flattened HF state-dict key.
+
+            Returns:
+                None. ``moe_groups`` and ``moe_expert_keys`` from the
+                enclosing scope are updated in-place.
+            """
             if not (moe_block_path and moe_names_set and moe_path):
                 return
             if expert_prefix not in k:
@@ -2011,6 +2239,16 @@ class EasyBridgeMixin(PushToHubMixin):
         parameters_flat: dict[tuple, tp.Any] = {}
 
         def _maybe_shard_and_callback(key_tuple, arr):
+            """Apply optional shard fn and user callback to a converted leaf.
+
+            Args:
+                key_tuple: Path tuple for the parameter.
+                arr: Converted JAX array.
+
+            Returns:
+                Any: The array after applying ``shard_fns[key_tuple]`` and
+                the user-supplied ``callback`` (if any).
+            """
             if shard_fns and key_tuple in shard_fns:
                 arr = shard_fns[key_tuple](arr)
             if callback is not None:
@@ -2018,6 +2256,16 @@ class EasyBridgeMixin(PushToHubMixin):
             return arr
 
         def _process_tensor(key: str, tensor):
+            """Convert one HF tensor and store the result(s) in ``parameters_flat``.
+
+            Args:
+                key: HF state-dict key.
+                tensor: The torch tensor for that key.
+
+            Returns:
+                None. Side-effect: populates the ``parameters_flat`` dict
+                in the enclosing scope.
+            """
             results = StateDictConverter.process_tensor(key, tensor, converter_config)
             if results is None:
                 return
@@ -2026,6 +2274,18 @@ class EasyBridgeMixin(PushToHubMixin):
 
         @contextlib.contextmanager
         def _with_resolved_shard(fname: str):
+            """Yield a local path for shard *fname*, downloading if needed.
+
+            Honors a streaming cache strategy: reuses already-downloaded
+            paths, downloads from HF when the source is a remote repo, or
+            stages into a temporary directory when streaming.
+
+            Args:
+                fname: Shard filename to resolve.
+
+            Yields:
+                str: Local filesystem path to the shard.
+            """
             if fname in ckpt_filename_to_path and os.path.isfile(ckpt_filename_to_path[fname]):
                 yield ckpt_filename_to_path[fname]
                 return
@@ -2050,6 +2310,17 @@ class EasyBridgeMixin(PushToHubMixin):
                 yield resolve_shard(fname, tmpdir)
 
         def _run_streaming_conversion():
+            """Stream HF shards into JAX parameters with MoE consolidation.
+
+            Iterates each checkpoint shard, converts non-MoE tensors as they
+            arrive, and accumulates per-expert MoE weights to consolidate
+            single-file groups in place. Multi-file MoE groups are deferred
+            until all contributing shards have been seen.
+
+            Returns:
+                None. Side-effect: populates ``parameters_flat`` in the
+                enclosing scope.
+            """
             file_to_non_moe_keys: dict[str, list[str]] = {}
             for key, fname in ckpt_key_to_filename.items():
                 if key in moe_expert_keys:
@@ -2444,6 +2715,15 @@ class EasyBridgeMixin(PushToHubMixin):
         expert_key_to_group: dict[str, tuple[str, int]] = {}
 
         def _register_moe_key(k: str):
+            """Group an HF expert weight key under its consolidated MoE target path.
+
+            Args:
+                k: A flattened HF state-dict key.
+
+            Returns:
+                None. Side-effect: updates ``moe_groups`` and
+                ``expert_key_to_group`` in the enclosing scope.
+            """
             if not (moe_block_path and moe_names_set and moe_path):
                 return
             if expert_prefix not in k:
@@ -2481,6 +2761,16 @@ class EasyBridgeMixin(PushToHubMixin):
         cache_dir = kwargs.get("cache_dir", None)
 
         def _strip_or_keep_subfolder(filename: str) -> tuple[str, str]:
+            """Decide whether *filename* already includes the configured subfolder.
+
+            Args:
+                filename: Candidate filename, possibly already prefixed with
+                    the subfolder.
+
+            Returns:
+                tuple: ``(filename, effective_subfolder)`` to forward to
+                ``hf_hub_download``.
+            """
             if not subfolder:
                 return filename, ""
             normalized = subfolder.strip("/").replace("\\", "/")
@@ -2489,6 +2779,16 @@ class EasyBridgeMixin(PushToHubMixin):
             return filename, normalized
 
         def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
+            """Download a file from the HF Hub, honoring the configured subfolder.
+
+            Args:
+                filename: Repo-relative filename.
+                cache_dir_override: Optional cache override (otherwise
+                    ``cache_dir`` from the enclosing scope is used).
+
+            Returns:
+                str: Local path to the downloaded file.
+            """
             filename, effective_subfolder = _strip_or_keep_subfolder(filename)
             return huggingface_hub.hf_hub_download(
                 repo_id=pretrained_model_name_or_path,
@@ -2503,6 +2803,15 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         def _find_local(filename: str) -> str | None:
+            """Locate *filename* under a local pretrained-model directory.
+
+            Args:
+                filename: Repo-relative filename.
+
+            Returns:
+                str | None: Absolute local path when the file exists, else
+                ``None``.
+            """
             if not os.path.isdir(pretrained_model_name_or_path):
                 return None
             filename, effective_subfolder = _strip_or_keep_subfolder(filename)
@@ -2513,6 +2822,14 @@ class EasyBridgeMixin(PushToHubMixin):
             return candidate if os.path.isfile(candidate) else None
 
         def _load_index(path: str) -> dict[str, tp.Any]:
+            """Read a JSON checkpoint index file from *path*.
+
+            Args:
+                path: Filesystem path to the JSON file.
+
+            Returns:
+                dict: Parsed JSON contents.
+            """
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
 
@@ -2605,6 +2922,19 @@ class EasyBridgeMixin(PushToHubMixin):
             *,
             moe: bool,
         ) -> list[int]:
+            """Compute the TensorStore chunk shape for a parameter.
+
+            Args:
+                key_tuple: Path tuple identifying the parameter.
+                global_shape: Full (unsharded) tensor shape.
+                dtype_: The element dtype.
+                moe: Whether this parameter belongs to a consolidated MoE
+                    weight (in which case the leading expert axis is split
+                    one-per-chunk).
+
+            Returns:
+                list[int]: A chunk shape suitable for the zarr backend.
+            """
             # TODO: Comeafter this
             # spec = spec_map.get(key_tuple)
             local_shape = global_shape
@@ -2622,6 +2952,15 @@ class EasyBridgeMixin(PushToHubMixin):
             return [int(max(1, d)) for d in chunk]
 
         def _tensorstore_path_for_params(key_tuple: tuple) -> tuple[str, str]:
+            """Build absolute and relative TensorStore paths for a parameter.
+
+            Args:
+                key_tuple: Path tuple identifying the parameter.
+
+            Returns:
+                tuple: ``(absolute_path, relative_path)`` rooted at
+                ``save_root/model``.
+            """
             rel = os.path.join("model", *[str(p) for p in key_tuple])
             abs_path = os.path.join(str(save_root), rel)
             return abs_path, rel
@@ -2629,6 +2968,15 @@ class EasyBridgeMixin(PushToHubMixin):
         array_index: list[dict[str, tp.Any]] = []
 
         def _write_tensor(key_tuple: tuple, value) -> None:
+            """Write a single converted parameter to a TensorStore zarr store.
+
+            Args:
+                key_tuple: Path tuple for the parameter.
+                value: The JAX array to persist.
+
+            Returns:
+                None. Side-effect: appends an entry to ``array_index``.
+            """
             if key_tuple not in required_params:
                 return
             abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
@@ -2652,6 +3000,11 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         def _write_checkpoint_index() -> None:
+            """Persist the TensorStore index and metadata files to ``save_root``.
+
+            Returns:
+                None.
+            """
             index_path = save_root / TENSORSTORE_INDEX_NAME
             index_data = {
                 "format": "tensorstore",
@@ -2668,6 +3021,14 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         def _save_configs() -> None:
+            """Save the EasyDeL config and generation config alongside weights.
+
+            Strips runtime-only attention dtype hints and records the model
+            architecture before delegating to ``save_pretrained``.
+
+            Returns:
+                None.
+            """
             config_to_save = deepcopy(ed_config)
             config_to_save.__dict__.pop("attn_dtype", None)
             config_to_save.__dict__.pop("attn_softmax_dtype", None)
@@ -2682,6 +3043,20 @@ class EasyBridgeMixin(PushToHubMixin):
 
         @contextlib.contextmanager
         def _with_resolved_shard(fname: str):
+            """Yield a local path for shard *fname*, downloading if needed.
+
+            Args:
+                fname: Shard filename to resolve.
+
+            Yields:
+                str: Local filesystem path to the shard.
+
+            Raises:
+                FileNotFoundError: If a local source is configured but
+                    *fname* is missing.
+                NotADirectoryError: If ``torch_streaming_tmp_dir`` resolves
+                    to a regular file.
+            """
             if fname in ckpt_filename_to_path and os.path.isfile(ckpt_filename_to_path[fname]):
                 yield ckpt_filename_to_path[fname]
                 return
@@ -2708,6 +3083,16 @@ class EasyBridgeMixin(PushToHubMixin):
                 yield _hf_download(fname, cache_dir_override=tmpdir)
 
         def _iter_keys_single_file(filename: str, path: str):
+            """Yield every state-dict key from a single shard file.
+
+            Args:
+                filename: Logical shard filename (used by the surrounding
+                    bookkeeping; the on-disk path is *path*).
+                path: Local filesystem path to the shard.
+
+            Yields:
+                str: Each state-dict key contained in the shard.
+            """
             import torch
             from safetensors.torch import safe_open
 
@@ -2744,6 +3129,21 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_handles: dict[str, dict[str, tp.Any]] = {}
 
         def _ensure_moe_group_ready(target_path: str, *, sample_expert_tensor) -> dict[str, tp.Any] | None:
+            """Lazily allocate a TensorStore handle for a consolidated MoE weight.
+
+            Uses *sample_expert_tensor* to infer ``(in_features, out_features)``
+            and stacks the experts along a new leading axis on disk.
+
+            Args:
+                target_path: Consolidated MoE target path.
+                sample_expert_tensor: One expert's weight tensor (used solely
+                    for shape/dtype inference).
+
+            Returns:
+                dict[str, Any] | None: The TensorStore handle dict, or
+                ``None`` if the target path is not part of the model's
+                required params.
+            """
             if target_path in moe_handles:
                 return moe_handles[target_path]
 
@@ -2791,10 +3191,28 @@ class EasyBridgeMixin(PushToHubMixin):
             return handle
 
         def _finalize_moe_group(target_path: str) -> None:
+            """Drop a completed MoE group's TensorStore handle to free resources.
+
+            Args:
+                target_path: Consolidated MoE target path that is fully
+                    written.
+
+            Returns:
+                None.
+            """
             if target_path in moe_handles:
                 moe_handles.pop(target_path, None)
 
         def _process_and_write(key: str, tensor) -> None:
+            """Convert a non-MoE HF tensor and persist it to TensorStore.
+
+            Args:
+                key: HF state-dict key.
+                tensor: The torch tensor for that key.
+
+            Returns:
+                None.
+            """
             with convert_ctx:
                 results = StateDictConverter.process_tensor(key, tensor, converter_config)
             if results is None:

@@ -1164,6 +1164,19 @@ def _validate_paged_cache_init_args(
     hbm_utilization: float | None,
     max_model_length: int | None,
 ) -> None:
+    """Verify all paged-cache-init args are present when no config is passed.
+
+    Args:
+        page_size: Page size in tokens.
+        hbm_utilization: Fraction of HBM available to the cache.
+        max_model_length: Maximum model context length.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If any of the three arguments is ``None``.
+    """
     missing = [
         name
         for name, value in (
@@ -2254,6 +2267,19 @@ class EasyGenerationMixin:
             num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
 
         def _resolve_parallel_hybrid_attention_view_class(layer_idx: int) -> type:
+            """Identify the unique attention cache-view class for a hybrid layer.
+
+            Args:
+                layer_idx: Index of the parallel-hybrid layer in question.
+
+            Returns:
+                type: The single attention cache-view class declared by the
+                layer's slots.
+
+            Raises:
+                ValueError: If the layer exposes zero or more than one
+                    attention cache-view class.
+            """
             slots = cache_view_mapping_by_slot.get(layer_idx, {})
             attention_view_classes = {
                 cls
@@ -2607,6 +2633,15 @@ class EasyGenerationMixin:
             masking_details = getattr(text_config, "get_mask_details", lambda: None)()
 
         def _resolve_masking_details(layer_index: int):
+            """Return the masking details for a specific layer.
+
+            Args:
+                layer_index: Layer index to resolve.
+
+            Returns:
+                Any: A per-layer entry when ``masking_details`` is a dict,
+                otherwise the shared masking-details object.
+            """
             if isinstance(masking_details, dict):
                 return masking_details.get(layer_index)
             return masking_details
@@ -3540,6 +3575,20 @@ class EasyGenerationMixin:
         """
 
         def _expand_generation_value(key: str, value: tp.Any) -> tp.Any:
+            """Repeat one model-kwarg value along its batch axis.
+
+            Special-cases visual tensors (pixel values, grid sizes) so that
+            the generation batch dim is consolidated correctly after the
+            repeat.
+
+            Args:
+                key: Model-kwarg name (used for visual special-casing).
+                value: The candidate tensor (non-arrays pass through).
+
+            Returns:
+                Any: The expanded tensor or the original input when not
+                applicable.
+            """
             if value is None or not isinstance(value, jax.Array):
                 return value
 
@@ -3561,6 +3610,15 @@ class EasyGenerationMixin:
             return value
 
         def _expand_dict_for_generation(dict_to_expand):
+            """Expand every value in a model-kwargs dict in-place.
+
+            Args:
+                dict_to_expand: Mutable mapping of model kwargs.
+
+            Returns:
+                dict: The same dict with each value passed through
+                :func:`_expand_generation_value`.
+            """
             for key in dict_to_expand:
                 dict_to_expand[key] = _expand_generation_value(key, dict_to_expand[key])
             return dict_to_expand
@@ -3820,6 +3878,16 @@ class EasyGenerationMixin:
         elif not generation_config.do_sample and generation_config.num_beams > 1:
 
             def _repeat_mask_info(mi: MaskInfo, repeats: int) -> MaskInfo:
+                """Repeat every array leaf of a :class:`MaskInfo` along axis 0.
+
+                Args:
+                    mi: The mask-info pytree to expand.
+                    repeats: Per-element repeat count (typically the number
+                        of beams).
+
+                Returns:
+                    MaskInfo: The expanded mask-info pytree.
+                """
                 return jax.tree_util.tree_map(
                     lambda x: jnp.repeat(x, repeats=repeats, axis=0) if isinstance(x, jax.Array) else x,
                     mi,
@@ -4434,6 +4502,15 @@ class EasyGenerationMixin:
             )
 
             def gather_fn(tensor):
+                """Gather a single tensor along the ``(batch, beam)`` axes.
+
+                Args:
+                    tensor: A pytree leaf; scalars pass through unchanged.
+
+                Returns:
+                    Any: The fancy-indexed slice ``tensor[batch_indices,
+                    beam_indices]`` for non-scalar inputs.
+                """
                 # ignore scalars (e.g. cache index)
                 if tensor.ndim == 0:
                     return tensor

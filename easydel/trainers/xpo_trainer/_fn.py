@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Internal functions for Exploratory Preference Optimization (XPO).
+
+XPO augments DPO-style preference learning with an exploratory term that
+pushes additional probability mass onto reference completions, encouraging
+the policy to broaden its support beyond the local mode of the preferred
+distribution. The objective evaluated per pair is
+
+    L = L_pref(beta) + alpha * sum_t log pi(y^ref_t | x, y^ref_<t)
+
+where ``L_pref`` is either the sigmoid (DPO) or the squared-margin (IPO)
+preference loss applied to the (chosen, rejected) log-ratios. Reference
+log probabilities are computed under ``stop_gradient``.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -88,6 +102,29 @@ def _compute_pair_logps(
     ref_completion_mask: jax.Array,
     logprob_vocab_chunk_size: int | None,
 ) -> tuple[jax.Array, jax.Array]:
+    """Score policy and reference completions in a single concatenated forward.
+
+    Doubles the prompt batch and concatenates the policy and reference
+    completions along the batch axis so that one model call returns
+    per-token log probabilities for both samples.
+
+    Args:
+        module (spx.Module): Bound model module.
+        prompt_ids (jax.Array): Prompt token ids of shape ``[B, P]``.
+        prompt_mask (jax.Array): Prompt attention mask of shape ``[B, P]``.
+        policy_completion_ids (jax.Array): Policy completion ids
+            ``[B, C_pol]``.
+        policy_completion_mask (jax.Array): Policy completion mask.
+        ref_completion_ids (jax.Array): Reference completion ids
+            ``[B, C_ref]``.
+        ref_completion_mask (jax.Array): Reference completion mask.
+        logprob_vocab_chunk_size (int | None): Optional vocabulary
+            chunking size used inside :func:`get_per_token_logps`.
+
+    Returns:
+        tuple[jax.Array, jax.Array]: ``(policy_token_logps,
+        ref_token_logps)`` both shaped ``[B, completion_len]``.
+    """
     prompt_ids = jnp.concatenate([prompt_ids, prompt_ids], axis=0)
     prompt_mask = jnp.concatenate([prompt_mask, prompt_mask], axis=0)
     completion_ids = jnp.concatenate([policy_completion_ids, ref_completion_ids], axis=0)
@@ -119,6 +156,19 @@ def _sum_logps(token_logps: jax.Array, completion_mask: jax.Array) -> jax.Array:
 
 
 def _xpo_pair_forward(module: spx.Module, batch: dict[str, tp.Any], logprob_vocab_chunk_size: int | None):
+    """Pair forward used by the cached reference-model JIT.
+
+    Args:
+        module (spx.Module): Bound reference model.
+        batch (dict[str, tp.Any]): Batch with ``prompt_ids``, ``prompt_mask``,
+            and policy / reference completion fields.
+        logprob_vocab_chunk_size (int | None): Optional vocabulary
+            chunking size.
+
+    Returns:
+        tuple[jax.Array, jax.Array]: Reference per-token log probabilities
+        for the policy and reference completions, respectively.
+    """
     return _compute_pair_logps(
         module,
         batch["prompt_ids"],
@@ -132,6 +182,16 @@ def _xpo_pair_forward(module: spx.Module, batch: dict[str, tp.Any], logprob_voca
 
 
 def _cached_xpo_reference_forward(mesh: spx.SpxMesh) -> tp.Callable[..., tp.Any]:
+    """Return a JIT-cached reference-model pair forward keyed by mesh identity.
+
+    Args:
+        mesh (spx.SpxMesh): The Spectrax device mesh used as the cache
+            key. Different meshes get different specializations.
+
+    Returns:
+        tp.Callable: Cached ``spx.jit``-compiled wrapper around
+        :func:`_xpo_pair_forward`.
+    """
     key = id(mesh)
     cached = _XPO_REFERENCE_FORWARD_CACHE.get(key)
     if cached is None:
@@ -152,25 +212,75 @@ def xpo_step(
     is_train: bool,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """Execute a single XPO training or evaluation step.
+    """Run one XPO training or evaluation step (DPO + exploration on policy/ref pairs).
 
-    Implements the Exploratory Preference Optimization objective, which combines
-    DPO-style preference learning with an exploratory term that encourages the
-    policy to assign probability mass to reference completions.
+    The step assumes the trainer has already produced a batch carrying
+    *one* policy completion and *one* reference completion per prompt
+    along with a ``chosen_mask`` selecting which of the two has the
+    higher reward. Inside this function:
+
+    1. The reference model is forwarded twice (under
+       ``stop_gradient``) on the policy and reference completions to
+       cache per-token log-probs as ``_ref_on_policy`` and
+       ``_ref_on_ref`` -- shared by every microbatch in this call to
+       avoid repeated reference forwards.
+    2. The policy model is forwarded twice as well -- once on the
+       policy completions and once on the reference completions --
+       producing per-token log-probs ``policy_on_policy`` and
+       ``policy_on_ref``.
+    3. Sequence-level log-probs ``policy_logps_*`` / ``ref_logps_*`` are
+       formed, then routed by ``chosen_mask`` into chosen/rejected
+       slots so a single pair of per-prompt log-ratios feeds the DPO
+       loss
+
+       ``logits = (chosen_policy_logps - chosen_ref_logps)
+                 - (rejected_policy_logps - rejected_ref_logps)``.
+
+    4. The DPO surrogate is selected by the broadcast ``loss_type``
+       field: ``loss_type==0`` picks the sigmoid (Bradley-Terry)
+       form ``-log_sigmoid(beta * logits)``; non-zero picks the IPO
+       squared-margin loss ``(logits - 1/(2*beta))^2``. The XPO
+       exploration bonus ``alpha * mean(policy_logps_ref)`` is added
+       to the chosen DPO loss; total loss is averaged over the batch.
+    5. Diagnostics include the per-side rewards
+       ``beta * log_ratio``, the preference accuracy
+       ``mean(margin > 0)``, the symmetric KL between policy and
+       reference (averaged over the two completion sets), and the
+       mean policy entropy across both branches.
+
+    Sharding is applied to the input batch by
+    :func:`make_assertions_and_get_sizes`; gradient accumulation is
+    handled by :func:`minibatch_call` and the optimiser update by
+    :func:`update_state_respectfully`.
 
     Args:
-        state: Current model state containing parameters and optimizer state.
-        batch: Input batch containing prompt IDs, completion IDs, masks, and hyperparameters.
-        reference_state: Frozen reference model state for computing log probability ratios.
-        loss_config: Optional configuration for loss computation and clipping.
-        learning_rate_fn: Function that returns the learning rate for the current step.
-        partition_spec: Sharding specification for distributed training.
-        gradient_accumulation_steps: Number of steps to accumulate gradients before updating.
-        is_train: Whether this is a training step (True) or evaluation step (False).
+        state: Current policy state (parameters + optimiser).
+        batch: Mapping with ``prompt_ids`` / ``prompt_mask``,
+            ``policy_completion_ids`` / ``policy_completion_mask``,
+            ``ref_completion_ids`` / ``ref_completion_mask``,
+            ``chosen_mask``, and broadcast scalars ``beta``, ``alpha``
+            and ``loss_type``.
+        reference_state: Frozen reference policy used both as the KL
+            anchor and as the source of the exploration bonus.
+        logprob_vocab_chunk_size: Optional vocabulary-axis chunk size
+            forwarded to :func:`get_per_token_logps` to bound peak
+            memory.
+        loss_config: Optional :class:`LossConfig` consumed by
+            :func:`update_state_respectfully` (clip / scale).
+        learning_rate_fn: Optional schedule used by
+            :func:`update_metrics` for per-step LR logging.
+        partition_spec: Sharding spec for the input batch.
+        gradient_accumulation_steps: Number of microbatches whose
+            gradients are accumulated per optimiser update.
+        is_train: When ``True`` differentiate, accumulate, and apply
+            the optimiser update; when ``False`` evaluate the loss and
+            return only metrics.
+        straight_through_emulator: Optional STE wrapper applied to the
+            parameter tree inside the loss closure.
 
     Returns:
-        If is_train is True, returns tuple of (updated_state, metrics).
-        If is_train is False, returns only metrics.
+        ``(updated_state, metrics)`` in training mode; otherwise just
+        the :class:`LossMetrics` instance.
     """
 
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -205,6 +315,20 @@ def xpo_step(
     del ref_module
 
     def loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
+        """Compute the XPO scalar loss and diagnostics for a minibatch.
+
+        Args:
+            tree (spx.State): Differentiable parameter tree.
+            minibatch (dict[str, jax.Array]): Minibatch with prompt /
+                policy-completion / ref-completion fields, ``chosen_mask``,
+                ``beta``, ``alpha``, ``loss_type`` and pre-computed
+                stop-gradient reference log probabilities.
+
+        Returns:
+            tuple[jax.Array, LossMetrics]: Scalar total loss and metrics
+            with ``loss_dpo``, ``loss_xpo``, ``kl``, ``entropy``,
+            chosen / rejected rewards and accuracy.
+        """
         if is_train and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
@@ -325,6 +449,28 @@ def _xpo_loss_from_logps(
     alpha: jax.Array,
     loss_type: jax.Array,
 ) -> jax.Array:
+    """Compute the XPO loss given pre-aggregated per-token log probabilities.
+
+    Args:
+        policy_on_policy (jax.Array): Policy per-token log probabilities
+            on the policy completions.
+        policy_on_ref (jax.Array): Policy per-token log probabilities on
+            the reference completions.
+        ref_on_policy (jax.Array): Reference per-token log probabilities
+            on the policy completions (stop-gradient).
+        ref_on_ref (jax.Array): Reference per-token log probabilities on
+            the reference completions (stop-gradient).
+        policy_completion_mask (jax.Array): Mask for policy completions.
+        ref_completion_mask (jax.Array): Mask for reference completions.
+        chosen_mask (jax.Array): Boolean mask selecting which sample is
+            preferred (True = policy completion preferred).
+        beta (jax.Array): DPO/IPO temperature.
+        alpha (jax.Array): Exploratory term coefficient.
+        loss_type (jax.Array): ``0`` for sigmoid (DPO), non-zero for IPO.
+
+    Returns:
+        jax.Array: Scalar XPO loss averaged over the batch.
+    """
     policy_logps_policy = _sum_logps(policy_on_policy, policy_completion_mask)
     policy_logps_ref = _sum_logps(policy_on_ref, ref_completion_mask)
     ref_logps_policy = _sum_logps(ref_on_policy, policy_completion_mask)
@@ -346,6 +492,25 @@ def _xpo_loss_from_logps(
 
 
 def _prepare_xpo_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Augment a scheduled-loss batch with reference per-token log probabilities.
+
+    On first invocation, runs the reference model under
+    :func:`_cached_xpo_reference_forward` and stores the
+    ``stop_gradient``-wrapped policy / reference log-probs in the batch
+    under the keys ``_ref_on_policy`` and ``_ref_on_ref``. Subsequent
+    invocations short-circuit when these keys are already present.
+
+    Args:
+        call: Scheduled call descriptor; must expose ``batch``,
+            ``reference_state``, ``partition_spec``,
+            ``logprob_vocab_chunk_size`` and ``schedule``.
+
+    Returns:
+        dict[str, tp.Any]: The (possibly augmented) batch.
+
+    Raises:
+        RuntimeError: If ``reference_state`` is missing.
+    """
     batch = dict(call.batch)
     if "_ref_on_policy" in batch and "_ref_on_ref" in batch:
         return batch
@@ -365,6 +530,16 @@ def _prepare_xpo_scheduled_batch(call) -> dict[str, tp.Any]:
 
 
 def _xpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build the cache key for a scheduled XPO loss specialization.
+
+    Args:
+        call: Scheduled call descriptor.
+
+    Returns:
+        tuple[tp.Any, ...]: Hashable identifier for the
+        ``(logprob_vocab_chunk_size, partition_spec,
+        straight_through_emulator)`` specialization.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("logprob_vocab_chunk_size", "partition_spec"),
@@ -373,10 +548,30 @@ def _xpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_xpo_scheduled_loss(call):
+    """Build a scalar XPO loss closure for the scheduled-loss adapter.
+
+    Args:
+        call: Scheduled call descriptor providing
+            ``logprob_vocab_chunk_size`` and ``partition_spec``.
+
+    Returns:
+        tp.Callable: A function ``(tree, batch) -> Array`` returning the
+        scalar XPO objective.
+    """
     logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the XPO scalar loss for the scheduled-loss adapter.
+
+        Args:
+            tree (spx.State): Current parameter tree.
+            batch (dict[str, tp.Any]): Minibatch produced by
+                :func:`_prepare_xpo_scheduled_batch`.
+
+        Returns:
+            jax.Array: Scalar loss.
+        """
         module = bind_scheduled_module(call, tree)
         batch = constrain_scheduled_batch(module, batch, partition_spec)
         policy_on_policy, policy_on_ref = _compute_pair_logps(

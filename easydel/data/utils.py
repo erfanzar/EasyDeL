@@ -36,17 +36,31 @@ def with_retry(
     backoff_factor: float = 2.0,
     retryable_exceptions: tuple = (IOError, OSError, TimeoutError),
 ) -> Callable:
-    """Decorator for retry with exponential backoff on transient errors.
+    """Build a decorator that adds bounded exponential-backoff retries to a function.
+
+    The returned decorator catches a configurable tuple of
+    "transient" exception types and retries the call up to
+    ``max_retries`` times, sleeping ``initial_delay`` seconds before
+    the first retry and multiplying the delay by ``backoff_factor``
+    each subsequent attempt (capped at ``max_delay``). Used by
+    :class:`ParquetShardedSource` and friends to absorb transient
+    cloud-storage outages.
 
     Args:
-        max_retries: Maximum number of retry attempts.
-        initial_delay: Initial delay between retries in seconds.
-        max_delay: Maximum delay between retries.
-        backoff_factor: Multiplier for delay after each retry.
-        retryable_exceptions: Tuple of exception types to retry on.
+        max_retries: Number of additional attempts after the
+            initial call (so the function is invoked up to
+            ``max_retries + 1`` times in total).
+        initial_delay: First inter-attempt sleep in seconds.
+        max_delay: Upper bound on inter-attempt sleeps.
+        backoff_factor: Multiplier applied to ``delay`` after each
+            failed attempt.
+        retryable_exceptions: Tuple of exception classes that
+            trigger a retry. Anything outside this tuple
+            propagates immediately, regardless of attempts left.
 
     Returns:
-        Decorated function with retry logic.
+        Callable: A decorator that wraps any function with the
+        configured retry semantics.
 
     Example:
         >>> @with_retry(max_retries=3)
@@ -55,8 +69,41 @@ def with_retry(
     """
 
     def decorator(func: Callable) -> Callable:
+        """Inline closure: capture ``func`` and produce the retrying wrapper.
+
+        Args:
+            func: The user-supplied callable to wrap.
+
+        Returns:
+            Callable: A function-preserving wrapper applying the
+            configured retry policy.
+        """
+
         @wraps(func)
         def wrapper(*args, **kwargs):
+            """Inline closure: drive the retry loop while preserving ``func``'s metadata.
+
+            Captures ``func``, the retry budget, and the exception
+            tuple from the enclosing :func:`with_retry` /
+            :func:`decorator` scope. On a retryable exception
+            sleeps ``min(delay, max_delay)``, multiplies ``delay``
+            by ``backoff_factor``, and tries again; on a
+            non-retryable exception (or after the budget is
+            exhausted) re-raises.
+
+            Args:
+                *args: Positional arguments forwarded to ``func``.
+                **kwargs: Keyword arguments forwarded to ``func``.
+
+            Returns:
+                Any: Whatever ``func`` returns on the first
+                successful attempt.
+
+            Raises:
+                Exception: The most recent retryable exception when
+                    every attempt failed, or any non-retryable
+                    exception raised by ``func``.
+            """
             delay = initial_delay
             last_exception = None
 
@@ -84,17 +131,36 @@ def get_cached_filesystem(
     expiry_time: int = 86400,
     storage_options: dict | None = None,
 ):
-    """Get a cached fsspec filesystem for remote protocols.
+    """Wrap a remote fsspec filesystem with a local read-through cache.
+
+    Cloud-storage reads are expensive; this helper layers an
+    fsspec cache (``filecache``, ``simplecache``, or ``blockcache``)
+    in front of the remote protocol so repeated reads of the same
+    object are served locally. Local protocols (``"file"``,
+    ``"local"``, ``""``) bypass the cache and return a plain
+    filesystem.
 
     Args:
-        protocol: Remote protocol (gs, s3, etc.).
-        cache_dir: Local directory for cached files.
-        cache_type: Cache type - "filecache", "simplecache", or "blockcache".
-        expiry_time: Cache expiry time in seconds (default: 24 hours).
-        storage_options: Additional options for the underlying filesystem.
+        protocol: Remote scheme (e.g. ``"gs"``, ``"s3"``,
+            ``"hf"``). Local protocols short-circuit the cache.
+        cache_dir: Base directory; the actual cache is rooted at
+            ``cache_dir / fsspec_cache / <protocol>`` and created
+            on demand.
+        cache_type: Which fsspec cache implementation to use —
+            ``"filecache"`` (default, file-level cache),
+            ``"simplecache"`` (whole-file cache without
+            invalidation), or ``"blockcache"`` (block-level cache).
+        expiry_time: TTL in seconds for cached entries before
+            re-fetching (defaults to 24 hours).
+        storage_options: Per-protocol storage options forwarded as
+            ``target_options[protocol]`` to the underlying
+            filesystem (credentials, project ids, request
+            timeouts).
 
     Returns:
-        Cached filesystem instance, or regular filesystem for local protocols.
+        AbstractFileSystem: A cached filesystem for remote
+        protocols, or the plain local filesystem when ``protocol``
+        is ``"file"``/``"local"``/``""``.
 
     Example:
         >>> fs = get_cached_filesystem("gs", "/tmp/cache")
@@ -121,25 +187,38 @@ def get_cached_filesystem(
 
 
 def is_streaming(ds) -> bool:
-    """Check if a dataset is a streaming dataset.
+    """Heuristic check for whether ``ds`` is an HF streaming :class:`IterableDataset`.
+
+    Uses the presence of the private ``_ex_iterable`` attribute as
+    the signal — fast and avoids importing ``datasets`` just to
+    check the type. Sufficient for the use cases here (deciding
+    whether to use ``.take`` vs ``.select`` for row truncation).
 
     Args:
-        ds: Dataset object to check.
+        ds: Dataset-like object to classify.
 
     Returns:
-        True if the dataset is a streaming IterableDataset, False otherwise.
+        bool: ``True`` when the object looks like an HF streaming
+        ``IterableDataset``; ``False`` for in-memory ``Dataset`` or
+        anything else.
     """
     return hasattr(ds, "_ex_iterable")
 
 
 def infer_builder_from_ext(path: str) -> str | None:
-    """Infer the dataset builder type from file extension.
+    """Map a file extension to the matching HuggingFace ``datasets`` builder name.
+
+    Recognised mappings: ``.arrow`` -> ``"arrow"``, ``.csv`` ->
+    ``"csv"``, ``.json``/``.jsonl`` -> ``"json"``,
+    ``.parquet``/``.pq`` -> ``"parquet"``. Anything else returns
+    ``None`` so the caller can fall back to alternative detection.
 
     Args:
-        path: File path to analyze.
+        path: File path or URL whose suffix is examined.
 
     Returns:
-        Builder name ("arrow", "csv", "json", "parquet") or None if unknown.
+        str | None: One of ``"arrow"``, ``"csv"``, ``"json"``,
+        ``"parquet"``, or ``None`` for unrecognised extensions.
     """
     if path.endswith(".arrow"):
         return "arrow"
@@ -153,16 +232,25 @@ def infer_builder_from_ext(path: str) -> str | None:
 
 
 def glob_files(pattern: str, recursive: bool = True) -> list[str]:
-    """Expand glob patterns to actual file paths.
+    """Expand a glob pattern through fsspec, supporting both local and remote URIs.
 
-    Supports both local and remote filesystems through fsspec.
+    Detects the protocol (via :func:`fsspec.utils.infer_storage_options`),
+    asks the corresponding filesystem for matches, and reconstructs
+    full URIs for remote protocols (so callers don't accidentally
+    drop the scheme between glob and open). Used as the underlying
+    expansion engine for :func:`expand_data_files`.
 
     Args:
-        pattern: Glob pattern to expand (e.g., "data/*.json", "s3://bucket/**.parquet").
-        recursive: Whether to search recursively (default: True).
+        pattern: Glob pattern. Local paths (``"data/*.json"``)
+            and cloud URIs (``"s3://bucket/**.parquet"``,
+            ``"gs://..."``, ``"hf://..."``) are both supported.
+        recursive: Whether ``**`` should match across directory
+            boundaries.
 
     Returns:
-        List of matching file paths.
+        list[str]: Matching paths/URIs. For remote protocols the
+        returned strings include the scheme so they can be
+        re-opened directly.
 
     Example:
         >>> files = glob_files("data/**/*.json")
@@ -185,20 +273,42 @@ def glob_files(pattern: str, recursive: bool = True) -> list[str]:
 
 
 def wrap_format_callback(fn, content_key: str = "content"):
-    """Wrap a format callback to ensure it returns a dictionary.
+    """Adapt user-supplied format callbacks so they always yield a row dict.
 
-    This helper ensures that format callbacks always return a dictionary,
-    even if the callback returns a single value or None.
+    User callbacks come in three common shapes: row -> dict,
+    row -> string (the new content), and row -> ``None`` (drop the
+    transform). To let the rest of the pipeline assume the
+    "row -> dict" shape, this wrapper coerces the latter two into
+    that shape: ``None`` returns the original row unchanged; a
+    bare value ``v`` returns ``{content_key: v}``.
 
     Args:
-        fn: The original callback function.
-        content_key: Key to use if the callback returns a non-dict value.
+        fn: User-supplied format callback to wrap.
+        content_key: Row key used when ``fn`` returns a non-dict
+            non-None value.
 
     Returns:
-        Wrapped function that always returns a dictionary.
+        Callable: A new callback with the canonical "row -> dict"
+        shape.
     """
 
     def wrapped(ex):
+        """Inline closure: invoke ``fn`` on a row and coerce the result to a dict.
+
+        Captures ``fn`` and ``content_key`` from
+        :func:`wrap_format_callback`. The pipeline downstream
+        relies on row dicts, so this is the bridge between
+        loose user contracts and the strict pipeline contract.
+
+        Args:
+            ex: Row dict to feed into the user callback.
+
+        Returns:
+            dict: The original row when ``fn(ex)`` returned
+            ``None``; ``fn(ex)`` itself when it returned a
+            ``dict``; otherwise a single-key dict
+            ``{content_key: fn(ex)}``.
+        """
         out = fn(ex)
         if out is None:
             return ex
@@ -210,16 +320,27 @@ def wrap_format_callback(fn, content_key: str = "content"):
 
 
 def align_columns_intersection(datasets: list):
-    """Align datasets to have only common columns.
+    """Project a list of HF datasets onto their shared column set.
 
-    Removes columns that are not present in all datasets, ensuring
-    they can be concatenated or mixed properly.
+    Computes the intersection of all input datasets' column lists
+    and uses ``Dataset.remove_columns`` to drop the rest from each.
+    Required before ``concatenate_datasets`` (which fails on
+    schema mismatches) and before block-mixing heterogeneously
+    schemed sources.
+
+    No-ops when the input is empty or when the columns happen to
+    have nothing in common (the empty intersection case is treated
+    as "give up and return the original datasets" rather than
+    silently producing empty schemas).
 
     Args:
-        datasets: List of Dataset objects to align.
+        datasets: List of HuggingFace ``Dataset`` instances; each
+            must expose ``column_names`` and ``remove_columns``.
 
     Returns:
-        List of datasets with only common columns retained.
+        list[Dataset]: Datasets with non-shared columns removed,
+        in the original order. Identical to ``datasets`` when no
+        change was needed.
 
     Example:
         >>> # dataset1 has columns: ["text", "label", "metadata"]
@@ -238,9 +359,14 @@ def align_columns_intersection(datasets: list):
 
 
 def warn_deprecated(msg: str):
-    """Issue a deprecation warning.
+    """Emit a :class:`DeprecationWarning` with ``stacklevel=2``.
+
+    Wrapping :func:`warnings.warn` ensures every deprecation in
+    the data layer is consistently surfaced (same category,
+    same stack level so the warning points at the caller's
+    deprecated usage rather than at this helper).
 
     Args:
-        msg: Deprecation message to display.
+        msg: Deprecation message shown to the user.
     """
     warnings.warn(msg, DeprecationWarning, stacklevel=2)

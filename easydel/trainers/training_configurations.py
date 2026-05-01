@@ -11,6 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Top-level :class:`TrainingArguments` dataclass and supporting helpers.
+
+This module defines the configuration surface shared by every concrete
+EasyDeL trainer.  ``TrainingArguments`` exposes hyperparameters for the
+optimizer, scheduler, sharding, dataloaders, logging/checkpointing,
+generation and benchmarking, plus utility methods to construct an
+optimizer/scheduler pair and resolve save directories.
+
+Subclassed configs (DPO, GRPO, SFT, ...) extend this base with
+algorithm-specific knobs while reusing the shared serialization,
+checkpoint-resume, and W&B-init plumbing.
+"""
+
 from __future__ import annotations
 
 import ast

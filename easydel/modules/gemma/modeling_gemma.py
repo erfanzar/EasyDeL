@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of Google's Gemma decoder-only language model.
+
+Gemma is a family of lightweight open language models developed by Google DeepMind.
+This module provides the building blocks (RMSNorm, attention, gated MLP, decoder
+layer) and full models for base inference, causal language modeling, and sequence
+classification.
+
+Architectural traits:
+    - Pre-normalization decoder transformer with RMSNorm (uses ``1 + weight`` scaling).
+    - Grouped-query attention (GQA) with rotary position embeddings (RoPE).
+    - Gated MLP with approximate GeLU activation (``gelu_pytorch_tanh``).
+    - Embedding scaling by ``sqrt(hidden_size)`` applied to token embeddings.
+    - Optional gradient checkpointing and pipeline-parallel layer staging.
+
+Exports:
+    - :class:`GemmaModel`: Backbone model returning hidden states.
+    - :class:`GemmaForCausalLM`: Decoder LM with tied / weight-shared output head.
+    - :class:`GemmaForSequenceClassification`: Pooled classifier head over the last token.
+"""
 
 import functools
 import warnings
@@ -54,20 +73,35 @@ logger = get_logger(__name__)
 
 
 class GemmaRMSNorm(spx.Module):
-    """Root Mean Square Layer Normalization for Gemma models.
+    """Gemma's Root Mean Square LayerNorm with the ``(1 + weight)`` scaling convention.
 
-    This normalization technique normalizes the inputs by the root mean square,
-    providing stability during training while being computationally efficient.
+    Gemma's RMSNorm differs from the textbook formulation in two ways. First, the
+    learnable scale parameter is initialised to **zero** and applied as
+    ``(1 + weight) * hat_x`` instead of ``weight * hat_x``; this means a freshly
+    initialised norm acts as the identity, which Google's reference implementation
+    relies on for stable warm-up. Second, the variance is computed in float32
+    regardless of the activation dtype to avoid catastrophic cancellation when
+    running under bfloat16.
+
+    Attributes:
+        config: Source ``GemmaConfig``; only ``hidden_size`` and ``rms_norm_eps``
+            are read at runtime.
+        epsilon: Numerical stabiliser added inside the inverse-RMS square-root.
+        dtype: Output / compute dtype the normalised activations are cast back to.
+        weight: Learnable scale of shape ``(hidden_size,)`` initialised to zeros
+            and consumed as ``1 + weight`` so the layer starts as the identity.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(self, config: GemmaConfig, dtype: jnp.dtype = jnp.float32):
-        """Initialize Gemma RMS normalization layer.
+        """Build the per-feature scale and capture the epsilon from ``config``.
 
-        Args:
-            config (GemmaConfig): Model configuration containing hidden_size and rms_norm_eps.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+        The scale is registered as a bound :class:`ArrayParam` of shape
+        ``(config.hidden_size,)`` initialised to ones-then-shifted-by-minus-one
+        (i.e. ``init_method="ones"`` storage; the ``+1`` happens at apply time).
+        ``dtype`` is only the cast-back dtype — the variance reduction itself
+        always promotes to float32.
         """
         self.config = config
         self.epsilon = self.config.rms_norm_eps
@@ -82,13 +116,21 @@ class GemmaRMSNorm(spx.Module):
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply RMS normalization with learnable scale.
+        """Normalise along the last axis and apply the ``(1 + weight)`` scale.
+
+        Computes ``hat_x = x / sqrt(mean(x**2, axis=-1, keepdims=True) + eps)``
+        in float32, then returns ``(1 + weight) * hat_x`` cast back to
+        ``self.dtype``. The mean is taken over the hidden dimension only;
+        batch and sequence dims are preserved.
 
         Args:
-            hidden_states: Input tensor to normalize
+            hidden_states: Tensor of shape ``[batch, seq_len, hidden_dim]`` to
+                be normalised. May be any dtype — the variance reduction is
+                lifted to float32 internally.
 
         Returns:
-            Normalized and scaled hidden states
+            Tensor of the same shape as the input, with the last axis
+            re-scaled to unit RMS and modulated by ``(1 + weight)``.
         """
         variance = hidden_states.astype(jnp.float32)
         variance = jnp.power(variance, 2)
@@ -99,16 +141,19 @@ class GemmaRMSNorm(spx.Module):
 
 
 class GemmaAttention(UnifiedAttention):
-    """Multi-head attention layer for Gemma models with rotary position embeddings.
+    """Causal multi-head / grouped-query attention block for Gemma.
 
-    Implements standard multi-head attention (MHA) or grouped query attention (GQA)
-    with rotary position embeddings (RoPE). Inherits from UnifiedAttention for
-    efficient attention computation with support for KV caching and various
-    attention backends.
+    Thin specialisation of :class:`UnifiedAttention` that fixes
+    ``attention_type="standard"`` and ``causal=True``, so the underlying ejkernel
+    backend dispatches to a dense causal kernel (or its GQA variant when
+    ``num_key_value_heads < num_attention_heads``) with rotary position
+    embeddings applied to Q and K before the softmax. Q/K/V projections are
+    laid out via ColumnParallel/RowParallel linears in the parent class so the
+    head axis is sharded along the model-parallel mesh axis.
 
-    Attributes:
-        config (GemmaConfig): Model configuration with attention parameters.
-        head_dim (int): Dimensionality of each attention head.
+    The :meth:`_create_rotary` override is what carries Gemma's full-head-dim
+    rotary embedding (``rotary_dim == head_dim``) and the configurable
+    ``rope_theta`` base; everything else is inherited.
     """
 
     def __init__(
@@ -121,16 +166,12 @@ class GemmaAttention(UnifiedAttention):
         rngs: spx.Rngs,
         layer_idx: int,
     ):
-        """Initialize Gemma attention layer.
+        """Forward all parameters to :class:`UnifiedAttention` with Gemma defaults.
 
-        Args:
-            config (GemmaConfig): Model configuration with attention parameters.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-            layer_idx (int): Index of this layer in the model.
+        Pins ``attention_type="standard"`` (dense softmax, no sliding window
+        like Gemma2) and ``causal=True`` so prefill and decode share the same
+        masked kernel. ``layer_idx`` is propagated so the parent can route the
+        appropriate KV-cache view per layer.
         """
         super().__init__(
             config,
@@ -144,9 +185,21 @@ class GemmaAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: GemmaConfig, dtype: jnp.dtype):
-        """Create Gemma-specific rotary embedding layer.
+        """Build the rotary-embedding helper for this layer's head geometry.
 
-        Override to use Gemma's rope_theta configuration.
+        Gemma applies RoPE across the full head dimension (``rotary_dim ==
+        head_dim``) and uses ``config.rope_theta`` as the frequency base. The
+        helper is the standard precomputed cos/sin table generator returned by
+        :meth:`EasyDeLBaseConfig.get_basic_rope`.
+
+        Args:
+            config: Source config exposing ``rope_theta``.
+            dtype: Compute dtype the cos/sin table is cast to (typically the
+                attention dtype, not the parameter dtype).
+
+        Returns:
+            A rotary-embedding callable that, given ``positions``, yields the
+            ``(cos, sin)`` tables consumed by the attention kernel.
         """
         return config.get_basic_rope(
             dtype=dtype,
@@ -181,16 +234,16 @@ class GemmaMLP(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Gemma MLP block.
+        """Construct the three projections (gate, up, down) and pin the activation.
 
-        Args:
-            config (GemmaConfig): Model configuration with MLP parameters.
-            layer_idx (int): Index of this layer in the model.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (str | jax.lax.Precision | None, optional): Numerical precision for matrix operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
+        The gate and up projections are ColumnParallel (output-sharded across
+        the model-parallel mesh) while the down projection is RowParallel
+        (input-sharded), matching the canonical Megatron MLP layout. The
+        activation is read from ``config.hidden_activation`` and falls back to
+        ``"gelu_pytorch_tanh"`` with a warning if it is left unset, because
+        Gemma's reference uses approximate GeLU rather than exact GeLU.
+        ``layer_idx`` is accepted for API parity with Gemma2's per-layer MLP
+        but is not used here.
         """
         self.config = config
         self.dtype = dtype
@@ -308,16 +361,14 @@ class GemmaDecoderLayer(spx.Module):
         rngs: spx.Rngs,
         layer_idx: int,
     ):
-        """Initialize Gemma decoder layer.
+        """Wire up the four sub-modules of one decoder block.
 
-        Args:
-            config (GemmaConfig): Model configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (str | jax.lax.Precision | None, optional): Numerical precision for matrix operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-            layer_idx (int): Index of this layer in the model.
+        Builds, in order: pre-attention RMSNorm, causal GQA attention,
+        pre-MLP RMSNorm, gated GeGLU MLP. ``layer_idx`` is propagated to the
+        attention sub-module so it can pick its KV-cache view; it has no
+        effect on the MLP. The same ``rngs`` stream is forked to all
+        sub-modules; init keys are derived deterministically from the parent
+        seed.
         """
         self.config = config
         self.dtype = dtype
@@ -424,17 +475,31 @@ class GemmaDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GemmaConfig, model_type="gemma")
 class GemmaModel(EasyDeLBaseModule):
-    """Gemma model implementation.
+    """Backbone Gemma transformer returning hidden states (no LM head).
 
-    This implements the Gemma language model architecture, utilizing transformer blocks
-    with RMSNorm, rotary position embeddings, and a specific attention mechanism.
-    Gemma uses embedding scaling by sqrt(hidden_size) for training stability.
+    Implements the standard pre-norm decoder stack: ``embed -> [decoder_layer
+    x num_hidden_layers] -> RMSNorm``. Token embeddings are scaled by
+    ``sqrt(hidden_size)`` immediately before entering layer 0, matching
+    Google's reference; this scale is what makes the otherwise-identity
+    ``(1 + 0)`` RMSNorm at init produce bounded activations.
+
+    The model supports two cache flavours via ``past_key_values`` —
+    :class:`TransformerCache` for dense KV layouts and
+    :class:`RaggedPagesCache` for paged (vLLM-style) attention used by the
+    eSurge inference engine. Layers are stage-assigned for pipeline
+    parallelism (see :meth:`_assign_layer_stage`) and optionally
+    ``ModuleList.stack`` ed when ``config.scan_layers`` is set and there is
+    only a single pipeline stage.
 
     Attributes:
-        config (GemmaConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        config: Source ``GemmaConfig``.
+        dtype: Activation/compute dtype (typically ``bfloat16``).
+        param_dtype: Storage dtype of the parameter tree.
+        precision: ``jax.lax.PrecisionLike`` forwarded into all matmuls.
+        embed_tokens: Token embedding lookup of shape ``[vocab, hidden]``.
+        layers: ``ModuleList`` (optionally stacked) of
+            :class:`GemmaDecoderLayer`.
+        norm: Final ``GemmaRMSNorm`` applied to the last hidden state.
     """
 
     def __init__(
@@ -446,15 +511,16 @@ class GemmaModel(EasyDeLBaseModule):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Gemma base model.
+        """Build embeddings, ``num_hidden_layers`` decoder blocks, and final norm.
 
-        Args:
-            config (GemmaConfig): Model configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
+        Each decoder block is wrapped through :func:`auto_remat` with the
+        gradient-checkpointing policy from
+        ``config.gradient_checkpointing`` and the named save/exclude points
+        from ``config.gradient_checkpointing_targets`` so backward pass can
+        recompute the per-block activations selectively. When
+        ``config.scan_layers`` is true *and* there is only one pipeline stage,
+        the ``ModuleList`` is collapsed via ``stack()`` so the forward becomes
+        a single ``lax.scan`` over a parameter-stacked block.
         """
         super().__init__(
             config=config,
@@ -673,16 +739,21 @@ class GemmaModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=GemmaConfig, model_type="gemma")
 class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
-    """Gemma model with a language modeling head for causal language modeling tasks.
+    """Causal LM wrapper: ``GemmaModel`` + biasless tied LM head.
 
-    This model is a transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation.
+    Subclass of :class:`BaseCausalLMModule` that supplies the backbone class
+    (:class:`GemmaModel`), the attribute name under which the backbone is
+    stored (``"model"``), and ``lm_head_bias=False``. Because Gemma defaults
+    ``tie_word_embeddings=True`` in :class:`GemmaConfig`, the LM head shares
+    weights with ``embed_tokens`` and the unembedding logits are computed via
+    ``compute_lm_logits`` in :class:`BaseCausalLMModule`.
 
     Attributes:
-        config (GemmaConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-        precision: Precision setting for JAX operations.
+        config: Source ``GemmaConfig`` (read by the parent for vocab size and
+            tie-embedding flag).
+        dtype: Activation dtype (defaults to ``bfloat16``).
+        param_dtype: Parameter dtype (defaults to ``bfloat16``).
+        precision: ``jax.lax.PrecisionLike`` forwarded to all matmuls.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -698,15 +769,11 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Gemma model for causal language modeling.
+        """Delegate to :class:`BaseCausalLMModule` with Gemma-specific defaults.
 
-        Args:
-            config (GemmaConfig): Model configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
+        Pins ``base_model_class=GemmaModel``, ``base_model_name="model"`` (so
+        the backbone is reachable as ``self.model``) and ``lm_head_bias=False``
+        — Gemma never trains a bias on the unembedding projection.
         """
         super().__init__(
             config=config,
@@ -823,16 +890,21 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GemmaConfig, model_type="gemma")
 class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel, GemmaConfig]):
-    """Gemma model for sequence classification tasks.
+    """Sequence-classification wrapper: ``GemmaModel`` + linear score head.
 
-    This class extends the base Gemma model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Adds a single ``Linear(hidden_size -> num_labels)`` classification head on
+    top of :class:`GemmaModel`. The head is fed the *last non-pad* token's
+    hidden state (``pooling_strategy="last"``) — i.e., the wrapper finds the
+    final position before ``config.pad_token_id`` and gathers from
+    ``last_hidden_state`` at that index. With no pad token configured, the
+    forward asserts ``batch == 1`` and uses position ``-1`` directly.
 
     Attributes:
-        config (GemmaConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        config: Source ``GemmaConfig``; ``num_labels`` and ``pad_token_id``
+            drive the head shape and pooling logic respectively.
+        dtype: Activation dtype.
+        param_dtype: Parameter dtype.
+        precision: ``jax.lax.PrecisionLike`` for all matmuls.
     """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
@@ -848,15 +920,13 @@ class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Gemma model for sequence classification.
+        """Delegate to :class:`BaseSequenceClassificationModule` with last-token pooling.
 
-        Args:
-            config (GemmaConfig): Model configuration with num_labels for classification.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
-                Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
+        Pins ``base_model_class=GemmaModel``, ``base_model_name="model"``,
+        ``pooling_strategy="last"`` (last non-pad token) and
+        ``score_head_bias=False``. The classification head is created as a
+        plain ``Linear`` of shape ``(hidden_size, config.num_labels)`` inside
+        the parent constructor.
         """
         super().__init__(
             config=config,

@@ -11,6 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""SigLIP vision-language model implementation for EasyDeL.
+
+This module implements Google Research's SigLIP, a CLIP-style
+contrastive vision-language model that uses a per-image-text-pair
+sigmoid loss instead of CLIP's softmax-over-negatives. Both encoders
+are standard transformers; the vision tower converts images into patch
+tokens (with learned absolute position embeddings) while the text tower
+uses learned token + position embeddings.
+
+Components:
+- :class:`SiglipTextModel` and :class:`SiglipVisionModel` for the two
+  encoder towers.
+- :class:`SiglipModel` glues them together and exposes the joint
+  ``logit_scale`` / ``logit_bias`` parameters used by the contrastive
+  loss.
+- :class:`SiglipForImageClassification` reuses the vision tower for
+  image classification tasks.
+"""
+
 import typing as tp
 from functools import partial
 
@@ -45,7 +65,22 @@ from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionCo
 
 @auto_pytree
 class SiglipVisionModelOutput(ModelOutput):
-    """Outputs from the SigLIP vision tower including pooled embeddings."""
+    """Output bundle returned by :class:`SiglipVisionModel`.
+
+    Attributes:
+        image_embeds: Pooled image-level embedding of shape
+            ``(batch, projection_dim)``. Already L2-normalised when the
+            model is instantiated for contrastive use; ``None`` when the
+            vision projection layer is disabled.
+        last_hidden_state: Final-layer per-patch hidden states of shape
+            ``(batch, num_patches + 1, hidden_size)`` (the leading slot
+            is the optional CLS / pooled patch).
+        hidden_states: Per-layer hidden states (length
+            ``num_hidden_layers + 1``) when ``output_hidden_states`` is
+            requested.
+        attentions: Per-layer attention weights when
+            ``output_attentions`` is requested.
+    """
 
     image_embeds: Array | None = None
     last_hidden_state: Array = None
@@ -55,7 +90,20 @@ class SiglipVisionModelOutput(ModelOutput):
 
 @auto_pytree
 class SiglipTextModelOutput(ModelOutput):
-    """Outputs from the SigLIP text encoder with optional attentions."""
+    """Output bundle returned by :class:`SiglipTextModel`.
+
+    Attributes:
+        text_embeds: Pooled text embedding of shape
+            ``(batch, projection_dim)`` produced by the text projection
+            head; ``None`` when projection is disabled.
+        last_hidden_state: Final-layer per-token hidden states of shape
+            ``(batch, seq_len, hidden_size)``.
+        hidden_states: Per-layer hidden states (length
+            ``num_hidden_layers + 1``) when ``output_hidden_states`` is
+            requested.
+        attentions: Per-layer attention weights when
+            ``output_attentions`` is requested.
+    """
 
     text_embeds: Array | None = None
     last_hidden_state: Array = None
@@ -65,7 +113,29 @@ class SiglipTextModelOutput(ModelOutput):
 
 @auto_pytree
 class SiglipOutput(ModelOutput):
-    """Contrastive SigLIP output bundling text/vision logits and embeddings."""
+    """Output bundle for the dual-tower contrastive SigLIP model.
+
+    Holds the per-pair logits (image→text and text→image), the
+    individual normalised embeddings used to derive them, and the raw
+    per-tower outputs in case downstream code needs hidden states or
+    attention weights.
+
+    Attributes:
+        loss: Sigmoid contrastive loss when supervision is provided;
+            ``None`` for inference-only forward passes.
+        logits_per_image: Image→text similarity matrix of shape
+            ``(batch, batch)``; entry ``[i, j]`` scores image ``i``
+            against text ``j``.
+        logits_per_text: Transposed companion of ``logits_per_image``
+            ``(batch, batch)`` for the text→image direction.
+        text_embeds: L2-normalised text embeddings of shape
+            ``(batch, projection_dim)``.
+        image_embeds: L2-normalised image embeddings of shape
+            ``(batch, projection_dim)``.
+        text_model_output: Raw output of the text tower (including
+            hidden states / attentions when requested).
+        vision_model_output: Raw output of the vision tower (same).
+    """
 
     loss: Array | None = None
     logits_per_image: Array = None
@@ -664,6 +734,12 @@ class SiglipEncoder(EasyDeLLayerStackMixin, spx.Module):
         all_hidden_states = () if output_hidden_states else None
 
         def _layer_loop(layer, carry):
+            """Apply a single transformer layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``layer`` on the current
+            hidden states, optionally accumulates per-layer hidden states
+            / attention weights, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1807,5 +1883,13 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
         return self.base_model.get_embedding()
 
     def get_task_head(self):
-        """Returns the image classification head."""
+        """Return the image-classification head.
+
+        Returns:
+            spx.Module: The :attr:`classifier` linear layer that maps
+            the pooled image embedding to ``num_labels`` class logits.
+            Distinct from ``image_embeds`` produced by the contrastive
+            projection: this head is fine-tuned independently for
+            classification.
+        """
         return self.classifier

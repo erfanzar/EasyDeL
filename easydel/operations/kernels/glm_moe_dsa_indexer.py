@@ -12,7 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dynamic sparse indexer operation for GLM-MoE-DSA."""
+"""Dynamic Sparse Attention (DSA) top-k indexer for GLM-MoE-DSA models.
+
+This module provides :class:`GlmMoeDsaIndexerOp`, an :class:`OperationImpl`
+that selects per-query top-k key indices used by the DSA branch of the
+GLM-MoE-DSA architecture. Optional RoPE is applied (interleaved or split),
+keys may be cached across calls, and an attention mask may be supplied to
+suppress invalid positions before the top-k reduction.
+
+Exports:
+    GlmMoeDsaIndexerOp: The registered operation, named ``"glm_moe_dsa_indexer"``
+        / ``"dsa_indexer"``.
+    GlmMoeDsaIndexerOutput: Pytree container holding the selected indices
+        and the (optionally updated) key cache.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +40,15 @@ from ..requirements import CacheType, ExecutionMode, MetadataField, OperationReq
 
 @auto_pytree
 class GlmMoeDsaIndexerOutput(OperationOutput):
-    """Output container for the GLM-MoE-DSA indexer operation."""
+    """Output container for the GLM-MoE-DSA indexer operation.
+
+    Attributes:
+        topk_indices: Selected per-query token indices of shape
+            ``(batch, seq, topk)``, or ``None`` before the operation runs.
+        cached_keys: Optional cached key tensor of shape
+            ``(batch, total_seq, head_dim)``. Populated only when
+            ``use_cache=True`` was passed to the operator; ``None`` otherwise.
+    """
 
     topk_indices: Int[Array, "batch seq topk"] | None = None
     cached_keys: Float[Array, "batch total_seq head_dim"] | None = None
@@ -35,10 +56,24 @@ class GlmMoeDsaIndexerOutput(OperationOutput):
 
 @OperationRegistry.register
 class GlmMoeDsaIndexerOp(OperationImpl):
-    """Computes DSA top-k token indices with an optional indexer-local key cache."""
+    """Compute DSA top-k token indices with an optional indexer-local key cache.
+
+    The indexer multiplies queries against (optionally cached) keys, weights
+    the per-head scores by ``head_weights``, applies an optional attention
+    mask, and returns the indices of the highest-scoring keys. It is used by
+    the GLM-MoE-DSA architecture to drive the dynamic-sparse-attention
+    routing decision.
+
+    Registered names: ``"glm_moe_dsa_indexer"`` and ``"dsa_indexer"``.
+    """
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
+        """Return the registered names of this operation.
+
+        Returns:
+            tuple[str, ...]: ``("glm_moe_dsa_indexer", "dsa_indexer")``.
+        """
         return ("glm_moe_dsa_indexer", "dsa_indexer")
 
     @classmethod
@@ -46,6 +81,18 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         cls,
         mode: ExecutionMode = ExecutionMode.MIXED,
     ) -> OperationRequirements:
+        """Declare metadata and cache requirements for the indexer.
+
+        The indexer needs ``POSITIONS`` for RoPE and is compatible with the
+        transformer or hybrid cache types, but does not itself require a KV
+        cache (``requires_cache(False)``).
+
+        Args:
+            mode: Execution mode (unused for this operation).
+
+        Returns:
+            OperationRequirements: The declared requirements.
+        """
         del mode
         return (
             RequirementsBuilder("glm_moe_dsa_indexer")
@@ -61,6 +108,17 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         cos: Float[Array, "batch seq rope_dim_half"],
         sin: Float[Array, "batch seq rope_dim_half"],
     ) -> Float[Array, "batch seq ... rope_dim"]:
+        """Apply RoPE in interleaved layout (even/odd lane pairs).
+
+        Args:
+            x: Tensor whose last dimension is RoPE-rotated, of shape
+                ``(batch, seq, ..., rope_dim)``.
+            cos: Cosine table of shape ``(batch, seq, rope_dim // 2)``.
+            sin: Sine table with the same shape as ``cos``.
+
+        Returns:
+            Float[Array]: ``x`` after RoPE rotation, with the same shape.
+        """
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
         o1 = x1 * cos[..., None, :] - x2 * sin[..., None, :]
@@ -73,6 +131,17 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         cos: Float[Array, "batch seq rope_dim_half"],
         sin: Float[Array, "batch seq rope_dim_half"],
     ) -> Float[Array, "batch seq ... rope_dim"]:
+        """Apply RoPE in split (first-half / second-half) layout.
+
+        Args:
+            x: Tensor whose last dimension is RoPE-rotated, of shape
+                ``(batch, seq, ..., rope_dim)``.
+            cos: Cosine table of shape ``(batch, seq, rope_dim // 2)``.
+            sin: Sine table with the same shape as ``cos``.
+
+        Returns:
+            Float[Array]: ``x`` after RoPE rotation, with the same shape.
+        """
         x1, x2 = jnp.split(x, 2, axis=-1)
         return jnp.concatenate(
             [x1 * cos[..., None, :] - x2 * sin[..., None, :], x2 * cos[..., None, :] + x1 * sin[..., None, :]],

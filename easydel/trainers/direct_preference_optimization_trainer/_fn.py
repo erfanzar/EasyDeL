@@ -175,6 +175,15 @@ def _compute_dpo_outputs_from_hidden_states(
     _has_prepare = hasattr(model, "prepare_lm_head_inputs")
 
     def _project_chunk(chunk_hidden_states: Array) -> Array:
+        """Project a sequence-axis hidden-state chunk through the LM head.
+
+        Args:
+            chunk_hidden_states: ``[batch, chunk_seq, hidden_dim]`` slice
+                of hidden states.
+
+        Returns:
+            The corresponding ``[batch, chunk_seq, vocab_size]`` logits.
+        """
         if _has_prepare:
             chunk_hidden_states = model.prepare_lm_head_inputs(chunk_hidden_states)
         return _lm_head_fn(chunk_hidden_states)
@@ -186,6 +195,19 @@ def _compute_dpo_outputs_from_hidden_states(
         chunk_labels: Array,
         chunk_loss_mask: Array,
     ) -> tuple[Array, Array, Array, Array, Array]:
+        """Compute per-sequence per-chunk DPO log-prob and logit accumulators.
+
+        Args:
+            chunk_hidden_states: Hidden-state slice for the current
+                chunk.
+            chunk_labels: Label slice with the same sequence range.
+            chunk_loss_mask: Boolean loss mask slice.
+
+        Returns:
+            A 5-tuple with masked log-prob sums, chosen / rejected
+            logit sums, and chosen / rejected token counts for the
+            current chunk.
+        """
         chunk_logits = _project_chunk(chunk_hidden_states)
         chunk_logps = _compute_token_logps_chunked(
             chunk_logits,
@@ -214,6 +236,17 @@ def _compute_dpo_outputs_from_hidden_states(
         size: int,
         carry: tuple[Array, Array, Array, Array, Array],
     ) -> tuple[Array, Array, Array, Array, Array]:
+        """Add the contributions of a sequence-chunk into the running totals.
+
+        Args:
+            start: Start index along the sequence axis.
+            size: Number of tokens in this chunk.
+            carry: Running ``(logp_sums, chosen_logit_sum,
+                rejected_logit_sum, chosen_count, rejected_count)``.
+
+        Returns:
+            The updated carry with the chunk's contributions added.
+        """
         chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, size, axis=1)
         chunk_labels = lax.dynamic_slice_in_dim(labels, start, size, axis=1)
         chunk_loss_mask = lax.dynamic_slice_in_dim(loss_mask, start, size, axis=1)
@@ -240,6 +273,15 @@ def _compute_dpo_outputs_from_hidden_states(
         i: int,
         inner_carry: tuple[Array, Array, Array, Array, Array],
     ) -> tuple[Array, Array, Array, Array, Array]:
+        """``fori_loop`` body that processes the ``i``-th full-sized sequence chunk.
+
+        Args:
+            i: Chunk index in ``[0, num_full_chunks)``.
+            inner_carry: Current accumulator tuple.
+
+        Returns:
+            The updated accumulator tuple.
+        """
         return _accumulate_chunk(i * chunk_size, chunk_size, inner_carry)
 
     if num_full_chunks > 0:
@@ -369,21 +411,53 @@ def get_loss_function(
     beta: float,
     label_smoothing: float | int,
 ):
-    """
-    Returns a loss function based on the specified loss type.
+    """Resolve the DPO-family loss closure for a given variant.
 
-    This function maps a given loss type (e.g., "sigmoid", "hinge", "ipo", etc.)
-    to a corresponding loss function implementation that computes the DPO (Direct Preference Optimization) loss.
+    All variants share the same calling convention -- they consume the
+    summed sequence log-probabilities of policy and reference models on
+    the chosen/rejected halves of a preference pair and return a
+    per-example loss tensor that the trainer averages. The variants
+    differ in how they shape the policy-vs-reference log-ratio
+    ``(log pi(y_w|x) - log pi(y_l|x)) - (log pi_ref(y_w|x) - log pi_ref(y_l|x))``
+    into a scalar penalty:
+
+    * ``sigmoid`` -- the canonical DPO objective from Rafailov et al. 2023:
+      negative log-sigmoid of the temperature-scaled log-ratio with optional
+      smoothing toward the conservative DPO (cDPO) variant.
+    * ``ipo`` -- Identity Preference Optimization (Azar et al. 2024); a
+      squared loss that targets ``logits == 1/(2*beta)`` and avoids the
+      saturation pathology of the sigmoid form. Requires
+      length-normalized logps (handled upstream).
+    * ``hinge`` -- max-margin loss ``relu(1 - beta * logits)``.
+    * ``robust`` -- noise-aware DPO (Chowdhury et al. 2024) that rescales
+      smoothed sigmoid by ``1/(1 - 2*label_smoothing)``.
+    * ``exo_pair`` -- Exact Preference Optimization (EXO).
+    * ``nca_pair`` -- pair-based Noise-Contrastive Alignment.
+    * ``bco_pair``, ``sppo_hard``, ``aot``/``aot_pair``,
+      ``apo_zero``/``apo_down`` -- additional preference objectives;
+      see each closure for the exact functional form.
+
+    The returned callable is pure, jit-compatible, and ignores extra
+    keyword arguments so callers can pass training-time auxiliaries
+    (e.g. discopop temperature) uniformly.
 
     Args:
-        loss_type (LOSS_FN_VARIANTS): The type of loss function to return.
-        beta (float): A scaling factor applied to the loss computation.
-        label_smoothing (tp.Union[float, int]): A value for label smoothing used in some loss functions.
+        loss_type: Variant key. See :data:`LOSS_FN_VARIANTS`.
+        beta: Inverse-temperature on the policy-vs-reference log-ratio
+            (the DPO ``beta``). Larger values penalise deviations from
+            the reference model more aggressively.
+        label_smoothing: cDPO-style smoothing factor in ``[0, 0.5)``.
+            For variants that ignore smoothing this argument is dropped.
 
     Returns:
-        A callable loss function that accepts arguments:
-            (chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps, beta, label_smoothing, **kwargs)
-        and returns the computed loss.
+        A pure function with signature
+        ``(chosen_logps, rejected_logps, ref_chosen_logps,
+        ref_rejected_logps, beta, label_smoothing, **kwargs) -> Array``
+        producing the per-example loss tensor.
+
+    Raises:
+        ValueError: If ``loss_type`` is not one of the registered
+            variants.
     """
 
     def _base_dpo_loss(
@@ -395,23 +469,32 @@ def get_loss_function(
         label_smoothing: float,
         **kwargs,
     ) -> tuple[Array, Array, Array]:
-        """
-        Base computation for DPO loss.
+        """Compute the policy/reference log-ratio differential at the heart of DPO.
 
-        Computes the log ratios between chosen and rejected log probabilities, and similarly for reference values.
+        Given the four per-example summed log-probabilities, this helper
+        returns ``logits = logratios - ref_logratios`` (also known as the
+        DPO implicit reward differential) along with the two intermediate
+        log-ratios so callers can reuse them. ``logits`` is what every
+        DPO variant feeds into its scalar shaping function (sigmoid,
+        squared, hinge, ...).
 
         Args:
-            chosen_logps (Array): Log probabilities for chosen examples.
-            rejected_logps (Array): Log probabilities for rejected examples.
-            ref_chosen_logps (Array): Reference log probabilities for chosen examples.
-            ref_rejected_logps (Array): Reference log probabilities for rejected examples.
-            beta (float): Scaling factor.
-            label_smoothing (float): Label smoothing factor.
-            **kwargs: Additional arguments (ignored).
+            chosen_logps: ``[batch]`` summed log-prob of the chosen
+                completion under the *policy*.
+            rejected_logps: ``[batch]`` for the rejected completion
+                under the policy.
+            ref_chosen_logps: Same as ``chosen_logps`` but under the
+                frozen reference model.
+            ref_rejected_logps: Same as ``rejected_logps`` but under
+                the reference model.
+            beta: Unused in this base helper; accepted for signature
+                uniformity with the variant closures.
+            label_smoothing: Unused here.
+            **kwargs: Ignored.
 
         Returns:
-            A tuple of (logits, logratios, ref_logratios) where:
-                logits = logratios - ref_logratios.
+            ``(logits, logratios, ref_logratios)`` where each entry has
+            shape ``[batch]`` and ``logits = logratios - ref_logratios``.
         """
         logratios = chosen_logps - rejected_logps
         ref_logratios = ref_chosen_logps - ref_rejected_logps
@@ -427,18 +510,16 @@ def get_loss_function(
         label_smoothing: float,
         **kwargs,
     ) -> Array:
-        """
-        Computes the DPO loss using a sigmoid-based formulation.
+        """Compute the canonical DPO loss (Rafailov et al. 2023).
 
-        Args:
-            chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps (Array):
-                Log probabilities for chosen/rejected examples and their reference values.
-            beta (float): Scaling factor.
-            label_smoothing (float): Label smoothing factor.
-            **kwargs: Additional arguments (ignored).
+        Returns ``-(1 - eps) * logsigmoid(beta * h) - eps * logsigmoid(-beta * h)``
+        where ``h`` is the policy-vs-reference log-ratio differential
+        from :func:`_base_dpo_loss` and ``eps = label_smoothing`` is the
+        cDPO smoothing knob (Mitchell 2023). With ``eps = 0`` this
+        reduces to the original DPO objective.
 
         Returns:
-            The computed loss as a negative weighted log sigmoid.
+            ``[batch]`` per-example loss tensor.
         """
         logits, _, _ = _base_dpo_loss(
             chosen_logps,
@@ -462,14 +543,16 @@ def get_loss_function(
         label_smoothing: float,
         **kwargs,
     ) -> Array:
-        """
-        Computes the DPO loss using an NCA pair formulation.
+        """Compute the pair NCA-style DPO loss (Chen et al. 2024).
 
-        Args:
-            (Same as above.)
+        Combines a positive-likelihood term on the chosen reward with
+        symmetric noise-contrastive penalties on both halves:
+        ``-logsigmoid(r_w) - 0.5 * logsigmoid(-r_w) - 0.5 * logsigmoid(-r_l)``
+        where ``r_w/r_l = beta * (logp - logp_ref)`` are the implicit
+        DPO rewards. Ignores ``label_smoothing``.
 
         Returns:
-            The computed loss based on the NCA pair loss formulation.
+            ``[batch]`` per-example loss tensor.
         """
         chosen_rewards = (chosen_logps - ref_chosen_logps) * beta
         rejected_rewards = (rejected_logps - ref_rejected_logps) * beta
@@ -488,16 +571,15 @@ def get_loss_function(
         label_smoothing: float,
         **kwargs,
     ) -> Array:
-        """
-        Computes the DPO loss using the AOT (All Ordered Terms) loss formulation.
+        """Compute the AOT (Alignment via Optimal Transport) DPO loss.
 
-        This loss function sorts the log ratios and compares them with the sorted reference log ratios.
-
-        Args:
-            (Same as above.)
+        Sorts both the policy and reference log-ratios across the batch
+        axis and applies the standard sigmoid DPO objective on the
+        rank-aligned differences. This reframes preference matching as
+        a 1-D optimal-transport problem along the batch.
 
         Returns:
-            The computed loss based on sorted differences.
+            ``[batch]`` per-example loss tensor (over the sorted permutation).
         """
         logratios = chosen_logps - rejected_logps
         ref_logratios = ref_chosen_logps - ref_rejected_logps
@@ -519,15 +601,20 @@ def get_loss_function(
         discopop_tau: float = 1.0,
         **kwargs,
     ) -> Array:
-        """
-        Computes the DPO loss using a Discopo-based modulation.
+        """Compute the DiscoPOP discovered-preference loss.
+
+        Smoothly interpolates between the standard logistic DPO loss
+        ``-logsigmoid(beta * h)`` and an exponential ``exp(-beta * h)``
+        penalty. The mixing weight is itself a sigmoid of
+        ``beta * h / discopop_tau``, so larger margins gradually shift
+        the loss surface from logistic toward exponential.
 
         Args:
-            discopop_tau (float): Temperature parameter for modulation.
-            (Other arguments are as described above.)
+            discopop_tau: Temperature controlling how sharply the
+                exponential branch turns on as the margin grows.
 
         Returns:
-            The computed loss with a logistic and exponential modulation.
+            ``[batch]`` per-example loss tensor.
         """
         logits, _, _ = _base_dpo_loss(
             chosen_logps,
@@ -551,14 +638,16 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the hinge loss version of the DPO loss.
+        """Compute the hinge variant of DPO (max-margin alignment).
 
-        Args:
-            (Same as above.)
+        Drops the logistic shaping in favour of ``relu(1 - beta * h)``,
+        which produces a hard zero penalty once the policy has a
+        sufficient margin (``beta * h > 1``) over the reference. Useful
+        when the gradient saturation of the sigmoid form is undesirable.
+        Ignores ``label_smoothing``.
 
         Returns:
-            The hinge loss computed as the ReLU of (1 - beta * logits).
+            ``[batch]`` per-example loss tensor.
         """
         logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
         return relu(1 - beta * logits)
@@ -571,14 +660,18 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the IPO loss variant of the DPO loss.
+        """Compute the Identity Preference Optimization (IPO) loss.
 
-        Args:
-            (Same as above.)
+        From Azar et al. 2024, IPO replaces DPO's logistic shaping with
+        the squared error ``(h - 1/(2*beta))**2``, where ``h`` is the
+        log-ratio differential. This avoids the early-saturation
+        pathology of sigmoid-DPO and keeps gradients well-conditioned
+        for arbitrarily separable preferences. The caller is expected
+        to pass *length-normalized* logps (handled by the surrounding
+        forward when ``loss_type=="ipo"``). Ignores ``label_smoothing``.
 
         Returns:
-            A squared loss computed from the logits with a bias term.
+            ``[batch]`` per-example squared-error loss.
         """
         logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
         return (logits - 1 / (2 * beta)) ** 2
@@ -591,14 +684,14 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the KTO pair loss variant.
+        """Compute the paired-data KTO surrogate (Kahneman-Tversky-style).
 
-        Args:
-            (Same as above.)
+        Falls back to the same logistic form as the canonical sigmoid
+        DPO with cDPO smoothing, but is exposed as ``"kto"`` for
+        configurations that want a paired analogue of unpaired KTO.
 
         Returns:
-            The loss computed using the log-sigmoid function.
+            ``[batch]`` per-example loss tensor.
         """
         logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
         return -logsigmoid(beta * logits) * (1 - label_smoothing) - logsigmoid(-beta * logits) * label_smoothing
@@ -611,14 +704,16 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes a robust variant of the DPO loss.
+        """Compute the noise-robust DPO loss (Chowdhury et al. 2024).
 
-        Args:
-            (Same as above.)
+        Like cDPO this assumes the labels are flipped with probability
+        ``label_smoothing``, but rescales the smoothed sigmoid loss by
+        ``1 / (1 - 2 * label_smoothing)`` to recover an unbiased
+        estimator of the clean-preference DPO objective. Requires
+        ``label_smoothing < 0.5``.
 
         Returns:
-            The loss computed with an adjustment that involves dividing by (1 - 2 * label_smoothing).
+            ``[batch]`` per-example loss tensor.
         """
         logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
         return (-logsigmoid(beta * logits) * (1 - label_smoothing) + logsigmoid(-beta * logits) * label_smoothing) / (
@@ -633,14 +728,17 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the exo-pair variant of the DPO loss.
+        """Compute the EXO (Efficient eXact Optimization) pair loss.
 
-        Args:
-            (Same as above.)
+        Implements the cross-entropy between the policy-induced
+        Bradley-Terry distribution and a smoothed target, yielding
+        ``sigmoid(z) * (logsigmoid(z) - log(1 - eps)) +
+        sigmoid(-z) * (logsigmoid(-z) - log(eps))`` with
+        ``z = beta * h`` and ``eps`` clipped at 1e-3 for numerical
+        safety. Recovers the clean-preference KL when ``eps -> 0``.
 
         Returns:
-            The computed loss combining sigmoid and log-sigmoid terms with label smoothing.
+            ``[batch]`` per-example loss tensor.
         """
         import math
 
@@ -658,14 +756,17 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the BCO pair variant of the DPO loss.
+        """Compute the Binary Classifier Optimization (BCO) pair loss.
 
-        Args:
-            (Same as above.)
+        Trains an implicit reward classifier whose decision boundary is
+        the in-batch mean reward ``delta``. Each chosen example is
+        pushed above ``delta`` and each rejected example below it via
+        ``-logsigmoid(beta * r_w - delta) - logsigmoid(-(beta * r_l - delta))``
+        where ``r_* = logp_* - logp_ref_*``. ``delta`` is recomputed
+        per-batch from the concatenation of chosen/rejected rewards.
 
         Returns:
-            The loss computed from the log-ratios of chosen and rejected rewards.
+            ``[batch]`` per-example loss tensor.
         """
         chosen_logratios = chosen_logps - ref_chosen_logps
         rejected_logratios = rejected_logps - ref_rejected_logps
@@ -682,14 +783,16 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the SPO PPO hard variant of the DPO loss.
+        """Compute the hard-target SPPO loss (Wu et al. 2024).
 
-        Args:
-            (Same as above.)
+        Targets per-side rewards directly: drives ``beta * r_w`` toward
+        ``+0.5`` and ``beta * r_l`` toward ``-0.5`` with squared
+        penalties ``(r_w - 0.5/beta)**2 + (r_l + 0.5/beta)**2``. Unlike
+        sigmoid DPO this trains both halves to symmetric targets rather
+        than only the margin.
 
         Returns:
-            A squared loss combining the differences for chosen and rejected examples.
+            ``[batch]`` per-example loss tensor.
         """
         a = chosen_logps - ref_chosen_logps
         b = rejected_logps - ref_rejected_logps
@@ -703,14 +806,17 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the AOT pair variant of the DPO loss.
+        """Compute the paired AOT (Alignment via Optimal Transport) loss.
 
-        Args:
-            (Same as above.)
+        Variant of :func:`_aot_dpo_loss` that sorts the *per-side*
+        rewards independently before pairing: chosen rewards sorted
+        ascending against rejected rewards sorted ascending, then the
+        smoothed sigmoid DPO objective is applied to the rank-aligned
+        differences. Reframes preference matching as 1-D OT between the
+        two reward distributions.
 
         Returns:
-            The loss computed from the sorted differences between chosen and rejected log ratios.
+            ``[batch]`` per-example loss tensor.
         """
         chosen_logratios = chosen_logps - ref_chosen_logps
         rejected_logratios = rejected_logps - ref_rejected_logps
@@ -727,16 +833,17 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the AOT variant of the DPO loss.
+        """Compute the unpaired AOT (Alignment via Optimal Transport) loss.
 
-        This is similar to _aot_pair_dpo_loss but may be used when the pair version is not required.
-
-        Args:
-            (Same as above.)
+        Distinct from :func:`_aot_pair_dpo_loss`: here the policy *log
+        ratios* and the reference *log ratios* are each sorted across
+        the batch, and the smoothed sigmoid DPO objective is applied to
+        their rank-aligned differences. Used when only the marginal
+        distributions of margins (not paired chosen/rejected) need to
+        align.
 
         Returns:
-            The computed loss based on the differences of sorted log ratios.
+            ``[batch]`` per-example loss tensor.
         """
         logratios = chosen_logps - rejected_logps
         ref_logratios = ref_chosen_logps - ref_rejected_logps
@@ -753,14 +860,17 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the APO zero variant of the DPO loss.
+        """Compute the APO-zero loss (D'Oosterlinck et al. 2024).
 
-        Args:
-            (Same as above.)
+        Pushes the policy *up* on chosen and *down* on rejected
+        independently of the reference margin:
+        ``(1 - sigmoid(beta * r_w)) + sigmoid(beta * r_l)``.
+        Recommended when the model is *worse* than the reference and
+        you want to drag the chosen reward up before relying on the
+        margin signal.
 
         Returns:
-            The computed loss based on the sigmoid of the log ratios.
+            ``[batch]`` per-example loss tensor.
         """
         chosen_logratios = chosen_logps - ref_chosen_logps
         rejected_logratios = rejected_logps - ref_rejected_logps
@@ -776,14 +886,17 @@ def get_loss_function(
         beta: float,
         label_smoothing: float,
     ) -> Array:
-        """
-        Computes the APO down variant of the DPO loss.
+        """Compute the APO-down loss (D'Oosterlinck et al. 2024).
 
-        Args:
-            (Same as above.)
+        Pulls the chosen reward *down* slightly while still penalising
+        the rejected side using the *margin*:
+        ``sigmoid(beta * r_w) + (1 - sigmoid(beta * (r_w - r_l)))``.
+        Recommended when the model already exceeds the reference on
+        chosen completions and you want to keep it close to the
+        reference rather than diverge further.
 
         Returns:
-            The computed loss based on an alternative weighting of the chosen and rejected log ratios.
+            ``[batch]`` per-example loss tensor.
         """
         chosen_logratios = chosen_logps - ref_chosen_logps
         rejected_logratios = rejected_logps - ref_rejected_logps
@@ -993,31 +1106,60 @@ def training_step(
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """
-    Performs a single training step.
+    """Run one DPO training step (forward, loss, backward, optimizer update).
 
-    This function computes gradients via minibatch processing over the input batch,
-    calculates the loss using a specified loss function, updates the model state,
-    and returns the updated state along with loss metrics.
+    The DPO objective is a maximum-likelihood-on-preferences surrogate
+    (Rafailov et al. 2023): given a preference pair ``(x, y_w, y_l)``,
+    the policy is updated so its log-ratio against a *frozen* reference
+    increases on the preferred completion and decreases on the
+    dispreferred one. This function executes one such update:
+
+    1. Validate batch shapes and resolve the gradient-accumulation
+       minibatch size.
+    2. If not ``reference_free``, fetch ``ref_chosen_logps`` and
+       ``ref_rejected_logps`` either from the batch (if precomputed by
+       :class:`DPOPreprocessTransform`) or by running ``reference_state``
+       through ``concatenated_forward`` outside the gradient trace
+       (avoids ``nn.remat`` retrace conflicts when the reference model
+       checkpoints).
+    3. Run ``minibatch_call`` over the local batch to accumulate the
+       value-and-grad of the inner :func:`calculate_loss` closure.
+    4. Update the optimizer state via ``update_state_respectfully``
+       (NaN-aware).
 
     Args:
-        state (EasyDeLState): The current model state.
-        batch (dict): Input batch data.
-        reference_state (EasyDeLState): A reference model state used for computing reference log probabilities.
-        learning_rate_fn (tp.Callable): Function to compute the learning rate.
-        concatenated_forward (tp.Callable): Function to perform a forward pass on concatenated inputs.
-        beta (float, optional): Scaling factor for loss computation. Defaults to 0.1.
-        label_smoothing (float, optional): Label smoothing factor. Defaults to 0.
-        loss_type (LOSS_FN_VARIANTS, optional): Type of loss function to use. Defaults to "sigmoid".
-        ref_precalculated (bool, optional): If True, uses precalculated reference log probabilities from the batch.
-            Defaults to True.
-        loss_config (tp.Optional[LossConfig], optional): Additional configuration for loss. Defaults to None.
-        partition_spec (tp.Optional[PartitionSpec], optional): Partitioning specification for sharding the batch.
-            Defaults to None.
-        gradient_accumulation_steps (int, optional): Number of steps for gradient accumulation. Defaults to 1.
+        state: Current policy ``EasyDeLState`` (graphdef + graphstate +
+            optimizer state). Differentiation target.
+        batch: Preference minibatch carrying paired
+            ``prompt_input_ids``, ``chosen_input_ids``,
+            ``rejected_input_ids`` and their attention masks (and
+            optionally precomputed ``ref_chosen_logps``/``ref_rejected_logps``).
+        reference_state: Frozen reference-model state used when the
+            batch does not already carry reference logps. Ignored when
+            ``reference_free`` is set.
+        learning_rate_fn: Schedule mapping ``state.step -> lr``.
+        concatenated_forward: Forward closure built by the trainer that
+            packs chosen/rejected through one model call and returns
+            ``{"chosen_logps", "rejected_logps", "mean_*_logits"}``.
+        beta: DPO inverse-temperature on the log-ratio differential.
+        label_smoothing: cDPO smoothing factor (``[0, 0.5)``).
+        loss_type: Variant key passed through :func:`get_loss_function`.
+        reference_free: If ``True``, replaces reference logps with zeros
+            (PPO-style implicit-reward baseline).
+        loss_config: Optional ``LossConfig`` controlling NaN handling
+            inside ``update_state_respectfully``.
+        partition_spec: Sharding spec applied to the input batch under
+            the model's mesh.
+        gradient_accumulation_steps: Number of gradient-accumulation
+            sub-steps; the batch must be divisible by this.
+        straight_through_emulator: Optional STE callable that rewrites
+            the policy graphstate before the forward pass (used by QAT).
 
     Returns:
-        tp.Tuple[EasyDeLState, LossMetrics]: A tuple containing the updated model state and the loss metrics.
+        ``(new_state, metrics)`` where ``metrics`` is a ``LossMetrics``
+        with the mean DPO loss, per-example ``chosen_rewards`` /
+        ``rejected_rewards`` (``beta * (logp - logp_ref)``, stop-gradient'd),
+        and the standard learning-rate / gradient-norm fields.
     """
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -1052,15 +1194,36 @@ def training_step(
             }
 
     def calculate_loss(tree: spx.State, call_batch):
-        """
-        Inner function to compute loss and metrics for a given minibatch.
+        """Compute the DPO loss + metrics for a single minibatch.
+
+        Steps inside the value-and-grad trace:
+
+        1. Optionally rewrite ``tree`` through ``straight_through_emulator``
+           (QAT path).
+        2. Merge ``tree`` with the captured ``state.graphdef`` to materialize
+           a callable model module.
+        3. Run ``concatenated_forward`` to obtain
+           ``{"chosen_logps", "rejected_logps", ...}`` for the policy.
+        4. Substitute zero reference logps when ``reference_free``,
+           otherwise read precomputed (and stop-gradient'd) reference
+           logps from ``call_batch``.
+        5. Apply ``_loss_func`` (a closure of ``beta`` /
+           ``label_smoothing`` / ``loss_type``) to the four logp arrays.
+        6. Add ``aux_loss`` from the model output if present (load
+           balancing / MoE auxiliaries are forwarded straight through).
+
+        Reference logps are always wrapped in ``stop_gradient`` so the
+        optimizer can never leak gradients into the reference model.
 
         Args:
-            tree (spx.State): The current model graph state.
-            call_batch (dict): A minibatch of data.
+            tree: Policy graphstate to differentiate against.
+            call_batch: Per-microbatch slice of the outer ``batch``.
 
         Returns:
-            A tuple (loss, metrics) where loss is a scalar and metrics is a LossMetrics instance.
+            ``(loss_scalar, LossMetrics)`` where ``loss_scalar`` is the
+            mean per-example DPO loss and ``LossMetrics`` carries
+            stop-gradient'd ``chosen_rewards`` / ``rejected_rewards`` for
+            logging.
         """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
@@ -1120,6 +1283,20 @@ def training_step(
 
 
 def _prepare_dpo_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Inject reference chosen/rejected log-probabilities into ``call.batch``.
+
+    When the batch already supplies reference logps (via either the
+    canonical or legacy column names), it is returned untouched.  In
+    reference-free mode the trainer skips this hook altogether (handled
+    inside the loss closure).
+
+    Args:
+        call: The :class:`ScheduledStepCall` being prepared.
+
+    Returns:
+        A copy of ``call.batch`` with ``ref_chosen_logps`` and
+        ``ref_rejected_logps`` populated.
+    """
     batch = dict(call.batch)
     ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
     if ref_chosen_logps is not None and ref_rejected_logps is not None:
@@ -1139,6 +1316,17 @@ def _prepare_dpo_scheduled_batch(call) -> dict[str, tp.Any]:
 
 
 def _dpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the DPO scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering DPO knobs that influence compilation
+        (``beta``, ``label_smoothing``, ``loss_type``,
+        ``reference_free``, partition spec, and forward fn / quantizer
+        identities).
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("beta", "label_smoothing", "loss_type", "reference_free", "partition_spec"),
@@ -1147,6 +1335,16 @@ def _dpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_dpo_scheduled_loss(call):
+    """Build a SpectraX-scheduled DPO scalar-loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` providing forward fn,
+            ``beta``, ``label_smoothing``, loss-type, etc.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready for
+        :func:`spx.sxvalue_and_grad`.
+    """
     concatenated_forward_fn = call.get("concatenated_forward")
     beta = call.get("beta", 0.1)
     label_smoothing = call.get("label_smoothing", 0)
@@ -1160,6 +1358,20 @@ def _make_dpo_scheduled_loss(call):
     )
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the scalar DPO loss inside the SpectraX scheduled VJP.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            batch: Minibatch dict carrying preference triples and (when
+                not reference-free) precomputed reference logps.
+
+        Returns:
+            The mean DPO loss with optional aux-loss term.
+
+        Raises:
+            RuntimeError: If reference logps are missing while the
+                trainer is not in reference-free mode.
+        """
         module = bind_scheduled_module(call, tree)
         batch = constrain_scheduled_batch(module, batch, partition_spec)
         model_output = concatenated_forward_fn(module, batch)
@@ -1213,26 +1425,34 @@ def evaluation_step(
     reference_free: bool = False,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
-    """
-    Performs a single evaluation step.
+    """Run one DPO evaluation step (forward only, no parameter update).
 
-    This function computes loss metrics for the input batch using the provided model state.
-    It can optionally use a reference state to compute reference log probabilities.
+    Computes the same loss and reward metrics as :func:`training_step`
+    but without gradient accumulation or optimizer interaction. When
+    ``reference_state`` is ``None`` and the batch does not carry
+    precomputed reference logps, the policy itself stands in as the
+    reference; this is mainly a convenience for sanity checks (the
+    reported loss is then trivially zero on the canonical sigmoid
+    variant).
 
     Args:
-        state (EasyDeLState): The current model state.
-        batch (dict): Input batch data.
-        concatenated_forward (tp.Callable): Function to perform a forward pass on concatenated inputs.
-        reference_state (EasyDeLState, optional): A reference model state. Defaults to None.
-        beta (float, optional): Scaling factor for loss computation. Defaults to 0.1.
-        label_smoothing (float, optional): Label smoothing factor. Defaults to 0.
-        loss_type (LOSS_FN_VARIANTS, optional): Type of loss function to use. Defaults to "sigmoid".
-        reference_free (bool, optional): If True, ignores reference log probabilities. Defaults to False.
-        partition_spec (tp.Optional[PartitionSpec], optional): Partitioning specification for sharding the batch.
-            Defaults to None.
+        state: Current policy state to evaluate.
+        batch: Preference minibatch (same structure as
+            :func:`training_step`).
+        reference_state: Optional reference state. If ``None`` and the
+            batch lacks precomputed reference logps, the policy stands
+            in as its own reference (purely diagnostic).
+        concatenated_forward: Forward closure built by the trainer.
+        beta: DPO inverse-temperature.
+        label_smoothing: cDPO smoothing factor.
+        loss_type: Variant key.
+        reference_free: When ``True``, reference logps are zeroed out
+            and the loss reduces to a policy-only objective.
+        partition_spec: Sharding spec applied to the input batch.
 
     Returns:
-        LossMetrics: The computed loss metrics.
+        ``LossMetrics`` with ``loss``, ``chosen_rewards``, and
+        ``rejected_rewards`` populated.
     """
     *_, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -1248,14 +1468,22 @@ def evaluation_step(
     )
 
     def calculate_loss(tree: spx.State):
-        """
-        Inner function to compute loss metrics for evaluation.
+        """Compute DPO eval metrics on the captured ``batch``.
+
+        Mirrors :func:`training_step.calculate_loss` minus the STE /
+        gradient plumbing: merges the policy ``tree`` with the captured
+        graphdef, runs ``concatenated_forward``, resolves reference
+        logps (precomputed, reference state forward, or fallback to the
+        policy itself), evaluates ``_loss_func``, and wraps the result
+        in a ``LossMetrics`` object with ``chosen_rewards`` /
+        ``rejected_rewards`` (no stop-gradient is needed at eval time).
 
         Args:
-            tree (spx.State): The current model graph state.
+            tree: Policy graphstate to evaluate against.
 
         Returns:
-            LossMetrics: The computed loss metrics.
+            ``LossMetrics`` populated with the mean loss and the
+            implicit reward arrays.
         """
         model_output = concatenated_forward(state.merge(tree), batch)
         chosen_logps = model_output["chosen_logps"]

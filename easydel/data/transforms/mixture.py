@@ -40,10 +40,25 @@ logger = logging.getLogger(__name__)
 
 
 class WeightScheduler:
-    """Dynamic weight scheduler for dataset mixing.
+    """Step-indexed interpolator that produces curriculum mixing weights on demand.
 
-    Supports step-function, linear, and cosine interpolation between
-    weight checkpoints during training.
+    Wraps a list of :class:`WeightSchedulePoint` knots and answers
+    "what should the weights be at step N?" via :meth:`get_weights`.
+    Three interpolation modes are supported: ``"step"`` returns the
+    weights of the previous knot unchanged, ``"linear"`` blends
+    linearly between adjacent knots, and ``"cosine"`` uses a cosine
+    annealing curve. Linearly interpolated values are renormalised
+    so they always sum to ``1.0`` even when the source vectors do.
+
+    Two invariants are enforced at construction:
+
+    1. The schedule must be non-empty.
+    2. Every knot must declare weights for the same set of dataset
+       names; otherwise interpolation between knots would be
+       under-specified.
+
+    The schedule is sorted by step internally so callers can pass
+    knots in any order.
 
     Example:
         >>> schedule = [
@@ -60,11 +75,20 @@ class WeightScheduler:
         schedule: list[WeightSchedulePoint],
         interpolation: str = "step",
     ):
-        """Initialize WeightScheduler.
+        """Validate and store the schedule, sorted by step.
 
         Args:
-            schedule: List of weight schedule points, sorted by step.
-            interpolation: Interpolation type - "step", "linear", or "cosine".
+            schedule: One or more :class:`WeightSchedulePoint` knots.
+                Order does not matter — the constructor sorts by
+                step. Must be non-empty.
+            interpolation: One of ``"step"`` (piecewise-constant),
+                ``"linear"`` (linear blending), or ``"cosine"``
+                (cosine-annealed blending). Unknown values fall
+                through to linear.
+
+        Raises:
+            ValueError: When ``schedule`` is empty or when knots
+                declare different dataset name sets.
         """
         if not schedule:
             raise ValueError("Schedule must have at least one point")
@@ -80,13 +104,23 @@ class WeightScheduler:
                 raise ValueError("All schedule points must have the same dataset names")
 
     def get_weights(self, step: int) -> dict[str, float]:
-        """Get weights for a specific training step.
+        """Resolve the active mixing weights at ``step`` per the configured policy.
+
+        Steps before the first knot return that knot's weights;
+        steps after the last knot return the last knot's weights.
+        Steps in between are interpolated according to
+        :attr:`interpolation`. Output is always renormalised to sum
+        to 1.0.
 
         Args:
-            step: Current training step.
+            step: Training step (0-indexed) at which to evaluate the
+                schedule.
 
         Returns:
-            Dictionary mapping dataset names to weights.
+            dict[str, float]: Mapping from dataset name to its weight
+            at ``step``. The dataset name set is identical across
+            steps and equals
+            :attr:`WeightSchedulePoint.weights`'s keys.
         """
         # Find surrounding schedule points
         if step <= self._schedule[0].step:
@@ -131,20 +165,39 @@ class WeightScheduler:
 
     @property
     def dataset_names(self) -> list[str]:
-        """Get the list of dataset names in the schedule."""
+        """Names of the datasets the schedule applies to, in declaration order.
+
+        Returns:
+            list[str]: Fresh copy of the canonical name list — mutating
+            it does not affect the scheduler.
+        """
         return self._dataset_names.copy()
 
 
 @dataclass
 class MixedShardState:
-    """State for tracking position in mixed iteration.
+    """Resumable position marker for an in-progress :class:`MixedShardedSource` iteration.
+
+    Captured (and later restored) by checkpointing so a long mixed
+    run can be paused and continued without restarting from the
+    beginning. Most fields are bookkeeping for the mixer's
+    block-based interleaver — together they identify which source
+    we were drawing from, where inside that source, and how many
+    blocks of the schedule we've completed.
 
     Attributes:
-        source_index: Index of the current source dataset.
-        shard_index: Index of the current shard within the source.
-        row_index: Current row position within the shard.
-        block_index: Current mixing block index.
-        examples_yielded: Total number of examples yielded so far.
+        source_index (int): Position within
+            :attr:`MixedShardedSource._names` of the source currently
+            being drawn from.
+        shard_index (int): Index into the active source's
+            :attr:`ShardedDataSource.shard_names` list.
+        row_index (int): Row offset inside the active shard.
+        block_index (int): Number of mixing blocks that have been
+            fully consumed so far; drives the curriculum scheduler
+            and per-block RNG seed for reproducibility.
+        examples_yielded (int): Total examples produced across all
+            blocks since iteration began. Useful for progress
+            display and for debugging schedule resumption.
     """
 
     source_index: int
@@ -155,9 +208,23 @@ class MixedShardState:
 
 
 class MixedShardedSource(ShardedDataSource[dict]):
-    """Sharded source that mixes multiple sources with weights.
+    """:class:`ShardedDataSource` adapter implementing block-based weighted mixing.
 
-    Implements block-based deterministic mixing for reproducibility.
+    Wraps several named :class:`ShardedDataSource` constituents into
+    a single virtual source. Each output "block" of ``block_size``
+    examples contains exactly the configured number of rows from
+    each constituent (rounded by largest-remainder, ensuring sums
+    match block size); the rows inside the block are shuffled with
+    a per-block deterministic RNG so cross-source ordering is
+    reproducible across restarts.
+
+    Behaviour at end-of-source is controlled by ``stop_strategy``:
+    ``"restart"`` recycles the constituent, ``"first_exhausted"``
+    halts the entire mix, ``"all_exhausted"`` keeps drawing from
+    the surviving sources until every constituent has been
+    exhausted at least once. Optional :class:`WeightScheduler`
+    integration replaces the static weights with curriculum-driven
+    weights at each block.
     """
 
     def __init__(
@@ -169,15 +236,31 @@ class MixedShardedSource(ShardedDataSource[dict]):
         stop_strategy: str = "restart",
         weight_scheduler: WeightScheduler | None = None,
     ):
-        """Initialize MixedShardedSource.
+        """Validate inputs, normalise weights, and capture state without iterating.
 
         Args:
-            sources: Dictionary mapping dataset names to sources.
-            weights: Static weights per dataset (if no scheduler).
-            block_size: Number of examples per mixing block.
-            seed: Random seed for deterministic mixing.
-            stop_strategy: What to do when exhausted - "restart", "first_exhausted", "all_exhausted".
-            weight_scheduler: Optional dynamic weight scheduler.
+            sources: ``{dataset_name: ShardedDataSource}`` mapping
+                whose order defines the canonical name list.
+            weights: Static per-dataset weights; must have the
+                exact same key set as ``sources``. ``None`` falls
+                back to uniform mixing.
+            block_size: Number of examples produced per mixing
+                block; larger blocks improve throughput at the cost
+                of mixing granularity.
+            seed: Master RNG seed; per-block seeds are derived from
+                ``seed + block_idx`` so iteration is deterministic
+                yet uncorrelated across blocks. ``None`` uses NumPy
+                default randomness (non-deterministic).
+            stop_strategy: ``"restart"``, ``"first_exhausted"``, or
+                ``"all_exhausted"``; see class docstring.
+            weight_scheduler: Optional :class:`WeightScheduler`. When
+                set, ``weights`` are recomputed per block from the
+                scheduler instead of using the static map.
+
+        Raises:
+            ValueError: When ``weights`` keys don't match
+                ``sources`` keys, or the weights sum to a non-positive
+                value.
         """
         self._sources = sources
         self._names = list(sources.keys())
@@ -204,20 +287,46 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
     @property
     def shard_names(self) -> "Sequence[str]":
+        """Return a single synthetic shard name for the virtual mix.
+
+        Returns:
+            One-element list ``["mixed_shard_0"]``.
+        """
         # Return a synthetic shard name since this is a virtual mix
         return ["mixed_shard_0"]
 
     def num_shards(self) -> int:
+        """Return the constant shard count of one.
+
+        Returns:
+            Always ``1``.
+        """
         return 1
 
     def _get_weights_for_step(self, step: int) -> dict[str, float]:
-        """Get weights for a specific step (uses scheduler if available)."""
+        """Resolve mixing weights for a training step.
+
+        Args:
+            step: Training step index.
+
+        Returns:
+            Dictionary mapping dataset name to weight, sourced from the
+            scheduler when available, else the static weights.
+        """
         if self._weight_scheduler is not None:
             return self._weight_scheduler.get_weights(step)
         return self._weights
 
     def _compute_counts(self, weights: dict[str, float]) -> dict[str, int]:
-        """Compute per-dataset counts for a block."""
+        """Convert normalized weights to integer per-dataset block counts.
+
+        Args:
+            weights: Per-dataset weights (re-normalized internally).
+
+        Returns:
+            Dictionary mapping dataset name to integer count whose sum
+            equals ``self._block_size``.
+        """
         ws = np.array([weights.get(name, 0) for name in self._names], dtype=np.float64)
         ws = ws / ws.sum()
 
@@ -229,16 +338,23 @@ class MixedShardedSource(ShardedDataSource[dict]):
         return {name: int(counts_arr[i]) for i, name in enumerate(self._names)}
 
     def open_shard(self, _shard_name: str) -> "Iterator[dict]":
-        """Open the mixed shard and iterate over interleaved examples.
+        """Drive the block-mixer until either ``stop_strategy`` halts it or all sources die.
 
-        Yields examples from all sources in deterministic blocks, with
-        per-block shuffling for randomness within each block.
+        Maintains one chained iterator per constituent (built by
+        :meth:`_chain_shards`) and walks them in block-randomised
+        order. Each emitted example is augmented with a
+        ``"__source__"`` key naming the dataset of origin, so
+        downstream consumers can apply per-source logic if they
+        need to. Per-block deterministic RNG means re-running with
+        the same seed produces an identical interleaving.
 
         Args:
-            _shard_name: Shard identifier (ignored, single virtual shard).
+            _shard_name: Ignored — :class:`MixedShardedSource`
+                exposes only one synthetic shard.
 
         Yields:
-            Examples from the mixed sources, with "__source__" metadata added.
+            dict: Mixed rows with the extra ``"__source__"`` field.
+            Iteration ends per the configured ``stop_strategy``.
         """
         # Create iterators for all sources (from all their shards)
         iters = {}
@@ -295,19 +411,41 @@ class MixedShardedSource(ShardedDataSource[dict]):
             block_idx += 1
 
     def _chain_shards(self, source: ShardedDataSource) -> "Iterator[dict]":
-        """Chain all shards of a source into a single iterator."""
+        """Chain every shard of ``source`` into one continuous iterator.
+
+        Args:
+            source: Source whose shards should be flattened.
+
+        Yields:
+            Examples concatenated across all shards in ``source.shard_names``
+            order.
+        """
         for shard_name in source.shard_names:
             yield from source.open_shard(shard_name)
 
     def __len__(self) -> int:
-        """Return total number of examples across all sources.
+        """Sum of each constituent's length — note this is a notional length only.
 
-        Note: For 'restart' stop_strategy, this returns the sum of all source lengths.
-        Actual iteration may be infinite with 'restart' strategy.
+        With ``stop_strategy="restart"`` actual iteration is
+        infinite (constituents are recycled), so this value should
+        be treated as the "one-pass" length rather than the
+        iteration cap.
+
+        Returns:
+            int: ``sum(len(source) for source in self._sources.values())``.
+
+        Raises:
+            TypeError: If any constituent does not support
+                ``len()`` (i.e. is streaming).
         """
         return sum(len(source) for source in self._sources.values())
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"MixedShardedSource(sources=N, weights=[...], block_size=B)"``.
+        """
         weights_str = ", ".join(f"{k}={v:.2f}" for k, v in self._weights.items())
         return (
             f"MixedShardedSource(sources={len(self._sources)}, weights=[{weights_str}], block_size={self._block_size})"
@@ -315,25 +453,35 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
 
 class MixStage(BaseStage):
-    """Pipeline stage for mixing multiple datasets into one.
+    """Pipeline stage that collapses ``{name: source}`` into a single mixed source.
 
-    Supports static weights and dynamic weight scheduling. When only
-    one dataset is present, passes it through unchanged. Creates a
-    MixedShardedSource that interleaves examples from multiple sources
-    in deterministic blocks.
+    On a multi-dataset pipeline, instantiates a
+    :class:`MixedShardedSource` configured with the static weights
+    or the dynamic schedule from :class:`MixStageConfig` and replaces
+    the rolling source dict with ``{"mixed": mixed_source}``. On a
+    single-dataset pipeline the stage is a no-op so the same code
+    path can run with or without mixing.
     """
 
     def __init__(self, config: MixStageConfig | None = None):
-        """Initialize MixStage.
+        """Capture the mix configuration; defaulted to a fresh :class:`MixStageConfig` when omitted.
 
         Args:
-            config: Mixing stage configuration.
+            config: :class:`MixStageConfig` controlling weights,
+                block size, stop strategy, RNG seed, and optional
+                schedule. ``None`` produces a default config so the
+                stage is constructible without arguments in tests.
         """
         super().__init__(config.__dict__ if config else {})
         self._stage_config = config or MixStageConfig()
 
     @property
     def name(self) -> str:
+        """Stage identifier used in metric and log namespaces.
+
+        Returns:
+            str: Constant string ``"mix"``.
+        """
         return "mix"
 
     def process(
@@ -341,14 +489,30 @@ class MixStage(BaseStage):
         data: dict[str, ShardedDataSource],
         context: PipelineContext,
     ) -> dict[str, ShardedDataSource]:
-        """Mix multiple datasets into one.
+        """Build a :class:`MixedShardedSource` from the input dataset map.
+
+        When ``data`` already contains a single entry the stage is
+        a no-op (the input dict is returned unchanged) so callers
+        can invoke ``mix()`` unconditionally. When the
+        :class:`MixStageConfig.weight_schedule` is set, a
+        :class:`WeightScheduler` is built and attached to the mixer.
+        The mixer's RNG seed defaults to
+        :attr:`MixStageConfig.seed`, falling back to
+        ``context.seed`` when unset.
 
         Args:
-            data: Dictionary mapping dataset names to sources.
-            context: Pipeline context.
+            data: Rolling ``{dataset_name: ShardedDataSource}`` dict
+                from the previous stage.
+            context: Shared :class:`PipelineContext` whose
+                ``seed`` is used as the fallback RNG seed.
 
         Returns:
-            Dictionary with single "mixed" source.
+            dict[str, ShardedDataSource]: A single-key dict
+            ``{"mixed": MixedShardedSource}`` for multi-source
+            inputs, or ``data`` itself when there's only one source.
+
+        Raises:
+            ValueError: When ``data`` is empty.
         """
         if len(data) == 0:
             raise ValueError("No datasets to mix")
@@ -455,6 +619,27 @@ def block_mixture_interleave(
         counts[np.argmax(ws)] += remainder
 
     def gen():
+        """Inline closure that drives the deterministic block-based interleaver.
+
+        Captures ``datasets_list``, ``counts``, ``seed``, and
+        ``stop`` from :func:`block_mixture_interleave`'s scope.
+        Produces blocks of ``block_size`` examples by picking
+        ``counts[i]`` rows from each input dataset, shuffling the
+        per-block ordering with a seed of ``seed + block_idx`` so
+        each block is reproducible independently. End-of-source is
+        handled per the ``stop`` flag: ``"restart"`` recycles the
+        constituent (raising ``ValueError`` if it's truly empty),
+        anything else terminates the whole generator.
+
+        Yields:
+            Any: Each yielded example is whatever the underlying
+            datasets produced (typically dict rows).
+
+        Raises:
+            ValueError: When ``stop="restart"`` is requested and one
+                of the constituent datasets has zero examples (so it
+                cannot legitimately be restarted).
+        """
         iters = [iter(ds) for ds in datasets_list]
         block_idx = 0
         while True:

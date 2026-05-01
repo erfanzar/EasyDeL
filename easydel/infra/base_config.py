@@ -181,6 +181,15 @@ _REMOVED_BASE_CONFIG_KEYS = frozenset(
 
 
 def is_remote_url(url_or_filename: str) -> bool:
+    """Return whether the given path is an HTTP(S) URL.
+
+    Args:
+        url_or_filename: Candidate string that may be a URL or a local path.
+
+    Returns:
+        bool: ``True`` if the input parses as an ``http://`` or ``https://``
+        URL, ``False`` otherwise (including when parsing fails).
+    """
     try:
         return urlparse(url_or_filename).scheme in {"http", "https"}
     except Exception:
@@ -188,6 +197,18 @@ def is_remote_url(url_or_filename: str) -> bool:
 
 
 def download_url(url: str, cache_dir: str | None = None) -> str:
+    """Download a URL into a content-addressed cache and return the local path.
+
+    Uses an SHA-256 of the URL as the cache filename to avoid re-downloading.
+
+    Args:
+        url: Remote URL to fetch.
+        cache_dir: Optional cache directory; defaults to the Hugging Face hub
+            cache (``HF_HUB_CACHE``).
+
+    Returns:
+        str: Local filesystem path to the cached download.
+    """
     cache_dir = cache_dir or HF_HUB_CACHE
     os.makedirs(cache_dir, exist_ok=True)
     parsed = urlparse(url)
@@ -249,6 +270,17 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
     size_by_group = {"dp": 1, "ep": 1, "tp": 1}
 
     def assign_axis(axis_name: str | None, group: str) -> None:
+        """Bind a physical mesh axis to a logical group, multiplying its size.
+
+        Args:
+            axis_name: Physical mesh axis name (or ``None`` to skip).
+            group: Target logical group, one of ``"dp"``, ``"ep"``, or
+                ``"tp"``.
+
+        Returns:
+            None. ``assigned_axes`` and ``size_by_group`` from the enclosing
+            scope are updated in-place.
+        """
         if axis_name is None:
             return
 
@@ -398,13 +430,128 @@ warnings.filterwarnings("ignore", message="Some donated buffers were not usable:
 
 
 class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
-    """TypedDict for EasyDeL configuration parameters.
+    """Typed dictionary mirror of :class:`EasyDeLBaseConfig`'s constructor surface.
 
-    Provides type hints for all configuration options that can be
-    passed to EasyDeLBaseConfig. All fields are optional (total=False).
+    Every field is the keyword-style override you can pass to
+    ``EasyDeLBaseConfig.__init__`` (and equivalently to
+    :meth:`eLargeModel.update_module` via ``Unpack[EasyDeLBaseConfigDict]``)
+    to configure sharding, attention kernels, MoE kernels, RoPE caches, and
+    quantization without subclassing the config. All keys are ``NotRequired``
+    so callers may supply only the fields they wish to override; missing
+    fields keep their constructor defaults defined on
+    :class:`EasyDeLBaseConfig`.
 
-    This is useful for type checking when creating configurations
-    from dictionaries or JSON.
+    Attributes:
+        sharding_axis_dims: Per-axis device counts for the model mesh, in the
+            canonical ``(pp, dp, fsdp, ep, tp, sp)`` order. ``-1`` consumes all
+            remaining devices on that axis.
+        sharding_dcn_axis_dims: Optional outer (DCN-slice) mesh sizes for
+            multi-host / multi-slice topologies; ``None`` keeps a single-slice
+            mesh.
+        sharding_axis_names: Logical names for each mesh axis. Must agree in
+            length with ``sharding_axis_dims``.
+        attn_mechanism: Attention implementation used during training/forward
+            passes (e.g. ``"flash_attn2"``, ``"ring"``, ``"vanilla"``).
+        decode_attn_mechanism: Attention implementation used during
+            autoregressive decoding. ``None`` re-uses ``attn_mechanism``.
+        mla_attn_mechanism: MLA-specific attention override; ``"auto"`` lets
+            EasyDeL pick the best MLA kernel for the current platform.
+        mla_attn_dtype: Activation dtype for MLA attention. ``None`` falls back
+            to ``attn_dtype``.
+        mla_attn_softmax_dtype: Softmax accumulator dtype for MLA attention.
+            ``None`` falls back to ``attn_softmax_dtype``.
+        blocksize_k: Key-axis block size used by tiled attention kernels.
+        blocksize_q: Query-axis block size used by tiled attention kernels.
+        blocksize_b: Batch/block tile size used by some attention backends.
+        moe_tiling_size_batch: Batch tile size used by MoE GEMM kernels.
+        moe_tiling_size_seqlen: Sequence-axis tile size used by MoE GEMM
+            kernels.
+        moe_tiling_size_dim: Hidden-dim tile size used by MoE GEMM kernels.
+        partition_axis: ``PartitionAxis`` instance describing how logical model
+            tensors map onto the named mesh axes.
+        axis_policy: Optional ``AxisPolicy`` (or dict that constructs one)
+            controlling EasyDeL's semantic-axis sharding scope.
+        use_sharded_kv_caching: When True, KV-cache tensors are sharded across
+            mesh axes instead of replicated.
+        use_sharding_constraint: When True, EasyDeL inserts explicit
+            ``with_sharding_constraint`` calls during forward construction.
+        backend: Explicit JAX backend (``"tpu"``, ``"gpu"``, ``"cpu"``).
+            ``None`` defers to ``jax.default_backend()``.
+        platform: Hardware/kernel platform hint (e.g. ``"triton"``, ``"pallas"``,
+            ``"jax"``). ``None`` selects the platform-default.
+        easy_method: Workflow context tag — one of ``"train"``, ``"serve"``,
+            ``"convert"``. Some kernels and code paths branch on this.
+        bits: Optional bit-width for weight quantization. ``None`` disables.
+        scan_ring_attention: Use scanned ring-attention implementation when
+            available.
+        scan_attention_layers: Apply ``jax.lax.scan`` over attention blocks to
+            trade compute for memory.
+        scan_layers: Apply ``jax.lax.scan`` over identical model layers.
+            Models that opt in expose a stack-of-layers pytree.
+        pipeline_stage_regions: When True, partition the forward graph into
+            pipeline regions according to declared stage boundaries.
+        pipeline_virtual_stages: Number of virtual pipeline stages per
+            physical stage (interleaved 1F1B / loop schedules).
+        pipeline_stage_layout: Layout strategy for assigning layers to
+            pipeline stages (``"contiguous"``, ``"interleaved"``, ``"loop"``).
+        use_scan_mlp: Apply ``jax.lax.scan`` over MLP rows to save memory.
+        scan_mlp_chunk_size: Chunk size used when scanning MLPs.
+        sequence_axis_name: Logical mesh axis name treated as the sequence /
+            attention axis.
+        gradient_checkpointing: Gradient-checkpointing policy enum/string used
+            by SpectraX remat. ``"none"`` disables checkpointing.
+        gradient_checkpointing_targets: Optional list of submodule labels to
+            include or exclude from selective checkpointing.
+        kv_cache_quantization_config: Quantization config applied to KV-cache
+            tensors. ``None`` disables KV-cache quantization.
+        kv_cache_sharding_sequence_axis_name: Mesh axis (or tuple of axes)
+            used when sharding KV pages along the sequence dimension.
+        use_qmm_best_config: Whether quantized matmul kernels should request
+            ejkernel's tuned block configuration.
+        qmm_platform_override: Force a specific quantized-matmul platform
+            (``"pallas"``, ``"xla"``, ``"triton"``). ``None`` keeps the
+            platform-default.
+        qmm_tpu_path_override: Force a specific quantized-matmul TPU code
+            path (``"hybrid"``, ``"packed"``, ``"predecode"``). ``None`` keeps
+            the default.
+        flash_attention_backward_pass_impl: Backend used for the flash
+            attention backward kernel (``"triton"`` or ``"xla"``).
+        attn_dtype: Dtype used for attention activations. Defaults to
+            ``bfloat16``.
+        kvdtype: Dtype used for stored KV pages. ``None`` re-uses
+            ``attn_dtype``.
+        attn_softmax_dtype: Dtype used for the softmax accumulator inside
+            attention. Defaults to ``float32`` for numerical stability.
+        fcm_max_ratio: Upper bound on the forgetful-causal-mask sampling
+            ratio used during training augmentation.
+        fcm_min_ratio: Lower bound on the forgetful-causal-mask sampling
+            ratio used during training augmentation.
+        use_expert_tensor_mode: Treat the expert axis as an additional
+            tensor-parallel axis (Mixtral-style sharding).
+        moe_method: Mixture-of-experts dispatch implementation (e.g.
+            ``"gmm"``, ``"ragged"``).
+        moe_force_xla_gmm: Force XLA grouped-matmul kernels for MoE even when
+            fused Pallas/Triton kernels are available.
+        use_ring_of_experts: Use ring-topology dispatch for MoE expert
+            communication.
+        fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when
+            building the per-stage expert mesh.
+        sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis
+            when building the per-stage expert mesh.
+        quantization_config: Quantization config applied to linear layers.
+            ``None`` disables weight quantization.
+        operation_configs: Mapping from ejkernel operation name to a
+            ``BaseOperationConfig`` override. Empty mapping or ``None`` keeps
+            ejkernel's autotune behavior.
+        mask_max_position_embeddings: Maximum sequence length for which causal
+            masks are precomputed and cached on-mesh.
+        freq_max_position_embeddings: Maximum sequence length for which
+            RoPE frequencies are precomputed and cached on-mesh.
+        precompute_masks: Whether to precompute and cache causal masks at
+            module construction time.
+        lmhead_chunksize: Optional chunk size for chunked LM-head projection.
+            When set, the LM head materializes logits in sequence chunks
+            instead of a single full-sequence matmul.
     """
 
     sharding_axis_dims: NotRequired[collections.abc.Sequence[int]]
@@ -587,6 +734,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
     }
 
     def __setattr__(self, key, value):
+        """Set an attribute, normalizing RoPE and MoE-related fields on the fly.
+
+        Args:
+            key: Attribute name being assigned.
+            value: New value for the attribute.
+
+        Returns:
+            None.
+        """
         # HF v5 expects `rope_parameters` to include `rope_theta`.
         # Keep late assignments (e.g. tests mutating `config.rope_scaling`) compatible.
         if key in {"rope_scaling", "rope_parameters"} and isinstance(value, dict):
@@ -600,6 +756,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self._backfill_rope_parameters()
 
     def __init_subclass__(cls, **kwargs):
+        """Restore ``__hash__`` on subclasses dropped by ``PretrainedConfig``.
+
+        Args:
+            **kwargs: Forwarded to ``super().__init_subclass__``.
+
+        Returns:
+            None.
+        """
         super().__init_subclass__(**kwargs)
 
         # PreTrainedConfig provides value-based equality, which causes Python to
@@ -626,6 +790,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return normalized
 
     def _normalize_rope_assignment(self, rope_parameters: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Normalize a ``rope_parameters``/``rope_scaling`` assignment.
+
+        Detects whether the dict is a flat RoPE config or a per-layer-type
+        nested mapping (when ``layer_types`` keys match) and dispatches to
+        :meth:`_normalize_rope_parameters_dict` accordingly.
+
+        Args:
+            rope_parameters: Raw dict being assigned to ``rope_parameters`` or
+                ``rope_scaling``.
+
+        Returns:
+            dict[str, Any]: Normalized HF v5-style RoPE config (flat or
+            nested by layer-type, depending on input shape).
+        """
         rope_theta = getattr(self, "rope_theta", None)
         partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
         layer_types = getattr(self, "layer_types", None)
@@ -1329,6 +1507,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def _as_spx_mesh(mesh: MeshLike) -> spx.SpxMesh:
+        """Coerce any mesh-like value to an :class:`spx.SpxMesh`.
+
+        If *mesh* is already an :class:`spx.SpxMesh`, it is returned as-is.
+        Otherwise it is converted to a ``jax.sharding.Mesh`` via
+        :func:`spx.to_jax_mesh` and wrapped in an ``SpxMesh`` whose
+        ``mpmd_axis`` is computed by :func:`_compute_mpmd_axis`.
+
+        Args:
+            mesh: A ``jax.sharding.Mesh``, ``spx.SpxMesh``, or any value
+                accepted by :func:`spx.to_jax_mesh`.
+
+        Returns:
+            spx.SpxMesh: A SpectraX mesh with MPMD axis info populated.
+        """
         if isinstance(mesh, spx.SpxMesh):
             return mesh
         jax_mesh = spx.to_jax_mesh(mesh)

@@ -71,6 +71,19 @@ from easydel.infra.sharding import RuntimeShardingResolver, TensorLayout, shardi
 
 
 def promote_dtype(values, *, dtype=None):
+    """Cast a tuple of arrays to a shared dtype.
+
+    Lightweight replacement for ``flax.linen.dtypes.promote_dtype`` used by
+    the MoE linear layers prior to the grouped matmul.
+
+    Args:
+        values: Iterable of arrays (or array-like values) to promote.
+        dtype: Target dtype. If ``None``, the values are returned unchanged.
+
+    Returns:
+        Tuple of arrays cast to ``dtype`` if it was provided, otherwise the
+        original ``values`` argument unchanged.
+    """
     if dtype is None:
         return values
     return tuple(jnp.asarray(v, dtype=dtype) for v in values)
@@ -102,6 +115,25 @@ def _moe_parameter_layout(
     use_expert_tensor_mode: bool,
     is_bias: bool = False,
 ) -> TensorLayout | None:
+    """Build the per-expert parameter layout for an MoE linear weight or bias.
+
+    The layout determines how the parameter is partitioned across the mesh:
+    along the expert (``EP``) axis, the tensor-parallel (``TP``) axis, or
+    the special "expert-on-TP" mode used when experts fit on the TP axis.
+
+    Args:
+        direction: Parallelism direction of the linear layer. ``"column"``
+            partitions output features, ``"row"`` partitions input features,
+            and ``None`` disables the layout (returns ``None``).
+        use_expert_tensor_mode: When ``True`` experts are placed on the TP
+            axis instead of the EP axis. Useful when ``num_experts`` is small.
+        is_bias: ``True`` for the 2-D bias parameter, ``False`` for the 3-D
+            weight kernel.
+
+    Returns:
+        A :class:`TensorLayout` describing the partitioning of the parameter,
+        or ``None`` when ``direction`` is ``None``.
+    """
     if direction is None:
         return None
     if use_expert_tensor_mode:

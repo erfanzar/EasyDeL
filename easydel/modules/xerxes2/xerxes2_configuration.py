@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Xerxes2 model family.
+
+Defines :class:`Xerxes2Config`, the EasyDeL configuration object for
+the second-generation Xerxes experimental decoder-only architecture.
+Extends Xerxes with a structured :class:`RopeConfig` for fine-grained
+control over rotary position embeddings (theta, scaling, low/high freq
+factors, ``original_max_position_embeddings``).
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -110,6 +118,17 @@ class Xerxes2Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize Xerxes2Config.
+
+        See the class docstring for parameter semantics. Xerxes2 supports
+        a routed MoE FFN (``num_experts``, ``num_experts_per_tok``,
+        ``moe_intermediate_size``) with optional dense-only layers
+        (``mlp_only_layers``), a DeepSeek-style low-rank attention
+        decomposition (``q_lora_dim``, ``kv_lora_dim``,
+        ``qk_rope_head_dim``, ``qk_nope_head_dim``, ``vhead_dim``), and a
+        structured RoPE config built from ``rope_theta`` / ``rope_scaling``.
+        ``**kwargs`` are forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.bits = bits
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -152,7 +171,21 @@ class Xerxes2Config(EasyDeLBaseConfig):
         )
 
     def _get_rope_config(self) -> RopeConfig:
-        """Get RoPE configuration from the instance attributes."""
+        """Build the :class:`RopeConfig` used by Xerxes2 attention.
+
+        Xerxes2 uses YaRN-flavoured rotary embeddings with mscale
+        smoothing. When ``rope_scaling`` is unset on the config, this
+        method synthesises a sensible default (``rope_type="yarn"``,
+        unit scaling factor, 4096-token original window). When
+        ``rope_scaling`` is provided, it is parsed via
+        :meth:`RopeConfig.from_dict` and the original max-position
+        slot is back-filled from
+        :attr:`original_max_position_embeddings` if missing.
+
+        Returns:
+            RopeConfig: Fully populated rotary-embedding config ready
+            to drive :class:`Xerxes2Attention`'s rotary module.
+        """
         if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
             config = RopeConfig.from_dict(
                 dict(

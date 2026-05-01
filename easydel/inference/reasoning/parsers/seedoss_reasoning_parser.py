@@ -20,7 +20,21 @@ from ..basic_parsers import BaseThinkingReasoningParser
 
 @ReasoningParserManager.register_module(["seed_oss"])  # pyright: ignore[reportUntypedClassDecorator]
 class SeedOSSReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for Seed OSS models using <think>...</think> tags."""
+    """Reasoning parser for Seed-OSS chain-of-thought outputs.
+
+    Seed-OSS reuses the literal ``<think>``…``</think>`` grammar that has
+    become standard among open thinking models. This class is a marker
+    subclass — all parsing semantics live in
+    :class:`BaseThinkingReasoningParser`, including the streaming state
+    machine that emits :class:`DeltaMessage` events with
+    ``reasoning_content`` while inside the markers and ``content`` after
+    the closing tag is consumed, and the prompt-gated path that handles
+    chat templates which pre-emit ``<think>``.
+
+    Attributes:
+        start_token: Reasoning open tag ``"<think>"``.
+        end_token: Reasoning close tag ``"</think>"``.
+    """
 
     start_token = "<think>"
     end_token = "</think>"

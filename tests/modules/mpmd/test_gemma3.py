@@ -46,7 +46,7 @@ class TestGemma3:
         vision_config = {
             "hidden_size": 256,
             "intermediate_size": 512,
-            "num_hidden_layers": 2,
+            "num_hidden_layers": small_model_config["num_hidden_layers"],
             "num_attention_heads": 4,
             "image_size": 224,
             "patch_size": 14,

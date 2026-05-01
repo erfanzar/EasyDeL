@@ -12,12 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged Flash Attention for CUDA with paged KV cache support.
+"""Paged Flash Attention V2 backed by ejkernel's CUDA kernel with block tables.
 
-This implementation uses ejkernel's Flash Attention with block tables to
-address paged KV caches. It is CUDA-only and intended for fixed-length
-batches (no varlen cu_seqlens). The KV cache layout matches
-UnifiedAttentionCacheView (separate K/V pages).
+This module implements :class:`PagedFlashAttn`, an :class:`OperationImpl`
+that drives ejkernel's :func:`flash_attention` over a paged KV buffer
+addressed via per-request block tables (the same layout used by
+:class:`UnifiedAttentionCacheView`, i.e. separate ``key_cache`` and
+``value_cache`` page pools).
+
+Capabilities and constraints:
+
+* CUDA-only: the underlying kernel is a Triton/CUDA Flash Attention V2
+  variant; on non-GPU backends ``forward_native`` raises
+  ``NotImplementedError``.
+* Fixed-length batches in BTHD layout. Variable-length packing
+  (``cum_seqlens``) is not supported by this op; the falsfback to
+  :class:`UnifiedAttn` covers query/page-table batch mismatches.
+* Optional data-parallel page sharding is honored: the ``ATTN_DP`` axis
+  enters the in_specs only when the cache reports
+  ``data_parallel_size > 1`` and the
+  ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH`` flag is on, in which case
+  block-table page IDs are translated into per-shard local IDs by
+  :func:`_localize_block_tables_for_dp_pages`.
+* Segment IDs in the ``mask_info`` are not supported (paged KV makes them
+  ambiguous) and raise ``ValueError`` if present.
 """
 
 from __future__ import annotations
@@ -43,7 +61,15 @@ ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH",
 
 
 def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
-    """Resolve the logical page axis for the active cache view."""
+    """Resolve the logical page axis for the active cache view.
+
+    Args:
+        cache_view: Unified-attention cache view carrying the DP metadata.
+
+    Returns:
+        Any: ``ATTN_DP`` when the cache reports ``data_parallel_size > 1``,
+        else ``ct.EMPTY`` (replicated pages).
+    """
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
     return ATTN_DP if dp_size > 1 else ct.EMPTY
 
@@ -56,8 +82,20 @@ def _localize_block_tables_for_dp_pages(
 ) -> Array:
     """Translate global page IDs into DP-local page IDs per request row.
 
-    Assumes rows are assigned contiguously per DP shard and page IDs are from
-    a globally indexed page pool partitioned evenly over DP shards.
+    Assumes rows are assigned contiguously per DP shard and page IDs are
+    from a globally indexed page pool partitioned evenly over DP shards.
+
+    Args:
+        block_tables: ``int[rows, max_blocks]`` table of page IDs per
+            request.
+        num_pages: Total number of pages in the global pool.
+        dp_size: Data-parallel mesh size.
+
+    Returns:
+        Array: ``block_tables`` with the per-shard page-ID offset removed.
+        Returns the input unchanged when DP localization is disabled or when
+        ``rows`` and ``num_pages`` cannot be evenly partitioned. Padding
+        entries (``0``) are preserved.
     """
     if not ENABLE_DP_LOCAL_PAGE_PATH or dp_size <= 1:
         return block_tables
@@ -76,14 +114,56 @@ def _localize_block_tables_for_dp_pages(
 
 @OperationRegistry.register
 class PagedFlashAttn(OperationImpl):
-    """Paged Flash Attention using CUDA flash_attention with block tables."""
+    """Flash Attention V2 over a paged KV cache addressed by per-request block tables.
+
+    Bridges the BTHD query convention used by EasyDeL training/serving paths
+    to ejkernel's CUDA Flash Attention V2 kernel, while reading keys and
+    values from a paged buffer. The expected cache layout is the same as
+    :class:`UnifiedAttentionCacheView`: separate ``key_cache`` /
+    ``value_cache`` tensors of shape
+    ``[num_pages, page_size, num_kv_heads, head_dim]`` and a
+    ``[batch, max_blocks]`` ``pages_tables`` mapping logical positions to
+    physical page IDs.
+
+    The operator is registered under ``"paged_flash_attention"`` and is
+    primarily used in continuous-batching inference where queries come in
+    fixed-length batches but the underlying KV grows page-by-page. It does
+    not own cache updates; callers must populate the pages before invoking
+    this op (see ``UnifiedAttentionCacheView.concatenate_to_cache``).
+
+    Notes:
+        - GPU/CUDA-only. Other backends fall through to ``forward_native``
+          which raises ``NotImplementedError``.
+        - Falls back to :class:`UnifiedAttn` when the query batch dimension
+          and ``pages_tables`` batch dimension disagree (e.g. mid-step
+          rebatching scenarios).
+        - Honors the ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH`` flag for
+          DP-sharded page pools; block tables are translated via
+          :func:`_localize_block_tables_for_dp_pages` so each DP shard sees
+          local page IDs only.
+    """
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
+        """Return the registered name of this operation.
+
+        Returns:
+            str: ``"paged_flash_attention"``.
+        """
         return "paged_flash_attention"
 
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
+        """Declare metadata and cache requirements.
+
+        Args:
+            mode: Execution mode (currently unused; requirements are mode
+                independent).
+
+        Returns:
+            OperationRequirements: Requires the paged-V2 metadata bundle and
+            uses :class:`UnifiedAttentionCacheView` over ragged-page caches.
+        """
         return (
             RequirementsBuilder("paged_flash_attention")
             .require_metadata(MetadataField.paged_v2())

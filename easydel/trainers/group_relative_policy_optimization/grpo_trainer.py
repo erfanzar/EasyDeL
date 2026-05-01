@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Group Relative Policy Optimization (GRPO) trainer.
 
+GRPO -- DeepSeek (2024) -- replaces the PPO critic with a group-
+relative advantage: rewards are mean-centred (and optionally
+standardised) within each prompt group of online rollouts.  This
+trainer drives the online generation pipeline, calls the registered
+reward functions / models, computes reference log-probabilities for
+the KL penalty, and dispatches to the JIT-compiled GRPO step.
+"""
 
 from __future__ import annotations
 
@@ -67,10 +75,30 @@ RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[f
 
 
 def _fileaf(x):
+    """``is_leaf`` predicate that stops at JAX arrays.
+
+    Args:
+        x: Pytree leaf candidate.
+
+    Returns:
+        ``True`` when ``x`` is a JAX array.
+    """
     return isinstance(x, jax.Array)
 
 
 def delete_tree(pytree):
+    """Eagerly free every JAX-array leaf inside ``pytree``.
+
+    Used after a generation pass to release on-device buffers before
+    the next compiled step allocates new ones.
+
+    Args:
+        pytree: A pytree mixing JAX arrays with Python objects.
+
+    Returns:
+        A pytree of ``None`` leaves, returned for caller symmetry; the
+        side effect is the in-place buffer deletion.
+    """
     return jax.tree_util.tree_map(
         lambda x: x.delete() if isinstance(x, jax.Array) else None,
         pytree,
@@ -132,6 +160,34 @@ class GRPOTrainer(Trainer):
         reward_processing_classes: ProcessingClassType | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
+        """Initialize the GRPO trainer.
+
+        Resolves the policy state, deep-copies it into a frozen
+        reference state, sets up reward modules / callables (lifting
+        :class:`EasyDeLBaseModule` rewards into compiled
+        :class:`EasyDeLState` apply functions when needed), and forwards
+        construction to :class:`Trainer`.
+
+        Args:
+            arguments: GRPO-specific training configuration.
+            model: Policy module or state.
+            reward_funcs: Single reward callable / module / state, or a
+                list of them.  Reward modules are converted to
+                :class:`EasyDeLState` automatically.
+            train_dataset: Optional dataset of prompts.
+            eval_dataset: Optional evaluation dataset.
+            processing_class: Tokenizer/processor; defaults to
+                ``AutoTokenizer.from_pretrained(model.config._name_or_path)``.
+            reward_processing_classes: Per-reward tokenizer overrides;
+                falls back to ``AutoTokenizer`` based on each reward
+                model's ``config._name_or_path``.
+            data_tokenize_fn: Optional custom tokenization callable.
+
+        Raises:
+            ValueError: If ``arguments`` is ``None`` or the reward-
+                weight count does not match the number of rewards.
+            TypeError: If ``arguments`` is not a :class:`GRPOConfig`.
+        """
         if arguments is None:
             raise ValueError(
                 "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
@@ -192,6 +248,18 @@ class GRPOTrainer(Trainer):
                     sharding = reward_func.shardings
 
                     def apply_fn(gd, gs, gt, batch):
+                        """Sharded reward-model forward used as the state's ``apply_fn``.
+
+                        Args:
+                            gd: Reward-module graphdef.
+                            gs: Trainable graphstate.
+                            gt: Frozen graphother (stop-gradient applied).
+                            batch: Tokenized input batch.
+
+                        Returns:
+                            The reward module's output (typically a
+                            ``logits`` field with the per-example score).
+                        """
                         gt = jax.tree_util.tree_map(
                             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                             gt,
@@ -310,22 +378,28 @@ class GRPOTrainer(Trainer):
 
     @property
     def step_sharding(self):
+        """Return the :class:`NamedSharding` used for per-step batch tensors."""
         return NamedSharding(
             mesh=self.model.mesh,
             spec=self.arguments.step_partition_spec,
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """
-        Configures and JIT-compiles the training and evaluation step functions.
+        """Build the JIT-compiled GRPO training/evaluation step functions.
 
-        This method sets up the necessary functions for training and evaluation, including:
-            - Initialization of the model state.
-            - Sharding of the model parameters and optimizer state.
-            - JIT-compilation of the training and evaluation step functions.
+        Resolves the optional QAT straight-through emulator, wires up
+        the captured static-arg tuples for both training and
+        evaluation passes (``num_generations``, ``beta``, loss type,
+        clip bounds, importance-sampling level, chunk sizes, ...),
+        compiles :func:`grpo_step` once for each mode under the
+        active MPMD pipeline schedule, and registers the sharded
+        reference-model forward callable used inside
+        :meth:`_preprocess_batch_input`.
 
         Returns:
-            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh, and
+            the streaming checkpoint manager.
         """
         mesh = self.model.mesh
 
@@ -400,6 +474,25 @@ class GRPOTrainer(Trainer):
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, model_kwargs=None, graphdef=None):
+            """Sharded reference-model per-token log-prob forward.
+
+            Stops gradients through the reference parameters, applies
+            the trainer's step partition spec, and dispatches to
+            :func:`get_per_token_logps` with the configured vocab chunk
+            size.
+
+            Args:
+                graphtree: Reference trainable graphstate.
+                graphother: Reference frozen graphother.
+                ids: Token id array ``[batch, seq_len]``.
+                mask: Attention mask ``[batch, seq_len]``.
+                model_kwargs: Optional dict of additional model kwargs
+                    (forwarded after normalization).
+                graphdef: Reference graphdef captured via partial.
+
+            Returns:
+                ``[batch, seq_len]`` reference log-probabilities.
+            """
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
@@ -464,6 +557,30 @@ class GRPOTrainer(Trainer):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        """Run online generation, score completions, and assemble the GRPO batch.
+
+        For every prompt this hook:
+
+        1. Calls :meth:`generate_unified` to draw ``num_generations``
+           completions per prompt.
+        2. Computes the reference-model per-token log-probabilities
+           via the compiled :meth:`compute_refmodel_logps`.
+        3. Calls each registered reward function and combines results
+           with the configured weights.
+        4. Packs prompt/completion ids, masks, advantages, and reward
+           breakdown into a JAX-friendly batch.
+
+        Args:
+            state: Current policy state.
+            batch: Raw batch from the dataloader (containing prompt
+                tokens and any per-prompt side-channel metadata).
+            is_train: Whether the call is during training or eval.
+
+        Returns:
+            A ``(batch, info)`` tuple where ``batch`` is the JAX-pure
+            dict consumed by ``grpo_step`` and ``info`` is a dict of
+            timing / reward metrics.
+        """
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
         if reward_batch:

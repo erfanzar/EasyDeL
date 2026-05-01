@@ -108,6 +108,25 @@ class EmbeddingTrainer(Trainer):
         processing_class: ProcessingClassType | None = None,
         data_collator: tp.Callable | None = None,
     ):
+        """Initialize the contrastive embedding trainer.
+
+        Resolves the padding value from the tokenizer, hands the
+        ``model`` and datasets to :class:`Trainer`, and wires
+        up the embedding-specific preprocessing transform.
+
+        Args:
+            arguments: Embedding-specific training configuration.
+            model: Encoder module or state used to compute embeddings.
+            train_dataset: Training dataset of contrastive triples.
+            eval_dataset: Optional evaluation dataset.
+            processing_class: Tokenizer/processor used for query and
+                positive (and optional negative) text encoding.
+            data_collator: Optional custom collator.
+
+        Raises:
+            TypeError: If ``arguments`` is not an
+                :class:`EmbeddingConfig`.
+        """
         if not isinstance(arguments, EmbeddingConfig):
             raise TypeError(f"arguments must be EmbeddingConfig, got {type(arguments)}")
 

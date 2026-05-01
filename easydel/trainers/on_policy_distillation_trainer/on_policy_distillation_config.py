@@ -114,6 +114,25 @@ class OnPolicyDistillationConfig(DistillationConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Validate and reconcile prompt/completion/total length budgets.
+
+        If both ``max_length`` and ``max_completion_length`` are configured,
+        ensures their sum does not exceed ``max_length``. If only
+        ``max_length`` is provided, ``max_completion_length`` is derived as
+        ``max_length - max_prompt_length``. ``max_length`` is then
+        renormalized as the sum.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias forwarded to
+                the base class for backward compatibility.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the base class.
+
+        Raises:
+            ValueError: If ``max_length`` is smaller than ``max_prompt_length``
+                or if ``max_prompt_length + max_completion_length`` exceeds
+                ``max_length``.
+        """
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:

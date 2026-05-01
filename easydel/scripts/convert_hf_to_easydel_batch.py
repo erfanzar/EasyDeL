@@ -11,21 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-How to use
+"""Batch wrapper around ``convert_hf_to_easydel.py``.
 
-Batch wrapper around `scripts/convert_hf_to_easydel.py`.
+Reads a list of source models (from CLI ``--source`` flags and/or a
+``--models-file``) and invokes the single-model conversion script as a
+subprocess for each entry. Unknown flags are forwarded verbatim to the
+per-model script, so any ``ConvertArgs`` flag is supported.
 
-Create a models file (one per line). Supported formats:
-- `source`
-- `source owner/name`
-- `source -> owner/name`
+Models file formats (one per line, ``#`` comments allowed):
+    - ``source``
+    - ``source owner/name``
+    - ``source,owner/name``
+    - ``source -> owner/name``
 
-Example `models.txt`:
-  meta-llama/Llama-3.1-8B
-  meta-llama/Llama-3.1-8B-Instruct -> EasyDeL/Llama-3.1-8B-Instruct
+Example ``models.txt``:
+    meta-llama/Llama-3.1-8B
+    meta-llama/Llama-3.1-8B-Instruct -> EasyDeL/Llama-3.1-8B-Instruct
 
-Run (all unknown flags are forwarded to `convert_hf_to_easydel.py`):
+Example invocation:
 
   python scripts/convert_hf_to_easydel_batch.py \\
     --models-file models.txt \\
@@ -51,12 +54,25 @@ from eformer.aparser import DataClassArgumentParser
 
 @dataclass(frozen=True)
 class ModelJob:
-    """A single model conversion job specification.
+    """Immutable record describing one (source, target, output) triple to convert.
+
+    Built by :func:`_parse_models_file` (one per non-comment line)
+    and via the repeated ``--source`` CLI flag in :func:`main`.
+    Frozen so the per-job dedupe set in :func:`main` can hash
+    instances directly. Each job becomes one subprocess invocation
+    of ``convert_hf_to_easydel.py``.
 
     Attributes:
-        source: HuggingFace source model identifier or local path.
-        repo_id: Target HuggingFace repository ID for the converted model.
-        out_dir: Local output directory for the conversion.
+        source (str): HuggingFace source repo id (e.g.
+            ``"meta-llama/Llama-3.1-8B"``) or local path passed
+            verbatim to the per-model script's ``--source``.
+        repo_id (str): Target Hub repo id (``owner/name``) used as
+            ``--repo-id``. Auto-derived from ``source`` when the
+            models file omits it (using
+            :attr:`BatchArgs.repo_owner`).
+        out_dir (Path): Filesystem directory under ``out_root``
+            where the converted checkpoint is written; passed as
+            ``--out`` to the per-model script.
     """
 
     source: str
@@ -65,10 +81,48 @@ class ModelJob:
 
 
 def _strip_comment(line: str) -> str:
+    """Strip ``# ...`` trailing comments and surrounding whitespace from a single line.
+
+    Used by :func:`_parse_models_file` to skip blank lines and
+    full-line comments while still parsing inline comments
+    correctly. The comment marker is the unescaped ``#``; there
+    is no support for backslash-escaping a literal ``#`` inside
+    a source name (no real-world repo id contains one anyway).
+
+    Args:
+        line: Raw line from the models file.
+
+    Returns:
+        str: Comment-free, whitespace-stripped line. Empty when
+        the input is fully blank or comment-only.
+    """
     return line.split("#", 1)[0].strip()
 
 
 def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root: Path) -> list[ModelJob]:
+    """Read a models file and turn each non-empty line into a :class:`ModelJob`.
+
+    Strips comments via :func:`_strip_comment`, skips blank
+    lines, and delegates per-line parsing to
+    :func:`_parse_model_line`. The ``out_dir`` for each job is
+    computed by concatenating ``out_root`` with the destination
+    repo's name (last path component of ``repo_id``), so jobs
+    that share a target name share an output directory — this is
+    intentional, allowing the same model to be re-converted in
+    place across runs.
+
+    Args:
+        path: Filesystem path to the models file (UTF-8).
+        default_owner: HF owner/org used by
+            :func:`_parse_model_line` when a line gives only a
+            source.
+        out_root: Output root directory; combined with each
+            job's repo name.
+
+    Returns:
+        list[ModelJob]: Ordered jobs, in the same order as the
+        non-empty lines in the file.
+    """
     jobs: list[ModelJob] = []
     text = Path(path).read_text(encoding="utf-8")
 
@@ -85,6 +139,24 @@ def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root:
 
 
 def _parse_model_line(line: str, *, default_owner: str) -> tuple[str, str]:
+    """Parse a single models-file line into ``(source, repo_id)``.
+
+    Supported formats:
+        - ``source``
+        - ``source -> owner/name``
+        - ``source,owner/name``
+        - ``source owner/name``
+
+    Args:
+        line: Pre-stripped line (no trailing comment, non-empty).
+        default_owner: HF owner used when only a source is provided.
+
+    Returns:
+        Tuple ``(source, repo_id)``.
+
+    Raises:
+        ValueError: If the line cannot be parsed into the expected fields.
+    """
     # Supported formats:
     # - source
     # - source -> owner/name
@@ -119,6 +191,20 @@ def _parse_model_line(line: str, *, default_owner: str) -> tuple[str, str]:
 
 
 def _mask_secrets(argv: list[str]) -> list[str]:
+    """Hide HF tokens in argv before logging or printing the planned command line.
+
+    Looks for the recognised token flag forms (``--token``,
+    ``--hf-token``, ``--huggingface-token``) and replaces the
+    *next* argument (the actual token value) with ``"****"``.
+    Returns a fresh list so the caller's argv stays unmodified.
+
+    Args:
+        argv: Subprocess command-line arguments to mask.
+
+    Returns:
+        list[str]: Copy of ``argv`` with any token values
+        replaced by ``"****"``.
+    """
     masked = argv[:]
     for i, arg in enumerate(masked):
         if arg in {"--token", "--hf-token", "--huggingface-token"} and i + 1 < len(masked):
@@ -127,19 +213,74 @@ def _mask_secrets(argv: list[str]) -> list[str]:
 
 
 def _format_cmd(argv: list[str]) -> str:
+    """Render an argv list as a single shell-quoted command string for printing.
+
+    Used purely for human-readable logging — every argument is
+    quoted by :func:`shlex.quote` so the printed line is
+    copy-paste safe even when arguments contain spaces or
+    special characters.
+
+    Args:
+        argv: Subprocess command-line arguments.
+
+    Returns:
+        str: Single shell-quoted command line.
+    """
     return " ".join(shlex.quote(x) for x in argv)
 
 
 def _default_convert_script() -> Path:
+    """Locate the bundled per-model converter that lives next to this script.
+
+    Resolves ``convert_hf_to_easydel.py`` relative to the current
+    file so the batch runner works regardless of where the user
+    invokes it from. The :func:`main` function uses this when the
+    user does not pass ``--convert-script``.
+
+    Returns:
+        Path: Absolute path to ``convert_hf_to_easydel.py`` in the
+        same directory as this module.
+    """
     return Path(__file__).resolve().parent / "convert_hf_to_easydel.py"
 
 
 @dataclass
 class BatchArgs:
-    """Command-line arguments for batch model conversion.
+    """CLI arguments specific to the batch converter (delegated flags pass through).
 
-    Extends the single-model converter by supporting a models file and
-    forwarding extra flags to the per-model conversion script.
+    Captures only the batch-runner concerns — list of source models,
+    output root directory, owner default, subprocess interpreter,
+    and the runner-level safety flags (dry-run, continue-on-error,
+    skip-existing). Anything else on the command line is forwarded
+    verbatim to ``convert_hf_to_easydel.py`` via the
+    ``return_remaining_strings`` mechanism in :func:`main`.
+
+    Attributes:
+        out_root (str): Directory under which each model gets a
+            ``<out-root>/<repo-name>/`` subdirectory.
+        source (str): Repeatable ``--source`` flag; collected into
+            a list by ``argparse``. Each entry becomes one
+            :class:`ModelJob`.
+        models_file (str | None): Optional path to a text file
+            with one source per line; format described in the
+            module docstring.
+        repo_owner (str): HF owner/org used to build target
+            ``repo_id``s when the models file/CLI does not
+            specify one. Defaults to ``"EasyDeL"``.
+        python (str | None): Path to the Python interpreter used
+            to run the per-model script. ``None`` uses the
+            current ``sys.executable``.
+        convert_script (str | None): Override for the per-model
+            script path. Defaults to the bundled
+            ``convert_hf_to_easydel.py``.
+        dry_run (bool): When ``True``, prints commands instead of
+            executing them — useful for verifying the planned
+            invocations.
+        continue_on_error (bool): When ``True``, a failed
+            subprocess does not abort the remaining jobs; the
+            runner returns ``2`` at the end if any job failed.
+        skip_existing (bool): When ``True``, skip jobs whose
+            output directory already exists and is non-empty.
     """
 
     out_root: str = field(metadata={"help": "Output root directory; each model writes to <out-root>/<repo-name>."})

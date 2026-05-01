@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""MiniMax (MiniMax-Text-01) model implementation.
+
+Implements the MiniMax decoder family which alternates between two attention
+flavors per layer:
+
+- ``MiniMaxLightningAttention``: a block-wise linear attention with per-head
+  exponential decay, suited for very long sequences.
+- ``MiniMaxAttention``: standard causal multi-head attention (with optional
+  sliding window) inheriting from :class:`UnifiedAttention`.
+
+Each decoder layer also contains a top-k Sparse Mixture-of-Experts feed-forward
+block (``MiniMaxSparseMoeBlock`` over ``MiniMaxExperts``) and per-component
+residual scaling factors (``*_alpha_factor`` / ``*_beta_factor``).
+
+Exports:
+    - ``MiniMaxLightningAttention``, ``MiniMaxAttention``: attention variants.
+    - ``MiniMaxExperts``, ``MiniMaxSparseMoeBlock``: MoE feed-forward blocks.
+    - ``MiniMaxDecoderLayer``: hybrid-attention + MoE decoder block.
+    - ``MiniMaxModel``: base transformer trunk.
+    - ``MiniMaxForCausalLM``: causal LM head wrapper with auxiliary MoE loss.
+"""
+
 from __future__ import annotations
 
 import typing
@@ -57,21 +79,45 @@ from .minimax_configuration import MiniMaxConfig
 
 
 class MiniMaxLightningAttention(spx.Module):
-    """Lightning Attention module for MiniMax models.
+    """Lightning Attention — MiniMax's linear-attention block.
 
-    This module implements a linear attention mechanism with exponential decay,
-    designed for efficient long-sequence processing. It uses a block-wise computation
-    strategy with intra-block and inter-block attention components.
+    Replaces softmax attention with a per-head **exponentially-decaying linear
+    attention** maintaining a recurrent KV-outer-product memory
+    :math:`S_t \\in \\mathbb{R}^{d_k \\times d_v}` per head:
+
+    .. math::
+        S_t = e^{-\\lambda} \\, S_{t-1} + k_t v_t^\\top, \\qquad
+        o_t = q_t^\\top S_t
+
+    where :math:`\\lambda` is a *fixed*, non-learned per-head slope produced
+    by :meth:`_get_slope_rate` (geometric series :math:`2^{-8 i / H}` scaled
+    by a layer-depth factor — earlier layers decay faster, later layers
+    integrate longer histories). Q/K/V are silu-activated, the output is
+    sigmoid-gated by ``output_gate``, and an RMSNorm sits between the
+    aggregator and the output projection.
+
+    Implementation: prefill is computed *block-wise* with two terms per
+    block — an intra-block ``Q K^T`` masked by an exponential causal kernel
+    (``diagonal_decay``) and an inter-block contribution from the rolling
+    memory ``S`` (``query_decay``/``key_decay`` factors). Decode (mode ==
+    ``MODE_DECODE``) collapses to the single-token recurrence above.
+    The recurrent ``S`` is what is carried in :class:`RecurrentCacheView`.
 
     Attributes:
-        config: Model configuration object.
-        layer_idx: Index of this layer in the transformer stack.
-        hidden_size: Dimension of hidden states.
-        num_attention_heads: Number of attention heads.
-        num_hidden_layers: Total number of layers in the model.
-        head_dim: Dimension of each attention head.
-        block_size: Size of blocks for block-wise attention computation.
-        act_fn: Activation function used in QKV projections.
+        qkv_proj, out_proj, output_gate: Linear projections for the QKV fan-in,
+            output projection, and the sigmoid output gate.
+        norm (RMSNorm): RMSNorm applied to the aggregated head outputs before
+            gating.
+        layer_idx (int): Layer index, used to compute the depth-dependent
+            decay scale.
+        block_size (int): Size of the block-wise scan during prefill.
+        head_dim (int): Per-head Q/K/V dimension.
+        num_attention_heads (int): Number of independent decay-attention
+            heads.
+        num_hidden_layers (int): Total layers (used to scale the decay
+            factor).
+        hidden_size (int): Channel dimension of the input/output.
+        act_fn: Pre-projection activation applied to the fused QKV.
     """
 
     def __init__(
@@ -144,13 +190,19 @@ class MiniMaxLightningAttention(spx.Module):
         )
 
     def _get_slope_rate(self) -> Array:
-        """Compute the slope rate for exponential decay in attention.
+        """Build the per-head exponential decay scalar :math:`\\lambda`.
 
-        The slope rate determines the decay factor for each attention head,
-        with earlier layers having faster decay rates.
+        Slopes are picked from the geometric sequence
+        :math:`\\lambda_h = 2^{-8 (h+1) / H}` (head ``h``, ``H = num_heads``)
+        and scaled by ``1 - layer_idx / (num_hidden_layers - 1)``. The
+        layer-depth factor makes early layers decay aggressively (short
+        memory) and late layers decay slowly (long memory), which is what
+        gives Lightning Attention its long-context behaviour without
+        learnable decay parameters.
 
         Returns:
-            Array: Decay rates per head of shape (num_heads, 1, 1).
+            jax.Array: ``(num_heads, 1, 1)`` float32 tensor of per-head
+            decay rates suitable for broadcasting against ``(seq, head_dim)``.
         """
         base = 1.0 / (2.0 ** (8.0 / self.num_attention_heads))
         exponent = jnp.arange(self.num_attention_heads, dtype=jnp.float32) + 1.0
@@ -159,16 +211,27 @@ class MiniMaxLightningAttention(spx.Module):
         return rate[:, None, None].astype(jnp.float32)
 
     def _decay_factors(self, slope_rate: Array) -> tuple[Array, Array, Array]:
-        """Compute decay factors for block-wise attention computation.
+        """Materialize the three per-block decay tensors used in the chunked scan.
+
+        For a block of length ``block_size``:
+
+        * ``query_decay[i] = exp(-λ * (i + 1))`` weights how strongly each
+          query in this block reads from the rolling memory carried over
+          from the previous block.
+        * ``key_decay[i] = exp(-λ * (block_size - i))`` weights how strongly
+          each key contributes to the next block's rolling memory.
+        * ``diagonal_decay[i, j] = exp(λ * (i - j))`` for ``i >= j`` and
+          ``0`` for ``i < j`` — the *exponential causal kernel* used inside
+          the intra-block ``Q K^T``, replacing softmax with a cheaply
+          differentiable substitute.
 
         Args:
-            slope_rate (Array): Decay rate per attention head, shape (num_heads, 1, 1).
+            slope_rate: Per-head decay :math:`\\lambda`, shape ``(num_heads, 1, 1)``.
 
         Returns:
-            tuple[Array, Array, Array]: A tuple containing:
-                - query_decay: Decay factors for queries, shape (num_heads, block_size, 1).
-                - key_decay: Decay factors for keys, shape (num_heads, block_size, 1).
-                - diagonal_decay: Causal mask with decay, shape (1, 1, block_size, block_size).
+            tuple: ``(query_decay, key_decay, diagonal_decay)`` with shapes
+            ``(num_heads, block_size, 1)``, ``(num_heads, block_size, 1)``,
+            ``(1, 1, block_size, block_size)``.
         """
         block_size_range = jnp.arange(self.block_size, dtype=jnp.float32) + 1.0
         block_size_range_2d = block_size_range[:, None]
@@ -191,18 +254,37 @@ class MiniMaxLightningAttention(spx.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: RecurrentCacheView | None = None,
     ) -> tuple[Float[Array, "batch seq_len hidden_dim"], RecurrentCacheView | None]:
-        """Perform lightning attention forward pass.
+        """Run Lightning Attention with the appropriate prefill/decode path.
+
+        Two branches:
+
+        * **Prefill** (``mode != MODE_DECODE``): split the sequence into
+          ``ceil(seq_len / block_size)`` chunks. For each chunk compute the
+          full output as ``intra(chunk) + inter(chunk)``: the intra-chunk
+          term is :math:`(Q K^\\top \\odot \\text{diag\\_decay})V` and the
+          inter-chunk term reads from the rolling memory ``S``. After the
+          chunk, ``S`` is decayed by ``exp(-λ * block_size)`` and updated
+          with :math:`\\sum (k_t \\, e^{-λ(B-t)}) v_t^\\top`. Padding tokens
+          are masked out of the *value* stream so their keys do not
+          contaminate ``S``.
+        * **Decode** (``mode == MODE_DECODE``): run the scalar recurrence
+          ``S = exp(-λ) * S + k v^T`` once per token and project queries
+          against the updated ``S``.
 
         Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
-            attention_mask (Array | None): Optional boolean mask of shape (batch, seq_len).
-            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
-            cache_view (RecurrentCacheView | None, optional): Recurrent cache for incremental
-                decoding. Defaults to None.
+            hidden_states: ``(batch, seq_len, hidden_size)`` block input.
+            attention_mask: Optional ``(batch, seq_len)`` 0/1 mask used to
+                zero-out padding values during prefill.
+            mode: Runtime mode toggling between the chunked-prefill and
+                single-step-decode code paths.
+            cache_view: Per-layer recurrent state carrying ``S`` of shape
+                ``(batch, num_heads, head_dim, head_dim)``. ``None`` skips
+                state threading entirely.
 
         Returns:
-            tuple[Array, RecurrentCacheView | None]: A tuple containing the output hidden states
-                of shape (batch, seq_len, hidden_dim) and the updated cache view.
+            tuple: ``(attn_output, cache_view)`` where ``attn_output`` has
+            shape ``(batch, seq_len, hidden_size)`` and ``cache_view`` is
+            the updated recurrent state (or ``None``).
         """
         batch_size, seq_len, _ = hidden_states.shape
         num_blocks = (seq_len + self.block_size - 1) // self.block_size
@@ -600,23 +682,36 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
 
 
 class MiniMaxDecoderLayer(spx.Module):
-    """Single decoder layer for MiniMax transformer models.
+    """One MiniMax block: hybrid attention plus sparse MoE feed-forward.
 
-    Each layer consists of an attention block (either lightning or standard attention)
-    followed by a sparse MoE feed-forward block, with residual connections and
-    layer normalization.
+    The attention type per layer is read from ``config.layer_types[layer_idx]``;
+    layers tagged ``"linear_attention"`` use :class:`MiniMaxLightningAttention`
+    and the corresponding ``linear_attn_*`` residual scaling factors, while
+    ``"full_attention"`` layers use the standard softmax :class:`MiniMaxAttention`
+    with the ``full_attn_*`` factors. Both branches feed a
+    :class:`MiniMaxSparseMoeBlock`. Residuals are scaled by the configured
+    ``alpha_factor`` (residual stream contribution) / ``beta_factor`` (sub-layer
+    contribution) so the architecture can match HF MiniMax-Text-01 weight
+    behaviour exactly:
+
+    .. math::
+        x \\leftarrow \\alpha_a \\, x + \\beta_a \\, \\text{attn}(\\text{RMSNorm}(x)),
+        \\qquad
+        x \\leftarrow \\alpha_m \\, x + \\beta_m \\, \\text{MoE}(\\text{RMSNorm}(x))
 
     Attributes:
-        config: Model configuration object.
-        layer_idx: Index of this layer in the transformer stack.
-        dtype: Data type for computation.
-        param_dtype: Data type for parameters.
-        precision: JAX precision setting for matrix operations.
-        layer_type: Type of attention ("linear_attention" or "full_attention").
-        self_attn: Attention module (MiniMaxLightningAttention or MiniMaxAttention).
-        block_sparse_moe: Sparse MoE feed-forward block.
-        input_layernorm: Pre-attention layer normalization.
-        post_attention_layernorm: Pre-FFN layer normalization.
+        layer_type (str): ``"linear_attention"`` or ``"full_attention"``;
+            determines which attention block this layer instantiates.
+        self_attn (spx.Module): Either :class:`MiniMaxLightningAttention` or
+            :class:`MiniMaxAttention`.
+        block_sparse_moe (MiniMaxSparseMoeBlock): Top-k MoE feed-forward.
+        input_layernorm, post_attention_layernorm (RMSNorm): Pre-attention
+            and pre-MLP RMSNorms.
+        attn_alpha_factor, attn_beta_factor (float): Residual / sub-layer
+            scales for the attention block; selected from the linear vs full
+            config groups based on ``layer_type``.
+        mlp_alpha_factor, mlp_beta_factor (float): Residual / sub-layer
+            scales for the MoE block.
     """
 
     # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion
@@ -816,20 +911,22 @@ class MiniMaxDecoderLayer(spx.Module):
 @register_module(TaskType.BASE_MODULE, config=MiniMaxConfig, model_type="minimax_text_01")
 @register_module(TaskType.BASE_MODULE, config=MiniMaxConfig, model_type="MiniMaxText01")
 class MiniMaxModel(EasyDeLBaseModule):
-    """Base transformer model for MiniMax architecture.
+    """MiniMax-Text-01 base trunk: embeddings + hybrid attention/MoE stack + final RMSNorm.
 
-    This model implements the core MiniMax transformer with hybrid attention
-    (combining lightning and standard attention) and sparse Mixture-of-Experts
-    feed-forward layers. It serves as the backbone for downstream tasks.
+    Each layer's attention type is read from ``config.layer_types``; in the
+    canonical MiniMax-Text-01 schedule a 1:7 ratio (one full attention layer
+    every eight blocks) gives most of the long-context speedup while keeping
+    a few softmax layers for accuracy. Linear-attention layers consume
+    :class:`RecurrentCacheView` slots from a hybrid cache; full-attention
+    layers consume :class:`TransformerCacheView` slots from the same hybrid
+    cache. Token embedding -> ``num_hidden_layers`` :class:`MiniMaxDecoderLayer`
+    blocks (executed via :meth:`nn.ModuleList.scan`) -> final RMSNorm.
 
     Attributes:
-        config: Model configuration object.
-        dtype: Data type for computation.
-        param_dtype: Data type for parameters.
-        precision: JAX precision setting.
-        embed_tokens: Token embedding layer.
-        layers: List of MiniMaxDecoderLayer modules.
-        norm: Final layer normalization.
+        embed_tokens (Embed): Token embedding ``(vocab_size, hidden_size)``.
+        layers (nn.ModuleList[MiniMaxDecoderLayer]): One block per layer,
+            assigned to pipeline stages via :func:`spx.assign_stage`.
+        norm (RMSNorm): Final RMS normalization at ``rms_norm_eps``.
     """
 
     def __init__(

@@ -92,10 +92,30 @@ def _slice_decode_window_for_vanilla_fallback(
 ]:
     """Bake the active decode KV window into TPU/CPU vanilla-attention fallback inputs.
 
-    GPU decode uses a dedicated kernel that interprets sliding windows in absolute
-    cache coordinates. The vanilla fallback does not, so for non-GPU decode we
-    explicitly slice the cached KV axis and the materialized mask to the live
-    per-request window before calling the generic attention implementation.
+    GPU decode uses a dedicated kernel that interprets sliding windows in
+    absolute cache coordinates. The vanilla fallback does not, so for non-GPU
+    decode we explicitly slice the cached KV axis and the materialized mask
+    to the live per-request window before calling the generic attention
+    implementation.
+
+    Args:
+        key: Cached key tensor of shape ``(batch, kv_seq_len, num_kv_heads,
+            head_dim)``.
+        value: Cached value tensor of shape ``(batch, kv_seq_len,
+            num_kv_heads, head_dim)``.
+        mask_info: Optional :class:`MaskInfo` whose attention mask, segment
+            ids and positions are sliced in lockstep with the KV tensors.
+        cache_metadata: Per-batch cache metadata; only ``indexes`` (current
+            lengths) is consulted to compute the slice start.
+        sliding_window: Either an ``int`` for symmetric window, a tuple
+            ``(left, right)``, or ``None`` to skip slicing.
+
+    Returns:
+        tuple: ``(key, value, mask_info)`` where each tensor is reduced along
+        the ``kv_seq_len`` axis to ``min(left + right + 1, kv_seq_len)`` and
+        ``mask_info`` is ``replace``-d so that ``sliding_window_baked_in``
+        is ``True``. When ``sliding_window`` is ``None`` the inputs are
+        returned unchanged.
     """
     if sliding_window is None:
         return key, value, mask_info
@@ -376,47 +396,47 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """
-        CPU forward pass for autoregressive decoding attention.
+        """GPU forward pass for autoregressive decoding attention.
 
-        Delegates to the native JAX/XLA implementation (`forward_native`).
+        Delegates to :meth:`forward_native`, which selects the
+        ``ragged_decode_attention`` Pallas/Triton kernel when running on GPU.
 
         Args:
-            *args: Positional arguments for the attention calculation.
-            **kwargs: Keyword arguments for the attention calculation.
+            *args: Positional arguments forwarded to :meth:`forward_native`.
+            **kwargs: Keyword arguments forwarded to :meth:`forward_native`.
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-        """
-        CPU forward pass for autoregressive decoding attention.
+        """TPU forward pass for autoregressive decoding attention.
 
-        Delegates to the native JAX/XLA implementation (`forward_native`).
+        Delegates to :meth:`forward_native`. On TPU the native path falls back
+        to :class:`VanillaAttn` over the live decode window.
 
         Args:
-            *args: Positional arguments for the attention calculation.
-            **kwargs: Keyword arguments for the attention calculation.
+            *args: Positional arguments forwarded to :meth:`forward_native`.
+            **kwargs: Keyword arguments forwarded to :meth:`forward_native`.
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """
-        CPU forward pass for autoregressive decoding attention.
+        """CPU forward pass for autoregressive decoding attention.
 
-        Delegates to the native JAX/XLA implementation (`forward_native`).
+        Delegates to :meth:`forward_native`, which uses the
+        :class:`VanillaAttn` fallback on CPU.
 
         Args:
-            *args: Positional arguments for the attention calculation.
-            **kwargs: Keyword arguments for the attention calculation.
+            *args: Positional arguments forwarded to :meth:`forward_native`.
+            **kwargs: Keyword arguments forwarded to :meth:`forward_native`.
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 

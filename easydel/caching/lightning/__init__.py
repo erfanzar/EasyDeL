@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Lightning attention cache.
+
+Re-exports the per-layer view, container and metadata classes that back
+EasyDeL's Lightning attention KV cache. Lightning attention uses a fused
+linear-recurrent kernel with a dedicated cache shape; the container hides
+the layout from model code.
+"""
+
 from .cache import LightningCache, LightningCacheConfig, LightningCacheView, LightningMetadata
 
 __all__ = ("LightningCache", "LightningCacheConfig", "LightningCacheView", "LightningMetadata")

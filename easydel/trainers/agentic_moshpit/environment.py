@@ -190,6 +190,15 @@ def _make_regex_parser(pattern: str) -> tp.Callable[[str], list[tuple[str, str]]
     compiled = re.compile(pattern, re.DOTALL)
 
     def parser(action: str) -> list[tuple[str, str]]:
+        """Extract ``(tool_name, tool_args_json)`` pairs from a regex match.
+
+        Args:
+            action: Raw model output potentially containing tool calls.
+
+        Returns:
+            A list of ``(name, args_json_string)`` tuples for every
+            successful match; malformed JSON entries are skipped.
+        """
         results = []
         for match in compiled.finditer(action):
             try:
@@ -220,6 +229,16 @@ def _make_inference_tool_parser(
     parser_instance = parser_cls(tokenizer)
 
     def parser(action: str) -> list[tuple[str, str]]:
+        """Delegate to a registered ``easydel.inference.tools`` parser.
+
+        Args:
+            action: Raw model output to inspect.
+
+        Returns:
+            A list of ``(name, args_json_string)`` tuples for every tool
+            call recognised by the registered parser; an empty list when
+            the parser reports no tools.
+        """
         result = parser_instance.extract_tool_calls(action, request=None)
         if not result.tools_called:
             return []
@@ -268,6 +287,19 @@ class ToolEnvWrapper(AgenticEnvironment):
         tool_call_parser: tp.Callable[[str], list[tuple[str, str]]] | None = None,
         max_tool_calls_per_step: int = 5,
     ):
+        """Cache the inner environment and tool dispatch configuration.
+
+        Args:
+            env: The base :class:`AgenticEnvironment` being wrapped.
+            tools: Registered :class:`Tool` instances available to the
+                agent.  ``tool.name`` is the dispatch key.
+            tool_call_parser: Callable that turns model text into
+                ``[(name, args_json)]`` pairs; defaults to a simple
+                JSON tool-call detector.
+            max_tool_calls_per_step: Hard cap on tool invocations within
+                a single agent turn (after which extra calls are
+                ignored).
+        """
         self.env = env
         self.tools = {tool.name: tool for tool in tools}
         self.tool_call_parser = tool_call_parser or _default_tool_call_parser
@@ -275,11 +307,29 @@ class ToolEnvWrapper(AgenticEnvironment):
         self._tool_calls_this_step = 0
 
     def reset(self, seed: int | None = None) -> ResetResult:
+        """Reset the wrapped environment and per-turn tool counters.
+
+        Args:
+            seed: Optional seed forwarded to the inner environment.
+
+        Returns:
+            The :class:`ResetResult` produced by the inner environment.
+        """
         self._tool_calls_this_step = 0
         return self.env.reset(seed=seed)
 
     @staticmethod
     def _coerce_tool_args_json(tool_args: tp.Any) -> str:
+        """Coerce an arbitrary tool-args payload into a JSON string.
+
+        Args:
+            tool_args: Tool arguments in any shape (dict, JSON string,
+                ``None``, etc.).
+
+        Returns:
+            A JSON-encoded string, or the unchanged string for already
+            JSON-string inputs; ``"{}"`` for ``None``.
+        """
         if tool_args is None:
             return "{}"
         if isinstance(tool_args, str):
@@ -293,6 +343,19 @@ class ToolEnvWrapper(AgenticEnvironment):
         self,
         tool_calls: tp.Any | None,
     ) -> list[tuple[str, str]]:
+        """Flatten heterogeneous tool-call payloads into ``(name, args_json)`` pairs.
+
+        Accepts dicts, dataclass-like objects with ``function``
+        attributes, and ``(name, args)`` tuples.
+
+        Args:
+            tool_calls: Optional list of tool-call descriptors emitted
+                by the generator.
+
+        Returns:
+            A list of ``(name, args_json)`` pairs; empty when the input
+            is not a list of recognised payloads.
+        """
         if not isinstance(tool_calls, list):
             return []
 
@@ -330,6 +393,19 @@ class ToolEnvWrapper(AgenticEnvironment):
         return normalized
 
     def _execute_tool_calls(self, parsed_calls: list[tuple[str, str]]) -> StepResult | None:
+        """Run pending tool calls and assemble a tool-result observation.
+
+        Calls past ``max_tool_calls_per_step`` are dropped silently.
+
+        Args:
+            parsed_calls: ``(name, args_json)`` pairs from a parser.
+
+        Returns:
+            A :class:`StepResult` whose ``observation`` concatenates
+            ``[name]: result`` lines, or ``None`` when no registered
+            tools were invoked (so the underlying ``env.step`` should
+            run instead).
+        """
         if not parsed_calls or self._tool_calls_this_step >= self.max_tool_calls_per_step:
             return None
 
@@ -358,6 +434,22 @@ class ToolEnvWrapper(AgenticEnvironment):
         *,
         tool_calls: tp.Any | None = None,
     ) -> StepResult:
+        """Step the environment, executing tool calls when present.
+
+        Tries the structured ``tool_calls`` payload first (already
+        parsed by the generator) and falls back to running the
+        configured text parser on ``action``.  When neither path
+        produces a tool result, the action is forwarded to the inner
+        environment's ``step``.
+
+        Args:
+            action: The agent's raw text action.
+            tool_calls: Optional pre-parsed structured tool-call list.
+
+        Returns:
+            A :class:`StepResult` with either tool output observations
+            or the inner environment's response.
+        """
         self._tool_calls_this_step = 0
         parsed_calls = self._normalize_structured_tool_calls(tool_calls)
         step_result = self._execute_tool_calls(parsed_calls)
@@ -372,11 +464,23 @@ class ToolEnvWrapper(AgenticEnvironment):
         return self.env.step(action)
 
     def step(self, action: str) -> StepResult:
+        """Default :class:`AgenticEnvironment` ``step`` -- delegates to
+        :meth:`step_with_tool_calls`.
+
+        Args:
+            action: The agent's raw text action.
+
+        Returns:
+            The result of :meth:`step_with_tool_calls` without
+            structured tool-call hints.
+        """
         return self.step_with_tool_calls(action)
 
     def close(self) -> None:
+        """Close the inner environment, releasing its resources."""
         self.env.close()
 
     @property
     def max_steps(self) -> int | None:
+        """Return the underlying environment's ``max_steps`` (if any)."""
         return self.env.max_steps

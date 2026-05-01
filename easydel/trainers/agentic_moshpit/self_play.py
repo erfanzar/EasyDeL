@@ -210,6 +210,28 @@ class LocalQuestionGenerator(QuestionGenerator):
         verifier_top_k: int | None = None,
         strip_reasoning_fn: tp.Callable[[str], str] | None = None,
     ):
+        """Cache the prompts and sampling parameters for self-play.
+
+        Args:
+            questioner_system_prompt: System prompt used for question
+                generation.
+            verifier_system_prompt: System prompt used for grading.
+                ``None`` reuses the questioner prompt.
+            tokenizer: Tokenizer used to apply chat templates; can be
+                attached lazily by the trainer.
+            tool_schemas: Optional list of tool schemas forwarded to
+                chat templates.
+            questioner_temperature: Sampling temperature when generating
+                questions (typically high for diversity).
+            questioner_top_p: Top-p for question generation.
+            questioner_top_k: Optional top-k for question generation.
+            verifier_temperature: Sampling temperature for grading.
+            verifier_top_p: Top-p for grading.
+            verifier_top_k: Optional top-k for grading.
+            strip_reasoning_fn: Optional callable used to strip
+                ``<think>`` blocks from student answers; defaults to a
+                regex-based stripper.
+        """
         self._questioner_prompt = questioner_system_prompt
         self._verifier_prompt = verifier_system_prompt
         self._tokenizer = tokenizer
@@ -226,14 +248,38 @@ class LocalQuestionGenerator(QuestionGenerator):
             _unclosed = re.compile(r"<think>.*", re.DOTALL)
 
             def strip_reasoning_fn(text: str) -> str:
+                """Drop ``<think>...</think>`` blocks (closed and unclosed) from ``text``.
+
+                Args:
+                    text: Raw model output potentially containing reasoning blocks.
+
+                Returns:
+                    The cleaned text with reasoning regions removed.
+                """
                 return _unclosed.sub("", _closed.sub("", text)).strip()
 
         self._strip_reasoning = strip_reasoning_fn
 
     def set_generate_fn(self, generate_fn: tp.Callable[[list[str]], list[str]]) -> None:
+        """Inject the trainer-provided batched generation callable.
+
+        Args:
+            generate_fn: Callable accepting a list of prompts and
+                returning a list of completions of the same length.
+        """
         self._generate_fn = generate_fn
 
     def generate(self, topic: str, seed: int | None = None) -> GeneratedQuestion:
+        """Generate a single question via the batched code path.
+
+        Args:
+            topic: Topic prompt.
+            seed: Optional integer seed for variation.
+
+        Returns:
+            The :class:`GeneratedQuestion` wrapping the generated text
+            and metadata.
+        """
         return self.generate_batch([topic], [seed])[0]
 
     def generate_batch(
@@ -284,6 +330,16 @@ class LocalQuestionGenerator(QuestionGenerator):
         answer: str,
         metadata: dict[str, tp.Any] | None = None,
     ) -> float:
+        """Grade a single answer via the batched verification path.
+
+        Args:
+            question: The question that was asked.
+            answer: The student's answer.
+            metadata: Optional metadata associated with the question.
+
+        Returns:
+            A reward value in ``[0, 1]``.
+        """
         return self.verify_batch([question], [answer], [metadata])[0]
 
     def verify_batch(
@@ -330,6 +386,23 @@ class LocalQuestionGenerator(QuestionGenerator):
         user: str,
         enable_thinking: bool = True,
     ) -> str:
+        """Apply the tokenizer's chat template to a system/user pair.
+
+        Optionally requests ``enable_thinking=False`` for tokenizers that
+        understand the flag (e.g. Qwen3) so reasoning tokens are not
+        produced.
+
+        Args:
+            system: System message content.
+            user: User message content.
+            enable_thinking: Whether to allow chain-of-thought blocks.
+
+        Returns:
+            The fully templated prompt string with a generation prompt.
+
+        Raises:
+            RuntimeError: If no tokenizer has been configured.
+        """
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -353,6 +426,19 @@ class LocalQuestionGenerator(QuestionGenerator):
 
     @staticmethod
     def _parse_score(text: str) -> float:
+        """Extract a normalized reward in ``[0, 1]`` from a verifier response.
+
+        Tries to match a ``<reward>X</reward>`` tag first, falling back
+        to the last number in ``text``.  Values outside ``[0, 10]`` are
+        clipped before normalization.
+
+        Args:
+            text: Raw verifier response.
+
+        Returns:
+            A float reward in ``[0, 1]``, or ``0.0`` when no number is
+            found.
+        """
         import re
 
         tag_match = re.search(r"<reward>\s*(\d+(?:\.\d+)?)\s*</reward>", text)
@@ -393,6 +479,21 @@ class OpenAIQuestionGenerator(QuestionGenerator):
         max_tokens: int = 1024,
         timeout: float = 30.0,
     ):
+        """Cache OpenAI-compatible endpoint configuration.
+
+        Args:
+            base_url: API base URL (without the trailing slash).
+            api_key: Bearer token for authentication.
+            model: Model name passed in the ``model`` field of each
+                request.
+            questioner_system_prompt: System prompt for question
+                generation.
+            verifier_system_prompt: System prompt for verification.
+                ``None`` reuses the questioner prompt.
+            temperature: Sampling temperature for both phases.
+            max_tokens: Per-request ``max_tokens``.
+            timeout: HTTP timeout in seconds.
+        """
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
@@ -403,6 +504,16 @@ class OpenAIQuestionGenerator(QuestionGenerator):
         self._timeout = timeout
 
     def generate(self, topic: str, seed: int | None = None) -> GeneratedQuestion:
+        """Generate a single question via the configured OpenAI-compatible endpoint.
+
+        Args:
+            topic: Topic prompt.
+            seed: Optional seed used to deterministically diversify the
+                generated question.
+
+        Returns:
+            The :class:`GeneratedQuestion` with metadata.
+        """
         variety = _deterministic_variety(seed)
         user_msg = (
             f"Topic: {topic}\n"
@@ -422,6 +533,17 @@ class OpenAIQuestionGenerator(QuestionGenerator):
         answer: str,
         metadata: dict[str, tp.Any] | None = None,
     ) -> float:
+        """Grade ``answer`` for ``question`` via the configured endpoint.
+
+        Args:
+            question: The question that was asked.
+            answer: The student's answer.
+            metadata: Optional metadata associated with the question.
+
+        Returns:
+            A reward value in ``[0, 1]`` parsed via
+            :meth:`LocalQuestionGenerator._parse_score`.
+        """
         sys_prompt = self._verifier_prompt or self._questioner_prompt
         user_msg = (
             f"Question: {question}\n\n"
@@ -433,6 +555,16 @@ class OpenAIQuestionGenerator(QuestionGenerator):
         return LocalQuestionGenerator._parse_score(response)
 
     def _chat(self, system: str, user: str) -> str:
+        """Issue a single chat-completions request and return the response text.
+
+        Args:
+            system: System message content.
+            user: User message content.
+
+        Returns:
+            The first choice's message content, or a string describing
+            the exception when the call fails.
+        """
         import json
         import urllib.request
 
@@ -479,10 +611,26 @@ class CallableQuestionGenerator(QuestionGenerator):
         generate_fn: tp.Callable[[str, int | None], str],
         verify_fn: tp.Callable[[str, str, dict[str, tp.Any] | None], float] | None = None,
     ):
+        """Cache the wrapped generation/verification callables.
+
+        Args:
+            generate_fn: ``(topic, seed) -> question`` callable.
+            verify_fn: Optional ``(question, answer, metadata) -> reward``
+                callable; ``None`` means verification always returns 0.
+        """
         self._gen_fn = generate_fn
         self._ver_fn = verify_fn
 
     def generate(self, topic: str, seed: int | None = None) -> GeneratedQuestion:
+        """Delegate to the wrapped ``generate_fn``.
+
+        Args:
+            topic: Topic prompt.
+            seed: Optional integer seed.
+
+        Returns:
+            A :class:`GeneratedQuestion` wrapping the produced text.
+        """
         return GeneratedQuestion(question=self._gen_fn(topic, seed))
 
     def verify(
@@ -491,6 +639,17 @@ class CallableQuestionGenerator(QuestionGenerator):
         answer: str,
         metadata: dict[str, tp.Any] | None = None,
     ) -> float:
+        """Delegate verification to the wrapped ``verify_fn`` when available.
+
+        Args:
+            question: The question that was asked.
+            answer: The student's answer.
+            metadata: Optional metadata associated with the question.
+
+        Returns:
+            The verifier's reward, or ``0.0`` when no verifier was
+            configured.
+        """
         if self._ver_fn is not None:
             return self._ver_fn(question, answer, metadata)
         return 0.0
@@ -533,6 +692,20 @@ class SelfPlayEnvironment(AgenticEnvironment):
         answer_pattern: str | None = None,
         max_steps_override: int | None = None,
     ):
+        """Cache the topic, question generator, and termination policy.
+
+        Args:
+            topic: Topic prompt forwarded to the question generator.
+            generator: Backend used to produce questions and verify
+                answers.
+            verify: Whether to run the verifier at the end of an
+                episode.  When ``False`` the environment never
+                terminates on its own and always returns reward 0.
+            answer_pattern: Optional regex; episodes terminate as soon
+                as a turn's answer matches this pattern.
+            max_steps_override: Optional cap on the number of solver
+                turns; defaults to 5 when ``None``.
+        """
         self._topic = topic
         self._generator = generator
         self._verify = verify
@@ -580,6 +753,21 @@ class SelfPlayEnvironment(AgenticEnvironment):
         )
 
     def step(self, action: str) -> StepResult:
+        """Advance the episode by one solver turn.
+
+        The episode terminates when ``answer_pattern`` matches the
+        action or when ``max_steps_override`` is reached.  When
+        ``self._defer_verify`` is set the reward is left as ``NaN`` to
+        be filled in by a batched verifier later; otherwise the
+        verifier is invoked inline.
+
+        Args:
+            action: The solver's response for this turn.
+
+        Returns:
+            A :class:`StepResult` carrying the next observation,
+            reward, terminated flag, and metadata.
+        """
         self._solver_turns.append(action)
         self._step_count += 1
 
@@ -623,11 +811,30 @@ class SelfPlayEnvironment(AgenticEnvironment):
         self._generator.set_generate_fn(generate_fn)
 
     def _do_verify(self, answer: str) -> float:
+        """Run the verifier on ``answer`` if verification is enabled.
+
+        Args:
+            answer: The candidate final answer.
+
+        Returns:
+            The verifier's reward, or ``0.0`` when verification is
+            disabled.
+        """
         if not self._verify:
             return 0.0
         return self._generator.verify(self._question, answer, self._metadata)
 
     def _make_info(self, reward: float, answer: str) -> dict[str, tp.Any]:
+        """Build the ``info`` dict returned alongside terminal step results.
+
+        Args:
+            reward: Terminal reward produced by the verifier.
+            answer: The (possibly aggregated) final answer.
+
+        Returns:
+            A dict including the question, answer, reward, topic, turn
+            count, and per-turn history.
+        """
         return {
             "question": self._question,
             "answer": answer,
@@ -640,4 +847,5 @@ class SelfPlayEnvironment(AgenticEnvironment):
 
     @property
     def max_steps(self) -> int:
+        """Return the configured per-episode step cap."""
         return self._max_steps_override

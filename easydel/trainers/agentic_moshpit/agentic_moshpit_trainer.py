@@ -94,18 +94,34 @@ class _InfiniteRolloutDataset:
     """
 
     def __init__(self, batch_size: int):
+        """Configure the dummy dataset to produce ``batch_size``-sized batches.
+
+        Args:
+            batch_size: Per-step batch size used to compute a synthetic
+                length so the trainer treats one "epoch" as 10 000 steps.
+        """
         self._batch_size = batch_size
         self._row = {"prompt": [{"role": "user", "content": ""}], "input_ids": [0], "attention_mask": [0]}
         self._len = batch_size * 10_000
 
     def __iter__(self):
+        """Yield the same empty prompt forever."""
         while True:
             yield self._row
 
     def __len__(self):
+        """Return the synthetic dataset length."""
         return self._len
 
     def __getitem__(self, key):
+        """Return the empty prompt regardless of the requested index/slice.
+
+        Args:
+            key: Integer index or slice; both return the same canned row.
+
+        Returns:
+            The empty prompt row, or a list of identical rows for a slice.
+        """
         if isinstance(key, int):
             return self._row
         if isinstance(key, slice):
@@ -115,10 +131,12 @@ class _InfiniteRolloutDataset:
 
     @property
     def column_names(self) -> list[str]:
+        """Return the column names exposed by the dummy row."""
         return list(self._row.keys())
 
     @property
     def num_rows(self) -> int:
+        """Return the synthetic row count."""
         return self._len
 
 
@@ -195,6 +213,34 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         reward_processing_classes: ProcessingClassType | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
+        """Initialize the multi-turn agentic trainer.
+
+        Wires up the reasoning stripper, tool registry, environment
+        factory, rollout manager, and the underlying GRPO trainer.
+
+        Args:
+            arguments: Algorithm configuration (must be
+                :class:`AgenticMoshPitConfig`).
+            model: Model module or state used as the policy.
+            env_factory: Zero-argument callable that returns a fresh
+                :class:`AgenticEnvironment` per episode.
+            reward_funcs: Optional auxiliary reward callables/strings
+                applied on top of environment rewards.  Defaults to a
+                placeholder so GRPO sees a non-empty list.
+            tools: Optional pre-instantiated tool list to expose to the
+                policy.
+            train_dataset: Optional training dataset; defaults to an
+                infinite synthetic dataset when no prompts are required.
+            eval_dataset: Optional evaluation dataset.
+            processing_class: Tokenizer or processor.
+            reward_processing_classes: Optional tokenizer(s) for reward
+                models.
+            data_tokenize_fn: Optional custom tokenization callable.
+
+        Raises:
+            TypeError: If ``arguments`` is not an
+                :class:`AgenticMoshPitConfig`.
+        """
         if not isinstance(arguments, AgenticMoshPitConfig):
             raise TypeError(f"arguments must be AgenticMoshPitConfig, got {type(arguments)}")
 
@@ -287,6 +333,24 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             num_return_sequences: int | None = None,
             strip_thinking: bool = False,
         ) -> list[str]:
+            """Generate visible action text for a batch of prompts.
+
+            Args:
+                prompts: List of prompt strings (already chat-templated).
+                temperature: Optional sampling temperature override.
+                top_p: Optional nucleus sampling threshold override.
+                top_k: Optional top-k sampling override.
+                num_return_sequences: Optional number of completions per
+                    prompt.
+                strip_thinking: If ``True``, the configured reasoning
+                    stripper is applied to each completion before return.
+
+            Returns:
+                A list of visible action strings, one per generation. The
+                wrapper also stashes raw text / reasoning / tool-call
+                metadata on ``generate_fn.last_generation_metadata`` for
+                downstream rollout bookkeeping.
+            """
             overrides: dict[str, tp.Any] = {}
             if temperature is not None:
                 overrides["temperature"] = temperature
@@ -336,12 +400,38 @@ class AgenticMoshPitTrainer(GRPOTrainer):
 
     @staticmethod
     def _is_env_reward_placeholder(reward_func: tp.Any) -> bool:
+        """Return ``True`` when ``reward_func`` is the env-reward placeholder.
+
+        Args:
+            reward_func: A reward callable or state object.
+
+        Returns:
+            ``True`` when the function is the placeholder injected for
+            environments that score themselves.
+        """
         return getattr(reward_func, "__name__", None) == "_env_reward_placeholder"
 
     def _score_auxiliary_rewards(
         self,
         trajectories: list,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Run any non-placeholder auxiliary reward functions over rollouts.
+
+        Builds the chat-templated prompts and assistant completions for
+        each trajectory's final response turn, then dispatches to either
+        a reward-model :class:`EasyDeLState` or a plain Python callable.
+
+        Args:
+            trajectories: Rollout trajectories produced by the rollout
+                manager.
+
+        Returns:
+            ``(total_rewards, breakdown)`` where ``total_rewards`` is a
+            ``[len(trajectories)]`` float32 vector summing every
+            auxiliary reward weighted by ``reward_weights`` and
+            ``breakdown`` maps reward-name to its raw per-trajectory
+            scores.
+        """
         active_reward_indices = [
             idx for idx, reward_func in enumerate(self.reward_funcs) if not self._is_env_reward_placeholder(reward_func)
         ]
@@ -466,6 +556,20 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         self,
         trajectories: list,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Add auxiliary rewards back into trajectory step rewards.
+
+        Computes auxiliary rewards via :meth:`_score_auxiliary_rewards`
+        and folds them into each trajectory based on the configured
+        ``advantage_estimator``.  Trajectories without reward changes are
+        returned unchanged.
+
+        Args:
+            trajectories: Rollout trajectories to mutate in-place.
+
+        Returns:
+            ``(aux_rewards, breakdown)`` from the underlying scorer for
+            downstream logging.
+        """
         aux_rewards, reward_breakdown = self._score_auxiliary_rewards(trajectories)
         if not trajectories or not np.any(np.nan_to_num(aux_rewards)):
             return aux_rewards, reward_breakdown
@@ -528,6 +632,15 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                 try:
 
                     def wrapped_env_factory():
+                        """Create an environment instance with tools and self-play hooks attached.
+
+                        Returns:
+                            A fresh :class:`AgenticEnvironment` wrapped in
+                            :class:`ToolEnvWrapper` when tools are
+                            registered, with the local generation
+                            function and reasoning stripper installed on
+                            self-play question generators.
+                        """
                         env = self.env_factory()
                         if isinstance(env, SelfPlayEnvironment):
                             env.set_generate_fn(generate_fn)

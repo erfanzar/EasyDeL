@@ -143,6 +143,20 @@ class RLVRConfig(GRPOConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Normalize RLVR-specific knobs after parent post-init runs.
+
+        - Forwards both inputs to the GRPO ``__post_init__``.
+        - Coerces ``length_penalty_target`` and ``reward_clip_range`` to
+          ``None`` when they hold a non-positive sentinel value.
+        - Forces ``mask_truncated_completions`` on whenever
+          ``max_len_mask`` is requested.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias for
+                ``max_length``; forwarded to the parent class.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the parent class.
+        """
         super().__post_init__(
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,

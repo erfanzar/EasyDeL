@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of EXAONE 4.0.
+
+EXAONE 4.0 keeps the EXAONE recipe (RMSNorm, RoPE, GQA, gated SiLU MLPs) and
+adds an interleaved sliding/full attention pattern: every Nth layer
+(``sliding_window_pattern``) uses full attention, the rest use a fixed-size
+sliding window driven by ``sliding_window``. Per-layer attention type is
+read from ``config.layer_types``.
+
+Building blocks:
+
+- :class:`Exaone4MLP` — gated SiLU FFN.
+- :class:`Exaone4Attention` — :class:`UnifiedAttention` subclass that toggles
+  sliding-window attention based on the layer's type.
+- :class:`Exaone4DecoderLayer` — single decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`Exaone4Model` — base decoder.
+- :class:`Exaone4ForCausalLM` — causal LM head.
+- :class:`Exaone4ForSequenceClassification` — pooled classifier head.
+"""
 
 import functools
 

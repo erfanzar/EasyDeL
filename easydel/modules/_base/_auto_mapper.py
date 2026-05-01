@@ -672,6 +672,16 @@ def create_embedding_class(
     class_name = f"{model_name}ForEmbedding"
 
     def __init__(self, config, dtype=None, param_dtype=None, precision=None, *, rngs, **kwargs):
+        """Initialize the dynamically created ForEmbedding model.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype: Parameter dtype. Defaults to jnp.bfloat16.
+            precision: JAX precision setting.
+            rngs: spectrax random number generators.
+            **kwargs: Additional kwargs merged with default_feature_kwargs.
+        """
         merged_kwargs = {**default_feature_kwargs, **kwargs}
         import jax.numpy as _jnp
 

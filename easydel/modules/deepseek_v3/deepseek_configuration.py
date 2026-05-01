@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for DeepSeek-V3.
+
+DeepSeek-V3 builds on DeepSeek-V2 with: a much larger MoE (256 routed + 1
+shared expert by default with top-8 routing), the auxiliary-free top-k
+selection method (``topk_method="noaux_tc"``) using sigmoid scoring,
+multi-token prediction (``num_nextn_predict_layers``), and YaRN-style RoPE
+scaling for extended context. This module exposes :class:`DeepseekV3Config`,
+which captures all of those knobs alongside the Multi-head Latent Attention
+hyperparameters inherited from V2.
+"""
 
 import typing
 
@@ -129,9 +139,20 @@ class DeepseekV3Config(EasyDeLBaseConfig):
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __setattr__(self, key, value):
-        # DeepSeek HF remote code expects `rope_scaling=None` for default RoPE.
-        # Newer config normalization can materialize {"type":"default", ...},
-        # which triggers legacy branches that require `factor`.
+        """Normalize ``rope_scaling`` assignments before storing them.
+
+        DeepSeek's HF remote code expects ``rope_scaling=None`` for default
+        RoPE. Newer normalization can produce ``{"type": "default", ...}``
+        dicts that trigger legacy YaRN branches requiring a ``factor`` key.
+        This override coerces such "default" specs back to ``None``; all
+        other attributes pass through unchanged.
+
+        Args:
+            key (str): Attribute name being assigned.
+            value (Any): Proposed value. ``rope_scaling`` dicts whose
+                ``rope_type`` (or legacy ``type``) is ``None`` or ``"default"``
+                are rewritten to ``None``.
+        """
         if key == "rope_scaling" and isinstance(value, dict):
             rope_type = value.get("rope_type", value.get("type"))
             if rope_type in (None, "default"):
@@ -290,7 +311,19 @@ class DeepseekV3Config(EasyDeLBaseConfig):
                 object.__setattr__(self, "rope_scaling", None)
 
     def _get_rope_config(self) -> RopeConfig:
-        """Get RoPE configuration from the instance attributes."""
+        """Build the RoPE configuration for DeepSeek-V3.
+
+        When ``rope_scaling`` is unset or ``None``, returns a YaRN config
+        seeded with DeepSeek-V3's defaults (``base=10000``,
+        ``scaling_factor=1.0``, ``original_max_position_embeddings=4096``,
+        ``beta_fast=32``, ``beta_slow=1``, ``mscale=1``, ``mscale_all_dim=0``).
+        Otherwise builds a :class:`RopeConfig` from ``self.rope_scaling`` and
+        back-fills ``original_max_position_embeddings`` from the legacy
+        attribute when absent.
+
+        Returns:
+            RopeConfig: Resolved RoPE configuration.
+        """
         if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
             config = RopeConfig.from_dict(
                 dict(

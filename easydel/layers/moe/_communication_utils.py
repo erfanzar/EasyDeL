@@ -1135,6 +1135,19 @@ class MoeMetrics:
 
 
 def _coerce_axis_manager(manager: object | None) -> RuntimeShardingResolver | object:
+    """Coerce arbitrary input into a runtime sharding resolver-like object.
+
+    Accepts a :class:`RuntimeShardingResolver`, an EFormer-style legacy axis
+    manager (must expose both ``paxis`` and ``resolve``), or anything else that
+    :func:`coerce_runtime_sharding_resolver` knows how to convert.
+
+    Args:
+        manager: Object to coerce. ``None`` produces the default resolver.
+
+    Returns:
+        A :class:`RuntimeShardingResolver` or a legacy axis manager that is
+        guaranteed to expose ``paxis`` and ``resolve``.
+    """
     if isinstance(manager, RuntimeShardingResolver):
         return manager
     if manager is None:

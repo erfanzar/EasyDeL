@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Paged (ragged) KV cache.
+
+Re-exports the configuration, per-layer view, multi-layer container and
+runtime metadata for EasyDeL's ragged page attention cache. The cache
+layout is shared with Pallas/JAX kernels in the ``ejkernel`` backend.
+"""
+
 from .cache import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
 
 __all__ = ("RaggedPagesCache", "RaggedPagesCacheConfig", "RaggedPagesCacheView", "RaggedPagesMetadata")

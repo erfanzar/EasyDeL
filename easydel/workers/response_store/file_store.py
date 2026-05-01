@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""On-disk store for the OpenAI Responses API state.
+
+Provides :class:`FileResponseStore`, an LRU-bounded directory-backed store
+that persists ``response_id`` records and ``conversation_id`` histories used
+by the Responses API across worker processes. Records are JSON-serialized
+and optionally zlib-compressed; the index is rewritten atomically on every
+mutation so the store can be reopened safely after a crash.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -30,6 +39,14 @@ logger = get_logger("ResponseStore")
 
 @dataclass
 class _Entry:
+    """Index entry tracking a single record on disk.
+
+    Attributes:
+        file: Filename inside the responses/conversations subdirectory.
+        created_at: Original creation timestamp (Unix epoch seconds).
+        touched_at: Last access timestamp; used by the LRU eviction policy.
+    """
+
     file: str
     created_at: float
     touched_at: float
@@ -89,12 +106,29 @@ class FileResponseStore:
         logger.info(f"Response store initialized at: {self.storage_dir}")
 
     def _encode(self, obj: tp.Any) -> bytes:
+        """JSON-serialize ``obj`` and optionally zlib-compress it.
+
+        Args:
+            obj: Any JSON-serializable Python object.
+
+        Returns:
+            bytes: UTF-8 encoded JSON payload, compressed when
+            ``compression_level > 0``.
+        """
         data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if self._compression_level <= 0:
             return data
         return zlib.compress(data, level=self._compression_level)
 
     def _decode(self, blob: bytes) -> tp.Any:
+        """Inverse of :meth:`_encode`; tolerates uncompressed legacy blobs.
+
+        Args:
+            blob: The raw bytes read from disk.
+
+        Returns:
+            Any: The decoded Python object.
+        """
         try:
             data = zlib.decompress(blob)
         except zlib.error:
@@ -102,6 +136,15 @@ class FileResponseStore:
         return json.loads(data.decode("utf-8"))
 
     def _atomic_write(self, path: Path, data: bytes) -> None:
+        """Write ``data`` to ``path`` via a temp file and rename.
+
+        Keeps the previous version under ``<path>.bak`` so a partial failure
+        does not corrupt the store.
+
+        Args:
+            path: Destination path.
+            data: Bytes to write.
+        """
         temp_path = path.with_suffix(path.suffix + ".tmp")
         backup_path = path.with_suffix(path.suffix + ".bak")
 
@@ -115,10 +158,23 @@ class FileResponseStore:
         temp_path.rename(path)
 
     def _conversation_file_name(self, conversation_id: str) -> str:
+        """Hash a conversation id into a filesystem-safe filename.
+
+        Args:
+            conversation_id: Arbitrary, possibly path-unsafe identifier.
+
+        Returns:
+            str: ``"<sha256(conversation_id)>.bin"``.
+        """
         digest = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()
         return f"{digest}.bin"
 
     def _load_index(self) -> None:
+        """Populate the in-memory index from ``index.json`` (or its backup).
+
+        Drops entries whose backing file has gone missing, then sorts each
+        store by ``touched_at`` so the LRU ordering is preserved.
+        """
         if not self.index_file.exists():
             self._dirty = True
             self._flush_index()
@@ -137,6 +193,16 @@ class FileResponseStore:
         conversations = tp.cast(dict[str, tp.Any], raw.get("conversations") or {})
 
         def _load_entries(items: dict[str, tp.Any], base_dir: Path) -> list[tuple[str, _Entry]]:
+            """Convert the on-disk index dict into ``(key, _Entry)`` tuples.
+
+            Args:
+                items: Raw mapping from id -> {file, created_at, touched_at}.
+                base_dir: Directory whose ``file`` entries should exist.
+
+            Returns:
+                list[tuple[str, _Entry]]: Surviving entries sorted by
+                ``touched_at``. Missing or malformed records are skipped.
+            """
             loaded: list[tuple[str, _Entry]] = []
             for key, meta in items.items():
                 if not isinstance(meta, dict):
@@ -167,6 +233,11 @@ class FileResponseStore:
         )
 
     def _flush_index(self) -> None:
+        """Persist the in-memory index to ``index.json`` if dirty.
+
+        Atomic so a crash mid-write cannot leave an empty index file. No-op
+        when nothing has changed and the index already exists.
+        """
         if not self._dirty and self.index_file.exists():
             return
 
@@ -193,6 +264,13 @@ class FileResponseStore:
         self._dirty = False
 
     def _touch(self, store: OrderedDict[str, _Entry], key: str) -> None:
+        """Mark an entry as recently used by updating ``touched_at`` and reordering.
+
+        Args:
+            store: The ``OrderedDict`` (responses or conversations) to
+                update.
+            key: The entry id. No-op when missing.
+        """
         entry = store.get(key)
         if entry is None:
             return
@@ -201,6 +279,12 @@ class FileResponseStore:
         self._dirty = True
 
     def _evict(self) -> None:
+        """Drop oldest entries until the per-store size limits are met.
+
+        Honours the ``max_stored_responses`` and ``max_stored_conversations``
+        constructor arguments. ``0`` for either disables that store and
+        causes all of its records to be removed eagerly.
+        """
         if self._max_stored_responses == 0:
             for entry in self._responses.values():
                 try:

@@ -62,14 +62,25 @@ class OperationExecutor:
 
     @property
     def prefill_operation(self) -> BaseOperation | None:
-        """Get the operation for prefill mode."""
+        """Resolve the operation that should service prefill requests.
+
+        Returns:
+            BaseOperation | None: ``prefill_impl`` if set, otherwise
+            ``mixin_impl``. ``None`` when neither is provided.
+        """
         if self.prefill_impl is not None:
             return self.prefill_impl
         return self.mixin_impl
 
     @property
     def decode_operation(self) -> BaseOperation | None:
-        """Get the operation for decode mode."""
+        """Resolve the operation that should service decode requests.
+
+        Returns:
+            BaseOperation | None: ``decode_impl`` if set; otherwise falls back
+            to ``prefill_impl`` and finally ``mixin_impl``. ``None`` when no
+            operation is available.
+        """
         if self.decode_impl is not None:
             return self.decode_impl
         if self.prefill_impl is not None:
@@ -154,20 +165,37 @@ class OperationExecutor:
 
     @property
     def requires_cache(self) -> bool:
-        """Whether any operation requires cache."""
+        """Whether the underlying operations need a KV cache.
+
+        Returns:
+            bool: ``True`` when the combined prefill/decode requirements ask
+            for a cache (typical for autoregressive decoding); ``False`` for
+            cacheless operators such as some vision encoders.
+        """
         reqs = self.get_combined_requirements()
         return reqs.cache.requires_cache
 
     @property
     def has_separate_decode(self) -> bool:
-        """Whether decode uses a different operation than prefill."""
+        """Whether decode is dispatched to a distinct operation from prefill.
+
+        Returns:
+            bool: ``True`` only when both ``prefill_impl`` and ``decode_impl``
+            are set and refer to different objects (e.g. flash for prefill,
+            ragged-page for decode).
+        """
         return (
             self.decode_impl is not None and self.prefill_impl is not None and self.decode_impl is not self.prefill_impl
         )
 
     @property
     def is_valid(self) -> bool:
-        """Whether at least one operation is available."""
+        """Whether at least one backing operation is configured.
+
+        Returns:
+            bool: ``True`` if any of ``prefill_impl``, ``decode_impl``, or
+            ``mixin_impl`` is non-``None``.
+        """
         return self.prefill_impl is not None or self.decode_impl is not None or self.mixin_impl is not None
 
     def get_operation_name(self, mode: ExecutionMode = ExecutionMode.MIXED) -> str | None:

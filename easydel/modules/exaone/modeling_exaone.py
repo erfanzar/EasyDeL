@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the EXAONE decoder-only LLM.
+
+EXAONE is LG AI Research's GPT-style decoder targeting strong Korean and
+English performance. Architecture: RMSNorm, RoPE, optional grouped-query
+attention, gated SiLU MLPs, and standard pre-norm transformer blocks.
+
+Building blocks:
+
+- :class:`ExaoneGatedMLP` — gated SwiGLU FFN.
+- :class:`ExaoneAttentionInner` — :class:`UnifiedAttention` subclass with
+  EXAONE's projection naming.
+- :class:`ExaoneAttention` — wrapper that exposes the inner attention as the
+  block's attention module.
+- :class:`ExaoneDecoderLayer` — single decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`ExaoneModel` — base decoder.
+- :class:`ExaoneForCausalLM` — causal LM head.
+- :class:`ExaoneForSequenceClassification` — pooled classifier head.
+"""
 
 import functools
 from typing import ClassVar
@@ -50,10 +71,14 @@ logger = get_logger(__name__)
 
 
 class ExaoneGatedMLP(spx.Module):
-    """Gated Multi-Layer Perceptron module for Exaone models.
+    """SwiGLU-style gated FFN used by EXAONE decoder layers.
 
-    Implements the gated feedforward network with configurable activation function
-    for enhanced representation learning in Exaone architecture.
+    Computes ``c_proj(act(c_fc_0(x)) * c_fc_1(x))`` — same algebra as
+    SwiGLU but with EXAONE's HF naming (``c_fc_0`` = gate, ``c_fc_1`` = up,
+    ``c_proj`` = down). Activation is selected by
+    ``config.activation_function``. ``c_fc_*`` are unbiased
+    :class:`ColumnParallelLinear` (output sharded across TP) and
+    ``c_proj`` is :class:`RowParallelLinear`.
     """
 
     def __init__(
@@ -130,10 +155,14 @@ class ExaoneGatedMLP(spx.Module):
 
 
 class ExaoneAttentionInner(UnifiedAttention):
-    """Multi-head attention layer with partial RoPE embeddings for Exaone models.
+    """Causal MHA with partial RoPE for EXAONE.
 
-    This attention implementation supports partial rotary position embeddings,
-    which applies RoPE to only a portion of the head dimensions.
+    Standard pre-norm causal multi-head attention, but RoPE rotation is
+    applied to only the first ``rotary_dim = head_size *
+    partial_rotary_factor`` channels of each head — the remainder is left
+    unrotated. ``partial_rotary_factor`` (1.0 by default) controls the
+    fraction. Output projection uses EXAONE's HF naming (``out_proj``)
+    rather than the more common ``o_proj``.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -205,10 +234,15 @@ class ExaoneAttentionInner(UnifiedAttention):
 
 
 class ExaoneAttention(spx.Module):
-    """Wrapper around ExaoneAttentionInner for Exaone decoder layers.
+    """Outer attention block matching EXAONE's HF parameter layout.
 
-    This module wraps the inner attention mechanism to provide a consistent
-    interface for integration with decoder layers.
+    EXAONE checkpoints nest attention parameters one level deeper than the
+    standard :class:`UnifiedAttention` layout (``layer.attention.attention.q_proj``
+    rather than ``layer.attention.q_proj``). This module is the thin outer
+    wrapper that hosts an :class:`ExaoneAttentionInner` instance under the
+    expected HF attribute name and forwards every call through to it,
+    keeping checkpoint loads / saves byte-identical with the upstream
+    HF release.
     """
 
     def __init__(
@@ -282,10 +316,13 @@ class ExaoneAttention(spx.Module):
 
 
 class ExaoneDecoderLayer(spx.Module):
-    """Single decoder layer for Exaone models.
+    """One EXAONE decoder layer (sequential pre-norm attention + gated MLP).
 
-    Combines multi-head attention with partial RoPE and gated feedforward networks
-    with RMS normalization and residual connections.
+    Standard pre-norm transformer block:
+    ``x = x + attn(ln_1(x))`` then ``x = x + mlp(ln_2(x))``. Attention is
+    :class:`ExaoneAttention` (causal MHA with partial RoPE), MLP is
+    :class:`ExaoneGatedMLP` (SwiGLU). Layer norms use the
+    ``rms_norm_eps`` from the config.
     """
 
     def __init__(
@@ -416,10 +453,14 @@ class ExaoneDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, ExaoneConfig, model_type="exaone")
 class ExaoneModel(EasyDeLBaseModule):
-    """Exaone model implementation.
+    """LG AI EXAONE backbone (registered as ``BASE_MODULE``).
 
-    This implements the Exaone language model architecture, utilizing transformer blocks
-    with RMSNorm, partial rotary position embeddings, and a gated attention mechanism.
+    Stack: token embedding (``wte``) -> ``num_hidden_layers`` :class:`ExaoneDecoderLayer`
+    blocks -> final RMSNorm (``ln_f``). All decoder layers share the same
+    causal-MHA-with-partial-RoPE attention and SwiGLU gated MLP. Decoder
+    layers are wrapped with :func:`auto_remat` so per-layer activation
+    checkpointing follows ``config.gradient_checkpointing``. Returns
+    :class:`BaseModelOutput`.
 
     Attributes:
         config (ExaoneConfig): Configuration for the model.
@@ -665,10 +706,12 @@ class ExaoneModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, ExaoneConfig, model_type="exaone")
 class ExaoneForCausalLM(BaseCausalLMModule[ExaoneModel, ExaoneConfig]):
-    """Exaone model with a language modeling head for causal language modeling tasks.
+    """EXAONE backbone + ``vocab_size`` LM head for autoregressive generation.
 
-    This model is a transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation.
+    Wraps :class:`ExaoneModel` with an unbiased linear LM head producing
+    token logits. EXAONE supports tied embeddings via
+    ``config.tie_word_embeddings``; when enabled, the LM head shares
+    weights with ``wte``.
 
     Attributes:
         config (ExaoneConfig): Configuration for the model.
@@ -713,10 +756,12 @@ class ExaoneForCausalLM(BaseCausalLMModule[ExaoneModel, ExaoneConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ExaoneConfig, model_type="exaone")
 class ExaoneForSequenceClassification(BaseSequenceClassificationModule[ExaoneModel, ExaoneConfig]):
-    """Exaone model for sequence classification tasks.
+    """EXAONE backbone + linear ``score`` head for sequence-level classification.
 
-    This class extends the base Exaone model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Pools the last non-pad token's hidden state from :class:`ExaoneModel`
+    and feeds it through an unbiased ``score`` head with
+    ``num_labels`` outputs. ``config.pad_token_id`` is required for batched
+    inputs.
 
     Attributes:
         config (ExaoneConfig): Configuration for the model.

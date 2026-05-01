@@ -156,26 +156,44 @@ class BlockSparseAttn(OperationImpl):
         cache_metadata: TransformerMetadata | None = None,
         **ignore,
     ) -> AttentionOutput:
-        """
-        Performs Splash Attention on TPU/GPU using the Pallas/Triton kernel.
+        """Performs Splash/Block-Sparse Attention via the Pallas/Triton kernel.
 
-        Handles fallback logic, attention_mask processing, block size configuration, and
-        sharding via `shard_map`. Expects inputs potentially in BTHD format and
-        transposes them to BHTD for the kernel.
+        Handles fallback logic, mask-info processing, block size configuration,
+        and sharding through ``shard_map``. Expects inputs in BTHD layout and
+        internally transposes them to BHTD for the kernel.
 
         Args:
-            query: Query tensor (B, T, Hq, D).
-            key: Key tensor (B, S, Hkv, D).
-            value: Value tensor (B, S, Hkv, Dv).
-            attention_mask: Optional boolean attention_mask (broadcastable to B, 1, T, S).
-                Used to generate segment IDs if provided.
-            causal: If True, applies causal masking via the kernel's attention_mask configuration.
-                If False, falls back to VanillaAttn.
-            **ignore: Ignored keyword arguments.
+            query: Query tensor of shape ``(B, T, Hq, D)``.
+            key: Key tensor of shape ``(B, S, Hkv, D)``.
+            value: Value tensor of shape ``(B, S, Hkv, Dv)``.
+            softmax_aux: Optional attention-sink logits broadcast onto the
+                softmax denominator, of shape ``(num_kv_heads, num_sinks)`` or
+                ``(num_sinks,)``. Reshaped to a flat 1-D vector before the
+                kernel call.
+            mask_info: Optional ``MaskInfo`` describing the attention pattern
+                (e.g. block-sparse mask). Axis names are filled in from the
+                resolved query/key sharding before the kernel runs.
+            logits_soft_cap: Optional logit soft-cap value applied inside the
+                kernel for numerical stability.
+            softmax_scale: Optional scalar multiplier applied to the logits.
+                Defaults to ``head_dim ** -0.5`` when ``None``.
+            sliding_window: Optional sliding-window size. Either an ``int`` for
+                a symmetric window, or a ``(left, right)`` tuple. ``None``
+                disables sliding-window masking.
+            causal: If ``True`` apply causal masking via the kernel; ignored
+                in decode mode and may trigger the vanilla fallback for
+                ill-shaped block sizes.
+            fused_backward: If ``True``, request the kernel's fused-backward
+                code path during training.
+            cache_metadata: Optional transformer-cache metadata; passed
+                through to the vanilla fallback when used.
+            **ignore: Additional keyword arguments are accepted and ignored
+                for forward-compatibility with other operators.
 
         Returns:
-            An `AttentionOutput` object containing the attention outputs. Attention weights
-            are not computed or returned by Splash Attention.
+            AttentionOutput: ``attention_outputs`` of shape
+            ``(B, T, Hq, Dv)`` in BTHD layout. ``attention_weights`` is always
+            ``None`` for this kernel.
         """
 
         def _run_vanilla_fallback() -> AttentionOutput:
@@ -375,72 +393,67 @@ class BlockSparseAttn(OperationImpl):
         return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Not implemented for Splash Attention.
-
-        Splash Attention is TPU-specific and has no GPU implementation.
+        """GPU dispatch path. Delegates to :meth:`forward_native`.
 
         Args:
-            *args: Ignored arguments.
-            **kwargs: Ignored keyword arguments.
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
 
-        Raises:
-            NotImplementedError: Always raised as GPU execution is not supported.
+        Returns:
+            AttentionOutput: The attention result produced by the unified
+            :meth:`forward_native` implementation.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Not implemented for Splash Attention.
-
-        Splash Attention is TPU-specific and has no GPU implementation.
+        """TPU dispatch path. Delegates to :meth:`forward_native`.
 
         Args:
-            *args: Ignored arguments.
-            **kwargs: Ignored keyword arguments.
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
 
-        Raises:
-            NotImplementedError: Always raised as GPU execution is not supported.
+        Returns:
+            AttentionOutput: The attention result produced by the unified
+            :meth:`forward_native` implementation.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Not implemented for Splash Attention.
+        """CPU dispatch path. Delegates to :meth:`forward_native`.
 
-        Splash Attention is TPU-specific and has no GPU implementation.
+        Block-sparse/splash attention is TPU/GPU oriented; on CPU the
+        ``forward_native`` body will typically take the vanilla fallback.
 
         Args:
-            *args: Ignored arguments.
-            **kwargs: Ignored keyword arguments.
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
 
-        Raises:
-            NotImplementedError: Always raised as GPU execution is not supported.
+        Returns:
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Not implemented for Splash Attention.
-
-        Splash Attention is TPU-specific and has no GPU implementation.
+        """CUDA dispatch path. Delegates to :meth:`forward_native`.
 
         Args:
-            *args: Ignored arguments.
-            **kwargs: Ignored keyword arguments.
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
 
-        Raises:
-            NotImplementedError: Always raised as GPU execution is not supported.
+        Returns:
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Not implemented for Splash Attention.
-
-        Splash Attention is TPU-specific and has no GPU implementation.
+        """ROCm dispatch path. Delegates to :meth:`forward_native`.
 
         Args:
-            *args: Ignored arguments.
-            **kwargs: Ignored keyword arguments.
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
 
-        Raises:
-            NotImplementedError: Always raised as GPU execution is not supported.
+        Returns:
+            AttentionOutput: The attention result.
         """
         return self.forward_native(*args, **kwargs)
 
@@ -459,25 +472,35 @@ class BlockSparseAttn(OperationImpl):
         cache_metadata: TransformerMetadata | None = None,
         **ignore,
     ) -> AttentionOutput:
-        """
-        Executes the Splash Attention computation or falls back to Vanilla Attention.
+        """Run Splash/Block-Sparse attention with automatic fallback.
 
-        Calls the appropriate backend-specific forward method (`forward_tpu`) via
-        `super().__call__`. If the backend is not TPU or fallback conditions are met,
-        it relies on the fallback mechanism within `forward_tpu`.
+        Dispatches to the backend-specific forward method via
+        :meth:`OperationImpl.__call__`, which in turn forwards to
+        :meth:`forward_native`. The native implementation contains the
+        fallback logic to ``VanillaAttn`` when the kernel constraints cannot
+        be met.
 
         Args:
-            query: Query tensor.
-            key: Key tensor.
-            value: Value tensor.
-            attention_mask: Optional attention_mask.
-            causal: If True, applies causal masking. Affects fallback logic and
-                kernel configuration.
-            cache_metadata: Cache view for current layer.
-            **ignore: Additional ignored keyword arguments.
+            query: Query tensor of shape ``(B, T, Hq, D)``.
+            key: Key tensor of shape ``(B, S, Hkv, D)``.
+            value: Value tensor of shape ``(B, S, Hkv, Dv)``.
+            softmax_aux: Optional attention-sink logits (see
+                :meth:`forward_native`).
+            mask_info: Optional mask metadata describing the attention
+                pattern.
+            logits_soft_cap: Optional soft-cap for logits.
+            softmax_scale: Optional logit scaling factor.
+            sliding_window: Optional sliding-window size or ``(left, right)``
+                tuple.
+            causal: Whether to apply causal masking.
+            fused_backward: Whether to use the kernel's fused backward path.
+            cache_metadata: Optional transformer-cache metadata for KV-cache
+                inference flows.
+            **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
-            An `AttentionOutput` object containing the attention results.
+            AttentionOutput: Attention results with ``attention_outputs`` of
+            shape ``(B, T, Hq, Dv)``.
         """
         return super().__call__(
             query=query,

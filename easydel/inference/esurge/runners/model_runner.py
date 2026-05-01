@@ -107,6 +107,23 @@ logger = get_logger("eSurge")
 
 @dataclass(frozen=True)
 class RunnerPerfSample:
+    """One snapshot of runner-level performance counters.
+
+    Emitted by :class:`eSurgeRunner` after each completed step.
+
+    Attributes:
+        iteration: Monotonically increasing step counter.
+        total_tokens: Tokens fed to the model this step (prompt + decode).
+        num_scheduled_reqs: Number of requests in the scheduler output.
+        num_new: Newly arrived requests on this step.
+        num_cached: Requests served from prefix cache on this step.
+        num_finished: Requests that completed this step.
+        total_time: Wall-clock seconds spent in the step.
+        agg_tps: Aggregate tokens/second across all sequences.
+        req_tps: Average per-request tokens/second.
+        ema_tps: Exponential moving average of ``agg_tps``.
+    """
+
     iteration: int
     total_tokens: int
     num_scheduled_reqs: int
@@ -120,7 +137,14 @@ class RunnerPerfSample:
 
 
 class _AsyncExecutionHandle:
-    """Deferred host-materialized model output for overlap execution."""
+    """Deferred host-materialized model output for overlap execution.
+
+    Returned by :meth:`eSurgeRunner.execute_model` when overlap execution is
+    enabled. Wraps a partially-materialized :class:`ModelRunnerOutput` plus
+    one :class:`AsyncWindowResult` per runner window. Calling
+    :meth:`get_output` finishes the host copies and returns the fully
+    populated :class:`ModelRunnerOutput`.
+    """
 
     def __init__(
         self,
@@ -128,12 +152,30 @@ class _AsyncExecutionHandle:
         windows: list[AsyncWindowResult],
         finalize: typing.Callable[[list[list[int]]], None] | None = None,
     ) -> None:
+        """Initialize the deferred handle.
+
+        Args:
+            model_runner_output (ModelRunnerOutput): Output skeleton with all
+                host-resolvable fields filled in (sampled tokens are filled
+                later from ``windows``).
+            windows (list[AsyncWindowResult]): Per-window sampled-token tensors
+                whose host copies are already in flight.
+            finalize: Optional callback invoked exactly once with the resolved
+                ``sampled_token_ids`` once the host data is ready.
+        """
         self._model_runner_output = model_runner_output
         self._windows = windows
         self._finalize = finalize
         self._resolved_output: ModelRunnerOutput | None = None
 
     def get_output(self) -> ModelRunnerOutput:
+        """Block on host copies and return the finalized output.
+
+        Returns:
+            ModelRunnerOutput: Output with ``sampled_token_ids`` and
+            ``token_logprobs`` populated. Subsequent calls return the cached
+            result without redoing host transfer.
+        """
         if self._resolved_output is not None:
             return self._resolved_output
 
@@ -492,7 +534,17 @@ class eSurgeRunner:
         return 0
 
     def _clear_window_aware_runtime_cap_metadata(self) -> None:
-        """Reset runtime-cap metadata to the default non-window-aware state."""
+        """Reset the cache-metadata fields that the window-aware estimate writes.
+
+        Sentinel-clears the three derived attributes
+        (``window_aware_max_num_seqs``, ``window_aware_pages_per_request``,
+        ``window_aware_max_num_batched_tokens``) on ``self.metadata`` to
+        ``-1`` so downstream consumers (the scheduler's heuristic
+        request-cap path) treat them as absent. Always called before
+        writing fresh values in :meth:`_apply_window_aware_runtime_cap`,
+        and used as the no-op path when window-aware estimation is
+        disabled.
+        """
         for attr_name in (
             "window_aware_max_num_seqs",
             "window_aware_pages_per_request",
@@ -643,19 +695,31 @@ class eSurgeRunner:
 
     @property
     def mesh(self):
-        """Get the JAX sharding mesh from the model.
+        """The model's JAX/Spectrax sharding mesh.
+
+        Surfaced as a property so the runner code can keep referring to
+        ``self.mesh`` even as the underlying model reference is swapped
+        during a hot weight update.
 
         Returns:
-            The JAX mesh used for distributed execution.
+            The :class:`MeshLike` mesh the model was built on; may be a
+            standard JAX mesh or an MPMD ``MpMdMesh`` when pipeline
+            parallelism is active.
         """
         return self.model.mesh
 
     @property
     def _empty_sharding(self):
-        """Get empty sharding for replicated arrays.
+        """Cheap fully-replicated ``NamedSharding`` for scalar-shaped placement.
+
+        Used by the runner whenever a tensor needs to live on the mesh
+        but has no axis to shard along (perf scalars, host-prepared scratch
+        buffers, etc.). Building the sharding fresh per call keeps it cheap
+        and side-effect-free.
 
         Returns:
-            NamedSharding with empty PartitionSpec for fully replicated arrays.
+            ``NamedSharding(self.mesh, PartitionSpec())`` — replicated on
+            every device in the mesh.
         """
         return replicated_named_sharding(self.mesh)
 
@@ -1358,12 +1422,32 @@ class eSurgeRunner:
         self.executor_manager._sampler_executor.model = None
 
     def destroy_kv_cache(self) -> None:
-        """Destroy the current ragged KV cache to release memory."""
+        """Drop the executor-manager's KV-pages reference to free HBM.
+
+        Called from :meth:`eSurge.pause` when ``destroy_pages_on_pause``
+        is enabled. Does not zero the underlying device buffers — Python
+        garbage collection of the cache object releases the HBM as soon
+        as no other reference remains. Counterpart of
+        :meth:`initialize_kv_cache`, which reallocates a fresh cache on
+        resume.
+        """
         logger.info("Destroying eSurgeRunner ragged KV cache pages")
         self.executor_manager.kv_pages = None
 
     def initialize_kv_cache(self) -> None:
-        """Reinitialize the ragged KV cache if it has been destroyed."""
+        """Allocate the operations cache when the executor manager has none.
+
+        Idempotent: when ``executor_manager.kv_pages`` is already set,
+        returns immediately so resuming an already-running engine doesn't
+        leak a second allocation. Otherwise builds the right
+        ``Quantizer`` (TurboQuant gets a no-config quantizer; everything
+        else gets the model's standard kv-quant config) and delegates to
+        the bounded-retry path
+        :meth:`ExecutionManager._init_operations_cache_with_retry`, which
+        will shrink the page pool on PP HBM-OOM. Called by both
+        :meth:`eSurge.initiate` (fresh start) and :meth:`eSurge.resume`
+        (after a pause that destroyed pages).
+        """
 
         if self.executor_manager.kv_pages is not None:
             logger.debug("KV cache already initialized; skipping reallocation")
@@ -2657,11 +2741,19 @@ class eSurgeRunner:
         return self._execute_model_impl(scheduler_output, return_async_output=True)
 
     def initialize_async_executor(self) -> None:
-        """Retained for API compatibility.
+        """Retire any legacy background executor and confirm same-thread overlap.
 
-        Older overlap code used a background ThreadPoolExecutor here. TPU/JAX
-        proved unreliable when the compiled step ran on a different Python
-        thread, so overlap now uses same-thread async handles instead.
+        Historical context: an earlier version of the overlap path moved
+        compiled-step dispatch to a :class:`ThreadPoolExecutor` so the
+        scheduler thread could prepare the next batch while the current
+        one was in flight. TPU/JAX dispatch turned out to be unreliable
+        across threads (different XLA-runtime contexts), so the design
+        was changed to keep dispatch on the scheduler thread and use
+        host-async copies (:meth:`execute_model_async`) for the overlap.
+        This method is retained for API compatibility: if a stale
+        executor is still attached (older callers), it is shut down
+        cleanly; otherwise it is a no-op that just records the chosen
+        overlap strategy.
         """
         if self._executor is not None:
             logger.debug("Shutting down legacy async executor")
@@ -2670,10 +2762,22 @@ class eSurgeRunner:
         logger.debug("Using same-thread async execution handles for overlap")
 
     def reset_state(self) -> None:
-        """Clear sequence state and request bookkeeping.
+        """Forget every in-flight request and drop pending async results.
 
-        Useful when pausing or resetting the runner to ensure no stale pages
-        or request metadata linger between sessions.
+        Wipes the runner's three state containers:
+
+        * ``self.requests`` — the dict of :class:`CachedRequestState` that
+          tracks per-request prompt tokens, vision data, and sample state.
+        * ``self.sequence_buffer`` — the per-row scheduler view (token ids,
+          positions, sampling params) backing the model step.
+        * ``self._pre_async_results`` — any deferred sampled-token payload
+          from the previous overlap window.
+
+        Required precondition (callers should enforce): no requests are
+        currently in flight, otherwise their device-side rows will become
+        unreachable. The method itself does not check, so the engine
+        :meth:`update_model_weights` / :meth:`pause` paths gate the call
+        on ``num_running_requests + num_pending_requests == 0``.
         """
         self.requests.clear()
         self.sequence_buffer.clear()
@@ -2697,7 +2801,14 @@ class eSurgeRunner:
         return future.result()
 
     def shutdown(self) -> None:
-        """Cleanup resources including async executor if present."""
+        """Tear down legacy thread executor and forward to executor manager.
+
+        Engine-teardown path: drains any leftover background executor
+        retained for backward compat, then defers to
+        :meth:`ExecutionManager.shutdown` so resident PP-stage worker
+        threads inside :class:`ModelStepExecutor` are joined. Safe to
+        invoke when the runner has already been shut down.
+        """
         if self._executor is not None:
             logger.debug("Shutting down async executor")
             self._executor.shutdown(wait=True)

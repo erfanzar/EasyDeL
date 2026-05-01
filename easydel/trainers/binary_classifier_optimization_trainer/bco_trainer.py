@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Binary Classifier Optimization (BCO) trainer.
+
+BCO -- introduced as an extension of KTO -- aligns language models from
+unpaired desirable / undesirable completions by minimising a logistic
+loss against a reference policy.  It optionally uses User-Driven Modeling
+(UDM) embeddings to estimate density ratios and reweight examples,
+helping when the desirable and undesirable distributions are severely
+imbalanced.
+"""
 
 from __future__ import annotations
 
@@ -46,22 +55,37 @@ logger = get_logger(__name__)
 
 @Registry.register("trainer", "bco")
 class BCOTrainer(Trainer):
-    """Binary Classifier Optimization (BCO) trainer.
+    """Trainer for Binary Classifier Optimization (BCO).
 
-    Implements BCO training which aligns language models using binary feedback.
-    Supports Unbiased Data Marginalization (UDM) for handling distribution mismatch
-    between desirable and undesirable examples.
+    Implements the unpaired BCO objective from Jung et al. 2024 (a
+    cousin of KTO): each row carries a single binary ``label``
+    (desirable vs. undesirable) and the loss treats the implicit
+    reward ``r = beta * (logp - logp_ref)`` as the score of an
+    implicit binary classifier whose decision boundary is the running
+    in-batch reward mean ``delta``. The trainer maintains ``delta``
+    across steps via :class:`RunningMoments` and (optionally) trains a
+    UDM (Unbiased Data Marginalization) density-ratio classifier on
+    prompt embeddings to correct for distribution mismatch between
+    the desirable and undesirable streams.
 
-    Args:
-        arguments: BCO-specific training configuration.
-        model: Policy model to train.
-        reference_model: Reference model for computing log probability ratios.
-        processing_class: Tokenizer or processor.
-        train_dataset: Training dataset with prompt, completion, and label.
-        eval_dataset: Optional evaluation dataset.
-        data_collator: Optional custom data collator.
-        embedding_func: Optional embedding function for UDM.
-        embedding_tokenizer: Optional tokenizer for UDM embeddings.
+    See :func:`compute_bco_loss` for the loss form and
+    :func:`training_step` for the per-step pipeline.
+
+    Attributes:
+        arguments: :class:`BCOConfig` controlling losses, lengths, UDM
+            knobs, and the inherited ``TrainingArguments`` surface.
+        processing_class: Tokenizer/processor used for prompt/completion
+            encoding.
+        beta: Cached copy of ``arguments.beta`` used by the loss
+            closure.
+        running: Running mean / variance tracker for the BCO
+            ``delta`` threshold.
+        embedding_func: Optional embedding callable used by UDM to
+            estimate density ratios on prompts.
+        embedding_tokenizer: Optional separate tokenizer for the UDM
+            embedding feed.
+        reference_state: Frozen reference :class:`EasyDeLState`; falls
+            back to a deep copy of the policy when none is provided.
     """
 
     arguments: BCOConfig
@@ -78,6 +102,37 @@ class BCOTrainer(Trainer):
         embedding_func: tp.Callable | None = None,
         embedding_tokenizer: ProcessingClassType | None = None,
     ):
+        """Initialize the BCO trainer.
+
+        Wires up the policy and reference states, copies the policy to a
+        frozen reference when one is not provided, configures padding /
+        encoder-decoder handling, and seeds the running-moments helper
+        used for density-ratio estimation.
+
+        Args:
+            arguments: BCO-specific training configuration.
+            model: Policy model module or state.
+            reference_model: Optional reference model; defaults to a
+                deep copy of ``model`` when omitted.
+            processing_class: Tokenizer/processor used for prompt and
+                completion encoding.
+            train_dataset: Training dataset with ``prompt``,
+                ``completion`` and ``label`` fields.
+            eval_dataset: Optional evaluation dataset.
+            data_collator: Optional custom collator; otherwise the
+                default :class:`BCODataCollatorTFDS` /
+                :class:`BCODataCollatorGrain` is used.
+            embedding_func: Optional callable that maps prompts to
+                fixed-length embeddings used by the UDM density
+                estimator.
+            embedding_tokenizer: Optional separate tokenizer for the
+                UDM embedding feed.
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`BCOConfig`.
+            ValueError: If ``processing_class`` or ``train_dataset`` is
+                missing.
+        """
         if not isinstance(arguments, BCOConfig):
             raise TypeError(f"`arguments` must be a `BCOConfig`, received {type(arguments)}")
         if processing_class is None:
@@ -359,6 +414,16 @@ class BCOTrainer(Trainer):
         )
 
         def forward_fn(model, batch):
+            """Compute the BCO concatenated forward pass for ``batch``.
+
+            Args:
+                model: The current policy or reference model module.
+                batch: The collated BCO batch.
+
+            Returns:
+                A 4-tuple ``(chosen_logps, rejected_logps, chosen_logits,
+                rejected_logits)`` plus optional aux-loss components.
+            """
             return concatenated_forward(
                 model,
                 batch,

@@ -67,26 +67,54 @@ _MATMUL_PRECISION = lax.Precision.HIGHEST
 
 
 def l2norm(x, axis=-1, eps=1e-6):
-    """L2 normalize along specified axis.
+    """Normalize ``x`` to unit L2 norm along ``axis``.
 
-    Uses rsqrt: inv_norm = rsqrt(sum(x^2) + eps); return x * inv_norm
+    Implementation uses ``rsqrt`` for numerical stability:
+    ``inv_norm = rsqrt(sum(x*x, axis=axis) + eps)`` and
+    ``x_normalized = x * inv_norm``. The KDA forward pass invokes this
+    on Q and K to keep the recurrent state norms bounded across long
+    decode loops.
+
+    Args:
+        x: Input tensor; any shape and floating dtype is accepted.
+        axis: Reduction axis. Defaults to the trailing axis.
+        eps: Stability epsilon mixed in before ``rsqrt`` to bound the
+            output magnitude on zero-magnitude rows.
+
+    Returns:
+        jnp.ndarray: Same shape and dtype as ``x``, with elements along
+        ``axis`` summing in squared magnitude to approximately 1.
     """
     inv_norm = lax.rsqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
     return x * inv_norm
 
 
 def fused_kda_gate(gate: Float[Array, "..."], A_log: Float[Array, "num_heads"], dt_bias: Float[Array, "num_heads"]):
-    """Compute KDA decay gate.
+    """Materialise the per-token KDA log-decay from raw f_b / A_log / dt_bias.
 
-    Implements: decay = -exp(A_log) * softplus(gate + dt_bias)
+    Implements the fused expression
+    ``decay = -exp(A_log) * softplus(gate + dt_bias)`` used by the Kimi
+    Linear / KDA recurrence. The negative ``-exp(A_log)`` factor keeps
+    the recurrent state contractive; the softplus ensures the
+    per-token rate is strictly positive even when ``gate + dt_bias``
+    goes negative.
+
+    All arithmetic is performed in float32 and the output keeps that
+    dtype so the downstream ``exp(decay)`` stays numerically stable
+    even for long sequences. Shapes use broadcasting: ``A_log`` and
+    ``dt_bias`` are per-head ``(num_heads,)``, ``gate`` is
+    ``(batch, seq, num_heads)``.
 
     Args:
-        gate: Gate values from f_b_proj [batch, seq, num_heads]
-        A_log: Log decay parameter [num_heads]
-        dt_bias: Time discretization bias [num_heads]
+        gate: Per-token gate from the ``f_b_proj`` head, shape
+            ``(batch, seq, num_heads)``.
+        A_log: Per-head log-decay parameter, shape ``(num_heads,)``.
+        dt_bias: Per-head time-discretisation bias, shape
+            ``(num_heads,)``.
 
     Returns:
-        Decay values [batch, seq, num_heads]
+        Float[Array, "batch seq num_heads"]: The float32 log-decay
+        ready to be exponentiated inside the KDA state update.
     """
     A = -jnp.exp(A_log.astype(jnp.float32))
     gate = gate.astype(jnp.float32)
@@ -132,21 +160,32 @@ def _recurrent_kda_fwd(
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Recurrent forward pass for KDA.
+    """Sequential KDA recurrence over a full sequence (reference path).
 
-    Processes each position sequentially using lax.scan for efficiency.
+    Used as the numerical reference for :func:`_chunk_kda_fwd` (and as a
+    fallback for tiny sequences where chunking adds overhead). Lays the
+    sequence axis as the leading axis of a ``lax.scan`` so each scan
+    iteration applies one step of the same recurrence as
+    :func:`_single_step_kda_core`. All math is done in float32.
 
     Args:
-        query: Query tensor [batch, num_heads, seq_len, head_dim]
-        key: Key tensor [batch, num_heads, seq_len, head_dim]
-        value: Value tensor [batch, num_heads, seq_len, d_state]
-        beta: Gating tensor [batch, num_heads, seq_len]
-        decay: Per-token decay [batch, num_heads, seq_len]
-        initial_state: Optional initial recurrent state
-        use_qk_l2norm: Whether to apply L2 normalization to query and key
+        query: ``(batch, num_heads, seq_len, head_dim)``.
+        key: ``(batch, num_heads, seq_len, head_dim)``.
+        value: ``(batch, num_heads, seq_len, d_state)``.
+        beta: Per-token gating coefficient,
+            ``(batch, num_heads, seq_len)``.
+        decay: Per-token log-decay, ``(batch, num_heads, seq_len)``;
+            pass ``None`` to disable decay (equivalent to all-zeros).
+        initial_state: Optional starting recurrent state,
+            ``(batch, num_heads, head_dim, d_state)``. Defaults to
+            zeros.
+        use_qk_l2norm: Whether to L2-normalize ``query`` and ``key``
+            before the loop.
 
     Returns:
-        Tuple of (outputs, final_state)
+        tuple: ``(outputs, final_state)`` where ``outputs`` has shape
+        ``(batch, num_heads, seq_len, d_state)`` and ``final_state``
+        has shape ``(batch, num_heads, head_dim, d_state)``.
     """
     B, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
@@ -207,23 +246,41 @@ def _chunk_kda_fwd(
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Chunked forward pass for KDA.
+    """Chunked KDA forward pass for training / long-context decode.
 
-    Processes the sequence in chunks for efficient parallel computation.
-    Uses intra-chunk parallel attention and inter-chunk sequential state updates.
+    Implements the FLA-style two-level decomposition: each contiguous
+    block of ``chunk_size`` tokens is processed in parallel via the
+    intra-chunk attention pattern (computed at ``Precision.HIGHEST``),
+    while the recurrent state is propagated *between* chunks using
+    ``lax.scan``. The intra-chunk path solves a unit lower-triangular
+    system to mix the gated delta updates inside the chunk; the
+    inter-chunk path applies the cumulative-decay matmul plus the
+    delta correction.
+
+    The sequence is right-padded to a multiple of ``chunk_size``; the
+    pad is stripped from the final output before returning. All math
+    runs in float32 internally; outputs are returned in float32 too -
+    callers cast back to runtime dtype as needed.
 
     Args:
-        query: Query tensor [batch, num_heads, seq_len, head_dim]
-        key: Key tensor [batch, num_heads, seq_len, head_dim]
-        value: Value tensor [batch, num_heads, seq_len, d_state]
-        beta: Gating tensor [batch, num_heads, seq_len]
-        decay: Per-token decay [batch, num_heads, seq_len]
-        chunk_size: Size of chunks for parallel processing
-        initial_state: Optional initial recurrent state
-        use_qk_l2norm: Whether to apply L2 normalization to query and key
+        query: ``(batch, num_heads, seq_len, head_dim)``.
+        key: ``(batch, num_heads, seq_len, head_dim)``.
+        value: ``(batch, num_heads, seq_len, d_state)``.
+        beta: Per-token gating, ``(batch, num_heads, seq_len)``.
+        decay: Per-token log-decay, ``(batch, num_heads, seq_len)``;
+            pass ``None`` to disable decay.
+        chunk_size: Chunk granularity used for the intra-chunk parallel
+            kernel. Must divide the (padded) sequence length.
+        initial_state: Optional starting recurrent state,
+            ``(batch, num_heads, head_dim, d_state)``.
+        use_qk_l2norm: Whether to L2-normalize ``query`` and ``key``
+            before processing.
 
     Returns:
-        Tuple of (outputs, final_state)
+        tuple: ``(outputs, final_state)`` with outputs of shape
+        ``(batch, num_heads, seq_len, d_state)`` (the padding is
+        sliced away) and final state of shape
+        ``(batch, num_heads, head_dim, d_state)``.
     """
     B, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
@@ -375,7 +432,28 @@ def _single_step_kda_fwd(
     Float[Array, "batch num_heads 1 d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Single-step recurrent forward pass for BHTD-layout decode inputs."""
+    """One-step KDA recurrence for inputs in BHTD layout (decode path).
+
+    Thin shim around :func:`_single_step_kda_core` that squeezes the
+    ``seq_len=1`` axis out of BHTD-shaped Q/K/V/beta/decay tensors,
+    runs the shared core update, and re-inserts the time axis on the
+    output so callers see the same rank as the inputs.
+
+    Args:
+        query: ``(batch, num_heads, 1, head_dim)``.
+        key: ``(batch, num_heads, 1, head_dim)``.
+        value: ``(batch, num_heads, 1, d_state)``.
+        beta: ``(batch, num_heads, 1)`` gating coefficient.
+        decay: Optional ``(batch, num_heads, 1)`` log-decay; ``None``
+            disables the exponential state decay this step.
+        recurrent_state: ``(batch, num_heads, head_dim, d_state)``.
+        use_qk_l2norm: Whether to L2-normalize Q and K before the update.
+
+    Returns:
+        tuple: ``(output, new_state)`` with output of shape
+        ``(batch, num_heads, 1, d_state)`` and the same recurrent-state
+        layout as the input.
+    """
     output, new_state = _single_step_kda_core(
         query=query.squeeze(2),
         key=key.squeeze(2),
@@ -400,7 +478,28 @@ def _single_step_kda_fwd_bthd(
     Float[Array, "batch 1 num_heads d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Single-step recurrent forward pass for BTHD-layout decode inputs."""
+    """One-step KDA recurrence for inputs in BTHD layout (decode path).
+
+    Mirror of :func:`_single_step_kda_fwd` for the
+    ``(batch, seq, num_heads, head_dim)`` layout used by the public
+    :class:`KernelDeltaAttnOp` forward. Slices the ``seq=1`` axis,
+    delegates to :func:`_single_step_kda_core`, and reattaches the
+    sequence axis on the output.
+
+    Args:
+        query: ``(batch, 1, num_heads, head_dim)``.
+        key: ``(batch, 1, num_heads, head_dim)``.
+        value: ``(batch, 1, num_heads, d_state)``.
+        beta: ``(batch, 1, num_heads)`` gating coefficient.
+        decay: Optional ``(batch, 1, num_heads)`` log-decay; ``None``
+            disables the exponential state decay this step.
+        recurrent_state: ``(batch, num_heads, head_dim, d_state)``.
+        use_qk_l2norm: Whether to L2-normalize Q and K before the update.
+
+    Returns:
+        tuple: ``(output, new_state)`` with output of shape
+        ``(batch, 1, num_heads, d_state)``.
+    """
     output, new_state = _single_step_kda_core(
         query=query[:, 0, :, :],
         key=key[:, 0, :, :],
@@ -425,7 +524,44 @@ def _single_step_kda_core(
     Float[Array, "batch num_heads d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Shared single-step KDA math over squeezed decode tensors."""
+    """Shared single-step KDA recurrence over squeezed decode tensors.
+
+    Backbone of the BHTD and BTHD decode shims; the layout-specific
+    wrappers squeeze and re-expand the time axis around this call.
+    Computes one step of the Kernel Delta Attention recurrence:
+
+    1. Optional L2-normalisation of Q and K (matches FLA convention).
+    2. Cast to float32 for stable accumulation; scale ``query`` by
+       ``head_dim ** -0.5``.
+    3. Apply exponential decay to the recurrent state when ``decay`` is
+       provided: ``state *= exp(decay)[..., None, None]``.
+    4. Compute ``kv_mem = sum(state * key[..., None], axis=-2)`` and
+       the gated delta ``delta = (value - kv_mem) * beta[..., None]``.
+    5. Update the state: ``state += key[..., None] * delta[..., None, :]``.
+    6. Read out the output: ``output = sum(state * query[..., None],
+       axis=-2)``.
+    7. Cast the output back to the input dtype and return both the
+       output and the float32 ``new_state`` for the caller to persist.
+
+    Args:
+        query: ``(batch, num_heads, head_dim)``.
+        key: ``(batch, num_heads, head_dim)``.
+        value: ``(batch, num_heads, d_state)``.
+        beta: ``(batch, num_heads)`` gating coefficient (already
+            sigmoid-activated upstream).
+        decay: Optional ``(batch, num_heads)`` log-decay; pass ``None``
+            to skip the multiplicative state decay (equivalent to
+            ``decay=0``).
+        recurrent_state: ``(batch, num_heads, head_dim, d_state)``.
+        use_qk_l2norm: Whether to L2-normalize ``query`` and ``key``
+            before the update. Match the chunked path's setting to
+            keep training and inference consistent.
+
+    Returns:
+        tuple: ``(output, new_state)`` with output of shape
+        ``(batch, num_heads, d_state)`` cast to ``query.dtype`` and
+        ``new_state`` retained in float32 to feed the next decode step.
+    """
     if use_qk_l2norm:
         query = l2norm(query, axis=-1, eps=1e-6)
         key = l2norm(key, axis=-1, eps=1e-6)

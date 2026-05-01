@@ -66,6 +66,16 @@ _CHATML_ROLE_MAPPING = {
 
 
 def _maybe_json_load(value: str) -> tp.Any:
+    """Best-effort JSON decode of a string, returning the original on failure.
+
+    Args:
+        value: A string that may be a JSON document.
+
+    Returns:
+        The parsed JSON object when ``value`` looks like JSON (begins with
+        ``{`` or ``[``) and decodes cleanly; otherwise the original
+        ``value``.
+    """
     stripped = value.strip()
     if not stripped or stripped[0] not in {"{", "["}:
         return value
@@ -83,6 +93,19 @@ def normalize_message_payload(
     """Normalize chat payloads into ``[{role, content, ...}, ...]`` form."""
 
     def _normalize_single(item: tp.Any) -> list[dict[str, tp.Any]] | None:
+        """Normalize a single message payload to a list of role/content dicts.
+
+        Handles ChatML ``from``/``value`` pairs, OpenAI ``role``/``content``
+        dicts, JSON strings, and (when ``allow_plain_text`` is set) bare
+        strings interpreted as a user turn.
+
+        Args:
+            item: A single message-shaped value (string/dict/list).
+
+        Returns:
+            A one-element list of normalized message dicts, or ``None``
+            when the payload cannot be turned into a chat message.
+        """
         if isinstance(item, str):
             parsed = _maybe_json_load(item)
             if parsed is not item:
@@ -1153,12 +1176,27 @@ class _SegmentTree:
     """
 
     def __init__(self, maxval: int):
+        """Allocate the underlying max-segment-tree array.
+
+        Args:
+            maxval: Largest integer value that may be inserted; the tree
+                allocates the smallest power-of-two strictly above
+                ``maxval - 1`` for storage.
+        """
         self.maxval = maxval
 
         self.tree_size = 1 << (maxval - 1).bit_length()
         self.tree = [0] * (2 * self.tree_size)
 
     def add(self, val):
+        """Insert ``val`` into the segment tree.
+
+        Args:
+            val: Integer in the range ``(0, maxval]``.
+
+        Raises:
+            ValueError: If ``val`` is outside the permitted range.
+        """
         if not (0 < val <= self.maxval):
             raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = self.tree_size + val - 1
@@ -1170,6 +1208,14 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def remove(self, val):
+        """Remove ``val`` from the segment tree.
+
+        Args:
+            val: Integer in the range ``(0, maxval]``.
+
+        Raises:
+            ValueError: If ``val`` is outside the permitted range.
+        """
         if not (0 < val <= self.maxval):
             raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = self.tree_size + val - 1
@@ -1181,6 +1227,18 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def search(self, val):
+        """Return the smallest stored value ``>= val``.
+
+        Args:
+            val: Integer in the range ``(0, maxval]``.
+
+        Returns:
+            The smallest currently-stored value that is at least ``val``,
+            or ``0`` when no such value exists.
+
+        Raises:
+            ValueError: If ``val`` is outside the permitted range.
+        """
         if not (0 < val <= self.maxval):
             raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = 1
@@ -1369,6 +1427,15 @@ def truncate_dataset(dataset: DatasetType, max_length: int, map_kwargs: dict[str
     if isinstance(dataset, Dataset):
 
         def truncate(examples):
+            """Slice every list-typed Arrow column to ``max_length``.
+
+            Args:
+                examples: Arrow ``Table`` batch produced by HF datasets.
+
+            Returns:
+                A new Arrow ``Table`` with each list/large-list column
+                truncated to ``max_length`` entries.
+            """
             truncated_columns = []
             for column in examples.columns:
                 if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
@@ -1382,6 +1449,15 @@ def truncate_dataset(dataset: DatasetType, max_length: int, map_kwargs: dict[str
     else:
 
         def truncate(examples):
+            """Truncate every list-typed column in a Python-batched HF dataset.
+
+            Args:
+                examples: Mapping of column name to per-example lists.
+
+            Returns:
+                A new mapping with each list column truncated to
+                ``max_length`` entries.
+            """
             truncated_examples = {}
             for key, column in examples.items():
                 if column and isinstance(column[0], list):
@@ -1429,6 +1505,21 @@ def pad_and_truncate_dataset(
         padding_values = {}
 
     def get_padding_value(column_name: str) -> tp.Any:
+        """Resolve the padding value to use for ``column_name``.
+
+        Args:
+            column_name: Name of the column being padded.
+
+        Returns:
+            The configured pad value (overrides via ``padding_values``
+            take precedence; ``attention_mask`` / ``*_mask`` use ``0``;
+            ``position_ids`` returns ``None`` so it can be auto-extended;
+            ``*_ids`` / ``labels`` use ``padding_token_id``).
+
+        Raises:
+            ValueError: If ``padding_token_id`` is required but not
+                supplied.
+        """
         if column_name in padding_values:
             return padding_values[column_name]
 
@@ -1449,6 +1540,19 @@ def pad_and_truncate_dataset(
             return 0
 
     def process_batch(batch: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
+        """Pad/truncate a single batch dict to ``max_length`` along the last axis.
+
+        Honours the trainer-level ``side`` (``"left"`` / ``"right"``),
+        ``truncate``, ``padding``, and ``make_it_1d`` flags, and looks up
+        per-column padding values via :func:`get_padding_value`.
+
+        Args:
+            batch: Mapping of column name to per-example list/array.
+
+        Returns:
+            A new mapping with each column padded or truncated to
+            ``max_length``, optionally flattened.
+        """
         processed: dict[str, list[tp.Any]] = {}
         for k, v in batch.items():
             # Ensure v is an array (handle cases where HF datasets returns lists)

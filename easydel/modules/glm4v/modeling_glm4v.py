@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of THUDM's GLM-4V vision-language model.
+
+GLM-4V combines a vision transformer encoder with a GLM-4 text decoder using
+multi-dimensional rotary position embeddings (mRoPE) to jointly encode
+temporal/height/width positions for visual tokens and standard sequence
+positions for text tokens.
+
+Architectural traits:
+    - Vision encoder: ViT-style with patch embedding and a spatial-merge
+      downsampling step (default 2x2) projected into the text hidden size.
+    - Text decoder: GLM-4-derived decoder with grouped-query attention,
+      partial RoPE, and gated SwiGLU MLP, extended with mRoPE
+      ``[temporal, height, width]`` (default sections ``[8, 12, 12]``).
+    - Image and video token merging at special placeholder positions.
+
+Exports:
+    - :class:`Glm4vVisionModel`: Vision tower.
+    - :class:`Glm4vTextModel`: Text-only decoder backbone.
+    - :class:`Glm4vModel`: Multimodal backbone.
+    - :class:`Glm4vForConditionalGeneration`: VLM with LM head.
+"""
+
 import math
 from itertools import groupby
 
@@ -133,11 +155,21 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
 
 
 class Glm4vVisionPatchEmbed(spx.Module):
-    """3D convolution-based patch embedding for GLM4V vision encoder.
+    """3-D convolutional patch stem for unified image / video tokenization.
 
-    Converts image/video patches into embeddings using a 3D convolution that
-    operates across temporal and spatial dimensions. Handles both single images
-    and video frames.
+    GLM-4V tokenises images and videos uniformly by treating an image as a
+    1-frame video. The stem is a single 3-D convolution with kernel and
+    stride both equal to ``(temporal_patch_size, patch_size, patch_size)``,
+    which is mathematically equivalent to flattening each
+    ``T x H x W`` patch into a vector and projecting it linearly. By using
+    ``stride == kernel_size`` the patches are non-overlapping; the bias
+    term is enabled to match the HF reference checkpoint.
+
+    Inputs are reshaped from ``(num_patches, channels, temporal_patch,
+    patch, patch)`` into NHWDC layout (``[num_patches, T, H, W, C]``)
+    before the conv to match :class:`spectrax.nn.Conv3d`'s axis convention.
+    The output is then flattened back to ``(num_patches, hidden_size)`` so
+    the rest of the vision encoder can treat each patch as a 1-D token.
     """
 
     def __init__(
@@ -200,10 +232,15 @@ class Glm4vVisionPatchEmbed(spx.Module):
 
 
 class Glm4vVisionMLP(spx.Module):
-    """SwiGLU-style MLP for GLM4V vision encoder blocks.
+    """SwiGLU MLP for the vision encoder, mirroring the text decoder's structure.
 
-    Implements a gated feedforward network with SiLU activation
-    (SwiGLU) for the vision encoder transformer blocks.
+    Same gated-MLP recipe used in the text side
+    (``down(act(gate(x)) * up(x))``), but instantiated against the vision
+    config's ``hidden_size`` and ``intermediate_size``. The activation is
+    read from ``config.hidden_act`` (typically ``"silu"`` so the gated form
+    becomes SwiGLU). All three projections are biasless. Gate and up are
+    column-parallel (output-sharded), down is row-parallel (input-sharded)
+    to keep the activations on-chip during tensor parallelism.
     """
 
     def __init__(
@@ -268,10 +305,21 @@ class Glm4vVisionMLP(spx.Module):
 
 
 class Glm4vVisionAttention(UnifiedAttention):
-    """Self-attention for GLM4V vision encoder with rotary embeddings.
+    """Bidirectional MHA for vision tokens with fused QKV and 2-D positional RoPE.
 
-    Implements multi-head self-attention with 2D rotary position embeddings
-    for encoding spatial relationships in vision patches.
+    Vision tokens have no causal ordering, so this attention runs with
+    ``causal=False``: every patch attends to every other patch in its
+    image (or to every patch across frames in a video, after temporal
+    flattening). Three Q/K/V projections are fused into one
+    ``ColumnParallelLinear`` of width ``3 * hidden_size`` (``use_fused_qkv=True``),
+    and grouped-query attention is disabled (``use_gqa=False``) — the
+    encoder is small enough that the GQA cost / quality trade-off is not
+    worthwhile.
+
+    Position information enters via 2-D rotary embeddings (one frequency
+    set for the spatial-y axis, another for the spatial-x axis) computed
+    upstream and supplied through ``cu_seqlens`` / ``rotary_pos_emb`` at
+    forward time, so this class itself does not own the rotary table.
     """
 
     def __init__(
@@ -423,10 +471,17 @@ class Glm4vVisionAttention(UnifiedAttention):
 
 
 class Glm4vVisionBlock(spx.Module):
-    """Transformer block for GLM4V vision encoder.
+    """Pre-norm bidirectional transformer block for the vision encoder.
 
-    Implements a standard transformer block with pre-normalization,
-    self-attention with rotary embeddings, and a SwiGLU feedforward network.
+    Standard pre-norm shape: ``x + attn(norm1(x))`` followed by
+    ``x + mlp(norm2(x))``. Both norms are RMSNorm at the vision-encoder
+    epsilon (``config.rms_norm_eps``), the attention is bidirectional with
+    fused QKV (see :class:`Glm4vVisionAttention`), and the MLP is the
+    SwiGLU :class:`Glm4vVisionMLP`. The block is invoked from the encoder's
+    layer-stack scan, with ``cu_seqlens`` (cumulative sequence lengths,
+    enabling block-diagonal masks for batched images of different patch
+    counts) and per-token rotary position embeddings forwarded into the
+    attention sub-module.
     """
 
     def __init__(
@@ -492,10 +547,31 @@ class Glm4vVisionBlock(spx.Module):
 
 
 class Glm4vVisionPatchMerger(spx.Module):
-    """Projection + gated MLP merger for GLM4V vision features.
+    """Vision-tower → language-decoder projection contract for GLM-4V.
 
-    Merges vision patch embeddings using a projection layer followed by
-    a gated MLP to bridge vision and language hidden dimensions.
+    The merger is GLM-4V's *cross-modal connector*: every patch token
+    emerging from the vision encoder is mapped through this module before
+    being inserted into the text decoder's residual stream at
+    ``image_token_id``/``video_token_id`` positions. The transformation is
+    a four-step bridge:
+
+    1. Linear projection ``dim -> dim`` (``proj``) that aligns the
+       vision-tower hidden space with the text decoder's expected scale.
+    2. LayerNorm + GeLU ``act1`` for stabilisation post-projection. This
+       is the "post_projection_norm" referenced by the
+       ``reform_param`` dict so HF checkpoints with that legacy name load
+       cleanly.
+    3. Gated MLP ``down(act(gate(x)) * up(x))`` of width ``context_dim``,
+       using the same SwiGLU recipe as the text decoder. ``context_dim``
+       (typically ``intermediate_size`` of the merger) governs how much
+       cross-modal mixing the merger can do per token.
+    4. The output is in the *text-decoder* hidden dimension and is the
+       value that gets gathered into the text embedding at vision-token
+       positions.
+
+    No spatial pooling happens in the merger itself — patch reduction is
+    handled upstream by the encoder's ``spatial_merge_size`` so the merger
+    is a pure 1-token-in/1-token-out projection.
     """
 
     def __init__(
@@ -1702,7 +1778,10 @@ class Glm4vModel(EasyDeLBaseModule):
         if video_grid_thw is None:
             raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
 
-        video_grid = np.array(video_grid_thw)
+        try:
+            video_grid = np.asarray(video_grid_thw)
+        except jax.errors.TracerArrayConversionError:
+            return self.visual(pixel_values_videos, grid_thw=video_grid_thw)
         temp_frames_hw = []
         for t, h, w in video_grid:
             temp_frames_hw.append(np.tile(np.array([1, int(h), int(w)], dtype=video_grid.dtype), (int(t), 1)))
@@ -1734,8 +1813,11 @@ class Glm4vModel(EasyDeLBaseModule):
         pixel_values = pixel_values.astype(self.visual.get_dtype())
         if image_grid_thw is None:
             raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
-        image_grid = np.array(image_grid_thw)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        try:
+            image_grid = np.asarray(image_grid_thw)
+        except jax.errors.TracerArrayConversionError:
+            return image_embeds
         split_sizes = (image_grid.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         indices = np.cumsum(split_sizes)[:-1]
         image_embeds = jnp.split(image_embeds, indices) if len(indices) > 0 else (image_embeds,)

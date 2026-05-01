@@ -41,7 +41,7 @@ class TestGlm4vMoe:
         cfg.text_config.intermediate_size = 1024
         cfg.text_config.num_attention_heads = 4
         cfg.text_config.num_key_value_heads = 2
-        cfg.text_config.num_hidden_layers = 2
+        cfg.text_config.num_hidden_layers = small_model_config["num_hidden_layers"]
         cfg.text_config.head_dim = 128
         cfg.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [8, 12, 12]}
 
@@ -64,7 +64,7 @@ class TestGlm4vMoe:
         cfg.vision_config.intermediate_size = 512
         cfg.vision_config.num_heads = 4
         cfg.vision_config.num_attention_heads = 4
-        cfg.vision_config.depth = 2
+        cfg.vision_config.depth = small_model_config["num_hidden_layers"]
         cfg.vision_config.out_hidden_size = cfg.text_config.hidden_size
         return cfg
 
@@ -101,7 +101,9 @@ class TestGlm4vMoe:
         }
 
     @pytest.mark.parametrize("mpmd_schedule_kind", LOSS_SCHEDULE_KINDS, indirect=True)
-    def test_vision_language(self, glm4v_moe_config, small_model_config, vlm_config, hf_glm4v_moe_class, mpmd_schedule_kind):
+    def test_vision_language(
+        self, glm4v_moe_config, small_model_config, vlm_config, hf_glm4v_moe_class, mpmd_schedule_kind
+    ):
         """Test Glm4vMoeForConditionalGeneration with vision inputs."""
         local_cfg = small_model_config.copy()
         local_cfg["max_position_embeddings"] = 2048

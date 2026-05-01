@@ -12,6 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the Cohere Command decoder-only LLM.
+
+Cohere Command is a Llama-shaped causal transformer with the following
+characteristic choices: a learnable logit scale (default ``1/16``), optional
+RMSNorm of query/key projections (``use_qk_norm``), SwiGLU MLPs, full RoPE,
+grouped-query attention, and tied input/output embeddings by default.
+
+Building blocks:
+
+- :func:`repeat_kv` — replicate KV heads up to the query head count.
+- :class:`RMSNorm` — module-local RMS normalization with optional weight
+  transpose.
+- :class:`CohereAttention` — :class:`UnifiedAttention` subclass with optional
+  QK norm and a custom RoPE.
+- :class:`CohereMLP` — SwiGLU FFN.
+- :class:`CohereBlock` — single decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`CohereModel` — base decoder.
+- :class:`CohereForCausalLM` — causal LM head with logit scaling.
+- :class:`CohereForSequenceClassification` — pooled classifier head.
+"""
 
 from functools import partial
 
@@ -63,10 +86,19 @@ def repeat_kv(
 
 
 class RMSNorm(spx.Module):
-    """Root Mean Square Layer Normalization for Cohere models.
+    """Cohere-flavoured RMSNorm with learned scale and per-head shape support.
 
-    Implements RMS normalization with learnable scale parameters,
-    providing training stability without mean centering.
+    Differs from the layer in :mod:`easydel.layers` in two ways needed by
+    Cohere's Q/K normalization:
+
+    * ``dim`` may be a tuple (e.g. ``(head_dim, num_heads)``) so a single
+      RMSNorm can normalise a per-head tensor without reshaping.
+    * ``do_t`` transposes the learned ``weight`` before scaling, matching the
+      layout HF Cohere checkpoints store Q/K-norm parameters in.
+
+    Computation: ``y = x * rsqrt(mean(x ** 2) + eps) * weight``, with the
+    accumulator promoted to ``float32`` (or kept ``float32`` for any FP8
+    activation dtype) before being cast back to ``self.dtype``.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -144,11 +176,19 @@ class RMSNorm(spx.Module):
 
 
 class CohereAttention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for Cohere models.
+    """Causal GQA attention with optional Q/K-norm for Cohere.
 
-    Inherits from UnifiedAttention with Cohere-specific customizations:
-    - Optional Q/K normalization (use_qk_norm)
-    - Custom RoPE configuration
+    Standard grouped-query attention (``num_attention_heads`` queries,
+    ``num_key_value_heads`` KV heads) with RoPE rotation. The
+    Cohere-specific bits are:
+
+    * **Q/K-norm.** When ``config.use_qk_norm`` is set, applies a
+      per-head :class:`RMSNorm` (``dim = (head_dim, num_heads)``) to the Q
+      and K projections *after* RoPE but before the dot product. Stabilises
+      training of larger Cohere variants.
+    * **RoPE.** ``_create_rotary`` always builds the basic RoPE with the
+      Cohere ``rope_theta`` and ``head_dim``; rotation is applied to the
+      full per-head dimension.
     """
 
     def __init__(
@@ -231,10 +271,13 @@ class CohereAttention(UnifiedAttention):
 
 
 class CohereMLP(spx.Module):
-    """Multi-Layer Perceptron module for Cohere models.
+    """SwiGLU feed-forward block for Cohere decoder layers.
 
-    Implements feedforward network with configurable activation functions
-    and gated linear units for enhanced representation learning.
+    Computes ``down_proj(silu(gate_proj(x)) * up_proj(x))`` — the standard
+    SwiGLU formulation. Linears are unbiased, ``gate_proj`` and ``up_proj``
+    are :class:`ColumnParallelLinear` (output sharded across the TP axis),
+    ``down_proj`` is :class:`RowParallelLinear` (input sharded). Intermediate
+    width is ``config.intermediate_size``.
     """
 
     def __init__(
@@ -312,12 +355,18 @@ class CohereMLP(spx.Module):
 
 
 class CohereBlock(spx.Module):
-    """Single decoder layer for Cohere models.
+    """Single Cohere decoder layer with parallel attention/MLP residuals.
 
-    Combines multi-head attention and feedforward networks with
-    RMS normalization and residual connections. Uses a parallel
-    attention-feedforward architecture where both are applied
-    to the same normalized input.
+    Cohere uses the parallel-residual transformer block (à la GPT-J / PaLM):
+    a single ``input_layernorm`` feeds *both* the attention and MLP paths,
+    and the two outputs are summed back into the residual stream:
+
+        ``y = x + attn(input_ln(x)) + mlp(input_ln(x))``
+
+    rather than the sequential pre-norm pattern. This keeps the attention
+    and feed-forward computations independent so they can run concurrently.
+    Attention is :class:`CohereAttention` (GQA + optional Q/K-norm), MLP is
+    :class:`CohereMLP` (SwiGLU).
     """
 
     def __init__(
@@ -342,6 +391,7 @@ class CohereBlock(spx.Module):
         """
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -448,11 +498,14 @@ class CohereBlock(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=CohereConfig, model_type="cohere")
 class CohereModel(EasyDeLBaseModule):
-    """Cohere model implementation.
+    """Cohere Command-family backbone (registered as ``BASE_MODULE``).
 
-    This implements the Cohere language model architecture, utilizing transformer blocks
-    with RMSNorm, rotary position embeddings, optional Q/K normalization, and a
-    parallel attention-feedforward architecture.
+    Stack: token embedding -> ``num_hidden_layers`` :class:`CohereBlock`
+    layers (parallel attention/MLP residuals) -> final ``LayerNorm``. Uses
+    GQA with optional Q/K normalisation (``config.use_qk_norm``), RoPE
+    rotation, and SwiGLU MLPs. Decoder layers are wrapped with
+    :func:`auto_remat` so per-layer activation checkpointing follows
+    ``config.gradient_checkpointing``. Returns :class:`BaseModelOutput`.
 
     Attributes:
         config (CohereConfig): Configuration for the model.
@@ -503,7 +556,7 @@ class CohereModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+            with self._assign_layer_stage(i, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -620,9 +673,10 @@ class CohereModel(EasyDeLBaseModule):
 
         def _run_layer(block, carry):
             hs, cv, ah, aa, idx = carry
+            stage_idx = getattr(block, "layer_idx", idx)
             if output_hidden_states:
                 ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
+            with self._layer_stage_context(stage_idx, layers=self.layers):
                 layer_outputs = block(
                     hidden_states=hs,
                     mask_info=mask_info,
@@ -633,7 +687,7 @@ class CohereModel(EasyDeLBaseModule):
                     output_attentions=output_attentions,
                     frequencies=self.frequencies,
                 )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, stage_idx, layers=self.layers)
             cv = self._layer_cache_view_update(
                 cv,
                 idx,
@@ -694,11 +748,13 @@ class CohereModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=CohereConfig, model_type="cohere")
 class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
-    """Cohere model with a language modeling head for causal language modeling tasks.
+    """Cohere backbone + scaled LM head for autoregressive generation.
 
-    This model is a transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation. Includes logit scaling
-    as configured in CohereConfig.
+    Wraps :class:`CohereModel` with an unbiased ``vocab_size`` LM head.
+    Cohere's distinguishing inference-time detail is **logit scaling**: the
+    raw logits are multiplied by ``config.logit_scale`` (typically a small
+    constant like 0.0625) before sampling, which the base
+    :class:`BaseCausalLMModule` applies through :meth:`apply_logit_cap`.
 
     Attributes:
         config (CohereConfig): Configuration for the model.
@@ -869,10 +925,12 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=CohereConfig, model_type="cohere")
 class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereModel, CohereConfig]):
-    """Cohere model for sequence classification tasks.
+    """Cohere backbone + linear classification head.
 
-    This class extends the base Cohere model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Pools the last non-pad token's hidden state from :class:`CohereModel`
+    and feeds it through an unbiased ``score`` head with ``num_labels``
+    outputs. Shares the parallel-residual / Q/K-norm architecture of the
+    base model; ``config.pad_token_id`` is required for batched inputs.
 
     Attributes:
         config (CohereConfig): Configuration for the model.

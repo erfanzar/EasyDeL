@@ -323,6 +323,11 @@ class KDACacheView(BaseCacheView):
         )
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` listing the conv/recurrent state shapes.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         return (
             f"KDACacheView(q={self.q_conv_state.shape}, k={self.k_conv_state.shape}, "
             f"v={self.v_conv_state.shape}, rec={self.recurrent_state.shape}, "
@@ -411,6 +416,11 @@ class KDACache(BaseCache):
         return KDACache(views=new_views)
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing the number of layer views.
+
+        Returns:
+            A human-readable representation of the cache container.
+        """
         return f"KDACache(layers={len(self.views)})"
 
     def to_pure(self) -> tuple[list[dict[str, tp.Any]], KDACacheConfig | None]:

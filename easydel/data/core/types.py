@@ -33,10 +33,17 @@ from easydel.utils.helpers import get_cache_dir
 
 
 class DatasetType(StrEnum):
-    """Enumeration of supported dataset file formats.
+    """Enumeration of dataset container formats supported by the data layer.
 
-    This enum defines all the file formats that can be automatically
-    detected and loaded by the data management system.
+    Acts as the canonical tag carried on :class:`BaseDatasetInform` and
+    its subclasses to select the correct reader in
+    :mod:`easydel.data.sources`. Members inherit from :class:`StrEnum`
+    so they compare equal to their wire-format strings (``"json"``,
+    ``"parquet"``, …) in serialised configs.
+
+    Members include the standard file containers (``JSON``, ``PARQUET``,
+    ``CSV``, ``ARROW``, ``TSV``, ``TXT``) plus the HuggingFace virtual
+    type (``HF``) used for ``datasets.load_dataset``-style sources.
     """
 
     JSON = "json"
@@ -49,13 +56,21 @@ class DatasetType(StrEnum):
 
     @classmethod
     def from_string(cls, value: str) -> DatasetType | str:
-        """Convert string to DatasetType enum value.
+        """Best-effort coercion of a free-form string into a :class:`DatasetType`.
+
+        Performs a case-insensitive lookup. When the string does not
+        match any member, the input is returned unchanged so callers can
+        round-trip user-supplied values they want to keep verbatim
+        (e.g. plugin formats added by downstream code).
 
         Args:
-            value: String representation of dataset type.
+            value: Candidate format identifier such as ``"json"`` or
+                ``"PARQUET"``.
 
         Returns:
-            DatasetType enum or original string if not found.
+            DatasetType | str: A :class:`DatasetType` member when
+            ``value`` matches one (case-insensitive); otherwise the
+            original string is returned.
         """
         try:
             return cls(value.lower())
@@ -64,13 +79,19 @@ class DatasetType(StrEnum):
 
     @classmethod
     def infer_from_path(cls, path: str) -> DatasetType | None:
-        """Infer dataset type from file path extension.
+        """Guess the dataset format from the suffix of a filesystem path.
+
+        Recognises common compressed variants (``.json.gz``,
+        ``.json.zst``, ``.tsv.gz``, …) so the extension table covers
+        everything the readers in :mod:`easydel.data.sources` accept.
 
         Args:
-            path: File path to analyze.
+            path: Filesystem path or URI whose suffix is examined. Only
+                the trailing extension is consulted.
 
         Returns:
-            Inferred DatasetType or None if cannot be determined.
+            DatasetType | None: The inferred type, or ``None`` when the
+            extension does not match any known reader.
         """
         mapping = {
             (".json", ".jsonl", ".json.gz", ".jsonl.gz", ".json.zst", ".jsonl.zst"): cls.JSON,
@@ -88,19 +109,43 @@ class DatasetType(StrEnum):
 
 @auto_pytree
 class BaseDatasetInform:
-    """Base configuration class for dataset information.
+    """Legacy per-dataset declaration for the :class:`DatasetMixture` API.
 
-    This class provides the common configuration options for all dataset types.
-    It handles automatic format detection and field normalization.
+    The legacy ``*Inform`` family describes one constituent dataset of a
+    :class:`DatasetMixture`, capturing its location, format, split, and
+    optional row-level transformations. ``__post_init__`` runs auto-type
+    inference from the data file extensions and emits a deprecation
+    warning when ``dataset_split_name`` is set on file-based formats
+    (it is only meaningful for HuggingFace datasets). Subclasses
+    :class:`TextDatasetInform` and :class:`VisualDatasetInform` add
+    text/multimodal-specific fields.
+
+    The newer typed pipeline API (:class:`DatasetConfig`) is the
+    preferred entry point; this class remains for backwards
+    compatibility with existing :class:`DatasetMixture` users.
 
     Attributes:
-        type: Dataset format type (auto-inferred from file extension if None).
-        data_files: Path or paths to dataset files.
-        num_rows: Optional limit on number of rows to load.
-        dataset_split_name: Name of the dataset split (for HuggingFace datasets).
-        split: Which split to load (default: "train").
-        format_callback: Optional function to transform dataset examples.
-        format_fields: Optional mapping for renaming fields.
+        type (DatasetType | str | None): Container format tag. When
+            ``None`` the format is inferred from the file extension in
+            ``__post_init__`` and the constructor raises if inference
+            fails. Stored as :class:`DatasetType` after normalisation.
+        data_files (os.PathLike | str | list[...] | None): Path,
+            list of paths, or glob/URI to the dataset files. ``None`` is
+            allowed during construction but most downstream code
+            requires this to be set.
+        num_rows (int | None): Optional cap on the number of rows
+            actually loaded; useful for smoke tests and debugging.
+        dataset_split_name (str | None): Split name for HuggingFace
+            datasets (the ``split=`` argument to ``load_dataset``).
+            Ignored — and warned about — for file-based types.
+        split (str): Generic split label used by file-based readers
+            (defaults to ``"train"``).
+        format_callback (Callable[[dict[str, Any]], dict[str, Any]] | None):
+            Per-row transform applied immediately after reading. Useful
+            for one-off schema massaging without writing a full
+            transform.
+        format_fields (dict[str, str] | None): Old-key -> new-key
+            rename map applied to each row.
     """
 
     type: DatasetType | str | None = None
@@ -112,7 +157,26 @@ class BaseDatasetInform:
     format_fields: dict[str, str] | None = None
 
     def __post_init__(self):
-        """Validate and auto-detect dataset type from file extension if not provided."""
+        """Normalise ``type``, infer it from file extensions, and validate splits.
+
+        Performs three operations after dataclass initialisation:
+
+        1. If :attr:`type` is ``None``, the first entry of
+           :attr:`data_files` is examined and
+           :meth:`DatasetType.infer_from_path` is consulted to pick a
+           reader. Failing that, ``ValueError`` is raised.
+        2. String inputs to :attr:`type` are coerced to a
+           :class:`DatasetType` member (silently leaving unknown strings
+           in place, matching :meth:`DatasetType.from_string`).
+        3. When :attr:`dataset_split_name` is set on a file-based
+           container (i.e. anything that is not ``"huggingface"`` /
+           ``"hf"``), a :class:`DeprecationWarning` is emitted because
+           the field has no effect for those readers.
+
+        Raises:
+            ValueError: If :attr:`type` is ``None`` and cannot be
+                inferred from :attr:`data_files`.
+        """
         if self.type is None:
             # Convert PathLike to string for type inference
             inferred_type = None
@@ -148,10 +212,19 @@ class BaseDatasetInform:
             )
 
     def get_str_type(self):
-        """Get string representation of dataset type.
+        """Return the dataset type as a lowercase string for routing decisions.
+
+        Mostly used by readers that branch on the format tag —
+        :class:`DatasetType` enum members support string comparison via
+        :class:`StrEnum`, but downstream code occasionally wants the
+        bare value. Falls back to returning :attr:`type` unchanged when
+        the field is not a :class:`DatasetType` (e.g. a raw plugin
+        string).
 
         Returns:
-            Lowercase string representation of the dataset type.
+            str: Lowercase dataset format identifier (``"json"``,
+            ``"parquet"``, …) or the raw value of :attr:`type` when
+            unrecognised.
         """
         try:
             return self.type.value.lower()
@@ -161,14 +234,24 @@ class BaseDatasetInform:
 
 @auto_pytree
 class TextDatasetInform(BaseDatasetInform):
-    """Configuration for text-only datasets.
+    """Per-dataset declaration for text-only constituents of a :class:`DatasetMixture`.
 
-    Extends BaseDatasetInform with text-specific configuration options.
+    Adds the fields the text-mixing path needs on top of
+    :class:`BaseDatasetInform`: which row key holds the actual text
+    content, which extra columns to preserve through the pipeline, and
+    an optional pure-Python preprocessing hook.
 
     Attributes:
-        content_field: Name of the field containing text content (default: "content").
-        additional_fields: Optional list of additional fields to preserve.
-        preprocessing_fn: Optional function to preprocess text data.
+        content_field (str | None): Source row key holding the raw text;
+            renamed to :attr:`DatasetMixture.text_target_field` during
+            mixing. ``None`` indicates the dataset has no text body
+            (rare; useful for label-only sources).
+        additional_fields (list[str] | None): Extra row keys to keep
+            (e.g. ``"label"``, ``"meta"``); everything else is dropped
+            after mixing to keep batches small.
+        preprocessing_fn (Callable[[dict[str, Any]], dict[str, Any]] | None):
+            Optional per-row transform applied before mixing. Receives
+            and returns the row dict.
     """
 
     content_field: str | None = "content"
@@ -178,15 +261,25 @@ class TextDatasetInform(BaseDatasetInform):
 
 @auto_pytree
 class VisualDatasetInform(BaseDatasetInform):
-    """Configuration for visual/multimodal datasets.
+    """Per-dataset declaration for image / multimodal constituents of a mixture.
 
-    Extends BaseDatasetInform with image-specific configuration options.
+    Specialises :class:`BaseDatasetInform` with multimodal fields.
+    Carries the row key holding image data, an optional companion text
+    field, and a target resize spec used by the image-handling code in
+    the mixer.
 
     Attributes:
-        pixel_field: Name of the field containing image data (default: "images").
-        content_field: Optional field name for accompanying text content.
-        image_size: Optional target image size as (width, height) tuple.
-        preprocessing_fn: Optional function to preprocess image data.
+        pixel_field (str): Row key under which raw image bytes/arrays
+            live in the source schema; renamed to
+            :attr:`DatasetMixture.image_target_field` during mixing.
+        content_field (str | None): Optional row key for accompanying
+            text (captions, instructions). ``None`` indicates a
+            text-free image dataset.
+        image_size (tuple[int, int] | None): Target ``(width, height)``
+            to which loaded images are resized. ``None`` keeps the
+            native resolution.
+        preprocessing_fn (Callable[[dict[str, Any]], dict[str, Any]] | None):
+            Optional per-row transform applied before mixing.
     """
 
     pixel_field: str = "images"
@@ -197,39 +290,89 @@ class VisualDatasetInform(BaseDatasetInform):
 
 @auto_pytree
 class DatasetMixture:
-    """Configuration for mixing multiple datasets with various strategies.
+    """Top-level legacy declaration of a multi-dataset training mix.
 
-    Supports combining text and visual datasets with configurable sampling,
-    shuffling, batching, and token packing strategies.
+    A :class:`DatasetMixture` aggregates one or more
+    :class:`BaseDatasetInform` constituents together with all the
+    settings needed to load, mix, optionally tokenize, optionally pack,
+    and batch them for training. It is the original (pre-Pipeline) API
+    surface for the data layer; see :class:`PipelineConfig` for the
+    typed-stage replacement.
+
+    The dataclass is registered as a pytree via ``@auto_pytree`` so it
+    can be passed across JAX transforms / serialised consistently with
+    other EasyDeL state. ``__post_init__`` ensures :attr:`cache_dir`
+    exists on disk so caching can be turned on without manual setup.
 
     Attributes:
-        informs: List of dataset configurations to mix.
-        cache_dir: Directory for caching datasets.
-        streaming: Enable streaming mode (default: True).
-        text_target_field: Target field name for text content (default: "text").
-        image_target_field: Target field name for images (default: "image").
-        batch_size: Batch size for data loading (default: 1).
-        shuffle_buffer_size: Buffer size for shuffling (default: None, disabled).
-        seed: Random seed for reproducibility (default: 42).
-
-        # Token packing configuration (optional)
-        pack_tokens: Enable pre-tokenized sequence packing (default: False).
-        tokens_field_name: Field name containing token IDs (default: "tokens").
-        pack_seq_length: Target sequence length for packing (default: None).
-        pack_eos_token_id: EOS token ID for padding (default: 0).
-        pack_shuffle: Shuffle packed sequences (default: True).
-        pack_shuffle_buffer_factor: Buffer size multiplier for shuffle (default: 16).
-        dask_storage_options: Storage options for dask/remote files (default: None).
-
-        # On-the-fly tokenization and packing (optional)
-        pack_on_the_fly: Enable on-the-fly tokenization and packing (default: False).
-        tokenize_callback: Function to tokenize examples, returns token IDs (default: None).
-
-        # Block-deterministic mixture configuration (optional)
-        block_mixture: Use deterministic block mixing instead of standard interleave (default: True).
-        mixture_block_size: Number of examples per block (default: 2048).
-        stop_strategy: Strategy when dataset exhausted - "restart" or "first_exhausted" (default: "restart").
-        mixture_weights: Per-dataset weights as dict mapping dataset identifier to weight (default: None).
+        informs (list[VisualDatasetInform | TextDatasetInform]):
+            Constituent dataset declarations that make up the mix.
+        cache_dir (str | ePathLike): Directory backing on-disk caches
+            for dataset fragments and tokenization. Defaults to the
+            EasyDeL user cache directory and is auto-created.
+        streaming (bool): Iterate the inputs in streaming mode rather
+            than fully materialising them in RAM.
+        text_target_field (str): Canonical row key the mix re-projects
+            text content onto regardless of source schema.
+        image_target_field (str): Canonical row key the mix re-projects
+            image content onto regardless of source schema.
+        batch_size (int): Examples per yielded batch. ``1`` is the
+            default to match consumer code that batches downstream.
+        shuffle_buffer_size (int | None): Reservoir size for streaming
+            shuffle. ``None`` disables the shuffle entirely.
+        seed (int | None): RNG seed governing shuffling and mixing.
+            Defaults to ``42`` for reproducibility.
+        pack_tokens (bool): Enable pre-tokenized sequence packing — if
+            ``True``, the rows are assumed to carry token id arrays
+            under :attr:`tokens_field_name` and are packed into windows
+            of length :attr:`pack_seq_length`.
+        tokens_field_name (str): Row key consulted by the packer when
+            :attr:`pack_tokens` is on.
+        pack_seq_length (int | None): Target window length for packing.
+            ``None`` indicates packing has not been configured.
+        pack_eos_token_id (int): Token id used as the boundary between
+            packed examples and as padding.
+        pack_shuffle (bool): Shuffle the post-packed stream. Useful
+            because consecutive packed rows tend to share underlying
+            examples.
+        pack_shuffle_buffer_factor (int): Multiplier on the natural
+            packing batch governing the post-pack shuffle reservoir
+            size.
+        dask_storage_options (dict[str, Any] | None): Forwarded
+            verbatim to ``fsspec``/``dask`` readers as
+            ``storage_options``; carries credentials, request timeouts,
+            etc.
+        pack_on_the_fly (bool): When ``True``, raw rows are tokenized
+            with :attr:`tokenize_callback` and packed in a single
+            streaming pass — alternative to pre-tokenizing the dataset
+            on disk.
+        tokenize_callback (Callable[[dict[str, Any]], list[int]] | None):
+            User-supplied tokenizer hook used by ``pack_on_the_fly``;
+            takes a row dict and returns token ids.
+        prefetch_workers (int): Background prefetch threads driving the
+            output iterator.
+        prefetch_buffer_size (int): Number of fully-formed batches kept
+            in the prefetch queue.
+        cloud_max_retries (int): Maximum retry attempts for transient
+            cloud-IO failures before propagating.
+        cloud_retry_delay (float): Initial backoff delay between retries
+            in seconds; subsequent retries use exponential backoff.
+        cache_remote_files (bool): When ``True``, files fetched from
+            cloud storage are cached to ``cache_dir`` for reuse.
+        cache_expiry_seconds (int): TTL for cached remote files.
+        block_mixture (bool): Use the deterministic block mixer
+            (consumes :attr:`mixture_block_size` examples from one
+            dataset before switching) instead of round-robin
+            interleave. Improves throughput.
+        mixture_block_size (int): Number of examples per contiguous
+            block when :attr:`block_mixture` is on.
+        stop_strategy (str): What the mixer does when a dataset is
+            exhausted — ``"restart"`` (recycle), ``"first_exhausted"``
+            (terminate immediately), or ``"all_exhausted"``.
+        mixture_weights (dict[str, float] | None): Per-dataset weights
+            keyed by dataset identifier (the constituent's
+            ``data_files`` path or explicit name). ``None`` falls back
+            to uniform mixing.
 
     Example:
         >>> from easydel.data import DatasetMixture, TextDatasetInform
@@ -292,43 +435,69 @@ class DatasetMixture:
     mixture_weights: dict[str, float] | None = None
 
     def __post_init__(self):
-        """Ensure cache directory exists, converting string paths to ePath."""
+        """Normalise :attr:`cache_dir` to an :class:`ePath` and ensure it exists.
+
+        Allows the user to supply ``cache_dir`` as a plain string for
+        ergonomics — the dataclass coerces it into an :class:`ePath` so
+        downstream code can rely on the rich path API regardless of how
+        it was constructed. The directory is created with ``mkdir
+        -p`` semantics so caching is safe to enable on a fresh machine.
+        """
         if isinstance(self.cache_dir, str):
             self.cache_dir = ePath(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike):
-        """Load dictionary from JSON file.
+        """Read a JSON file and decode its content into a Python dict.
+
+        Internal helper for :meth:`load_mixture`; assumes UTF-8
+        encoding and a top-level JSON object.
 
         Args:
-            json_file: Path to JSON file.
+            json_file: Path to the JSON file to read.
 
         Returns:
-            Parsed dictionary from JSON.
+            dict: The parsed top-level JSON object.
         """
         with open(json_file, encoding="utf-8") as reader:
             text = reader.read()
         return json.loads(text)
 
     def to_json_string(self) -> str:
-        """Serialize configuration to JSON string.
+        """Serialise the mixture into a stable, deterministic JSON string.
+
+        Uses ``sort_keys=True`` so byte-equal mixtures produce
+        byte-equal JSON, which makes the output diffable and safe to
+        use as a cache key. A trailing newline is appended so the
+        result plays nicely with file editors.
 
         Returns:
-            JSON string representation of this configuration.
+            str: JSON-encoded representation of this mixture, including
+            a trailing newline.
         """
         config_dict = self.to_dict()
         return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def load_mixture(cls, json_file: str | os.PathLike):
-        """Load DatasetMixture configuration from JSON file.
+        """Reconstruct a :class:`DatasetMixture` from a previously saved JSON file.
+
+        Decodes the file with :meth:`_dict_from_json_file`, instantiates
+        the mixture with the top-level fields, then walks
+        :attr:`informs` and re-hydrates each entry into either
+        :class:`VisualDatasetInform` (if the dict carries a
+        ``"pixel_field"``) or :class:`TextDatasetInform`. The
+        reconstructed informs replace the raw dicts on the returned
+        mixture.
 
         Args:
-            json_file: Path to JSON file containing mixture configuration.
+            json_file: Path to the JSON file written by
+                :meth:`save_mixture`.
 
         Returns:
-            DatasetMixture instance loaded from file.
+            DatasetMixture: A fully reconstructed mixture, ready to be
+            used with :meth:`build`.
         """
 
         config_dict = cls._dict_from_json_file(json_file)
@@ -343,23 +512,31 @@ class DatasetMixture:
         return mixture
 
     def save_mixture(self, json_file_path: str | os.PathLike):
-        """Save DatasetMixture configuration to JSON file.
+        """Persist the mixture as JSON for later round-tripping via :meth:`load_mixture`.
+
+        The output is the same string returned by :meth:`to_json_string`
+        — sorted keys, two-space indent, trailing newline.
 
         Args:
-            json_file_path: Path where JSON file will be saved.
+            json_file_path: Destination path. The file is written with
+                UTF-8 encoding and overwrites any existing content.
         """
         with open(json_file_path, "w", encoding="utf-8") as writer:
             writer.write(self.to_json_string())
 
     def build(self):
-        """Build the dataset using this mixture configuration.
+        """Materialise this declaration into an iterable dataset object.
 
-        Convenience method that builds a dataset from the current mixture
-        configuration by calling the pipeline's build_dataset function.
+        Thin wrapper that defers to
+        :func:`easydel.data.execution.pipeline.build_dataset`, kept on
+        the class so users can write ``mixture.build()`` instead of
+        importing the runner. The import is deferred to avoid a
+        circular module dependency at import time.
 
         Returns:
-            Dataset or IterableDataset configured according to this mixture's
-            settings, with all transformations and mixing strategies applied.
+            Dataset or IterableDataset fully configured according to
+            the mixture (mixing, shuffling, batching, optional
+            tokenization and packing all applied).
 
         Example:
             >>> mixture = DatasetMixture(
@@ -376,10 +553,15 @@ class DatasetMixture:
 
 
 class DatasetLoadError(Exception):
-    """Exception raised when dataset loading fails.
+    """Domain-specific exception for unrecoverable dataset-loading errors.
 
-    This exception is raised for various dataset loading failures including
-    file not found, invalid format, parsing errors, or storage access issues.
+    Raised by readers in :mod:`easydel.data.sources` and execution
+    helpers in :mod:`easydel.data.execution` when a dataset cannot be
+    materialised — e.g. the file is missing, the format does not match
+    its declared :class:`DatasetType`, the underlying parser fails, or
+    cloud storage access errors out after retries. Catch this in
+    application code that needs to distinguish dataset issues from
+    other runtime failures.
     """
 
     pass

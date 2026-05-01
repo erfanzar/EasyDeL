@@ -12,7 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ragged gated delta rule packed JAX implementation."""
+"""Packed (ragged) Gated Delta Rule kernels for continuous-batching inference.
+
+This module provides the JAX/Pallas implementation of the Gated Delta Rule
+(GDR) recurrence for the eSurge packed-inference path, where many requests
+of heterogeneous lengths share a single contiguous token buffer. It exposes:
+
+* :func:`ragged_gated_delta_rule` - the top-level JIT entry point that splits
+  an interleaved ``mixed_qkv`` stream into Q/K/V, optionally repeats heads
+  for grouped-query layouts, and dispatches to either the decode-only fast
+  path or the chunked mixed-prefill branch based on the ``request_distribution``.
+* :func:`ragged_gated_delta_rule_decode_only` - per-token Pallas/JAX update
+  used when every active request consumes exactly one new token.
+* :func:`ragged_gated_delta_rule_mixed_prefill` - chunked algorithm that
+  pads each request's tokens to a multiple of ``chunk_size``, runs the
+  intra-chunk attention in parallel, and propagates inter-chunk state via
+  ``lax.scan``. Requires the unit lower-triangular inverse provided by
+  :class:`TriangleSolverImpl`.
+* :class:`RaggedGatedDeltaRule` - first-class :class:`OperationImpl`
+  wrapping the kernel in a head-parallel ``shard_map``.
+* Helpers for the unit lower-triangular inverse used inside the chunked
+  formulation (Newton-Schulz, blockwise Gaussian elimination, and a portable
+  ``jax.scipy``-based path), plus a Pallas TPU decode kernel
+  (``_pallas_gdn_decode_kernel``) used when the geometry fits in VMEM.
+
+Algorithmic notes:
+- All forward arithmetic is performed in float32 for numerical stability and
+  cast back to ``mixed_qkv.dtype`` (typically bfloat16) on the way out.
+- The chunked path uses an online-style update: per-chunk ``q @ k^T`` is
+  weighted by ``exp(g_diff)`` to mix the gated decay into the attention
+  pattern, then the inter-chunk recurrence carries the running ``state``
+  through a ``lax.scan``.
+- The decode-only path tries a Pallas TPU kernel when geometric constraints
+  (head dim, Mosaic VMEM budget, identity state mapping) are satisfied,
+  falling back to a pure-JAX gather/scatter implementation otherwise.
+"""
 
 import enum
 import functools
@@ -38,30 +72,33 @@ from ._gdn_policy import normalize_kernel_tile_policy
 
 
 def newton_schulz_inverse_ref(A, n=None):
-    """Inverse of unit lower triangular matrix using Newton-Schulz iteration.
+    """Reference Newton-Schulz inverse for unit lower-triangular matrices.
+
+    Computes :math:`A^{-1}` for a batch of unit lower-triangular ``N x N``
+    matrices using the Newton-Schulz iteration
+    :math:`S_{k+1} = S_k (2 I - A S_k)`. With :math:`L = A - I` strictly
+    lower-triangular, the recurrence is mathematically equivalent to the
+    finite product :math:`S_k = (I - L) \\prod_{j=1}^{k}(I + L^{2^j})`,
+    which terminates exactly after :math:`\\lceil \\log_2 N \\rceil`
+    doublings because :math:`L^{N} = 0`.
+
+    For numerical stability the implementation does *not* materialise the
+    closed-form product; instead it iterates :math:`S \\leftarrow S (2 I -
+    A S)` with the matmul running at ``Precision.HIGHEST`` so the final
+    step is performed at full precision while the loop body remains
+    accurate enough for bfloat16/float16 inputs.
 
     Args:
-      A: Tensor with last two dimensions representing a square lower triangular
-        matrix with unit diagonal.
-      n: Number of iterations to run.
-
-    Newton Schulz iteration:
-    https://en.wikipedia.org/wiki/Matrix_sign_function#Newton%E2%80%93Schulz_iteration
-    S_{k+1} = S_k @ (2 * I - A @ S_k)
-
-    Let L = A - I
-    Starting with S_0 = I, this is equivalent mathematically to
-    S_k = (I - L) @ (I + L^2) @ (I + L^4)....(I + (L^(2^k))), k > 0
-
-    If L is strictly lower (or upper) triangular, L ^ n == 0.
-    So this series converges after log(n) steps.
-
-    We don't directly compute S_k as above to reduce precision loss.
-    We run the last step in higher precision to improve the overall estimate.
-    Initial steps are kept in lower precision for speed.
+        A: Array of shape ``(..., N, N)`` whose last two dimensions form a
+            unit lower-triangular matrix (1s on the diagonal, zeros above).
+            Higher leading dimensions are batched.
+        n: Optional iteration upper bound; defaults to ``A.shape[-1]``.
+            The loop doubles ``k`` each iteration so any value at or above
+            ``ceil(log2(N))`` produces the exact inverse.
 
     Returns:
-      Inverse of A.
+        jnp.ndarray: A tensor with the same shape and dtype as ``A``
+        containing the inverse of each unit lower-triangular slab.
     """
     if n is None:
         n = A.shape[-1]
@@ -77,11 +114,36 @@ def newton_schulz_inverse_ref(A, n=None):
 
 
 def newton_schulz_inverse_pallas_kernel(A_ref, x_ref):
+    """Pallas kernel body that wraps :func:`newton_schulz_inverse_ref`.
+
+    Reads the unit lower-triangular block from ``A_ref`` and writes its
+    inverse into ``x_ref``.
+
+    Args:
+        A_ref: Pallas reference to a block of unit lower-triangular matrices
+            with shape ``(block_size, N, N)``.
+        x_ref: Pallas reference to the output block, same shape and dtype as
+            ``A_ref``.
+    """
     x_ref[...] = newton_schulz_inverse_ref(A_ref[...])
 
 
 def newton_schulz_inverse_pallas(A, *, block_size=64):
-    """Newton-Schulz iteration for unit lower triangular matrices on Pallas."""
+    """Newton-Schulz iteration for unit lower triangular matrices on Pallas.
+
+    Tiles the leading dimensions of ``A`` so each Pallas program inverts a
+    ``(block_size, N, N)`` slab using :func:`newton_schulz_inverse_pallas_kernel`.
+
+    Args:
+        A: Tensor whose last two dimensions form a unit lower-triangular
+            ``N x N`` matrix; the leading dimensions are batched.
+        block_size: Number of leading-axis matrices to handle per Pallas
+            program. Defaults to 64.
+
+    Returns:
+        jnp.ndarray: Tensor with the same shape and dtype as ``A`` containing
+        the inverse of each unit lower-triangular slab.
+    """
 
     A_shape = A.shape
     A = A.reshape(-1, *A.shape[-2:])
@@ -101,15 +163,26 @@ def newton_schulz_inverse_pallas(A, *, block_size=64):
 
 
 def local_forward_substitution(A, b):
-    """Solves A X = B for unit lower triangular matrix A using forward substitution.
+    """Solve :math:`A X = b` row-by-row for unit lower-triangular ``A``.
+
+    Used inside :func:`decompose_triangular_matrix_inverse_pallas_kernel`
+    on a single Pallas program block. Iterates over the ``N`` rows of each
+    matrix, solving for ``X[:, i, :]`` using the previously-computed
+    rows. Because ``A`` has unit diagonal, no division is required:
+    ``X[:, i, :] = b[:, i, :] - sum_{j < i} A[:, i, j] * X[:, j, :]``.
+
+    The implementation accumulates ``X`` row-by-row in a Python list (the
+    loop is unrolled at trace time) and stacks them at the end. This is
+    intended for small ``N`` (typically ``block_size`` of the calling
+    Pallas tile, e.g. 16); use a Newton-Schulz or LAPACK-based path for
+    large matrices.
 
     Args:
-      A: A tensor of shape (B, N, N) representing a batch of unit lower triangular
-        matrices.
-      b: A tensor of shape (B, N, K) representing the right-hand side.
+        A: Batched unit lower-triangular matrix of shape ``(B, N, N)``.
+        b: Right-hand side of shape ``(B, N, K)``.
 
     Returns:
-      A tensor of shape (B, N, K) representing the solution X.
+        jnp.ndarray: Solution ``X`` of shape ``(B, N, K)``.
     """
     _B, N, _K = b.shape
     x_list = []
@@ -128,6 +201,21 @@ def local_forward_substitution(A, b):
 
 
 def decompose_triangular_matrix_inverse_pallas_kernel(A_ref, x_ref, *, block_size=16):
+    """Pallas kernel body for blockwise unit lower-triangular inversion.
+
+    Performs blockwise Gaussian elimination over the trailing ``N x N`` axis
+    of ``A_ref``, writing the inverse incrementally into ``x_ref`` in chunks
+    of ``block_size`` rows.
+
+    Args:
+        A_ref: Pallas reference holding the input matrices,
+            shape ``(B, N, N)``.
+        x_ref: Pallas reference for the inverse output, same shape as
+            ``A_ref``.
+        block_size: Row-block size used to partition each ``N x N`` matrix
+            during the forward-substitution sweep. ``N`` must be a multiple
+            of ``block_size``.
+    """
     A = A_ref[...]
     B, N, _ = A.shape
     num_blocks = N // block_size
@@ -150,19 +238,33 @@ def decompose_triangular_matrix_inverse_pallas_kernel(A_ref, x_ref, *, block_siz
 
 
 def decompose_triangular_matrix_inverse_pallas(A, *, n_block_size=64, block_size=16):
-    """Inverts unit lower triangular matrices using a block-wise approach in Pallas.
+    """Pallas TPU kernel that inverts a stack of unit lower-triangular matrices.
 
-    This function solves A X = I for X, where A is a unit lower triangular matrix.
-    It uses a block-wise Gaussian elimination approach to improve performance.
+    Solves :math:`A X = I` for ``X`` where every ``N x N`` slab of ``A`` is
+    unit lower-triangular. The leading dimensions are first squashed into
+    a single batch axis, then partitioned along that axis in chunks of
+    ``n_block_size`` matrices per Pallas program. Within each program,
+    :func:`decompose_triangular_matrix_inverse_pallas_kernel` performs
+    blockwise Gaussian elimination, sweeping through ``N // block_size``
+    row-blocks and using :func:`local_forward_substitution` for each
+    inner block.
+
+    The kernel sets ``vmem_limit_bytes`` to 64 MiB so it can hold the
+    full ``(n_block_size, N, N)`` slab in VMEM without spills.
 
     Args:
-      A: A tensor of shape (batch_size, chunks, heads, head_dim, head_dim) where
-        the last two dimensions represent unit lower triangular matrices.
-      n_block_size: The block size for Pallas grid execution.
-      block_size: The block size for the block-wise inversion algorithm.
+        A: Tensor of shape ``(..., N, N)`` whose last two dimensions form
+            unit lower-triangular matrices. The leading dimensions are
+            arbitrary (e.g. ``(batch, num_chunks, num_heads, N, N)`` for
+            the chunked GDR path).
+        n_block_size: Number of leading-axis matrices that each Pallas
+            program processes. Larger values amortise launch overhead but
+            increase per-program VMEM footprint.
+        block_size: Inner block size used by the Gaussian elimination
+            sweep; ``N`` must be a multiple of ``block_size``.
 
     Returns:
-      A tensor of the same shape as A, representing the inverse of A.
+        jnp.ndarray: Inverse of ``A`` with the same shape and dtype.
     """
 
     # Squash all the leading dimensions
@@ -191,10 +293,22 @@ def decompose_triangular_matrix_inverse_pallas(A, *, n_block_size=64, block_size
 
 
 def triangular_inverse_jax(A):
-    """Pure-JAX inverse of unit lower-triangular matrices (any backend).
+    """Backend-agnostic unit lower-triangular inverse via ``jax.scipy``.
 
-    Uses ``jax.scipy.linalg.solve_triangular`` to solve :math:`A X = I`
-    column-by-column.  Works on TPU, GPU and CPU without Pallas.
+    Computes :math:`A^{-1}` column-by-column using
+    :func:`jax.scipy.linalg.solve_triangular` against an identity batch.
+    Acts as the portable fallback selected by :class:`TriangleSolverImpl`
+    when the Pallas TPU paths are not available (non-TPU backend, mixed
+    dtypes the Pallas kernel does not support, or unit-test reference
+    flows).
+
+    Args:
+        A: Tensor of shape ``(..., N, N)`` whose last two dimensions form
+            unit lower-triangular matrices. Leading dimensions are
+            preserved.
+
+    Returns:
+        jnp.ndarray: Inverse with the same shape and dtype as ``A``.
     """
     shape = A.shape
     A_2d = A.reshape(-1, shape[-2], shape[-1])
@@ -205,11 +319,33 @@ def triangular_inverse_jax(A):
 
 
 class TriangleSolverImpl(enum.StrEnum):
+    """Selector for the unit lower-triangular inverse implementation.
+
+    Members:
+        GAUSSIAN: Blockwise Gaussian elimination via Pallas TPU kernel
+            (:func:`decompose_triangular_matrix_inverse_pallas`).
+        NEWTON_SCHULZ: Newton-Schulz iteration via Pallas TPU kernel
+            (:func:`newton_schulz_inverse_pallas`).
+        JAX: Portable pure-JAX path via
+            :func:`triangular_inverse_jax`.
+    """
+
     GAUSSIAN = "gaussian"
     NEWTON_SCHULZ = "newton_schulz"
     JAX = "jax"
 
     def __call__(self, A):
+        """Invoke the selected inverse implementation.
+
+        Args:
+            A: Tensor whose last two dimensions form unit lower-triangular
+                ``N x N`` matrices.
+
+        Returns:
+            jnp.ndarray: The inverse of ``A`` along the last two
+            dimensions, computed by the chosen backend. Falls back to
+            :data:`GAUSSIAN` when the value is unknown.
+        """
         if self == TriangleSolverImpl.GAUSSIAN:
             return decompose_triangular_matrix_inverse_pallas(A, n_block_size=min(64, A.shape[-1]))
         elif self == TriangleSolverImpl.NEWTON_SCHULZ:
@@ -222,15 +358,23 @@ class TriangleSolverImpl(enum.StrEnum):
 
 
 def l2norm(x: jnp.ndarray, dim: int = -1, eps: float = 1e-6) -> jnp.ndarray:
-    """Normalizes x along the specified dimension using L2 norm.
+    """Normalize ``x`` to unit L2 norm along ``dim``.
+
+    Implementation uses ``rsqrt`` for stability:
+    ``inv_norm = rsqrt(sum(x*x, axis=dim) + eps)`` then
+    ``x_normalized = x * inv_norm``. The epsilon is added inside the
+    rsqrt to keep the operation well-defined for zero-magnitude inputs.
 
     Args:
-      x: Input array.
-      dim: Dimension along which to normalize.
-      eps: Epsilon value to avoid division by zero.
+        x: Input tensor; any shape and floating dtype is accepted.
+        dim: Axis to reduce; defaults to the trailing axis.
+        eps: Stability epsilon mixed in before the rsqrt to bound the
+            output magnitude when ``x`` is identically zero. Small values
+            (~1e-6) preserve numerical fidelity for normal inputs.
 
     Returns:
-      Normalized array.
+        jnp.ndarray: Same shape and dtype as ``x``, with the squared
+        elements along ``dim`` summing to approximately 1.
     """
     inv_norm = jax.lax.rsqrt((x * x).sum(axis=dim, keepdims=True) + jnp.array(eps, dtype=x.dtype))
     return x * inv_norm
@@ -285,27 +429,34 @@ def pack_inputs_single_stream(
       (Indicates whether each chunk starts a new sequence)
 
     Args:
-      query: Query tensor.
-      key: Key tensor.
-      value: Value tensor.
-      g: Gate tensor.
-      beta: Beta tensor.
-      query_start_loc: Start locations of each sequence in original stream.
-      distribution: Distribution tensor containing number of valid sequences at
-        index 2.
-      chunk_size: Chunk size for padding.
-      compute_dtype: Dtype for computation (Q, K, V, beta).
+        query: Ragged queries of shape ``(num_tokens, num_heads, d_k)`` in
+            the unpadded original stream.
+        key: Ragged keys with the same layout as ``query``.
+        value: Ragged values of shape ``(num_tokens, num_heads, d_v)``.
+        g: Per-token log-space gate of shape ``(num_tokens, num_heads)``,
+            float32.
+        beta: Per-token gating coefficient of shape
+            ``(num_tokens, num_heads)``.
+        query_start_loc: Cumulative per-request token offsets of shape
+            ``(num_requests + 1,)`` describing the request boundaries in
+            the original stream.
+        distribution: ``(decode_end, prefill_end, total)`` int32 triple;
+            only the third entry (number of valid requests) is consumed
+            here to mask out trailing inactive slots.
+        chunk_size: Pad each request to a multiple of this size.
+        compute_dtype: Dtype to cast Q/K/V/beta into for the chunked
+            kernel (typically ``bfloat16``); ``g`` stays in float32.
 
     Returns:
-      A tuple containing:
-        - packed_query: Packed query tensor.
-        - packed_key: Packed key tensor.
-        - packed_value: Packed value tensor.
-        - packed_g: Packed gate tensor.
-        - packed_beta: Packed beta tensor.
-        - reset_mask: Mask indicating start of sequences (per chunk).
-        - new_query_start_loc: Start locations in packed stream.
-        - padded_indices_valid: Indices mapping original to packed.
+        tuple: ``(packed_query, packed_key, packed_value, packed_g,
+        packed_beta, reset_mask, new_query_start_loc, padded_indices_valid)``
+        where the packed tensors live in the chunked stream of length
+        ``num_chunks * chunk_size``, ``reset_mask`` is a boolean array of
+        shape ``(num_chunks,)`` true at chunk boundaries that start a
+        fresh request, ``new_query_start_loc`` describes request
+        boundaries in the packed stream, and ``padded_indices_valid``
+        gives per-original-token indices into the packed buffer for use
+        when scattering outputs back.
     """
     num_tokens = query.shape[0]
     num_seqs = len(query_start_loc) - 1
@@ -402,32 +553,46 @@ def ragged_gated_delta_rule_mixed_prefill(
     within chunks, and sequentially across chunks.
 
     Args:
-      query: Query tensor.
-      key: Key tensor.
-      value: Value tensor.
-      b_reshaped: Reshaped b tensor (for beta).
-      a_reshaped: Reshaped a tensor (for g).
-      A_log: A_log tensor.
-      dt_bias: dt_bias tensor.
-      query_start_loc: Start locations of sequences in original stream.
-      recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
-        d_v)`. `num_blocks` is always equal or larger than `max_seqs + 1`. The
-        first block is a null_block and only used for padded / invalid tokens.
-      state_indices: Indices mapping sequences to recurrent state slots.
-      distribution: Distribution tensor containing number of valid sequences at
-        index 2.
-      chunk_size: Chunk size for padding and processing.
-      use_qk_norm_in_gdn: Whether to use QK normalization.
-      compute_dtype: Dtype for computation.
-      precision: Precision for matrix multiplication.
-      preferred_element_type: Preferred element type for matrix multiplication.
-      triangle_solver_impl: Which triangle solver implementation to use.
+        query: Ragged queries ``(num_tokens, n_v, d_k)`` already expanded
+            from the grouped layout (so head count matches ``n_v``).
+        key: Ragged keys with the same shape as ``query``.
+        value: Ragged values ``(num_tokens, n_v, d_v)``.
+        b_reshaped: Pre-sigmoid beta source ``(num_tokens, n_v)``;
+            sigmoided in-place to produce the gating coefficient.
+        a_reshaped: Pre-softplus alpha source ``(num_tokens, n_v)``;
+            combined with ``A_log`` and ``dt_bias`` to form the log-space
+            decay.
+        A_log: Per-head log-decay parameter ``(n_v,)``.
+        dt_bias: Per-head delta-time bias ``(n_v,)``.
+        query_start_loc: Cumulative per-request offsets in the original
+            stream, shape ``(num_requests + 1,)``.
+        recurrent_state: Global state pool of shape
+            ``(num_blocks, n_v, d_k, d_v)`` where ``num_blocks >= max_reqs
+            + 1``; the first block is a null block reserved for padded /
+            invalid tokens.
+        state_indices: Per-request mapping into ``recurrent_state``,
+            shape ``(num_requests,)``.
+        distribution: Triple ``[decode_end, prefill_end, total]``; the
+            third entry gates which slots have outputs to write.
+        chunk_size: Padding and chunking granularity for the parallel
+            intra-chunk attention.
+        use_qk_norm_in_gdn: Whether to L2-normalize Q and K before the
+            chunked attention.
+        compute_dtype: Dtype for the chunked Q/K/V/beta tensors.
+        precision: ``lax.Precision`` for the matmul calls; defaults to
+            ``HIGHEST`` to keep numerical stability across long
+            recurrences.
+        preferred_element_type: Accumulation dtype for ``jnp.matmul``.
+        triangle_solver_impl: Selector for the unit lower-triangular
+            inverse used to solve for the per-chunk attention weights.
+            Defaults to the Pallas TPU Gaussian solver on TPU and the
+            portable JAX path otherwise.
 
     Returns:
-      A tuple containing:
-        - updated_recurrent_state: Updated recurrent state tensor of shape
-          `(num_blocks, n_v, d_k, d_v)`.
-        - output: Output tensor.
+        tuple: ``(updated_recurrent_state, output)`` where
+        ``updated_recurrent_state`` has shape
+        ``(num_blocks, n_v, d_k, d_v)`` and ``output`` has shape
+        ``(num_tokens, n_v * d_v)`` cast back to ``query.dtype``.
     """
     if triangle_solver_impl is None:
         triangle_solver_impl = TriangleSolverImpl.GAUSSIAN if jax.default_backend() == "tpu" else TriangleSolverImpl.JAX
@@ -702,14 +867,45 @@ _PALLAS_GDN_BTOK_CANDIDATES = (16, 8, 4)
 
 
 def set_gdn_kernel_tile_policy(policy: str) -> None:
-    """Set the TPU Pallas GDN decode tile policy for future traces."""
+    """Set the TPU Pallas GDN decode tile policy for future traces.
+
+    Updates the module-level ``_PALLAS_GDN_TILE_POLICY`` consulted by
+    :func:`_select_pallas_gdn_btok` when the operation is next traced. Also
+    invoked indirectly via the ``EASYDEL_GDN_TILE_POLICY`` environment
+    variable.
+
+    Args:
+        policy: One of ``"auto"``, ``"b16"``, ``"b8"`` or ``"b4"`` (case
+            insensitive). ``"auto"`` lets the kernel pick a tile size based
+            on VMEM-window heuristics.
+
+    Raises:
+        ValueError: If ``policy`` is not one of the supported variants.
+    """
 
     global _PALLAS_GDN_TILE_POLICY
     _PALLAS_GDN_TILE_POLICY = normalize_kernel_tile_policy(policy)
 
 
 def _select_pallas_gdn_btok(num_tokens: int, n_v: int, d_k: int, d_v: int, dtype) -> int | None:
-    """Choose a TPU tile that keeps Mosaic VMEM windows under control."""
+    """Choose a TPU tile that keeps Mosaic VMEM windows under control.
+
+    Honours the ``_PALLAS_GDN_TILE_POLICY`` global. In ``"auto"`` mode it
+    iterates over ``(16, 8, 4)`` candidates and returns the first that both
+    divides ``num_tokens`` and keeps ``2 * b_tok * n_v * d_k * d_v *
+    bytes_per`` under a 14 MiB cap (input + output state windows).
+
+    Args:
+        num_tokens: Total tokens packed into the decode batch.
+        n_v: Number of value heads in the kernel.
+        d_k: Key/query head dimension.
+        d_v: Value head dimension.
+        dtype: Input dtype, used to estimate per-element bytes.
+
+    Returns:
+        int | None: The chosen ``b_tok`` value, or ``None`` if no candidate
+        fits the constraints (in which case the JAX fallback is used).
+    """
 
     policy = _PALLAS_GDN_TILE_POLICY
     if policy != "auto":
@@ -735,11 +931,31 @@ def _select_pallas_gdn_btok(num_tokens: int, n_v: int, d_k: int, d_v: int, dtype
 
 
 def _pallas_gdn_decode_call(q, k, v, beta, exp_g, state, valid, *, b_tok: int):
-    """Run the fused Pallas kernel. Returns (new_state_pool, outputs_3d).
+    """Run the fused Pallas decode kernel and return ``(outputs, new_state)``.
+
+    Wraps :func:`_pallas_gdn_decode_kernel` in a ``pallas_call`` with a
+    ``(T // b_tok,)`` grid. ``beta``, ``exp_g`` and ``valid`` are broadcast
+    into 128-wide lane-aligned tensors before being handed to the kernel.
 
     Assumes:
-        - state_indices is identity: token i corresponds to slot i.
-        - ``q.shape[0]`` is divisible by the selected Pallas tile.
+        - ``state_indices`` is identity (token ``i`` corresponds to slot ``i``).
+        - ``q.shape[0]`` is divisible by the selected Pallas tile size.
+
+    Args:
+        q: Query tensor of shape ``(T, H, D_K)``.
+        k: Key tensor of shape ``(T, H, D_K)``.
+        v: Value tensor of shape ``(T, H, D_V)``.
+        beta: Per-token gating coefficients of shape ``(T, H)``.
+        exp_g: Per-token decay (already ``exp``-applied) of shape ``(T, H)``.
+        state: Per-slot recurrent state of shape ``(T, H, D_K, D_V)``.
+        valid: Boolean validity mask of shape ``(T,)`` indicating which
+            tokens are real vs padding.
+        b_tok: Pallas tile size along the token axis. Must divide ``T``.
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray]: ``(outputs, new_state)`` where
+        ``outputs`` has shape ``(T, H, D_V)`` and ``new_state`` has shape
+        ``(T, H, D_K, D_V)``.
     """
     T, H, D_K = q.shape
     D_V = v.shape[-1]
@@ -782,7 +998,26 @@ def recurrent_gated_delta_rule_step(
     beta: jnp.ndarray,
     state: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Single-step recurrent update for decode."""
+    """Single-step recurrent update for gated-delta-rule decode.
+
+    Reference pure-JAX implementation of one decode step of the Gated Delta
+    Rule recurrence used by Qwen3-Next style models. Useful as a numerical
+    check for the Pallas decode kernel.
+
+    Args:
+        query: Query tensor of shape ``(B, H, d_k)``.
+        key: Key tensor of shape ``(B, H, d_k)``.
+        value: Value tensor of shape ``(B, H, d_v)``.
+        g: Log-space decay of shape ``(B, H)``.
+        beta: Gating coefficient of shape ``(B, H)``.
+        state: Optional initial recurrent state of shape
+            ``(B, H, d_k, d_v)``. Defaults to all-zeros when ``None``.
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray]: ``(out, new_state)`` where ``out``
+        has shape ``(B, H, d_v)`` and ``new_state`` has shape
+        ``(B, H, d_k, d_v)``.
+    """
     B, H, d_k = query.shape
     d_v = value.shape[-1]
 
@@ -828,27 +1063,32 @@ def ragged_gated_delta_rule_decode_only(
     """Applies gated delta rule for decode-only case (sequence lengths = 1).
 
     Args:
-      query: Query tensor.
-      key: Key tensor.
-      value: Value tensor.
-      b_reshaped: Reshaped b tensor (for beta).
-      a_reshaped: Reshaped a tensor (for g).
-      recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
-        d_v)`. `num_blocks` is always equal or larger than `max_seqs + 1`. The
-        first block is a null_block and only used for padded / invalid tokens.
-      A_log: A_log tensor.
-      dt_bias: dt_bias tensor.
-      query_start_loc: Start locations of sequences.
-      state_indices: Indices mapping sequences to recurrent state slots.
-      distribution: Distribution tensor containing number of valid sequences at
-        index 2.
-      use_qk_norm_in_gdn: Whether to use QK normalization.
+        query: Per-token queries ``(num_tokens, n_v, d_k)`` (already
+            expanded to value-head count).
+        key: Per-token keys with the same shape as ``query``.
+        value: Per-token values ``(num_tokens, n_v, d_v)``.
+        b_reshaped: Pre-sigmoid beta source ``(num_tokens, n_v)``.
+        a_reshaped: Pre-softplus alpha source ``(num_tokens, n_v)``.
+        recurrent_state: Global state pool of shape
+            ``(num_blocks, n_v, d_k, d_v)`` where the first block is a
+            null block reserved for padding / invalid tokens.
+        A_log: Per-head log-decay ``(n_v,)``.
+        dt_bias: Per-head delta-time bias ``(n_v,)``.
+        query_start_loc: Cumulative per-request offsets, shape
+            ``(num_requests + 1,)``.
+        state_indices: Request-to-slot mapping, shape ``(num_requests,)``.
+        distribution: ``[decode_end, prefill_end, total]`` int32 triple;
+            ``distribution[2]`` is consulted to mask outputs of inactive
+            tokens.
+        use_qk_norm_in_gdn: Whether to L2-normalize Q and K before the
+            decode update.
 
     Returns:
-      A tuple containing:
-        - updated_recurrent_state: Updated recurrent state tensor of shape
-          `(num_blocks, n_v, d_k, d_v)`.
-        - output: Output tensor.
+        tuple: ``(updated_recurrent_state, output)`` where the state has
+        shape ``(num_blocks, n_v, d_k, d_v)`` and the output has shape
+        ``(num_tokens, n_v * d_v)``. Output rows for tokens with
+        ``token_idx >= distribution[2]`` are zeroed and the corresponding
+        state slots are left untouched.
     """
     num_tokens = query.shape[0]
     max_reqs = recurrent_state.shape[0]
@@ -971,30 +1211,35 @@ def ragged_gated_delta_rule(
     depending on sequence lengths.
 
     Args:
-      mixed_qkv: Mixed query, key, value tensor.
-      b: b tensor (for beta).
-      a: a tensor (for g).
-      recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
-        d_v)`. `num_blocks` is always equal or larger than `max_reqs + 1`. The
-        first block is a null_block and only used for padded / invalid tokens.
-      A_log: A_log tensor.
-      dt_bias: dt_bias tensor.
-      query_start_loc: Start locations of sequences.
-      state_indices: Indices mapping sequences to recurrent state slots.
-      distribution: Tensor of shape `(3,)` int32 — `(decode_end, prefill_end,
-        mixed_end)`.
-      n_kq: Number of key/query heads.
-      n_v: Number of value heads.
-      d_k: Key/query dimension.
-      d_v: Value dimension.
-      chunk_size: Chunk size for padding in mixed prefill.
-      use_qk_norm_in_gdn: Whether to use QK normalization.
+        mixed_qkv: Interleaved Q/K/V projections in a single flat feature
+            dimension, shape ``(num_tokens, 2 * n_kq * d_k + n_v * d_v)``.
+            The first ``n_kq * d_k`` features hold queries, the next
+            ``n_kq * d_k`` features hold keys, and the remaining
+            ``n_v * d_v`` features hold values.
+        b: Pre-sigmoid beta source ``(num_tokens, n_v)``.
+        a: Pre-softplus alpha source ``(num_tokens, n_v)``.
+        recurrent_state: Global state pool ``(num_blocks, n_v, d_k, d_v)``
+            with ``num_blocks >= max_reqs + 1``; block 0 is the null
+            block reserved for padded slots.
+        A_log: Per-head log-decay ``(n_v,)``.
+        dt_bias: Per-head delta-time bias ``(n_v,)``.
+        query_start_loc: Cumulative per-request offsets,
+            shape ``(num_requests + 1,)``.
+        state_indices: Request-to-slot mapping, shape ``(num_requests,)``.
+        distribution: ``int32[3]`` ``(decode_end, prefill_end, mixed_end)``
+            classifying scheduled requests; controls the
+            ``decode_only_branch`` / ``mixed_prefill_branch`` selection.
+        n_kq: Number of key/query heads (before head expansion).
+        n_v: Number of value heads (after the GQA-style expansion).
+        d_k: Per-head key/query dimension.
+        d_v: Per-head value dimension.
+        chunk_size: Padding granularity used by the mixed-prefill branch.
+        use_qk_norm_in_gdn: Whether to L2-normalize queries and keys.
 
     Returns:
-      A tuple containing:
-        - updated_recurrent_state: Updated recurrent state tensor of shape
-          `(num_blocks, n_v, d_k, d_v)`.
-        - output: Output tensor.
+        tuple: ``(updated_recurrent_state, output)`` with state of shape
+        ``(num_blocks, n_v, d_k, d_v)`` and output of shape
+        ``(num_tokens, n_v * d_v)`` cast to ``mixed_qkv.dtype``.
     """
     num_tokens = mixed_qkv.shape[0]
     key_dim = n_kq * d_k
@@ -1068,6 +1313,11 @@ class RaggedGatedDeltaRule(OperationImpl):
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
+        """Return the registry name for this operation.
+
+        Returns:
+            str: ``"ragged_gated_delta_rule_v2"``.
+        """
         return "ragged_gated_delta_rule_v2"
 
     @classmethod
@@ -1113,7 +1363,14 @@ class RaggedGatedDeltaRule(OperationImpl):
         chunk_size: int = 64,
         use_qk_norm_in_gdn: bool = True,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Forward pass for ragged gated delta rule.
+        """Run :func:`ragged_gated_delta_rule` under a head-parallel ``shard_map``.
+
+        Splits the flat ``mixed_qkv`` feature axis into Q / K / V tensors,
+        expands key / query heads when ``n_v > n_kq`` (GQA-style), and
+        wraps a per-shard call to :func:`ragged_gated_delta_rule` in
+        :func:`jax.shard_map`. The mesh axis used for head sharding is
+        resolved from the operation metadata's BTHD sharding spec, so
+        this op transparently follows the model's TP layout.
 
         Args:
             mixed_qkv: Post-convolution mixed QKV tensor,
@@ -1262,16 +1519,62 @@ class RaggedGatedDeltaRule(OperationImpl):
         return new_state, output
 
     def forward_tpu(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """TPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional args (see :meth:`forward_native`).
+            **kwargs: Forwarded keyword args (see :meth:`forward_native`).
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray]: ``(updated_recurrent_state,
+            output)`` from :meth:`forward_native`.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_gpu(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """GPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional args.
+            **kwargs: Forwarded keyword args.
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray]: Same as :meth:`forward_native`.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """CPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional args.
+            **kwargs: Forwarded keyword args.
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray]: Same as :meth:`forward_native`.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """CUDA dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional args.
+            **kwargs: Forwarded keyword args.
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray]: Same as :meth:`forward_native`.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """ROCm dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional args.
+            **kwargs: Forwarded keyword args.
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray]: Same as :meth:`forward_native`.
+        """
         return self.forward_native(*args, **kwargs)

@@ -86,27 +86,51 @@ class MetadataField(Flag):
 
     @classmethod
     def basic(cls) -> "MetadataField":
-        """Basic metadata for simple attention operations."""
+        """Return the minimal metadata bundle for simple attention ops.
+
+        Returns:
+            MetadataField: ``SEQ_LENS | POSITIONS | LOGITS_INDICES``.
+        """
         return cls.SEQ_LENS | cls.POSITIONS | cls.LOGITS_INDICES
 
     @classmethod
     def ragged(cls) -> "MetadataField":
-        """Metadata for ragged batch format."""
+        """Return metadata for ragged-batch attention.
+
+        Returns:
+            MetadataField: :meth:`basic` extended with ``QUERY_START_LOC``
+            and ``CONTEXT_LENS``.
+        """
         return cls.basic() | cls.QUERY_START_LOC | cls.CONTEXT_LENS
 
     @classmethod
     def paged_v2(cls) -> "MetadataField":
-        """Metadata for RPA v2 paged attention."""
+        """Return metadata for RPA v2 paged attention.
+
+        Returns:
+            MetadataField: :meth:`ragged` extended with ``PAGES_TABLES`` and
+            ``SLOT_MAPPING``.
+        """
         return cls.ragged() | cls.PAGES_TABLES | cls.SLOT_MAPPING
 
     @classmethod
     def paged_v3(cls) -> "MetadataField":
-        """Metadata for RPA v3 paged attention."""
+        """Return metadata for RPA v3 paged attention.
+
+        Returns:
+            MetadataField: :meth:`ragged` extended with ``PAGES_TABLES`` and
+            ``REQUEST_DISTRIBUTION``.
+        """
         return cls.ragged() | cls.PAGES_TABLES | cls.REQUEST_DISTRIBUTION
 
     @classmethod
     def recurrent(cls) -> "MetadataField":
-        """Metadata for recurrent/state space models."""
+        """Return metadata for recurrent / state-space models.
+
+        Returns:
+            MetadataField: :meth:`basic` extended with ``HAS_INITIAL_STATE``
+            and ``STATE_INDICES``.
+        """
         return cls.basic() | cls.HAS_INITIAL_STATE | cls.STATE_INDICES
 
 
@@ -133,12 +157,20 @@ class CacheType(Flag):
 
     @classmethod
     def any(cls) -> "CacheType":
-        """Any cache type - operation is cache-agnostic."""
+        """Return the union of every cache type, marking the op as cache-agnostic.
+
+        Returns:
+            CacheType: ``TRANSFORMER | RAGGED_PAGES | RECURRENT | HYBRID``.
+        """
         return cls.TRANSFORMER | cls.RAGGED_PAGES | cls.RECURRENT | cls.HYBRID
 
     @classmethod
     def attention(cls) -> "CacheType":
-        """Cache types suitable for attention operations."""
+        """Return the cache types suitable for attention operations.
+
+        Returns:
+            CacheType: ``TRANSFORMER | RAGGED_PAGES | HYBRID``.
+        """
         return cls.TRANSFORMER | cls.RAGGED_PAGES | cls.HYBRID
 
     def is_compatible_with(self, other: "CacheType") -> bool:

@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Metadata and sharding-rule definitions for EasyDeL attention operations.
+
+This module exposes:
+
+* :class:`AttnShardingRules` - a ``NamedTuple`` of ``PartitionSpec`` entries
+  for every tensor that flows through an attention kernel (query, key, value,
+  bias, mask, output, segment ids, optional softmax auxiliary output).
+* :class:`OperationMetadata` - the runtime configuration object passed to
+  every concrete :class:`~easydel.operations.OperationImpl`. It centralises
+  dtype, mesh, sharding policy, backend/platform selection, and per-operation
+  ejkernel configuration.
+
+These classes are consumed by the kernels under
+``easydel/operations/kernels/`` and by the higher-level attention dispatch
+machinery in ``easydel.layers``.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -207,17 +224,22 @@ class OperationMetadata:
 
     @classmethod
     def from_config(cls, config: EasyDeLBaseConfig) -> OperationMetadata:
-        """
-        Factory method to create OperationMetadata from an EasyDeLBaseConfig.
+        """Factory method to create OperationMetadata from an EasyDeLBaseConfig.
+
+        Pulls dtype, sharding, platform/backend, and operation-config defaults
+        directly off the model config so all attention operators inside the
+        same model share identical runtime behaviour.
 
         Args:
-            config: The base configuration object (e.g., model config).
-            softmax_scale: The attention softmax scaling factor. Usually calculated
-                based on head dimension.
-            dropout_prob: The attention dropout probability. Defaults to 0.0.
+            config: The base configuration object (e.g. a model config). The
+                following attributes are consulted: ``attn_dtype``,
+                ``attn_softmax_dtype``, ``sequence_axis_name``, ``platform``,
+                ``backend``, ``axis_policy``, and the optional
+                ``operation_configs``.
 
         Returns:
-            An initialized OperationMetadata instance.
+            OperationMetadata: An initialized instance whose ``base_config``
+            field references ``config`` for further on-demand lookups.
         """
         return cls(
             runtime_dtype=config.attn_dtype,
@@ -232,7 +254,14 @@ class OperationMetadata:
 
     @property
     def mesh(self) -> StageMesh:
-        """Get current mesh from base_config if available, otherwise return stored mesh."""
+        """Resolved JAX mesh used by attention kernels.
+
+        Returns:
+            StageMesh: The mesh attached to ``base_config`` if it is set,
+            otherwise the mesh that was supplied at construction time and
+            stored in ``_stored_mesh``. Returns ``None`` when no mesh is
+            available.
+        """
         if self.base_config is not None:
             mesh = self.base_config.mesh
         else:
@@ -243,7 +272,12 @@ class OperationMetadata:
 
     @mesh.setter
     def mesh(self, value: MeshLike | None):
-        """Set mesh value for cases where base_config is not available."""
+        """Override the stored mesh.
+
+        Args:
+            value: The new mesh to associate with this metadata. Used when no
+                ``base_config`` is available to source the mesh from.
+        """
         self._stored_mesh = value
 
     def get_shardings(

@@ -12,7 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for the Qwen3Next hybrid attention model."""
+"""Configuration for the Qwen3Next hybrid attention model.
+
+Defines :class:`Qwen3NextConfig`, the EasyDeL configuration object for
+Alibaba's Qwen3-Next hybrid architecture. The configuration captures:
+
+- Standard Qwen3 hyperparameters (hidden size, depth, GQA head counts,
+  RMSNorm epsilon, RoPE theta/scaling).
+- Hybrid layer schedule controls (which layers use full attention vs.
+  GatedDeltaNet linear attention).
+- Linear-attention specifics: number of value heads, head/value
+  dimensions, depthwise convolution width (``d_conv``), and per-head
+  decay/beta parameterization.
+- MoE controls: number of experts, top-k routing, ``moe_intermediate_size``,
+  optional shared-expert intermediate size, and the auxiliary-loss
+  coefficient used for load balancing.
+
+Also includes the :func:`_ensure_loss_tensor` helper used by the
+modeling code to harmonize the auxiliary-loss return type across
+dispatch paths.
+"""
 
 from eformer.loggings import get_logger
 
@@ -23,7 +42,27 @@ logger = get_logger(__name__)
 
 
 def _ensure_loss_tensor(result, gate_logits):
-    """Wrap a plain Python numeric loss in a torch tensor on the right device."""
+    """Coerce a scalar HF aux-loss return value to a tensor.
+
+    Some HuggingFace versions of ``load_balancing_loss_func`` short-
+    circuit and return a plain Python ``int``/``float`` (typically
+    ``0``) when the inputs degenerate. Downstream code in
+    ``Qwen3NextForCausalLM`` expects a torch tensor on the same
+    device as the gate logits so it can be summed into the model's
+    auxiliary loss without a dtype/device mismatch.
+
+    Args:
+        result: Either a scalar number returned by the HF aux-loss
+            function, or an already-tensorised loss value.
+        gate_logits: The original ``gate_logits`` argument passed to
+            the HF function — used to recover a target device when
+            ``result`` is a Python scalar.
+
+    Returns:
+        ``result`` unchanged when it is already a tensor; otherwise a
+        ``torch.Tensor`` wrapping ``float(result)`` on the device of
+        the first gate-logits entry.
+    """
     if isinstance(result, (int, float)):
         import torch
 
@@ -35,7 +74,25 @@ def _ensure_loss_tensor(result, gate_logits):
 
 
 def _patch_hf_qwen3_next_load_balancing_loss() -> None:
-    """HF compatibility: guard Qwen3-Next aux-loss mask shape regressions."""
+    """Monkey-patch HF's Qwen3-Next aux-loss to be shape-resilient.
+
+    Several ``transformers`` releases exposed an ``attention_mask``
+    shape regression in
+    ``hf_qwen3_next.load_balancing_loss_func``: when the mask had
+    fewer dimensions than the gate logits, the upstream function
+    raised in the middle of training, and when the inputs degenerated
+    it occasionally returned a plain Python scalar instead of a
+    tensor. This helper wraps the function with a defensive shim that:
+
+    1. Catches the shape error and falls back to passing ``None`` for
+       the mask, which yields the unmasked load-balancing estimate
+       that earlier HF versions produced.
+    2. Wraps any scalar return value with :func:`_ensure_loss_tensor`
+       so the result is always a torch tensor.
+
+    The patch is idempotent (guarded by the ``_easydel_qwen3_next_lb_patch``
+    sentinel) and silently no-ops when ``transformers`` is missing.
+    """
     try:
         from transformers.models.qwen3_next import modeling_qwen3_next as hf_qwen3_next
     except Exception:
@@ -51,6 +108,15 @@ def _patch_hf_qwen3_next_load_balancing_loss() -> None:
         top_k=2,
         attention_mask=None,
     ):
+        """HF-compatible Qwen3-Next load-balancing loss with mask-shape guard.
+
+        Wraps :func:`hf_qwen3_next.load_balancing_loss_func` to guarantee
+        a tensor return value and to recover gracefully from an upstream
+        regression where some HF snapshots compute an invalid expert
+        attention mask shape on small synthetic inputs. On the second
+        ``RuntimeError`` it falls back to a zero-tensor on the correct
+        device.
+        """
         try:
             result = original_fn(
                 gate_logits=gate_logits,
@@ -89,6 +155,14 @@ def _patch_hf_qwen3_next_load_balancing_loss() -> None:
         ):
 
             def _patched_get_seq_length(self, layer_idx: int | None = 0) -> int:  # type: ignore[override]
+                """Return 0 instead of indexing into an empty Qwen3-Next dynamic cache.
+
+                Guards :meth:`Qwen3NextDynamicCache.get_seq_length`
+                against the upstream regression where the method assumes
+                ``self.transformer_layers`` is non-empty; before any
+                tokens have been cached the list is empty and the
+                original implementation raises ``IndexError``.
+                """
                 if not getattr(self, "transformer_layers", None):
                     return 0
                 return original_get_seq_length(self, layer_idx)
@@ -246,7 +320,18 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
 
     @property
     def rotary_dim(self) -> int:
-        """Return the dimension used for rotary embeddings (partial RoPE)."""
+        """Number of trailing head channels rotated by RoPE.
+
+        Qwen3-Next uses *partial* rotary embeddings: only the leading
+        ``head_dim * partial_rotary_factor`` channels of each query/key
+        head are rotated; the remainder are passed through unchanged.
+        This property returns the rotated channel count as an integer
+        suitable for sizing precomputed ``cos``/``sin`` tables.
+
+        Returns:
+            Integer number of channels (always between ``0`` and
+            ``head_dim``).
+        """
         return int(self.head_dim * self.partial_rotary_factor)
 
     @property
@@ -263,7 +348,19 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
 
     @property
     def linear_d_state(self) -> int:
-        """Return the state dimension for linear attention recurrence."""
+        """Recurrent-state dimension for the linear-attention layers.
+
+        Qwen3-Next's gated-delta-net (GDN) linear-attention blocks
+        carry a recurrent state of shape
+        ``(batch, num_v_heads, head_v_dim, value_dim)``. The trailing
+        per-head value dimension equals
+        :attr:`linear_value_head_dim`; this property surfaces it as a
+        named ``d_state`` so caching / Pallas-fused-decode utilities
+        do not have to chase the raw config attribute.
+
+        Returns:
+            Per-head linear-attention state dimension.
+        """
         return self.linear_value_head_dim
 
     def is_full_attention_layer(self, layer_idx: int) -> bool:

@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen3-VL-MoE multimodal model implementation for EasyDeL.
+
+This module implements the Mixture-of-Experts variant of Qwen3-VL: the
+same vision tower and 3-D mRoPE language schedule as Qwen3-VL, but with
+the dense MLP in the language backbone replaced by a routed sparse MoE
+block (with optional shared expert).
+
+Exposes the vision tower components, the LM trunk
+:class:`Qwen3VLMoeModel`, and the multimodal wrapper
+:class:`Qwen3VLMoeForConditionalGeneration`. Token-to-expert routing
+contributes a load-balancing auxiliary loss when training.
+"""
+
 import math
 import typing
 from functools import cached_property, partial
@@ -112,7 +125,19 @@ class Qwen3VLMoeModelOutputWithPast(ModelOutput):
 
 
 def _dbg_tail(x: Array) -> Array:  # pyright: ignore[reportUnusedFunction]
-    """Return the last 5 flattened elements for compact debug prints."""
+    """Return the last five flattened elements of an array for debug prints.
+
+    Helper used when iterating on numerical-correctness issues during
+    development: printing the tail of an internal tensor is cheap and
+    surfaces the most commonly mutated positions (e.g. the latest
+    decoded tokens) without dumping the whole tensor.
+
+    Args:
+        x: Any JAX array.
+
+    Returns:
+        A 1-D array containing the final five values of ``ravel(x)``.
+    """
     flat = jnp.ravel(x)
     return flat[-5:]
 
@@ -304,7 +329,28 @@ def merge_multimodal_embeddings(
     multimodal_embeddings: jax.Array,
     placeholder_token_id: int | list[int],
 ) -> jax.Array:
-    """Overwrite inputs_embeds wherever input_ids matches placeholder tokens."""
+    """Splice vision embeddings into a text embedding sequence.
+
+    Wraps the JIT-friendly cumsum-gather core implemented in
+    :func:`_merge_multimodal_embeddings`: positions in ``input_ids``
+    matching one of the placeholder ids are replaced with successive
+    rows from ``multimodal_embeddings`` (scanned left-to-right), and
+    every other position keeps its text embedding.
+
+    Args:
+        input_ids: Token ids of shape ``(batch, seq_len)``.
+        inputs_embeds: Text embeddings of shape
+            ``(batch, seq_len, hidden_size)``.
+        multimodal_embeddings: Concatenated visual tokens of shape
+            ``(num_visual_tokens, hidden_size)`` produced by the vision
+            tower + projector.
+        placeholder_token_id: Single id or list of ids that mark visual
+            slots in ``input_ids`` (e.g. ``image_token_id`` /
+            ``video_token_id``).
+
+    Returns:
+        Merged embeddings with the same shape as ``inputs_embeds``.
+    """
     if isinstance(placeholder_token_id, list):
         placeholder_token_id = jnp.array(placeholder_token_id)
         is_multimodal = jnp.isin(input_ids, placeholder_token_id)
@@ -314,7 +360,20 @@ def merge_multimodal_embeddings(
 
 
 def rotate_half(x: Array) -> Array:
-    """Rotate half the hidden dims of the input for RoPE."""
+    """Rotate the second half of the trailing dim by negation.
+
+    Standard RoPE building block: given ``x = [a, b]`` along the last
+    axis with equal halves, returns ``[-b, a]``. Combined with
+    ``cos``/``sin`` element-wise products this realises a 2-D rotation
+    per pair of channels.
+
+    Args:
+        x: Tensor with an even-sized trailing dimension.
+
+    Returns:
+        Tensor of identical shape with halves swapped and the new
+        lower half negated.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
@@ -1066,6 +1125,11 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         deepstack_feature_lists = []
 
         def _layer_loop(block, carry):
+            """Apply a single vision-encoder block inside the layer-stack scan.
+
+            Body of ``self.blocks.scan``; runs ``block`` on the current
+            visual hidden states and returns the updated carry tuple.
+            """
             hidden_states, layer_num = carry
             with self._layer_stage_context(layer_num, layers=self.blocks):
                 hidden_states = block(
@@ -1301,7 +1365,30 @@ class Qwen3VLMoeMLPStack(spx.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
-        """Forward pass through MoE MLP."""
+        """Apply the per-expert SwiGLU MLP on grouped tokens.
+
+        ``hidden_states`` is expected to be already partitioned into
+        contiguous groups by destination expert (see the parent
+        :class:`BaseMoeModule` for the routing dispatcher). Each grouped
+        tile is then projected through the per-expert ``gate``/``up``
+        ``ColumnParallelMoELinear``s, mixed via SwiGLU
+        (``act_fn(gate) * up``), and reduced back to ``hidden_size`` by
+        the ``RowParallelMoELinear`` ``down_proj``.
+
+        Args:
+            hidden_states: Token activations after dispatch, shape
+                ``(num_dispatched_tokens, hidden_size)``.
+            group_sizes: Per-expert group sizes used to slice
+                ``hidden_states`` into the right per-expert blocks.
+            sorted_experts: Optional permutation of expert ids matching
+                the dispatch order; needed when expert tensor parallelism
+                is enabled.
+
+        Returns:
+            Per-expert MLP outputs of shape
+            ``(num_dispatched_tokens, hidden_size)`` ready to be
+            scattered back to their source token positions.
+        """
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -1817,6 +1904,13 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Apply a single language-model decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden
+            states, attention weights and MoE router logits, and returns
+            the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -2377,22 +2471,24 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             special_video_mask = input_ids == self.config.video_token_id
 
         n_image_tokens = special_image_mask.sum()
-        special_image_mask_expanded = jnp.broadcast_to(special_image_mask[..., None], inputs_embeds.shape)
         if image_features is not None:
-            image_feature_size = image_features.size
-            masked_size = inputs_embeds[special_image_mask_expanded].size
-            if masked_size != image_feature_size:
+            try:
+                image_token_count = int(n_image_tokens)
+            except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
+                image_token_count = None
+            if image_token_count is not None and image_token_count * inputs_embeds.shape[-1] != image_features.size:
                 raise ValueError(
                     f"Image features and image tokens do not match: "
                     f"tokens: {n_image_tokens}, features {image_features.shape[0]}"
                 )
 
         n_video_tokens = special_video_mask.sum()
-        special_video_mask_expanded = jnp.broadcast_to(special_video_mask[..., None], inputs_embeds.shape)
         if video_features is not None:
-            video_feature_size = video_features.size
-            masked_size = inputs_embeds[special_video_mask_expanded].size
-            if masked_size != video_feature_size:
+            try:
+                video_token_count = int(n_video_tokens)
+            except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
+                video_token_count = None
+            if video_token_count is not None and video_token_count * inputs_embeds.shape[-1] != video_features.size:
                 raise ValueError(
                     f"Video features and video tokens do not match: "
                     f"tokens: {n_video_tokens}, features {video_features.shape[0]}"

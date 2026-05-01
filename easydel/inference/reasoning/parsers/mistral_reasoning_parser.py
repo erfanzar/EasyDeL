@@ -21,7 +21,28 @@ from ..basic_parsers import BaseThinkingReasoningParser
 
 @ReasoningParserManager.register_module(["mistral"])  # pyright: ignore[reportUntypedClassDecorator]
 class MistralReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for Mistral models using [THINK]...[/THINK] tokens."""
+    """Reasoning parser for Mistral thinking models using bracketed delimiters.
+
+    Mistral diverges from the ``<think>``/``</think>`` convention and uses
+    bracketed special tokens ``[THINK]``/``[/THINK]`` that are part of the
+    tokenizer vocabulary — they are emitted as single token IDs rather
+    than as multi-character text. The base class handles both
+    representations: it resolves the corresponding ``input_ids`` from the
+    tokenizer at construction time and falls back to text-level scanning
+    when the IDs are unavailable, so detection works the same in either
+    case.
+
+    Streaming follows the inherited state machine: while inside
+    ``[THINK]``…``[/THINK]`` the parser emits :class:`DeltaMessage` events
+    with ``reasoning_content``; once ``[/THINK]`` is consumed the phase
+    flips and subsequent deltas surface as visible ``content``. Prompt-gated
+    asymmetric parsing (chat template injecting ``[THINK]`` via
+    ``add_generation_prompt``) is also handled by the base class.
+
+    Attributes:
+        start_token: Mistral reasoning open special token ``"[THINK]"``.
+        end_token: Mistral reasoning close special token ``"[/THINK]"``.
+    """
 
     start_token = "[THINK]"
     end_token = "[/THINK]"

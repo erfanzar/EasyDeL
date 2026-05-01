@@ -13,6 +13,24 @@
 # limitations under the License.
 
 
+"""Parameter format conversion between PyTorch/HuggingFace and EasyDeL.
+
+This module is the bridge that lets EasyDeL load HuggingFace checkpoints
+into JAX/Spectrax modules and vice versa. It groups three responsibilities:
+
+* :class:`DtypeHandler` -- string-to-``jnp.dtype`` mapping and float tensor
+  re-cast helpers used throughout the converters.
+* :class:`TensorConverter` -- low-level torch-tensor / JAX-array conversion
+  (with optional zero-copy DLPack transfer).
+* :class:`StateDictConverter` and :class:`ModelConverter` -- the high-level
+  HuggingFace -> EasyDeL and EasyDeL -> HuggingFace converters, including
+  MoE expert consolidation and key renaming logic.
+
+Most public entry points are exposed via the top-level ``easydel.utils``
+package as :class:`ModelConverter`, :class:`StateDictConverter`, and
+:class:`TensorConverter`.
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -57,11 +75,35 @@ EASYDEL_PREFERRED_HOST_COPY: str | None = None if _preferred_host_copy_raw == "n
 
 
 class DtypeHandler:
-    """Handles dtype conversions and operations."""
+    """Static helpers for parsing dtype aliases and re-casting float tensors.
+
+    EasyDeL's checkpoint and conversion code receives dtypes from CLI flags
+    and YAML configs as short strings (``"bf16"``, ``"fp16"``, ``"fp8_e4m3fn"``,
+    …); :meth:`get_dtype` is the single canonical place that maps those
+    aliases to ``jnp.dtype`` objects, including the various 8-bit FP variants.
+    :meth:`float_tensor_to_dtype` is the matching tensor-side helper used by
+    :class:`StateDictConverter`/:class:`ModelConverter` to coerce *only*
+    floating-point arrays while leaving integer/bool tensors (e.g. masks,
+    indices) at their native precision.
+
+    The class deliberately exposes only ``@staticmethod`` callables so it
+    can be used as a namespace without instantiation.
+    """
 
     @staticmethod
     def get_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
-        """Convert string dtype representation to JAX dtype."""
+        """Convert string dtype representation to JAX dtype.
+
+        Args:
+            dtype: Either a ``jnp.dtype`` (returned unchanged) or a short
+                alias string such as ``"bf16"``, ``"fp16"``, ``"fp8_e4m3fn"``.
+
+        Returns:
+            The corresponding ``jnp.dtype``.
+
+        Raises:
+            KeyError: If ``dtype`` is a string not in the supported alias map.
+        """
         if isinstance(dtype, str):
             dtype_map: dict[str, jnp.dtype] = {
                 "bf16": jnp.bfloat16,
@@ -92,7 +134,20 @@ class DtypeHandler:
 
     @staticmethod
     def float_tensor_to_dtype(tensor: tp.Any, dtype: str | jnp.dtype | None) -> tp.Any:
-        """Convert float tensor to specified dtype."""
+        """Convert a float-valued tensor to the specified dtype, if applicable.
+
+        Integer/boolean tensors and ``None``/``""`` dtypes pass through.
+
+        Args:
+            tensor: Any object exposing a ``dtype`` attribute and an
+                ``astype`` method (JAX/NumPy/PyTorch arrays all qualify).
+            dtype: Target dtype as a string or ``jnp.dtype``; ``None`` or
+                ``""`` skip the conversion.
+
+        Returns:
+            ``tensor`` cast to ``dtype`` when its current dtype is a known
+            float type; otherwise ``tensor`` unchanged.
+        """
         if dtype is None or dtype == "":
             return tensor
 
@@ -115,11 +170,39 @@ class DtypeHandler:
 
 
 class TensorConverter:
-    """Handles tensor conversions between PyTorch and JAX."""
+    """Low-level tensor adapters between PyTorch tensors and JAX arrays.
+
+    Used by the higher-level :class:`StateDictConverter` to move parameter
+    leaves between frameworks while preserving dtype semantics. Two
+    transfer paths are supported:
+
+    * **NumPy bridge** — slower but format-stable. ``bfloat16`` PyTorch
+      tensors are upcast to ``float`` before going through NumPy because
+      NumPy lacks native ``bfloat16`` storage.
+    * **DLPack** — zero-copy capsule transfer used when both runtimes are
+      on a compatible backend (CPU or CUDA). Gated by ``EASY_SAFE_TRANSFER``;
+      callers can force the safe NumPy path on platforms with broken DLPack
+      capsules.
+
+    All callables are ``@staticmethod`` so the class is used as a
+    namespace; ``get_torch`` is ``lru_cache``-d to avoid paying repeated
+    import-time cost on hot conversion loops.
+    """
 
     @staticmethod
     def convert_pytorch_to_jnp(tensor: tp.Any, dtype: jnp.dtype) -> jnp.ndarray:
-        """Convert PyTorch tensor to JAX array."""
+        """Convert a PyTorch tensor to a JAX array of the requested dtype.
+
+        ``bfloat16`` PyTorch tensors are upcast to ``float`` before going
+        through NumPy because NumPy doesn't natively support ``bfloat16``.
+
+        Args:
+            tensor: A PyTorch tensor to convert.
+            dtype: Target ``jnp.dtype`` for the resulting array.
+
+        Returns:
+            A JAX array with the same data and the requested dtype.
+        """
         if "bfloat16" in str(tensor.dtype):
             tensor = tensor.float()
         npv = tensor.cpu().detach().numpy()
@@ -128,14 +211,30 @@ class TensorConverter:
     @staticmethod
     @functools.lru_cache
     def get_torch():
-        """Import and return torch module (cached)."""
+        """Import and return the ``torch`` module, cached across calls.
+
+        Returns:
+            The imported ``torch`` module.
+        """
         import torch
 
         return torch
 
     @staticmethod
     def jax_to_pytorch(x: jax.Array) -> tp.Any:
-        """Convert JAX array to PyTorch tensor."""
+        """Convert a JAX array to a PyTorch tensor.
+
+        When ``EASY_SAFE_TRANSFER`` is enabled (the default) the data is
+        moved through NumPy, which is slower but avoids DLPack edge cases.
+        Otherwise a zero-copy DLPack transfer is used when the JAX backend
+        is CPU/GPU and CUDA is available.
+
+        Args:
+            x: JAX array to transfer.
+
+        Returns:
+            A PyTorch tensor view of the array.
+        """
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
             x = jax.device_get(x)
             x = np.asarray(x)
@@ -171,16 +270,58 @@ class TensorConverter:
 
     @staticmethod
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
-        """Convert PyTorch tensor to JAX array."""
+        """Convert a PyTorch tensor to a JAX array via NumPy.
+
+        Args:
+            x: A PyTorch tensor.
+
+        Returns:
+            A JAX array with the same dtype and shape.
+        """
         return jnp.asarray(x.detach().cpu().numpy())
 
 
 class StateDictConverter:
-    """Handles conversion between PyTorch and EasyDeL state dictionaries."""
+    """Convert flat PyTorch ``state_dict``s to nested EasyDeL parameter trees.
+
+    PyTorch ships parameters as a flat ``{'layer.0.attn.q_proj.weight': Tensor}``
+    mapping where each entry follows PyTorch's ``[out, in]`` weight layout.
+    EasyDeL's Spectrax modules expect a nested ``{tuple_path: jnp.ndarray}``
+    pytree with JAX-friendly axis order (``[in, out]`` for dense layers, with
+    higher-rank tensors transposed analogously). This class is the bridge.
+
+    The high-traffic entry point is the private helper
+    :meth:`_base_huggingface_to_easydel`; trainer/loader code reaches it
+    through :class:`ModelConverter`, which adds MoE expert consolidation and
+    config-driven hooks. Static methods on this class implement the
+    individual stages: keyword filtering (:meth:`match_keywords`), per-tensor
+    rewriting (:meth:`process_tensor` — applies the axis transposition,
+    detects embeddings/layernorms, and applies optional ``reform_param``
+    splits), and the orchestration loop that progress-bars over a state dict
+    and runs each tensor through user-provided shard/callback hooks.
+
+    Notes:
+        * The class is deliberately stateless; configuration flows through
+          the per-call ``config`` dict so concurrent conversions don't
+          interact.
+        * Tied LM-head weights are intentionally not dropped during
+          conversion to keep tree-key parity with EasyDeL graphs that still
+          materialise ``lm_head.kernel``.
+    """
 
     @staticmethod
     def match_keywords(string: str, required: list[str], forbidden: list[str]) -> bool:
-        """Check if string contains all required keywords and none of the forbidden ones."""
+        """Check if a string contains all required keywords and none of the forbidden ones.
+
+        Args:
+            string: The text to inspect.
+            required: Substrings that must all be present in ``string``.
+            forbidden: Substrings that must not appear in ``string``.
+
+        Returns:
+            ``True`` when every required keyword is present and no forbidden
+            keyword appears.
+        """
         return all(t in string for t in required) and not any(n in string for n in forbidden)
 
     @staticmethod
@@ -349,6 +490,16 @@ class StateDictConverter:
                     try:
                         # Note: memory_stats() returns None on CPU devices
                         def get_memory_bytes(device_idx):
+                            """Return current bytes-in-use for a local JAX device.
+
+                            Args:
+                                device_idx: Index into ``jax.local_devices()``.
+
+                            Returns:
+                                ``stats["bytes_in_use"]`` when available,
+                                otherwise ``0`` (e.g. on CPU devices that
+                                don't expose ``memory_stats()``).
+                            """
                             stats = jax.local_devices()[device_idx].memory_stats()
                             return stats["bytes_in_use"] if stats is not None else 0
 
@@ -396,6 +547,33 @@ class StateDictConverter:
             ...
         To:
             model.layers.3.block_sparse_moe.experts.w3.weight -> shape (num_experts, 128, 256)
+
+        Args:
+            state_dict: HuggingFace ``state_dict``-style mapping. Mutated in
+                place (entries are popped) for memory efficiency.
+            moe_block_names: Tail names of MoE block modules (e.g.
+                ``"block_sparse_moe"``).
+            moe_names: Tail names of expert sub-modules (e.g.
+                ``["w1", "w2", "w3"]``).
+            moe_block_path: Full dotted paths to each MoE block in the model
+                graph.
+            moe_path: Full dotted paths to expert modules. Used to derive the
+                expert container name (e.g. ``"experts"``).
+            tensor_transform: Optional callable applied to each stacked tensor
+                before it is written into the output dict.
+            reform_param: Optional split-rule mapping reused from the rest of
+                the converter; keys mentioning the experts container provide
+                fallback names when the strict rule does not match.
+
+        Returns:
+            ``(new_state_dict, consolidated_keys)`` where ``new_state_dict``
+            contains stacked expert tensors (and any non-expert leaves passed
+            through unchanged) and ``consolidated_keys`` lists the new stacked
+            keys for downstream MoE-aware logic.
+
+        Raises:
+            ValueError: If the required ``moe_path`` / ``moe_names`` /
+                ``moe_block_path`` arguments are ``None``.
         """
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict, set()
@@ -613,6 +791,23 @@ class StateDictConverter:
             model.layers.3.block_sparse_moe.experts.0.w3.weight -> shape (128, 256)
             model.layers.3.block_sparse_moe.experts.1.w3.weight -> shape (128, 256)
             ...
+
+        Args:
+            state_dict: PyTorch-style state dict containing stacked-MoE tensors.
+            moe_block_names: Tail names of MoE block modules.
+            moe_names: Tail names of expert sub-modules.
+            moe_block_path: Full dotted paths to each MoE block.
+            moe_path: Full dotted paths to expert modules; used to detect the
+                expert-container name.
+            tensor_transform: Optional callable applied to each per-expert
+                tensor before it is written to the output dict.
+
+        Returns:
+            A new dict with each stacked tensor split into one ``...{i}.{name}.weight``
+            entry per expert.
+
+        Raises:
+            ValueError: If ``moe_names`` or ``moe_block_path`` is ``None``.
         """
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict
@@ -827,7 +1022,21 @@ class StateDictConverter:
 
 
 class ModelConverter:
-    """Handles model conversions between EasyDeL and HuggingFace formats."""
+    """High-level orchestrator for two-way EasyDeL ↔ HuggingFace model conversion.
+
+    Where :class:`StateDictConverter` operates on raw parameter mappings,
+    :class:`ModelConverter` brings model classes and configs into the
+    picture: it instantiates a fresh ``transformers`` ``PreTrainedModel``
+    from the equivalent EasyDeL config, feeds it the converted state dict,
+    and validates parameter shape parity along the way. Used by the public
+    ``module.to_torch()`` / ``module.from_pretrained(... save_torch=True)``
+    paths.
+
+    The class exposes only ``@staticmethod`` callables — there is no
+    instance state. Memory-conscious conversions can be run under
+    ``torch.device("meta")`` (the default) so the HuggingFace skeleton is
+    materialised lazily.
+    """
 
     @staticmethod
     def easydel_to_huggingface(

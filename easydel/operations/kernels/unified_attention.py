@@ -12,16 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vLLM-style Unified (paged) Attention operation.
+"""vLLM-style Unified (paged) Attention for ragged-query continuous batching.
 
-This operation wraps ejkernel's Triton implementation of vLLM's unified
-attention kernel (paged KV cache + ragged queries).
+This module exposes :class:`UnifiedAttn`, an :class:`OperationImpl` that
+wraps ejkernel's Triton implementation of vLLM's *unified* attention
+kernel: a single fused kernel that consumes ragged queries packed into a
+``[total_tokens, num_q_heads, head_dim]`` buffer, reads K/V from a paged
+cache addressed via ``pages_tables``, and emits one output row per query
+token.
 
-Notes:
-    - Inference-oriented: the underlying kernel is causal-only.
-    - Cache *updates* are handled by the cache view's `concatenate_to_cache(...)`
-      (called from `AttentionModule.concatenate(...)`). This op assumes the KV
-      cache already contains the current step's K/V for the query tokens.
+Capabilities and constraints:
+
+* GPU-only: the kernel is causal-only and Triton-backed. Non-GPU backends
+  raise :class:`NotImplementedError`.
+* Cache *updates* are not the responsibility of this op; the KV cache must
+  already contain the current step's K/V for the new query tokens. Updates
+  happen earlier via :meth:`UnifiedAttentionCacheView.concatenate_to_cache`.
+* When the cache reports ``data_parallel_size > 1`` and
+  ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH`` is enabled, the op runs under
+  ``shard_map`` with DP-local page slicing: each DP shard sees its own
+  rows and translates block-table IDs into per-shard pages, then a
+  ``psum`` reduces over the data-parallel axis to recover the full output.
+* Sliding-window, logits soft-cap, and sink-token (``softmax_aux``) features
+  are forwarded into the Triton kernel as configured by
+  ``UnifiedAttentionConfig``.
 """
 
 from __future__ import annotations
@@ -47,30 +61,47 @@ ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH",
 
 
 def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
-    """Resolve the logical page axis for the active cache view."""
+    """Resolve the logical page axis for the active cache view.
+
+    Args:
+        cache_view: Unified-attention cache view carrying DP metadata.
+
+    Returns:
+        Any: ``ATTN_DP`` when the data-parallel size exceeds 1; otherwise
+        ``ct.EMPTY`` (replicated KV pages).
+    """
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
     return ATTN_DP if dp_size > 1 else ct.EMPTY
 
 
 @OperationRegistry.register
 class UnifiedAttn(OperationImpl):
-    """
-    Attention implementation using vLLM-style Unified (Paged) Attention mechanism with Triton kernels.
+    """vLLM-style unified (paged) attention over ragged queries on GPU.
 
-    This class provides a GPU-optimized attention mechanism for scenarios where the
-    Key-Value cache is managed in non-contiguous pages (Paged KV Cache). It leverages
-    Triton kernels for efficient execution on GPUs, handling ragged queries with paged KV cache.
+    Executes ejkernel's Triton ``unified_attention`` kernel against
+    ``[total_tokens, num_q_heads, head_dim]`` ragged queries and a paged
+    KV cache (separate ``key_cache`` / ``value_cache`` page pools as
+    described by :class:`UnifiedAttentionCacheView`). Designed for
+    serving paths that mix prefill and decode in one batch and rely on
+    ``query_start_loc`` plus ``pages_tables`` to address the live KV
+    pages.
 
-    The implementation is inference-oriented and causal-only. Cache updates are handled
-    separately by the cache view's `concatenate_to_cache()` method (called from
-    `AttentionModule.concatenate()`). This operation assumes the KV cache already
-    contains the current step's K/V for the query tokens.
+    The op is causal-only, GPU-only, and intentionally read-only with
+    respect to the cache: callers populate K/V pages via
+    :meth:`UnifiedAttentionCacheView.concatenate_to_cache` before
+    invoking this operation. When the cache reports
+    ``data_parallel_size > 1``, the op runs under ``shard_map`` with
+    DP-local page slicing (see :func:`_dp_page_axis`), translating
+    block-table ids into per-shard local ids and reducing the per-shard
+    output via ``psum``.
 
     Attributes:
-        metadata (OperationMetadata): Configuration metadata for the attention mechanism.
-            While this class uses `OperationMetadata`, it primarily relies on the
-            additional `RaggedPagesMetadata` passed during the forward call for
-            paged-specific information.
+        metadata (OperationMetadata): Operator-level configuration
+            (runtime dtype, mesh, sharding resolver, op-config dict).
+            Per-batch paging information (context lengths, page tables,
+            query start locations) is supplied by the
+            ``cache_metadata`` argument to :meth:`forward_native` rather
+            than living on the instance.
     """
 
     @classmethod

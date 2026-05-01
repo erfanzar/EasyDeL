@@ -22,8 +22,10 @@ def _base_mpmd_small_model_config() -> dict:
 
     config = dict(spmd_conftest.small_model_config.__wrapped__())
     config["sharding_axis_dims"] = (2, 1, 1, -1, 1, 1)
-    config["pipeline_stage_regions"] = False
+    config["pipeline_stage_regions"] = True
     config["scan_layers"] = False
+    config["num_hidden_layers"] = 4
+    config["num_layers"] = 4
     return config
 
 

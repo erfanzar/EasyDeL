@@ -465,7 +465,18 @@ class InferenceApiRouter:
 
     @staticmethod
     def _format_metadata_sse(metadata: BaseModel | dict[str, tp.Any] | tp.Any) -> bytes:
-        """Format metadata as a standard SSE event payload."""
+        """Format metadata as a standard SSE event payload.
+
+        Serializes ``metadata`` (Pydantic model, dict, or arbitrary value)
+        into a UTF-8 encoded ``event: metadata\\ndata: ...\\n\\n`` frame for
+        Server-Sent Event streaming.
+
+        Args:
+            metadata: The metadata payload to encode.
+
+        Returns:
+            The encoded SSE frame as bytes ready to write to the client.
+        """
         if hasattr(metadata, "model_dump_json"):
             payload = metadata.model_dump_json(exclude_unset=True)
         elif isinstance(metadata, dict):

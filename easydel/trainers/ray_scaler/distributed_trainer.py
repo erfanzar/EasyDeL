@@ -102,7 +102,27 @@ class RayDistributedConfig(BaseModel):
     config_variables: dict[str, tp.Any] | None = None
 
     def _saving_preprocess(self):
-        """Convert dtypes and PartitionAxis to JSON-serializable formats before saving."""
+        """Replace non-JSON-friendly values in the config dicts with string surrogates.
+
+        Pydantic dumps ``RayDistributedConfig`` to JSON, but two of the
+        nested values are not naturally JSON-encodable:
+
+        * **JAX dtypes** stored in ``config_variables`` /
+          ``config_scaling_variables``. Each occurrence is replaced with
+          its canonical string representation from
+          ``DTYPE_TO_STRING_MAP`` (e.g. ``jnp.bfloat16`` becomes
+          ``"bfloat16"``). The reverse mapping happens in
+          :meth:`_loading_postprocess`.
+        * **PartitionAxis** under
+          ``config_variables["partition_axis"]``. The dataclass instance
+          is converted to its ``__dict__`` so Pydantic can serialise the
+          plain field-name -> axis mapping.
+
+        The mutation is in-place so subsequent calls to
+        ``model_dump_json`` see the JSON-safe payload. Symmetrically
+        :meth:`_loading_postprocess` must be invoked after deserialising
+        to restore live objects.
+        """
         if self.config_variables:
             for k, v in list(self.config_variables.items()):
                 if v in STRING_TO_DTYPE_MAP.values():
@@ -118,7 +138,24 @@ class RayDistributedConfig(BaseModel):
                     self.config_scaling_variables[k] = DTYPE_TO_STRING_MAP[v]
 
     def _loading_postprocess(self):
-        """Convert string representations back to dtypes and PartitionAxis after loading."""
+        """Reverse :meth:`_saving_preprocess` after JSON deserialisation.
+
+        After parsing the on-disk JSON Pydantic returns plain Python
+        primitives (strings for dtypes, dicts for ``PartitionAxis``).
+        This hook converts them back into the live runtime values that
+        :class:`RayDistributedTrainer` expects:
+
+        * dtype strings in ``config_variables`` / ``config_scaling_variables``
+          are reverse-looked-up through ``STRING_TO_DTYPE_MAP``;
+        * ``config_variables["partition_axis"]`` -- if it is still a
+          dict -- is rebuilt into a real :class:`PartitionAxis` via
+          ``PartitionAxis(**dict)``.
+
+        The mutation is in-place. The method is idempotent: already-live
+        values pass through untouched because they are not present in
+        ``DTYPE_TO_STRING_MAP.values()`` and are already
+        ``PartitionAxis`` instances.
+        """
         if self.config_variables:
             for k, v in list(self.config_variables.items()):
                 if v in DTYPE_TO_STRING_MAP.values():
@@ -347,7 +384,16 @@ class RayDistributedTrainer:
 
     @cached_property
     def processor(self) -> PreTrainedTokenizer:
-        """Cached property for the tokenizer/processor."""
+        """Tokenizer/processor for the model, loaded once per trainer instance.
+
+        Backed by :func:`functools.cached_property`: the first access
+        triggers :meth:`load_processor` (which downloads or loads the
+        :class:`PreTrainedTokenizer` and reconciles ``pad_token_id``);
+        subsequent accesses on the same trainer return the cached
+        object without re-downloading. The cache lives on the instance,
+        so different :class:`RayDistributedTrainer` instances do not
+        share processors.
+        """
         return self.load_processor()
 
     @staticmethod
@@ -650,6 +696,14 @@ class RayDistributedTrainer:
         ).train()
 
     def __repr__(self):
+        """Return a multi-line, human-readable representation of the trainer.
+
+        Long attribute values are truncated to keep the output readable.
+
+        Returns:
+            str: Indented description showing the public attributes and their
+            (possibly truncated) string values.
+        """
         cls_name = self.__class__.__name__
         items = []
         for k, v in self.__dict__.items():

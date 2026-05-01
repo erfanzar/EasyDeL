@@ -146,7 +146,19 @@ def _clamp_tpu_ragged_page_v3_block_config(query, cfg):
 
 
 def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array:
-    """Build the v3 request distribution `[decode_end, prefill_end, total]`."""
+    """Build the v3 request distribution ``[decode_end, prefill_end, total]``.
+
+    Args:
+        scheduled: ``int32[num_requests]`` count of scheduled tokens per
+            request.
+        context_lens: ``int32[num_requests]`` total context length per
+            request.
+
+    Returns:
+        Array: ``int32[3]`` distribution vector indexing decode requests,
+        prefill requests and the total active request count for the v3
+        kernel.
+    """
     scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
     context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
 
@@ -159,19 +171,52 @@ def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array
 
 
 def _dp_page_axis(cache_view: RaggedPagesCacheView):
-    """Resolve the logical page axis for the active cache view."""
+    """Resolve the logical page axis for the active cache view.
+
+    Args:
+        cache_view: Ragged-pages cache view carrying DP metadata.
+
+    Returns:
+        Any: ``ATTN_DP`` when ``data_parallel_size > 1`` else ``ct.EMPTY``.
+    """
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
     return ATTN_DP if dp_size > 1 else ct.EMPTY
 
 
 def _kv_axis(cache_view: RaggedPagesCacheView, sharded_axis: str):
-    """Return `sharded_axis` only when the cache keeps a sharded KV-head axis."""
+    """Return ``sharded_axis`` only when the cache keeps a sharded KV-head axis.
+
+    Args:
+        cache_view: Ragged-pages cache view.
+        sharded_axis: Axis name to use when KV heads are sharded.
+
+    Returns:
+        str: ``sharded_axis`` if the cache reports more than one KV-head
+        shard, otherwise ``ct.EMPTY`` (replicated).
+    """
     kv_head_shards = max(1, int(getattr(cache_view.metadata, "kv_head_shards", 1)))
     return sharded_axis if kv_head_shards > 1 else ct.EMPTY
 
 
 def _runtime_sharding_resolver(metadata, cache_view):
-    """Resolve the sharding resolver from op metadata or the active cache view."""
+    """Resolve the sharding resolver from op metadata or the active cache view.
+
+    Falls back through ``runtime_sharding_resolver`` on metadata, then on
+    cache view, then ``partition_manager`` on either object.
+
+    Args:
+        metadata: :class:`OperationMetadata` for the call.
+        cache_view: Ragged-pages cache view; checked when metadata does not
+            expose a resolver directly.
+
+    Returns:
+        Any: A resolver bound to ``metadata.mesh`` if one is available,
+        otherwise the raw resolver.
+
+    Raises:
+        AttributeError: When neither object exposes a resolver or partition
+            manager.
+    """
     resolver = getattr(metadata, "runtime_sharding_resolver", None)
     if resolver is None:
         resolver = getattr(cache_view, "runtime_sharding_resolver", None)
@@ -188,20 +233,38 @@ def _runtime_sharding_resolver(metadata, cache_view):
 
 
 class _RaggedPageAttn(OperationImpl):
-    """
-    Attention implementation using the Paged Attention mechanism with TPU Pallas kernels.
+    """Common base for ragged paged-attention operators (v2 / v3).
 
-    This class provides an attention mechanism suitable for scenarios where the
-    Key-Value cache is managed in non-contiguous pages (Paged KV Cache). It leverages
-    specialized kernels
-    for efficient execution on TPUs, handling prefill and decode phases separately
-    or in a mixed mode.
+    Concentrates the shared machinery used by both
+    :class:`RaggedPageAttnV2` and :class:`RaggedPageAttnV3`:
+
+    * Sharding-spec resolution via
+      :func:`_runtime_sharding_resolver`, including DP-page axis selection
+      (``ATTN_DP`` vs ``ct.EMPTY``) and KV-head axis fan-out.
+    * Two ``shard_map`` paths controlled by
+      ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH``: a DP-local path that slices
+      ``context_lens`` / ``pages_tables`` per DP shard and ``psum``-reduces
+      the per-shard outputs, and a globally replicated path that runs the
+      kernel against the full batch.
+    * Variants for the standard ragged-pages cache view as well as the
+      TurboQuant-compressed cache view, with the latter going through a
+      separate ejkernel entry point that consumes the index/sign/norm
+      pages.
+    * BTHD <-> ragged ``[total_tokens, heads, dim]`` reshaping in
+      :meth:`__call__` so callers can pass both 4-D batched and 3-D ragged
+      tensors interchangeably.
+
+    Subclasses only override :meth:`get_impl_name` and
+    :meth:`get_requirements` and select the v2 or v3 ejkernel through
+    :meth:`forward_v2` / :meth:`forward_v3` (dispatched by
+    :meth:`forward_native`).
 
     Attributes:
-        metadata (OperationMetadata): Configuration metadata for the attention mechanism.
-            While this class uses `OperationMetadata`, it primarily relies on the
-            additional `RaggedPagesMetadata` passed during the forward call for
-            paged-specific information.
+        metadata (OperationMetadata): Operator configuration. Most paged
+            specifics (page tables, query start locations, request
+            distribution, ...) come in per-call via the ``cache_view`` and
+            ``cache_metadata`` arguments rather than living on the
+            instance.
     """
 
     @classmethod
@@ -229,6 +292,35 @@ class _RaggedPageAttn(OperationImpl):
         vmem_limit_bytes: int | None = None,
         **ignore,
     ) -> AttentionOutput:
+        """V2 ragged paged attention (read-only over cached KV pages).
+
+        Dispatches to the TurboQuant-aware code path for compressed cache
+        views, otherwise calls ``ragged_page_attention_v2`` from ejkernel.
+
+        Args:
+            query: Ragged query tensor of shape
+                ``(total_tokens, num_q_heads, head_dim)``.
+            cache_view: Ragged-pages cache view. May be a
+                :class:`TurboQuantRaggedPagesCacheView`.
+            cache_metadata: Per-batch metadata describing context lengths,
+                page tables and query start locations.
+            softmax_scale: Logits scaling factor; defaults to
+                ``1 / sqrt(head_dim)``.
+            logits_soft_cap: Optional soft-cap for logits.
+            compute_dtype: Dtype used inside the kernel; defaults to
+                ``bfloat16``.
+            optimized: Use the optimized kernel variant when available.
+            sliding_window: Optional window size for local attention.
+            softmax_aux: Optional sink-token logits.
+            mask_value: Value used for masked positions.
+            vmem_limit_bytes: VMEM budget hint forwarded to the kernel.
+            **ignore: Forward-compatibility kwargs (ignored).
+
+        Returns:
+            AttentionOutput: ``attention_outputs`` of shape
+            ``(total_tokens, num_q_heads, head_dim)``. ``attention_weights``
+            is ``None``.
+        """
         if isinstance(cache_view, TurboQuantRaggedPagesCacheView):
             return self._forward_v2_turboquant(
                 query,
@@ -403,6 +495,32 @@ class _RaggedPageAttn(OperationImpl):
         sliding_window: int | None = None,
         **ignore,
     ) -> AttentionOutput:
+        """V3 ragged paged attention with cache-update support.
+
+        V3 takes new ``key``/``value`` projections, scatters them into the
+        paged KV buffer using the request-distribution metadata and
+        produces output for the just-written tokens. Dispatches to the
+        TurboQuant variant for compressed cache views.
+
+        Args:
+            query: Ragged query tensor of shape
+                ``(total_tokens, num_q_heads, head_dim)``.
+            key: Ragged keys to be appended to the cache, of shape
+                ``(total_tokens, num_kv_heads, head_dim)``.
+            value: Ragged values to be appended to the cache, same shape
+                convention as ``key``.
+            cache_view: Ragged-pages cache view (possibly TurboQuant-
+                compressed).
+            cache_metadata: Per-batch metadata.
+            softmax_scale: Logits scaling factor.
+            logits_soft_cap: Optional soft-cap for logits.
+            sliding_window: Optional window size for local attention.
+            **ignore: Additional kwargs forwarded to the underlying kernel
+                (e.g. ``softmax_aux``, ``vmem_limit_bytes``).
+
+        Returns:
+            AttentionOutput: Attention output and the (mutated) cache view.
+        """
         if isinstance(cache_view, TurboQuantRaggedPagesCacheView):
             return self._forward_v3_turboquant(
                 query,
@@ -554,6 +672,30 @@ class _RaggedPageAttn(OperationImpl):
         vmem_limit_bytes: int | None = None,
         **ignore,
     ) -> AttentionOutput:
+        """V3 ragged paged attention over a standard (non-TurboQuant) cache.
+
+        Selects either a DP-local ``shard_map`` path (when DP page sharding
+        is enabled and the request count divides the DP size) or a
+        replicated path that runs the kernel directly.
+
+        Args:
+            query: Ragged queries ``(total_tokens, num_q_heads, head_dim)``.
+            key: Ragged keys ``(total_tokens, num_kv_heads, head_dim)``.
+            value: Ragged values, same shape convention as ``key``.
+            cache_view: Standard ragged-pages cache view holding ``kv_pages``.
+            cache_metadata: Per-batch metadata including
+                ``request_distribution``.
+            softmax_scale: Logits scaling factor.
+            logits_soft_cap: Optional soft-cap for logits.
+            sliding_window: Optional window size for local attention.
+            softmax_aux: Optional sink-token logits.
+            vmem_limit_bytes: VMEM budget hint for the kernel.
+            **ignore: Forward-compatibility kwargs (ignored).
+
+        Returns:
+            AttentionOutput: Attention output plus the updated cache view
+            with the mutated ``kv_pages``.
+        """
         kv_pages = cache_view.kv_pages
         kv_cache_dtype = getattr(kv_pages, "dtype", None)
         if kv_cache_dtype is not None and (key.dtype != kv_cache_dtype or value.dtype != kv_cache_dtype):
@@ -802,23 +944,63 @@ class _RaggedPageAttn(OperationImpl):
         )
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Not implemented for Paged Attention."""
+        """GPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Not implemented for Paged Attention."""
+        """TPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Not implemented for Paged Attention."""
+        """CPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Not implemented for Paged Attention."""
+        """CUDA dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Not implemented for Paged Attention."""
+        """ROCm dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def __call__(
@@ -908,6 +1090,22 @@ class _RaggedPageAttn(OperationImpl):
 
 @OperationRegistry.register
 class RaggedPageAttnV2(_RaggedPageAttn):
+    """Ragged paged attention using vLLM-style slot mappings (read-only over cache).
+
+    Variant of the ragged paged-attention operation that consumes
+    pre-populated paged KV pools (the cache update step is performed
+    elsewhere via the cache view). The kernel is selected by
+    ``ragged_page_attention_v2`` from ejkernel and accepts ``pages_tables``
+    plus ``slot_mapping`` from :class:`RaggedPagesMetadata`.
+
+    Used by the legacy v2 serving path (still active for some Gemma /
+    LLaMA-style models). Newer deployments prefer :class:`RaggedPageAttnV3`,
+    which uses a coarser ``request_distribution`` instead of per-token slot
+    maps. Both share the same :class:`RaggedPagesCacheView` cache layout.
+
+    Registered under ``"ragged_page_attention_v2"``.
+    """
+
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
         """
@@ -943,6 +1141,25 @@ class RaggedPageAttnV2(_RaggedPageAttn):
 
 @OperationRegistry.register
 class RaggedPageAttnV3(_RaggedPageAttn):
+    """Ragged paged attention with cache-update support and request-distribution dispatch.
+
+    The current default ragged paged-attention operator. Unlike the v2
+    variant, v3 takes the new ``key`` / ``value`` projections as direct
+    inputs and is responsible for both scattering them into the paged KV
+    pool and emitting outputs for the just-written tokens. Branching
+    between decode-only, prefill-only and mixed batches is driven by the
+    ``request_distribution`` triple ``(decode_end, prefill_end, total)``
+    instead of per-token slot mapping.
+
+    Supports both the standard :class:`RaggedPagesCacheView` and the
+    compressed :class:`TurboQuantRaggedPagesCacheView` (handled by
+    ``_forward_v3_turboquant``). On TPU the TPU-specific Pallas kernel is
+    selected and ``num_kv_pages_per_block`` is clamped to keep VMEM under
+    the 16MB scoped limit for wide-head models.
+
+    Registered under ``"ragged_page_attention_v3"``.
+    """
+
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
         """

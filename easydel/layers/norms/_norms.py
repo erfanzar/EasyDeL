@@ -67,12 +67,33 @@ PromoteDtypeFn = tp.Callable[..., tuple]
 
 
 def promote_dtype(values, *, dtype=None):
+    """Cast a tuple of arrays to a shared dtype, preserving ``None`` values.
+
+    Args:
+        values: Iterable of arrays (or ``None`` placeholders) to promote.
+        dtype: Target dtype. If ``None``, the values are returned unchanged.
+
+    Returns:
+        Tuple of arrays cast to ``dtype`` (or ``None`` for any input that was
+        ``None``). When ``dtype`` is ``None`` the original ``values`` argument
+        is returned as-is.
+    """
     if dtype is None:
         return values
     return tuple(jnp.asarray(v, dtype=dtype) if v is not None else None for v in values)
 
 
 def first_from(*args, default=None):
+    """Return the first non-``None`` argument, or ``default`` if none qualify.
+
+    Args:
+        *args: Candidates to search, in priority order.
+        default: Value to return when every entry in ``args`` is ``None``.
+
+    Returns:
+        The first ``a`` in ``args`` such that ``a is not None``, otherwise
+        ``default``.
+    """
     for arg in args:
         if arg is not None:
             return arg
@@ -83,6 +104,22 @@ def _with_default_sharding(
     parameter_kwargs: collections.abc.Mapping[str, tp.Any],
     default_sharding: spx.Sharding | None,
 ) -> dict[str, tp.Any]:
+    """Inject a default sharding into parameter kwargs when none is specified.
+
+    Used by the normalization layers to register learnable scale / bias
+    parameters as replicated by default while still letting callers override
+    the sharding via ``sharding`` / ``axis_names`` / ``metadata``.
+
+    Args:
+        parameter_kwargs: Existing ``spx.Parameter`` kwargs (e.g. ``metadata``,
+            ``sharding``, ``axis_names``).
+        default_sharding: Sharding to install when no explicit sharding has
+            been requested. ``None`` keeps the kwargs untouched.
+
+    Returns:
+        Dict of kwargs ready to splat into :class:`spectrax.Parameter`. The
+        returned mapping is always a fresh dict.
+    """
     kwargs = dict(parameter_kwargs)
     metadata = dict(kwargs.get("metadata", {}))
     has_explicit_sharding = (
@@ -99,12 +136,46 @@ def _with_default_sharding(
 
 
 def _canonicalize_axes(ndim, axes):
+    """Normalize an axis or axis-tuple into a canonical positive-index tuple.
+
+    Args:
+        ndim: Total number of dimensions of the tensor whose axes are being
+            canonicalized.
+        axes: A single integer axis or a sequence of axes, possibly negative.
+
+    Returns:
+        Tuple of non-negative axis indices in the range ``[0, ndim)``.
+    """
     if isinstance(axes, int):
         axes = (axes,)
     return tuple(a if a >= 0 else ndim + a for a in axes)
 
 
 def _compute_stats(x, axes, dtype, axis_name, axis_index_groups, use_fast_variance=True, mask=None):
+    """Compute mean and variance for batch / layer normalization.
+
+    Supports masked statistics (for variable-length sequences) and
+    cross-replica aggregation via ``jax.lax.pmean`` when ``axis_name`` is
+    provided. The "fast" variance path uses ``E[x^2] - E[x]^2`` while the
+    safe path uses the centered formulation ``E[(x - mean)^2]``.
+
+    Args:
+        x: Input tensor.
+        axes: Reduction axes (int or sequence of ints, possibly negative).
+        dtype: Computation dtype for the reductions.
+        axis_name: Optional named mesh axis for ``pmean`` aggregation; ``None``
+            disables cross-device aggregation.
+        axis_index_groups: Optional groups of axis indices for partitioned
+            ``pmean`` reductions.
+        use_fast_variance: If ``True`` use the algebraically faster but
+            numerically less stable ``E[x^2] - E[x]^2`` form.
+        mask: Optional boolean mask broadcastable to ``x`` selecting which
+            elements participate in the statistics.
+
+    Returns:
+        Tuple ``(mean, var)`` of arrays with the reduction axes kept (size 1)
+        so they can be broadcast against ``x``.
+    """
     axes = _canonicalize_axes(x.ndim, axes)
     if mask is not None:
         # Masked mean/variance
@@ -130,6 +201,26 @@ def _compute_stats(x, axes, dtype, axis_name, axis_index_groups, use_fast_varian
 
 
 def _normalize(x, mean, var, scale, bias, reduction_axes, feature_axes, dtype, epsilon):
+    """Apply per-element normalization and (optional) affine transformation.
+
+    Implements ``y = ((x - mean) / sqrt(var + epsilon)) * scale + bias``.
+    Reduction and feature axes are accepted for API symmetry with the rest of
+    the spectrax/flax normalization stack but are not used directly.
+
+    Args:
+        x: Input tensor.
+        mean: Mean tensor with reduction axes kept (size 1).
+        var: Variance tensor with reduction axes kept (size 1).
+        scale: Optional learnable scale parameter (broadcastable to ``x``).
+        bias: Optional learnable bias parameter (broadcastable to ``x``).
+        reduction_axes: Axes that were reduced when computing the stats.
+        feature_axes: Axes that contain learnable parameters.
+        dtype: Optional dtype to cast ``x`` to before normalization.
+        epsilon: Variance epsilon for numerical stability.
+
+    Returns:
+        Normalized array with the same shape as ``x``.
+    """
     x = jnp.asarray(x, dtype=dtype) if dtype is not None else x
     y = (x - mean) * jax.lax.rsqrt(var + epsilon)
     if scale is not None:
@@ -175,56 +266,50 @@ Note:
 
 
 class RMSNorm(spx.Module):
-    """Root Mean Square normalization layer.
+    """Root Mean Square normalization (no mean-centering, no learnable bias).
 
-        RMSNorm normalizes inputs by their root mean square value, providing a simpler
-        and more computationally efficient alternative to Layer Normalization. Unlike
-        LayerNorm, RMSNorm does not re-center activations (no learned bias/shift),
-        which reduces parameter count while maintaining comparable performance in
-        transformer architectures.
+    Computes ``y = (x * rsqrt(mean(x**2, axis=-1, keepdims=True) + eps)) * weight``
+    where ``mean`` is the *uncentered* second moment along the trailing feature
+    axis and ``weight`` is a single learnable per-feature scale of shape
+    ``(dim,)``. This is the variant used in LLaMA / Mistral / Qwen / Gemma:
+    cheaper than :class:`LayerNorm` because there is no mean reduction and no
+    learned shift, and empirically just as good for decoder-only transformers.
 
-        The normalization formula is:
-            output = (x / RMS(x)) * scale
-            where RMS(x) = sqrt(mean(x^2) + eps)
+    Numerical stability rules implemented in :meth:`forward`:
 
-        This implementation automatically handles low-precision floating point types
-        (float8, float4) by promoting computations to float32 for numerical stability.
+    * ``eps`` is added *inside* the square root via ``rsqrt(var + eps)``, not
+      after. This is the standard placement and matches HuggingFace / vLLM.
+    * If either ``param_dtype`` or ``dtype`` is one of the low-precision floats
+      in :data:`lowfloats` (float4 / float8 family), the input is promoted to
+      ``float32`` for the entire normalization. Otherwise the input is promoted
+      to ``jnp.promote_types(self.dtype, x.dtype)`` so that bf16 inputs with an
+      fp32 ``dtype`` setting don't silently round-trip.
+    * The final result is cast back to ``x.dtype`` before being returned, so
+      the caller's dtype contract is preserved regardless of internal
+      promotion.
 
-        Attributes:
-            dim (int): Dimension of the input features (last axis size).
-            eps (float): Small constant added to denominator for numerical stability.
-            dtype (jnp.dtype): Data type for intermediate computations.
-            param_dtype (jnp.dtype): Data type for learnable parameters (kernel).
-            kernel (spx.Parameter): Learnable scale parameters of shape (dim,).
+    The scale parameter is registered as fully replicated via
+    :func:`sharding_for_layout(Replicated)` — feature dim is always small
+    enough that sharding it is counter-productive.
 
-        Example:
-            >>> import jax.numpy as jnp
-            >>> import spectrax as spx
-    from spectrax import nn
-            >>> from easydel.layers.norms import RMSNorm
-            >>>
-            >>> # Create RMSNorm layer for 768-dim hidden states
-            >>> norm = RMSNorm(
-            ...     dim=768,
-            ...     eps=1e-6,
-            ...     dtype=jnp.bfloat16,
-            ...     param_dtype=jnp.float32,
-            ...     rngs=spx.Rngs(0)
-            ... )
-            >>>
-            >>> # Apply to transformer hidden states
-            >>> hidden_states = jnp.ones((2, 512, 768))
-            >>> normalized = norm(hidden_states)
-            >>> assert normalized.shape == (2, 512, 768)
+    Attributes:
+        dim (int): Size of the trailing feature axis the layer normalizes
+            over. Equal to the size of the learnable ``weight``.
+        eps (float): Variance epsilon, added inside ``rsqrt`` to avoid
+            division by zero on near-zero activations.
+        dtype (DTypeLike): Compute dtype hint used to cast the input/weight
+            during the forward pass. Overridden to ``float32`` when low-precision
+            dtypes are in play.
+        param_dtype (DTypeLike): Storage dtype of the learnable ``weight``
+            parameter (typically ``bfloat16`` for memory or ``float32`` for
+            higher-precision parameter servers).
+        weight (spx.Parameter[Array]): Learnable per-feature scale of shape
+            ``(dim,)``, initialized to ones (so the layer is initially
+            equivalent to plain RMS division).
 
-        Note:
-            RMSNorm is particularly popular in large language models like LLaMA,
-            Mistral, and other recent architectures due to its efficiency and
-            effectiveness. It typically provides 10-15% speedup compared to
-            LayerNorm while maintaining model quality.
-
-        See Also:
-            - :data:`lowfloats`: List of dtypes that trigger float32 promotion.
+    See Also:
+        :data:`lowfloats`: Dtypes that trigger fp32 promotion in :meth:`forward`.
+        :class:`RMSNormGated`: SiLU-gated variant used by linear-attention blocks.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -354,25 +439,41 @@ class RMSNorm(spx.Module):
 
 
 class RMSNormGated(spx.Module):
-    """Gated Root Mean Square normalization layer.
+    """RMSNorm fused with a SiLU output gate (linear-attention output head).
 
-    Applies RMSNorm with a SiLU gating mechanism::
+    Implements the post-norm gated activation used at the tail of GatedDeltaNet
+    / KDA / Mamba-style mixer blocks:
 
-        output = silu(gate) * (kernel * RMSNorm(x))
+    .. code-block:: text
 
-    All computation is performed in float32 for numerical stability,
-    including the kernel multiplication and the SiLU activation on the
-    gate, before casting back to the original input dtype.
+        y = silu(gate) * (weight * rsqrt(mean(x**2, -1) + eps) * x)
 
-    This layer is used in the output path of linear-attention blocks
-    (KDA, GatedDeltaNet) for improved gradient flow and expressiveness.
+    The full computation runs in ``float32`` regardless of the configured
+    ``dtype`` — feature variance and SiLU both lose accuracy quickly in
+    bfloat16 once activations get large, and at this point in the network the
+    extra cast is negligible relative to the matmuls that follow. The result
+    is cast back to the input dtype on exit so the caller still sees its own
+    precision contract.
+
+    Compared to :class:`RMSNorm`, this layer:
+
+    * Takes a separate ``gate`` tensor (typically the output of a
+      ``W_gate(x)`` projection inside the mixer) and multiplies the
+      normalized stream by ``silu(gate)``.
+    * Has no fused-bias path (linear attention blocks handle bias upstream).
+    * Always promotes to fp32, even when neither dtype is a low-precision
+      float — gating amplifies tail values, so fp32 stability matters.
 
     Attributes:
-        hidden_size: Dimension of the input features (last axis size).
-        eps: Small constant for numerical stability.
-        dtype: Data type for computation.
-        param_dtype: Data type for learnable parameters.
-        kernel: Learnable scale parameters of shape ``(hidden_size,)``.
+        hidden_size (int): Trailing-axis feature count, equal to the shape of
+            the learnable ``weight`` and the expected last-axis size of both
+            ``hidden_states`` and ``gate`` in :meth:`forward`.
+        eps (float): Variance epsilon, added inside ``rsqrt``.
+        dtype (DTypeLike): Compute dtype hint kept for API symmetry; the
+            forward pass always upcasts to ``float32`` internally.
+        param_dtype (DTypeLike): Storage dtype of the learnable scale.
+        weight (spx.Parameter[Array]): Per-feature scale of shape
+            ``(hidden_size,)``, initialized to ones.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -386,6 +487,21 @@ class RMSNormGated(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the gated RMSNorm layer.
+
+        Args:
+            hidden_size: Number of features along the last axis to normalize.
+                Also the size of the learnable scale parameter.
+            eps: Small constant added to the variance for numerical stability.
+                Defaults to ``1e-6``.
+            dtype: Computation dtype hint. The forward pass internally promotes
+                to ``float32`` for the gated branch regardless of this value.
+                Defaults to ``jnp.bfloat16``.
+            param_dtype: Storage dtype for the learnable scale parameter.
+                Defaults to ``jnp.bfloat16``.
+            rngs: SpecTrax random number generators used to initialize the
+                scale parameter (default initializer is ones).
+        """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -403,12 +519,18 @@ class RMSNormGated(spx.Module):
     ) -> Float[Array, "... hidden_size"]:
         """Apply gated RMSNorm normalization.
 
-        Args:cle
+        Computes ``silu(gate) * (kernel * RMSNorm(hidden_states))`` in
+        ``float32`` and casts back to the input dtype.
+
+        Args:
             hidden_states: Input tensor of shape ``(..., hidden_size)``.
-            gate: Gate tensor of shape ``(..., hidden_size)``.
+            gate: Gate tensor of shape ``(..., hidden_size)``. Passed through
+                a SiLU activation before being multiplied with the normalized
+                hidden states.
 
         Returns:
-            Gated normalized tensor of the same shape and dtype as input.
+            Gated normalized tensor of the same shape and dtype as
+            ``hidden_states``.
         """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)

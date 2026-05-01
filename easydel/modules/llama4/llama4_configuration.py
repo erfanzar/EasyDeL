@@ -24,7 +24,18 @@ logger = get_logger(__name__)
 
 
 def _patch_hf_llama4_pooler_output() -> None:
-    """HF compatibility: ensure Llama4 image features expose `pooler_output`."""
+    """HF compatibility: ensure Llama4 image features expose ``pooler_output``.
+
+    Monkey-patches ``transformers.models.llama4.Llama4ForConditionalGeneration.get_image_features``
+    so that downstream EasyDeL code can rely on a ``pooler_output`` attribute being
+    present on the returned object even when the upstream HF version omits it.
+
+    The patch is idempotent (sets a sentinel on the wrapper) and silently no-ops if
+    the upstream HF module is unavailable.
+
+    Returns:
+        None: The function patches the HF class in-place.
+    """
     try:
         from transformers.modeling_outputs import BaseModelOutputWithPooling
         from transformers.models.llama4 import modeling_llama4 as hf_llama4
@@ -142,6 +153,41 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
         rope_theta: float = 10000,
         **kwargs,
     ):
+        """Initialize Llama4 vision config.
+
+        Args:
+            hidden_size (int, optional): Vision encoder hidden dimension. Defaults to 768.
+            hidden_act (str, optional): Activation function. Defaults to "gelu".
+            num_hidden_layers (int, optional): Number of vision transformer layers.
+                Defaults to 34.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
+            num_channels (int, optional): Input image channels. Defaults to 3.
+            intermediate_size (int, optional): MLP intermediate dimension. Defaults to 5632.
+            vision_output_dim (int, optional): Vision encoder output dimension before
+                projection. Defaults to 7680.
+            image_size (int, optional): Input image resolution. Defaults to 448.
+            patch_size (int, optional): Patch size for the vision transformer. Defaults to 14.
+            norm_eps (float, optional): Epsilon for normalization layers. Defaults to 1e-5.
+            vision_feature_layer (int, optional): Hidden-layer index used as vision
+                features (-1 for the last layer). Defaults to -1.
+            vision_feature_select_strategy (str, optional): Strategy for selecting
+                vision features. Defaults to "default".
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            pixel_shuffle_ratio (float, optional): Pixel-shuffle downsampling ratio.
+                Defaults to 0.5.
+            projector_input_dim (int, optional): Multi-modal projector input dimension.
+                Defaults to 4096.
+            projector_output_dim (int, optional): Multi-modal projector output
+                dimension (must match text hidden_size). Defaults to 4096.
+            multi_modal_projector_bias (bool, optional): Whether the projector uses bias.
+                Defaults to False.
+            projector_dropout (float, optional): Projector dropout rate. Defaults to 0.0.
+            attention_dropout (float, optional): Vision-encoder attention dropout.
+                Defaults to 0.0.
+            rope_theta (float, optional): RoPE base frequency. Defaults to 10000.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         self.hidden_size = hidden_size
         self.hidden_act = hidden_act
         self.num_hidden_layers = num_hidden_layers
@@ -282,6 +328,69 @@ class Llama4TextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize Llama4 text decoder config.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 202048.
+            hidden_size (int, optional): Hidden dimension. Defaults to 5120.
+            intermediate_size (int, optional): MoE expert MLP intermediate dimension.
+                Defaults to 8192.
+            intermediate_size_mlp (int, optional): Dense MLP intermediate dimension
+                (non-MoE layers). Defaults to 16384.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to 48.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 40.
+            num_key_value_heads (int | None, optional): Number of key/value heads for
+                grouped-query attention. Defaults to 8.
+            head_dim (int | None, optional): Dimension of each attention head.
+                Defaults to 128.
+            hidden_act (str, optional): MLP activation function. Defaults to "silu".
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``4096 * 32``.
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            rms_norm_eps (float, optional): Epsilon for RMSNorm. Defaults to 1e-5.
+            use_cache (bool, optional): Whether to enable KV caching. Defaults to True.
+            pad_token_id (int | None, optional): Padding token id. Defaults to None.
+            bos_token_id (int, optional): Beginning-of-stream token id. Defaults to 1.
+            eos_token_id (int, optional): End-of-stream token id. Defaults to 2.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            rope_theta (float, optional): RoPE base frequency. Defaults to 500000.
+            attention_dropout (float, optional): Attention dropout. Defaults to 0.0.
+            num_experts_per_tok (int, optional): Experts activated per token in MoE
+                layers. Defaults to 1.
+            num_local_experts (int, optional): Total experts per MoE layer. Defaults to 16.
+            moe_layers (list[int] | None, optional): Indices of layers using MoE; if
+                ``None``, computed from ``interleave_moe_layer_step``. Defaults to None.
+            interleave_moe_layer_step (int, optional): MoE interleaving period.
+                Defaults to 1.
+            use_qk_norm (bool, optional): Apply QK normalization in attention.
+                Defaults to True.
+            output_router_logits (bool, optional): Whether to output router logits.
+                Defaults to False.
+            router_aux_loss_coef (float, optional): Auxiliary load-balancing loss
+                coefficient. Defaults to 0.001.
+            router_jitter_noise (float, optional): Router-logit jitter noise.
+                Defaults to 0.0.
+            rope_scaling (dict | None, optional): RoPE scaling configuration.
+                Defaults to None.
+            no_rope_layers (list[int] | None, optional): Per-layer flags marking
+                layers that skip RoPE; if ``None``, computed from
+                ``no_rope_layer_interval``. Defaults to None.
+            no_rope_layer_interval (int, optional): RoPE-skipping period.
+                Defaults to 4.
+            attention_chunk_size (int, optional): Chunk size for chunked attention.
+                Defaults to 8192.
+            attn_temperature_tuning (int, optional): Attention temperature tuning
+                factor. Defaults to 4.
+            floor_scale (int, optional): Floor scale for attention temperature.
+                Defaults to 8192.
+            attn_scale (float, optional): Attention-logit scale. Defaults to 0.1.
+            layer_types (list[str] | None, optional): Per-layer attention types
+                (``"chunked_attention"`` or ``"full_attention"``). Auto-derived from
+                ``no_rope_layers`` when ``None``. Defaults to None.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -383,6 +492,24 @@ class Llama4Config(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize the top-level Llama4 multimodal configuration.
+
+        Args:
+            vision_config (dict | Llama4VisionConfig | None, optional): Vision encoder
+                configuration. Accepts a dict, a ``Llama4VisionConfig`` instance, or
+                ``None`` for defaults. Defaults to None.
+            text_config (dict | Llama4TextConfig | None, optional): Text decoder
+                configuration. Accepts a dict, a ``Llama4TextConfig`` instance, or
+                ``None`` for defaults. Defaults to None.
+            boi_token_index (int, optional): Beginning-of-image token index.
+                Defaults to 200080.
+            eoi_token_index (int, optional): End-of-image token index. Defaults to 200081.
+            image_token_index (int, optional): Image-patch placeholder token index.
+                Defaults to 200092.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings of the
+                text model. Defaults to False.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         if vision_config is None:
             self.vision_config = Llama4VisionConfig()
             logger.info("vision_config is None, using default llama4 vision config")

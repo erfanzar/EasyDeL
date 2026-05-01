@@ -20,7 +20,26 @@ from ..basic_parsers import BaseThinkingReasoningParser
 
 @ReasoningParserManager.register_module(["ernie45"])  # pyright: ignore[reportUntypedClassDecorator]
 class Ernie45ReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for ERNIE 4.5 models using <think>...</think> tags."""
+    """Reasoning parser for Baidu ERNIE-4.5 chain-of-thought outputs.
+
+    ERNIE-4.5 uses the same ``<think>``/``</think>`` grammar as DeepSeek-R1
+    and most other Western open-weights reasoning models. The opening tag
+    can either be emitted by the model or pre-seeded by the chat template
+    when ``add_generation_prompt`` is active; in the latter case the
+    prompt-gated path inherited from :class:`BaseThinkingReasoningParser`
+    treats the output as already inside the reasoning section.
+
+    The streaming state machine emits :class:`DeltaMessage` events with
+    ``reasoning_content`` while inside the markers and ``content`` once the
+    closing tag is consumed. All the heavy lifting (delimiter splitting,
+    prompt-context handling, streaming boundary detection) lives in the
+    base class — this subclass only fixes the marker strings.
+
+    Attributes:
+        start_token: Reasoning open tag ``"<think>"``.
+        end_token: Reasoning close tag ``"</think>"`` whose detection flips
+            the parser into the visible-content phase.
+    """
 
     start_token = "<think>"
     end_token = "</think>"

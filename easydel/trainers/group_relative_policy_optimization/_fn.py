@@ -404,6 +404,31 @@ def grpo_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
+        """Compute the GRPO surrogate loss for one minibatch.
+
+        Concatenates prompts and completions, calls the policy forward
+        in chunked mode (using ``completion_chunk_size`` /
+        ``logprob_vocab_chunk_size`` for memory), masks the
+        per-token log-probabilities by the completion mask, applies
+        the importance-sampling clip given by ``epsilon`` /
+        ``epsilon_high`` / ``delta`` and the configured ``loss_type``
+        (``grpo``, ``grpo_token``, ``dr_grpo``, ``bnpo``, ...), folds
+        in the KL penalty against the reference policy and the
+        optional ``top_entropy_quantile`` mask.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            minibatch: Dict carrying ``prompt_ids``, ``prompt_mask``,
+                ``completion_ids``, ``completion_mask``,
+                ``advantages``, ``ref_per_token_logps``, and any
+                generation-time model kwargs.
+
+        Returns:
+            ``(loss, metrics)`` where ``metrics`` is a populated
+            :class:`LossMetrics` recording surrogate loss components,
+            clip fractions, KL diagnostics, and any straight-through
+            quantizer signals.
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree)
@@ -751,6 +776,17 @@ def grpo_step(
             raise ValueError(f"Unknown loss type: {loss_type}")
 
         def masked_mean(x):
+            """Average ``x`` over masked completion tokens.
+
+            For sequence-level (``shape[1] == 1``) tensors falls back
+            to a plain mean since there is nothing to mask.
+
+            Args:
+                x: Tensor of shape ``[batch, seq_len]`` or ``[batch, 1]``.
+
+            Returns:
+                A scalar mean over the masked positions.
+            """
             if x.shape[1] == 1:
                 return jnp.mean(x)
             return jnp.sum(x * completion_mask) / jnp.maximum(completion_token_count, 1.0)

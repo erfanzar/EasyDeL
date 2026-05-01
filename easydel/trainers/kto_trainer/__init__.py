@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Kahneman-Tversky Optimization (KTO) trainer entry point.
+
+KTO -- Ethayarajh et al. (2024) -- learns from unpaired
+desirable/undesirable completions using a prospect-theory-inspired
+loss that decouples reward gain (chosen) and loss (rejected).  This
+package exposes :class:`KTOConfig` and :class:`KTOTrainer`.
+"""
 
 from .kto_config import KTOConfig
 from .kto_trainer import KTOTrainer

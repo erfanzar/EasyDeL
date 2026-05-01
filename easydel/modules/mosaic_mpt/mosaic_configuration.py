@@ -21,10 +21,22 @@ from easydel.infra.factory import register_config
 
 
 class MptAttentionConfig(EasyDeLBaseConfig):
-    """
-    This is the configuration class to store the attention related configuration of a [`MptModel`].
+    """Sub-config bundling MPT's attention-only knobs.
 
-    Args:
+    MPT (MosaicML Pretrained Transformer) keeps its attention configuration
+    in a separate object that is composed into :class:`MptConfig` via
+    ``attn_config``. The two flavours of attention are controlled by
+    ``attn_type``: ``"multihead_attention"`` is standard MHA, while
+    ``"multiquery_attention"`` shares K/V across all heads (effectively
+    ``num_key_value_heads = 1``). MPT does not use RoPE — long-range
+    positional information comes from ALiBi (Attention with Linear Biases),
+    a per-head linear position penalty added directly to the QK scores
+    before softmax. ``alibi_bias_max`` caps the slope so very deep models
+    stay well-conditioned. Optional QK LayerNorm (``qk_ln``) stabilises
+    training; ``clip_qkv`` clamps the QKV projections to a symmetric range
+    to suppress activation outliers.
+
+    Attributes:
         attn_type (`str`, *optional*, defaults to `"multihead_attention"`):
             The type of attention to use. Can be either `"multihead_attention"` or `"multiquery_attention"`.
         attn_pdrop (`float`, *optional*, defaults to 0.0):
@@ -114,11 +126,18 @@ class MptAttentionConfig(EasyDeLBaseConfig):
 
 @register_config("mpt")
 class MptConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for MosaicML Pretrained Transformer (MPT) decoder models.
 
-    Args:
+    MPT is a GPT-style causal decoder that distinguishes itself with
+    ALiBi position biases (no RoPE, no learned positional embeddings),
+    optional multi-query attention, and a low-precision LayerNorm variant
+    that runs the rescale in fp32 even when activations are bf16/fp16.
+    The ``attribute_map`` below maps the MPT-native parameter names
+    (``d_model``, ``n_heads``, ``n_layers``, …) to the standard transformer
+    aliases (``hidden_size``, ``num_attention_heads``, …) used elsewhere in
+    EasyDeL — both spellings are accessible on instances of this class.
+
+    Attributes:
         d_model (`int`, *optional*, defaults to 2048):
             Dimensionality of the encoder layers and the pooler layer.
         n_heads (`int`, *optional*, defaults to 16):

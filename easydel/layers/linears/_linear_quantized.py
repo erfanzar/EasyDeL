@@ -140,11 +140,34 @@ _QMM_DEFAULT_POLICY_TABLE: dict[str, tp.Any] = {
 
 
 def _is_mosaic_version_error(exc: BaseException) -> bool:
+    """Detect Mosaic-stack version errors raised by Pallas/TPU kernels.
+
+    Args:
+        exc: Exception to inspect.
+
+    Returns:
+        ``True`` if ``exc``'s message contains the canonical
+        ``"stable_mosaic.version"`` / ``"Unsupported version"`` substrings used
+        by Mosaic to signal a kernel/runtime mismatch, ``False`` otherwise.
+    """
     message = str(exc)
     return "stable_mosaic.version" in message and "Unsupported version" in message
 
 
 def _qmm_xla_fallback_kwargs(kwargs: dict[str, tp.Any]) -> dict[str, tp.Any]:
+    """Build XLA-only kwargs for quantized matmul fallback.
+
+    Used when a fused TPU kernel raises a Mosaic version error and we need to
+    retry with the unfused XLA path.
+
+    Args:
+        kwargs: Original kwargs passed to ``ej_quantized_matmul``. Only
+            ``use_best_config`` is preserved.
+
+    Returns:
+        A dict with ``fuse=False``, ``platform="xla"`` and the original
+        ``use_best_config`` flag (defaulting to ``True``).
+    """
     return {
         "fuse": False,
         "platform": "xla",
@@ -153,6 +176,16 @@ def _qmm_xla_fallback_kwargs(kwargs: dict[str, tp.Any]) -> dict[str, tp.Any]:
 
 
 def _policy_mode_key(mode: str | None) -> str:
+    """Map a quantization-mode string to a policy-table key.
+
+    Args:
+        mode: Quantization mode (e.g. ``"affine"``, ``"nf4"``, ``"mxfp4"``).
+
+    Returns:
+        ``"affine"`` for affine quantization, ``"non_affine"`` for
+        microscaling formats listed in :data:`_QMM_NON_AFFINE_MODES`, or
+        ``"default"`` for any unrecognized mode.
+    """
     mode_n = str(mode).strip().lower() if mode is not None else ""
     if mode_n == "affine":
         return "affine"
@@ -162,6 +195,16 @@ def _policy_mode_key(mode: str | None) -> str:
 
 
 def _policy_size_key(m_tokens: int | None, threshold: int | None) -> str:
+    """Bucket the token-count dimension into a policy size category.
+
+    Args:
+        m_tokens: Number of rows (flattened token count) being processed.
+        threshold: Threshold separating ``"small"`` from ``"large"`` sizes.
+
+    Returns:
+        ``"small"`` if ``m_tokens <= threshold``, ``"large"`` otherwise. Falls
+        back to ``"default"`` when either input is ``None``.
+    """
     if m_tokens is None or threshold is None:
         return "default"
     return "small" if int(m_tokens) <= int(threshold) else "large"
@@ -175,6 +218,26 @@ def _lookup_qmm_policy_entry(
     tpu_small_threshold: int | None,
     policy_table: dict[str, tp.Any] | None,
 ) -> dict[str, tp.Any]:
+    """Resolve the per-call quantized-matmul policy entry.
+
+    Performs a three-level lookup ``backend -> mode_key -> size_key`` against
+    ``policy_table`` (or :data:`_QMM_DEFAULT_POLICY_TABLE` when ``None``),
+    falling back to ``"default"`` at each level when the specific key is
+    missing.
+
+    Args:
+        backend: JAX default backend (``"tpu"``, ``"gpu"``, ``"cpu"``).
+        mode: Quantization mode string (see :func:`_policy_mode_key`).
+        m_tokens: Number of token rows in the current matmul call.
+        tpu_small_threshold: Threshold below which calls are considered
+            "small" on TPU (see :func:`_policy_size_key`).
+        policy_table: Optional override table; when ``None`` the built-in
+            default is used.
+
+    Returns:
+        A copy of the matched policy entry as a dict, or an empty dict if no
+        entry was found.
+    """
     table = policy_table if policy_table is not None else _QMM_DEFAULT_POLICY_TABLE
     backend_table = table.get(backend, table.get("default", {}))
     mode_table = backend_table.get(_policy_mode_key(mode), backend_table.get("default", {}))
@@ -219,6 +282,15 @@ def _effective_ejkernel_group_size(mode: str, requested_group_size: int, array_s
 
 
 def _spec_is_sharded(spec: jax.sharding.PartitionSpec) -> bool:
+    """Test whether any axis of a :class:`PartitionSpec` is partitioned.
+
+    Args:
+        spec: A partition spec to inspect.
+
+    Returns:
+        ``True`` if at least one axis entry is non-``None`` (i.e. partitioned
+        across some mesh axis), ``False`` if every entry is ``None``.
+    """
     return any(axis is not None for axis in tuple(spec))
 
 
@@ -253,6 +325,15 @@ def _spec_matches_kernel_parallel_layout(
 
 
 def _axis_names(axis_spec: tp.Any) -> tuple[str, ...]:
+    """Normalize a single :class:`PartitionSpec` entry into a tuple of names.
+
+    Args:
+        axis_spec: Single axis entry from a partition spec. May be ``None``,
+            a string axis name, or a list/tuple of axis names.
+
+    Returns:
+        Tuple of mesh-axis names, possibly empty.
+    """
     if axis_spec is None:
         return ()
     if isinstance(axis_spec, str):
@@ -267,6 +348,22 @@ def _extract_tp_axis_name(
     direction: tp.Literal["row", "column"] | None,
     mesh: MeshLike,
 ) -> str | None:
+    """Extract the TP-axis name actively partitioning the kernel.
+
+    Looks at the kernel's row axis (for row-parallel) or column axis (for
+    column-parallel) and finds an active mesh axis (size > 1). Prefers the
+    canonical name ``"tp"`` when present.
+
+    Args:
+        kernel_spec: Partition spec of the quantized kernel
+            ``(in_features, out_features)``.
+        direction: Parallelism direction of the layer.
+        mesh: Active JAX mesh.
+
+    Returns:
+        The mesh-axis name partitioning the relevant kernel dimension, or
+        ``None`` if no eligible axis is found.
+    """
     if direction not in {"row", "column"}:
         return None
     dim = 0 if direction == "row" else 1

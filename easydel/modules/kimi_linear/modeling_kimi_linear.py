@@ -288,13 +288,32 @@ class KimiMoEGate(spx.Module):
         )
 
     def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]):
-        """Route tokens to experts.
+        """Pick the top-``top_k`` experts per token using DeepSeek-V3 grouped routing.
+
+        Algorithm (per token):
+
+        1. Score every expert with ``sigmoid(W x)``.
+        2. Add the static ``e_score_correction_bias`` (a per-expert offset that
+           the trainer can nudge to keep utilization balanced — analogous to
+           the "expert priority" trick in Mixtral/DeepSeek-V3).
+        3. Reshape into ``num_expert_group`` groups, score each group by the
+           sum of its top-2 experts, and select the ``topk_group`` highest
+           groups. Mask all experts outside the selected groups to ``-inf``
+           so subsequent ``top_k`` only picks within them — this is the
+           "expert grouping" load-balance trick.
+        4. Take the global ``top_k`` of the masked scores; if
+           ``moe_renormalize`` is on, renormalize the kept weights so they
+           sum to 1, then multiply by ``routed_scaling_factor``.
 
         Args:
-            hidden_states: Flattened hidden states [num_tokens, hidden_dim]
+            hidden_states: Per-token features ``(num_tokens, hidden_size)``;
+                expected to be already flattened across batch/seq.
 
         Returns:
-            Top-k expert weights scaled by routed_scaling_factor
+            jax.Array: ``(num_tokens, top_k)`` array of expert-routing
+            weights, ready to be multiplied with the matching expert outputs.
+            Indices are not returned here — the parent
+            :class:`KimiSparseMoeBlock` derives them from the same scores.
         """
         num_tokens, _ = hidden_states.shape
 
@@ -445,19 +464,27 @@ class KimiMLPMoE(spx.Module):
 
 
 class KimiSparseMoeBlock(BaseMoeModule):
-    """Sparse Mixture of Experts block for Kimi Linear.
+    """Sparse-MoE feed-forward block used by Kimi-Linear.
 
-    Implements the MoE feedforward layer with:
-    - Sigmoid routing with e_score_correction_bias (DeepSeek V3 style)
-    - Shared experts that process all tokens
-    - Grouped top-k expert selection for load balancing
-    - Optional auxiliary load balancing loss
+    Replaces the dense :class:`KimiMLP` on layers ``>= first_k_dense_replace``
+    (and gated by ``moe_layer_freq``). Each token is routed by
+    :class:`KimiMoEGate` to ``num_experts_per_token`` experts among
+    ``num_experts`` routed experts, executed via a single batched
+    ``ColumnParallelMoELinear`` / ``RowParallelMoELinear`` pair (no
+    explicit Python loop over experts, so EP / TP layouts stay efficient).
+    A small block of ``num_shared_experts`` experts is also evaluated on
+    every token and added on top — the shared experts capture
+    "always-useful" features while the routed experts specialize. Routing
+    weights are produced *outside* the softmax (sigmoid-with-bias) and
+    multiplied directly with expert outputs.
 
     Attributes:
-        config: Model configuration.
-        gate: Router module for expert selection.
-        experts: Collection of expert MLP modules.
-        shared_experts: Optional shared experts applied to all tokens.
+        config (KimiLinearConfig): Model configuration.
+        gate (KimiMoEGate): Sigmoid grouped top-k router.
+        experts (KimiMLPMoE): Batched SwiGLU experts running ``num_experts``
+            in parallel via grouped GEMM.
+        shared_experts (KimiMLP | None): Always-on dense expert path; ``None``
+            when ``num_shared_experts == 0``.
     """
 
     def __init__(
@@ -553,23 +580,38 @@ class KimiSparseMoeBlock(BaseMoeModule):
 
 
 class KimiMLAAttention(UnifiedAttention):
-    """Kimi Linear MLA (Multi-Latent Attention) layer.
+    """Kimi-Linear's Multi-Latent Attention block (DeepSeek-V3 MLA layout).
 
-    Implements Multi-Latent Attention with DeepSeek V3-style latent KV compression
-    for efficient long-context processing while maintaining full attention expressiveness.
+    The "linear" in Kimi-Linear refers to the KDA layers; MLA is used in the
+    *full-attention* layers (those listed in
+    ``config.linear_attn_config["full_attn_layers"]``). MLA reduces KV-cache
+    pressure by storing a single low-rank latent ``c_kv`` of dimension
+    ``kv_lora_rank`` per token instead of full-rank ``num_heads * head_dim``
+    K and V tensors. Per head, K/V are reconstructed on-the-fly from the
+    latent via a fixed projection ``kv_b_proj`` whose two halves give the
+    "nope" (no-RoPE) Q/K dot product and the V tensor. A small per-token
+    ``qk_rope_head_dim``-wide RoPE-carrying tensor is concatenated to the
+    queries and to the *shared* KV latent, separating the rotary subspace
+    from the latent-compressed subspace. Optional LoRA on Q
+    (``q_a_proj -> q_a_layernorm -> q_b_proj``) further compresses query
+    activations during training.
 
-    Features:
-        - LoRA-style latent compression for key-value projections
-        - Per-head RMSNorm on query/key latent projections
-        - Support for YaRN RoPE position scaling
-        - Optional LoRA for query projections
+    Per-head dimensions:
+        * Total query/key head dim ``= qk_nope_head_dim + qk_rope_head_dim``.
+        * ``v_head_dim`` is the per-head value dimension.
 
     Attributes:
-        q_head_dim: Total query head dimension (nope + rope).
-        qk_nope_head_dim: Query/key dimension without rotary embedding.
-        qk_rope_head_dim: Query/key dimension with rotary embedding.
-        v_head_dim: Value head dimension.
-        kv_lora_rank: Rank of KV LoRA compression.
+        q_head_dim (int): ``qk_nope_head_dim + qk_rope_head_dim``.
+        qk_nope_head_dim (int): Per-head Q/K dim that does NOT receive RoPE.
+        qk_rope_head_dim (int): Per-head Q/K dim that DOES receive RoPE.
+        v_head_dim (int): Per-head value dim.
+        kv_lora_rank (int): Latent rank stored in the KV cache (replaces the
+            full-rank K and V tensors).
+        head_dim (int): Aliased to ``v_head_dim`` so :class:`UnifiedAttention`
+            shape checks line up with the value path.
+        projection_mapping (ClassVar[dict]): Internal MLA-attribute name to
+            HuggingFace checkpoint name mapping consumed by
+            :meth:`define_network`.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -815,34 +857,55 @@ class KimiMLAAttention(UnifiedAttention):
 
 
 class KimiDeltaAttention(spx.Module):
-    """Kimi Linear KDA (Kernel Delta Attention) layer.
+    """Kernel Delta Attention (KDA) — Kimi-Linear's per-layer linear-attention block.
 
-    Implements linear attention with O(N) complexity for efficient long-context
-    processing. Uses delta rule updates for recurrent state maintenance.
+    KDA replaces softmax attention with a recurrent *kernel-feature* state that
+    is updated by the **delta rule** at every token, giving O(seq_len) compute
+    and O(1) decode. Conceptually each head maintains a key/value memory matrix
+    :math:`S \\in \\mathbb{R}^{d_k \\times d_v}` that evolves as
 
-    Architecture components:
-        - Separate causal convolutions for Q, K, V (d_conv kernel size)
-        - Decay gate via two-layer MLP (f_a_proj -> f_b_proj) with A_log/dt_bias
-        - Update gate (beta) via b_proj with sigmoid activation
-        - Output gate via two-layer MLP (g_a_proj -> g_b_proj) with gated RMSNorm
-        - Chunk-wise processing for memory efficiency
+    .. math::
+        S_t = \\alpha_t \\, S_{t-1} \\, (I - \\beta_t k_t k_t^\\top)
+              + \\beta_t \\, k_t v_t^\\top, \\qquad
+        o_t = S_t^\\top q_t
 
-    HuggingFace-compatible parameter naming:
-        - q_proj, k_proj, v_proj: Input linear projections
-        - q_conv1d, k_conv1d, v_conv1d: Separate causal convolutions
-        - f_a_proj, f_b_proj: Decay gate MLP layers
-        - b_proj: Beta/update gate projection
-        - g_a_proj, g_b_proj: Output gate MLP layers
-        - A_log, dt_bias: Decay parameters
-        - o_norm: Gated RMSNorm for output
-        - o_proj: Output projection
+    where :math:`\\alpha_t = \\exp(-\\Delta_t \\, \\text{softplus}(A))` is a
+    per-head data-independent decay (a la Mamba-2), :math:`\\beta_t =
+    \\sigma(W_b x_t)` is the per-token *write strength* (the "delta" of the
+    delta rule — large :math:`\\beta` overwrites the existing memory at
+    direction :math:`k_t`, small :math:`\\beta` blends), and :math:`\\Delta_t`
+    is a low-rank scalar produced by ``f_a_proj -> f_b_proj``. Q/K/V are first
+    passed through *separate* causal depthwise 1-D convolutions of width
+    ``d_conv`` so each head still sees a small local window, and the output
+    is fed through a low-rank gate (``g_a_proj -> g_b_proj``) and a gated
+    RMSNorm before the final output projection. The recurrence is realized
+    on hardware by chunking the sequence into ``chunk_size`` blocks and
+    running the kernel :class:`KernelDeltaAttnOp`, which folds the
+    intra-chunk parallel matmul with the inter-chunk recurrent carry.
+
+    State carried across decode steps inside :class:`KDACacheView`:
+        * The three rolling conv windows for Q/K/V (length ``d_conv``).
+        * The recurrent memory ``S`` of shape ``(num_heads, head_k_dim, head_v_dim)``.
 
     Attributes:
-        num_heads: Number of attention heads.
-        head_k_dim: Dimension per head for keys.
-        head_v_dim: Dimension per head for values.
-        d_conv: Convolution kernel size.
-        chunk_size: Size of chunks for chunk-wise processing.
+        q_proj, k_proj, v_proj: Linear projections to Q/K/V before the convs.
+        q_conv1d, k_conv1d, v_conv1d: Per-stream causal depthwise 1-D
+            convolutions (``feature_group_count == channels``) of width ``d_conv``.
+        f_a_proj, f_b_proj: Low-rank MLP producing the per-head decay
+            factor :math:`\\Delta`.
+        b_proj: Per-head linear producing the delta-rule write strength
+            :math:`\\beta` (sigmoid-activated).
+        g_a_proj, g_b_proj: Low-rank MLP producing the output gate.
+        o_norm (RMSNormGated): Gated RMS normalization on the head outputs.
+        o_proj: Final output projection back to ``hidden_size``.
+        A_log (ArrayParam): Log-scale per-head decay base; the actual decay
+            uses ``-softplus(A_log)`` to stay non-positive.
+        dt_bias (ArrayParam): Per-head bias on :math:`\\Delta` after the
+            low-rank projection.
+        kda_op (KernelDeltaAttnOp): Fused chunked kernel that runs the
+            recurrence.
+        num_heads, head_k_dim, head_v_dim, d_conv, chunk_size,
+        gate_low_rank_dim, key_dim, value_dim: Mirror their config fields.
     """
 
     reform_param: typing.ClassVar = {
@@ -999,16 +1062,37 @@ class KimiDeltaAttention(spx.Module):
         cache_view: KDACacheView | None = None,
         cache_metadata: KDAMetadata | None = None,
     ) -> AttentionLayerOutput:
-        """Forward pass for KDA attention.
+        """Run the chunked delta-rule recurrence over a block of tokens.
+
+        Streaming behavior: when ``cache_view`` carries non-``None`` rolling
+        conv windows and a previous memory ``S``, the kernel splices the new
+        token onto the conv buffers, advances ``S`` by one delta-rule step
+        per chunk, and writes the trailing ``d_conv`` columns plus the
+        updated ``S`` back into the cache. During training / prefill the
+        conv applies left-pad ``d_conv - 1`` and the kernel uses a parallel
+        intra-chunk matmul with a recurrent carry between chunks of size
+        ``chunk_size``.
+
+        Padding tokens are zeroed out of the input *before* projection (via
+        :func:`apply_mask_to_padding_states`) so they contribute neither to
+        the conv windows nor to the recurrent memory.
 
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_dim]
-            mask_info: Attention mask information
-            cache_view: Hybrid cache view for inference
-            cache_metadata: Hybrid cache metadata
+            hidden_states: ``(batch, seq_len, hidden_size)`` block input.
+            mask_info: Optional :class:`MaskInfo`. KDA only consumes
+                ``q_attention_mask`` to zero out padding; there is no
+                pairwise causal mask because the recurrence is causal by
+                construction.
+            cache_view: Per-layer KDA cache (rolling Q/K/V conv windows and
+                recurrent memory ``S``). ``None`` skips state threading.
+            cache_metadata: Optional :class:`KDAMetadata` for paged cache
+                layouts; not used by the dense layout.
 
         Returns:
-            AttentionLayerOutput with attention output and updated cache
+            AttentionLayerOutput: ``attention_output`` of shape
+            ``(batch, seq_len, hidden_size)``, the updated KDA cache view,
+            and ``attention_weight = None`` (KDA produces no attention
+            matrix).
         """
         if mask_info is not None:
             q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)

@@ -1092,7 +1092,10 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         Returns:
             Array: Projected image features ready for merging with text.
         """
-        image_features = self.vision_tower(pixel_values, image_grid_hws)
+        if self._pipeline_stage_regions_enabled():
+            image_features = spx.sxstage_region("kimi_vl_vision")(self.vision_tower)(pixel_values, image_grid_hws)
+        else:
+            image_features = self.vision_tower(pixel_values, image_grid_hws)
         return self.multi_modal_projector(image_features)
 
     def get_image_features(

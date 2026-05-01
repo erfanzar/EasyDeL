@@ -58,10 +58,21 @@ PipelineDataValue = ShardedDataSource | AsyncDataLoader
 
 
 class Pipeline:
-    """Fluent API for building data processing pipelines.
+    """Fluent builder that materialises a :class:`PipelineConfig` into a runnable graph.
 
-    Provides a chainable interface for creating complex data pipelines
-    with per-dataset configuration support.
+    The :class:`Pipeline` walks the configured stages in user-chosen
+    order — ``source().tokenize().mix().pack().load()`` is the canonical
+    sequence — applying each stage's ``process`` to the rolling
+    ``{name: source}`` dict and forwarding the result to the next call.
+    Each method returns ``self`` so the calls can chain. Internally the
+    pipeline owns a :class:`PipelineContext` (built from the supplied
+    config) which it threads through every stage so that step/epoch
+    counters, cached tokenizers, and metrics are shared.
+
+    Stages may be omitted (e.g. skip ``mix()`` for a single-dataset
+    run) but ``source()`` must always come first; calling any other
+    method beforehand raises :class:`RuntimeError` via
+    :meth:`_ensure_data`.
 
     Example:
         >>> config = PipelineConfig(
@@ -80,10 +91,15 @@ class Pipeline:
     """
 
     def __init__(self, config: PipelineConfig):
-        """Initialize Pipeline.
+        """Capture the configuration and build a fresh :class:`PipelineContext`.
+
+        No I/O happens here — the pipeline graph is constructed
+        lazily as stages are chained.
 
         Args:
-            config: Pipeline configuration.
+            config: Resolved :class:`PipelineConfig` describing the
+                datasets and stage settings. The constructor also
+                seeds the context's RNG from :attr:`PipelineConfig.seed`.
         """
         self._config = config
         self._context = PipelineContext(config=config, seed=config.seed)
@@ -92,13 +108,26 @@ class Pipeline:
 
     @classmethod
     def from_config(cls, config: PipelineConfig | dict) -> "Pipeline":
-        """Create a pipeline from configuration.
+        """Construct a :class:`Pipeline` from either a typed config or a plain dict.
+
+        Accepts both already-built :class:`PipelineConfig` instances
+        (forwarded as-is) and dicts that originate from JSON/YAML
+        config files. The dict path is forgiving: each known stage key
+        is wrapped into the matching ``*StageConfig`` dataclass when
+        present, datasets are coerced into :class:`DatasetConfig`, and
+        unspecified stages fall back to the dataclass defaults.
 
         Args:
-            config: PipelineConfig or dict with configuration.
+            config: Either a :class:`PipelineConfig` (returned wrapped
+                in a new :class:`Pipeline`) or a dict literal of
+                top-level options. Recognised dict keys: ``datasets``,
+                ``default_tokenizer``, ``streaming``, ``seed``,
+                ``source``, ``tokenize``, ``cache``, ``mix``,
+                ``pack``, ``load``, ``save``.
 
         Returns:
-            New Pipeline instance.
+            Pipeline: A new pipeline ready to have its stage methods
+            chained.
         """
         if isinstance(config, dict):
             # Convert dict to PipelineConfig
@@ -119,12 +148,20 @@ class Pipeline:
         return cls(config)
 
     def source(self) -> "Pipeline":
-        """Load datasets from their sources.
+        """First stage: instantiate a :class:`ShardedDataSource` for every configured dataset.
 
-        Creates ShardedDataSource instances for each dataset in the config.
+        Walks :attr:`PipelineConfig.datasets` and runs each through
+        :func:`create_source`, building the initial ``{name: source}``
+        dict that subsequent stages will transform. Must be called
+        exactly once before any other stage method; calling it twice
+        raises.
 
         Returns:
-            Self for chaining.
+            Pipeline: ``self``, for chaining.
+
+        Raises:
+            RuntimeError: If :meth:`source` has already been called on
+                this pipeline.
         """
         if self._data is not None:
             raise RuntimeError("source() has already been called")
@@ -140,15 +177,23 @@ class Pipeline:
         return self
 
     def tokenize(self, config: TokenizeStageConfig | None = None) -> "Pipeline":
-        """Apply tokenization to all datasets.
+        """Apply tokenization to every loaded source via a :class:`TokenizeStage`.
 
-        Uses per-dataset tokenizer configuration when available.
+        Per-dataset tokenizer overrides on
+        :attr:`DatasetConfig.tokenizer` are honoured; the supplied
+        ``config`` (or :attr:`PipelineConfig.tokenize` when ``None``)
+        provides defaults. Mutates the rolling source dict in-place so
+        downstream stages see tokenized rows.
 
         Args:
-            config: Optional override for tokenization config.
+            config: Stage-level :class:`TokenizeStageConfig` override.
+                When ``None``, uses :attr:`PipelineConfig.tokenize`.
 
         Returns:
-            Self for chaining.
+            Pipeline: ``self``, for chaining.
+
+        Raises:
+            RuntimeError: When called before :meth:`source`.
         """
         self._ensure_data()
         data = tp.cast(dict[str, ShardedDataSource], self._data)
@@ -160,15 +205,22 @@ class Pipeline:
         return self
 
     def mix(self, config: MixStageConfig | None = None) -> "Pipeline":
-        """Mix multiple datasets into one.
+        """Combine all current sources into a single mixed source via :class:`MixStage`.
 
-        Supports static weights and dynamic weight scheduling.
+        Honours static weights (:attr:`MixStageConfig.weights`) or a
+        curriculum schedule (:attr:`MixStageConfig.weight_schedule`).
+        When the rolling source dict already contains exactly one
+        entry, the stage is a no-op (just records that ``"mix"`` ran).
 
         Args:
-            config: Optional override for mix config.
+            config: Stage-level :class:`MixStageConfig` override; when
+                ``None`` uses :attr:`PipelineConfig.mix`.
 
         Returns:
-            Self for chaining.
+            Pipeline: ``self``, for chaining.
+
+        Raises:
+            RuntimeError: When called before :meth:`source`.
         """
         self._ensure_data()
         data = tp.cast(dict[str, ShardedDataSource], self._data)
@@ -185,15 +237,21 @@ class Pipeline:
         return self
 
     def pack(self, config: PackStageConfig | None = None) -> "Pipeline":
-        """Pack sequences into fixed-length chunks.
+        """Concatenate variable-length tokenized rows into fixed-length windows via :class:`PackStage`.
 
-        Supports multiple packing strategies (greedy, pool, first_fit).
+        Strategy is selected by :attr:`PackStageConfig.strategy`
+        (``"greedy"``, ``"pool"``, ``"first_fit"``). When packing is
+        disabled in the config the stage is a no-op.
 
         Args:
-            config: Optional override for pack config.
+            config: Stage-level :class:`PackStageConfig` override; when
+                ``None`` uses :attr:`PipelineConfig.pack`.
 
         Returns:
-            Self for chaining.
+            Pipeline: ``self``, for chaining.
+
+        Raises:
+            RuntimeError: When called before :meth:`source`.
         """
         self._ensure_data()
         data = tp.cast(dict[str, ShardedDataSource], self._data)
@@ -205,15 +263,22 @@ class Pipeline:
         return self
 
     def save(self, config: SaveStageConfig | None = None) -> "Pipeline":
-        """Save datasets to disk.
+        """Persist the current rolling sources to disk via :class:`SaveStage`.
 
-        Uses per-dataset save paths when available.
+        Each source is materialised as Parquet/Arrow/JSONL shards under
+        :attr:`SaveStageConfig.output_dir` (or the per-dataset
+        :attr:`DatasetConfig.save_path` if set). Optionally pushes the
+        result to the HuggingFace Hub.
 
         Args:
-            config: Optional override for save config.
+            config: Stage-level :class:`SaveStageConfig` override; when
+                ``None`` uses :attr:`PipelineConfig.save`.
 
         Returns:
-            Self for chaining.
+            Pipeline: ``self``, for chaining.
+
+        Raises:
+            RuntimeError: When called before :meth:`source`.
         """
         self._ensure_data()
         data = tp.cast(dict[str, ShardedDataSource], self._data)
@@ -225,13 +290,22 @@ class Pipeline:
         return self
 
     def load(self, config: LoadStageConfig | None = None) -> "Pipeline":
-        """Create data loaders with batching and prefetching.
+        """Wrap the rolling sources into :class:`AsyncDataLoader` batches via :class:`LoadStage`.
+
+        After this stage the pipeline's data dict no longer contains
+        :class:`ShardedDataSource` instances but
+        :class:`AsyncDataLoader` instances ready to be iterated by
+        the trainer.
 
         Args:
-            config: Optional override for load config.
+            config: Stage-level :class:`LoadStageConfig` override; when
+                ``None`` uses :attr:`PipelineConfig.load`.
 
         Returns:
-            Self for chaining.
+            Pipeline: ``self``, for chaining.
+
+        Raises:
+            RuntimeError: When called before :meth:`source`.
         """
         self._ensure_data()
         data = tp.cast(dict[str, ShardedDataSource], self._data)
@@ -243,10 +317,19 @@ class Pipeline:
         return self
 
     def build(self) -> "ShardedDataSource | Iterator[dict] | AsyncDataLoader":
-        """Build and return the final data iterator.
+        """Finalise the chain and return a single iterable for downstream consumption.
+
+        After running through whatever stages were chained, the
+        rolling data dict is reduced to its first value and returned —
+        callers expecting a single source/loader after a complete
+        ``source().mix().load()`` chain will get the loader directly.
+        For multi-source pipelines that did not call ``mix()``,
+        callers should iterate :meth:`get_data` themselves.
 
         Returns:
-            Iterator or AsyncDataLoader depending on pipeline configuration.
+            ShardedDataSource | Iterator[dict] | AsyncDataLoader: The
+            first (and typically only) entry of the rolling data dict.
+            Concrete type depends on which stages were applied.
         """
         self._ensure_data()
 
@@ -258,34 +341,52 @@ class Pipeline:
         return next(iter(self._data.values()))
 
     def get_data(self) -> dict[str, tp.Any]:
-        """Get the current pipeline data.
+        """Inspect the rolling ``{name: data}`` dict at its current pipeline position.
+
+        Useful for tests and for multi-source pipelines that did not
+        call ``mix()`` and need to iterate constituents independently.
 
         Returns:
-            Dictionary mapping dataset names to their current state.
+            dict[str, Any]: A reference to the rolling data dict
+            (sources, loaders, …) keyed by dataset name. Returns an
+            empty dict before :meth:`source` has been called.
         """
         return self._data or {}
 
     def get_context(self) -> PipelineContext:
-        """Get the pipeline context.
+        """Return the :class:`PipelineContext` shared by every stage in this pipeline.
+
+        Useful for retrieving accumulated metrics, the cached
+        tokenizers, or step/epoch counters set during execution.
 
         Returns:
-            Pipeline context with configuration and metrics.
+            PipelineContext: The live context owned by the pipeline.
+            Mutating it has the same effect as if a stage had done so.
         """
         return self._context
 
     def get_stages(self) -> list[str]:
-        """Get the list of applied stages.
+        """Return the ordered list of stage names that have been applied so far.
+
+        Useful for assertions in tests (e.g. "the pipeline really did
+        run tokenize before pack") and for diagnostic logging.
 
         Returns:
-            List of stage names in order.
+            list[str]: Copy of the per-call stage log; mutating it has
+            no effect on the pipeline.
         """
         return self._stages.copy()
 
     def _ensure_data(self):
-        """Ensure data has been loaded by calling source() first.
+        """Guard helper: assert :meth:`source` has been called before any other stage.
+
+        Every transforming stage method (:meth:`tokenize`,
+        :meth:`mix`, :meth:`pack`, :meth:`save`, :meth:`load`,
+        :meth:`build`) calls this first to fail loud and early if
+        the user forgot to call :meth:`source`.
 
         Raises:
-            RuntimeError: If source() has not been called yet.
+            RuntimeError: When :attr:`_data` is still ``None``.
         """
         if self._data is None:
             raise RuntimeError("Call source() before other pipeline stages")
@@ -296,15 +397,26 @@ def create_pipeline(
     default_tokenizer: str | None = None,
     **kwargs,
 ) -> Pipeline:
-    """Create a pipeline from a list of dataset configurations.
+    """Convenience wrapper that builds a :class:`Pipeline` from positional dataset configs.
+
+    Coerces dict entries to :class:`DatasetConfig` and feeds everything
+    into a :class:`PipelineConfig`, then wraps that in a
+    :class:`Pipeline`. Useful for short scripts where building the full
+    typed config explicitly is verbose.
 
     Args:
-        datasets: List of DatasetConfig or dicts.
-        default_tokenizer: Default tokenizer for all datasets.
-        **kwargs: Additional PipelineConfig options.
+        datasets: Iterable of :class:`DatasetConfig` instances or
+            dicts that match the dataclass shape; dicts are passed to
+            ``DatasetConfig(**ds)``.
+        default_tokenizer: Pipeline-wide tokenizer fallback used when
+            individual datasets do not declare their own.
+        **kwargs: Additional keyword arguments forwarded verbatim to
+            :class:`PipelineConfig` (``streaming``, ``seed``, stage
+            configs, …).
 
     Returns:
-        New Pipeline instance.
+        Pipeline: A fresh pipeline ready to be chained
+        (``pipeline.source().tokenize()...``).
     """
     ds_configs = [DatasetConfig(**ds) if isinstance(ds, dict) else ds for ds in datasets]
     config = PipelineConfig(
@@ -322,16 +434,26 @@ def tokenize_and_save(
     output_format: str = "parquet",
     max_length: int = 2048,
 ) -> None:
-    """Tokenize a dataset and save to disk.
+    """One-call helper: tokenize a single dataset and persist the result.
 
-    Convenience function for the common pattern of tokenizing and saving.
+    Builds a minimal :class:`PipelineConfig` consisting of a single
+    :class:`DatasetConfig`, runs ``source().tokenize().save().build()``,
+    and logs the destination on completion. Suitable for one-off
+    preprocessing scripts; for richer pipelines use :class:`Pipeline`
+    directly.
 
     Args:
-        data_files: Path(s) to input data.
-        tokenizer: Tokenizer name or path.
-        output_path: Output directory.
-        output_format: Output format (parquet, arrow, jsonl).
-        max_length: Maximum sequence length.
+        data_files: Source location passed verbatim to
+            :class:`DatasetConfig.data_files` (path, glob, list, or
+            URI).
+        tokenizer: Tokenizer name or path used by the tokenize stage.
+        output_path: Filesystem directory under which the persisted
+            shards are written.
+        output_format: One of ``"parquet"``, ``"arrow"``, ``"jsonl"``;
+            governs both the writer used and the per-dataset
+            ``save_format``.
+        max_length: Truncation length applied during tokenization;
+            forwarded to :class:`TokenizeStageConfig.max_length`.
     """
     config = PipelineConfig(
         datasets=[
@@ -502,6 +624,25 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
             mapping_local = dict(inform.format_fields)
 
             def rename_fields(ex, _mapping=mapping_local):
+                """Inline closure: apply ``inform.format_fields`` to one example.
+
+                Renames keys both at the top level of the example dict
+                **and** inside nested message-style dicts (e.g.
+                ``messages: [{"role": ..., "content": ...}, ...]``)
+                so chat-formatted datasets with off-spec key names can
+                be re-aligned to the canonical schema. Mutates ``ex``
+                in place.
+
+                Args:
+                    ex: Single source row dict to rename in place.
+                    _mapping: Default-bound capture of
+                        ``inform.format_fields`` so the closure does
+                        not depend on the loop variable.
+
+                Returns:
+                    dict: The same ``ex`` with the requested renames
+                    applied (returned for ``ds.map`` compatibility).
+                """
                 for old_name, new_name in _mapping.items():
                     if old_name in ex:
                         ex[new_name] = ex.pop(old_name)
@@ -535,6 +676,39 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
             addl_fields = tuple(addl or ())
 
             def to_target(ex, _content_field=content_field, _addl=addl_fields, _target=content_target):
+                """Inline closure: re-key an example onto the mixture's canonical schema.
+
+                Promotes ``ex[_content_field]`` to ``ex[_target]`` and
+                copies any whitelisted additional fields. When the
+                source row is a preference-style pair (carries
+                ``chosen``/``rejected`` instead of a plain content
+                column) the row is forwarded unchanged so DPO-style
+                datasets work without special-casing on the caller
+                side. The defaults are bound at closure-creation time
+                via the ``=`` syntax so each constituent dataset gets
+                its own captured field names rather than aliasing the
+                outer loop variables.
+
+                Args:
+                    ex: Single source row dict.
+                    _content_field: Captured ``inform.content_field``
+                        for this dataset; ``None`` short-circuits and
+                        returns the row unchanged.
+                    _addl: Captured tuple of extra fields to preserve.
+                    _target: Captured destination key
+                        (:attr:`DatasetMixture.text_target_field`).
+
+                Returns:
+                    dict: New row dict keyed by ``_target`` plus the
+                    retained additional fields, or the original ``ex``
+                    for preference-style data missing the content
+                    column.
+
+                Raises:
+                    KeyError: When ``_content_field`` is missing and
+                        the row does not carry both ``chosen`` and
+                        ``rejected`` keys.
+                """
                 if _content_field is None:
                     return ex
                 try:

@@ -203,6 +203,18 @@ def sparse_distillation_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
+        """Compute the sparse-distillation loss for one minibatch.
+
+        Args:
+            tree: Differentiable parameter tree.
+            minibatch (collections.abc.Mapping[str, jax.Array]): Minibatch
+                with ``input_ids``, ``attention_mask``,
+                ``teacher_top_k_indices``, ``teacher_top_k_logprobs`` and
+                optional ``completion_mask`` / ``labels``.
+
+        Returns:
+            tuple[jax.Array, LossMetrics]: ``(scalar_loss, metrics)``.
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree)

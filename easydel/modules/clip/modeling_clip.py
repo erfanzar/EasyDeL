@@ -11,6 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Spectrax implementation of OpenAI CLIP (Contrastive Language-Image Pre-training).
+
+CLIP couples a vision transformer encoder with a causal text transformer
+encoder; both project into a shared embedding space where matched image-text
+pairs have high cosine similarity. Training optimizes a symmetric InfoNCE
+loss with a learnable temperature.
+
+Loss helpers:
+
+- :func:`contrastive_loss` — single-direction softmax cross-entropy.
+- :func:`clip_loss` — symmetric image/text contrastive loss.
+
+Building blocks:
+
+- :class:`CLIPVisionEmbeddings`, :class:`CLIPTextEmbeddings` — patch/word +
+  position embeddings (vision adds a learnable CLS token).
+- :class:`CLIPAttention`, :class:`CLIPMLP`, :class:`CLIPEncoderLayer`,
+  :class:`CLIPEncoder` — shared transformer stack.
+- :class:`CLIPTextTransformer`, :class:`CLIPVisionTransformer` — encoder
+  wrappers used by the text/vision sub-models.
+
+Public model classes (registered with the factory):
+
+- :class:`CLIPTextModel` — text encoder (+ EOS pooling).
+- :class:`CLIPTextModelWithProjection` — text encoder + projection head.
+- :class:`CLIPVisionModel` — vision encoder.
+- :class:`CLIPForImageClassification` — vision encoder + linear classifier.
+- :class:`CLIPModel` — joint dual-encoder for contrastive training and
+  zero-shot image classification.
+"""
+
 import inspect
 import typing as tp
 from functools import cached_property, partial
@@ -45,28 +76,38 @@ from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
 
 def contrastive_loss(logits: jax.Array) -> jax.Array:
-    """
-    Computes the contrastive loss.
+    """Compute the one-direction softmax cross-entropy used by CLIP.
+
+    Treats each row of ``logits`` as the similarities of a single anchor
+    (e.g. one image) against all candidates (e.g. all texts in the batch);
+    the correct match is on the diagonal. Returns the mean
+    log-softmax cross-entropy with diagonal targets — i.e. the InfoNCE
+    objective for that direction.
 
     Args:
-            logits (jax.Array): Logits from the model.
+        logits (jax.Array): Square similarity matrix of shape ``(N, N)``.
 
     Returns:
-            jax.Array: Contrastive loss.
+        jax.Array: Scalar mean cross-entropy loss.
     """
     labels = jnp.arange(len(logits))
     return jnp.mean(-jnp.sum(jax.nn.log_softmax(logits) * jax.nn.one_hot(labels, len(logits)), axis=-1))
 
 
 def clip_loss(similarity: jax.Array) -> jax.Array:
-    """
-    Computes the CLIP loss.
+    """Symmetric image/text contrastive loss used for CLIP pre-training.
+
+    Averages :func:`contrastive_loss` applied to ``similarity`` (image -> text
+    direction) and to its transpose (text -> image), so neither modality is
+    privileged.
 
     Args:
-            similarity (jax.Array): Similarity matrix.
+        similarity (jax.Array): Square cosine similarity matrix of shape
+            ``(batch, batch)`` already scaled by ``logit_scale``. The
+            diagonal entries correspond to the correct image-text pairs.
 
     Returns:
-            jax.Array: CLIP loss.
+        jax.Array: Scalar symmetric InfoNCE loss.
     """
     caption_loss = contrastive_loss(similarity)
     image_loss = contrastive_loss(similarity.T)
@@ -74,10 +115,22 @@ def clip_loss(similarity: jax.Array) -> jax.Array:
 
 
 class CLIPVisionEmbeddings(spx.Module):
-    """Vision embeddings module for CLIP models.
+    """Patch + position + CLS embedding for the CLIP ViT tower.
 
-    Converts image pixel values into patch embeddings with position encodings
-    and a learnable class token for vision transformer processing.
+    Computes the standard ViT input contract:
+
+    1. ``patch_embedding``: a 2D conv with ``kernel_size = stride =
+       config.patch_size`` slices the input image
+       ``(batch, image_size, image_size, num_channels)`` into
+       ``(image_size // patch_size) ** 2`` non-overlapping patch tokens of
+       width ``hidden_size``.
+    2. A learnable ``[CLS]`` token (``class_embedding``) is prepended,
+       producing ``num_patches + 1`` tokens.
+    3. Learned absolute position embeddings (``num_positions = num_patches +
+       1``) are added.
+
+    Output shape: ``(batch, num_patches + 1, hidden_size)``. The ``[CLS]``
+    token at position 0 is what the vision tower's pooled head reads.
     """
 
     def __init__(
@@ -162,10 +215,12 @@ class CLIPVisionEmbeddings(spx.Module):
 
 
 class CLIPTextEmbeddings(spx.Module):
-    """Text embeddings module for CLIP models.
+    """Token + learned absolute position embedding for the CLIP text encoder.
 
-    Combines token embeddings and position embeddings for text
-    transformer processing in the CLIP architecture.
+    Looks up token ids in ``token_embedding`` (vocab ``config.vocab_size``,
+    width ``hidden_size``), then adds a learned absolute position embedding
+    sliced to the input sequence length (``config.max_position_embeddings``,
+    typically 77). Output: ``(batch, seq_len, hidden_size)``.
     """
 
     def __init__(
@@ -225,10 +280,15 @@ class CLIPTextEmbeddings(spx.Module):
 
 
 class CLIPAttention(AttentionModule):
-    """Multi-head attention module for CLIP models.
+    """Multi-head self-attention shared by both CLIP encoders.
 
-    Supports both causal attention for text encoder and non-causal
-    attention for vision encoder based on configuration type.
+    Standard pre-norm MHA: ``q``/``k``/``v``/``out_proj`` are
+    :class:`ColumnParallelLinear` projections of width ``hidden_size``
+    (no GQA — ``num_heads = num_attention_heads``). The masking convention is
+    config-driven: a :class:`CLIPTextConfig` instance forces a causal mask
+    (so the text encoder is autoregressive in the contrastive sense, with
+    EOS-token pooling), while a :class:`CLIPVisionConfig` instance disables
+    causal masking so every patch can attend to every other patch.
     """
 
     def __init__(
@@ -355,10 +415,13 @@ class CLIPAttention(AttentionModule):
 
 
 class CLIPMLP(spx.Module):
-    """Multi-Layer Perceptron module for CLIP models.
+    """Two-layer feed-forward block for CLIP encoder layers.
 
-    Implements the feedforward network with configurable activation function
-    for both text and vision encoders in the CLIP architecture.
+    Computes ``fc2(act(fc1(x)))`` where ``fc1`` widens to
+    ``config.intermediate_size`` and ``fc2`` projects back to ``hidden_size``.
+    The activation is selected by ``config.hidden_act`` (typically
+    ``"quick_gelu"`` for CLIP). No gating; this is the original
+    transformer-style MLP.
     """
 
     def __init__(
@@ -426,10 +489,14 @@ class CLIPMLP(spx.Module):
 
 
 class CLIPEncoderLayer(spx.Module):
-    """Single encoder layer for CLIP models.
+    """One CLIP encoder block (pre-norm attention + MLP residuals).
 
-    Combines multi-head self-attention and feedforward networks with
-    layer normalization and residual connections.
+    The forward path is the canonical pre-LN transformer block:
+    ``x = x + attn(layer_norm1(x))`` then
+    ``x = x + mlp(layer_norm2(x))``. Used identically by both the text
+    encoder and the vision encoder; the only behavioural difference is the
+    causal-mask flag on :class:`CLIPAttention`, which is set by the config
+    type (text → causal, vision → bidirectional).
     """
 
     def __init__(
@@ -526,10 +593,14 @@ class CLIPEncoderLayer(spx.Module):
 
 
 class CLIPEncoder(EasyDeLLayerStackMixin, spx.Module):
-    """Transformer encoder for CLIP models.
+    """Stack of :class:`CLIPEncoderLayer` blocks, scan-friendly.
 
-    Stacks multiple CLIPEncoderLayer instances to form the complete
-    encoder for either text or vision processing.
+    Holds ``config.num_hidden_layers`` encoder blocks in a
+    :class:`spx.nn.ModuleList`. Inherits :class:`EasyDeLLayerStackMixin` so
+    the layer loop runs through ``self.layers.scan(...)`` (single trace,
+    optional remat) and so cache-views / hidden-state collection follow the
+    same contract as the decoder stacks elsewhere in EasyDeL. Used by both
+    :class:`CLIPTextTransformer` and :class:`CLIPVisionTransformer`.
     """
 
     def __init__(
@@ -647,10 +718,15 @@ class CLIPEncoder(EasyDeLLayerStackMixin, spx.Module):
 
 
 class CLIPTextTransformer(EasyDeLBaseModule):
-    """Text transformer encoder for CLIP models.
+    """Causal text encoder for CLIP — embeddings + encoder + EOS pooling.
 
-    Processes text tokens through embeddings, multiple encoder layers with
-    causal attention, and final layer normalization to produce text representations.
+    Pipeline: :class:`CLIPTextEmbeddings` -> :class:`CLIPEncoder` (causal) ->
+    final ``LayerNorm``. The pooled representation used downstream for
+    contrastive similarity is the hidden state at the EOS position
+    (``argmax(input_ids, axis=-1)``, matching OpenAI's reference
+    tokenization where EOS is the highest-id token in the sequence). Returns
+    a :class:`BaseModelOutputWithPooling` carrying both the per-token hidden
+    states and the EOS-pooled vector.
     """
 
     def __init__(
@@ -790,10 +866,16 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 
 
 class CLIPVisionTransformer(EasyDeLBaseModule):
-    """Vision transformer encoder for CLIP models.
+    """Bidirectional ViT image encoder used by CLIP.
 
-    Processes images through patch embeddings, multiple encoder layers with
-    bidirectional attention, and layer normalization to produce vision representations.
+    Pipeline: :class:`CLIPVisionEmbeddings` (Conv2d patchify + CLS +
+    learned position embedding) -> ``pre_layrnorm`` -> :class:`CLIPEncoder`
+    (bidirectional self-attention) -> ``post_layernorm`` applied to the
+    ``[CLS]`` token. Pixel input contract is
+    ``(batch, image_size, image_size, num_channels)`` (NHWC); the output is
+    a :class:`BaseModelOutputWithPooling` whose ``pooler_output`` is the
+    layer-normed CLS hidden state — this is the vector projected into the
+    shared image-text embedding space by :class:`CLIPModel`.
     """
 
     def __init__(
@@ -929,10 +1011,13 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 
 @register_module(config=CLIPTextConfig, model_type="clip_text_model", task_type=TaskType.BASE_MODULE)
 class CLIPTextModel(EasyDeLBaseModule):
-    """CLIP text model outputting raw hidden states.
+    """Top-level CLIP text encoder (registered under ``clip_text_model``).
 
-    A bare transformer encoder for text that produces embeddings without
-    any task-specific head, suitable for use in contrastive learning.
+    Thin wrapper over :class:`CLIPTextTransformer` exposing the standard
+    EasyDeL ``BASE_MODULE`` interface (``compute_embedding``, ``get_encoder``,
+    …). Returns a :class:`BaseModelOutputWithPooling` — same contract as the
+    underlying transformer, just promoted to a registered module so
+    :class:`AutoEasyDeLModel` can resolve it from a config alone.
     """
 
     def __init__(
@@ -1040,10 +1125,13 @@ class CLIPTextModel(EasyDeLBaseModule):
 
 
 class CLIPTextModelWithProjection(EasyDeLBaseModule):
-    """CLIP text model with a projection layer.
+    """CLIP text encoder + linear projection into the shared embedding space.
 
-    Extends the text transformer with a linear projection layer to map
-    text embeddings to the shared multimodal embedding space.
+    Composes :class:`CLIPTextTransformer` with an unbiased ``text_projection``
+    of shape ``(hidden_size, projection_dim)``. The projection is applied to
+    the EOS-pooled hidden state, producing a vector directly comparable
+    (via cosine similarity, after ``l2`` norm) with the image projection
+    from :class:`CLIPVisionModel`. Returns :class:`CLIPTextModelOutput`.
     """
 
     def __init__(
@@ -1158,10 +1246,13 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 @register_module(config=CLIPVisionConfig, model_type="clip_vision_model", task_type=TaskType.BASE_VISION)
 @register_module(config=CLIPVisionConfig, model_type="clip_vision_model", task_type=TaskType.BASE_MODULE)
 class CLIPVisionModel(EasyDeLBaseModule):
-    """CLIP vision model outputting raw hidden states.
+    """Top-level CLIP vision encoder (registered under ``clip_vision_model``).
 
-    A bare vision transformer that processes images and produces embeddings
-    without any task-specific head, suitable for use in contrastive learning.
+    Thin wrapper over :class:`CLIPVisionTransformer` exposing the registered
+    ``BASE_MODULE`` interface; pixel input contract is the NHWC ``(batch,
+    image_size, image_size, num_channels)`` tensor expected by the underlying
+    Conv2d patch embedder. Returns :class:`BaseModelOutputWithPooling` with
+    the ``[CLS]`` token's post-layernorm vector as ``pooler_output``.
     """
 
     def __init__(
@@ -1251,10 +1342,15 @@ class CLIPVisionModel(EasyDeLBaseModule):
 
 @register_module(config=CLIPVisionConfig, model_type="clip", task_type=TaskType.IMAGE_CLASSIFICATION)
 class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransformer, CLIPVisionConfig]):  # type: ignore
-    """CLIP vision model with image classification head.
+    """CLIP vision tower + linear ``classifier`` head for supervised image classification.
 
-    Extends the CLIP vision transformer with a linear classification layer
-    on top of the mean-pooled patch embeddings for image classification tasks.
+    Backbone: :class:`CLIPVisionTransformer`. Pooling: mean over the patch
+    tokens (the ``[CLS]`` token at position 0 is excluded), giving one
+    ``hidden_size`` vector per image. Head: a single ``classifier`` linear
+    of shape ``(hidden_size, num_labels)``. Suitable for fine-tuning the
+    CLIP image encoder on closed-vocabulary classification benchmarks
+    (ImageNet, etc.). Pixel input contract matches
+    :class:`CLIPVisionTransformer`.
     """
 
     def __init__(
@@ -1363,11 +1459,20 @@ class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransfo
 
 @register_module(config=CLIPConfig, model_type="clip", task_type=TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION)
 class CLIPModel(EasyDeLBaseModule):
-    """Contrastive Language-Image Pre-training (CLIP) model.
+    """Joint dual-encoder CLIP model (registered under ``ZERO_SHOT_IMAGE_CLASSIFICATION``).
 
-    Combines text and vision encoders with projection heads to create
-    a shared embedding space for zero-shot image classification and
-    image-text retrieval tasks.
+    Combines :class:`CLIPTextTransformer` and :class:`CLIPVisionTransformer`
+    with two unbiased projection heads (``text_projection``,
+    ``visual_projection``) of shape ``(text/vision_hidden, projection_dim)``
+    that map both modalities into a shared embedding space. A learnable
+    scalar ``logit_scale`` (initialised at ``log(1 / 0.07)``, exponentiated
+    at use, optionally clipped by ``logit_scale_init_value``) controls the
+    softmax temperature of the contrastive similarity. Forward returns a
+    :class:`CLIPOutput` with both image and text embeddings, the
+    ``logits_per_image`` / ``logits_per_text`` similarity matrices, and the
+    symmetric InfoNCE :func:`clip_loss` when training. Used at inference for
+    zero-shot classification (text prompts as classes) and image-text
+    retrieval.
     """
 
     def __init__(

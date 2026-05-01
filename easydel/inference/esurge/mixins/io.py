@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""I/O mixin for the eSurge engine.
+
+Provides the user-facing generation entry points — ``generate``, ``stream``,
+chat-completion adapters, and OpenAI-compatible Responses adapters — that
+sit on top of the lower-level scheduler/runner pipeline.
+
+This module exposes :class:`EngineIOMixin`, mixed into :class:`eSurge`. It
+does not own any standalone business logic; methods rely on attributes
+populated by :meth:`eSurge.__init__` (tokenizer, scheduler, request bookkeeping
+locks, multimodal manager, parsers, etc.).
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -49,10 +61,23 @@ class EngineIOMixin:
     """
 
     def _ensure_scheduler_running(self, *, context: str) -> None:
-        """Raise a clear error when scheduler is unavailable.
+        """Fail fast when the scheduler is not actually running.
 
-        This prevents request wait-loops from hanging indefinitely if the
-        scheduler is stopped without a fatal-crash exception.
+        Streaming/blocking entry points spin in a wait loop on
+        ``self._output_event``; if the scheduler was stopped quietly
+        (manual :meth:`pause` / :meth:`terminate`) the loop would hang
+        forever waiting for output that will never come. This helper
+        runs once at the start of those entry points: when the scheduler
+        is alive it returns immediately, when a recorded crash exists
+        :meth:`_raise_if_scheduler_failed` re-raises that exception with
+        the original traceback, and otherwise it raises a fresh
+        :class:`RuntimeError` mentioning the calling ``context`` so logs
+        say which API path discovered the dead scheduler.
+
+        Args:
+            context: Short label (``"generate-start"``,
+                ``"stream-start"``, …) embedded into the error message
+                so log scrapers can identify the originating call.
         """
         if self._scheduler_running:
             return
@@ -60,11 +85,27 @@ class EngineIOMixin:
         raise RuntimeError(f"Background scheduler is not running ({context}).")
 
     def _recover_orphaned_request(self, request_id: str) -> bool:
-        """Abort a request when unresolved samples have no live scheduler/request state.
+        """Force-abort a request whose child samples vanished without a final output.
 
-        This prevents indefinite waits if a child request (especially in n>1
-        sampling) disappears from both scheduler and active-request tracking
-        without delivering a terminal output update.
+        ``n>1`` parallel sampling registers one scheduler-side child per
+        sample. When a fatal scheduler error or out-of-order finish event
+        leaves a child request gone from both ``scheduler.requests`` and
+        ``self._active_requests`` *and* the parent's
+        :class:`RequestOutput` still has unresolved samples (no
+        ``finish_reason`` set), generate/stream loops would otherwise
+        wait forever. This helper detects that state under careful
+        triple-locking — releasing each lock between checks so a real
+        completion can race in and avoid the abort — and only fires
+        :meth:`abort_request` when every cross-check still confirms the
+        orphan condition. Logs a WARNING when an abort is forced.
+
+        Args:
+            request_id: Parent request id that the calling generate/
+                stream loop is currently waiting on.
+
+        Returns:
+            ``True`` when an abort was issued (caller should restart its
+            poll loop), ``False`` when the request appears healthy.
         """
         with self._output_lock:
             ro = self._request_outputs.get(request_id)
@@ -120,7 +161,33 @@ class EngineIOMixin:
         tools: list[dict] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ):
-        """Build a minimal chat request for parser-side schema access."""
+        """Synthesize a stripped-down :class:`ChatCompletionRequest` for tool parsers.
+
+        Some tool parsers consult the request's tool schema and
+        ``tool_choice`` selector to disambiguate model output (e.g.
+        forced-function calls vs free-form). Internal entry points like
+        :meth:`generate` and :meth:`stream` only have a flat prompt
+        string, so this helper assembles a synthetic
+        :class:`ChatCompletionRequest` carrying a single user message
+        plus the engine-normalized tool list / choice. Returns ``None``
+        when no tools and no choice were supplied — the parser will then
+        fall back to its tool-free behaviour. Each tool dict is
+        converted into the OpenAI ``{"type": "function", "function":
+        {...}}`` wrapper shape the parsers expect, regardless of
+        whether the caller passed the wrapped or unwrapped form.
+
+        Args:
+            prompt: Already-formatted prompt string used as the synthetic
+                user message content.
+            tools: Optional list of tool definitions; pydantic models
+                are accepted and ``model_dump``-ed.
+            tool_choice: Optional ``"auto"`` / ``"none"`` / ``"required"``
+                literal or full ``{"type": "function", ...}`` selector.
+
+        Returns:
+            A validated :class:`ChatCompletionRequest`, or ``None`` when
+            both inputs were ``None``.
+        """
         if tools is None and tool_choice is None:
             return None
 
@@ -657,7 +724,28 @@ class EngineIOMixin:
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> Iterator[ChatCompletionStreamResponse]:
-        """Yield OpenAI chat stream chunks assembled from engine snapshots."""
+        """Bridge :meth:`chat` snapshots into OpenAI ``ChatCompletionStreamResponse`` frames.
+
+        Drives :meth:`chat` in streaming mode and pipes its
+        :class:`RequestOutput` snapshots through
+        :func:`iter_chat_completion_stream_responses`, which translates
+        each delta (text, tool calls, reasoning) into the OpenAI Chat
+        Completions stream chunk shape (``chat.completion.chunk``).
+        Callers can plug the resulting iterator straight into an SSE
+        endpoint without further translation.
+
+        Args:
+            model: Model id echoed back into every stream frame's
+                ``model`` field.
+            messages: Conversation messages forwarded to :meth:`chat`.
+            tools, tool_choice, sampling_params, request_id,
+                chat_template, chat_template_kwargs: Same semantics as
+                :meth:`chat`.
+
+        Yields:
+            ``ChatCompletionStreamResponse`` frames, one per snapshot,
+            terminating with the final frame carrying ``finish_reason``.
+        """
 
         outputs = self.chat(
             messages=messages,
@@ -690,7 +778,36 @@ class EngineIOMixin:
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> Iterator[StreamEventFrame]:
-        """Yield Responses API stream frames assembled from engine snapshots."""
+        """Bridge :meth:`chat` snapshots into OpenAI Responses-API stream frames.
+
+        Sister to :meth:`iter_chat_completion_stream`, but emits the
+        richer Responses-API event protocol
+        (``response.created``, ``response.output_item.delta``,
+        ``response.output_item.reasoning_summary.delta``, …). Wraps
+        :meth:`chat` in streaming mode and pipes its snapshots through
+        :func:`iter_responses_stream_frames`, which keeps track of
+        response/output ids and emits both the per-event frames and the
+        terminal ``response.completed`` envelope.
+
+        Args:
+            response_id: Stable response id echoed in every emitted frame.
+            model: Model id echoed in the response envelope.
+            include_reasoning_summary: When ``True``, also emits
+                ``reasoning_summary`` items derived from the model's
+                reasoning content.
+            final_response_overrides: Optional finalization tweaks
+                applied to the terminating frame (status,
+                ``incomplete_details``, etc.).
+            created_at: Optional fixed ``created_at`` epoch; ``None``
+                uses the iteration's current time.
+            messages, tools, tool_choice, sampling_params, request_id,
+                chat_template, chat_template_kwargs: Same semantics as
+                :meth:`chat`.
+
+        Yields:
+            :class:`StreamEventFrame` events compatible with the OpenAI
+            Responses-API SSE protocol.
+        """
 
         outputs = self.chat(
             messages=messages,
@@ -712,13 +829,23 @@ class EngineIOMixin:
         )
 
     def _messages_have_multimodal_content(self, messages: list[dict]) -> bool:
-        """Check if messages contain multimodal content (images/videos).
+        """Detect whether any chat turn carries image or video content.
+
+        Walks every message's ``content`` list looking for typed parts
+        whose ``type`` matches the recognized media types
+        (``"image"``, ``"image_url"``, ``"input_image"``, ``"video"``,
+        ``"video_url"``, ``"input_video"``) or that contain bare media
+        keys. Drives the routing decision in :meth:`chat` between the
+        pure-text fast path and the multimodal helper
+        :meth:`_chat_multimodal`.
 
         Args:
-            messages: List of chat message dictionaries.
+            messages: Chat messages exactly as the user supplied them
+                (no normalization required).
 
         Returns:
-            True if any message contains image or video content.
+            ``True`` if any part contains image / video content,
+            ``False`` for text-only conversations.
         """
         for message in messages:
             content = message.get("content", [])
@@ -837,16 +964,33 @@ class EngineIOMixin:
             return self._wait_for_request(request_id)
 
     def _stream_multimodal_request(self, request_id: str) -> Iterator[RequestOutput]:
-        """Stream output for a multimodal request.
+        """Stream :class:`RequestOutput` snapshots for an already-admitted multimodal request.
+
+        Mirror of :meth:`stream` for the multimodal path: the caller has
+        already submitted the request via :meth:`_chat_multimodal`, so
+        this helper only owns the read loop. On every wakeup it
+        snapshots the live ``_request_outputs`` entry (under
+        ``_output_lock``), copies the per-sample fields into a fresh
+        :class:`RequestOutput`, computes monotonically-correct
+        ``delta_text`` / ``raw_delta_text`` /
+        ``delta_reasoning_content`` against the previous snapshot, and
+        yields the result. Exits when ``finished`` flips true; in the
+        ``finally`` block, cleans up per-request events and either
+        records the completed output for retention or aborts the
+        request when the consumer abandons mid-stream.
 
         Args:
-            request_id: ID of the multimodal request to stream.
+            request_id: Parent request id returned by
+                :meth:`_chat_multimodal`.
 
         Yields:
-            RequestOutput snapshots with incremental updates.
+            New :class:`RequestOutput` snapshots whose ``delta_*`` fields
+            describe what changed since the last yield.
 
         Raises:
-            RuntimeError: If request event is missing.
+            RuntimeError: If the per-request event is missing (indicates
+                the engine never registered this id) or the scheduler
+                stops mid-stream.
         """
         with self._request_lock:
             req_event = self._request_events.get(request_id)
@@ -956,18 +1100,28 @@ class EngineIOMixin:
                 self.abort_request(request_id)
 
     def _wait_for_request(self, request_id: str) -> RequestOutput:
-        """Wait for a request to complete and return the output.
+        """Block until a multimodal request finishes and return the final output.
 
-        Blocks until the request finishes generation.
+        Sibling of :meth:`_stream_multimodal_request` for non-streaming
+        callers. Loops on the per-request event with a one-second
+        timeout, periodically calling
+        :meth:`_recover_orphaned_request` so child-sample disappearances
+        cannot stall the wait, and exits as soon as the underlying
+        ``RequestOutput`` is finished. On exit, removes the per-request
+        events (parent and per-sample) and records the output for
+        retention bookkeeping when ``max_request_outputs`` is set.
 
         Args:
-            request_id: ID of the request to wait for.
+            request_id: Parent request id returned by
+                :meth:`_chat_multimodal`.
 
         Returns:
-            Completed RequestOutput with all generated text.
+            The final :class:`RequestOutput` with every sample's text /
+            tool calls / reasoning fully populated.
 
         Raises:
-            RuntimeError: If request event is missing.
+            RuntimeError: If the per-request event is missing or the
+                scheduler stops while waiting.
         """
         with self._request_lock:
             req_event = self._request_events.get(request_id)

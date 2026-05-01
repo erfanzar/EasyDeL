@@ -93,10 +93,22 @@ class WorkerManager:
 
     @property
     def tokenizer_endpoint(self) -> str | None:
+        """Return the tokenizer worker endpoint.
+
+        Returns:
+            str | None: ZMQ endpoint URI bound by the tokenizer worker, or
+            ``None`` before :meth:`start` has run successfully.
+        """
         return self._tokenizer_endpoint
 
     @property
     def detokenizer_endpoint(self) -> str | None:
+        """Return the detokenizer worker endpoint.
+
+        Returns:
+            str | None: ZMQ endpoint URI bound by the detokenizer worker,
+            or ``None`` before :meth:`start` has run successfully.
+        """
         return self._detokenizer_endpoint
 
     def start(
@@ -198,6 +210,24 @@ class WorkerManager:
                 logger.warning("Failed to drain %s worker: %s", name, exc)
 
     def _resolve_startup_timeout(self, startup_timeout: float | None) -> float:
+        """Pick the worker startup timeout from the explicit value or env vars.
+
+        Order of precedence:
+
+        1. ``startup_timeout`` argument (must be > 0).
+        2. ``EASURGE_WORKER_STARTUP_TIMEOUT`` / ``ESURGE_WORKER_STARTUP_TIMEOUT``
+           environment variables (first valid value wins).
+        3. :data:`DEFAULT_WORKER_STARTUP_TIMEOUT`.
+
+        Args:
+            startup_timeout: Optional explicit override.
+
+        Returns:
+            float: A positive timeout in seconds.
+
+        Raises:
+            ValueError: When ``startup_timeout`` is non-positive.
+        """
         if startup_timeout is not None:
             timeout = float(startup_timeout)
             if timeout <= 0:
@@ -235,6 +265,17 @@ class WorkerManager:
         *,
         detokenizer_max_states: int,
     ) -> subprocess.Popen:
+        """Launch ``worker_main.py`` in tokenizer or detokenizer mode.
+
+        Args:
+            mode: ``"tokenizer"`` or ``"detokenizer"``.
+            endpoint: ZMQ endpoint the worker will bind to.
+            detokenizer_max_states: Forwarded as ``--max-states`` only when
+                ``mode == "detokenizer"``.
+
+        Returns:
+            subprocess.Popen: Handle to the spawned process.
+        """
         worker_main_path = Path(__file__).with_name("worker_main.py")
         cmd = [
             sys.executable,
@@ -259,6 +300,18 @@ class WorkerManager:
         return subprocess.Popen(cmd, env=env)
 
     def _wait_for_endpoint(self, worker_name: str, endpoint: str, process: subprocess.Popen | None) -> None:
+        """Block until the worker binds ``endpoint`` or the timeout fires.
+
+        Args:
+            worker_name: Human-readable worker label for log messages.
+            endpoint: ZMQ endpoint to monitor (``ipc://`` is poll-based).
+            process: Worker process handle. ``None`` skips liveness checks.
+
+        Raises:
+            RuntimeError: If the worker exits before binding.
+            TimeoutError: If the worker has not bound by the configured
+                ``startup_timeout``.
+        """
         deadline = time.time() + self._startup_timeout
         path = None
         if endpoint.startswith("ipc://"):
@@ -280,6 +333,15 @@ class WorkerManager:
         )
 
     def _make_ipc_endpoint(self, prefix: str) -> str:
+        """Build a unique ``ipc://`` endpoint inside ``_ipc_dir``.
+
+        Args:
+            prefix: Tag inserted into the socket filename for clarity.
+
+        Returns:
+            str: Endpoint URI of the form
+            ``ipc:///<dir>/easydel_<prefix>_<uuid>.sock``.
+        """
         os.makedirs(self._ipc_dir, exist_ok=True)
         file_path = os.path.join(self._ipc_dir, f"easydel_{prefix}_{uuid.uuid4().hex}.sock")
         return f"ipc://{file_path}"
@@ -291,6 +353,16 @@ class WorkerManager:
         process_attr: str,
         endpoint: str | None,
     ) -> None:
+        """Tear down a single managed client + process pair.
+
+        Args:
+            client_attr: Name of the ``self`` attribute holding the client.
+            owned_attr: Name of the ``self`` attribute flagging whether
+                this manager spawned the worker (vs connected to one).
+            process_attr: Name of the ``self`` attribute holding the
+                ``subprocess.Popen``.
+            endpoint: Endpoint URI to clean up if owned.
+        """
         client = getattr(self, client_attr)
         if client is None:
             return
@@ -309,6 +381,15 @@ class WorkerManager:
             self._cleanup_ipc_file(endpoint)
 
     def _terminate_process(self, process_attr: str) -> None:
+        """Terminate the worker subprocess held by ``process_attr``.
+
+        Sends ``SIGTERM`` first; if the worker does not exit within 5
+        seconds, escalates to ``SIGKILL``.
+
+        Args:
+            process_attr: Name of the ``self`` attribute holding the
+                subprocess. Set to ``None`` after teardown.
+        """
         process: subprocess.Popen | None = getattr(self, process_attr)
         if not process:
             return
@@ -321,6 +402,12 @@ class WorkerManager:
         setattr(self, process_attr, None)
 
     def _cleanup_ipc_file(self, endpoint: str | None) -> None:
+        """Delete the IPC socket file backing an ``ipc://`` endpoint.
+
+        Args:
+            endpoint: Endpoint URI; non-``ipc://`` and ``None`` are no-ops.
+                Missing files are tolerated.
+        """
         if not endpoint or not endpoint.startswith("ipc://"):
             return
         path = endpoint[len("ipc://") :]

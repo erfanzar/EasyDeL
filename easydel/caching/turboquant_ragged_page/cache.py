@@ -235,6 +235,16 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         page_axis = ATTN_DP if config.data_parallel_size > 1 else common_types.EMPTY
 
         def _make_pages(shape, np_dtype, axes):
+            """Allocate a zero-initialized page tensor with the requested sharding.
+
+            Args:
+                shape: Shape of the page tensor.
+                np_dtype: NumPy dtype for the underlying buffer.
+                axes: Logical sharding axes to resolve into a ``PartitionSpec``.
+
+            Returns:
+                A device-resident JAX array of zeros with the given sharding.
+            """
             spec = runtime_sharding_resolver.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=shape)
             sharding = Ns(mesh=mesh, spec=spec)
             return jax.device_put(np.zeros(shape, dtype=np_dtype), sharding)
@@ -393,6 +403,11 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         return self
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing the key-indices page shape.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         ki_shape = getattr(self.key_indices_pages, "shape", None)
         return f"{self.__class__.__name__}(layer_index={self.layer_index}, key_indices_shape={ki_shape})"
 
@@ -411,6 +426,12 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
 
     @property
     def metadata(self) -> TurboQuantRaggedPagesCacheConfig | None:
+        """Return the shared cache config, or ``None`` if uninitialized.
+
+        Returns:
+            The :class:`TurboQuantRaggedPagesCacheConfig` from the last view,
+            or ``None`` when the cache is empty.
+        """
         if not self.views or self.views[-1] is None:
             return None
         return self.views[-1].metadata

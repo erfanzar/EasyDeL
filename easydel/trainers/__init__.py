@@ -11,6 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""EasyDeL trainers package.
+
+Top-level entry point that re-exports the public trainer classes, their
+configuration dataclasses, and prompt-preprocessing transforms.  The
+package contains:
+
+* The base trainer (:class:`BaseTrainer`) and the generic supervised
+  :class:`Trainer` plus its arguments dataclass
+  (:class:`TrainingArguments`).
+* Supervised fine-tuning, reward modelling, and embedding trainers.
+* Preference- and policy-optimization trainers (DPO, ORPO, CPO, KTO, BCO,
+  PPO, GRPO, GSPO, GFPO, RLVR, Nash-MD, XPO, SDPO, ...).
+* Distillation trainers (offline, on-policy, generalized knowledge
+  distillation, sequence-level KD, sparse distillation).
+* Agentic self-play training (:class:`AgenticMoshPitTrainer`).
+* Utilities such as :func:`pack_sequences`, :class:`LogWatcher`, and the
+  Ray-based distributed launcher (:class:`RayDistributedTrainer`).
+
+Importing from this package is the recommended way to access trainers and
+configs; sub-modules expose internal helpers that are not part of the
+public API.
+"""
 
 from . import prompt_transforms
 from .agentic_moshpit import AgenticMoshPitConfig, AgenticMoshPitTrainer

@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the Direct Preference Optimization trainer.
+
+DPO learns from pair-wise preference data (chosen / rejected
+completions) by maximising the likelihood-ratio margin between the
+policy and a frozen reference model.  This module defines
+:class:`DPOConfig`, which selects the loss variant
+(sigmoid/IPO/Hinge/...), the temperature ``beta``, length normalisation,
+and the various preprocessing/precomputation knobs.
+"""
 
 import typing as tp
 from dataclasses import dataclass, field

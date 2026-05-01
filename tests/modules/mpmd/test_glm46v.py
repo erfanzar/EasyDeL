@@ -41,7 +41,7 @@ class TestGlm46V:
         cfg.text_config.intermediate_size = 1024
         cfg.text_config.num_attention_heads = 4
         cfg.text_config.num_key_value_heads = 2
-        cfg.text_config.num_hidden_layers = 2
+        cfg.text_config.num_hidden_layers = small_model_config["num_hidden_layers"]
         cfg.text_config.head_dim = 128
         cfg.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [8, 12, 12]}
 
@@ -56,7 +56,7 @@ class TestGlm46V:
         cfg.vision_config.intermediate_size = 512
         cfg.vision_config.num_heads = 4
         cfg.vision_config.num_attention_heads = 4
-        cfg.vision_config.depth = 2
+        cfg.vision_config.depth = small_model_config["num_hidden_layers"]
         cfg.vision_config.out_hidden_size = cfg.text_config.hidden_size
         return cfg
 

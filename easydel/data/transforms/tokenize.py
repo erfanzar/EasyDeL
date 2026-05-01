@@ -41,16 +41,34 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TokenizerManager:
-    """Manages tokenizers with caching and configuration.
+    """In-process cache of HuggingFace tokenizers keyed by ``TokenizerConfig``.
 
-    Provides efficient tokenizer loading and consistent tokenization
-    across multiple datasets.
+    Tokenizer loads via ``AutoTokenizer.from_pretrained`` are
+    expensive (especially for fast tokenizers backed by Rust) and
+    each pipeline run typically wants the same handful of
+    tokenizers across multiple stages. The manager memoises loaded
+    tokenizers under a stable key derived from the config so the
+    cost is paid at most once per ``(name_or_path, trust_remote_code)``
+    combination per pipeline run. Also exposes thin
+    :meth:`tokenize_text` / :meth:`tokenize_batch` helpers that
+    forward the call-time config to the underlying tokenizer.
+
+    Attributes:
+        _cache (dict[str, PreTrainedTokenizer]): Map from cache key
+            (built by :meth:`_make_cache_key`) to the loaded
+            tokenizer. The dataclass declares this for typing and
+            ``__init__`` resets it to an empty dict.
     """
 
     _cache: dict[str, "PreTrainedTokenizer"]
 
     def __init__(self):
-        """Initialize TokenizerManager with an empty cache."""
+        """Reset the tokenizer cache to empty.
+
+        Overrides the dataclass-generated init to ensure each
+        manager starts with its own dict (rather than aliasing a
+        class-level default). No tokenizers are eagerly loaded.
+        """
         self._cache = {}
 
     def get_tokenizer(
@@ -58,14 +76,27 @@ class TokenizerManager:
         config: TokenizerConfig,
         **extra_kwargs,
     ) -> "PreTrainedTokenizer":
-        """Get or create a tokenizer from configuration.
+        """Return a cached tokenizer matching ``config``, loading it on first request.
+
+        On a cache miss, calls
+        ``AutoTokenizer.from_pretrained(config.name_or_path,
+        trust_remote_code=config.trust_remote_code, **extra_kwargs)``
+        and stores the result. Subsequent calls with an equivalent
+        config return the same instance.
 
         Args:
-            config: Tokenizer configuration.
-            extra_kwargs: Additional kwargs to pass to from_pretrained.
+            config: Resolved tokenizer settings (path, remote-code
+                flag, default call-time kwargs). Only the path and
+                ``trust_remote_code`` participate in the cache key
+                — call-time kwargs like ``max_length`` do not
+                trigger reloads.
+            **extra_kwargs: Forwarded verbatim to
+                ``from_pretrained`` on cache misses; useful for
+                rare overrides like ``revision`` or ``token``.
 
         Returns:
-            Loaded tokenizer instance.
+            PreTrainedTokenizer: The cached or freshly loaded
+            tokenizer.
         """
         cache_key = self._make_cache_key(config)
         if cache_key in self._cache:
@@ -82,7 +113,21 @@ class TokenizerManager:
         return tokenizer
 
     def _make_cache_key(self, config: TokenizerConfig) -> str:
-        """Create a cache key from tokenizer config."""
+        """Reduce a :class:`TokenizerConfig` to the parts that affect tokenizer construction.
+
+        Only ``name_or_path`` and ``trust_remote_code`` change the
+        loaded tokenizer object — call-time settings like
+        ``max_length`` and ``padding`` are applied per-call rather
+        than baked into the tokenizer, so they do not need to
+        differentiate cache entries.
+
+        Args:
+            config: Tokenizer configuration.
+
+        Returns:
+            str: Colon-separated cache key
+            ``"<name_or_path>:<trust_remote_code>"``.
+        """
         key_parts = [
             config.name_or_path,
             str(config.trust_remote_code),
@@ -95,15 +140,25 @@ class TokenizerManager:
         text: str,
         config: TokenizerConfig,
     ) -> dict[str, list[int]]:
-        """Tokenize a single text string.
+        """Tokenize a single string with call-time settings drawn from ``config``.
+
+        Convenience wrapper that applies the call-time fields of
+        :class:`TokenizerConfig` (``max_length``, ``truncation``,
+        ``padding``, ``add_special_tokens``,
+        ``return_attention_mask``) and casts the
+        ``BatchEncoding`` return into a plain ``dict`` so callers
+        do not need to import ``transformers`` types.
 
         Args:
-            tokenizer: Tokenizer instance.
-            text: Text to tokenize.
-            config: Tokenization configuration.
+            tokenizer: Already-loaded tokenizer instance (typically
+                obtained via :meth:`get_tokenizer`).
+            text: Single text string to tokenize.
+            config: Call-time tokenizer configuration.
 
         Returns:
-            Dictionary with input_ids and optionally attention_mask.
+            dict[str, list[int]]: Mapping of tokenizer outputs —
+            always ``"input_ids"``, plus ``"attention_mask"`` when
+            ``config.return_attention_mask`` is ``True``.
         """
         result = tokenizer(
             text,
@@ -121,15 +176,21 @@ class TokenizerManager:
         texts: list[str],
         config: TokenizerConfig,
     ) -> dict[str, list[list[int]]]:
-        """Tokenize a batch of texts.
+        """Tokenize many strings in one call, amortising Python/Rust overhead.
+
+        Same fields from :class:`TokenizerConfig` are applied as in
+        :meth:`tokenize_text`; the difference is that the inner
+        lists are now per-sample rather than per-token, so the
+        result naturally yields rows when iterated.
 
         Args:
-            tokenizer: Tokenizer instance.
-            texts: List of texts to tokenize.
-            config: Tokenization configuration.
+            tokenizer: Already-loaded tokenizer instance.
+            texts: Batch of strings, one per row.
+            config: Call-time tokenizer configuration.
 
         Returns:
-            Dictionary with batched input_ids and optionally attention_mask.
+            dict[str, list[list[int]]]: Mapping of tokenizer outputs;
+            each value is a list with one entry per input string.
         """
         result = tokenizer(
             texts,
@@ -143,11 +204,19 @@ class TokenizerManager:
 
 
 class TokenizedShardedSource(ShardedDataSource[dict]):
-    """Sharded source that wraps another source with on-the-fly tokenization.
+    """:class:`ShardedDataSource` adapter that tokenizes upstream rows on the fly.
 
-    Applies tokenization lazily as examples are iterated, with optional
-    format callbacks and field renaming applied before tokenization.
-    Preserves specified additional fields alongside the tokenized output.
+    For each row produced by the wrapped source, applies (in order):
+    an optional ``format_callback`` to massage the row schema, an
+    optional ``format_fields`` rename map, and finally the tokenizer
+    against ``content_field``. The resulting ``input_ids`` (and
+    optional ``attention_mask``) are merged with whichever
+    ``additional_fields`` should survive into the output. Tokenizers
+    are reused across calls via an internal :class:`TokenizerManager`.
+
+    Note that this class re-tokenizes on every iteration; the
+    pipeline-level cache stage exists precisely to avoid that cost
+    across runs.
     """
 
     def __init__(
@@ -160,16 +229,23 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         format_callback: "Callable[[dict], dict] | None" = None,
         format_fields: dict[str, str] | None = None,
     ):
-        """Initialize TokenizedShardedSource.
+        """Capture the upstream source, tokenizer, and per-dataset transform settings.
 
         Args:
-            source: Underlying data source.
-            tokenizer: Tokenizer instance.
-            tokenizer_config: Tokenization configuration.
-            content_field: Field containing text to tokenize.
-            additional_fields: Additional fields to preserve.
-            format_callback: Function to transform examples before tokenization.
-            format_fields: Field renaming mapping.
+            source: Underlying :class:`ShardedDataSource` whose rows
+                are tokenized on the fly.
+            tokenizer: Pre-loaded HuggingFace tokenizer used for all
+                rows.
+            tokenizer_config: Call-time configuration applied to
+                each tokenizer call (max length, padding, etc.).
+            content_field: Row key holding the text to tokenize.
+            additional_fields: Row keys that should be preserved
+                alongside the tokenizer output. ``None`` keeps only
+                the tokenizer's columns.
+            format_callback: Optional pre-tokenize hook receiving
+                and returning a row dict.
+            format_fields: Optional ``{old: new}`` rename map
+                applied before tokenization.
         """
         self._source = source
         self._tokenizer = tokenizer
@@ -182,13 +258,31 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
 
     @property
     def shard_names(self) -> Sequence[str]:
+        """Return shard names from the underlying source.
+
+        Returns:
+            Pass-through of ``self._source.shard_names``.
+        """
         return self._source.shard_names
 
     def num_shards(self) -> int:
+        """Return shard count from the underlying source.
+
+        Returns:
+            Pass-through of ``self._source.num_shards()``.
+        """
         return self._source.num_shards()
 
     def _transform_example(self, example: dict) -> dict:
-        """Apply format transformation to an example."""
+        """Apply format callback and field renaming to an example.
+
+        Args:
+            example: Raw example dictionary.
+
+        Returns:
+            Example after the optional format callback and rename map
+            have been applied (in place).
+        """
         # Apply format callback first
         if self._format_callback is not None:
             example = self._format_callback(example)
@@ -202,7 +296,16 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         return example
 
     def _tokenize_example(self, example: dict) -> dict:
-        """Tokenize a single example."""
+        """Tokenize a single transformed example.
+
+        Args:
+            example: Raw example dictionary.
+
+        Returns:
+            Dictionary containing the tokenizer output (``input_ids`` and
+            optionally ``attention_mask``) plus any preserved additional
+            fields.
+        """
         example = self._transform_example(example)
 
         # Get text content
@@ -253,10 +356,19 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
             yield self._tokenize_example(example)
 
     def __len__(self) -> int:
-        """Return length of underlying source."""
+        """Return length of the underlying source.
+
+        Returns:
+            ``len(self._source)``.
+        """
         return len(self._source)
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"TokenizedShardedSource(<source>, max_length=N, content_field=...)"``.
+        """
         max_len = self._tokenizer_config.max_length if self._tokenizer_config else "?"
         return f"TokenizedShardedSource({self._source!r}, max_length={max_len}, content_field={self._content_field!r})"
 
@@ -270,19 +382,32 @@ def batched_tokenize_iterator(
     additional_fields: list[str] | None = None,
     format_callback: "Callable[[dict], dict] | None" = None,
 ) -> "Iterator[dict]":
-    """Iterate over a source with batched tokenization for efficiency.
+    """Iterate ``source`` with batched tokenization for higher throughput than per-row.
+
+    Buffers rows up to ``batch_size`` and tokenises them all at
+    once via :meth:`TokenizerManager.tokenize_batch`, then re-emits
+    one row per input augmented with whichever
+    ``additional_fields`` were captured pre-tokenization. Useful
+    when you want batched-tokenizer speed without the
+    :class:`TokenizedShardedSource` wrapper machinery.
 
     Args:
-        source: Data source to tokenize.
-        tokenizer: Tokenizer instance.
-        tokenizer_config: Tokenization configuration.
-        content_field: Field containing text to tokenize.
-        batch_size: Number of examples to tokenize at once.
-        additional_fields: Additional fields to preserve.
-        format_callback: Function to transform examples before tokenization.
+        source: :class:`ShardedDataSource` to read from.
+        tokenizer: Pre-loaded tokenizer instance.
+        tokenizer_config: Call-time tokenizer configuration.
+        content_field: Row key holding the text to tokenize.
+        batch_size: Number of rows accumulated before each
+            tokenizer call. Larger values improve throughput at the
+            cost of latency / memory.
+        additional_fields: Row keys preserved alongside the
+            tokenizer output. ``None`` keeps only the tokenizer's
+            columns.
+        format_callback: Optional pre-tokenize hook applied to
+            each row before it enters the buffer.
 
     Yields:
-        Tokenized examples.
+        dict: Per-row tokenized dicts including any preserved
+        ``additional_fields``.
     """
     additional_fields = additional_fields or []
     manager = TokenizerManager()
@@ -290,7 +415,19 @@ def batched_tokenize_iterator(
     batch_meta = []  # Store additional fields
 
     def flush_batch():
-        """Tokenize and yield the current batch."""
+        """Inline closure: tokenize the buffer and re-emit per-row results.
+
+        Captures the rolling ``batch``, ``batch_meta``, ``manager``,
+        ``tokenizer``, ``tokenizer_config``, and ``additional_fields``
+        from :func:`batched_tokenize_iterator`. Calls
+        :meth:`TokenizerManager.tokenize_batch` once for the whole
+        buffer, then yields the per-row slices stitched together
+        with the matching ``batch_meta`` entry.
+
+        Yields:
+            dict: One tokenized row per buffered example, with the
+            requested additional fields restored.
+        """
         if not batch:
             return
 
@@ -324,19 +461,24 @@ def batched_tokenize_iterator(
 
 
 class TokenizeStage(BaseStage):
-    """Pipeline stage for tokenizing text data in each dataset.
+    """Pipeline stage that wraps each dataset in a :class:`TokenizedShardedSource`.
 
-    Supports per-dataset tokenizer configuration (different tokenizers
-    for different datasets), with fallback to stage-level and global
-    defaults. Wraps each source as a TokenizedShardedSource for lazy
-    on-the-fly tokenization.
+    Per-dataset tokenizer settings are resolved through
+    :func:`merge_tokenizer_config` (dataset > stage default >
+    global default). Datasets with no resolvable tokenizer are
+    forwarded unchanged with a warning. A shared
+    :class:`TokenizerManager` is reused across constituent datasets
+    so identical tokenizer configs only load once per pipeline run.
     """
 
     def __init__(self, config: TokenizeStageConfig | None = None):
-        """Initialize TokenizeStage.
+        """Capture stage settings and allocate a fresh tokenizer cache.
 
         Args:
-            config: Tokenization stage configuration.
+            config: :class:`TokenizeStageConfig` controlling the
+                stage default tokenizer, batch size, and worker
+                count. ``None`` produces a default config so the
+                stage is constructible without arguments.
         """
         super().__init__(config.__dict__ if config else {})
         self._stage_config = config or TokenizeStageConfig()
@@ -344,6 +486,11 @@ class TokenizeStage(BaseStage):
 
     @property
     def name(self) -> str:
+        """Stage identifier used in metric and log namespaces.
+
+        Returns:
+            str: Constant string ``"tokenize"``.
+        """
         return "tokenize"
 
     def process(
@@ -351,14 +498,28 @@ class TokenizeStage(BaseStage):
         data: dict[str, ShardedDataSource],
         context: PipelineContext,
     ) -> dict[str, ShardedDataSource]:
-        """Process datasets through tokenization.
+        """Replace each entry in ``data`` with its tokenized counterpart.
+
+        For each dataset, looks up the matching :class:`DatasetConfig`
+        on the context, resolves the effective tokenizer via
+        :func:`merge_tokenizer_config`, loads it through the shared
+        :class:`TokenizerManager`, and constructs a
+        :class:`TokenizedShardedSource`. Datasets with no
+        configured tokenizer are passed through unchanged (with a
+        warning). Records the resolved tokenizer name as a stage
+        metric for each dataset.
 
         Args:
-            data: Dictionary mapping dataset names to sources.
-            context: Pipeline context.
+            data: Rolling ``{dataset_name: ShardedDataSource}`` dict
+                from the previous stage.
+            context: Shared :class:`PipelineContext` whose
+                :class:`PipelineConfig` carries the per-dataset
+                declarations.
 
         Returns:
-            Dictionary mapping dataset names to tokenized sources.
+            dict[str, ShardedDataSource]: Same-keyed dict where
+            tokenizable datasets have been replaced by
+            :class:`TokenizedShardedSource` wrappers.
         """
         result = {}
 
@@ -408,17 +569,32 @@ def tokenize_dataset_config(
     config: DatasetConfig,
     global_tokenizer: str | None = None,
 ) -> ShardedDataSource:
-    """Tokenize a source based on dataset configuration.
+    """Stand-alone helper to wrap a single source in a :class:`TokenizedShardedSource`.
 
-    Convenience function for tokenizing with per-dataset settings.
+    Convenience for callers who already have a
+    :class:`DatasetConfig` and a single :class:`ShardedDataSource`
+    in hand and don't want to spin up a full :class:`Pipeline`.
+    Resolves the tokenizer from ``config.tokenizer`` (with
+    ``global_tokenizer`` as a fallback), loads it via a fresh
+    :class:`TokenizerManager`, and wraps the source.
 
     Args:
-        source: Data source to tokenize.
-        config: Dataset configuration.
-        global_tokenizer: Fallback tokenizer if not specified in config.
+        source: :class:`ShardedDataSource` whose rows are to be
+            tokenized.
+        config: :class:`DatasetConfig` providing the tokenizer
+            identity, ``content_field``, and per-dataset transform
+            settings.
+        global_tokenizer: Fallback tokenizer name/path used when
+            ``config.tokenizer`` is unset.
 
     Returns:
-        Tokenized sharded source.
+        ShardedDataSource: A :class:`TokenizedShardedSource` wrapping
+        ``source``.
+
+    Raises:
+        ValueError: When neither ``config.tokenizer`` nor
+            ``global_tokenizer`` is set so no tokenizer can be
+            resolved.
     """
     tok_config = config.get_tokenizer_config()
     if tok_config is None and global_tokenizer:
@@ -442,12 +618,22 @@ def tokenize_dataset_config(
 
 
 def compute_tokenizer_hash(tokenizer_name: str) -> str:
-    """Compute a hash for a tokenizer for cache invalidation.
+    """Hash a tokenizer identifier into a short stable string for cache keys.
+
+    Used by the cache layer (:class:`CacheMetadata.tokenizer_hash`)
+    to invalidate tokenized datasets when the tokenizer
+    changes. Note that this is identifier-only — actual tokenizer
+    contents (vocabulary, special tokens) are not consulted, so two
+    different tokenizers stored at the same path would not be
+    distinguished. Acceptable in practice because tokenizers are
+    keyed by Hub repo id / path.
 
     Args:
-        tokenizer_name: Tokenizer name or path.
+        tokenizer_name: Tokenizer name or path identifying the
+            specific tokenizer.
 
     Returns:
-        Hash string.
+        str: First 16 hex characters of the SHA-256 of
+        ``tokenizer_name``.
     """
     return hashlib.sha256(tokenizer_name.encode()).hexdigest()[:16]

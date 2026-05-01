@@ -75,6 +75,11 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._prompt_started_reasoning = has_start_suffix_by_token or has_start_suffix_by_text
 
     def _is_prompt_reasoning_active(self) -> bool:
+        """Return ``True`` when the prompt already opened the reasoning block.
+
+        ``assume_reasoning`` remains a manual override that callers can flip
+        on to force prompt-gated parsing without an explicit detection.
+        """
         # `assume_reasoning` remains as a compatibility override.
         return self._prompt_started_reasoning or self.assume_reasoning
 

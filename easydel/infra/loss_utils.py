@@ -2530,7 +2530,7 @@ class CausalLMLossStrategy(BaseLossStrategy):
             TypeError: If the chunked path was selected but the model did
                 not return ``last_hidden_state``.
         """
-        effective_paxis = None if module.mesh.is_mpmd else (paxis or module.config.partition_axis)
+        effective_paxis = paxis
         last_hidden_state = getattr(outputs, "last_hidden_state", None)
         if forward_plan.forward_kwargs.get("apply_lm_head", True):
             return ForCausalLMLoss(

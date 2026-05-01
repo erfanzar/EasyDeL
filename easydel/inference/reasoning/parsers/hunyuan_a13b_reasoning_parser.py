@@ -20,7 +20,26 @@ from ..basic_parsers import BaseThinkingReasoningParser
 
 @ReasoningParserManager.register_module(["hunyuan_a13b"])  # pyright: ignore[reportUntypedClassDecorator]
 class HunyuanA13BReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for Hunyuan A13B models using <think>...</think> tags."""
+    """Reasoning parser for Tencent Hunyuan-A13B chain-of-thought outputs.
+
+    Hunyuan-A13B follows the canonical ``<think>``…``</think>`` chain-of-thought
+    grammar shared by DeepSeek-R1, Qwen3, ERNIE, OLMo-3, and Seed-OSS.
+    The class plugs Hunyuan into the registry without overriding any
+    behavior; all batch and streaming logic — including prompt-gated
+    parsing when the chat template injects ``<think>`` via
+    ``add_generation_prompt`` — comes from
+    :class:`BaseThinkingReasoningParser`.
+
+    During streaming the inherited state machine emits :class:`DeltaMessage`
+    events carrying ``reasoning_content`` while inside the markers and
+    switches to ``content`` once ``</think>`` is observed. Tokenization of
+    the marker strings is resolved at construction time so that boundary
+    detection survives both text-level and id-level scans.
+
+    Attributes:
+        start_token: Reasoning open tag ``"<think>"``.
+        end_token: Reasoning close tag ``"</think>"``.
+    """
 
     start_token = "<think>"
     end_token = "</think>"

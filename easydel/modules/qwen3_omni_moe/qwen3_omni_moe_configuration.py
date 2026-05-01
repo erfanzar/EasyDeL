@@ -315,7 +315,18 @@ class Qwen3OmniMoeTextConfig(EasyDeLBaseConfig):
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
-        """Get attention mask details for sliding window attention."""
+        """Build the per-layer sliding-window mask metadata.
+
+        Qwen3-Omni's text decoder applies sliding-window attention to
+        the trailing layers (``layer_idx >= max_window_layers``); the
+        leading layers retain a plain full causal mask. The returned
+        mapping is consumed by EasyDeL's attention dispatcher to pick
+        the right kernel per layer.
+
+        Returns:
+            dict[int, AttnMaskDetail]: Per-layer sliding-window
+            metadata; empty when sliding-window attention is disabled.
+        """
         mapping = {}
         if self.sliding_window is not None and self.use_sliding_window:
             for layer_idx in range(self.num_hidden_layers):
@@ -796,7 +807,17 @@ class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
 
     @property
     def layer_types(self) -> list[str]:
-        """All layers use sliding attention."""
+        """Per-layer attention type for the Code2Wav vocoder stack.
+
+        Code2Wav applies bounded local attention everywhere (no full
+        layers): every block uses sliding-window causal attention with
+        the configured ``sliding_window`` size. Returning the explicit
+        list keeps the attention dispatcher's per-layer routing logic
+        homogeneous with the text decoder layout.
+
+        Returns:
+            list[str]: ``["sliding_attention"] * num_hidden_layers``.
+        """
         return ["sliding_attention"] * self.num_hidden_layers
 
 
@@ -888,7 +909,21 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
         self.assistant_token_id = assistant_token_id
 
     def get_text_config(self, decoder: bool = True) -> Qwen3OmniMoeTextConfig:
-        """Get the text configuration from thinker."""
+        """Return the Thinker's text-decoder configuration.
+
+        Implements the HuggingFace ``get_text_config`` contract for
+        the composite Qwen3-Omni model. The Omni wrapper does not own
+        a text config directly — the text decoder lives inside the
+        Thinker — so this delegates to
+        :meth:`Qwen3OmniMoeThinkerConfig.get_text_config`.
+
+        Args:
+            decoder: Forwarded to the Thinker's ``get_text_config``.
+
+        Returns:
+            Qwen3OmniMoeTextConfig: The text-decoder portion of the
+            Thinker config.
+        """
         return self.thinker_config.get_text_config(decoder)  # pyright: ignore[reportReturnType]
 
 

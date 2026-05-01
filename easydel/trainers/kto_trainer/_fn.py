@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Loss and step implementations for the KTO trainer.
+
+Implements the per-example KTO loss (a prospect-theory-inspired
+sigmoid-of-margin function), the running KL estimator used to
+"normalise" desirable-vs-undesirable completion rewards, and the
+scheduled-VJP variants for MPMD pipeline parallelism.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -67,6 +75,14 @@ def _build_kl_batch(batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
             kl_batch[key] = batch[key]
 
     def _rolled(name: str):
+        """Insert a 1-position rolled copy of ``batch[name]`` into ``kl_batch``.
+
+        Used to build the KL-estimation batch by pairing each prompt
+        with the *next* example's completion.
+
+        Args:
+            name: Batch column name to roll into the KL batch.
+        """
         if name in batch:
             kl_batch[name] = jnp.roll(batch[name], shift=1, axis=0)
 
@@ -93,21 +109,59 @@ def kto_objective(
     policy_kl_logps: jax.Array | None = None,
     reference_kl_logps: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Compute KTO or APO unpaired losses and rewards.
+    """Compute the KTO (or APO-zero-unpaired) loss and per-example implicit rewards.
+
+    Implements the unpaired prospect-theoretic objective from
+    Ethayarajh et al. 2024. Given the policy/reference summed
+    completion logps and a binary ``labels`` array, the loss is built
+    around the implicit reward
+    ``r = beta * (logp - logp_ref)`` and a non-negative running KL
+    estimate ``z = ReLU(mean(policy_kl_logps - reference_kl_logps))``
+    obtained from a *mismatched* (prompt_i, completion_{i+1}) batch
+    (see :func:`_build_kl_batch`).
+
+    For ``loss_type == "kto"`` the loss is
+
+    - ``L_chosen   = 1 - sigmoid(beta * (r - z))``  on desirable rows
+    - ``L_rejected = 1 - sigmoid(beta * (z - r))``  on undesirable rows
+
+    so each side is shaped relative to the running KL anchor ``z``.
+
+    For ``loss_type == "apo_zero_unpaired"`` the rewards are anchored
+    at zero instead of ``z`` and the rejected branch is symmetric:
+
+    - ``L_chosen   = 1 - sigmoid(beta * r)``       (push reward up)
+    - ``L_rejected =     sigmoid(beta * r)``       (push reward down)
+
+    The two halves are then weighted by ``desirable_weight`` /
+    ``undesirable_weight`` and averaged over the *count* of examples
+    (not separately per side) so the optimisation is robust to
+    label imbalance. ``z`` is always stop-gradient'd.
 
     Args:
-        policy_logps: Log probabilities from the policy model.
-        reference_logps: Log probabilities from the reference model.
-        labels: Binary labels (True=desirable, False=undesirable).
-        beta: Temperature parameter controlling deviation from reference.
-        desirable_weight: Weight for desirable examples.
-        undesirable_weight: Weight for undesirable examples.
-        loss_type: Loss variant ('kto' or 'apo_zero_unpaired').
-        policy_kl_logps: Optional policy log probs for KL estimation.
-        reference_kl_logps: Optional reference log probs for KL estimation.
+        policy_logps: ``[batch]`` summed completion logps under the
+            policy.
+        reference_logps: ``[batch]`` summed completion logps under
+            the frozen reference.
+        labels: Boolean ``[batch]`` labels (``True`` = desirable).
+        beta: KTO inverse-temperature.
+        desirable_weight: Loss multiplier for desirable rows.
+        undesirable_weight: Loss multiplier for undesirable rows.
+        loss_type: ``"kto"`` or ``"apo_zero_unpaired"``.
+        policy_kl_logps: Optional ``[batch]`` policy logps on the
+            mismatched-prompt KL batch. ``None`` disables the KL
+            anchor (``z = 0``).
+        reference_kl_logps: Optional reference logps on the same
+            mismatched-prompt batch.
 
     Returns:
-        Tuple of (loss, chosen_rewards, rejected_rewards, kl).
+        ``(loss, chosen_rewards, rejected_rewards, kl)`` where
+        ``loss`` is the scalar weighted KTO loss, the reward arrays
+        are masked per-example implicit rewards (for logging), and
+        ``kl`` is the stop-gradient'd scalar KL anchor.
+
+    Raises:
+        ValueError: If ``loss_type`` is unrecognised.
     """
 
     if loss_type not in KTO_LOSS_TYPES:
@@ -127,6 +181,14 @@ def kto_objective(
     kl = jax.lax.stop_gradient(kl)
 
     def _safe_sigmoid(x):
+        """Numerically stable sigmoid (inputs clipped to ``[-30, 30]``).
+
+        Args:
+            x: Pre-activation values.
+
+        Returns:
+            ``sigmoid(clip(x, -30, 30))``.
+        """
         return sigmoid(jnp.clip(x, -30.0, 30.0))
 
     if loss_type == "kto":
@@ -168,26 +230,62 @@ def training_step(
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """Execute KTO training step with gradient computation.
+    """Run one KTO training step (forward, loss, backward, optimizer update).
+
+    Drives the unpaired KTO objective: each row carries a binary
+    ``label`` and the loss anchors the implicit reward against the
+    running KL estimate ``z`` (see :func:`kto_objective`). When
+    ``calculate_kl`` is ``True`` the trainer also forwards a
+    *mismatched-completion* KL batch (built by
+    :func:`_build_kl_batch`) through both policy and reference so
+    ``z`` reflects the current divergence between the two
+    distributions.
+
+    Pipeline inside the step:
+
+    1. Resolve the gradient-accumulation minibatch size and shard the
+       batch under the model's mesh.
+    2. ``minibatch_call`` computes value-and-grad of the inner
+       :func:`calculate_loss` closure, which:
+
+       - Optionally rewrites ``tree`` through ``straight_through_emulator``.
+       - Forwards the policy and (when not precomputed) the
+         reference through ``forward_fn`` on both the standard batch
+         and the mismatched KL batch.
+       - Calls :func:`kto_objective` and adds an aux loss scaled by
+         ``aux_loss_coef`` if the model exposes one.
+    3. ``update_state_respectfully`` applies the gradients with NaN
+       guards from ``loss_config``.
 
     Args:
-        state: Current model state.
-        batch: Training batch.
-        reference_state: Reference model state.
-        learning_rate_fn: Function mapping step to learning rate.
-        forward_fn: Forward pass function.
-        beta: Temperature parameter.
-        desirable_weight: Weight for desirable examples.
-        undesirable_weight: Weight for undesirable examples.
-        loss_type: Loss variant to use.
-        calculate_kl: Whether to compute KL divergence.
-        aux_loss_coef: Coefficient for auxiliary loss.
-        loss_config: Optional loss configuration.
-        partition_spec: Sharding specification.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
+        state: Policy ``EasyDeLState`` being differentiated.
+        batch: KTO minibatch with ``prompt_*`` / ``completion_*``,
+            boolean ``label``, and (optionally) precomputed
+            ``reference_logps`` and ``reference_kl_logps``.
+        reference_state: Frozen reference state used when reference
+            logps are not already cached on the batch.
+        learning_rate_fn: Schedule mapping step to learning rate.
+        forward_fn: Forward closure that returns
+            ``{"completion_logps": ..., "aux_loss": ...}`` (and is
+            also driven on the mismatched KL batch).
+        beta: KTO inverse-temperature.
+        desirable_weight: Loss multiplier for desirable rows.
+        undesirable_weight: Loss multiplier for undesirable rows.
+        loss_type: ``"kto"`` or ``"apo_zero_unpaired"``.
+        calculate_kl: When ``True``, the mismatched KL batch is built
+            and run to maintain a non-zero ``z`` anchor.
+        aux_loss_coef: Multiplier on any auxiliary load-balance loss
+            returned by the model forward.
+        loss_config: ``LossConfig`` controlling NaN handling.
+        partition_spec: Sharding spec applied to the input batch.
+        gradient_accumulation_steps: Gradient-accumulation factor.
+        straight_through_emulator: Optional STE callable applied to
+            the graphstate before the forward (QAT path).
 
     Returns:
-        Updated state and loss metrics.
+        ``(new_state, metrics)`` where ``metrics`` carries the scalar
+        KTO loss, per-example chosen/rejected rewards, the running
+        ``kl`` anchor, and any auxiliary metrics in ``other_metrics``.
     """
 
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -208,6 +306,22 @@ def training_step(
         batch["_reference_kl_logps"] = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
 
     def _loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
+        """Compute the KTO loss for one minibatch.
+
+        Runs the policy concatenated forward, optionally builds the KL
+        batch (rolled completions) for both policy and reference,
+        evaluates :func:`kto_objective`, and folds in any auxiliary
+        loss the policy reports.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            minibatch: One minibatch slice with ``label`` and the
+                precomputed reference (and optional KL) log-probs.
+
+        Returns:
+            ``(loss, metrics)`` with chosen / rejected rewards and the
+            KL diagnostic recorded under ``other_metrics["kl"]``.
+        """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
@@ -269,6 +383,24 @@ def training_step(
 
 
 def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Inject precomputed reference (and KL) log-probabilities into ``call.batch``.
+
+    Always populates ``reference_logps``; when ``calculate_kl`` is
+    enabled also runs the rolled-completion KL batch through both the
+    policy and reference models and stashes their stop-gradient
+    completion log-probs.
+
+    Args:
+        call: The :class:`ScheduledStepCall` describing the current
+            step.
+
+    Returns:
+        A copy of ``call.batch`` ready for the scheduled loss closure.
+
+    Raises:
+        RuntimeError: If reference state / forward fn are missing while
+            KL estimation is requested.
+    """
     batch = dict(call.batch)
     if "reference_logps" not in batch:
         batch = prepare_scheduled_reference_outputs(
@@ -311,6 +443,16 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
 
 
 def _kto_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the KTO scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering ``beta``, the desirable / undesirable weights,
+        the loss type, KL flag, ``aux_loss_coef``, partition spec, and
+        the forward-fn / quantizer identities.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=(
@@ -327,6 +469,16 @@ def _kto_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_kto_scheduled_loss(call):
+    """Build a SpectraX-scheduled KTO scalar-loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` carrying the trainer's
+            current configuration.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready for
+        :func:`spx.sxvalue_and_grad`.
+    """
     forward_fn = call.get("forward_fn")
     beta = call.get("beta")
     desirable_weight = call.get("desirable_weight")
@@ -337,6 +489,17 @@ def _make_kto_scheduled_loss(call):
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the scalar KTO loss inside the SpectraX scheduled VJP.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            batch: Minibatch dict carrying ``label``, precomputed
+                reference (and optional KL) log-probs, and the
+                trainer-supplied forward-friendly fields.
+
+        Returns:
+            The scalar KTO loss with optional aux-loss term.
+        """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
         policy_out = forward_fn(module, call_batch)
@@ -392,19 +555,30 @@ def evaluation_step(
     aux_loss_coef: float,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
-    """Execute KTO evaluation step without gradients.
+    """Run one KTO evaluation step (forward only, no parameter update).
+
+    Mirrors :func:`training_step` minus the gradient and optimizer
+    plumbing: forwards the policy (and, when ``calculate_kl`` is set,
+    the mismatched KL batch) through ``forward_fn``, retrieves
+    reference logps from either ``batch`` or by running
+    ``reference_state``, and reports the KTO loss alongside per-row
+    rewards and the running KL anchor.
 
     Args:
-        state: Current model state.
-        batch: Evaluation batch.
-        reference_state: Reference model state.
-        forward_fn: Forward pass function.
-        beta: Temperature parameter.
-        desirable_weight: Weight for desirable examples.
-        undesirable_weight: Weight for undesirable examples.
-        loss_type: Loss variant to use.
-        calculate_kl: Whether to compute KL divergence.
-        aux_loss_coef: Coefficient for auxiliary loss.
+        state: Policy state to evaluate.
+        batch: KTO evaluation minibatch (same structure as the
+            training batch).
+        reference_state: Frozen reference state used when reference
+            logps are not already cached.
+        forward_fn: Forward closure returning summed completion
+            logps plus optional aux losses.
+        beta: KTO inverse-temperature.
+        desirable_weight: Loss multiplier for desirable rows.
+        undesirable_weight: Loss multiplier for undesirable rows.
+        loss_type: ``"kto"`` or ``"apo_zero_unpaired"``.
+        calculate_kl: When ``True``, the mismatched KL batch is also
+            evaluated.
+        aux_loss_coef: Multiplier on any auxiliary load-balance loss.
         partition_spec: Sharding specification.
 
     Returns:

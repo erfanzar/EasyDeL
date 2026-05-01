@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Loss and step implementations for the BCO trainer.
+
+Binary Classifier Optimization minimises a logistic-regression-style
+loss on per-example log-probability ratios between a policy and a
+reference, optionally reweighted by an estimated density ratio (UDM).
+This module hosts the concatenated forward, the calculate-loss path
+used inside the JIT step, the running-moments helper for the BCO delta
+parameter, and the scheduled-VJP loss adapter used under MPMD pipelining.
+"""
+
 from __future__ import annotations
 
 import collections.abc
@@ -57,6 +67,11 @@ class RunningMoments:
     """
 
     def __init__(self):
+        """Initialize the running stats with zero mean / unit variance.
+
+        ``count`` is seeded with a tiny positive epsilon so that early
+        ``count``-weighted updates remain numerically well-defined.
+        """
         self.mean = 0.0
         self.var = 1.0
         self.count = 1e-24
@@ -118,20 +133,58 @@ def concatenated_forward(
     aux_loss_enabled: bool = False,
     logprob_vocab_chunk_size: int | None = None,
 ) -> dict[str, jax.Array]:
-    """Run model forward pass to compute completion log probabilities.
+    """Run a BCO model forward pass and accumulate per-example completion logps.
+
+    Unlike DPO this is a *single-stream* forward (no chosen/rejected
+    pairing) -- BCO labels are unary, so each row already represents
+    one (prompt, completion, label) triple. The forward path branches
+    on architecture:
+
+    - **Encoder-decoder**: prompt is fed to the encoder, completion as
+      decoder labels; the LM head is applied directly inside the
+      model and per-token logps are summed under the
+      ``completion_attention_mask``.
+    - **Causal LM**: prompt + completion are concatenated, optionally
+      truncated via :func:`apply_paired_truncation`, and either
+      (a) processed end-to-end and gathered with
+      :func:`compute_token_logps_and_entropies_chunked`, or (b)
+      processed up to the last hidden state with
+      ``apply_lm_head=False`` and scored chunk-by-chunk through
+      :func:`compute_sequence_scores_from_hidden_states`. The chunked
+      headless path activates whenever the model exposes a positive
+      ``lmhead_chunksize`` to keep peak memory bounded for large
+      vocabularies.
 
     Args:
-        model: Model to run forward pass on.
-        batch: Input batch with prompts and completions.
-        is_encoder_decoder: Whether model uses encoder-decoder architecture.
-        label_pad_token_id: Token ID for padding labels.
-        padding_value: Padding token ID.
-        max_length: Maximum sequence length.
-        truncation_mode: How to truncate sequences.
-        aux_loss_enabled: Whether to compute auxiliary loss.
+        model: Policy or reference model exposing the EasyDeL forward
+            interface.
+        batch: BCO batch with ``prompt_input_ids``,
+            ``prompt_attention_mask``, ``completion_input_ids``,
+            ``completion_attention_mask``, ``completion_labels`` and
+            optional multimodal keys.
+        is_encoder_decoder: Selects the encoder-decoder branch when
+            ``True``.
+        label_pad_token_id: Sentinel token id marking positions that
+            should be excluded from the loss mask in the causal LM
+            branch.
+        padding_value: Token id used when padding completions
+            (forwarded by the caller; this function does not pad
+            itself).
+        max_length: Maximum total sequence length used by the causal
+            LM branch's truncation.
+        truncation_mode: ``"keep_end"`` or ``"keep_start"`` truncation
+            policy.
+        aux_loss_enabled: When ``True``, the model's auxiliary load
+            balance loss (if any) is forwarded under the ``aux_loss``
+            key.
+        logprob_vocab_chunk_size: Vocab chunk size for
+            :func:`compute_token_logps_and_entropies_chunked`.
 
     Returns:
-        Dictionary with completion log probabilities and logits.
+        Dict with ``completion_logps`` (``[batch]`` summed log-probs),
+        ``completion_logits`` (raw logits or ``None`` under headless
+        scoring), ``mean_completion_logits`` (scalar mean for
+        diagnostics), and optionally ``aux_loss``.
     """
 
     prompt_input_ids = batch["prompt_input_ids"]
@@ -248,19 +301,49 @@ def compute_bco_loss(
     delta: float,
     udm_weights: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Compute BCO loss and rewards for desirable/undesirable examples.
+    """Compute the BCO logistic loss and per-example implicit rewards.
+
+    The BCO objective treats the per-example reward
+    ``r = beta * (log pi(y|x) - log pi_ref(y|x))`` as the score of an
+    implicit binary classifier whose decision threshold is the running
+    reference reward ``delta``. Desirable examples are pushed *above*
+    ``delta`` and undesirable ones *below* it, giving:
+
+    - ``chosen_loss   = -log_sigmoid(r - delta)``    (label=1)
+    - ``rejected_loss = -log_sigmoid(-(r - delta))`` (label=0)
+
+    Optionally, when UDM (underlying density model) reweighting is
+    enabled, undesirable examples are scaled by their density-ratio
+    weights to correct for prompt distribution mismatch between the
+    desirable and undesirable streams. The final scalar loss is the
+    weighted average.
 
     Args:
-        policy_logps: Policy model log probabilities.
-        reference_logps: Reference model log probabilities.
-        chosen_mask: Mask for desirable examples.
-        rejected_mask: Mask for undesirable examples.
-        beta: Temperature parameter.
-        delta: Running delta parameter.
-        udm_weights: Optional UDM weights for handling distribution mismatch.
+        policy_logps: ``[batch]`` summed completion log-probs under the
+            policy.
+        reference_logps: ``[batch]`` summed completion log-probs under
+            the frozen reference (typically the SFT model).
+        chosen_mask: Boolean ``[batch]`` mask selecting desirable
+            (positive-label) examples.
+        rejected_mask: Boolean ``[batch]`` mask selecting undesirable
+            examples. ``chosen_mask`` and ``rejected_mask`` should be
+            disjoint.
+        beta: Inverse-temperature on the implicit reward.
+        delta: Running estimate of the mean implicit reward used as
+            the classifier threshold (maintained outside this function
+            via :class:`RunningMoments`).
+        udm_weights: Optional ``[batch]`` density-ratio weights applied
+            to the undesirable slice. ``None`` disables UDM
+            reweighting.
 
     Returns:
-        Tuple of (loss, chosen_rewards, rejected_rewards, chosen_losses, rejected_losses, chosen_mask_f, rejected_mask_f).
+        A 7-tuple ``(loss, chosen_rewards, rejected_rewards,
+        chosen_losses, rejected_losses, chosen_mask_f, rejected_mask_f)``
+        where ``loss`` is the scalar (weighted) mean BCO loss, the
+        ``*_rewards`` arrays carry the unmasked per-example implicit
+        rewards (for logging/delta updates), and the ``*_losses`` /
+        ``*_mask_f`` arrays carry the per-example masked losses and
+        float-cast masks.
     """
 
     chosen_mask_f = chosen_mask.astype(policy_logps.dtype)
@@ -307,21 +390,63 @@ def training_step(
     gradient_accumulation_steps: int,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """Execute BCO training step with gradient computation.
+    """Run one BCO training step (forward, loss, backward, optimizer update).
+
+    Drives the binary-classifier objective: each example carries a
+    boolean ``label`` (desirable vs. undesirable) and the loss tries to
+    place the implicit reward ``beta * (logp - logp_ref)`` on the
+    correct side of the running ``delta`` threshold (see
+    :func:`compute_bco_loss`). The threshold itself is tracked across
+    steps via :class:`RunningMoments`; the trainer passes the current
+    estimate in ``batch["running_mean"]``.
+
+    Pipeline inside the step:
+
+    1. Pop ``running_mean`` (the BCO ``delta``) out of the batch so it
+       is treated as a scalar parameter rather than a per-row feature.
+    2. Resolve the gradient-accumulation minibatch size and shard the
+       batch under the model's mesh.
+    3. ``minibatch_call`` computes value-and-grad of the inner
+       :func:`calculate_loss` closure, which:
+
+       - Optionally rewrites ``tree`` through ``straight_through_emulator``.
+       - Forwards the policy through ``concatenated_forward_fn`` to get
+         summed completion logps.
+       - Forwards the *reference* model (or reads precomputed
+         ``reference_logps`` from the batch) and stop-gradient's the
+         result.
+       - Optionally weights undesirable rows with UDM
+         ``udm_weights`` from the batch.
+       - Calls :func:`compute_bco_loss` and adds any model
+         ``aux_loss``.
+    4. ``update_state_respectfully`` applies the gradients with NaN
+       guards from ``loss_config``.
 
     Args:
-        state: Current model state.
-        batch: Training batch.
-        reference_state: Reference model state.
-        learning_rate_fn: Function mapping step to learning rate.
-        concatenated_forward_fn: Forward function.
-        beta: Temperature parameter.
-        loss_config: Optional loss configuration.
-        partition_spec: Sharding specification.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
+        state: Policy state being differentiated.
+        batch: BCO minibatch with ``prompt_*``/``completion_*``,
+            boolean ``label``, optional ``reference_logps``, optional
+            ``udm_weights``, and the scalar ``running_mean`` (= BCO
+            ``delta``).
+        reference_state: Frozen reference state. Falls back to the
+            policy itself when ``None`` *and* the batch lacks
+            ``reference_logps``.
+        learning_rate_fn: Schedule mapping step to learning rate.
+        concatenated_forward_fn: Captured forward closure with
+            tokenization knobs (max length, truncation mode, ...) baked
+            in.
+        beta: BCO inverse-temperature.
+        loss_config: ``LossConfig`` controlling NaN handling.
+        partition_spec: Sharding spec applied to the input batch.
+        gradient_accumulation_steps: Number of accumulation
+            sub-steps; the batch must be evenly divisible.
+        straight_through_emulator: Optional STE callable applied to
+            the graphstate before the forward (QAT path).
 
     Returns:
-        Updated state and loss metrics.
+        ``(new_state, metrics)`` where ``metrics`` is a ``LossMetrics``
+        instance with per-example chosen/rejected rewards and the
+        scalar BCO loss.
     """
 
     running_delta = batch.get("running_mean")
@@ -341,6 +466,22 @@ def training_step(
     step_batch = with_sharding_constraint(step_batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: jax.ArrayTree, call_batch: dict[str, jax.Array]):
+        """Compute the BCO loss for one minibatch.
+
+        Runs the concatenated forward (and the reference forward when no
+        precomputed ``reference_logps`` is provided), assembles the
+        chosen/rejected masks from binary labels, optionally weights the
+        rejected slice by UDM density estimates, and returns the
+        combined logistic loss alongside diagnostic metrics.
+
+        Args:
+            tree: The current policy graphstate (differentiated against).
+            call_batch: One minibatch slice of the BCO batch.
+
+        Returns:
+            ``(loss, metrics)`` where ``loss`` is the scalar BCO loss
+            and ``metrics`` is a populated :class:`LossMetrics`.
+        """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         model = state.merge(tree=tree)
@@ -430,6 +571,21 @@ def training_step(
 
 
 def _prepare_bco_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Inject precomputed reference log-probabilities into ``call.batch``.
+
+    When the batch already carries ``reference_logps`` it is returned
+    unchanged.  Otherwise the helper invokes the reference state to
+    compute completion log-probabilities and stashes them under
+    ``reference_logps`` so the scheduled loss can run without re-running
+    the reference forward inside the VJP.
+
+    Args:
+        call: The :class:`ScheduledStepCall` describing the current
+            step.
+
+    Returns:
+        A copy of ``call.batch`` with ``reference_logps`` populated.
+    """
     batch = dict(call.batch)
     if "reference_logps" in batch:
         return batch
@@ -444,6 +600,16 @@ def _prepare_bco_scheduled_batch(call) -> dict[str, tp.Any]:
 
 
 def _bco_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the BCO scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple suitable for keying a per-trainer cache of compiled
+        scheduled losses (covers ``beta`` / partition spec / forward fn
+        / quantization emulator).
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("beta", "partition_spec"),
@@ -452,12 +618,36 @@ def _bco_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_bco_scheduled_loss(call):
+    """Build a SpectraX-scheduled BCO loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` providing forward fn,
+            beta, and partition spec.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready to be wrapped
+        with :func:`spx.sxvalue_and_grad`.
+    """
     concatenated_forward_fn = call.get("concatenated_forward_fn")
     beta = call.get("beta")
     partition_spec = call.get("partition_spec")
     call.get("straight_through_emulator")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the BCO scalar loss for the scheduled-VJP path.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            batch: Minibatch dict carrying ``label``, ``reference_logps``
+                and (optionally) ``udm_weights``.
+
+        Returns:
+            The scalar BCO loss (with optional aux-loss term added).
+
+        Raises:
+            RuntimeError: If ``reference_logps`` is missing from the
+                batch.
+        """
         running_delta = batch.get("running_mean")
         if running_delta is None:
             running_delta = jnp.array(0.0, dtype=jnp.float32)
@@ -521,17 +711,29 @@ def evaluation_step(
     concatenated_forward_fn: tp.Callable[..., dict[str, jax.Array]],
     beta: float,
 ) -> LossMetrics:
-    """Execute BCO evaluation step without gradients.
+    """Run one BCO evaluation step (forward only, no parameter update).
+
+    Computes the BCO logistic loss on the eval batch using the same
+    desirable/undesirable masking and (optional) UDM reweighting as
+    :func:`training_step`, but skips gradient accumulation and
+    optimizer interaction. The threshold ``delta`` is pulled from
+    ``batch["running_mean"]`` if present (defaults to ``0.0``); UDM
+    weights are read from ``batch["udm_weights"]`` when supplied.
 
     Args:
-        state: Current model state.
-        batch: Evaluation batch.
-        reference_state: Reference model state.
-        concatenated_forward_fn: Forward function.
-        beta: Temperature parameter.
+        state: Policy state to evaluate.
+        batch: BCO evaluation minibatch (same structure as the
+            training batch).
+        reference_state: Frozen reference state; when ``None`` and the
+            batch lacks ``reference_logps``, the policy stands in as
+            its own reference (purely diagnostic).
+        concatenated_forward_fn: Forward closure with tokenization
+            knobs baked in.
+        beta: BCO inverse-temperature.
 
     Returns:
-        Loss metrics.
+        ``LossMetrics`` populated with ``loss`` and the per-example
+        ``chosen_rewards`` / ``rejected_rewards`` arrays.
     """
 
     running_delta = batch.get("running_mean")

@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Group Filtered Policy Optimization (GFPO) trainer.
+
+GFPO subclasses :class:`GRPOTrainer` and rewrites the
+``_preprocess_batch_input`` hook so that, for every prompt group, only
+a "keep" subset of rollouts (chosen by length / diversity / token-level
+reward) survives into the gradient computation.  This counteracts the
+length-inflation pathology of large-scale RL fine-tuning.
+"""
 
 from __future__ import annotations
 

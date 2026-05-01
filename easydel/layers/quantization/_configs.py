@@ -219,10 +219,39 @@ class QuantizationConfig:
 
 
 def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int, int, bool]:
-    """Map EasyDeL quantization config to ejkernel quantization parameters.
+    """Map an EasyDeL :class:`QuantizationConfig` onto the ejkernel quantizer.
+
+    The ejkernel quantization API expects four positional knobs: a mode string
+    (``"affine" | "nf4" | "mxfp4" | "nvfp4" | "mxfp8" | "nvfp8"``), a
+    ``group_size`` (number of contiguous weights that share one scale), a
+    ``bits`` count, and a ``needs_biases`` flag indicating whether the scheme
+    stores per-group zero-points in addition to scales. This function
+    resolves the EasyDeL-side enum + optional overrides into that 4-tuple
+    while validating the combinatorics each scheme imposes:
+
+    * ``AFFINE`` / ``INT8`` — group_size must be a power-of-two in
+      ``{16, 32, 64, 128, 256, 512, 1024}``, bits must be in ``[2, 8]``;
+      stores per-group ``(scale, bias)`` so ``needs_biases=True``. INT8 is
+      treated as affine with bits defaulting to 8.
+    * ``NF4`` — fixed bits=4 (NormalFloat lookup), group_size in the same
+      power-of-two set; no biases (zero-mean lookup table).
+    * ``MXFP4`` / ``NVFP4`` — group_size pinned to 32 / 16, bits=4; no biases.
+    * ``MXFP8`` / ``NVFP8`` — group_size pinned to 32 / 16, bits=8; no biases.
+
+    Args:
+        config: Resolved :class:`QuantizationConfig` whose ``dtype`` selects
+            the scheme and whose optional ``group_size`` / ``bits`` override
+            the per-scheme defaults.
 
     Returns:
-        (mode, group_size, bits, needs_biases)
+        Tuple ``(mode, group_size, bits, needs_biases)`` ready to be unpacked
+        into ejkernel's quantization entry points.
+
+    Raises:
+        ValueError: If the (mode, group_size, bits) combination violates the
+            scheme's constraints, or if ``config.dtype`` is not one of the
+            ejkernel-supported quantization types (e.g. ``BINARY``, ``TERNARY``,
+            and ``TURBOQUANT`` are handled by their own paths).
     """
     dtype = config.dtype
     if isinstance(dtype, str):
@@ -279,10 +308,30 @@ def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int,
 
 
 def resolve_jax_native_dtype(dtype: QuantizationType | str | None):
-    """Return the JAX-native dtype for supported quantization types.
+    """Map an EasyDeL quantization type onto its native ``jax.numpy`` dtype.
 
-    Returns None when the quantization type is not supported by JAX or the dtype
-    is unavailable in the current JAX/ML-dtypes build.
+    Used by the ``jax_native=True`` path in :class:`QuantizationConfig`: when
+    the requested scheme is one that JAX/ml_dtypes can store directly
+    (microscaling FP4/FP8 variants), quantization can be done with a simple
+    ``jnp.astype`` rather than going through ejkernel's pack/unpack kernels.
+    Schemes without a backing JAX dtype (NF4, AFFINE, INT8, BINARY, …) return
+    ``None`` so the caller falls back to the regular path.
+
+    The mapping currently handles:
+
+    * ``MXFP4`` -> ``jnp.float4_e2m1fn``
+    * ``MXFP8`` -> ``jnp.float8_e5m2``
+    * ``NVFP8`` -> ``jnp.float8_e4m3``
+
+    Args:
+        dtype: Quantization type to resolve. May be a :class:`QuantizationType`,
+            its string code, or ``None``.
+
+    Returns:
+        The matching ``jnp`` dtype, or ``None`` when the type has no native
+        JAX representation, when the running JAX / ml_dtypes build doesn't
+        expose the dtype, or when ``dtype`` itself is ``None``. The function
+        is therefore safe to call defensively on any config.
     """
     if dtype is None:
         return None

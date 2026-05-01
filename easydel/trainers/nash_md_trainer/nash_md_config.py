@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the Nash-MD trainer.
+
+Defines :class:`NashMDConfig`, which adds the mirror-descent step
+size ``mixture_coef`` (mixture probability between the policy and
+reference), KL clipping, and judge/oracle handling to the GRPO base
+config.
+"""
 
 from __future__ import annotations
 
@@ -28,24 +35,38 @@ from ..group_relative_policy_optimization.grpo_config import GRPOConfig
 class NashMDConfig(GRPOConfig):
     """Configuration for the :class:`~easydel.trainers.NashMDTrainer`.
 
-    The configuration mirrors the Hugging Face TRL Nash-MD setup and extends
-    :class:`~easydel.trainers.GRPOConfig` with the additional hyper-parameters
-    required by the Nash mixture-of-decoders objective.
+    Nash-MD (Munos et al. 2024) frames RLHF as computing a Nash
+    equilibrium between the policy and a frozen reference under a
+    learned preference oracle. The trainer produces auxiliary
+    completions from the *geometric mixture* of the policy and
+    reference distributions
+    ``pi_mix = pi_policy^mixture_coef * pi_ref^(1 - mixture_coef)``,
+    treats those mixture samples as the opposing player, and updates
+    the policy via a mirror-descent style step regularised by the KL
+    against the reference.
 
-    Attributes
-    ----------
-    beta:
-        Prospect theoretic scaling applied to the KL component. When a list
-        is provided, values are consumed sequentially on every new epoch and
-        the final value is reused afterwards.
-    mixture_coef:
-        Mixture coefficient used when generating the auxiliary completions
-        from the geometric mixture of policy and reference models. Similar to
-        ``beta`` this can be scheduled per epoch by providing a list.
-    missing_eos_penalty:
-        Optional penalty that is subtracted from the reward when a completion
-        does not emit an EOS token. This encourages the policy to terminate
-        generations earlier than ``max_new_tokens``.
+    Inherits the entire GRPO surface (rollout count, sampling knobs,
+    reward functions, advantage normalisation). Construct with
+    dict-literal kwargs:
+
+    >>> cfg = NashMDConfig(beta=0.1, mixture_coef=0.5,
+    ...                    missing_eos_penalty=0.0)
+
+    Attributes:
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"NashMD"``).
+        beta: KL coefficient against the reference. Either a scalar
+            (constant schedule) or a sequence consumed one entry per
+            epoch (with the last entry reused thereafter). Default
+            ``0.1``.
+        mixture_coef: Geometric-mixture weight on the policy logits
+            when sampling the opposing player. ``0`` recovers the
+            reference, ``1`` recovers the policy. Either a scalar or
+            an epoch-wise schedule. Default ``[0.5]``.
+        missing_eos_penalty: Optional reward penalty subtracted from
+            completions that do not emit an EOS token within
+            ``max_completion_length``. Encourages early termination.
+            ``None`` disables the penalty.
     """
 
     trainer_prefix: str | None = field(
@@ -82,6 +103,17 @@ class NashMDConfig(GRPOConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Forward to the GRPO base then unwrap singleton scalar schedules.
+
+        ``mixture_coef`` and ``beta`` may be supplied as either scalars
+        or single-element sequences; the latter is collapsed for
+        backward compatibility.
+
+        Args:
+            max_sequence_length: Legacy alias for ``max_length``.
+            quantization_block: Legacy alias for the quantization group
+                size.
+        """
         super().__post_init__(
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,

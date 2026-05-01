@@ -376,6 +376,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         _cap = self.apply_logit_cap
 
         def _project(hidden_states: Array) -> Array:
+            """Trace-safe LM-head projection composed with logit capping."""
             return _cap(base_fn(hidden_states))
 
         return _project
@@ -466,6 +467,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         num_chunks = padded_seq_len // chunk_size
 
         def _project_chunk(chunk_hidden_states: Array) -> Array:
+            """Project a single chunk of hidden states through the LM head with logit capping."""
             logits = checkpoint_name(self.apply_lm_head(chunk_hidden_states), "lm_head_output")
             return self.apply_logit_cap(logits)
 
@@ -481,6 +483,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         logits = lax.dynamic_update_slice(logits, first_chunk_logits, (0, 0, 0))
 
         def _write_chunk(i: int, logits_buffer: Array) -> Array:
+            """fori_loop body: project chunk ``i`` and scatter it into ``logits_buffer``."""
             start = i * chunk_size
             chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, chunk_size, axis=1)
             chunk_logits = _project_chunk(chunk_hidden_states)

@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Lightweight logging utilities for EasyDeL worker processes.
+
+This module provides a colorized log formatter, a lazy ``eLogger`` wrapper
+that defers Python ``logging`` initialization until the first call, and a
+``ProgressLogger`` for progress-bar style updates in worker scripts.
+
+Exports:
+    ColorFormatter: ANSI-colorized variant of ``logging.Formatter``.
+    eLogger: Lazily initialized logger that exposes the standard logging
+        method names via attribute access.
+    get_logger: Factory for :class:`eLogger` instances.
+    ProgressLogger: Terminal progress reporter with ETA support and a
+        context-manager API.
+    COLORS, LEVEL_COLORS: ANSI color tables consumed by the formatter.
+"""
+
 from __future__ import annotations
 
 import datetime
@@ -74,6 +90,16 @@ class ColorFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format a ``LogRecord`` with ANSI colors and a per-line prefix.
+
+        Args:
+            record: The log record produced by Python's ``logging`` module.
+
+        Returns:
+            str: The fully formatted, color-annotated log line(s). Multi-
+            line messages have the colored ``(time loggername)`` prefix
+            applied to every line.
+        """
         orig_levelname = record.levelname
         color = LEVEL_COLORS.get(record.levelname, COLORS["RESET"])
         record.levelname = f"{color}{record.levelname:<8}{COLORS['RESET']}"
@@ -102,6 +128,14 @@ class eLogger:
     """
 
     def __init__(self, name: str, level: int | None = None):
+        """Initialize the lazy logger.
+
+        Args:
+            name: The logger name (passed to ``logging.getLogger``).
+            level: Optional explicit numeric or string log level. When
+                ``None``, falls back to the ``LOGGING_LEVEL_ED`` environment
+                variable, then to ``INFO``.
+        """
         if level is None:
             env_level = os.getenv("LOGGING_LEVEL_ED", "INFO")
             level = _LOGGING_LEVELS.get(env_level, _LOGGING_LEVELS["INFO"])
@@ -114,13 +148,28 @@ class eLogger:
 
     @property
     def level(self):
+        """Return the configured numeric log level.
+
+        Returns:
+            int: The numeric log level set at construction time.
+        """
         return self._level
 
     @property
     def name(self):
+        """Return the logger name.
+
+        Returns:
+            str: The name passed to the constructor.
+        """
         return self._name
 
     def _ensure_initialized(self) -> None:
+        """Construct and configure the underlying ``logging.Logger`` once.
+
+        Idempotent: subsequent calls are no-ops once the handler has been
+        installed.
+        """
         if self._logger is not None:
             return
 
@@ -139,6 +188,22 @@ class eLogger:
         self._logger = logger
 
     def __getattr__(self, name: str) -> tp.Callable:
+        """Forward log-level method names to the lazily-built ``Logger``.
+
+        Args:
+            name: Attribute name lookup. Recognized names are the standard
+                logging level methods (``debug``, ``info``, ``warning``,
+                ``error``, ``critical``, ``fatal``, ``warn``, ``notset``)
+                and ``exception`` / ``log``.
+
+        Returns:
+            Callable: A wrapper that calls :meth:`_ensure_initialized`
+            before delegating to the underlying ``logging.Logger`` method.
+
+        Raises:
+            AttributeError: When ``name`` does not correspond to a known
+                logging method.
+        """
         if name in _LOGGING_LEVELS or name.upper() in _LOGGING_LEVELS or name in ("exception", "log"):
 
             @wraps(getattr(logging.Logger, name))
@@ -151,15 +216,28 @@ class eLogger:
 
 
 def get_logger(name: str, level: int | None = None) -> eLogger:
-    """
-    Function to create a lazy logger that only initializes when first used.
+    """Build a lazily-initialised :class:`eLogger`.
+
+    Wraps the :class:`eLogger` constructor so worker modules can grab a
+    logger at import time without paying the cost of installing
+    ``logging`` handlers until the first message is actually emitted.
+    The returned object exposes the standard ``debug`` / ``info`` /
+    ``warning`` / ``error`` / ``critical`` / ``exception`` methods.
 
     Args:
-        name (str): The name of the logger.
-        level (Optional[int]): The logging level. Defaults to environment variable LOGGING_LEVEL_ED or "INFO".
+        name: Logger name passed to :func:`logging.getLogger`. Following
+            the standard convention, dotted names produce hierarchical
+            loggers (e.g. ``"AuthManager"``,
+            ``"easydel.workers.response_store"``).
+        level: Optional explicit numeric or string log level. When
+            omitted, :class:`eLogger` reads the ``LOGGING_LEVEL_ED``
+            environment variable and falls back to ``INFO`` if that is
+            unset or invalid.
 
     Returns:
-        eLogger: A lazy logger instance that initializes on first use.
+        eLogger: Lazy logger that resolves to a configured
+        :class:`logging.Logger` with a :class:`ColorFormatter` console
+        handler on first use.
     """
     return eLogger(name, level)
 
@@ -302,11 +380,24 @@ class ProgressLogger:
             self._logger.info(full_message)
 
     def __enter__(self):
-        """Context manager entry."""
+        """Enter the progress-logger context manager.
+
+        Returns:
+            ProgressLogger: ``self`` so callers can ``with progress as p:``.
+        """
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - complete the progress."""
+        """Exit the context manager, calling :meth:`complete` on success.
+
+        Args:
+            exc_type: Exception type (or ``None`` when exiting normally).
+            exc_val: Exception value (unused).
+            exc_tb: Exception traceback (unused).
+
+        Returns:
+            bool: ``False`` so any in-flight exception keeps propagating.
+        """
         if exc_type is None:
             self.complete()
         return False

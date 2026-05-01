@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Nash Mirror Descent (Nash-MD) trainer.
+
+Nash-MD -- Munos et al. (2023) -- searches for the Nash equilibrium
+of a self-play game by descending the regularised expected reward
+against a mixture between the current policy and a frozen reference,
+using a preference oracle to score head-to-head completions.  The
+trainer subclasses :class:`GRPOTrainer` for the online generation /
+reward pipeline and overrides only the loss/step.
+"""
 
 from __future__ import annotations
 
@@ -69,21 +78,32 @@ def _ensure_state(
 
 @Registry.register("trainer", ["nash-md", "nash_md"])
 class NashMDTrainer(GRPOTrainer):
-    """Nash Mirror Descent trainer for preference optimization.
+    """Trainer for Nash Mirror Descent (Nash-MD) preference optimization.
 
-    Implements the Nash-MD algorithm which optimizes language models using
-    a mixture of policy and reference model generations. Extends GRPO with
-    Nash equilibrium-based optimization.
+    Implements the Nash-MD algorithm (Munos et al. 2024): each step
+    samples auxiliary completions from the *geometric mixture* of the
+    policy and reference distributions
+    ``pi_mix = pi_policy^mixture_coef * pi_ref^(1 - mixture_coef)``,
+    treats those mixture samples as the opposing player, and updates
+    the policy via a mirror-descent step regularised by the
+    token-level KL against the reference. Both ``mixture_coef`` and
+    ``beta`` may be provided as epoch-wise schedules in the config.
 
-    Args:
-        arguments: Nash-MD specific training configuration.
-        model: Policy model to train.
-        reward_funcs: Reward function(s) for scoring completions.
-        reference_model: Reference model for mixture generation.
-        train_dataset: Training dataset with prompts.
-        eval_dataset: Optional evaluation dataset.
-        processing_class: Tokenizer or processor.
-        reward_processing_classes: Optional processing classes for reward models.
+    Inherits the GRPO data plumbing (rollout generator, reward
+    routing, advantage construction) from :class:`GRPOTrainer`; only
+    the loss step (:func:`nash_md_step`) and the rollout post-
+    processing (mixture sampling + oracle preference scoring) differ.
+
+    See :func:`nash_md_step` for the loss form.
+
+    Attributes:
+        arguments: :class:`NashMDConfig` controlling the mirror-descent
+            schedules and the inherited ``GRPOConfig`` surface.
+        reference_state: Frozen reference :class:`EasyDeLState` used
+            to evaluate the mixture and the KL-regularisation term.
+        reward_funcs: Single oracle reward callable / module that
+            scores head-to-head ``(policy_completion,
+            mixture_completion)`` pairs.
     """
 
     arguments: NashMDConfig
@@ -100,6 +120,32 @@ class NashMDTrainer(GRPOTrainer):
         processing_class: ProcessingClassType,
         reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None = None,
     ):
+        """Initialize the Nash-MD trainer.
+
+        Delegates the heavy lifting (state setup, reward routing, online
+        generation pipeline) to :class:`GRPOTrainer`, then attaches the
+        Nash-MD specific schedules (``beta``, ``mixture_coef``,
+        ``missing_eos_penalty``).
+
+        Args:
+            arguments: Nash-MD-specific training configuration.
+            model: Policy module or state.
+            reward_funcs: Single reward callable / module / state, or a
+                list with exactly one element (Nash-MD scores
+                head-to-head completions, so multi-reward isn't
+                supported).
+            reference_model: Optional reference module/state; when
+                omitted the GRPO trainer's deep-copy default is used.
+            train_dataset: Optional training dataset of prompts.
+            eval_dataset: Optional evaluation dataset.
+            processing_class: Tokenizer/processor.
+            reward_processing_classes: Optional per-reward tokenizer
+                overrides.
+
+        Raises:
+            ValueError: If ``reward_funcs`` is missing or contains more
+                than one entry.
+        """
         if reward_funcs is None:
             raise ValueError("NashMDTrainer requires at least one reward function.")
         super().__init__(
@@ -165,17 +211,29 @@ class NashMDTrainer(GRPOTrainer):
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Return the current ``beta`` schedule value as the extra training arg."""
         return (jnp.asarray(self._current_beta_value(), dtype=jnp.float32),)
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Return the current ``beta`` schedule value as the extra evaluation arg."""
         return (jnp.asarray(self._current_beta_value(), dtype=jnp.float32),)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure JIT-compiled training and evaluation functions.
+        """Build the JIT-compiled Nash-MD training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, captures
+        the static argument tuple (``beta`` schedule, vocab chunk
+        size, partition spec, ...), and compiles
+        :func:`nash_md_step` once for training (with state donation)
+        and once for evaluation. Also installs the sharded
+        per-token-logp callable used by the rollout pipeline to score
+        the mixture and reference completions.
 
         Returns:
-            Configuration containing compiled step functions and mesh.
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
@@ -232,6 +290,23 @@ class NashMDTrainer(GRPOTrainer):
             mask: jax.Array,
             graphdef: spx.GraphDef,
         ):
+            """Sharded model per-token log-prob forward used for both policy and reference.
+
+            Stops gradients through the frozen graphother, applies the
+            trainer's step partition spec, and dispatches to
+            :func:`get_per_token_logps` with the configured vocab chunk
+            size.
+
+            Args:
+                graphtree: Trainable graphstate.
+                graphother: Frozen graphother (stop-gradient applied).
+                ids: Token id array ``[batch, seq_len]``.
+                mask: Attention mask ``[batch, seq_len]``.
+                graphdef: Captured graphdef for the model.
+
+            Returns:
+                ``[batch, seq_len]`` log-probabilities.
+            """
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,

@@ -78,7 +78,12 @@ class RateLimitConfig:
     tokens_per_day: int | None = None
 
     def as_dict(self) -> dict[str, tp.Any]:
-        """Serialize the rate limit config to a plain dictionary."""
+        """Serialize the rate limit config to a plain dictionary.
+
+        Returns:
+            dict[str, tp.Any]: A JSON-serializable mapping of every limit
+            field to its current value. Unset limits are emitted as ``None``.
+        """
         return {
             "requests_per_minute": self.requests_per_minute,
             "requests_per_hour": self.requests_per_hour,
@@ -109,7 +114,12 @@ class QuotaConfig:
     monthly_request_limit: int | None = None
 
     def as_dict(self) -> dict[str, tp.Any]:
-        """Serialize the quota config to a plain dictionary."""
+        """Serialize the quota config to a plain dictionary.
+
+        Returns:
+            dict[str, tp.Any]: JSON-serializable mapping of quota fields.
+            Unset limits are emitted as ``None``.
+        """
         return {
             "max_total_tokens": self.max_total_tokens,
             "max_total_requests": self.max_total_requests,
@@ -143,7 +153,12 @@ class ApiKeyPermissions:
     max_tokens_per_request: int | None = None
 
     def as_dict(self) -> dict[str, tp.Any]:
-        """Serialize the permissions to a plain dictionary."""
+        """Serialize the permissions to a plain dictionary.
+
+        Returns:
+            dict[str, tp.Any]: JSON-serializable mapping of every
+            permission field. ``None`` lists denote "no restriction".
+        """
         return {
             "allowed_models": self.allowed_models,
             "allowed_endpoints": self.allowed_endpoints,
@@ -221,21 +236,35 @@ class ApiKeyMetadata:
     metadata: dict[str, tp.Any] = field(default_factory=dict)
 
     def is_expired(self) -> bool:
-        """Check if the key has expired."""
+        """Whether the key has passed its expiration timestamp.
+
+        Returns:
+            bool: ``True`` only when ``expires_at`` is set and lies in the
+            past.
+        """
         if self.expires_at is None:
             return False
         return time.time() > self.expires_at
 
     def is_active(self) -> bool:
-        """Check if the key is active and usable."""
+        """Whether the key may currently authorize requests.
+
+        Returns:
+            bool: ``True`` when the status is ``ACTIVE`` and the key has
+            not expired.
+        """
         return self.status == ApiKeyStatus.ACTIVE and not self.is_expired()
 
     def update_last_used(self) -> None:
-        """Update the last used timestamp."""
+        """Stamp ``last_used_at`` with the current time."""
         self.last_used_at = time.time()
 
     def reset_monthly_counters_if_needed(self) -> None:
-        """Reset monthly counters if we're in a new month."""
+        """Reset monthly token/request counters when a new calendar month starts.
+
+        Compares the current month against ``last_reset_month`` and zeros
+        the monthly counters when they differ.
+        """
         current_month = time.localtime().tm_mon
         if current_month != self.last_reset_month:
             self.monthly_requests = 0
@@ -243,10 +272,15 @@ class ApiKeyMetadata:
             self.last_reset_month = current_month
 
     def as_dict(self, include_sensitive: bool = False) -> dict[str, tp.Any]:
-        """Serialize key metadata to dictionary.
+        """Serialize the metadata to a JSON-compatible dictionary.
 
         Args:
-                include_sensitive: If True, include hashed_key. Never include the raw key.
+            include_sensitive: When ``True``, include the SHA-256
+                ``hashed_key``. The raw key is never returned in any form.
+
+        Returns:
+            dict[str, tp.Any]: A flat mapping of every public field plus
+            derived totals (``total_tokens``, ``is_expired``).
         """
         data = {
             "key_id": self.key_id,
@@ -303,7 +337,12 @@ class AuditLogEntry:
     success: bool = True
 
     def as_dict(self) -> dict[str, tp.Any]:
-        """Serialize the audit log entry to a plain dictionary."""
+        """Serialize the audit log entry to a plain dictionary.
+
+        Returns:
+            dict[str, tp.Any]: JSON-serializable mapping of every field on
+            this entry.
+        """
         return {
             "timestamp": self.timestamp,
             "key_id": self.key_id,

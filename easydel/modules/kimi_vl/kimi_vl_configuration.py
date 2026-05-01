@@ -72,6 +72,23 @@ class MoonViTConfig(EasyDeLBaseConfig):
         merge_kernel_size: tuple[int, int] | list[int] = (2, 2),
         **kwargs,
     ):
+        """Initialize the MoonViT vision encoder configuration.
+
+        Args:
+            patch_size (int, optional): Size of each image patch. Defaults to 14.
+            init_pos_emb_height (int, optional): Initial height of the 2D positional
+                embedding grid. Defaults to 64.
+            init_pos_emb_width (int, optional): Initial width of the 2D positional
+                embedding grid. Defaults to 64.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
+            num_hidden_layers (int, optional): Number of transformer layers. Defaults to 27.
+            hidden_size (int, optional): Dimensionality of the hidden layers. Defaults to 1152.
+            intermediate_size (int, optional): Dimensionality of the MLP intermediate
+                layer. Defaults to 4304.
+            merge_kernel_size (tuple[int, int] | list[int], optional): Kernel size for the
+                spatial merge step. Defaults to (2, 2).
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         super().__init__(**kwargs)
         self.patch_size = patch_size
         self.init_pos_emb_height = init_pos_emb_height
@@ -124,6 +141,24 @@ class KimiVLConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize the Kimi-VL configuration.
+
+        Args:
+            vision_config (Mapping[str, Any] | MoonViTConfig | None, optional): Vision
+                encoder configuration. Accepts a dict (auto-converted to ``MoonViTConfig``),
+                a ``MoonViTConfig`` instance, or ``None`` for defaults. Defaults to None.
+            text_config (Mapping[str, Any] | DeepseekV3Config | None, optional): Text
+                decoder configuration. Accepts a dict (auto-converted to ``DeepseekV3Config``),
+                a ``DeepseekV3Config`` instance, or ``None`` for defaults. Defaults to None.
+            ignore_index (int, optional): Label index ignored by the cross-entropy loss.
+                Defaults to -100.
+            media_placeholder_token_id (int, optional): Placeholder token id whose positions
+                are replaced by visual embeddings. Defaults to 163605.
+            pad_token_id (int, optional): Padding token id. Defaults to 0.
+            tie_word_embeddings (bool, optional): Whether to tie input and output word
+                embeddings. Defaults to False.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:
@@ -149,6 +184,16 @@ class KimiVLConfig(EasyDeLBaseConfig):
         )
 
     def get_text_config(self, decoder: bool = True) -> DeepseekV3Config:
+        """Return the underlying text-decoder configuration.
+
+        Args:
+            decoder (bool, optional): Kept for API parity with HuggingFace's
+                ``PretrainedConfig.get_text_config``; this model has only a decoder so
+                the flag is ignored. Defaults to True.
+
+        Returns:
+            DeepseekV3Config: The text configuration.
+        """
         return self.text_config  # type: ignore
 
 

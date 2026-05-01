@@ -28,9 +28,14 @@ from .base import Example, Transform
 
 
 class FilterTransform(Transform):
-    """Filter examples based on a predicate function.
+    """General-purpose row filter driven by a user-supplied predicate.
 
-    Examples that don't match the predicate are filtered out (return None).
+    Wraps an arbitrary ``Callable[[dict], bool]`` so it can be plugged
+    into the transform DSL via ``>>``. Rows for which the predicate
+    returns falsy are dropped (the transform returns ``None``); rows
+    for which it returns truthy are forwarded unchanged. The
+    predicate must be deterministic so resumed/distributed runs see
+    identical filtered streams.
 
     Example:
         >>> transform = FilterTransform(lambda x: len(x["text"]) > 10)
@@ -39,35 +44,56 @@ class FilterTransform(Transform):
     """
 
     def __init__(self, predicate: tp.Callable[[Example], bool]):
-        """Initialize FilterTransform.
+        """Capture the user-supplied predicate.
 
         Args:
-            predicate: Function that returns True for examples to keep.
+            predicate: Callable receiving the row dict and returning
+                truthy to keep, falsy to drop.
         """
         self._predicate = predicate
 
     def __call__(self, example: Example) -> Example | None:
-        """Return example if predicate is True, else None.
+        """Forward ``example`` if ``predicate(example)`` is truthy, otherwise ``None``.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            The example if it passes the predicate, None otherwise.
+            dict | None: ``example`` itself when the predicate is
+            truthy, ``None`` to drop the row.
         """
         return example if self._predicate(example) else None
 
     @property
     def is_filter(self) -> bool:
+        """Identifying flag — every :class:`FilterTransform` may drop rows.
+
+        Returns:
+            bool: Always ``True`` so chain wrappers know to expect
+            ``None`` returns.
+        """
         return True
 
     def __repr__(self) -> str:
+        """Concise developer-facing repr identifying the predicate.
+
+        Returns:
+            str: ``"FilterTransform(<name>)"`` using the predicate's
+            ``__name__`` attribute, or ``"lambda"`` for anonymous
+            lambdas.
+        """
         pred_name = getattr(self._predicate, "__name__", "lambda")
         return f"FilterTransform({pred_name})"
 
 
 class FilterByField(Transform):
-    """Filter examples based on a specific field value.
+    """Row filter that runs a predicate against the value of a single named field.
+
+    Convenience wrapper around :class:`FilterTransform` for the very
+    common case of "keep rows whose ``foo`` matches some condition".
+    Rows lacking the field are always dropped — treated as failing
+    the predicate vacuously — so callers don't need to handle
+    ``KeyError`` themselves.
 
     Example:
         >>> # Keep only English examples
@@ -80,25 +106,26 @@ class FilterByField(Transform):
     """
 
     def __init__(self, field: str, predicate: tp.Callable[[tp.Any], bool]):
-        """Initialize FilterByField.
+        """Capture the field name and value-level predicate.
 
         Args:
-            field: Name of the field to check.
-            predicate: Function that takes the field value and returns True to keep.
+            field: Name of the row key whose value is tested.
+            predicate: Callable receiving the field value (not the
+                whole row) and returning truthy to keep the row.
         """
         self._field = field
         self._predicate = predicate
 
     def __call__(self, example: Example) -> Example | None:
-        """Return example if the specified field's value matches the predicate.
-
-        Returns None if the field is missing or the predicate returns False.
+        """Forward ``example`` if it has ``field`` and the value passes ``predicate``.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict.
 
         Returns:
-            The example if the field passes the predicate, None otherwise.
+            dict | None: ``example`` itself when both conditions are
+            true; ``None`` when the field is missing or the
+            predicate is falsy.
         """
         if self._field not in example:
             return None
@@ -106,17 +133,31 @@ class FilterByField(Transform):
 
     @property
     def is_filter(self) -> bool:
+        """Identifying flag — every :class:`FilterByField` may drop rows.
+
+        Returns:
+            bool: Always ``True``.
+        """
         return True
 
     def __repr__(self) -> str:
+        """Concise developer-facing repr identifying the field and predicate.
+
+        Returns:
+            str: ``"FilterByField('field', <name>)"``.
+        """
         pred_name = getattr(self._predicate, "__name__", "lambda")
         return f"FilterByField({self._field!r}, {pred_name})"
 
 
 class FilterNonEmpty(Transform):
-    """Filter out examples where specified fields are empty.
+    """Drop rows whose required fields are missing or hold empty values.
 
-    Checks for None, empty string "", and empty list [].
+    Treats ``None``, ``""``, and ``[]`` as empty (the common cases
+    for tokenized data: no text, no message list). A missing field
+    counts as empty too. Useful as the first transform in a chain to
+    purge structurally invalid rows before they reach tokenization
+    or packing.
 
     Example:
         >>> transform = FilterNonEmpty(["text", "messages"])
@@ -126,23 +167,23 @@ class FilterNonEmpty(Transform):
     """
 
     def __init__(self, fields: list[str]):
-        """Initialize FilterNonEmpty.
+        """Capture the list of required-non-empty field names.
 
         Args:
-            fields: List of field names that must be non-empty.
+            fields: Names of the row keys that must be present and
+                non-empty for the row to be kept.
         """
         self._fields = fields
 
     def __call__(self, example: Example) -> Example | None:
-        """Return example if all specified fields are non-empty.
-
-        Checks for None, empty string "", empty list [], and missing fields.
+        """Drop rows where any required field is missing/None/empty-string/empty-list.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict.
 
         Returns:
-            The example if all fields are non-empty, None otherwise.
+            dict | None: ``example`` when every required field is
+            present and non-empty; ``None`` otherwise.
         """
         for field in self._fields:
             value = example.get(field)
@@ -152,7 +193,17 @@ class FilterNonEmpty(Transform):
 
     @property
     def is_filter(self) -> bool:
+        """Identifying flag — every :class:`FilterNonEmpty` may drop rows.
+
+        Returns:
+            bool: Always ``True``.
+        """
         return True
 
     def __repr__(self) -> str:
+        """Concise developer-facing repr listing the required fields.
+
+        Returns:
+            str: ``"FilterNonEmpty([...])"``.
+        """
         return f"FilterNonEmpty({self._fields!r})"

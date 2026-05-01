@@ -291,6 +291,11 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def type_id(self) -> str:
+        """Identify this full-attention spec for cache compatibility checks.
+
+        Returns:
+            String of the form ``"full_attention_{page_size}_{page_size_bytes}"``.
+        """
         return f"full_attention_{self.page_size}_{self.page_size_bytes}"
 
     def max_memory_usage_bytes(self, max_model_len: int, **kwargs) -> int:
@@ -334,9 +339,19 @@ class FullAttentionSpec(AttentionSpec):
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        """
-        Merge a list of FullAttentionSpec objects into a single
-        FullAttentionSpec object.
+        """Merge a list of ``FullAttentionSpec`` objects into one.
+
+        Args:
+            specs: Specifications to combine. Must share the same ``type_id``.
+
+        Returns:
+            A new ``FullAttentionSpec`` whose ``sliding_window`` and
+            ``attention_chunk_size`` are the (single) merged values across
+            ``specs``.
+
+        Raises:
+            ValueError: If the provided specs cannot be reconciled (different
+                window sizes, or both sliding-window and chunked layers).
         """
         merged_spec = super().merge(specs)
         sliding_window = set(spec.sliding_window for spec in specs if spec.sliding_window is not None)
@@ -371,6 +386,12 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 
     @property
     def type_id(self) -> str:
+        """Identify this chunked-local-attention spec.
+
+        Returns:
+            String of the form
+            ``"local_attention_{chunk}_{page_size}_{page_size_bytes}"``.
+        """
         return f"local_attention_{self.attention_chunk_size}_{self.page_size}_{self.page_size_bytes}"
 
     def max_memory_usage_bytes(
@@ -429,6 +450,12 @@ class SlidingWindowSpec(AttentionSpec):
 
     @property
     def type_id(self) -> str:
+        """Identify this sliding-window-attention spec.
+
+        Returns:
+            String of the form
+            ``"sliding_window_{window}_{page_size}_{page_size_bytes}"``.
+        """
         return f"sliding_window_{self.sliding_window}_{self.page_size}_{self.page_size_bytes}"
 
     def max_memory_usage_bytes(
@@ -489,6 +516,11 @@ class MambaSpec(KVCacheSpec):
 
     @property
     def type_id(self) -> str:
+        """Identify this Mamba state cache spec.
+
+        Returns:
+            String of the form ``"mamba_{shapes}_{dtype}"``.
+        """
         return f"mamba_{self.shapes}_{self.dtype}"
 
     @property

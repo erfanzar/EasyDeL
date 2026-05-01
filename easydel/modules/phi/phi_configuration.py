@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Phi model family.
+
+Defines :class:`PhiConfig`, the EasyDeL configuration object that captures
+hyperparameters for Microsoft's Phi small-language-model architecture
+(partial RoPE, optional QK layer-norm, standard LayerNorm, gated MLP).
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

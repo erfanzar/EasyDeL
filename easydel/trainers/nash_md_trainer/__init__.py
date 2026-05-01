@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Nash-MD trainer entry point.
+
+Nash Mirror Descent (Munos et al., 2023) seeks the Nash equilibrium of
+a self-play game by descending the regularised expected reward of a
+mixture between the current policy and a reference, using a
+preference oracle to score head-to-head completions.  This package
+exposes :class:`NashMDConfig` and :class:`NashMDTrainer`.
+"""
 
 from .nash_md_config import NashMDConfig
 from .nash_md_trainer import NashMDTrainer

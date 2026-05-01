@@ -519,6 +519,17 @@ class UnifiedAttentionCacheView(BaseCacheView):
             pages: Float[Array, "num_pages page_size num_kv_heads head_dim"],
             num_update_slices: Array,
         ) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
+            """Apply the JAX KV-update kernel to either the key or value page tensor.
+
+            Args:
+                new_tokens: New tokens to insert into the page buffer.
+                slot_mapping: v2-style slot mapping array describing the writes.
+                pages: Existing page buffer.
+                num_update_slices: Number of valid slices in ``slot_mapping``.
+
+            Returns:
+                The updated page buffer with the same shape as ``pages``.
+            """
             original_shape = pages.shape
             pages_flat = pages.reshape(-1, *original_shape[-2:])
             page_shard_index = jnp.int32(0)
@@ -565,6 +576,11 @@ class UnifiedAttentionCacheView(BaseCacheView):
         return self.replace(key_cache=new_key_cache, value_cache=new_value_cache)
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing key/value cache shapes.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         return (
             f"{self.__class__.__name__}(layer_index={self.layer_index}, "
             f"key_cache_shape={getattr(self.key_cache, 'shape', None)}, "

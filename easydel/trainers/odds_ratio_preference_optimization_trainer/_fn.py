@@ -609,6 +609,31 @@ def orpo_training_step(
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
+    """Execute one ORPO training step (forward, backward, optimizer update).
+
+    Thin wrapper around :func:`orpo_step` with ``mode="train"``. Suitable as
+    the JIT entry point compiled by the trainer.
+
+    Args:
+        state (EasyDeLState): Current model state (parameters, optimizer state).
+        batch (dict): Mapping containing chosen/rejected token tensors.
+        concatenated_forward (tp.Callable): Forward function returning the
+            tuple of (chosen_logps, rejected_logps, chosen_logits,
+            rejected_logits, nll_loss, accuracy).
+        beta (float): Scaling factor for the odds ratio loss term.
+        learning_rate_fn (tp.Callable | None): Optional callable mapping
+            step -> learning rate, used for metric reporting.
+        loss_config (LossConfig | None): Optional loss configuration override.
+        partition_spec (PartitionSpec | None): Sharding spec to apply to the
+            input batch.
+        gradient_accumulation_steps (int): Number of microbatches whose
+            gradients are accumulated before an optimizer update.
+        straight_through_emulator (tp.Callable | None): Optional STE callable
+            wrapping the parameter tree to emulate quantized forward passes.
+
+    Returns:
+        tuple[EasyDeLState, LossMetrics]: Updated state and computed metrics.
+    """
     return orpo_step(
         state=state,
         batch=batch,
@@ -624,6 +649,17 @@ def orpo_training_step(
 
 
 def _orpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build the cache key identifying a scheduled ORPO loss specialization.
+
+    Args:
+        call: A scheduled call descriptor produced by the training utilities,
+            holding the bound static arguments for the loss function.
+
+    Returns:
+        tuple[tp.Any, ...]: A hashable tuple uniquely identifying the
+        ``(beta, partition_spec, concatenated_forward, straight_through_emulator)``
+        specialization.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("beta", "partition_spec"),
@@ -632,11 +668,30 @@ def _orpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_orpo_scheduled_loss(call):
+    """Build a scalar loss closure for the scheduled-loss adapter.
+
+    Args:
+        call: Scheduled call descriptor carrying ``concatenated_forward``,
+            ``beta``, and ``partition_spec`` entries.
+
+    Returns:
+        tp.Callable: A function ``(tree, batch) -> Array`` returning the
+        scalar ORPO objective ``policy_nll_loss - mean(odds_ratio_loss)``.
+    """
     concatenated_forward = call.get("concatenated_forward")
     beta = call.get("beta")
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree: spx.State, batch: dict):
+        """Compute the ORPO scalar loss for the scheduled-loss adapter.
+
+        Args:
+            tree (spx.State): Current model parameter tree.
+            batch (dict): Input minibatch with chosen/rejected entries.
+
+        Returns:
+            Array: Scalar loss value.
+        """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
         (

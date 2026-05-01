@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Pixtral vision encoder.
+
+Defines :class:`PixtralVisionConfig`, the EasyDeL configuration object
+for Mistral's Pixtral vision tower (used by Pixtral-12B and similar
+vision-language models). The configuration captures patch size, image
+size, hidden dimensions, number of layers, RoPE theta for 2-D position
+embeddings, and other vision-encoder hyperparameters.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config

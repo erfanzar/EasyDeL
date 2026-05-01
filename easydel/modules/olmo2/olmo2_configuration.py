@@ -134,6 +134,54 @@ class Olmo2Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize the Olmo2 configuration.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 50304.
+            hidden_size (int, optional): Hidden dimension. Defaults to 4096.
+            intermediate_size (int, optional): MLP intermediate dimension. Defaults to 11008.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to 32.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+            num_key_value_heads (int | None, optional): Number of key/value heads for
+                grouped-query attention; defaults to ``num_attention_heads`` when
+                ``None``. Defaults to None.
+            head_dim (int | None, optional): Per-head dimension; defaults to
+                ``hidden_size // num_attention_heads`` when ``None``. Defaults to None.
+            hidden_act (str, optional): MLP activation function. Defaults to "silu".
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to 2048.
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            use_cache (bool, optional): Whether to enable KV caching. Defaults to True.
+            pad_token_id (int, optional): Padding token id. Defaults to 1.
+            bos_token_id (int | None, optional): Beginning-of-sequence token id.
+                Defaults to None.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 50279.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            rope_theta (float, optional): RoPE base period. Defaults to 10000.0.
+            rope_scaling (dict | None, optional): RoPE scaling configuration.
+                Defaults to None.
+            attention_bias (bool, optional): Whether attention projections use bias.
+                Defaults to False.
+            attention_dropout (float, optional): Attention dropout. Defaults to 0.0.
+            rms_norm_eps (float, optional): Epsilon for RMSNorm. Defaults to 1e-5.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient
+                checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            use_scan_mlp (bool, optional): Whether to use the scan implementation
+                for the MLP. Defaults to False.
+            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP.
+                Defaults to 1024.
+            bits (int | None, optional): Quantization bits. Defaults to None.
+            layer_types (list[str] | None, optional): Per-layer attention type;
+                defaults to ``"full_attention"`` for every layer when ``None``.
+                Defaults to None.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+
+        Raises:
+            ValueError: If ``rope_scaling`` does not validate (see
+                :meth:`_rope_scaling_validation`).
+        """
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size

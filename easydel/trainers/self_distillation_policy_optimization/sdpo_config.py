@@ -103,6 +103,22 @@ class SDPOConfig(GRPOConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Validate the distillation type and trim ``max_completion_length``.
+
+        The teacher context must contain ``[prompt | feedback | completion]``
+        within ``max_length``. When the requested budget exceeds it, the
+        completion budget is reduced (rather than expanding ``max_length``)
+        to keep allocation sizes stable.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias forwarded to
+                the GRPO base class.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the base class.
+
+        Raises:
+            ValueError: If ``distillation_type`` is not ``'kl'`` or ``'jsd'``.
+        """
         if self.distillation_type not in ("kl", "jsd"):
             raise ValueError(f"`distillation_type` must be 'kl' or 'jsd', got '{self.distillation_type}'.")
         super().__post_init__(

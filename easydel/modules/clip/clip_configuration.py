@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration classes for the CLIP family of dual-encoder models.
+
+CLIP (Contrastive Language-Image Pre-training) jointly trains a vision
+encoder and a text encoder so their projections live in a shared embedding
+space. This module exposes:
+
+- :class:`CLIPTextConfig` — text transformer encoder hyperparameters.
+- :class:`CLIPVisionConfig` — vision transformer (ViT) hyperparameters,
+  including ``image_size``, ``patch_size``, and ``num_channels``.
+- :class:`CLIPConfig` — composite config that owns both sub-configs plus the
+  shared ``projection_dim`` and the contrastive ``logit_scale_init_value``.
+"""
 
 import typing
 
@@ -106,6 +118,37 @@ class CLIPTextConfig(EasyDeLBaseConfig):
         eos_token_id: int = 49407,
         **kwargs,
     ):
+        """Initialize the CLIP text encoder configuration.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``49408``.
+            hidden_size (int, optional): Encoder/pooler hidden width. Defaults to ``512``.
+            intermediate_size (int, optional): Feed-forward intermediate width.
+                Defaults to ``2048``.
+            projection_dim (int, optional): Shared joint embedding dimensionality.
+                Defaults to ``512``.
+            num_hidden_layers (int, optional): Number of transformer encoder layers.
+                Defaults to ``12``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``8``.
+            max_position_embeddings (int, optional): Maximum text sequence length.
+                Defaults to ``77``.
+            hidden_act (str, optional): Activation function name. Defaults to
+                ``"quick_gelu"``.
+            layer_norm_eps (float, optional): LayerNorm epsilon. Defaults to ``1e-5``.
+            attention_dropout (float, optional): Attention probability dropout.
+                Defaults to ``0.0``.
+            initializer_range (float, optional): Stddev for truncated-normal weight
+                init. Defaults to ``0.02``.
+            initializer_factor (float, optional): Multiplicative factor on weight
+                initialization (kept at ``1.0`` outside testing). Defaults to ``1.0``.
+            pad_token_id (int, optional): Padding token id. Defaults to ``1``.
+            bos_token_id (int, optional): Start-of-sequence token id. Defaults to
+                ``49406``.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to
+                ``49407``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -203,6 +246,36 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
         initializer_factor: float = 1.0,
         **kwargs,
     ):
+        """Initialize the CLIP vision encoder configuration.
+
+        Args:
+            hidden_size (int, optional): Vision transformer hidden width.
+                Defaults to ``768``.
+            intermediate_size (int, optional): Feed-forward intermediate width.
+                Defaults to ``3072``.
+            projection_dim (int, optional): Shared joint embedding dimensionality.
+                Defaults to ``512``.
+            num_hidden_layers (int, optional): Number of ViT encoder layers.
+                Defaults to ``12``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``12``.
+            num_channels (int, optional): Number of input image channels.
+                Defaults to ``3``.
+            image_size (int, optional): Input image side length in pixels.
+                Defaults to ``224``.
+            patch_size (int, optional): ViT patch side length in pixels.
+                Defaults to ``32``.
+            hidden_act (str, optional): Activation function name. Defaults to
+                ``"quick_gelu"``.
+            layer_norm_eps (float, optional): LayerNorm epsilon. Defaults to ``1e-5``.
+            attention_dropout (float, optional): Attention probability dropout.
+                Defaults to ``0.0``.
+            initializer_range (float, optional): Stddev for truncated-normal
+                weight init. Defaults to ``0.02``.
+            initializer_factor (float, optional): Multiplicative weight-init factor.
+                Defaults to ``1.0``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
@@ -279,6 +352,27 @@ class CLIPConfig(EasyDeLBaseConfig):
         logit_scale_init_value: float = 2.6592,
         **kwargs,
     ):
+        """Initialize the composite CLIP configuration.
+
+        Builds and stores child :class:`CLIPTextConfig` and
+        :class:`CLIPVisionConfig` instances. Optional ``text_config_dict`` /
+        ``vision_config_dict`` kwargs (recognized by HF round-trip dumps) take
+        precedence over the corresponding ``text_config`` / ``vision_config``
+        entries, with mismatches logged.
+
+        Args:
+            text_config (dict | None, optional): Init kwargs for the inner
+                :class:`CLIPTextConfig`. Defaults to ``None`` (use defaults).
+            vision_config (dict | None, optional): Init kwargs for the inner
+                :class:`CLIPVisionConfig`. Defaults to ``None`` (use defaults).
+            projection_dim (int, optional): Dimensionality of the shared
+                text/vision projection space. Defaults to ``512``.
+            logit_scale_init_value (float, optional): Initial value for the
+                learnable temperature parameter. Defaults to ``2.6592``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`. May include
+                ``text_config_dict`` and ``vision_config_dict`` (popped before
+                forwarding).
+        """
         text_config_dict = kwargs.pop("text_config_dict", None)
         vision_config_dict = kwargs.pop("vision_config_dict", None)
 

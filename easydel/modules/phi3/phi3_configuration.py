@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Phi-3 model family.
+
+Defines :class:`Phi3Config`, the EasyDeL configuration object for
+Microsoft's Phi-3 architecture. Phi-3 extends Phi with a fused
+``qkv_proj`` / ``gate_up_proj`` layout, RMSNorm, full RoPE (with
+optional long-rope scaling), and optional sliding-window attention.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -186,17 +193,20 @@ class Phi3Config(EasyDeLBaseConfig):
         )
 
     def _rope_scaling_validation(self):
-        """Validate the `rope_scaling` configuration."""
-        """Validates the `rope_scaling` configuration dictionary.
+        """Validate and normalise the ``rope_scaling`` configuration.
 
-    Ensures that the `rope_scaling` dictionary contains the correct keys (`type`, `factor`)
-    and that the values are valid (type is 'linear', 'dynamic', or 'longrope', factor is > 1.0).
-    It also handles backward compatibility for 'su' and 'yarn' types, mapping them to 'longrope'.
+        Ensures that the ``rope_scaling`` mapping (when supplied) uses
+        a recognised RoPE variant. Phi-3 supports ``"linear"``,
+        ``"dynamic"``, and ``"longrope"`` scaling. For backward
+        compatibility with earlier checkpoints, the legacy ``"su"`` and
+        ``"yarn"`` variants are silently rewritten to ``"longrope"``
+        in-place so downstream rotary code only needs to handle the
+        canonical name.
 
-    Raises:
-        ValueError: If `rope_scaling` is not a dictionary, is missing keys,
-            or has invalid values for `type` or `factor`.
-    """
+        Returns ``None`` when ``rope_scaling`` is ``None`` so callers
+        can blindly invoke the validator from ``__init__`` without an
+        extra guard.
+        """
         if self.rope_scaling is None:
             return
 

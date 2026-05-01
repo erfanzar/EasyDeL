@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Whisper speech-to-text model implementation for EasyDeL.
+
+This module implements OpenAI's Whisper encoder-decoder transformer
+for automatic speech recognition. The encoder consumes log-Mel
+spectrogram features through two strided 1-D convolutions followed by
+sinusoidal position embeddings, then a stack of self-attention
+transformer blocks. The decoder is a causal transformer with both
+self-attention and encoder-cross-attention.
+
+Components:
+- :class:`WhisperEncoder` and :class:`WhisperDecoder` for the
+  audio-encoder and text-decoder trunks.
+- :class:`WhisperModel` glues them together for raw encoder/decoder
+  exposure.
+- :class:`WhisperForConditionalGeneration` adds the LM head and is the
+  task entrypoint for transcription.
+- :class:`WhisperForAudioClassification` reuses the encoder for audio
+  classification tasks.
+"""
 
 import math
 import random
@@ -315,11 +334,29 @@ class WhisperAttention(AttentionModule):
         return attn_output, attentions.attention_weights, cache_view
 
     def _split_heads(self, hidden_state) -> jnp.ndarray:
-        """Splits the last dimension of the hidden state into (num_heads, head_dim)."""
+        """Reshape ``(batch, seq_len, embed_dim)`` to per-head layout.
+
+        Args:
+            hidden_state: Tensor with trailing dim ``embed_dim``.
+
+        Returns:
+            Tensor reshaped to
+            ``(batch, seq_len, num_heads, head_dim)`` so subsequent
+            attention ops can broadcast across heads.
+        """
         return hidden_state.reshape((*hidden_state.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_state) -> jnp.ndarray:
-        """Merges the last two dimensions (num_heads, head_dim) into embed_dim."""
+        """Inverse of :meth:`_split_heads`.
+
+        Args:
+            hidden_state: Tensor of shape
+                ``(batch, seq_len, num_heads, head_dim)``.
+
+        Returns:
+            Tensor of shape ``(batch, seq_len, embed_dim)`` ready for
+            the output projection.
+        """
         return hidden_state.reshape((*hidden_state.shape[:2], self.embed_dim))
 
 
@@ -802,6 +839,13 @@ class WhisperEncoder(EasyDeLBaseModule):
         hidden_states = self.dropout_layer(hidden_states)
 
         def _layer_loop(encoder_layer, carry):
+            """Apply a single Whisper encoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``encoder_layer`` on the
+            current hidden states, optionally accumulates per-layer
+            hidden states / self-attention weights, and returns the
+            updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 assert all_hidden_states is not None
@@ -1021,6 +1065,13 @@ class WhisperDecoder(EasyDeLBaseModule):
         )
 
         def _layer_loop(decoder_layer, carry):
+            """Apply a single Whisper decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``decoder_layer`` on the
+            current hidden states, optionally accumulates per-layer
+            hidden states, self-attention weights and cross-attention
+            weights, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1127,11 +1178,21 @@ class WhisperModel(EasyDeLBaseModule):
         )
 
     def _get_decoder_module(self):
-        """Returns the decoder module."""
+        """Internal accessor for the decoder used by generation utilities.
+
+        Returns:
+            WhisperDecoder: The autoregressive text decoder that
+            cross-attends to the encoder outputs.
+        """
         return self.decoder
 
     def _get_encoder_module(self):
-        """Returns the encoder module."""
+        """Internal accessor for the encoder used by caching helpers.
+
+        Returns:
+            WhisperEncoder: The acoustic encoder that consumes the
+            mel-spectrogram input features.
+        """
         return self.encoder
 
     def forward(
@@ -1394,9 +1455,22 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         )
 
     def _get_encoder_module(self):
+        """Reach the encoder owned by the wrapped :class:`WhisperModel`.
+
+        Used by generation helpers that pre-encode the audio once and
+        reuse the resulting hidden states across decoding steps.
+
+        Returns:
+            WhisperEncoder: ``self.model.encoder``.
+        """
         return self.model.encoder
 
     def _get_decoder_module(self):
+        """Reach the decoder owned by the wrapped :class:`WhisperModel`.
+
+        Returns:
+            WhisperDecoder: ``self.model.decoder``.
+        """
         return self.model.decoder
 
     def forward(

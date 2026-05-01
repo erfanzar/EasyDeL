@@ -62,19 +62,32 @@ def _masked_mean(x: jax.Array, mask: jax.Array) -> jax.Array:
 
 
 def compute_per_token_logps(logits: jax.Array, input_ids: jax.Array, prompt_length: int) -> jax.Array:
-    """Compute per-token log probabilities for completion tokens.
+    """Slice and gather per-token log-probabilities for completion positions.
 
-    Extracts the log probabilities of the actual tokens generated in the
-    completion portion of the sequence, given the model's logit predictions.
+    Used by the simple (non-chunked) PPO log-prob path: the function
+    converts the full vocabulary logits into log-probabilities via a
+    standard log-softmax, then gathers the log-probability of the
+    *realised* completion token at every completion position. The
+    prompt prefix is dropped wholesale -- PPO only differentiates the
+    policy at completion positions.
+
+    Note that this helper does **not** perform the causal shift; the
+    caller is expected to align ``logits`` and ``input_ids`` such that
+    ``logits[:, t]`` already predicts ``input_ids[:, t]`` (i.e. the
+    standard causal-LM shift has already been applied). PPO uses
+    :func:`get_per_token_logps_values_entropies` for the shifted path.
 
     Args:
-        logits: Model output logits of shape (batch, seq_len, vocab_size).
-        input_ids: Full input sequence including prompt and completion.
-        prompt_length: Length of the prompt prefix to skip.
+        logits: Model output logits of shape
+            ``(batch, seq_len, vocab_size)``.
+        input_ids: Full input sequence with shape
+            ``(batch, seq_len)`` covering prompt + completion.
+        prompt_length: Number of leading prompt tokens to drop.
 
     Returns:
-        Per-token log probabilities for the completion tokens,
-        shape (batch, completion_length).
+        Float array of shape ``(batch, seq_len - prompt_length)``
+        containing ``log p(token_t | logits_t)`` for each completion
+        position.
     """
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_ids = input_ids[:, prompt_length:]
@@ -191,36 +204,76 @@ def ppo_step(
     is_training: bool = True,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """Execute a single PPO training or evaluation step.
+    """Run one PPO update (forward + clipped objective + optimiser step).
 
-    Computes the clipped PPO objective including policy loss, value loss,
-    and optional entropy bonus. Supports gradient accumulation and
-    sharded training across devices.
+    The step implements the joint PPO loss
+
+    ``L = pg_loss + vf_coef * vf_loss - entropy_coef * entropy``
+
+    where each term is computed under the completion mask:
+
+    * **Policy loss** (clipped surrogate): for the importance ratio
+      ``ratio = exp(new_logps - old_logps)`` PPO uses
+      ``pg_loss = mean(max(-A * ratio, -A * clip(ratio, 1-cliprange, 1+cliprange)))``.
+      ``A`` is the GAE advantage, detached from the gradient via
+      ``stop_gradient``.
+    * **Value loss** (clipped regression): the new values are clipped
+      to a trust region around the rollout values
+      ``V_clipped = V_old + clip(V - V_old, -cliprange_value, +cliprange_value)``
+      and the loss is ``0.5 * mean(max((V - R)^2, (V_clipped - R)^2))``.
+      Returns ``R`` are detached.
+    * **Entropy bonus**: ``mean(entropy)`` of the per-token policy
+      distribution, scaled by ``entropy_coef`` and *subtracted* so that
+      higher-entropy policies are preferred.
+
+    Diagnostics emitted via :class:`LossMetrics` include the approx KL
+    ``0.5 * mean(log_ratio**2)``, the policy and value clip-fractions,
+    and masked means of ratio/advantages/returns -- the standard PPO
+    debugging panel.
+
+    Sharding constraints are applied to the batch up front (``ignore_mpmd``
+    is set so MPMD pipelines do not re-shard mid-step), and the body
+    runs through :func:`minibatch_call` for gradient accumulation. When
+    ``is_training=False`` no gradients are computed and only the
+    metrics dict is returned.
 
     Args:
-        state: Current model state with parameters and optimizer.
-        batch: Dictionary containing:
-            - input_ids: Token IDs for prompt + completion.
-            - attention_mask: Attention mask for the sequence.
-            - completion_mask: Mask for completion tokens only.
-            - old_logps: Log probabilities from rollout policy.
-            - old_values: Value predictions from rollout.
-            - advantages: GAE-computed advantages.
-            - returns: Target returns for value function.
-        prompt_length: Length of the prompt prefix.
-        cliprange: PPO clip range for policy ratio.
-        vf_coef: Coefficient for value function loss.
-        cliprange_value: Clip range for value function.
-        entropy_coef: Coefficient for entropy bonus.
-        loss_config: Optional configuration for loss computation.
-        learning_rate_fn: Learning rate schedule function.
-        partition_spec: Sharding specification for distributed training.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
-        is_training: Whether to compute gradients and update state.
+        state: Current model state for the value-head-augmented policy.
+        batch: Mapping carrying the rollout-computed quantities --
+            ``input_ids``, ``attention_mask``, ``completion_mask`` (1s
+            where the loss applies), ``old_logps`` and ``old_values``
+            from the rollout policy, plus precomputed ``advantages``
+            and ``returns``.
+        prompt_length: Number of leading prompt tokens, used to index
+            into the per-token outputs of
+            :func:`get_per_token_logps_values_entropies`.
+        cliprange: ``epsilon`` in the clipped policy surrogate.
+        vf_coef: Scalar weight on the value-function loss.
+        cliprange_value: Symmetric clip range for the value update.
+        entropy_coef: Weight on the entropy bonus (subtracted from the
+            loss).
+        logprob_vocab_chunk_size: Optional vocabulary-axis chunk size
+            forwarded to the chunked log-prob/entropy reductions; pass
+            ``None`` to disable chunking.
+        loss_config: Optional :class:`LossConfig` consumed by
+            :func:`update_state_respectfully` (e.g. for grad
+            clipping/scaling).
+        learning_rate_fn: Optional schedule used by
+            :func:`update_metrics` for per-step LR logging.
+        partition_spec: Sharding spec for the input batch; resolved by
+            :func:`make_assertions_and_get_sizes`.
+        gradient_accumulation_steps: Number of microbatches whose
+            gradients are accumulated per optimiser update.
+        is_training: When ``True`` differentiate, accumulate, and apply
+            the optimiser update; when ``False`` evaluate the loss and
+            return only metrics.
+        straight_through_emulator: Optional STE wrapper applied to the
+            parameter tree inside the loss closure to simulate
+            quantised forward passes during training.
 
     Returns:
-        If is_training: Tuple of (updated_state, metrics).
-        If not is_training: Just the metrics.
+        ``(updated_state, metrics)`` in training mode; in eval mode
+        only the :class:`LossMetrics`.
     """
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -230,6 +283,19 @@ def ppo_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
+        """Compute the clipped PPO objective for a single minibatch.
+
+        Args:
+            tree: Differentiable parameter tree (the policy graph state).
+            minibatch (collections.abc.Mapping[str, jax.Array]): Minibatch
+                with ``input_ids``, ``attention_mask``, ``completion_mask``,
+                ``old_logps``, ``old_values``, ``advantages``, and ``returns``.
+
+        Returns:
+            tuple[jax.Array, LossMetrics]: Scalar loss and a
+            :class:`LossMetrics` instance with diagnostic statistics
+            (policy/value losses, approx KL, clip fractions, etc.).
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree)

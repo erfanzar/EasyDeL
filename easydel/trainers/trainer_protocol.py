@@ -11,6 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Trainer protocol surfaces shared between :class:`BaseTrainer` and subclasses.
+
+This module declares the abstract interfaces (``BaseTrainerProtocol``) and
+result containers (``TrainerOutput``, ``TrainerConfigureFunctionOutput``,
+``TrainerConfigureDataloaderOutput``, ``TrainerConfigureModelOutput``)
+that every concrete EasyDeL trainer is expected to provide.  Concrete
+trainers (e.g. :class:`BaseTrainer`) subclass the protocol and fill in the
+implementation of each method.
+
+Re-exported helpers include :class:`MetricsTracker`, :class:`StepMetrics`,
+and :class:`BaseProgressBar` from the :mod:`easydel.trainers.metrics`
+module so that downstream code can import them from a single place.
+"""
+
 from __future__ import annotations
 
 import collections.abc
@@ -250,27 +264,39 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def model(self): ...
+    def model(self):
+        """Return the underlying :class:`EasyDeLBaseModule`."""
+        ...
 
     @property
     @abstractmethod
-    def mesh(self): ...
+    def mesh(self):
+        """Return the JAX device mesh used for sharded training."""
+        ...
 
     @property
     @abstractmethod
-    def training_batch_size(self): ...
+    def training_batch_size(self):
+        """Return the effective per-step training batch size."""
+        ...
 
     @property
     @abstractmethod
-    def evaluation_batch_size(self): ...
+    def evaluation_batch_size(self):
+        """Return the effective per-step evaluation batch size."""
+        ...
 
     @property
     @abstractmethod
-    def is_process_zero(self): ...
+    def is_process_zero(self):
+        """Return ``True`` on the rank-0 (admin) process only."""
+        ...
 
     @property
     @abstractmethod
-    def is_enable(self): ...
+    def is_enable(self):
+        """Return ``True`` if work should run on the current process."""
+        ...
 
     @abstractmethod
     def _initialize_attributes(self):
@@ -972,16 +998,27 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]: ...
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Return extra positional args appended to the shared training step."""
+        ...
+
     @property
     @abstractmethod
-    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]: ...
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Return extra positional args appended to the shared evaluation step."""
+        ...
+
     @property
     @abstractmethod
-    def _train_shared_fn_static_args(self) -> dict[str, tp.Any]: ...
+    def _train_shared_fn_static_args(self) -> dict[str, tp.Any]:
+        """Return static (compile-time) keyword args for the shared training step."""
+        ...
+
     @property
     @abstractmethod
-    def _eval_shared_fn_static_args(self) -> dict[str, tp.Any]: ...
+    def _eval_shared_fn_static_args(self) -> dict[str, tp.Any]:
+        """Return static (compile-time) keyword args for the shared evaluation step."""
+        ...
 
     @abstractmethod
     def _configure_grain_dataloader(self) -> TrainerConfigureDataloaderOutput:

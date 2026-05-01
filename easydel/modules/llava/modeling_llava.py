@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""LLaVA (Large Language and Vision Assistant) model implementation.
+
+Implements the multimodal LLaVA architecture, which couples a vision encoder
+(typically CLIP-ViT) with a decoder-only language model through a small MLP
+multimodal projector. Visual features are extracted from a configurable hidden
+layer of the vision tower, projected into the LM embedding space, and merged
+into the text embedding sequence at positions marked by ``image_token_id``.
+
+Exports:
+    - ``LlavaCausalLMOutputWithPast``: structured output for autoregressive runs.
+    - ``LlavaMultiModalProjector``: two-layer MLP that bridges vision and text.
+    - ``LlavaModel``: base multimodal model returning hidden states.
+    - ``LlavaForConditionalGeneration``: full model with LM head for generation.
+"""
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -88,11 +103,31 @@ class LlavaCausalLMOutputWithPast(ModelOutput):
 
 
 class LlavaMultiModalProjector(spx.Module):
-    """Multi-modal projector for LLaVA models.
+    """Two-layer MLP that maps vision-encoder patch features into the LM embedding space.
 
-    Projects visual features from the vision encoder into the language model's
-    embedding space using a two-layer MLP with GELU activation. This enables
-    the language model to process visual information alongside text tokens.
+    LLaVA's only learned bridge between modalities. The projector applies::
+
+        h = act(linear_1(image_features))         # vision_dim * K -> text_dim
+        out = linear_2(h)                          # text_dim -> text_dim
+
+    where ``act`` is ``config.projector_hidden_act`` (GELU by default in
+    LLaVA-1.5; SiLU in some derivative checkpoints) and ``K`` is the number
+    of vision feature layers concatenated along the channel dim
+    (``config.vision_feature_layer`` may be a single int — most checkpoints
+    pick the second-to-last CLIP-ViT layer — or a list, in which case the
+    layers are concatenated). Both linears default to bias-free; whether
+    biases are kept is controlled by ``multimodal_projector_bias``.
+
+    The output of this module is *patch-aligned* with the vision encoder
+    input — for a 336×336 image with 14×14 patches that is 576 tokens —
+    and gets spliced into the LM token sequence at the positions of the
+    image-token placeholder by the parent :class:`LlavaForConditionalGeneration`.
+
+    Attributes:
+        linear_1 (RowParallelLinear): Vision-to-text expansion projection;
+            input width is ``vision_hidden_size * num_feature_layers``.
+        act (Callable): Activation between the two linears.
+        linear_2 (RowParallelLinear): Square ``text_hidden_size`` projection.
     """
 
     def __init__(
@@ -164,16 +199,32 @@ class LlavaMultiModalProjector(spx.Module):
 
 @register_module(TaskType.BASE_VISION, config=LlavaConfig, model_type="llava")
 class LlavaModel(EasyDeLBaseModule):
-    """
-    LlavaModel model for conditional text generation based on image inputs.
-    Combines a vision tower and a language model with a multi-modal projector.
+    """LLaVA base trunk: vision tower + projector + language model (no LM head).
+
+    The LLaVA training recipe is "freeze the vision encoder, train the
+    projector, then jointly fine-tune". This class wires up the three
+    components in a single graph so that on a forward pass:
+
+    1. ``vision_tower`` (an :class:`AutoEasyDeLVisionModel` — typically
+       CLIP ViT-L/14 at the 336/224 resolution declared in
+       ``config.vision_config``) embeds the input image. The hidden state
+       at ``config.vision_feature_layer`` is selected (the second-to-last
+       layer's output minus the CLS token, per
+       ``vision_feature_select_strategy = "default"``).
+    2. ``multi_modal_projector`` (:class:`LlavaMultiModalProjector`) maps
+       those vision tokens to the language model's hidden dim.
+    3. ``language_model`` (an :class:`AutoEasyDeLModel`, no LM head — that
+       lives on :class:`LlavaForConditionalGeneration`) consumes the merged
+       embedding sequence formed by replacing every ``image_token_id``
+       position in the text input with the corresponding projected vision
+       tokens.
 
     Attributes:
-        config (LlavaConfig): Configuration object.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (spx.Rngs): Random number generators.
+        vision_tower: Frozen-or-trainable image encoder (typically CLIP-ViT).
+        multi_modal_projector (LlavaMultiModalProjector): Vision-to-text MLP.
+        language_model: Causal LM trunk *without* an LM head; the LM head
+            sits on :class:`LlavaForConditionalGeneration` and reuses this
+            trunk's last hidden state.
     """
 
     def __init__(

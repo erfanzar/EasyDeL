@@ -115,6 +115,36 @@ class SparseDistillationTrainer(Trainer):
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
     ):
+        """Initialize the sparse-distillation trainer.
+
+        Exactly one of ``teacher_model`` or ``teacher_fn`` must be
+        provided. If both are ``None`` a :class:`ValueError` is raised.
+
+        Args:
+            arguments (SparseDistillationConfig): Trainer configuration.
+            processing_class (ProcessingClassType): Tokenizer / processor
+                used for prompt encoding and (where applicable) decoding
+                for ``teacher_fn``.
+            student_model (EasyDeLBaseModule | EasyDeLState | None):
+                Student model under training.
+            teacher_model (EasyDeLBaseModule | EasyDeLState | None):
+                Optional in-process teacher whose top-k logprobs are
+                computed locally.
+            teacher_fn (SparseTeacherFn | None): Optional callable
+                returning ``(top_k_indices, top_k_logprobs)`` arrays
+                given ``(input_ids, attention_mask, prompt_texts)``.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset of prompts.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation
+                dataset(s).
+
+        Raises:
+            TypeError: If ``arguments`` is not a
+                :class:`SparseDistillationConfig`.
+            ValueError: If neither ``teacher_model`` nor ``teacher_fn``
+                is provided.
+        """
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
             tokenizer = processing_class.tokenizer
@@ -153,7 +183,20 @@ class SparseDistillationTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
-        """Get preprocessing transform for prompt-only datasets."""
+        """Build the lazy prompt-only preprocessing transform for sparse distillation.
+
+        Sparse distillation runs the student on-policy over prompts and
+        scores completions through the teacher, so the dataset only
+        needs to provide prompts. The :class:`GRPOPreprocessTransform`
+        applies the chat template (unless
+        ``skip_apply_chat_template`` is set) and tokenises to
+        ``arguments.max_prompt_length`` lazily inside the data loader.
+
+        Returns:
+            A :class:`GRPOPreprocessTransform`, or ``None`` when the
+            source already exposes ``input_ids`` (per
+            :meth:`_is_pretokenized`).
+        """
         if self._is_pretokenized():
             return None
         return GRPOPreprocessTransform(
@@ -163,7 +206,16 @@ class SparseDistillationTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check whether the source already yields token IDs."""
+        """Detect whether the bound training source already exposes tokenised prompts.
+
+        Peeks at the first row of the first shard and reports whether
+        an ``"input_ids"`` field is present. Defensive against missing
+        sources, empty shard lists, and shards yielding no rows.
+
+        Returns:
+            ``True`` if the first row of the first shard has
+            ``"input_ids"``; ``False`` otherwise.
+        """
         if self._train_source is None:
             return False
         try:
@@ -177,7 +229,23 @@ class SparseDistillationTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create Grain data collator for prompt-only batches."""
+        """Construct the Grain collator that left-pads prompt-only batches.
+
+        Sparse distillation operates on prompt-only batches; on-policy
+        completions are sampled inside :meth:`_preprocess_batch_input`.
+        The collator left-pads tokenised prompts to
+        ``arguments.max_prompt_length`` using ``self.padding_value`` so
+        student generation receives a contiguous, right-aligned prefix.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorGrain`.
+        """
         from ..utils import GRPODataCollatorGrain
 
         return GRPODataCollatorGrain(
@@ -190,7 +258,19 @@ class SparseDistillationTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create TFDS data collator for prompt-only batches."""
+        """Construct the TFDS collator that left-pads prompt-only batches.
+
+        TFDS analogue of :meth:`create_grain_collect_function`.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorTFDS`.
+        """
         from ..utils import GRPODataCollatorTFDS
 
         return GRPODataCollatorTFDS(
@@ -199,7 +279,35 @@ class SparseDistillationTrainer(Trainer):
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile training and evaluation step functions."""
+        """Compile the sparse-distillation training and evaluation step functions.
+
+        Sparse distillation differs from the dense distillation path in
+        that the teacher contributes only its top-k log-probabilities;
+        :func:`sparse_distillation_step` consumes those tensors out of
+        the prepared batch instead of doing a teacher forward inside the
+        compiled graph. This compile-step therefore wires:
+
+        * the resolved straight-through emulator for quantisation-aware
+          training (when configured);
+        * static-argument tuples for both train and eval phases that
+          freeze ``loss_config``, ``scheduler``, ``step_partition_spec``,
+          ``gradient_accumulation_steps``, the ``is_training`` flag,
+          ``temperature`` (KL softening), and ``alpha`` (mixing
+          coefficient between hard-label CE and KL terms);
+        * two compiled step functions over :func:`sparse_distillation_step`
+          that share the same input/output shardings -- state donated,
+          batch and metrics replicated.
+
+        When a local teacher state is available the method also adds the
+        teacher-forward FLOPs (with loss accounting, no backward) to
+        ``self._extra_forward_flops_per_token`` so the trainer's
+        throughput math accounts for the per-step teacher pass.
+
+        Returns:
+            A :class:`TrainerConfigureFunctionOutput` with the compiled
+            step functions, the active mesh, and the streaming
+            checkpoint manager.
+        """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
 
@@ -274,11 +382,30 @@ class SparseDistillationTrainer(Trainer):
     ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
         """Generate completions and score with teacher to get top-k logprobs.
 
-        1. Student generates completions (on-policy).
-        2. Full sequences (prompt + completion) are assembled.
-        3. Teacher scores the sequences → top-k logprobs are extracted.
-        4. The batch returned to the step function contains the pre-computed
-           teacher top-k data alongside student inputs.
+        Steps:
+            1. Student generates completions (on-policy).
+            2. Full sequences (prompt + completion) are assembled.
+            3. Teacher scores the sequences and the top-k logprobs are
+               extracted (locally via ``teacher_state`` or via the
+               ``teacher_fn`` callable).
+            4. The batch returned to the step function contains the
+               pre-computed teacher top-k data alongside the student
+               inputs.
+
+        Args:
+            state (EasyDeLState): Current student state used as the
+                generator.
+            batch (dict[str, tp.Any]): Raw input batch carrying prompt
+                token ids and attention mask.
+            is_train (bool): Whether this preprocessing runs for
+                training (currently behavior-equivalent for eval).
+
+        Returns:
+            tuple[dict[str, tp.Any], dict[str, float | int | str]]: A
+            pair of (training_batch, auxiliary_metrics). The training
+            batch contains ``input_ids``, ``attention_mask``,
+            ``completion_mask``, ``teacher_top_k_indices``, and
+            ``teacher_top_k_logprobs``.
         """
         batch = self._purify_batch(batch)
 

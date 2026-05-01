@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Pixtral vision encoder implementation for EasyDeL.
+
+This module implements the Pixtral vision tower used by Mistral's
+Pixtral multimodal models. The encoder converts images of (variable
+within a maximum) shape into a sequence of patch embeddings and
+processes them with a standard transformer using 2-D rotary position
+embeddings to encode patch row/column structure.
+
+Components include the patch embedding (Conv2D), 2-D RoPE generation,
+attention/MLP transformer blocks, and the top-level
+:class:`PixtralVisionModel` exposing :meth:`forward` for downstream
+multimodal models.
+"""
 
 import functools
 
@@ -122,7 +135,20 @@ def compute_frequencies(dim: int, max_patches_per_side: int, theta: float = 1000
 
 # Adapted from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
+    """Rotate the second half of the trailing dim by negation.
+
+    Standard RoPE building block: given ``x = [a, b]`` along the last
+    axis with equal halves, returns ``[-b, a]``. The pairwise rotation
+    ``x * cos + rotate_half(x) * sin`` then realises a 2-D rotation per
+    pair of channels.
+
+    Args:
+        x: Tensor with an even-sized trailing dimension.
+
+    Returns:
+        Tensor of identical shape with halves swapped and the new lower
+        half negated.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate((-x2, x1), axis=-1)
@@ -619,6 +645,12 @@ class PixtralTransformer(EasyDeLLayerStackMixin, spx.Module):
         hidden_states = inputs_embeds
 
         def _layer_loop(block, carry):
+            """Apply a single vision-encoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden states
+            / attention weights, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, _idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -793,17 +825,41 @@ class PixtralVisionModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """Returns the encoder (this vision model acts as the encoder)."""
+        """Return ``self`` — Pixtral's vision tower is encoder-only.
+
+        Returns:
+            spx.Module: ``self``. Used by encoder/decoder protocol
+            consumers that expect a separate encoder accessor.
+        """
         return self
 
     def get_decoder(self):
-        """Returns the decoder (not applicable for encoder-only vision model)."""
+        """Pixtral has no decoder; visual features are consumed by the LM.
+
+        Raises:
+            NotImplementedError: Always — the vision tower outputs
+                continuous patch embeddings that downstream language
+                models attend over; there is no decoder phase here.
+        """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable for vision encoder)."""
+        """Vision tower has no LM head.
+
+        Raises:
+            NotImplementedError: Always — token-level logits are
+                produced by the surrounding vision-language wrapper.
+        """
         raise NotImplementedError("This vision model does not have a language model head.")
 
     def get_embedding(self):
-        """Returns the patch embedding layer."""
+        """Return the front-end patch convolution.
+
+        Pixtral uses a strided ``Conv2D`` (``patch_conv``) to embed
+        image patches into ``hidden_size``-dimensional vectors before
+        the transformer blocks.
+
+        Returns:
+            spx.Module: The patch ``Conv2D`` module.
+        """
         return self.patch_conv

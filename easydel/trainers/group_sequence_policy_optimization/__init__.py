@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Group Sequence Policy Optimization (GSPO) trainer entry point.
+
+GSPO -- introduced by Qwen (2025) -- swaps GRPO's per-token importance
+ratio for a *sequence-level* importance ratio (geometric average of
+per-token ratios), producing a more stable PPO-style clip-objective on
+long generations.  This package re-exports :class:`GSPOConfig` and
+:class:`GSPOTrainer`; the algorithm reuses GRPO's loss kernels.
+"""
 
 from .gspo_config import GSPOConfig
 from .gspo_trainer import GSPOTrainer

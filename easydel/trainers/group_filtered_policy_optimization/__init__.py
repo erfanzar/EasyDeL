@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Group Filtered Policy Optimization (GFPO) trainer entry point.
+
+GFPO -- introduced by Microsoft Research (2025) -- selects an inner
+"keep" subset of rollouts within each prompt group based on
+length/diversity/reward signals before computing GRPO-style relative
+advantages.  This curbs run-away response length while preserving the
+preference-driven gradient signal.  This package re-exports
+:class:`GFPOConfig` and :class:`GFPOTrainer`.
+"""
 
 from .gfpo_config import GFPOConfig
 from .gfpo_trainer import GFPOTrainer

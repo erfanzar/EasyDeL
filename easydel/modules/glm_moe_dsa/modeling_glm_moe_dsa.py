@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of GLM-MoE-DSA.
+
+GLM-MoE-DSA combines Multi-head Latent Attention (MLA), a Dynamic Sparse
+Attention (DSA) indexer that selects top-k key tokens per query, and a
+hybrid dense/grouped-MoE FFN schedule. It is targeted at extremely long
+contexts where full attention becomes the bottleneck.
+
+Architectural traits:
+    - Multi-head Latent Attention with low-rank KV compression and
+      compressed KV cache views for inference.
+    - DSA indexer producing per-query top-k key indices used to mask the
+      attention computation to a sparse subset.
+    - First ``first_k_dense_replace`` layers are dense; remaining layers
+      use grouped MoE with shared and routed experts.
+    - Pre-norm RMSNorm decoder layers with partial RoPE.
+
+Exports:
+    - :class:`GlmMoeDsaModel`: Backbone returning hidden states.
+    - :class:`GlmMoeDsaForCausalLM`: Decoder LM with optional tied LM head.
+"""
+
 import functools
 import typing
 from functools import partial
@@ -503,19 +524,40 @@ class GlmMoeDsaMoE(BaseMoeModule):
 
 
 class GlmMoeDsaIndexer(spx.Module):
-    """Dynamic Sparse Attention (DSA) indexer for GLM-MoE-DSA.
+    """Lightweight per-query top-k key selector that drives Dynamic Sparse Attention.
 
-    Selects the top-k most relevant key positions for each query using a
-    lightweight scoring mechanism, enabling sub-quadratic attention during
-    both prefill and decode. An optional key cache stores projected keys
-    across autoregressive steps.
+    DSA splits the attention computation into two phases. First this indexer,
+    a tiny attention-flavoured network, scores every (query, key) pair using
+    its own ``index_n_heads``/``index_head_dim`` projections (much smaller than
+    the main attention) and selects the ``index_topk`` highest-scoring keys
+    per query. The main attention then evaluates softmax(Q · K^T) only over
+    those selected keys, turning the inner attention from O(N^2) to
+    O(N · index_topk).
 
-    Args:
-        config: Model configuration.
-        dtype: Computation dtype.
-        param_dtype: Parameter storage dtype.
-        precision: JAX matmul precision.
-        rngs: PRNG key container.
+    Architecture details:
+
+    - **Q projection** ``wq_b`` consumes the *low-rank query residual*
+      ``q_resid`` produced upstream by the MLA query LoRA, or falls back to
+      the raw hidden state when ``q_lora_rank`` is disabled.
+    - **K projection** ``wk`` projects the full hidden state into a single
+      shared key per token (no per-head split — the indexer is a *cheap*
+      bidirectional matcher), followed by a layernorm ``k_norm`` to stabilise
+      the score scale across positions.
+    - **Per-head weights** ``kernels_proj`` outputs a learned weight per
+      query-head per token (scaled by ``1 / sqrt(index_n_heads)``) so the
+      indexer can softly upweight or downweight individual indexer heads in
+      the final score reduction. This is computed in fp32 to keep the
+      relative head balance well-defined.
+    - **RoPE** is shared with the main attention via ``frequencies``; the
+      ``indexer_rope_interleave`` flag selects between half-rotation and
+      interleaved layouts.
+    - **KV cache** for autoregressive decoding is stored on the indexer
+      itself (``cached_keys``); the indexer signals ``reset_cache`` whenever
+      it sees a multi-token sequence (prefill).
+
+    The actual top-k scoring and gather are delegated to
+    :class:`GlmMoeDsaIndexerOp` (a kernel-fused op) so the entire indexer is
+    one fused launch on TPU/GPU.
     """
 
     reform_param: typing.ClassVar = {
@@ -630,22 +672,39 @@ class GlmMoeDsaIndexer(spx.Module):
 
 
 class GlmMoeDsaAttention(UnifiedAttention):
-    """Multi-head Latent Attention (MLA) for GLM-MoE-DSA.
+    """Multi-head Latent Attention with DSA-driven sparse key selection.
 
-    Uses low-rank KV compression (``kv_lora_rank``) to reduce the KV cache
-    footprint and optional query LoRA decomposition (``q_lora_rank``) for
-    parameter efficiency.  Query and key projections are split into
-    non-RoPE (``qk_nope_head_dim``) and RoPE (``qk_rope_head_dim``) subspaces.
-    A :class:`GlmMoeDsaIndexer` is applied before the main attention kernel
-    to restrict each query to attending only to the top-k key positions.
+    Combines two orthogonal savings on top of standard causal attention:
 
-    Args:
-        config: Model configuration.
-        dtype: Computation dtype.
-        param_dtype: Parameter storage dtype.
-        precision: JAX matmul precision.
-        rngs: PRNG key container.
-        layer_idx: Index of this layer in the decoder stack.
+    **MLA (Multi-head Latent Attention).** Both query and key/value
+    projections are factored through low-rank bottlenecks:
+
+    - Queries: ``hidden_size -> q_lora_rank -> num_heads * q_head_dim``
+      (skipped when ``q_lora_rank`` is None / 0).
+    - Keys/Values: ``hidden_size -> kv_lora_rank -> num_kv_heads * v_head_dim``
+      with the **compressed** ``kv_lora_rank``-dim representation being what
+      is actually stored in the KV cache. The full keys/values are
+      reconstructed at attention time, which is much cheaper than caching
+      the expanded ``num_kv_heads * v_head_dim`` for every position.
+
+    **Split-RoPE head**. Each query/key head is partitioned into a
+    *non-rotated* slice of width ``qk_nope_head_dim`` (carries
+    content-based matching) and a *rotated* slice of width
+    ``qk_rope_head_dim`` (carries position information). RoPE is applied
+    only to the second slice; the two are concatenated before the dot
+    product. Values use a separate ``v_head_dim`` because they don't need
+    the rotated component.
+
+    **DSA top-k gating** layered on top via :class:`GlmMoeDsaIndexer`: for
+    each query, the indexer selects ``index_topk`` keys from the cache, and
+    the actual attention softmax runs only over that sparse set rather than
+    the full sequence. This keeps decode cost near constant in context
+    length once the cache is warm.
+
+    The ``projection_mapping`` class variable rewrites the public attribute
+    names used in ``UnifiedAttention``'s parent factory into HF-checkpoint-
+    compatible names (``q_a_proj``, ``q_b_proj``, ``kv_a_proj_with_mqa``,
+    etc.) so DeepSeek-flavoured weight files load cleanly.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {

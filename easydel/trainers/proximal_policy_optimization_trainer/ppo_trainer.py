@@ -212,6 +212,18 @@ class PPOTrainer(Trainer):
                     sharding = reward_func.shardings
 
                     def apply_fn(gd, gs, gt, batch):
+                        """Sharded reward-model forward used to score completions.
+
+                        Args:
+                            gd: Reward model graph definition.
+                            gs: Reward model graph state (parameters).
+                            gt: Reward model auxiliary state.
+                            batch: Tokenized batch passed to the reward model.
+
+                        Returns:
+                            The reward model's full output (typically with a
+                            ``logits`` field used as the scalar score).
+                        """
                         gt = jax.tree_util.tree_map(
                             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                             gt,
@@ -273,10 +285,23 @@ class PPOTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
-        """Get the preprocessing transform for ShardedDataSource.
+        """Build the lazy prompt-only preprocessing transform for the rollout source.
+
+        PPO drives rollouts from prompt-only data: the dataset is
+        expected to provide a chat-templatable conversation (or a raw
+        prompt string when ``skip_apply_chat_template`` is true), and
+        completions are sampled inside :meth:`_preprocess_batch_input`.
+        This hook returns the GRPO-style transform that applies the
+        chat template (with any tool schemas in ``arguments.tools``)
+        and tokenises the prompt to ``arguments.max_prompt_length``.
+        The transform is lazy so it runs inside the data loader rather
+        than via an eager ``Dataset.map``.
 
         Returns:
-            GRPOPreprocessTransform if dataset needs tokenization, None otherwise.
+            A :class:`GRPOPreprocessTransform` configured against the
+            current tokenizer, prompt budget, tool schema, and chat-
+            template flag, or ``None`` when :meth:`_is_pretokenized`
+            indicates the source is already tokenised.
         """
         if self._is_pretokenized():
             return None
@@ -288,10 +313,19 @@ class PPOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if the dataset already has tokenized fields.
+        """Detect whether the bound training source already exposes tokenised prompts.
+
+        Peeks at the first row of the first shard of
+        ``self._train_source`` and reports whether it carries an
+        ``"input_ids"`` field. When present the trainer skips the
+        prompt preprocessing transform and feeds rows directly to the
+        prompt collator. Defensive against missing sources, empty shard
+        lists and shards that yield no rows.
 
         Returns:
-            True if dataset contains 'input_ids', False otherwise.
+            ``True`` when the first sample of the first shard contains
+            ``"input_ids"``; ``False`` if the source is unset, empty,
+            or the field is absent.
         """
         if self._train_source is None:
             return False
@@ -306,14 +340,24 @@ class PPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create a data collator for Grain data loading.
+        """Construct the Grain collator that left-pads prompt-only PPO batches.
+
+        PPO operates on prompt-only batches; rollouts (and therefore
+        completions) are produced inside :meth:`_preprocess_batch_input`.
+        The collator pads tokenised prompts to
+        ``arguments.max_prompt_length`` using ``self.padding_value`` so
+        generation always sees a contiguous, right-aligned prefix.
 
         Args:
-            max_sequence_length: Maximum sequence length (unused, kept for API).
-            truncation_mode: How to truncate sequences (unused, kept for API).
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored -- the prompt budget is taken
+                from :class:`PPOConfig`.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; the GRPO collator left-pads instead of
+                truncating.
 
         Returns:
-            GRPODataCollatorGrain instance for batching prompt data.
+            A freshly built :class:`GRPODataCollatorGrain`.
         """
         from ..utils import GRPODataCollatorGrain
 
@@ -327,14 +371,21 @@ class PPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create a data collator for TFDS data loading.
+        """Construct the TFDS collator that left-pads prompt-only PPO batches.
+
+        TFDS analogue of :meth:`create_grain_collect_function`. Returns
+        the :class:`GRPODataCollatorTFDS` configured with PPO's prompt
+        budget and pad token; completions are produced on-the-fly inside
+        :meth:`_preprocess_batch_input`.
 
         Args:
-            max_sequence_length: Maximum sequence length (unused, kept for API).
-            truncation_mode: How to truncate sequences (unused, kept for API).
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; ignored.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; ignored.
 
         Returns:
-            GRPODataCollatorTFDS instance for batching prompt data.
+            A freshly built :class:`GRPODataCollatorTFDS`.
         """
         from ..utils import GRPODataCollatorTFDS
 
@@ -419,6 +470,24 @@ class PPOTrainer(Trainer):
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+            """Compute frozen reference-model per-token log probabilities.
+
+            Args:
+                graphtree: Reference model graph state (parameters).
+                graphother: Reference model auxiliary state (non-parameters).
+                ids (jax.Array): Full ``[batch, seq]`` token ids
+                    (prompt + completion).
+                mask (jax.Array): Attention mask of shape ``[batch, seq]``.
+                graphdef: Reference model graph definition for binding.
+
+            Returns:
+                jax.Array: Per-token log probabilities for the completion
+                portion only, shape ``[batch, completion_len]``.
+
+            Raises:
+                ValueError: If headless mode is active but the reference
+                    model does not return ``last_hidden_state``.
+            """
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
@@ -481,6 +550,23 @@ class PPOTrainer(Trainer):
         )
 
         def _compute_rollout_logps_values(graphtree, graphother, ids, mask, graphdef):
+            """Compute policy log-probabilities and value-head predictions for a rollout.
+
+            Args:
+                graphtree: Policy graph state (parameters).
+                graphother: Policy auxiliary state (non-parameters).
+                ids (jax.Array): Full ``[batch, seq]`` token ids.
+                mask (jax.Array): Attention mask of shape ``[batch, seq]``.
+                graphdef: Policy graph definition for binding.
+
+            Returns:
+                tuple[jax.Array, jax.Array]: ``(token_log_probs, values)`` for
+                the completion portion, both shaped ``[batch, completion_len]``.
+
+            Raises:
+                ValueError: If hidden states are not available from the
+                    forward pass.
+            """
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
@@ -565,15 +651,30 @@ class PPOTrainer(Trainer):
         )
 
     def _masked_whiten(self, x: jax.Array, mask: jax.Array, *, shift_mean: bool) -> jax.Array:
-        """Normalize array values with optional mean shifting.
+        """Whiten ``x`` over the masked elements (variance scaling, optional centering).
+
+        Computes the masked first and second moments under ``mask``,
+        then either centres-and-scales (``shift_mean=True``, used for
+        advantages where a zero-mean target is desired) or scales only
+        (``shift_mean=False``, used for rewards when
+        :class:`PPOConfig.whiten_rewards` is enabled and absolute reward
+        magnitudes need to be preserved). A small constant ``1e-8`` is
+        added before the square root to keep gradients well-defined when
+        the masked variance collapses to zero.
 
         Args:
-            x: Input array to normalize.
-            mask: Binary mask for valid elements.
-            shift_mean: Whether to subtract the mean (True for advantages).
+            x: Tensor of shape ``(batch, completion_len)`` to whiten.
+            mask: Same-shape binary mask selecting completion positions
+                that participate in the moment estimation.
+            shift_mean: If ``True`` subtract the masked mean before
+                scaling; if ``False`` only scale by the standard
+                deviation.
 
         Returns:
-            Normalized array with unit variance (and zero mean if shift_mean).
+            ``x`` whitened to unit variance over the masked positions
+            (and zero mean when ``shift_mean`` is set). The masking is
+            *not* re-applied to the output -- callers multiply by
+            ``mask`` again to zero out padded positions.
         """
         mask = mask.astype(x.dtype)
         denom = jnp.maximum(jnp.sum(mask), 1.0)
@@ -590,20 +691,36 @@ class PPOTrainer(Trainer):
         values: jax.Array,
         mask: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        """Compute Generalized Advantage Estimation (GAE).
+        """Estimate per-token advantages and returns via Generalised Advantage Estimation.
 
-        Computes advantages and returns using the GAE algorithm, which provides
-        a balance between bias and variance in advantage estimation.
+        GAE estimates the advantage at each completion position from a
+        backward recursion on the temporal-difference residuals
+
+        ``delta_t = r_t + gamma * V_{t+1} * mask_{t+1} - V_t``
+
+        ``A_t = delta_t + gamma * lambda * A_{t+1} * mask_{t+1}``
+
+        where ``gamma`` is :class:`PPOConfig.gamma` and ``lambda`` is
+        :class:`PPOConfig.lam`. The recursion is implemented with
+        :func:`jax.lax.scan` over the time axis reversed in place; the
+        ``mask`` and shifted ``mask_next`` zero out contributions past
+        the end of each completion. Returns are reconstructed as
+        ``R_t = A_t + V_t`` so the value-function loss in
+        :func:`ppo_step` regresses against a consistent target.
 
         Args:
-            rewards: Per-token rewards including KL penalty and final score.
-            values: Value head predictions for each position.
-            mask: Binary mask for valid completion tokens.
+            rewards: ``(batch, completion_len)`` per-token rewards
+                already containing the score-on-final-token plus the
+                token-wise KL penalty.
+            values: ``(batch, completion_len)`` rollout-time value
+                predictions ``V_t`` aligned with ``rewards``.
+            mask: Same-shape binary mask selecting valid completion
+                positions; positions past EOS are zero.
 
         Returns:
-            Tuple of (advantages, returns):
-                - advantages: GAE-computed advantages for policy gradient.
-                - returns: Target values for value function training.
+            ``(advantages, returns)`` -- both ``(batch, completion_len)``.
+            ``advantages`` carries ``A_t`` (zeroed outside the mask) and
+            ``returns`` carries ``A_t + V_t``.
         """
         rewards = rewards.astype(jnp.float32)
         values = values.astype(jnp.float32)
@@ -617,6 +734,16 @@ class PPOTrainer(Trainer):
         lam = float(self.arguments.lam)
 
         def scan_fn(adv_next, inputs):
+            """Single backward GAE recursion step.
+
+            Args:
+                adv_next: Advantage at the next timestep ``A_{t+1}``.
+                inputs: Tuple ``(r_t, v_t, v_{t+1}, m_t, m_{t+1})`` for the
+                    current step.
+
+            Returns:
+                tuple: ``(A_t, A_t)`` -- carry and stacked output for ``scan``.
+            """
             r_t, v_t, v_next_t, m_t, m_next_t = inputs
             delta = r_t + gamma * v_next_t * m_next_t - v_t
             adv_t = delta + gamma * lam * adv_next * m_next_t

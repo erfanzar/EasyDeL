@@ -31,16 +31,38 @@ from typing import Any, Literal
 
 @dataclass
 class TokenizerConfig:
-    """Configuration for a tokenizer.
+    """Resolved settings for instantiating and calling a HuggingFace tokenizer.
+
+    Captures both the identity of the tokenizer (``name_or_path``) and the
+    keyword arguments that should be forwarded to ``__call__`` when tokenizing
+    text. Built either directly by the user or constructed lazily by
+    :meth:`DatasetConfig.get_tokenizer_config` from a bare string. Consumed by
+    :class:`~easydel.data.transforms.tokenize.TokenizerManager` and the
+    pretokenization helpers in :mod:`easydel.data.execution`.
 
     Attributes:
-        name_or_path: HuggingFace tokenizer name or local path.
-        max_length: Maximum sequence length for tokenization.
-        truncation: Whether to truncate sequences exceeding max_length.
-        padding: Padding strategy - "max_length", "longest", or False.
-        add_special_tokens: Whether to add BOS/EOS tokens.
-        return_attention_mask: Whether to return attention masks.
-        trust_remote_code: Whether to trust remote code for tokenizer.
+        name_or_path (str): Identifier accepted by
+            ``AutoTokenizer.from_pretrained`` — either a HuggingFace Hub repo
+            id (e.g. ``"meta-llama/Llama-2-7b"``) or a local directory
+            containing tokenizer files.
+        max_length (int): Upper bound on tokenized sequence length passed
+            through to the tokenizer call. Sequences longer than this are
+            truncated when ``truncation`` is ``True``.
+        truncation (bool): Forwarded as the ``truncation`` flag to the
+            tokenizer; when ``True`` over-length sequences are clipped to
+            ``max_length`` rather than raising.
+        padding (bool | Literal["max_length", "longest", "do_not_pad"]):
+            Padding strategy. ``"max_length"`` pads to ``max_length``,
+            ``"longest"`` pads each batch to the longest member, and
+            ``"do_not_pad"``/``False`` disables padding entirely.
+        add_special_tokens (bool): Whether the tokenizer should prepend/append
+            BOS/EOS or other model-specific special tokens.
+        return_attention_mask (bool): Whether tokenizer output should include
+            ``attention_mask``. Disable when downstream code does not consume
+            it to save memory in cached splits.
+        trust_remote_code (bool): Whether to allow custom Python code from the
+            tokenizer's repository to execute on load. Required for tokenizers
+            shipped with novel architectures.
     """
 
     name_or_path: str
@@ -52,11 +74,19 @@ class TokenizerConfig:
     trust_remote_code: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert tokenizer configuration to a dictionary of keyword arguments.
+        """Serialise the call-side knobs into a tokenizer ``__call__`` kwargs dict.
+
+        Note that :attr:`name_or_path` and :attr:`trust_remote_code` are
+        **not** part of the returned dict because those affect tokenizer
+        *construction*, not invocation. The dict produced here is meant
+        to be splatted into a tokenizer call directly:
+
+            ``tokenizer(text, **cfg.to_dict())``
 
         Returns:
-            Dictionary containing tokenization parameters suitable for
-            passing to a HuggingFace tokenizer call.
+            dict[str, Any]: Mapping of the call-time keyword arguments
+            (``max_length``, ``truncation``, ``padding``,
+            ``add_special_tokens``, ``return_attention_mask``).
         """
         return {
             "max_length": self.max_length,
@@ -69,29 +99,65 @@ class TokenizerConfig:
 
 @dataclass
 class DatasetConfig:
-    """Configuration for a single dataset in the pipeline.
+    """Per-dataset declaration for the typed :class:`PipelineConfig` API.
 
-    Supports per-dataset tokenization, caching, and save paths.
+    Each :class:`DatasetConfig` describes one logical dataset that should be
+    consumed by a :class:`~easydel.data.execution.pipeline.Pipeline` —
+    where its rows live, how to read them, how to tokenize them, where to
+    cache or save the processed outputs, and how to map the raw schema onto
+    the canonical ``content_field`` text used downstream. A list of these is
+    passed to :class:`PipelineConfig.datasets`. Per-dataset overrides are
+    resolved against stage-level and global defaults by
+    :func:`merge_tokenizer_config`.
 
     Attributes:
-        data_files: Path(s) to data files (string, list, or glob pattern). Required.
-        name: Unique identifier for this dataset (auto-generated if not provided).
-        type: Dataset type - json, parquet, csv, arrow, huggingface, txt.
-        split: Dataset split to use.
-        num_rows: Optional limit on number of rows to load.
-        dataset_split_name: Split name for HuggingFace datasets.
-        tokenizer: Tokenizer name/path or full TokenizerConfig.
-        tokenizer_kwargs: Additional kwargs for tokenizer.
-        cache_path: Path for caching this dataset's processed data.
-        cache_enabled: Whether caching is enabled for this dataset.
-        save_path: Output path for saving processed dataset.
-        save_format: Output format - parquet, arrow, jsonl.
-        content_field: Field name containing text content.
-        additional_fields: Additional fields to preserve.
-        format_callback: Function to transform examples.
-        format_fields: Mapping for renaming fields {'old': 'new'}.
-        shard_column: Column to use for sharding.
-        num_shards: Number of shards to create.
+        data_files (str | os.PathLike | list[str | os.PathLike]): Source for
+            the rows. May be a single path, a glob pattern (expanded by
+            :func:`expand_data_files`), an explicit list of paths, or a
+            ``hf://`` style identifier. Required.
+        name (str | None): Unique label for the dataset; surfaces in mixing
+            weights, cache keys, and progress bars. When ``None``, the
+            owning :class:`PipelineConfig` assigns ``f"dataset_{i}"`` in
+            ``__post_init__``.
+        type (Literal[...] | None): Forces a particular reader (``"json"``,
+            ``"jsonl"``, ``"parquet"``, ``"csv"``, ``"arrow"``,
+            ``"huggingface"``/``"hf"``, ``"txt"``). When ``None`` the type
+            is inferred from the file extension.
+        split (str): Split name passed to dataset readers (e.g. HuggingFace
+            ``load_dataset``); defaults to ``"train"``.
+        num_rows (int | None): Optional upper bound on rows yielded; used to
+            cap large datasets during smoke tests or fixed-budget evals.
+        dataset_split_name (str | None): Alternate split label for
+            HuggingFace datasets that follow non-standard naming.
+        tokenizer (str | TokenizerConfig | None): Per-dataset tokenizer
+            override. A bare string is wrapped into a default
+            :class:`TokenizerConfig` by :meth:`get_tokenizer_config`.
+        tokenizer_kwargs (dict[str, Any] | None): Extra keyword arguments
+            merged into the tokenizer call. Useful for model-specific flags
+            (e.g. ``add_generation_prompt``).
+        cache_path (str | None): Filesystem location for the per-dataset
+            cache directory; ``None`` falls back to the stage cache root.
+        cache_enabled (bool): Master switch that disables both reading and
+            writing the per-dataset cache when ``False``.
+        save_path (str | None): Output directory for the persisted version
+            of the post-processed dataset. ``None`` skips saving.
+        save_format (Literal["parquet", "arrow", "jsonl"] | None): Output
+            container; ``None`` inherits from :class:`SaveStageConfig`.
+        content_field (str): Name of the text column in the source schema;
+            renamed/extracted to the canonical ``"text"`` field used by the
+            tokenizer.
+        additional_fields (list[str] | None): Extra source columns to keep
+            alongside the content field (e.g. ``"label"``).
+        format_callback (Callable[[dict[str, Any]], dict[str, Any]] | None):
+            Per-row transform applied immediately after reading; receives the
+            raw row dict and returns a (possibly new) row dict.
+        format_fields (dict[str, str] | None): Rename map applied to row
+            keys (``{old_name: new_name}``); typically used to align source
+            schemas to ``content_field``.
+        shard_column (str | None): Column name to hash on when emitting a
+            sharded version of the dataset; ``None`` shards round-robin.
+        num_shards (int | None): Optional override for the number of output
+            shards; ``None`` defers to :class:`SaveStageConfig.num_shards`.
     """
 
     # Source (required)
@@ -129,19 +195,32 @@ class DatasetConfig:
     num_shards: int | None = None
 
     def __post_init__(self):
-        """Validate configuration after initialization."""
+        """Validate the dataset declaration after dataclass initialization.
+
+        Currently enforces that ``data_files`` is non-empty — a missing
+        source is unrecoverable downstream so we fail fast here rather than
+        in the source stage.
+
+        Raises:
+            ValueError: If ``data_files`` is falsy (empty string, empty list,
+                or ``None``).
+        """
         if not self.data_files:
             raise ValueError("data_files is required")
 
     def get_tokenizer_config(self) -> TokenizerConfig | None:
-        """Get tokenizer configuration, normalizing string to TokenizerConfig.
+        """Materialise :attr:`tokenizer` as a fully populated :class:`TokenizerConfig`.
 
-        If the tokenizer attribute is a plain string, wraps it into a
-        TokenizerConfig with default settings. Returns None if no tokenizer
-        is configured.
+        Accepts the union shape of :attr:`tokenizer` and normalises it:
+        string inputs are wrapped into a default-configured
+        :class:`TokenizerConfig` (length 2048, no padding, BOS/EOS
+        enabled), already-typed inputs are returned as-is, and ``None``
+        propagates as ``None`` so callers can distinguish "no tokenizer"
+        from "default tokenizer".
 
         Returns:
-            TokenizerConfig instance, or None if no tokenizer is set.
+            TokenizerConfig | None: The resolved tokenizer settings, or
+            ``None`` when this dataset opts out of tokenization.
         """
         if self.tokenizer is None:
             return None
@@ -152,13 +231,27 @@ class DatasetConfig:
 
 @dataclass
 class SourceStageConfig:
-    """Configuration for the source loading stage.
+    """Behavioural knobs for the source-reading stage of the pipeline.
+
+    Controls how raw rows are pulled from disk or cloud storage by the
+    :class:`~easydel.data.transforms.source.MixStage`/source readers. These
+    fields are global to the stage; per-dataset overrides live on
+    :class:`DatasetConfig`.
 
     Attributes:
-        streaming: Whether to use streaming mode.
-        cloud_max_retries: Max retries for cloud storage operations.
-        cloud_retry_delay: Initial delay between retries.
-        dask_storage_options: Storage options for dask/fsspec.
+        streaming (bool): When ``True``, datasets are read row-by-row via
+            iterator-backed readers (memory-bounded). When ``False`` the
+            entire split is materialised in RAM before downstream stages
+            run.
+        cloud_max_retries (int): Number of retry attempts for transient
+            failures on cloud-backed reads (``gs://``, ``s3://``, ``hf://``)
+            before propagating the error.
+        cloud_retry_delay (float): Initial delay in seconds between cloud
+            retries; subsequent retries use exponential backoff with this as
+            the base.
+        dask_storage_options (dict[str, Any] | None): Forwarded verbatim to
+            ``fsspec``/``dask`` readers as ``storage_options``; carries
+            credentials, project ids, request timeouts, etc.
     """
 
     streaming: bool = True
@@ -169,15 +262,28 @@ class SourceStageConfig:
 
 @dataclass
 class TokenizeStageConfig:
-    """Configuration for the tokenization stage.
+    """Defaults for the tokenization stage shared across datasets.
+
+    Per-dataset values on :class:`DatasetConfig` override the fields here
+    via :func:`merge_tokenizer_config`. Consumed by
+    :class:`~easydel.data.transforms.tokenize.TokenizeStage` and the
+    pretokenization helpers in :mod:`easydel.data.execution`.
 
     Attributes:
-        default_tokenizer: Fallback tokenizer if not specified per-dataset.
-        max_length: Default max sequence length.
-        batch_size: Batch size for batched tokenization.
-        num_workers: Number of workers for parallel tokenization.
-        cache_tokenized: Whether to cache tokenized results.
-        remove_columns: Columns to remove after tokenization.
+        default_tokenizer (str | None): Tokenizer name/path used when a
+            dataset does not declare its own ``tokenizer``. ``None`` causes
+            datasets without tokenizers to be passed through unchanged.
+        max_length (int): Default truncation length applied to tokenizer
+            output when the per-dataset config omits it.
+        batch_size (int): Number of rows passed to the tokenizer per batched
+            call; tuned to amortize Python/Rust crossings.
+        num_workers (int): Number of background threads/processes used by
+            map-style tokenization. Has no effect in pure-streaming mode.
+        cache_tokenized (bool): Whether tokenized outputs are persisted to
+            the cache layer for reuse on subsequent runs.
+        remove_columns (list[str] | None): Source columns dropped after
+            tokenization; ``None`` keeps everything alongside the new
+            ``input_ids`` columns.
     """
 
     default_tokenizer: str | None = None
@@ -190,16 +296,30 @@ class TokenizeStageConfig:
 
 @dataclass
 class CacheStageConfig:
-    """Configuration for the multi-layer caching stage (TreeCache-style).
+    """Configuration of the multi-tier (memory + disk) dataset cache.
+
+    Wires up the TreeCache-style multi-layer cache used by
+    :class:`~easydel.data.execution.cache.TreeCacheManager` to short-circuit
+    tokenization and other expensive transforms across runs.
 
     Attributes:
-        enabled: Whether caching is enabled.
-        cache_type: Type of cache - memory, disk, or hierarchical.
-        cache_dir: Base directory for disk cache.
-        memory_cache_size: Max items in memory cache (LRU).
-        disk_cache_expiry: Disk cache expiry in seconds.
-        compression: Compression algorithm - none, gzip, lz4, zstd.
-        hash_fn: Hash function for cache keys - content, path, combined.
+        enabled (bool): Master switch — when ``False`` the cache stage is
+            bypassed regardless of any other field below.
+        cache_type (Literal["memory", "disk", "hierarchical"]): Which layer
+            stack to instantiate. ``"hierarchical"`` mounts both memory and
+            disk caches with promotion between them.
+        cache_dir (str): Filesystem root used for disk-backed entries; created
+            on first write if it does not exist.
+        memory_cache_size (int): Maximum number of entries held in the LRU
+            memory layer before eviction.
+        disk_cache_expiry (int): Time-to-live in seconds for disk-cached
+            entries; older entries are treated as misses and replaced.
+        compression (Literal["none", "gzip", "lz4", "zstd"]): Compression
+            codec applied when writing payloads to the disk layer.
+        hash_fn (Literal["content", "path", "combined"]): Strategy for
+            computing cache keys — ``"content"`` hashes payloads,
+            ``"path"`` keys by source path/version, ``"combined"`` mixes
+            both for stronger invalidation.
     """
 
     enabled: bool = True
@@ -213,21 +333,37 @@ class CacheStageConfig:
 
 @dataclass
 class WeightSchedulePoint:
-    """A single checkpoint in a dynamic weight schedule for dataset mixing.
+    """One ``(step, weights)`` knot in a curriculum-style mixing schedule.
 
-    Defines the target mixing weights at a specific training step. Multiple
-    points form a schedule that can be interpolated (step, linear, cosine).
+    Multiple :class:`WeightSchedulePoint` entries on
+    :attr:`MixStageConfig.weight_schedule` form a piecewise schedule
+    interpolated by :class:`~easydel.data.transforms.mixture.WeightScheduler`
+    (``step``, ``linear``, or ``cosine``) to produce the active mixing
+    weights at each training step. Use this to implement curriculum learning
+    (gradually shift from short to long contexts, or from one dataset family
+    to another).
 
     Attributes:
-        step: Training step at which these weights apply.
-        weights: Dictionary mapping dataset names to their weights (must sum to 1.0).
+        step (int): Training step (0-indexed) at which ``weights`` becomes
+            the target. Between knots the actual mixing weights are
+            interpolated from the surrounding pair according to
+            :attr:`MixStageConfig.weight_schedule_type`.
+        weights (dict[str, float]): Mapping from dataset ``name`` (must
+            match :attr:`DatasetConfig.name`) to its target sampling weight
+            at this knot. Must sum to ``1.0`` (validated in
+            ``__post_init__``).
     """
 
     step: int
     weights: dict[str, float]
 
     def __post_init__(self):
-        """Validate weights sum to 1."""
+        """Verify the weights at this knot form a valid probability vector.
+
+        Raises:
+            ValueError: If the values in ``weights`` do not sum to ``1.0``
+                within ``1e-6`` tolerance.
+        """
         total = sum(self.weights.values())
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"Weights must sum to 1.0, got {total}")
@@ -235,17 +371,34 @@ class WeightSchedulePoint:
 
 @dataclass
 class MixStageConfig:
-    """Configuration for the dataset mixing stage.
+    """Configuration of the dataset-mixing stage (static or scheduled).
 
-    Supports static weights and dynamic weight scheduling.
+    Drives :class:`~easydel.data.transforms.mixture.MixedShardedSource` and
+    related interleavers. Supports two modes: a static weight vector
+    (``weights``) used throughout training, and a curriculum-style
+    schedule (``weight_schedule``) that interpolates weights as a function
+    of step.
 
     Attributes:
-        weights: Static weights per dataset (must sum to 1).
-        weight_schedule: List of schedule points for dynamic scheduling.
-        weight_schedule_type: Interpolation type - step, linear, cosine.
-        block_size: Number of examples per mixing block.
-        stop_strategy: What to do when a dataset is exhausted.
-        seed: Random seed for deterministic mixing.
+        weights (dict[str, float] | None): Static per-dataset weights keyed
+            by :attr:`DatasetConfig.name`; must sum to ``1.0``. ``None``
+            either falls back to ``weight_schedule`` or to a uniform mix.
+        weight_schedule (list[WeightSchedulePoint] | None): Curriculum
+            knots ordered by step. When set, overrides ``weights``.
+        weight_schedule_type (Literal["step", "linear", "cosine"]):
+            Interpolation policy used to derive the active weights between
+            two knots.
+        block_size (int): Number of examples drawn as a contiguous block
+            from a single dataset before the mixer rerolls the next source;
+            larger blocks improve throughput at the cost of mixing
+            granularity.
+        stop_strategy (Literal["restart", "first_exhausted", "all_exhausted"]):
+            What the mixer does when a constituent dataset runs out —
+            recycle it (``"restart"``), terminate immediately
+            (``"first_exhausted"``), or wait until every dataset is
+            exhausted (``"all_exhausted"``).
+        seed (int | None): RNG seed for the mixer's per-block sampler;
+            making mixing deterministic across runs/processes when set.
     """
 
     weights: dict[str, float] | None = None
@@ -256,7 +409,12 @@ class MixStageConfig:
     seed: int | None = None
 
     def __post_init__(self):
-        """Validate weights if provided."""
+        """Verify ``weights`` (if provided) forms a valid probability vector.
+
+        Raises:
+            ValueError: If ``weights`` is set but its values do not sum to
+                ``1.0`` within ``1e-6`` tolerance.
+        """
         if self.weights is not None:
             total = sum(self.weights.values())
             if abs(total - 1.0) > 1e-6:
@@ -265,18 +423,39 @@ class MixStageConfig:
 
 @dataclass
 class PackStageConfig:
-    """Configuration for the token packing stage.
+    """Settings for the example-packing stage that builds fixed-length sequences.
+
+    Packing concatenates multiple short tokenized rows into a single fixed
+    ``seq_length`` window separated by EOS, drastically improving GPU/TPU
+    utilisation for variable-length data. Drives the packers in
+    :mod:`easydel.data.transforms.pack`.
 
     Attributes:
-        enabled: Whether packing is enabled.
-        seq_length: Target sequence length for packing.
-        eos_token_id: EOS token ID for separation.
-        pad_token_id: Padding token ID.
-        strategy: Packing strategy - greedy, pool, first_fit.
-        num_packers: Number of packers for pool strategy.
-        include_segment_ids: Include segment IDs for attention masking.
-        shuffle_packed: Whether to shuffle packed sequences.
-        shuffle_buffer_factor: Buffer size multiplier for shuffle.
+        enabled (bool): When ``False`` the pack stage is skipped and rows
+            flow through unchanged.
+        seq_length (int): Target window length in tokens. Each emitted
+            packed row contains exactly this many tokens (padded if the
+            packer cannot fill it perfectly).
+        eos_token_id (int): Token id used as the boundary between packed
+            examples; consumed by attention masking on the model side.
+        pad_token_id (int): Token id used to pad incomplete windows up to
+            ``seq_length``.
+        strategy (Literal["greedy", "pool", "first_fit"]): Packing
+            algorithm — ``"greedy"`` walks rows in order,
+            ``"first_fit"`` fits each row into the first window with
+            room, and ``"pool"`` runs ``num_packers`` greedy packers in
+            parallel and round-robins their output.
+        num_packers (int): Number of parallel packers used by the
+            ``"pool"`` strategy; ignored otherwise.
+        include_segment_ids (bool): When ``True`` the packed row carries a
+            ``segment_ids`` array used by the model to mask attention
+            across packed boundaries.
+        shuffle_packed (bool): Whether the post-pack stream is shuffled
+            again before being yielded; useful because consecutive packed
+            rows share many of the same source examples.
+        shuffle_buffer_factor (int): Multiplier on ``seq_length`` (or the
+            stream's natural batch) defining the shuffle buffer size; bigger
+            buffers improve mixing at the cost of memory.
     """
 
     enabled: bool = False
@@ -292,16 +471,33 @@ class PackStageConfig:
 
 @dataclass
 class LoadStageConfig:
-    """Configuration for the data loading stage.
+    """Runtime settings for the final batch-assembling load stage.
+
+    Drives :class:`~easydel.data.execution.loader.AsyncDataLoader` and
+    :class:`~easydel.data.execution.loader.PrefetchIterator` — turning the
+    transformed row stream into batches optionally pre-sharded onto JAX
+    devices.
 
     Attributes:
-        batch_size: Number of examples per batch.
-        prefetch_enabled: Whether to enable async prefetching.
-        prefetch_workers: Number of prefetch worker threads.
-        prefetch_buffer_size: Number of batches to prefetch.
-        shuffle_buffer_size: Buffer size for streaming shuffle.
-        drop_last: Whether to drop incomplete final batch.
-        prefetch_to_device: Pre-shard data during prefetch (JAX optimization).
+        batch_size (int): Global examples-per-batch; per-host batch sizes
+            are derived by the data-parallel sharding spec.
+        prefetch_enabled (bool): Whether to launch background prefetch
+            workers that overlap dataset I/O with the training step.
+        prefetch_workers (int): Number of background threads filling the
+            prefetch queue. Has no effect when ``prefetch_enabled`` is
+            ``False``.
+        prefetch_buffer_size (int): Number of fully-formed batches kept in
+            the prefetch queue at any time.
+        shuffle_buffer_size (int | None): Optional reservoir size used by
+            the streaming shuffle pass before batching; ``None`` disables
+            the shuffle.
+        drop_last (bool): When ``True``, an incomplete trailing batch is
+            discarded to keep batch shapes static (required for many
+            JIT-compiled training steps).
+        prefetch_to_device (bool): JAX-specific optimisation: when
+            ``True`` the prefetch worker reshapes and moves the batch onto
+            its target devices instead of leaving the host->device
+            transfer to the training thread.
     """
 
     batch_size: int = 8
@@ -315,20 +511,44 @@ class LoadStageConfig:
 
 @dataclass
 class SaveStageConfig:
-    """Configuration for the save stage.
+    """Settings for the optional persistence stage that writes processed data.
+
+    The save stage materialises a transformed dataset to disk (and
+    optionally HuggingFace Hub) so it can be reused without rerunning
+    expensive preprocessing. Consumed by
+    :class:`~easydel.data.execution.save.SaveStage` and the standalone
+    helpers in :mod:`easydel.data.execution.save`.
 
     Attributes:
-        enabled: Whether saving is enabled.
-        output_dir: Base output directory.
-        format: Default output format - parquet, arrow, jsonl.
-        num_shards: Number of shards to split output.
-        compression: Compression for output files.
-        max_shard_size: Maximum shard size (e.g., "500MB").
-        overwrite: Whether to overwrite existing files.
-        push_to_hub: Whether to push to HuggingFace Hub.
-        hub_repo_id: Hub repository ID.
-        hub_private: Whether Hub repo should be private.
-        hub_token: HuggingFace Hub token.
+        enabled (bool): Master switch — when ``False`` the save stage is
+            skipped and rows flow through unchanged.
+        output_dir (str): Base directory under which per-dataset
+            subdirectories of shards are written.
+        format (Literal["parquet", "arrow", "jsonl"]): Default container
+            format used when a dataset does not specify its own
+            ``save_format``.
+        num_shards (int | None): Number of output shards per dataset;
+            ``None`` lets the writer choose based on row count and
+            ``max_shard_size``.
+        compression (str | None): Codec passed through to the writer
+            (e.g. ``"snappy"``, ``"zstd"``, ``"gzip"``); ``None`` writes
+            uncompressed.
+        max_shard_size (str | int): Soft cap on shard size, either as a
+            human-readable string (``"500MB"``, ``"2GB"``) or a raw byte
+            count. Writers roll over once a shard reaches this size.
+        overwrite (bool): When ``True``, existing files at
+            ``output_dir`` are clobbered; otherwise the writer raises if
+            outputs already exist.
+        push_to_hub (bool): When ``True``, the saved dataset is uploaded
+            to the HuggingFace Hub repo identified by ``hub_repo_id``
+            after writing finishes.
+        hub_repo_id (str | None): Target Hub repository (e.g.
+            ``"org/my-dataset"``). Required when ``push_to_hub`` is
+            ``True``.
+        hub_private (bool): Marks the Hub repo as private when it is
+            created during the upload.
+        hub_token (str | None): Authentication token for the Hub upload;
+            ``None`` falls back to ``HF_TOKEN`` / cached credentials.
     """
 
     enabled: bool = False
@@ -346,14 +566,28 @@ class SaveStageConfig:
 
 @dataclass
 class RayConfig:
-    """Configuration for Ray distributed preprocessing.
+    """Settings for fanning preprocessing out across a Ray cluster.
+
+    When ``enabled``, the pipeline shards source files across
+    ``num_workers`` Ray actors that each apply the transform DSL in
+    parallel before merging their output streams. Used by helpers in
+    :mod:`easydel.data.distributed.ray_utils`.
 
     Attributes:
-        enabled: Whether to use Ray for distributed processing.
-        num_workers: Number of Ray workers.
-        resources_per_worker: Resources per worker (e.g., {"CPU": 1}).
-        use_gpu: Whether workers should use GPU.
-        object_store_memory: Object store memory limit.
+        enabled (bool): Master switch — when ``False`` the pipeline runs
+            single-process and the rest of the fields are ignored.
+        num_workers (int): Total number of Ray actors used for
+            preprocessing. Higher values trade scheduler overhead for
+            parallelism.
+        resources_per_worker (dict[str, float] | None): Resource request
+            per actor passed verbatim to Ray (e.g.
+            ``{"CPU": 2, "memory": 4 * 2**30}``).
+        use_gpu (bool): When ``True``, each Ray actor reserves a GPU
+            slot — only relevant for GPU-accelerated transforms (e.g.
+            vision feature extractors).
+        object_store_memory (int | None): Optional cap on the Ray
+            object-store size in bytes; ``None`` lets Ray choose its
+            default sizing.
     """
 
     enabled: bool = False
@@ -365,14 +599,26 @@ class RayConfig:
 
 @dataclass
 class ObservabilityConfig:
-    """Configuration for pipeline observability.
+    """Logging, metrics, and progress-display settings for the pipeline.
+
+    Determines how the pipeline reports its work to the user — which
+    progress widget to render, whether to emit per-stage metrics, and at
+    what log level/cadence. Read by the pipeline runner and individual
+    stages when constructing their loggers.
 
     Attributes:
-        progress_enabled: Whether to show progress bars.
-        progress_type: Type of progress display - tqdm, rich, json, none.
-        metrics_enabled: Whether to collect metrics.
-        log_level: Logging level - DEBUG, INFO, WARNING, ERROR.
-        log_interval: Steps between log messages.
+        progress_enabled (bool): When ``False``, all progress bars are
+            suppressed regardless of ``progress_type``.
+        progress_type (Literal["tqdm", "rich", "json", "none"]): Choice
+            of progress renderer — ``"tqdm"`` for terminals,
+            ``"rich"`` for richly formatted output, ``"json"`` for
+            machine-readable status events, and ``"none"`` to disable.
+        metrics_enabled (bool): When ``True`` the pipeline records
+            per-stage throughput and latency counters.
+        log_level (Literal["DEBUG", "INFO", "WARNING", "ERROR"]):
+            Minimum log level emitted by pipeline-internal loggers.
+        log_interval (int): Number of processed rows/steps between
+            periodic INFO log entries; smaller values yield chattier logs.
     """
 
     progress_enabled: bool = True
@@ -384,25 +630,41 @@ class ObservabilityConfig:
 
 @dataclass
 class PipelineConfig:
-    """Main configuration for the data pipeline.
+    """Top-level declarative configuration for the data pipeline.
 
-    This is the top-level configuration that combines all stage configs
-    and dataset definitions.
+    A :class:`PipelineConfig` aggregates a list of :class:`DatasetConfig`
+    declarations together with one config object per pipeline stage. It is
+    consumed by :meth:`Pipeline.from_config` to construct the runtime
+    pipeline graph and provides centralised validation via
+    :meth:`validate`. Per-dataset overrides on the dataset configs win
+    over the stage-level defaults stored here, which in turn win over
+    any global fallback (``default_tokenizer``).
 
     Attributes:
-        datasets: List of dataset configurations (required).
-        default_tokenizer: Fallback tokenizer for all datasets.
-        streaming: Whether to use streaming mode globally.
-        seed: Random seed for reproducibility.
-        source: Source loading configuration.
-        tokenize: Tokenization configuration.
-        cache: Caching configuration.
-        mix: Mixing configuration.
-        pack: Packing configuration.
-        load: Loading configuration.
-        save: Save configuration.
-        ray: Ray distributed processing configuration.
-        observability: Observability configuration.
+        datasets (list[DatasetConfig]): Dataset declarations forming the
+            sources of the pipeline; required and must be non-empty.
+            ``__post_init__`` auto-assigns names to entries that omit one.
+        default_tokenizer (str | None): Lowest-priority tokenizer fallback
+            used when neither :attr:`DatasetConfig.tokenizer` nor
+            :attr:`TokenizeStageConfig.default_tokenizer` is set.
+        streaming (bool): Global default for streaming mode; passed
+            through to readers when an individual stage does not override
+            it.
+        seed (int | None): Master RNG seed used to derive deterministic
+            seeds for shuffling, mixing, and packing.
+        source (SourceStageConfig): Settings for the source-reading stage.
+        tokenize (TokenizeStageConfig): Settings for the tokenization
+            stage.
+        cache (CacheStageConfig): Settings for the multi-tier cache.
+        mix (MixStageConfig): Settings for dataset mixing.
+        pack (PackStageConfig): Settings for sequence packing.
+        load (LoadStageConfig): Settings for batch loading and
+            prefetching.
+        save (SaveStageConfig): Settings for the optional persistence
+            stage.
+        ray (RayConfig): Settings for distributed preprocessing on Ray.
+        observability (ObservabilityConfig): Settings controlling logging
+            and progress display.
 
     Example:
         >>> config = PipelineConfig(
@@ -438,7 +700,17 @@ class PipelineConfig:
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
     def __post_init__(self):
-        """Validate configuration after initialization."""
+        """Verify the pipeline declaration and assign default dataset names.
+
+        Enforces that at least one dataset is configured and assigns
+        ``f"dataset_{i}"`` as the name for any :class:`DatasetConfig`
+        whose ``name`` was left blank (so downstream code that keys on
+        names — mixing weights, save paths — always sees a unique
+        identifier).
+
+        Raises:
+            ValueError: If :attr:`datasets` is empty.
+        """
         if not self.datasets:
             raise ValueError("At least one dataset is required")
 
@@ -448,13 +720,16 @@ class PipelineConfig:
                 ds.name = f"dataset_{i}"
 
     def get_dataset_by_name(self, name: str) -> DatasetConfig | None:
-        """Get a dataset configuration by its unique name.
+        """Look up a configured dataset by its unique ``name`` field.
 
         Args:
-            name: Dataset name to search for.
+            name: Identifier matching :attr:`DatasetConfig.name`. Names
+                are either user-supplied or auto-assigned by
+                :meth:`__post_init__`.
 
         Returns:
-            Matching DatasetConfig, or None if not found.
+            DatasetConfig | None: The first dataset whose ``name``
+            matches, or ``None`` when no such dataset exists.
         """
         for ds in self.datasets:
             if ds.name == name:
@@ -462,10 +737,17 @@ class PipelineConfig:
         return None
 
     def validate(self) -> list[str]:
-        """Validate the full pipeline configuration.
+        """Run cross-field validation of the assembled pipeline declaration.
+
+        Checks that dataset names are unique and that any dataset names
+        referenced by mixing weights or by the curriculum schedule
+        actually correspond to a configured :class:`DatasetConfig`. Unlike
+        ``__post_init__`` (which raises), this method returns the
+        accumulated diagnostics so callers can present them as a batch.
 
         Returns:
-            List of validation error messages (empty if valid).
+            list[str]: Human-readable validation error messages. An empty
+            list indicates the configuration is internally consistent.
         """
         errors = []
 
@@ -491,14 +773,22 @@ class PipelineConfig:
 
 
 def get_dataset_name(ds_cfg: DatasetConfig, index: int) -> str:
-    """Get a unique name for a dataset configuration.
+    """Resolve the canonical name for a dataset, falling back to an indexed default.
+
+    Provides a single, side-effect-free way to derive the identifier used
+    in caches, save paths, mixing weights, and progress logs whether or
+    not the user supplied a custom name.
 
     Args:
-        ds_cfg: Dataset configuration.
-        index: Fallback index used to generate a name if none is set.
+        ds_cfg: Dataset configuration whose :attr:`DatasetConfig.name`
+            is consulted first.
+        index: Position of this dataset in the surrounding
+            :attr:`PipelineConfig.datasets` list, used to construct
+            ``"dataset_{index}"`` when no explicit name is set.
 
     Returns:
-        The dataset's name, or "dataset_{index}" if no name is configured.
+        str: ``ds_cfg.name`` if it is truthy, otherwise
+        ``f"dataset_{index}"``.
     """
     return ds_cfg.name if ds_cfg.name else f"dataset_{index}"
 
@@ -508,19 +798,29 @@ def merge_tokenizer_config(
     global_tokenizer: str | None,
     stage_cfg: TokenizeStageConfig,
 ) -> TokenizerConfig | None:
-    """Merge tokenizer configuration from multiple sources.
+    """Resolve the effective tokenizer for a dataset across the three config layers.
 
-    Resolves the tokenizer config with the following priority order:
-    dataset-level > stage default > global default.
+    Implements the canonical override order used throughout the pipeline:
+
+    1. **Dataset level** (highest priority) — :attr:`DatasetConfig.tokenizer`,
+       wrapped into a :class:`TokenizerConfig` if it was supplied as a
+       bare string.
+    2. **Stage level** (middle) — :attr:`TokenizeStageConfig.default_tokenizer`,
+       used when the dataset itself does not declare a tokenizer.
+    3. **Global level** (lowest) — :attr:`PipelineConfig.default_tokenizer`,
+       used as a final fallback.
 
     Args:
-        ds_cfg: Per-dataset configuration (highest priority).
-        global_tokenizer: Global fallback tokenizer name/path (lowest priority).
-        stage_cfg: Stage-level tokenization configuration (middle priority).
+        ds_cfg: Dataset whose per-row override is checked first.
+        global_tokenizer: Pipeline-wide fallback tokenizer name/path
+            (typically :attr:`PipelineConfig.default_tokenizer`).
+        stage_cfg: Stage-level tokenization configuration whose
+            ``default_tokenizer`` field is the middle-priority source.
 
     Returns:
-        Resolved TokenizerConfig, or None if no tokenizer is configured
-        at any level.
+        TokenizerConfig | None: A fully resolved :class:`TokenizerConfig`
+        for the dataset, or ``None`` when no tokenizer is configured at
+        any level (a legitimate state for purely text-export pipelines).
     """
     # Check dataset-level tokenizer
     tok_cfg = ds_cfg.get_tokenizer_config()

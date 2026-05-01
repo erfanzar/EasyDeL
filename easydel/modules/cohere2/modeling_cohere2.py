@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the Cohere Command R2 (Cohere2) decoder-only LLM.
+
+Cohere2 keeps the Cohere base architecture (logit scaling, optional QK norm,
+SwiGLU MLPs, full RoPE, GQA, tied embeddings) and adds an interleaved
+sliding/full attention pattern for efficient long-context inference. The
+mask layout is driven by ``config.layer_types`` / ``config.sliding_window``.
+
+Building blocks:
+
+- :class:`Cohere2LayerNorm` — fp32-promoted LayerNorm used in the decoder.
+- :class:`Cohere2Attention` — :class:`UnifiedAttention` subclass with optional
+  QK norm and Cohere2 RoPE.
+- :class:`Cohere2MLP` — SwiGLU FFN.
+- :class:`Cohere2Block` — single decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`Cohere2Model` — base decoder.
+- :class:`Cohere2ForCausalLM` — causal LM head with logit scaling.
+- :class:`Cohere2ForSequenceClassification` — pooled classifier head.
+"""
 
 from functools import partial
 
@@ -504,7 +525,7 @@ class Cohere2Model(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=idx):
+            with self._assign_layer_stage(idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -609,10 +630,11 @@ class Cohere2Model(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             hidden_states, all_hidden_states, all_attentions, idx = carry
+            stage_idx = getattr(block, "layer_idx", idx)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            with self._layer_stage_context(idx, layers=self.layers):
+            with self._layer_stage_context(stage_idx, layers=self.layers):
                 layer_outputs = block(
                     hidden_states=hidden_states,
                     mask_info=mask_info,
@@ -623,7 +645,7 @@ class Cohere2Model(EasyDeLBaseModule):
                     output_attentions=output_attentions,
                     frequencies=self.frequencies,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, stage_idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)

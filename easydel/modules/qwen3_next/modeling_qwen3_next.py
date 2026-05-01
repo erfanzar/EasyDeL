@@ -15,13 +15,42 @@
 """Qwen3Next model implementation for EasyDeL.
 
 This module implements the Qwen3Next hybrid attention architecture, which combines:
-- Full attention layers with sigmoid gating and partial RoPE
-- Linear attention layers using GatedDeltaNet
-- MoE FFN with routed and shared experts
 
-The hybrid attention approach allows for efficient long-context processing
-with linear complexity in linear attention layers while maintaining
-expressive power through full attention at regular intervals.
+- Full attention layers with sigmoid output gating and partial RoPE.
+- Linear attention layers using GatedDeltaNet (a recurrent gated delta-rule
+  state-space attention).
+- Mixture-of-Experts feedforward blocks with both routed and (optionally)
+  shared experts.
+
+The hybrid layout interleaves linear-attention layers — which scale
+linearly with sequence length and carry their state in a per-head
+recurrent matrix — with periodic full-attention layers that retain the
+expressive power of standard softmax attention. This gives long-context
+prefill and decode at near-linear cost while preserving accuracy.
+
+Performance notes (decode):
+    - On TPU, single-token decode dispatches to a fused Pallas kernel
+      (``GatedDeltaRuleOp.grouped_gdr_decode`` and
+      ``GatedDeltaRuleOp.fused_conv_decode``) that performs the depthwise
+      conv shift, gated-delta-rule recurrent update, and output gather
+      inside VMEM in a single kernel launch. The fused decode path
+      avoids materializing the 5-D intermediate state ratio between
+      query/key heads and value heads (see commit 090a03b2 for the
+      gather + compute + scatter consolidation).
+    - The packed-batch ``apply_qwen3_next_packed_updates`` pipeline
+      implements a single-token "fast lane" alongside a scan-based
+      multi-token prefill path so mixed decode/prefill batches share one
+      kernel launch per linear-attention layer.
+
+Public surface:
+    - :class:`Qwen3NextRMSNorm`, :class:`Qwen3NextMLP`,
+      :class:`Qwen3NextMLPStack`, :class:`Qwen3NextSparseMoeBlock`,
+      :class:`Qwen3NextFullAttention`, :class:`Qwen3NextLinearAttention`,
+      :class:`Qwen3NextDecoderLayer` provide the per-layer building
+      blocks.
+    - :class:`Qwen3NextModel` is the transformer trunk.
+    - :class:`Qwen3NextForCausalLM` is the causal-LM task wrapper and
+      computes the routed-MoE auxiliary load-balancing loss.
 """
 
 import typing
@@ -62,7 +91,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.sharding import RuntimeShardingResolver, resolve_stage_mesh
+from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver, resolve_stage_mesh
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -101,7 +130,27 @@ def l2norm_decode(
     axis: int = -1,
     eps: float = 1e-6,
 ) -> Array:
-    """Match ejkernel's decode-time L2 normalization."""
+    """Decode-time L2 normalisation that matches ejkernel's reference path.
+
+    Recomputes ``x / sqrt(sum(x**2) + eps)`` along ``axis`` using
+    :func:`jax.lax.rsqrt` so the numerics line up bit-for-bit with the
+    Pallas-fused decode kernel inside ``ejkernel.GatedDeltaRuleOp``.
+    Used outside the kernel by the python-side Q/K normalisation step
+    that runs immediately before grouped GDR dispatch — keeping a
+    single normalised representation prevents drift between the
+    fast-path kernel and the fallback math.
+
+    Args:
+        x: Input tensor with the channel dim to be normalised at
+            ``axis``.
+        axis: Axis along which to compute the L2 norm.
+        eps: Numerical-stability constant added inside the square
+            root.
+
+    Returns:
+        Tensor with the same shape and dtype as ``x``, normalised
+        along ``axis``.
+    """
     inv_norm = jax.lax.rsqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
     return x * inv_norm
 
@@ -112,12 +161,39 @@ def _preserve_array_sharding(
     partition_manager: RuntimeShardingResolver | None,
     partition_axis: PartitionAxis | None,
 ) -> Array:
-    """Apply recurrent-state sharding even when grouped decode bypasses the op kernel."""
+    """Re-impose recurrent-state sharding constraints on a freshly built array.
+
+    The grouped-decode fast path constructs new recurrent-state
+    tensors outside the fused Pallas kernel (which usually owns the
+    sharding) and therefore drops the partitioning that the rest of
+    the pipeline expects. This helper re-applies the canonical
+    recurrent-state sharding spec
+    (``[BATCH, HEAD, EMPTY, EMPTY]`` under ``MODE_PREFILL``) using
+    :func:`with_sharding_constraint`, mirroring the layout the kernel
+    would have produced.
+
+    No-ops gracefully when there is no resolver / mesh available
+    (e.g. during unit tests with a single-device default mesh) so the
+    same code path runs in both sharded and unsharded settings.
+
+    Args:
+        value: Array whose sharding should be re-imposed.
+        partition_manager: Active sharding resolver, or ``None`` to
+            skip.
+        partition_axis: Active partition axis policy, or ``None`` to
+            skip.
+
+    Returns:
+        ``value`` with the sharding constraint applied when possible,
+        otherwise the input unchanged.
+    """
     if partition_manager is None or partition_axis is None:
         return value
 
-    mesh = resolve_stage_mesh(partition_manager.mesh)
-    resolver = partition_manager.with_mesh(mesh)
+    mesh = resolve_stage_mesh(getattr(partition_manager, "mesh", None))
+    if mesh is None:
+        return value
+    resolver = coerce_runtime_sharding_resolver(partition_manager, mesh=mesh)
     spec = resolver.resolve(
         axes=[common_types.BATCH, common_types.HEAD, common_types.EMPTY, common_types.EMPTY],
         mode=common_types.MODE_PREFILL,
@@ -274,6 +350,19 @@ def _scatter_qwen3_next_selected_updates(
     num_updates = slots.shape[0]
 
     def _scatter_one(i, acc):
+        """``fori_loop`` body: write one update row into ``acc``.
+
+        For iteration ``i``: reads ``slots[i]`` to find the destination
+        row in ``acc``, ``valid[i]`` to decide whether to overwrite,
+        and ``updates[i]`` for the new row contents. When the slot is
+        not valid, the existing row at ``acc[slots[i]]`` is preserved
+        (i.e. the write is a no-op for that position) so downstream
+        code does not need a separate guard.
+
+        Compiles to a per-slot ``dynamic_update_slice_in_dim`` plus a
+        single ``where`` per row, which the XLA compiler folds into a
+        DMA-friendly write pattern on TPU.
+        """
         slot = slots[i]
         is_valid = valid[i]
         update_row = jax.lax.dynamic_index_in_dim(updates, i, axis=0, keepdims=False)
@@ -324,6 +413,17 @@ def _finalize_qwen3_next_conv_state_from_combined(
     max_seq = combined_inputs.shape[1]
 
     def _extract_one(row, length):
+        """``vmap`` body: trailing ``d_conv`` window of one slot's combined input.
+
+        For one slot, the new conv state is the last ``d_conv``
+        positions of the (prefix + new tokens) sequence. This helper
+        computes the start index as ``clip(length - d_conv, 0,
+        max_seq - d_conv)`` so short slots stay anchored at the
+        beginning of the buffer, then uses :func:`jax.lax.dynamic_slice`
+        to read a contiguous ``[d_conv, conv_dim]`` chunk and
+        transposes it to the canonical ``[conv_dim, d_conv]`` conv-
+        state layout used by the rest of the pipeline.
+        """
         start = jnp.clip(length - d_conv, 0, max_seq - d_conv)
         window = jax.lax.dynamic_slice(row, (start, 0), (d_conv, conv_dim))
         return window.T.astype(output_dtype)  # [conv_dim, d_conv]
@@ -430,6 +530,15 @@ def _apply_qwen3_next_packed_updates_unified(
     single_tokens = conv_input[0, safe_single_indices, :]
 
     def _apply_single_token_fast_lane(operand):
+        """Single-token decode fast lane for the unified packed update.
+
+        Applies the fused depthwise-conv decode + grouped GDR step in
+        VMEM for the single-token slots in the packed batch, then
+        scatters the per-slot conv-state and recurrent-state updates
+        back into the bulk buffers without materializing the 5-D
+        intermediate state. See module docstring for performance notes
+        on the fused Pallas decode kernel.
+        """
         token_outputs_i, conv_states_i, recurrent_states_i = operand
         shifted_conv_states, conv_output = GatedDeltaRuleOp.fused_conv_decode(
             conv_state=conv_states_i,
@@ -522,9 +631,45 @@ def _apply_qwen3_next_packed_updates_unified(
             Bool[Array, "chunk"],
         ],
     ]:
+        """Process one prefill chunk in the multi-token scan.
+
+        Body of the prefill ``jax.lax.scan`` over fixed-size chunks. For
+        each chunk the function gathers the active slots, runs the
+        depthwise convolution and the gated-delta-rule recurrence over
+        the chunk's tokens, and emits the per-slot conv-state and
+        recurrent-state updates. Empty chunks are short-circuited via
+        :func:`_skip_chunk` to avoid wasted work.
+        """
         chunk_slots, chunk_valid = scan_inputs
 
         def _apply_chunk(operand):
+            """Active branch: run conv + GDN over one packed prefill chunk.
+
+            Selected by :func:`jax.lax.cond` when at least one slot in
+            this fixed-size chunk has scheduled tokens. The body:
+
+            1. **Gather**: index ``starts`` and ``scheduled_tokens`` by
+               ``chunk_slots`` to recover per-slot offsets / lengths,
+               then build a per-token validity mask.
+            2. **Compute**: prepend the slot's existing conv-state
+               prefix to the gathered tokens, run the full causal
+               depthwise convolution over the combined sequence, slice
+               off the prefix portion, and reshape into
+               ``query``/``key``/``value`` per-head tensors. Apply
+               masking to invalid positions, optionally repeat Q/K
+               across grouped value heads, and dispatch the
+               gated-delta-rule recurrence.
+            3. **Scatter**: produce the final per-slot conv-state
+               updates via :func:`_finalize_qwen3_next_conv_state_from_combined`
+               and return them alongside the GDN-updated recurrent
+               state and the chunk's output tokens. Token outputs are
+               written back into ``token_outputs_j`` at the original
+               token positions via ``.at[].add``.
+
+            The function returns the same carry shape as
+            :func:`_skip_chunk` so :func:`jax.lax.cond` can select
+            between the two without reshaping.
+            """
             token_outputs_j, chunk_slots_j, chunk_valid_j = operand
             chunk_starts = starts[chunk_slots_j]
             chunk_lengths = scheduled_tokens[chunk_slots_j]
@@ -609,6 +754,19 @@ def _apply_qwen3_next_packed_updates_unified(
             )
 
         def _skip_chunk(operand):
+            """Inactive branch: skip this chunk and emit empty state updates.
+
+            Selected by :func:`jax.lax.cond` when none of the
+            ``chunk_slots`` in this packed chunk have scheduled tokens
+            (i.e. ``chunk_valid`` is all-False). The branch returns
+            zero-filled conv- and recurrent-state update tiles of the
+            shape :func:`_apply_chunk` would have produced so the
+            outer :func:`_scatter_qwen3_next_selected_updates` call
+            sees a uniform tensor signature; because the corresponding
+            ``flat_valid`` entries are False, those zero rows are
+            ignored during the final scatter. The token outputs
+            accumulator is returned untouched.
+            """
             token_outputs_j, chunk_slots_j, chunk_valid_j = operand
             return token_outputs_j, (
                 empty_conv_updates,
@@ -625,6 +783,14 @@ def _apply_qwen3_next_packed_updates_unified(
         )
 
     def _run_prefill_scan(operand):
+        """Driver branch: run the chunk-wise prefill scan and scatter resulting state updates.
+
+        Used when at least one packed-batch slot is in prefill mode (more
+        than one new token per slot). Iterates :func:`_prefill_chunk_step`
+        over fixed-size chunks via ``jax.lax.scan`` and writes the
+        accumulated per-slot updates back into the bulk conv-state and
+        recurrent-state buffers.
+        """
         token_outputs_i, conv_states_i, recurrent_states_i = operand
         token_outputs_i, scan_outputs = jax.lax.scan(
             _prefill_chunk_step,
@@ -1385,7 +1551,16 @@ class Qwen3NextFullAttention(UnifiedAttention):
         )
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
-        """Use Qwen3Next RMSNorm (1 + weight) for query normalization."""
+        """Build the per-head Qwen3-Next RMSNorm for the query projection.
+
+        Qwen3-Next normalises the query per-head before attention
+        using its own ``Qwen3NextRMSNorm`` layer (the ``(1 + weight)``
+        variant). This override replaces the default RMSNorm so the
+        normalisation matches the upstream PyTorch numerics exactly.
+
+        Returns:
+            Qwen3NextRMSNorm: Per-head norm of size ``head_dim``.
+        """
         return Qwen3NextRMSNorm(
             self.head_dim,
             eps=config.rms_norm_eps,
@@ -1395,7 +1570,14 @@ class Qwen3NextFullAttention(UnifiedAttention):
         )
 
     def _create_k_norm(self, config, dtype, param_dtype, rngs):
-        """Use Qwen3Next RMSNorm (1 + weight) for key normalization."""
+        """Build the per-head Qwen3-Next RMSNorm for the key projection.
+
+        Mirrors :meth:`_create_q_norm` for the key projection so that
+        Q and K are normalised symmetrically before attention.
+
+        Returns:
+            Qwen3NextRMSNorm: Per-head norm of size ``head_dim``.
+        """
         return Qwen3NextRMSNorm(
             self.head_dim,
             eps=config.rms_norm_eps,
@@ -2361,6 +2543,14 @@ class Qwen3NextModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Apply a single Qwen3Next decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states (alternating full-attention and linear-attention
+            layers), optionally accumulates per-layer hidden states,
+            attention weights, and MoE router logits, and returns the
+            updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

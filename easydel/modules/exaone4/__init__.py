@@ -63,7 +63,7 @@ Usage Example:
     from easydel import Exaone4Config, Exaone4ForCausalLM
     import jax.numpy as jnp
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
 
     # Initialize configuration
     config = Exaone4Config(

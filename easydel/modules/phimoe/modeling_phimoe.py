@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Phi-MoE model implementation for EasyDeL.
+
+This module implements Microsoft's Phi-MoE, the Mixture-of-Experts
+extension of Phi-3. It re-uses the Phi-3 attention/MLP block conventions
+(fused ``qkv_proj`` / ``gate_up_proj``, RMSNorm, RoPE, optional
+sliding-window attention) and replaces the dense MLP with a routed
+sparse MoE block.
+
+Key components:
+- :class:`PhiMoEAttention` and :class:`PhiMoEDecoderLayer` provide the
+  per-layer transformer logic.
+- :class:`PhiMoeBlocSparseMLP` implements the routed MoE FFN.
+- :class:`PhiMoeModel` is the transformer trunk; :class:`PhiMoeForCausalLM`
+  wraps it with an LM head and computes the auxiliary load-balancing loss.
+"""
 
 import functools
 
@@ -262,6 +277,23 @@ class PhiMoeSparseMoeBlock(spx.Module):
         )
 
         def _sparsemixer_eval(scores: Array, jitter_eps: float) -> tuple[Array, Array]:
+            """Run the inference-time SparseMixer routing for one expert slot.
+
+            Implements Phi-MoE's deterministic sparse routing rule used
+            outside of training: pick the argmax expert and compute its
+            multiplier from the masked-softmax of the surviving scores
+            (those within ``jitter_eps`` of the max).
+
+            Args:
+                scores: Per-token expert scores of shape ``(tokens, num_experts)``.
+                jitter_eps: Threshold controlling which non-max scores
+                    survive the masking step.
+
+            Returns:
+                A ``(multiplier, expert_index)`` pair: routing weights of
+                shape ``(tokens, 1)`` and selected expert indices of
+                shape ``(tokens, 1)``.
+            """
             tokens = scores.shape[0]
             max_vals = jnp.max(scores, axis=-1, keepdims=True)
             max_ind = jnp.argmax(scores, axis=-1, keepdims=True)
@@ -663,6 +695,12 @@ class PhiMoeModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden states
+            / attention weights, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

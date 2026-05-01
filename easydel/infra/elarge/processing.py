@@ -427,9 +427,37 @@ def normalize_task(t: TaskType | str | None) -> TaskType | None:
 
 
 class _CodeEvalMetricProxy:
-    """Proxy a Hugging Face `code_eval` metric with overridden execution kwargs."""
+    """Wrapper around HuggingFace's ``code_eval`` metric that injects worker/timeout overrides and runs untrusted code out-of-process.
+
+    The HuggingFace ``code_eval`` metric executes model-generated Python in
+    the host process via ``exec``, which is unsafe and also leaks state into
+    JAX/TPU runtimes when EasyDeL is using them concurrently. This proxy
+    behaves like the original metric for the rest of the lm-evaluation-harness
+    code (attribute access is forwarded via :meth:`__getattr__`) while
+    intercepting the only call that materially matters — ``compute(...)`` —
+    and routing it through :func:`_run_code_eval_metric_compute`, which
+    serializes the references/predictions and runs the metric in a fresh
+    subprocess with ``HF_ALLOW_CODE_EVAL=1`` and ``JAX_PLATFORMS=cpu`` so
+    the host accelerator stays clean.
+
+    The proxy also gives the rest of EasyDeL a single place to override the
+    defaults that lm-eval forwards to ``code_eval.compute``: when
+    ``num_workers`` or ``timeout`` are non-``None`` they replace whatever
+    lm-eval wanted to pass.
+    """
 
     def __init__(self, metric: Any, *, num_workers: int | None = None, timeout: float | None = None):
+        """Wrap an HF ``code_eval`` metric with overridden execution kwargs.
+
+        Args:
+            metric: The original HF ``evaluate`` metric instance.
+            num_workers: Optional override for the metric's ``num_workers``.
+            timeout: Optional override for the per-sample execution timeout
+                in seconds.
+
+        Returns:
+            None.
+        """
         self._metric = metric
         self._num_workers = None if num_workers is None else int(num_workers)
         self._timeout = None if timeout is None else float(timeout)
@@ -443,6 +471,17 @@ class _CodeEvalMetricProxy:
         return _run_code_eval_metric_compute(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
+        """Delegate attribute access to the wrapped HF metric.
+
+        Args:
+            name: Attribute name being looked up.
+
+        Returns:
+            Any: The matching attribute on ``self._metric``.
+
+        Raises:
+            AttributeError: If the wrapped metric has no such attribute.
+        """
         return getattr(self._metric, name)
 
 
@@ -570,6 +609,17 @@ def override_lm_eval_code_exec(
         if callable(original_load):
 
             def _patched_load(path: Any, *args: Any, **kwargs: Any) -> Any:
+                """Wrap :func:`evaluate.load` to inject code-eval overrides.
+
+                Args:
+                    path: The metric identifier passed to ``evaluate.load``.
+                    *args: Positional args forwarded to the original loader.
+                    **kwargs: Keyword args forwarded to the original loader.
+
+                Returns:
+                    Any: The loaded metric, wrapped with execution-kwarg
+                    overrides when the requested metric is ``"code_eval"``.
+                """
                 metric = original_load(path, *args, **kwargs)
                 if isinstance(path, str) and path == "code_eval":
                     return _patch_loaded_code_eval_metric(

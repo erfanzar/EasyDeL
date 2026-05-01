@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for the Qwen2-VL multimodal model family.
+
+This module defines two configurations consumed by Qwen2-VL:
+
+- :class:`Qwen2VLVisionConfig`: hyperparameters for the vision tower
+  (patch embedding size, hidden dimensions, transformer depth, etc.).
+- :class:`Qwen2VLConfig` (registered as ``qwen2_vl_text`` / ``qwen2_vl``):
+  hyperparameters for the language backbone, including 3-D rotary
+  position embeddings (mRoPE) used to encode video temporal/spatial
+  positions and the vision-merge spatial/temporal stride parameters.
+"""
 
 import typing
 from collections.abc import Mapping

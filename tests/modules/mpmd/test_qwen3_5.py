@@ -19,7 +19,11 @@ import pytest
 import transformers
 
 import easydel as ed
-from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
+from tests.modules.mpmd._scheduler_utils import (
+    GENERATION_SCHEDULE_KIND,
+    LOSS_SCHEDULE_KINDS,
+    scaled_mrope_section,
+)
 from tests.modules.test_utils import CausalLMTester, VisionLanguageTester
 
 
@@ -68,6 +72,10 @@ class TestQwen3_5:
             rope_theta=small_model_config["rope_theta"],
             attention_bias=small_model_config["attention_bias"],
             attention_dropout=small_model_config["attention_dropout"],
+            linear_key_head_dim=small_model_config["head_dim"],
+            linear_value_head_dim=small_model_config["head_dim"],
+            linear_num_key_heads=small_model_config["num_key_value_heads"],
+            linear_num_value_heads=small_model_config["num_attention_heads"],
             output_router_logits=False,
             mlp_only_layers=[],
         )
@@ -77,11 +85,14 @@ class TestQwen3_5:
         """Create Qwen3.5 multimodal config."""
         qwen3_5_text_config.rope_scaling = {
             "rope_type": "default",
-            "mrope_section": [24, 20, 20],
+            "mrope_section": scaled_mrope_section(
+                head_dim=qwen3_5_text_config.head_dim,
+                partial_rotary_factor=qwen3_5_text_config.partial_rotary_factor,
+            ),
             "mrope_interleaved": True,
         }
         vision_config = ed.Qwen3_5VisionConfig(
-            depth=2,
+            depth=qwen3_5_text_config.num_hidden_layers,
             hidden_size=128,
             intermediate_size=256,
             num_heads=4,
@@ -169,7 +180,9 @@ class TestQwen3_5:
         assert result.success, f"Qwen3.5 generation failed: {result.error_message}"
 
     @pytest.mark.parametrize("mpmd_schedule_kind", LOSS_SCHEDULE_KINDS, indirect=True)
-    def test_vision_language(self, qwen3_5_config, small_model_config, vlm_config, hf_qwen3_5_conditional_class, mpmd_schedule_kind):
+    def test_vision_language(
+        self, qwen3_5_config, small_model_config, vlm_config, hf_qwen3_5_conditional_class, mpmd_schedule_kind
+    ):
         """Test Qwen3_5ForConditionalGeneration with image inputs."""
         if hf_qwen3_5_conditional_class is None:
             pytest.skip("transformers.Qwen3_5ForConditionalGeneration not available")
@@ -191,7 +204,9 @@ class TestQwen3_5:
         assert result.success, f"Qwen3.5 VLM failed: {result.error_message or result.comparison.details}"
 
     @pytest.mark.parametrize("mpmd_schedule_kind", [GENERATION_SCHEDULE_KIND], indirect=True)
-    def test_multimodal_generation(self, qwen3_5_config, small_model_config, hf_qwen3_5_conditional_class, mpmd_schedule_kind):
+    def test_multimodal_generation(
+        self, qwen3_5_config, small_model_config, hf_qwen3_5_conditional_class, mpmd_schedule_kind
+    ):
         """Test Qwen3.5 multimodal text-only generation path."""
         if hf_qwen3_5_conditional_class is None:
             pytest.skip("transformers.Qwen3_5ForConditionalGeneration not available")

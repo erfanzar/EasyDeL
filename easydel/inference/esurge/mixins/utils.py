@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility mixin for the eSurge engine.
+
+Hosts cross-cutting helpers that don't fit cleanly under I/O, lifecycle, or
+parsing — context-window enforcement, stop-string normalization, sampling-
+params adjustment hooks, distributed-step coordination helpers, and similar
+small shared methods.
+
+Exposes :class:`EngineUtilsMixin`, mixed into :class:`eSurge`.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -46,7 +56,21 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _coerce_mapping_like(value: Any) -> Any:
-        """Coerce JSON-string payloads into mapping-like objects when possible."""
+        """Best-effort JSON-decode a string ``value``, returning the original on failure.
+
+        OpenAI-compatible clients sometimes send tool-call ``arguments`` (and
+        similar fields) as JSON strings instead of nested objects. The
+        chat-template normalizer wants real dicts, so this helper attempts
+        ``json.loads`` and silently returns the input when it isn't a
+        valid JSON string. Non-string inputs pass through unchanged.
+
+        Args:
+            value: Anything; only ``str`` values are inspected.
+
+        Returns:
+            The decoded JSON object when ``value`` is a parseable JSON
+            string, otherwise ``value`` itself.
+        """
 
         if isinstance(value, str):
             try:
@@ -58,7 +82,28 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _normalize_chat_template_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Normalize message payloads for HF/Jinja chat template compatibility."""
+        """Massage OpenAI-style messages into a shape every HF chat template can render.
+
+        Tokenizer Jinja templates assume ``content`` is a string or list,
+        ``tool_calls[*].function.arguments`` is a dict, and there is at most
+        one leading system message. Real-world OpenAI clients break all
+        three regularly: ``content=None`` for assistant tool-call messages,
+        ``arguments`` as a JSON string, and multi-turn system messages.
+        This pass deep-copies and rewrites the input so the template can
+        iterate without throwing — defaulting ``content`` to ``""``,
+        json-decoding ``arguments`` into dicts (with a ``{"value": ...}``
+        wrapper when decode produces a non-dict), and finally folding all
+        system messages into a single leading turn via
+        :meth:`_collapse_system_messages`.
+
+        Args:
+            messages: List of OpenAI-style message dicts as accepted by
+                :meth:`eSurge.chat`.
+
+        Returns:
+            New list of normalized message dicts safe to pass to
+            ``tokenizer.apply_chat_template``.
+        """
 
         normalized_messages: list[dict[str, Any]] = []
         for message in messages:
@@ -104,7 +149,22 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _content_to_text_parts(content: Any) -> list[dict[str, Any]]:
-        """Convert arbitrary message content into text-part arrays."""
+        """Lift any message ``content`` into the structured-parts list shape.
+
+        Strict chat templates (e.g. Gemma's) iterate over ``message["content"]``
+        as a list of typed parts (``[{"type": "text", "text": ...}, ...]``)
+        rather than a bare string. This helper produces that shape regardless
+        of input flavour: ``None`` becomes ``[]``, scalars become a single
+        ``"text"`` part, lists are deep-copied (with stringification of any
+        non-dict, non-None entries), and existing typed parts pass through
+        verbatim.
+
+        Args:
+            content: Message ``content`` value as it appeared in the input.
+
+        Returns:
+            List of typed-part dicts ready to be merged with other turns.
+        """
 
         if content is None:
             return []
@@ -120,7 +180,26 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _merge_system_content(existing: Any, new_content: Any) -> Any:
-        """Merge multiple system-message contents into a single leading turn."""
+        """Combine two system-message ``content`` values without losing structure.
+
+        Two cases:
+
+        * Either side is a list of typed parts → both are normalized via
+          :meth:`_content_to_text_parts` and concatenated, preserving
+          all parts in order.
+        * Both sides are scalar strings → joined with ``"\\n\\n"`` (or
+          falling back to the non-empty side) so simple text-only system
+          messages remain rendered as a single readable turn.
+
+        Args:
+            existing: Already-folded system content (or ``None``).
+            new_content: System content from the next system turn being
+                folded in.
+
+        Returns:
+            Merged content compatible with the input shape — list of
+            parts, joined string, or ``None`` when both inputs were empty.
+        """
 
         if isinstance(existing, list) or isinstance(new_content, list):
             return EngineUtilsMixin._content_to_text_parts(existing) + EngineUtilsMixin._content_to_text_parts(
@@ -135,7 +214,26 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _collapse_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Fold all system turns into one leading system message for strict templates."""
+        """Merge every ``role == "system"`` turn into a single leading system message.
+
+        Many tokenizer chat templates (Llama, Gemma, Qwen, …) require
+        exactly one system message at the start of the conversation and
+        will silently drop or misrender extra system turns. This helper
+        scans the input, returns it unchanged when at most one system
+        message already sits in position 0, and otherwise builds a single
+        merged system message via :meth:`_merge_system_content`, drops
+        ``tool_calls`` / ``function_call`` from system turns (templates
+        do not expect them), and prepends the merged turn before all
+        non-system messages in their original order.
+
+        Args:
+            messages: Already field-normalized message list.
+
+        Returns:
+            Either the original list or a new list with system messages
+            collapsed; logs a WARNING when a collapse actually happened so
+            users notice that their multi-system input was rewritten.
+        """
 
         if not messages:
             return messages
@@ -259,7 +357,26 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _is_recoverable_chat_template_tool_error(exc: Exception) -> bool:
-        """Return True for template/tool shape mismatches we can retry around."""
+        """Whether ``exc`` looks like a tool-shape mismatch worth retrying.
+
+        ``apply_chat_template`` failures come in two flavours: configuration
+        bugs (missing template, undefined variable) and shape mismatches
+        between our normalized tools and a template's expectations
+        (e.g. Gemma's wrapped vs unwrapped tool layout). The second class
+        is recoverable by reformatting tools and retrying; this predicate
+        identifies them by inspecting the exception type and message
+        substrings (``KeyError`` / ``TypeError`` referencing
+        ``parameters`` / ``properties`` / ``arguments``, plus
+        ``UndefinedError`` references to ``name``-style attributes).
+
+        Args:
+            exc: Exception raised by ``tokenizer.apply_chat_template``.
+
+        Returns:
+            ``True`` for template/tool shape mismatches the caller should
+            retry with a different normalization, ``False`` for hard
+            errors that should propagate.
+        """
 
         if isinstance(exc, KeyError):
             missing_key = exc.args[0] if len(exc.args) > 0 else None
@@ -279,7 +396,22 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _to_structured_text_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Convert message content into structured text-part arrays."""
+        """Rewrite every message's ``content`` into the typed-parts list shape.
+
+        Used as a retry rewrite when a chat template fails on bare-string
+        content (e.g. Gemma's template insists on
+        ``content=[{"type":"text","text":"..."}]``). Returns a new list of
+        deep-copied message dicts whose ``content`` field has been routed
+        through :meth:`_content_to_text_parts`; ``None`` and empty lists
+        are normalized to ``[]`` so the template can still iterate without
+        special-casing.
+
+        Args:
+            messages: Already field-normalized messages.
+
+        Returns:
+            New list of messages with structured-parts content.
+        """
 
         normalized: list[dict[str, Any]] = []
         for message in messages:
@@ -312,7 +444,21 @@ class EngineUtilsMixin:
 
     @staticmethod
     def _normalize_stop_sequences(stop: typing.Any) -> list[str]:
-        """Normalize stop input into a de-duplicated list of non-empty strings."""
+        """Coerce a heterogeneous stop-sequence input into a clean ``list[str]``.
+
+        Accepts a single string, an iterable of strings, or ``None``, and
+        produces a deduplicated list (preserving insertion order) of
+        non-empty strings. ``None`` and falsy inputs round-trip to ``[]``.
+        Used both to merge engine-level ``extra_stops`` into per-request
+        sampling params and to normalize user-supplied ``stop`` arguments.
+
+        Args:
+            stop: Raw stop-sequence input — string, iterable of strings,
+                or ``None``.
+
+        Returns:
+            Deduplicated, order-preserving list of non-empty stop strings.
+        """
 
         if stop is None:
             return []
@@ -336,7 +482,22 @@ class EngineUtilsMixin:
         return normalized
 
     def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
-        """Merge engine-level stop strings into request sampling parameters."""
+        """Splice engine-level ``extra_stops`` into a request's ``stop`` list.
+
+        Reads :attr:`extra_stops` from the engine config and merges them
+        with whatever stop sequences the request already carries. The
+        normalized union (deduplicated, order-preserving via
+        :meth:`_normalize_stop_sequences`) is written back to
+        ``sampling_params.stop`` *in place* and the same params object is
+        returned for chaining. No-op when the engine has no extra stops.
+
+        Args:
+            sampling_params: Per-request sampling parameters; mutated when
+                a merge is required.
+
+        Returns:
+            ``sampling_params`` (same instance) for chaining.
+        """
 
         extra_stops = self._normalize_stop_sequences(getattr(self, "extra_stops", None))
         if not extra_stops:
@@ -353,7 +514,25 @@ class EngineUtilsMixin:
         return sampling_params
 
     def _apply_generation_config_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
-        """Merge model generation-config EOS IDs into sampling stop-token policy."""
+        """Augment request stop-token policy with the model's generation-config EOS ids.
+
+        Some HF models distribute multiple EOS tokens through their
+        ``generation_config.json`` (Llama 3 ``<|eot_id|>``, Qwen
+        ``<|im_end|>``, …). The tokenizer alone often only knows about
+        the *primary* EOS, so requests that don't explicitly enumerate
+        ``stop_token_ids`` would otherwise miss those alternates. This
+        helper folds the generation-config EOS ids into
+        ``sampling_params.stop_token_ids`` (deduplicated, in-place) and
+        returns the same object for chaining. No-op when the model has
+        no extra EOS ids.
+
+        Args:
+            sampling_params: Per-request sampling parameters; mutated when
+                additional EOS ids exist.
+
+        Returns:
+            ``sampling_params`` (same instance) for chaining.
+        """
 
         generation_config = getattr(self, "_generation_config_dict", None)
         primary_eos_token_id = getattr(self, "_primary_eos_token_id", None)
@@ -692,13 +871,40 @@ class EngineUtilsMixin:
                     )
 
     def _touch_activity(self) -> None:
-        """Update the last-activity timestamp for idle reset tracking."""
+        """Mark the engine as active so the idle-reset watchdog re-arms.
+
+        Call sites cover every code path that admits work to the
+        scheduler (request-add, lifecycle initiate, multimodal chat
+        start). When ``worker_config.idle_reset_seconds`` is ``None``
+        the watchdog is disabled and this method is a no-op; otherwise
+        ``_idle_reset_last_activity`` is bumped to ``time.time()`` so
+        the daemon thread in :meth:`_start_idle_monitor` defers its next
+        check.
+        """
         if self.worker_config.idle_reset_seconds is None:
             return
         self._idle_reset_last_activity = time.time()
 
     def _start_idle_monitor(self) -> None:
-        """Start the idle-reset monitor thread if enabled."""
+        """Spawn the idle-reset daemon (or no-op when disabled / already running).
+
+        Idle reset frees KV pages and clears runner buffers after a
+        configurable inactivity window so long-lived idle engines don't
+        keep HBM occupied. The daemon polls
+        ``_idle_reset_last_activity`` at ``idle_reset_seconds / 4`` (capped
+        to 1s and floored at 0.1s) and triggers a
+        :meth:`pause` → :meth:`resume` cycle when:
+
+        * the scheduler is currently running,
+        * idle time exceeds ``idle_reset_seconds``,
+        * at least ``idle_reset_min_interval`` seconds have passed since
+          the previous reset, and
+        * no requests are running, pending, or active.
+
+        Resets observed mid-poll re-arm the activity timestamp without
+        firing a reset. Idempotent — if the watchdog thread is already
+        alive, nothing is created.
+        """
         if self.worker_config.idle_reset_seconds is None:
             return
         if self._idle_monitor_thread and self._idle_monitor_thread.is_alive():
@@ -736,7 +942,16 @@ class EngineUtilsMixin:
         self._idle_monitor_thread.start()
 
     def _stop_idle_monitor(self) -> None:
-        """Stop the idle-reset monitor thread if running."""
+        """Signal the idle-reset daemon to exit and join with a short timeout.
+
+        Sets the wake event so the monitor's ``wait`` returns and its
+        next iteration sees the falsy ``_idle_monitor_thread`` reference
+        and exits. When called from the daemon itself (defensive
+        re-entrant guard) the thread reference is cleared without a
+        self-join. Otherwise joins for up to two seconds and logs a
+        DEBUG line if the thread refused to exit. Idempotent — invoked
+        from :meth:`terminate` even when no monitor was started.
+        """
         if not self._idle_monitor_thread:
             return
         self._idle_monitor_event.set()

@@ -177,7 +177,26 @@ def return_type_adjuster(
     """
 
     def decorator(func: tp.Callable[..., spx.Module]) -> tp.Callable[..., _T]:
+        """Wrap *func* so type checkers see ``_T`` as its return type.
+
+        Args:
+            func: Function whose return value is a SpectraX module.
+
+        Returns:
+            Callable[..., _T]: A thin wrapper that casts the result to
+            ``_T``.
+        """
+
         def wrapper(*args: tp.Any, **kwargs: tp.Any) -> _T:
+            """Forward all arguments to *func* and cast the result.
+
+            Args:
+                *args: Positional arguments for ``func``.
+                **kwargs: Keyword arguments for ``func``.
+
+            Returns:
+                _T: ``func(*args, **kwargs)`` cast to ``_T``.
+            """
             return tp.cast(_T, func(*args, **kwargs))
 
         return wrapper

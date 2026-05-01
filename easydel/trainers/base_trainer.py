@@ -11,6 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Base trainer implementation for EasyDeL.
+
+Provides :class:`BaseTrainer`, the common foundation that every concrete
+trainer (SFT, DPO, GRPO, distillation, ...) inherits from.  Responsibilities
+include:
+
+* Configuring model state, sharding, and the JAX device mesh.
+* Building train/eval dataloaders from Hugging Face datasets, EasyDeL
+  :class:`ShardedDataSource` instances, or in-memory iterables.
+* Applying trainer-specific prompt-preprocessing transforms.
+* Compiling and running train/eval steps, with checkpointing and
+  preemption recovery.
+* Optional evaluation-time generation via the eSurge inference engine and
+  benchmark hooks.
+* Metrics logging (W&B / progress bars), readme/HF-config emission, and
+  saving to EasyDeL or Torch formats.
+
+The accompanying :class:`GenerationResults` named tuple is the canonical
+shape returned by the unified generation entry points.
+"""
+
 from __future__ import annotations
 
 import collections.abc
@@ -102,22 +123,60 @@ DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
 
 
 class _ReiterableDataLoader:
-    """Small wrapper that recreates a fresh iterator on every ``iter(...)`` call."""
+    """Small wrapper that recreates a fresh iterator on every ``iter(...)`` call.
+
+    Some upstream iterables can only be consumed once.  Wrapping them with
+    a factory and this helper turns them into reusable iterables suitable
+    for multi-epoch dataloaders.
+
+    Attributes:
+        _factory: Zero-argument callable that returns a fresh iterator each time.
+        _length: Optional pre-computed length for ``__len__``; ``None`` means
+            length is unknown and ``len(...)`` will raise ``TypeError``.
+    """
 
     def __init__(self, factory: tp.Callable[[], collections.abc.Iterator], length: int | None = None):
+        """Store the iterator factory and optional length.
+
+        Args:
+            factory: Callable returning a fresh iterator on each call.
+            length: Optional known length of the sequence; ``None`` if unknown.
+        """
         self._factory = factory
         self._length = length
 
     def __iter__(self):
+        """Return a freshly constructed iterator from the stored factory."""
         return self._factory()
 
     def __len__(self) -> int:
+        """Return the configured length.
+
+        Raises:
+            TypeError: If no length was supplied at construction time.
+        """
         if self._length is None:
             raise TypeError(f"{type(self).__name__} has no len()")
         return self._length
 
 
 class _ResolvedStepCount(NamedTuple):
+    """Result of resolving the number of training/evaluation steps.
+
+    Attributes:
+        steps: Final step count to run.
+        num_examples: Total number of examples backing those steps, or
+            ``None`` when the length is unknown.
+        num_examples_exact: ``True`` when ``num_examples`` is exact, ``False``
+            when it is an approximate lower bound.
+        source_label: Human-readable label describing where the step count
+            came from (e.g. argument name, dataset auto-discovery).
+        auto_discovered: ``True`` if the step count was discovered from the
+            dataset rather than supplied by the user.
+        auto_clamped: ``True`` if the step count was clamped to the dataset
+            size to avoid running past the end of the data.
+    """
+
     steps: int
     num_examples: int | None
     num_examples_exact: bool
@@ -837,7 +896,20 @@ class BaseTrainer(BaseTrainerProtocol):
         prompts: tp.Any,
         apply_chat_template: bool,
     ) -> list[str | list[dict[str, str]]]:
-        """Normalize user-provided prompts into strings or chat conversations."""
+        """Normalize user-provided prompts into strings or chat conversations.
+
+        Args:
+            prompts: A single prompt or list of prompts in any supported
+                shape (string, dict, or list of message dicts).
+            apply_chat_template: When ``True``, bare strings are wrapped as
+                a single ``user`` chat message so they can flow through the
+                processor's chat template.
+
+        Returns:
+            A list whose elements are either plain strings (no chat
+            template) or lists of role/content dicts ready for chat
+            templating.
+        """
 
         def _normalize_single(item: tp.Any) -> str | list[dict[str, str]]:
             """Normalize a single prompt item into a string or chat message list.
@@ -943,7 +1015,16 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         fallback: str | collections.abc.Sequence[tp.Any] | None = None,
     ) -> list[str]:
-        """Normalize generation text outputs into a list of strings."""
+        """Normalize generation text outputs into a list of strings.
+
+        Args:
+            values: The primary text value (string, sequence, or ``None``).
+            fallback: Alternate value used when ``values`` is ``None``.
+
+        Returns:
+            A list of strings.  An empty list is returned when both
+            ``values`` and ``fallback`` are ``None``.
+        """
         source = values if values is not None else fallback
         if source is None:
             return []
@@ -959,7 +1040,17 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         target_len: int,
     ) -> list[str | None]:
-        """Normalize optional generation text metadata to a fixed-length list."""
+        """Normalize optional generation text metadata to a fixed-length list.
+
+        Args:
+            values: Per-sample text metadata (string, sequence, or ``None``).
+            target_len: Desired output length; the result is padded with
+                ``None`` or truncated to match.
+
+        Returns:
+            A list of length ``target_len`` whose elements are strings or
+            ``None``.
+        """
         if values is None:
             return [None] * target_len
         if isinstance(values, str):
@@ -978,7 +1069,17 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         target_len: int,
     ) -> list[tp.Any | None]:
-        """Normalize non-text generation metadata to a fixed-length list."""
+        """Normalize non-text generation metadata to a fixed-length list.
+
+        Args:
+            values: Per-sample metadata (any type, sequence, or ``None``).
+            target_len: Desired output length; padded with ``None`` or
+                truncated as required.
+
+        Returns:
+            A list of length ``target_len``.  Scalars are wrapped into a
+            singleton list before padding/truncation.
+        """
         if values is None:
             return [None] * target_len
         if isinstance(values, collections.abc.Sequence) and not isinstance(values, (str, bytes)):
@@ -991,7 +1092,15 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @staticmethod
     def _coerce_mapping_like(value: tp.Any) -> tp.Any:
-        """Coerce JSON-string payloads into mapping-like objects when possible."""
+        """Coerce JSON-string payloads into mapping-like objects when possible.
+
+        Args:
+            value: Any value; strings are attempted to be parsed as JSON.
+
+        Returns:
+            The parsed JSON object when ``value`` was a valid JSON string;
+            otherwise ``value`` unchanged.
+        """
         if isinstance(value, str):
             try:
                 return json.loads(value)
@@ -1001,7 +1110,20 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @classmethod
     def _normalize_tool_call_payloads(cls, tool_calls: tp.Any) -> list[dict[str, tp.Any]]:
-        """Normalize structured tool-call payloads for chat-template rendering."""
+        """Normalize structured tool-call payloads for chat-template rendering.
+
+        Accepts dicts, pydantic-style models with ``model_dump``, or objects
+        with ``id``/``type``/``function`` attributes and produces a list of
+        plain dicts where ``function.arguments`` is always a mapping.
+
+        Args:
+            tool_calls: Sequence of tool-call descriptors in any supported
+                format.  Non-sequences and bytes/str are treated as empty.
+
+        Returns:
+            A list of normalized tool-call dicts ready for chat-template
+            consumption; empty when no usable entries are found.
+        """
         if not isinstance(tool_calls, collections.abc.Sequence) or isinstance(tool_calls, (str, bytes)):
             return []
 
@@ -1066,7 +1188,19 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         tool_calls: list[tp.Any | None] | None = None,
     ) -> list[list[dict[str, tp.Any]]]:
-        """Build assistant message payloads with normalized tool calls when present."""
+        """Build assistant message payloads with normalized tool calls when present.
+
+        Args:
+            contents: Per-completion assistant text content.
+            tool_calls: Optional per-completion list of structured tool-call
+                payloads aligned one-to-one with ``contents``.  ``None``
+                items signal "no tool calls".
+
+        Returns:
+            A list (one per completion) of single-message lists in the
+            ``[{"role": "assistant", ...}]`` shape, with optional
+            ``tool_calls`` entries appended after normalization.
+        """
         if tool_calls is None:
             tool_call_records = [None] * len(contents)
         else:
@@ -1082,7 +1216,12 @@ class BaseTrainer(BaseTrainerProtocol):
         return messages
 
     def _reward_chat_template_tools(self) -> list[dict[str, tp.Any]] | None:
-        """Resolve optional tool schemas for reward-side chat-template rendering."""
+        """Resolve optional tool schemas for reward-side chat-template rendering.
+
+        Returns:
+            The list of tool schemas declared on ``self.arguments.tool_schemas``
+            when it is a list; otherwise ``None``.
+        """
         arguments = getattr(self, "arguments", None)
         if arguments is None:
             return None
@@ -1105,7 +1244,29 @@ class BaseTrainer(BaseTrainerProtocol):
         batch: dict[str, tp.Any] | None = None,
         **extra_kwargs: tp.Any,
     ) -> dict[str, tp.Any]:
-        """Build filtered kwargs for callable reward functions."""
+        """Build filtered kwargs for callable reward functions.
+
+        Inspects the signature of ``reward_func`` and forwards only those
+        kwargs that the function actually accepts, avoiding ``TypeError``
+        for reward implementations that don't request the full payload.
+
+        Args:
+            reward_func: The reward callable whose signature is inspected.
+            prompts: Tokenized or text prompts.
+            completions: Tokenized or text completions.
+            max_length: Maximum sequence length used during generation.
+            raw_completions: Raw completion ids prior to truncation/decoding.
+            prompt_texts: Decoded prompt strings (if available).
+            completion_texts: Decoded completion strings (if available).
+            raw_text: Raw, unstripped completion strings.
+            reasoning: Per-completion reasoning text (when split out).
+            tool_calls: Per-completion structured tool-call payloads.
+            batch: The original batch dict (for side-channel access).
+            **extra_kwargs: Additional fields to expose to the reward function.
+
+        Returns:
+            A dict containing only the kwargs accepted by ``reward_func``.
+        """
         return filter_kwargs_for_callable(
             reward_func,
             {
@@ -1125,7 +1286,19 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @staticmethod
     def _extract_reward_batch_sidechannels(batch: tp.Any) -> dict[str, tp.Any]:
-        """Preserve non-numeric batch metadata needed by callable reward functions."""
+        """Preserve non-numeric batch metadata needed by callable reward functions.
+
+        Currently extracts the ``tools`` field if present, converting JAX
+        / NumPy arrays back to Python lists so they survive transport into
+        a Python reward callback.
+
+        Args:
+            batch: The current batch (dict, list of dicts, or other shape).
+
+        Returns:
+            A dict with extracted side-channel metadata (e.g.
+            ``{"tools": [...]}``); empty when nothing relevant is found.
+        """
         if isinstance(batch, dict):
             if "tools" not in batch:
                 return {}
@@ -1268,7 +1441,19 @@ class BaseTrainer(BaseTrainerProtocol):
         return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
 
     def _length_is_exact(self, candidate: tp.Any) -> bool:
-        """Best-effort signal for whether ``len(candidate)`` is an exact count."""
+        """Best-effort signal for whether ``len(candidate)`` is an exact count.
+
+        Filters and dynamic expansions can make ``len(...)`` return only an
+        upper bound, in which case downstream step-count clamping must be
+        more conservative.
+
+        Args:
+            candidate: A dataset-like object that may expose a ``_transform``
+                or ``_source`` attribute used for introspection.
+
+        Returns:
+            ``True`` when the reported length is believed to be exact.
+        """
         if candidate is None:
             return False
 
@@ -1287,7 +1472,16 @@ class BaseTrainer(BaseTrainerProtocol):
         return True
 
     def _sum_known_shard_rows(self, source: ShardedDataSource | None) -> int | None:
-        """Sum ``ShardInfo.num_rows`` when every shard advertises it."""
+        """Sum ``ShardInfo.num_rows`` when every shard advertises it.
+
+        Args:
+            source: A :class:`ShardedDataSource` to inspect.  ``None`` is
+                treated as "no information".
+
+        Returns:
+            The total exact row count across all shards, or ``None`` when
+            any shard fails to report ``num_rows``.
+        """
         if source is None:
             return None
         try:
@@ -1312,7 +1506,24 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         source: ShardedDataSource | None = None,
     ) -> tuple[int | None, bool, str]:
-        """Discover dataset cardinality from the most informative available object."""
+        """Discover dataset cardinality from the most informative available object.
+
+        Tries the sharded source first, then the underlying dataset, falling
+        back to summing per-shard row counts when ``len(...)`` is not
+        supported.
+
+        Args:
+            dataset: The user-supplied dataset (HF Dataset, IterableDataset,
+                ShardedDataSource, or ``None``).
+            source: An auxiliary :class:`ShardedDataSource` that may carry
+                more accurate metadata than ``dataset`` itself.
+
+        Returns:
+            A tuple ``(num_examples, exact, label)`` where ``num_examples``
+            is the discovered cardinality (or ``None``), ``exact`` indicates
+            whether the value is exact, and ``label`` describes which source
+            it came from.
+        """
         candidates: list[tuple[str, tp.Any]] = []
         if source is not None:
             candidates.append(("sharded_source", source))
@@ -1338,6 +1549,17 @@ class BaseTrainer(BaseTrainerProtocol):
         is_train: bool,
         resolution: _ResolvedStepCount,
     ) -> None:
+        """Persist resolved dataset/step metadata onto the trainer instance.
+
+        Stores the fields of *resolution* under ``_train_*`` or ``_eval_*``
+        attribute names so that loggers and progress bars can surface
+        "auto-discovered" / "auto-clamped" diagnostics.
+
+        Args:
+            is_train: Whether the resolution is for the training split
+                (``True``) or evaluation split (``False``).
+            resolution: The step-count resolution to persist.
+        """
         prefix = "_train" if is_train else "_eval"
         setattr(self, f"{prefix}_dataset_num_examples", resolution.num_examples)
         setattr(self, f"{prefix}_dataset_num_examples_exact", resolution.num_examples_exact)
@@ -1353,13 +1575,46 @@ class BaseTrainer(BaseTrainerProtocol):
         is_train: bool,
         drop_remainder: bool,
     ) -> _ResolvedStepCount:
-        """Resolve configured steps and clamp to discovered dataset capacity when possible."""
+        """Resolve configured steps and clamp to discovered dataset capacity when possible.
+
+        Combines user-supplied ``max_*_steps`` overrides with auto-discovered
+        dataset cardinality and the trainer's batch size / epoch settings to
+        produce the final number of steps.  When the user requests more
+        steps than the dataset supports and the cardinality is exact, the
+        request is clamped down with a warning.
+
+        Args:
+            dataset: The dataset under consideration (may be ``None``).
+            source: Companion :class:`ShardedDataSource` for metadata.
+            is_train: Whether this resolution is for the training split.
+            drop_remainder: Whether the last partial batch is dropped (so a
+                floor-divide step count is appropriate); if ``False`` a
+                ceiling-divide is used.
+
+        Returns:
+            A populated :class:`_ResolvedStepCount` with steps and
+            provenance metadata.
+
+        Raises:
+            ValueError: If ``per_epoch_*_steps`` is needed for a streaming
+                dataset but is not configured, or if the batch size is
+                non-positive.
+        """
         forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
         num_examples, num_examples_exact, source_label = self._discover_dataset_num_examples(dataset, source=source)
         batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
         num_epochs = self.arguments.num_train_epochs if is_train else 1
 
         def _steps_from_examples(total_examples: int) -> int:
+            """Compute step count from a known number of examples.
+
+            Args:
+                total_examples: Number of examples available across all
+                    epochs of the current split.
+
+            Returns:
+                The step count rounded according to ``drop_remainder``.
+            """
             if batch_size <= 0:
                 raise ValueError("Batch size must be > 0.")
             if num_epochs <= 0:
@@ -2682,6 +2937,13 @@ class BaseTrainer(BaseTrainerProtocol):
             esurge_engine = None
 
             def _cleanup_failed_esurge_generation() -> None:
+                """Best-effort teardown of an eSurge engine after a generation failure.
+
+                Pauses the engine and optionally releases its model state /
+                compiled cache so the next training step starts from a clean
+                slate.  All exceptions are swallowed since this runs on the
+                error path.
+                """
                 if esurge_engine is None:
                     try:
                         # If setup failed before returning an engine handle, fall back to
@@ -3301,6 +3563,21 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
         def _apply_chat_template(messages: list[dict[str, tp.Any]], **kwargs) -> tp.Any:
+            """Apply the processor's chat template, gracefully handling tool-unaware processors.
+
+            When ``tools`` is set the call is first attempted with the
+            ``tools=`` kwarg and, if the processor signature does not accept
+            it, falls back to a tools-less call.
+
+            Args:
+                messages: The chat-format message list.
+                **kwargs: Additional kwargs forwarded to
+                    ``processor.apply_chat_template``.
+
+            Returns:
+                The processor's chat-template output (typically token ids
+                plus an attention mask, or a string when ``tokenize=False``).
+            """
             if tools is not None:
                 try:
                     return processor.apply_chat_template(messages, tools=tools, **kwargs)
@@ -3430,6 +3707,18 @@ class BaseTrainer(BaseTrainerProtocol):
             *,
             target_len: int,
         ) -> list[str]:
+            """Format optional reasoning text for the generation preview.
+
+            Args:
+                values: Per-completion reasoning text (string, sequence, or
+                    ``None``).
+                target_len: Desired output length, padded with the
+                    placeholder ``no_reasoning_message`` when missing.
+
+            Returns:
+                A list of length ``target_len`` containing reasoning text or
+                a friendly placeholder for empty/missing entries.
+            """
             normalized = self._coerce_optional_generation_texts(values, target_len=target_len)
             return [value if value not in (None, "") else no_reasoning_message for value in normalized]
 
@@ -3438,6 +3727,17 @@ class BaseTrainer(BaseTrainerProtocol):
             *,
             target_len: int,
         ) -> list[str]:
+            """Pretty-format optional tool-call payloads for the generation preview.
+
+            Args:
+                values: Per-completion tool-call metadata of any shape.
+                target_len: Desired output length, padded with the
+                    placeholder ``no_tools_message`` when missing.
+
+            Returns:
+                A list of length ``target_len`` containing pretty-printed
+                tool-call payloads or a friendly placeholder.
+            """
             normalized = self._coerce_generation_metadata_list(values, target_len=target_len)
             entries: list[str] = []
             for value in normalized:

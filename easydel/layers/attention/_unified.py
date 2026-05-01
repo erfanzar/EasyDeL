@@ -305,16 +305,59 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         use_gqa: bool = False,
         use_mla_lora: bool = False,
     ) -> None:
-        """Initialize unified attention module.
+        """Build the QKV/output projections, RoPE/ALiBi, and the attention performer.
+
+        The constructor reads the standard transformer attention quantities
+        from ``config`` (``hidden_size``, ``num_attention_heads``,
+        ``num_key_value_heads``, ``head_dim``) — falling back to sensible
+        defaults when fields are missing — and then delegates the actual
+        layer creation to :meth:`define_network`, which can be overridden
+        to swap in fused QKV / model-specific norms / partial-rotary RoPE.
 
         Args:
-            config: Model configuration
-            dtype: Data type for computations
-            param_dtype: Data type for parameters
-            precision: JAX precision setting
-            rngs: Random number generators
-            attention_type: Type of attention mechanism ("standard", "mla", "alibi")
-            causal: Whether to use causal (autoregressive) attention masking
+            config: Owning model config (an :class:`EasyDeLBaseConfig`
+                subclass). Provides hidden size, head counts, RoPE base,
+                attention dropout, optional ``head_dim``, ``rms_norm_eps``,
+                and ``attention_bias`` flags.
+            dtype: Compute dtype for projections, normalisations, and
+                attention. Defaults to ``bfloat16``.
+            param_dtype: Storage dtype for projection / norm parameters.
+                Defaults to ``bfloat16``.
+            precision: JAX matmul precision flag forwarded to every linear
+                in the block. ``None`` defers to the JIT compiler default.
+            rngs: SpecTrax random-number generators consumed in turn by
+                each created sub-module's parameter initializer.
+            layer_idx: Zero-based index of this layer in the decoder stack.
+                Recorded as a static field (see ``_spx_scan_safe_static_fields``)
+                so that scanned-stage attention layers stay trace-stable.
+            attention_type: Selects the forward path that :meth:`forward`
+                routes to:
+
+                * ``"standard"`` — RoPE-based MHA/GQA used by Llama, Mistral,
+                  Qwen, Gemma, etc.
+                * ``"mla"`` — Multi-head Latent Attention (DeepSeek V2/V3)
+                  with optional ``use_mla_lora`` query compression.
+                * ``"alibi"`` — ALiBi linear-bias attention (Falcon, MPT);
+                  rotary is replaced with a learned per-head slope.
+            causal: When ``True`` the attention performer applies a causal
+                mask. Set ``False`` for encoder-style cross attention.
+            sliding_window: Optional Mistral-style local window. Either an
+                integer (symmetric ``[w, w]``) or a ``(left, right)`` tuple.
+                ``None`` disables local masking; the kernel still applies
+                the causal mask when ``causal=True``.
+            use_qk_norm: Enable per-head RMSNorm on the query and key
+                tensors (Gemma3, Olmoe). Norms are created via
+                :meth:`_create_q_norm` / :meth:`_create_k_norm` and applied
+                in :meth:`_postprocess_qkv`.
+            use_fused_qkv: Use a single column-parallel linear that emits
+                concatenated ``[Q, K, V]`` (Phi-3, DBRX, MPT layout)
+                instead of three separate projections.
+            use_gqa: Documentation-only flag indicating GQA is in effect
+                — the actual GQA broadcasting follows from
+                ``num_key_value_heads < num_attention_heads`` regardless.
+            use_mla_lora: For ``attention_type="mla"``, switch to the
+                LoRA-compressed query path (``q_a_proj`` ->
+                ``q_a_layernorm`` -> ``q_b_proj``) used by DeepSeek V3.
         """
         super().__init__(config=config)
 
@@ -575,9 +618,28 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: jax.lax.Precision,
         rngs: PRNGKeyArray,
     ) -> ColumnParallelLinear:
-        """Create fused QKV projection (Phi3, DBRX, MPT style).
+        """Build the single fused ``[Q | K | V]`` projection (Phi-3 / DBRX / MPT).
 
-        Override this for models with fused QKV projections.
+        Returns a column-parallel linear of width
+        ``(num_heads + 2 * num_kv_heads) * head_dim`` so that one matmul
+        produces all three streams concatenated along the feature axis;
+        the caller (``forward_*``) is responsible for splitting the result
+        with the correct head counts (the K and V slices have
+        ``num_key_value_heads * head_dim`` features when GQA is in play).
+        Tensor-parallelism is preserved because the fused width still
+        partitions cleanly along the head axis.
+
+        Args:
+            config: Owning model config; ``hidden_size`` and the
+                ``attention_bias`` / ``initializer_range`` flags are read.
+            dtype: Compute dtype for the fused linear.
+            param_dtype: Storage dtype for the fused weight.
+            precision: JAX matmul precision flag.
+            rngs: SpecTrax RNGs supplying the parameter initializer key.
+
+        Returns:
+            A :class:`ColumnParallelLinear` mapping
+            ``hidden_size -> (num_heads + 2*num_kv_heads) * head_dim``.
         """
         qkv_size: int = (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim
         return ColumnParallelLinear(
@@ -650,22 +712,49 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         return q_rotated, k_rotated
 
     def _create_alibi_slopes(self, config: Cfg) -> None:
-        """Create ALiBi slope values for positional bias.
+        """Build the per-head ALiBi slopes ``m_i = 2^(-8(i+1)/n)``.
 
-        Override for custom ALiBi configuration.
+        Implements the geometric slope schedule from the ALiBi paper
+        (Press et al., 2022): each head ``i`` (1-indexed in the formula)
+        receives a fixed multiplicative slope that is applied to the
+        relative-position matrix to produce a head-specific positional
+        bias. The schedule places head 1 at ``2^(-8/n)`` (slowest decay,
+        global view) and head ``n`` at ``2^(-8)`` (fastest decay, local
+        view) so that different heads attend to different distance scales
+        for free.
+
+        Subclasses can override this method (for example, Falcon-180B
+        uses a non-power-of-two head count and falls back to a slightly
+        different schedule).
+
+        Args:
+            config: Owning model config (currently unused — present for
+                signature parity with subclass overrides).
         """
         n: int = self.num_heads
         slopes = jnp.array([2 ** (-8 * (i + 1) / n) for i in range(n)])
         self.alibi_slopes = slopes
 
     def _compute_alibi_bias(self, sequence_length: int) -> Float[Array, "num_heads seq_len seq_len"]:
-        """Compute ALiBi positional bias matrix.
+        """Materialize the ALiBi bias ``b_h[i, j] = m_h * (j - i)``.
+
+        Outer-products the per-head ALiBi slopes (from
+        :meth:`_create_alibi_slopes`) with the relative-position matrix
+        ``j - i`` (negative on the upper triangle, so the causal mask
+        kept downstream still produces sensible logits). This bias is
+        added to the attention logits *before* softmax in
+        :meth:`forward_alibi`.
 
         Args:
-            sequence_length: Length of the sequence
+            sequence_length: Number of tokens in the current attention
+                window. The returned bias is square ``seq_len x seq_len``;
+                with KV caching, the caller is responsible for slicing
+                rows/columns to match the actual Q/K lengths.
 
         Returns:
-            ALiBi bias tensor [num_heads, seq_len, seq_len]
+            Float array of shape ``[num_heads, seq_len, seq_len]`` ready
+            to broadcast against ``[batch, num_heads, seq_q, seq_k]``
+            logits.
         """
         # Create position indices
         positions = jnp.arange(sequence_length)

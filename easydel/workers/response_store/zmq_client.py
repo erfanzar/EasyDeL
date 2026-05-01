@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ZeroMQ client for communicating with the response store worker process."""
+"""ZMQ REQ-socket client for the Responses API state store worker.
+
+Exposes :class:`ResponseStoreWorkerClient`, the thin wrapper used by
+the API server to read and write OpenAI Responses API records
+(``response_id`` payloads and ``conversation_id`` histories) against
+the persistent :class:`FileResponseStore` running in the worker
+subprocess. Every public method maps 1:1 to a worker command and
+serialises the underlying ZMQ round-trip behind a lock so concurrent
+request handlers can share one client safely.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +45,14 @@ class ResponseStoreWorkerClient:
     """
 
     def __init__(self, endpoint: str):
+        """Connect a REQ socket to ``endpoint``.
+
+        Args:
+            endpoint: ZMQ endpoint URI to connect to. Must be non-empty.
+
+        Raises:
+            ValueError: When ``endpoint`` is the empty string.
+        """
         if not endpoint:
             raise ValueError("Response store worker endpoint must be provided.")
         self._context = zmq.Context.instance()
@@ -45,6 +62,17 @@ class ResponseStoreWorkerClient:
         self._endpoint = endpoint
 
     def _request(self, payload: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Send a request and return the worker's response under a lock.
+
+        Args:
+            payload: Command dict consumed by ``worker_main``.
+
+        Returns:
+            dict[str, tp.Any]: The worker's response dict.
+
+        Raises:
+            RuntimeError: If the worker reported ``status == "error"``.
+        """
         with self._lock:
             self._socket.send_pyobj(payload)
             resp = tp.cast(dict[str, tp.Any], self._socket.recv_pyobj())
@@ -144,8 +172,20 @@ class ResponseStoreWorkerClient:
 
     @property
     def endpoint(self) -> str:
+        """Return the ZMQ endpoint this client is connected to.
+
+        Returns:
+            str: The endpoint URI passed to the constructor.
+        """
         return self._endpoint
 
     @property
     def enabled(self) -> bool:
+        """Whether the client is active.
+
+        Returns:
+            bool: Always ``True`` for this client; provided for interface
+            compatibility with stub clients used when persistence is
+            disabled.
+        """
         return True

@@ -56,16 +56,48 @@ def _ensure_state(
 
 @Registry.register("trainer", "xpo")
 class XPOTrainer(GRPOTrainer):
-    """Trainer for Exploratory Preference Optimization (XPO).
+    """Online Exploratory Preference Optimization trainer.
 
-    XPO extends preference optimization by combining DPO-style learning with an
-    exploratory term that encourages the policy to maintain probability mass on
-    reference completions. The trainer samples completions from both the policy
-    and reference models, compares their rewards, and optimizes using preference
-    pairs while adding an exploratory regularization term.
+    XPO is an online preference-learning algorithm that interleaves
+    DPO-style preference distillation with an explicit exploration
+    bonus encouraging the policy to keep probability mass on
+    *reference-policy* completions. Each training step:
+
+    1. Samples one completion per prompt from the *current policy*
+       (``state``) and one from a frozen *reference policy*
+       (``self.ref_state``).
+    2. Scores both completions through the configured single reward
+       function (callable or in-process reward model). Optionally
+       applies a missing-EOS penalty to discourage truncated outputs.
+    3. Forms a per-prompt preference pair: ``chosen`` is whichever
+       sample has the higher reward, ``rejected`` is the other.
+    4. Inside :func:`xpo_step` differentiates the joint loss
+
+       ``L = L_DPO(beta; chosen, rejected, ref_state) + alpha * L_exp``
+
+       where ``L_DPO`` is the standard ``"sigmoid"`` Bradley-Terry log-
+       sigmoid surrogate (or the IPO squared-margin loss when
+       ``loss_type="ipo"``), ``L_exp`` is the negative mean policy
+       log-probability of the *reference* completion, and both ``beta``
+       and ``alpha`` come from the schedules in :class:`XPOConfig`.
+
+    Compared to :class:`GRPOTrainer`, XPO fixes
+    ``num_return_sequences=1`` because the *exploration* sample comes
+    from the reference policy rather than from group sampling, and the
+    reward model is restricted to a single function.
 
     Attributes:
-        arguments: XPO-specific configuration including loss type, beta, and alpha schedules.
+        arguments: :class:`XPOConfig` carrying loss type, beta/alpha
+            schedules, reference-model sync cadence, and all GRPO-
+            inherited generation/sampling knobs.
+        ref_state: Frozen reference policy used both as a generation
+            source for the exploratory sample and as the KL anchor in
+            the DPO loss. Can be supplied via ``reference_model`` or
+            initialised from a deep copy of the policy.
+        loss_type_id: Integer code derived from
+            ``arguments.loss_type`` (``0`` for ``"sigmoid"``, ``1`` for
+            ``"ipo"``); broadcast into the batch so the JITted
+            :func:`xpo_step` can branch without retracing.
     """
 
     arguments: XPOConfig
@@ -169,14 +201,40 @@ class XPOTrainer(GRPOTrainer):
         return self._schedule_value(self._alpha_schedule, 1e-5)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and compile the training and evaluation step functions.
+        """Compile the XPO training and evaluation step functions.
 
-        Sets up JIT-compiled functions with appropriate sharding specifications
-        for distributed training, including both training and evaluation steps.
+        XPO needs the *current policy* state, the prepared preference
+        batch, *and* the frozen reference state inside the compiled
+        step so :func:`xpo_step` can score the chosen / rejected /
+        reference completions in one go. This method:
+
+        * Resolves the optional straight-through emulator from the
+          configured quantisation knobs so the policy forward can be
+          traced under simulated quantisation while the gradient path
+          stays differentiable.
+        * Caches the static-argument tuples for both phases under
+          ``self._train_shared_fn_static_args`` /
+          ``self._eval_shared_fn_static_args``; the eval tuple sets
+          ``is_training=False`` so the optimiser branch in
+          :func:`xpo_step` is short-circuited.
+        * JITs :func:`xpo_step` twice -- once with state donation and
+          a ``(state, metrics)`` output for training, once without
+          donation and metrics-only output for evaluation. Sharding is
+          ``(state_shardings, replicated_batch, ref_state_shardings)``
+          so the reference state is consumed in place without being
+          re-sharded.
+        * Records the reference state as the single extra positional
+          argument forwarded by the trainer loop into both compiled
+          steps (``self._train_shared_fn_extra_args`` /
+          ``self._eval_shared_fn_extra_args``).
+
+        Side effects:
+            Ensures the checkpoint directory exists.
 
         Returns:
-            TrainerConfigureFunctionOutput containing compiled step functions,
-            mesh configuration, and checkpoint manager.
+            A :class:`TrainerConfigureFunctionOutput` carrying both
+            compiled step functions, the active mesh, and the streaming
+            checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)

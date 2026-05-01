@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Monitoring mixin for the eSurge engine.
+
+Wires Prometheus exporters, optional Grafana auto-spawn, the rich-console live
+monitor, and metric snapshot helpers into :class:`eSurge`. Methods include
+``start_monitoring`` / ``stop_monitoring``, plus helpers to record per-request
+and per-step metrics into the shared :class:`MetricsCollector`.
+
+Exposes :class:`EngineMonitoringMixin`, mixed into :class:`eSurge`.
+"""
+
 from __future__ import annotations
 
 import json
@@ -38,7 +48,38 @@ def _panel(
     unit: str = "",
     legend_mode: str = "list",
 ) -> dict:
-    """Build a single Grafana dashboard panel dict."""
+    """Assemble one Grafana panel JSON object with a single Prometheus query.
+
+    Encapsulates the Grafana 9+ panel schema (datasource ref, ``targets``,
+    ``fieldConfig`` defaults, ``gridPos``, default ``options``) so the
+    dashboard model can list panels by their semantic intent (title /
+    expr / unit / position) without restating the boilerplate. Switches
+    to the ``stat``-panel-specific ``options`` shape automatically when
+    ``panel_type == "stat"``.
+
+    Args:
+        title: Human-readable panel title shown in the dashboard.
+        expr: Prometheus PromQL expression evaluated for this panel's
+            single target.
+        ds_uid: Datasource UID matching the auto-provisioned Prometheus
+            datasource the engine writes alongside the dashboard.
+        grid_x, grid_y: Top-left grid coordinates in Grafana's 24-column
+            layout.
+        grid_w, grid_h: Width / height in grid cells. Default ``12 x 8``
+            yields half-width, half-height panels.
+        panel_id: Numeric Grafana panel id; must be unique within the
+            dashboard JSON.
+        panel_type: Grafana panel kind (``"timeseries"``, ``"stat"``, …).
+            Anything other than ``"stat"`` keeps the default time-series
+            options.
+        unit: Grafana display unit (``"s"``, ``"ops"``, ``"percentunit"``,
+            …) applied to ``fieldConfig.defaults.unit``.
+        legend_mode: Legend display mode for non-stat panels.
+
+    Returns:
+        Plain ``dict`` suitable for inclusion in a Grafana dashboard
+        JSON model.
+    """
     target = {
         "datasource": {"type": "prometheus", "uid": ds_uid},
         "expr": expr,
@@ -66,7 +107,23 @@ def _panel(
 
 
 def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
-    """Return a complete Grafana dashboard dict for eSurge metrics."""
+    """Construct the canonical eSurge engine-overview dashboard JSON model.
+
+    Lays out the standard panel set in a 24-column Grafana grid: four
+    summary stats on row 0 (tokens/s, running, waiting, batch size), a pair
+    of time-series throughput / request-latency charts, the time-to-
+    first-token and schedule-duration latency rows, three cache-utilization
+    panels, and finally the model-execution and tokens-generated charts.
+
+    Args:
+        datasource_uid: UID of the Prometheus datasource that the engine's
+            provisioning step will create. Embedded into every panel's
+            target so the dashboard auto-binds to the right datasource.
+
+    Returns:
+        Grafana dashboard JSON model (a ``dict``) ready to be POSTed to
+        ``/api/dashboards/db`` or written under ``dashboard_json/``.
+    """
     panels = [
         _panel("Tokens / sec", "esurge_tokens_per_second", datasource_uid, 0, 0, 6, 4, 1, "stat", "ops"),
         _panel("Running Requests", "esurge_running_requests", datasource_uid, 6, 0, 6, 4, 2, "stat", "short"),

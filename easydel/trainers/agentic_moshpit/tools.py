@@ -220,6 +220,14 @@ def register_tool(name: str) -> tp.Callable[[type[Tool]], type[Tool]]:
     """
 
     def decorator(cls: type[Tool]) -> type[Tool]:
+        """Register ``cls`` under the captured name and return it unchanged.
+
+        Args:
+            cls: The :class:`Tool` subclass being registered.
+
+        Returns:
+            ``cls``, returned so the decorator chain stays composable.
+        """
         _TOOL_REGISTRY[name] = cls
         return cls
 
@@ -375,6 +383,13 @@ class PythonCodeTool(Tool):
     """
 
     def __init__(self, timeout: float = 10.0, max_output_length: int = 4096):
+        """Configure the Python tool's execution sandbox.
+
+        Args:
+            timeout: Maximum wall-clock time per ``exec`` call (seconds).
+            max_output_length: Maximum number of characters returned from
+                stdout/stderr capture; longer outputs are truncated.
+        """
         self._timeout = timeout
         self._max_output_length = max_output_length
 
@@ -391,6 +406,15 @@ class PythonCodeTool(Tool):
         try:
 
             def _timeout_handler(signum, frame):
+                """Raise ``TimeoutError`` from a ``SIGALRM`` interrupt.
+
+                Args:
+                    signum: Signal number (ignored).
+                    frame: Current stack frame (ignored).
+
+                Raises:
+                    TimeoutError: Always.
+                """
                 raise TimeoutError(f"Code execution timed out after {self._timeout}s")
 
             old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
@@ -501,6 +525,14 @@ class BashTool(Tool):
         max_output_length: int = 8192,
         shell: str = "/bin/bash",
     ):
+        """Configure the bash tool's subprocess sandbox.
+
+        Args:
+            timeout: Maximum wall-clock time per command (seconds).
+            max_output_length: Maximum bytes of combined stdout/stderr
+                to return; longer outputs are truncated.
+            shell: Path to the shell binary used to interpret commands.
+        """
         self._timeout = timeout
         self._max_output_length = max_output_length
         self._shell = shell
@@ -582,6 +614,18 @@ class JSONProcessorTool(Tool):
 
     @staticmethod
     def _query(data: tp.Any, path: str) -> str:
+        """Walk a parsed JSON value with a dotted path and return the result.
+
+        Args:
+            data: Parsed JSON value (dict / list / primitive).
+            path: Dot-separated key path; numeric segments index into
+                lists.
+
+        Returns:
+            The selected sub-tree pretty-printed as JSON, the raw string
+            for string leaves, or an error message when the path cannot
+            be resolved.
+        """
         keys = path.split(".") if path else []
         current = data
         for key in keys:
@@ -607,6 +651,14 @@ class WikipediaTool(Tool):
     """
 
     def __init__(self, language: str = "en", max_length: int = 4096):
+        """Configure the Wikipedia summary tool.
+
+        Args:
+            language: ISO language code used in the API host
+                (e.g. ``"en"`` for English).
+            max_length: Maximum number of characters returned from the
+                article extract; longer extracts are truncated.
+        """
         self._language = language
         self._max_length = max_length
 
@@ -643,6 +695,13 @@ class WebFetchTool(Tool):
     """
 
     def __init__(self, timeout: float = 15.0, max_length: int = 8192):
+        """Configure the HTTP fetch tool.
+
+        Args:
+            timeout: ``urlopen`` timeout in seconds.
+            max_length: Maximum number of characters of response body
+                returned; longer bodies are truncated.
+        """
         self._timeout = timeout
         self._max_length = max_length
 
@@ -687,6 +746,15 @@ class FileReadTool(Tool):
         allowed_dirs: list[str] | None = None,
         max_length: int = 16384,
     ):
+        """Configure the file-read sandbox.
+
+        Args:
+            allowed_dirs: Optional list of absolute directories that the
+                tool is allowed to read from.  An empty list (the
+                default) disables the directory check entirely.
+            max_length: Maximum number of characters returned from a
+                single file; longer files are truncated.
+        """
         self._allowed_dirs = allowed_dirs or []
         self._max_length = max_length
 
@@ -779,6 +847,7 @@ class NotepadTool(Tool):
     """Persistent scratch-pad that survives across turns within an episode."""
 
     def __init__(self):
+        """Initialize the notepad with an empty buffer."""
         self._content: str = ""
 
     def call(self, action: str, text: str = "") -> str:
@@ -824,6 +893,7 @@ class FunctionTool(Tool):
 
     @property
     def name(self) -> str:
+        """Return the configured tool name (overrides registry detection)."""
         return self.tool_name
 
     def call(self, **kwargs: tp.Any) -> str:

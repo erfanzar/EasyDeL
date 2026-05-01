@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of Shanghai AI Lab's InternLM2 decoder language model.
+
+InternLM2 is a decoder-only transformer optimised for bilingual (English /
+Chinese) understanding and generation. It uses grouped-query attention with
+RoPE, RMSNorm pre-normalization, and a SiLU-gated MLP, plus optional bias
+terms in attention and MLP layers.
+
+Architectural traits:
+    - Grouped-query attention with optional Q/K/V/output bias.
+    - Rotary positional embeddings (configurable ``rope_theta`` / scaling).
+    - RMSNorm pre-norm and gated SwiGLU MLP.
+    - Optional layer scanning and pre-training tensor parallelism.
+
+Exports:
+    - :class:`InternLM2Model`: Backbone returning hidden states.
+    - :class:`InternLM2ForCausalLM`: Decoder LM with optional tied LM head.
+    - :class:`InternLM2ForSequenceClassification`: Pooled classifier head.
+"""
 
 import functools
 from typing import ClassVar
@@ -97,6 +115,20 @@ class InternLM2Attention(UnifiedAttention):
         )
 
     def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create the fused query-key-value projection (HF ``wqkv``).
+
+        Args:
+            config: Model configuration providing hidden size, head counts, and
+                ``initializer_range``.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+
+        Returns:
+            ColumnParallelLinear: Combined Q/K/V projection with output size
+            ``(num_attention_heads + 2 * num_key_value_heads) * head_dim``.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim,
@@ -109,6 +141,19 @@ class InternLM2Attention(UnifiedAttention):
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create the attention output projection (HF ``wo``).
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+
+        Returns:
+            RowParallelLinear: Output projection from
+            ``num_attention_heads * head_dim`` back to ``hidden_size``.
+        """
         return RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,

@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Requests mixin for the eSurge engine.
+
+Centralizes per-request bookkeeping: id generation, ``EngineRequest``
+construction, scheduler enqueue/cancel, finished-output draining, and the
+streaming wakeup events used by :meth:`eSurge.stream`.
+
+Exposes :class:`EngineRequestsMixin`, mixed into :class:`eSurge`.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -32,7 +41,19 @@ from ..utils import truncate_tokens
 
 
 def _set_requested_new(sp, n: int):
-    """Set the max_tokens or max_new_tokens attribute on a SamplingParams object."""
+    """Write ``n`` to whichever max-tokens field the SamplingParams flavour exposes.
+
+    Different OpenAI-compatible client libraries spell the cap as
+    ``max_tokens`` (Chat Completions) or ``max_new_tokens`` (HF-style). The
+    engine accepts either, so when the context-length manager needs to clamp
+    the requested generation budget it writes the new value to *both* fields
+    (when present) so subsequent reads agree.
+
+    Args:
+        sp: SamplingParams-like instance (or any object exposing one or both
+            of the two attribute names).
+        n: New cap, written as ``int(n)``.
+    """
     if hasattr(sp, "max_tokens"):
         sp.max_tokens = int(n)
     if hasattr(sp, "max_new_tokens"):
@@ -60,7 +81,24 @@ class EngineRequestsMixin:
         prompt_text: str,
         prompt_token_ids: Sequence[int],
     ) -> None:
-        """Configure prompt context on a request-scoped reasoning parser."""
+        """Hand the prompt context to a fresh reasoning parser, swallowing failures.
+
+        Each request gets its own reasoning-parser instance (so per-request
+        parser state — open reasoning blocks, partial deltas, etc. — does
+        not leak across requests). Some parsers want the prompt up front so
+        they can pre-anchor their state machine; this helper invokes their
+        ``configure_prompt_context`` hook and demotes any exception to a
+        DEBUG log so a misbehaving parser cannot block request enqueue.
+
+        Args:
+            reasoning_parser: Per-request parser instance, or ``None`` when
+                the engine has no reasoning parser configured.
+            prompt_text: Detokenized prompt string passed verbatim to the
+                hook.
+            prompt_token_ids: Token-id sequence corresponding to
+                ``prompt_text``; some parsers prefer ids over text for
+                position alignment.
+        """
         if reasoning_parser is None:
             return
         try:
@@ -441,15 +479,24 @@ class EngineRequestsMixin:
         )
 
     def _generate_request_id(self) -> str:
-        """Generate a unique request ID with overflow protection.
+        """Allocate a fresh request id under the counter lock.
 
-        In multi-host mode, uses a deterministic counter-only format so all
-        JAX processes produce identical IDs for the same request sequence.
-        In single-host mode, uses UUID for uniqueness plus a counter for
-        ordering.
+        Two formats are produced depending on the JAX process count:
+
+        * Multi-host (``jax.process_count() > 1``) — the id is purely
+          counter-based (``req-{counter:010d}``) so every host generates
+          the *same* sequence of ids when handed the same input order.
+          This is essential because the SPMD/MPMD runner and distributed
+          control plane key on request id when verifying step digests
+          across ranks.
+        * Single-host — combines a UUID4 hex with the counter
+          (``req-{uuid}-{counter}``) so ids are unique even across engine
+          restarts while keeping a useful arrival-order suffix for logs.
+
+        The internal counter wraps at 2**32 to bound id length.
 
         Returns:
-            Unique request ID string.
+            Newly-allocated request id string.
         """
         with self._counter_lock:
             self._request_counter = (self._request_counter + 1) % (1 << 32)
@@ -458,13 +505,39 @@ class EngineRequestsMixin:
             return f"req-{uuid.uuid4().hex}-{self._request_counter}"
 
     def abort_request(self, request_id: str) -> None:
-        """Abort an in-progress request.
+        """Cancel a request and release every resource it holds.
 
-        Marks the request as aborted and signals any waiting threads.
-        The request will be removed from the scheduler queue if still waiting.
+        Atomic abort under all three engine locks (scheduler, request,
+        output) so no other thread can observe a half-aborted state. The
+        method:
+
+        1. Resolves whether ``request_id`` is the parent or one of the
+           ``n>1`` sample children, and gathers the full set of scheduler-
+           side ids that must be terminated.
+        2. Calls :meth:`Scheduler.finish_requests` with
+           ``FINISHED_ABORTED`` to evict the request rows and free their
+           pages.
+        3. Marks the parent ``RequestOutput`` (and the appropriate sample
+           slot for child aborts) as finished with ``finish_reason="abort"``.
+        4. Resets the streaming detokenizer state for each terminated id;
+           failures here are absorbed and re-tried later by
+           :meth:`_cleanup_detokenizer_state`.
+        5. Wakes any thread blocked in :meth:`generate` / :meth:`stream`
+           / :meth:`_wait_for_request` so it can observe the new finished
+           state.
 
         Args:
-            request_id: ID of the request to abort.
+            request_id: Identifier of the request to abort. May be the
+                parent id (terminates all sample children) or a child id
+                of the form ``"{parent}-{sample_idx}"`` (terminates only
+                that sample, marking the parent finished once every sample
+                has terminated).
+
+        State on exit: the request is no longer in
+        ``_active_requests`` / ``_request_events``, the scheduler has
+        released its row and pages, and the output object reflects the
+        abort. A best-effort log line records the before/after queue
+        counts for postmortem.
         """
         detokenizer_reset_ids: set[str] = set()
         parent_request_id = request_id
@@ -629,20 +702,31 @@ class EngineRequestsMixin:
 
     @property
     def num_pending_requests(self) -> int:
-        """Get the number of requests waiting in queue.
+        """Number of requests admitted to the scheduler but not yet running.
+
+        Acquires the scheduler lock to take a consistent snapshot of
+        ``scheduler.waiting``. Surfaced for monitoring dashboards and the
+        idle-reset watchdog (which only frees state when both pending and
+        running counts are zero).
 
         Returns:
-            Count of requests in the waiting queue.
+            Length of the scheduler's waiting queue at this instant.
         """
         with self._scheduler_lock:
             return len(self.scheduler.waiting)
 
     @property
     def num_running_requests(self) -> int:
-        """Get the number of actively running requests.
+        """Number of requests currently holding KV pages and being decoded.
+
+        Mirrors :attr:`num_pending_requests` but reads
+        ``scheduler.running``. The two together represent the engine's
+        in-flight workload — both must drop to zero before
+        :meth:`update_model_weights` or :meth:`release_model_state` will
+        proceed.
 
         Returns:
-            Count of requests currently being processed.
+            Length of the scheduler's running queue at this instant.
         """
         with self._scheduler_lock:
             return len(self.scheduler.running)

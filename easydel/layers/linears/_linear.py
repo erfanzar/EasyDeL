@@ -12,38 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linear layers with parallel and distributed computation support.
+"""Tensor-parallel linear layers (column-, row-, and unsharded variants).
 
-Provides optimized linear layers with support for model parallelism,
-tensor parallelism, and various sharding strategies for distributed training.
+The classes here are the workhorse projections used inside attention QKV /
+output projections and MLP gate/up/down matmuls throughout EasyDeL. They wrap
+``spectrax.Parameter`` weights with explicit :class:`TensorLayout` shardings
+so that the same module can run unsharded on a single device, FSDP-sharded
+along the contraction axis, or tensor-parallel along the output axis without
+the caller having to build different objects.
 
-Classes:
-    ParallelLinear: Linear layer with tensor/model parallelism support.
-    RowParallelLinear: Row-parallel variant (input dimension partitioned).
-    ColumnParallelLinear: Column-parallel variant (output dimension partitioned).
+The matmul itself is written with ``jnp.einsum`` and respects ``self.dtype``
+for compute and ``self.param_dtype`` for storage; both are decoupled so that
+e.g. fp4-stored weights can still be matmul'd in bf16. Conversion to a
+quantized clone of the same layer is provided by :meth:`to_quantized`,
+preserving direction and the runtime distributed-matmul hook.
 
-Key Features:
-    - Automatic sharding and gathering for distributed training
-    - Support for various matrix multiplication methods
-    - Mixed precision support
-    - Efficient initialization strategies with configurable scaling
-    - Integration with JAX's shard_map
-    - Conversion to quantized variants
+Layer summary:
 
-Example:
-    >>> from easydel.layers.linears import ParallelLinear
-    >>> import spectrax as spx
-from spectrax import nn
-    >>>
-    >>> # Create a parallel linear layer
-    >>> layer = ParallelLinear(
-    ...     in_features=768,
-    ...     out_features=3072,
-    ...     use_bias=True,
-    ...     dtype=jnp.bfloat16,
-    ...     rngs=spx.Rngs(0)
-    ... )
-    >>> output = layer(input_tensor)
+* :class:`ParallelLinear` – base class, ``_direction = None`` (replicated),
+  also the default for layers that are not explicitly tensor-parallel.
+* :class:`RowParallelLinear` – input axis is sharded across the TP mesh axis;
+  output is replicated and requires an all-reduce on the partial sums in the
+  caller's mesh. Use as the *second* projection in an MLP.
+* :class:`ColumnParallelLinear` – output axis is sharded across the TP mesh;
+  no comm needed at the matmul itself, but downstream consumers must handle
+  the sharded output (typically followed by a row-parallel layer that
+  consumes the same TP partition).
 """
 
 from __future__ import annotations
@@ -63,6 +57,20 @@ from easydel.layers.quantization._configs import QuantizationConfig
 
 
 def promote_dtype(values, *, dtype=None):
+    """Cast a tuple of arrays to a shared dtype.
+
+    Lightweight replacement for ``flax.linen.dtypes.promote_dtype`` that simply
+    forwards everything through ``jnp.asarray`` when a target dtype is given.
+
+    Args:
+        values: Iterable of arrays (or array-like values) to be promoted.
+        dtype: Target dtype to cast all values to. If ``None``, the inputs are
+            returned unchanged.
+
+    Returns:
+        Tuple of arrays cast to ``dtype`` if specified, otherwise the original
+        ``values`` argument unchanged.
+    """
     if dtype is None:
         return values
     return tuple(jnp.asarray(v, dtype=dtype) for v in values)
@@ -83,58 +91,59 @@ default_bias_init = jax.nn.initializers.zeros
 
 
 class ParallelLinear(spx.Module):
-    """A linear transformation layer with optional parallelism support.
+    """Base linear layer ``y = scale * (x @ W) + b`` with explicit sharding hooks.
 
-        Behaves like `nn.Linear` but supports distributed computation and parameters
-        across multiple devices. This layer implements the transformation:
+    This is the workhorse linear projection used throughout EasyDeL — attention
+    QKV/output, MLP gate/up/down, classification heads, etc. The behaviour
+    mirrors a stock ``nn.Linear`` (matmul plus optional bias) but with three
+    extras geared for very large transformer training:
 
-            y = x @ W + b
+    * **Sharding-aware kernel placement.** The weight ``Parameter`` is created
+      with a :func:`sharding_for_layout` annotation derived from the subclass'
+      ``_direction``: ``RowWise`` for :class:`RowParallelLinear`, ``ColumnWise``
+      for :class:`ColumnParallelLinear`, ``Replicated`` (via ``None``) for the
+      base class. Bias placement follows the *output* axis of the kernel — see
+      :meth:`__init__` for the SRowWise/Replicated choice.
+    * **Optional output scaling.** ``scale`` may be a constant float, the
+      string ``"fan_in"`` (multiplies the output by ``in_features ** -0.5``,
+      muP-style residual rescaling) or ``"fan_out"`` (``out_features ** -0.5``).
+      Resolved once in ``__init__`` into a closure ``_scale_operator`` so the
+      forward pass has no Python branching.
+    * **Quantized friend pattern.** :meth:`to_quantized` returns a
+      :class:`RowParallelLinearQuantized` / :class:`ColumnParallelLinearQuantized`
+      twin built with :func:`jax.eval_shape` (so no data is materialized on the
+      conversion path) and the existing kernel/bias are restaged into it,
+      enabling post-training quantization in-place on a live state tree.
 
-        where W has shape (in_features, out_features) and b has shape (out_features,).
+    The compute path uses ``jnp.einsum`` with the appropriate subscript for
+    1-D vs ND inputs and respects ``precision`` (forwarded to the einsum).
 
-        The layer supports optional scaling of the output, which can be specified as
-        a fixed value or computed from the fan-in or fan-out dimensions.
-
-        Attributes:
-            in_features: Number of input features.
-            out_features: Number of output features.
-            use_bias: Whether to include a bias term. Default is True.
-            dtype: The dtype of the computation (defaults to inferred from input).
-            param_dtype: The dtype of the parameters. Default is float32.
-            precision: JAX precision for the dot product. Default is None.
-            kernel_init: Initializer for the kernel weights.
-            bias_init: Initializer for the bias.
-            kernel: Weight matrix parameter of shape (in_features, out_features).
-            bias: Optional bias parameter of shape (out_features,).
-            tp_merged: Number of tensor parallel merged outputs.
-            distributed_matmul: Optional distributed matrix multiplication function.
-            _direction: Parallelism direction ("row", "column", or None).
-
-        Example:
-            >>> from easydel.layers.linears import ParallelLinear
-            >>> import jax.numpy as jnp
-            >>> import spectrax as spx
-    from spectrax import nn
-            >>>
-            >>> # Create a basic linear layer
-            >>> layer = ParallelLinear(
-            ...     in_features=768,
-            ...     out_features=3072,
-            ...     rngs=spx.Rngs(0)
-            ... )
-            >>>
-            >>> # Forward pass
-            >>> x = jnp.ones((32, 768))
-            >>> y = layer(x)
-            >>> # y.shape = (32, 3072)
-            >>>
-            >>> # With fan-in scaling (useful for certain architectures)
-            >>> layer_scaled = ParallelLinear(
-            ...     in_features=768,
-            ...     out_features=3072,
-            ...     scale="fan_in",
-            ...     rngs=spx.Rngs(0)
-            ... )
+    Attributes:
+        in_features (int): Size of the input feature axis.
+        out_features (int | Sequence[int]): Size of the output feature axis.
+            When passed as a sequence, the kernel is built with width
+            ``sum(out_features)`` and ``tp_merged`` records the segmentation —
+            used for fused QKV / gate-up projections that are split downstream.
+        use_bias (bool): Whether the layer carries a learnable bias.
+        dtype (Dtype | None): Compute dtype. ``None`` defers to the input.
+        param_dtype (Dtype): Storage dtype for ``weight`` and ``bias``.
+        precision (PrecisionLike): JAX precision flag forwarded to the einsum.
+        kernel_init (Initializer): Weight initializer (default LeCun normal).
+        bias_init (Initializer): Bias initializer (default zeros).
+        weight (spx.Parameter[Array]): Kernel of shape
+            ``(in_features, sum(out_features))``, sharding determined by
+            ``_direction``.
+        bias (spx.Parameter[Array] | None): Bias of shape ``(out_features,)``,
+            ``None`` when ``use_bias=False``. Sharded ``SRowWise`` for
+            column-parallel layers, ``Replicated`` otherwise.
+        tp_merged (int): Number of fused output segments
+            (``len(out_features)`` if it is a sequence, else 1).
+        distributed_matmul (Any | None): Optional injectable matmul backend
+            (e.g. an all-gather-fused matmul); ``None`` means "use the
+            jit-compiler default", which is correct in almost every case.
+        _direction (Literal["row", "column"] | None): Class-level marker
+            consumed by :func:`sharding_for_layout` and by
+            :meth:`_quantized_friend` to pick the right quantized clone.
     """
 
     _direction: tp.Literal["row", "column"] | None = None
@@ -353,7 +362,23 @@ class ParallelLinear(spx.Module):
         *,
         w: Array | None = None,
     ) -> Shaped[Array, "... out_features"]:
-        """Trace-safe alias used by LM-head projection helpers."""
+        """Trace-safe alias to :meth:`forward` used by LM-head projection helpers.
+
+        ``make_lm_head_fn`` and the rematerialisation logic in the LM-head
+        path need a stable, non-overridable function name to call so that the
+        bypass remains trace-safe even when subclasses override ``forward``
+        for fused execution. This alias forwards verbatim and is intentionally
+        not decorated with ``@jax.named_scope`` so the LM-head profile
+        attribution stays clean.
+
+        Args:
+            inputs: Input tensor of shape ``(..., in_features)``.
+            w: Optional kernel override (e.g. a tied embedding matrix). When
+                ``None`` the layer's own ``self.weight.value`` is used.
+
+        Returns:
+            Output tensor of shape ``(..., out_features)``.
+        """
         return self.forward(inputs=inputs, w=w)
 
     def to_quantized(
@@ -432,58 +457,51 @@ class ParallelLinear(spx.Module):
 
 
 class RowParallelLinear(ParallelLinear):
-    """Row-parallel variant of ParallelLinear.
+    """:class:`ParallelLinear` with kernel sharded along the *contraction* axis.
 
-    This class specializes ParallelLinear for row-wise parallelism, where the
-    input dimension is partitioned across devices. In row parallelism, each device
-    holds a subset of input features and computes partial results that are then
-    reduced (summed) across devices.
+    The weight matrix is partitioned ``(TP, [FSDP, SP])`` so that the input
+    features axis (the one that gets contracted away in ``x @ W``) is split
+    across the tensor-parallel mesh axis. Each TP rank holds the rows of ``W``
+    corresponding to its slice of the input, computes a partial product, and
+    the all-reduce required to sum the partial outputs is left to the
+    surrounding mesh / shard_map / collective scheduler — this layer does
+    *not* call ``lax.psum`` itself.
 
-    Row parallelism is typically used for the second linear layer in a two-layer
-    MLP pattern, where the first layer is column-parallel:
+    Bias is replicated (the output axis is replicated under row-parallelism),
+    so the same bias is added on every TP rank after the all-reduce.
 
-        x -> [Column-Parallel] -> activation -> [Row-Parallel] -> y
-                                                     |
-                                                 all-reduce
+    Conventional usage is the second projection in an MLP::
 
-    Attributes:
-        _direction: Fixed to "row" to indicate row-wise parallelism.
+        h = ColumnParallelLinear(d, ff)(x)   # outputs sharded along TP
+        h = activation(h)
+        y = RowParallelLinear(ff, d)(h)      # contracts along TP, then all-reduce
 
-    Example:
-        >>> layer = RowParallelLinear(
-        ...     in_features=3072,
-        ...     out_features=768,
-        ...     rngs=spx.Rngs(0)
-        ... )
+    Sets ``_direction = "row"``; everything else is inherited from
+    :class:`ParallelLinear`.
     """
 
     _direction: tp.Literal["row"] = "row"
 
 
 class ColumnParallelLinear(ParallelLinear):
-    """Column-parallel variant of ParallelLinear.
+    """:class:`ParallelLinear` with kernel sharded along the *output* axis.
 
-    This class specializes ParallelLinear for column-wise parallelism, where the
-    output dimension is partitioned across devices. In column parallelism, each
-    device computes a different slice of the output features independently
-    without requiring any communication.
+    The weight matrix is partitioned ``([FSDP, SP], TP)`` so that the output
+    features axis is split across the tensor-parallel mesh axis. Each TP rank
+    holds a column block of ``W`` and produces an independent slice of the
+    output — no communication is needed at the matmul itself. The bias along
+    the output axis is correspondingly sharded ``SRowWise`` (one block per TP
+    rank); replicating it would double-count the bias.
 
-    Column parallelism is typically used for the first linear layer in a two-layer
-    MLP pattern:
+    Conventional usage is the first projection in an MLP, paired with a
+    downstream :class:`RowParallelLinear` that consumes the same TP partition::
 
-        x -> [Column-Parallel] -> activation -> [Row-Parallel] -> y
-                  |
-              no comm needed (outputs are sharded)
+        h = ColumnParallelLinear(d, ff)(x)   # outputs sharded along TP
+        h = activation(h)
+        y = RowParallelLinear(ff, d)(h)      # contracts along TP, then all-reduce
 
-    Attributes:
-        _direction: Fixed to "column" to indicate column-wise parallelism.
-
-    Example:
-        >>> layer = ColumnParallelLinear(
-        ...     in_features=768,
-        ...     out_features=3072,
-        ...     rngs=spx.Rngs(0)
-        ... )
+    Sets ``_direction = "column"``; everything else is inherited from
+    :class:`ParallelLinear`.
     """
 
     _direction: tp.Literal["column"] = "column"

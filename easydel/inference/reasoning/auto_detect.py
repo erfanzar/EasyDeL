@@ -279,6 +279,15 @@ def make_reasoning_stripper(
     unclosed_re = re.compile(rf"(?:{escaped_start_pattern}).*", re.DOTALL)
 
     def strip_reasoning(text: str) -> str:
+        """Remove reasoning blocks from ``text`` using the resolved tags.
+
+        Args:
+            text: Source text potentially containing reasoning markup.
+
+        Returns:
+            ``text`` with closed and unclosed reasoning sections removed and
+            outer whitespace stripped.
+        """
         result = closed_re.sub("", text)
         result = unclosed_re.sub("", result)
         return result.strip()

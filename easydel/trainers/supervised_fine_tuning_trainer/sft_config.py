@@ -23,28 +23,58 @@ from ..training_configurations import TrainingArguments
 @Registry.register("trainer-arguments", "sft")
 @dataclass
 class SFTConfig(TrainingArguments):
-    r"""
-    Configuration class for the [`SFTTrainer`].
+    r"""Hyperparameters and dataset knobs for :class:`SFTTrainer`.
 
-    Parameters:
-        model_name (str): The name of the model. Defaults to "SFTTrainer".
-        dataset_text_field (str, optional): Name of the text field of the dataset. If provided, the trainer will
-            automatically create a [`ConstantLengthDataset`] based on `dataset_text_field`. Defaults to None.
-        packing (bool, optional): Controls whether the [`ConstantLengthDataset`] packs the sequences of the
-            dataset. Defaults to False.
-        learning_rate (float, optional): Initial learning rate for [`AdamW`] optimizer. The default value replaces
-            that of [`~transformers.TrainingArguments`]. Defaults to 2e-5.
-        dataset_num_proc (int, optional): Number of processes to use for processing the dataset. Only used when
-            `packing=False`. Defaults to None.
-        dataset_batch_size (int, optional): Number of examples to tokenize per batch. If
-            `dataset_batch_size <= 0` or `dataset_batch_size is None`, tokenizes the full dataset as a single
-            batch. Defaults to 1000.
-        dataset_kwargs (dict[str, Any], optional): Dictionary of optional keyword arguments to pass when creating
-            packed or non-packed datasets. Defaults to None.
-        eval_packing (bool, optional): Whether to pack the eval dataset. If `None`, uses the same value as
-            `packing`. Defaults to None.
-        num_of_sequences (int, optional): Number of sequences to use for the [`ConstantLengthDataset`].
-            Defaults to 1024.
+    Supervised fine-tuning runs standard causal-LM cross-entropy on
+    chat-templated text, optionally restricted to assistant turns
+    (``assistant_only_loss``) and/or accelerated by sequence packing
+    (``packing``). The fields below extend
+    :class:`TrainingArguments` with SFT-specific dataset and packing
+    controls; everything else (optimiser, scheduler, sharding,
+    quantisation) is inherited unchanged.
+
+    Attributes:
+        trainer_prefix: Prefix used when naming logs / checkpoints /
+            W&B runs. Default: ``"SFT"``.
+        dataset_text_field: Name of the column carrying the chat-
+            templatable / pre-rendered text. Used by the SFT
+            preprocessing transform when assembling the loss target.
+            Default: ``"text"``.
+        add_special_tokens: When ``True`` the tokenizer is allowed to
+            inject BOS/EOS tokens during chat-template rendering. Most
+            chat templates already produce their own delimiters, so the
+            default is ``False`` to avoid double-BOS issues.
+        packing: When ``True`` short sequences are concatenated into
+            fixed-length blocks of ``max_length`` tokens to reduce
+            padding waste; concatenation respects per-sequence
+            attention boundaries via the document-id mask emitted by
+            the packing strategy.
+        packing_strategy: Selects the packing algorithm. ``"bfd"``
+            (best-fit decreasing, the default) sorts sequences by
+            descending length and greedily places them in the smallest
+            block that still has room. ``"wrapped"`` simply concatenates
+            sequences in order and wraps when the block fills up.
+        assistant_only_loss: When ``True`` the loss mask is restricted
+            to assistant turns produced by the chat template; prompt
+            and tool turns receive ``-100`` labels and contribute zero
+            gradient. Requires the dataset to be conversational (i.e.
+            chat-template renders messages with ``role`` markers).
+        learning_rate: Initial learning rate for the optimiser
+            constructed by :class:`TrainingArguments`. Default
+            ``2e-5`` overrides the base default.
+        dataset_num_proc: Number of worker processes used by the
+            dataset preprocessing pipeline. ``None`` runs sequentially.
+            Only honoured when ``packing=False``.
+        dataset_batch_size: Number of rows tokenised per worker call.
+            Set to ``<= 0`` or ``None`` to tokenise the full dataset
+            as a single batch.
+        dataset_kwargs: Extra keyword arguments forwarded to the
+            (packed or unpacked) dataset constructor; useful for opting
+            into experimental packing knobs without growing the config.
+        eval_packing: Optional eval-time override for ``packing``. When
+            ``None`` the eval pipeline mirrors the train-time setting.
+        num_of_sequences: Number of sequences buffered by the constant-
+            length dataset wrapper that backs sequence packing.
     """
 
     trainer_prefix: str | None = field(

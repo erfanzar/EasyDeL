@@ -12,7 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility functions for managing and manipulating SpectraX module states."""
+"""Utility functions for managing and manipulating SpectraX module states.
+
+This module collects the dictionary/PyTree helpers EasyDeL uses to bridge
+between checkpoint formats, parameter trees, and live :class:`spx.Module`
+instances. It includes:
+
+* Flat-dict helpers (``flatten_dict``/``unflatten_dict``/``flatten_tree``/
+  ``named_tree_map``) that operate on both raw dicts and JAX PyTrees.
+* :func:`merge_model_and_tree` for grafting a parameter dict onto an
+  existing SpectraX model state.
+* Module navigation helpers (``iter_module_search`` /
+  ``get_module_from_path`` / ``set_module_from_path``) for path-based
+  traversal of nested ``spx.Module`` graphs.
+* :class:`MetaValueRecreator` for deterministic counter/RNG stand-ins.
+"""
 
 import dataclasses
 import typing as tp
@@ -51,23 +65,46 @@ class MetaValueRecreator:
     """
 
     def __init__(self, seed: int = 42):
+        """Initialize the recreator with a deterministic PRNG seed.
+
+        Args:
+            seed: Integer seed used to build the initial PRNG key.
+        """
         self._count = 0
         self._rng = jax.random.PRNGKey(seed)
 
     def get_count(self) -> jnp.ndarray:
-        """Return the next counter value as a uint32 array and increment."""
+        """Return the next counter value as a uint32 array and increment.
+
+        Returns:
+            A scalar ``uint32`` JAX array equal to the current counter value.
+        """
         count = self._count
         self._count += 1
         return jnp.array(count, dtype=jnp.uint32)
 
     def get_rng(self) -> jax.random.PRNGKey:
-        """Split the internal PRNG key and return one half."""
+        """Split the internal PRNG key and return one half.
+
+        The other half is retained as the new internal key, so successive
+        calls produce independent keys.
+
+        Returns:
+            A fresh ``PRNGKey`` derived from the current internal key.
+        """
         key, self._rng = jax.random.split(self._rng)
         return key
 
 
 @dataclasses.dataclass
 class _EmptyNode:
+    """Sentinel value representing an empty dict node in flatten round-trips.
+
+    A single shared instance, ``empty_node``, is placed at paths whose
+    sub-trees were originally empty so that ``flatten_dict`` / ``unflatten_dict``
+    can preserve those structural holes when ``keep_empty_nodes=True``.
+    """
+
     pass
 
 
@@ -134,16 +171,54 @@ def string_key_to_int(xs):
 
 
 def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap=False):
+    """Internal recursive flattener used by :func:`flatten_dict`.
+
+    Args:
+        xs: Dictionary (or any value when ``fumap`` is ``True``) to flatten.
+        keep_empty_nodes: When ``True``, empty sub-dicts are preserved as
+            ``empty_node`` sentinels at their dotted path.
+        is_leaf: Optional ``(path, value) -> bool`` predicate that stops the
+            recursion early so that the value is treated as a leaf.
+        sep: Optional string separator. When provided, paths are joined into
+            strings; otherwise the original tuple paths are used.
+        fumap: When ``True``, accept non-dict top-level inputs and treat them
+            as already-leaves. Used by some callers to avoid pre-checks.
+
+    Returns:
+        A flat dict whose keys are tuples (or separated strings) of the path
+        from the root and whose values are the original leaves.
+
+    Raises:
+        TypeError: If ``xs`` is not a dict and ``fumap`` is ``False``.
+    """
     if not fumap:
         if not isinstance(xs, dict):
             raise TypeError(f"expected dict; got {type(xs)}")
 
     def _key(path):
+        """Format a path tuple into the requested key form (tuple or string).
+
+        Args:
+            path: Tuple of path segments accumulated during recursion.
+
+        Returns:
+            ``path`` unchanged when ``sep`` is ``None``, otherwise the
+            separator-joined string form.
+        """
         if sep is None:
             return path
         return sep.join(path)
 
     def _flatten(xs, prefix):
+        """Recursively walk ``xs`` accumulating leaves into a flat dict.
+
+        Args:
+            xs: Current sub-tree being processed.
+            prefix: Tuple of path segments leading to ``xs``.
+
+        Returns:
+            A flat dict for the current sub-tree, ready to be merged.
+        """
         if not isinstance(xs, dict) or (is_leaf and is_leaf(prefix, xs)):
             return {_key(prefix): xs}
         result = {}
@@ -162,11 +237,34 @@ def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap
 
 
 def is_iterable(obj):
-    """Check whether ``obj`` is an iterable (excluding strings)."""
+    """Check whether ``obj`` is an iterable.
+
+    Note that strings are considered iterable too; callers that want to
+    exclude them should add their own check.
+
+    Args:
+        obj: Any value.
+
+    Returns:
+        ``True`` if ``obj`` is an instance of ``collections.abc.Iterable``.
+    """
     return isinstance(obj, Iterable)
 
 
 def _dict_unflatten_dict(xs, sep=None):
+    """Internal helper used by :func:`unflatten_dict`.
+
+    Args:
+        xs: Flat dict produced by :func:`_dict_flatten_dict`.
+        sep: Separator used when paths were joined into strings; ``None``
+            when paths are tuples.
+
+    Returns:
+        A nested dict mirroring the path structure encoded in ``xs``.
+
+    Raises:
+        TypeError: If ``xs`` is not a dict.
+    """
     if not isinstance(xs, dict):
         raise TypeError(f"input is not a dict; it is a {type(xs)}")
     result = {}

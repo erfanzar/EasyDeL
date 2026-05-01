@@ -241,6 +241,20 @@ class RolloutManager:
         system_prompt: str | None = None,
         tool_schemas: list[dict[str, tp.Any]] | None = None,
     ):
+        """Cache the tokenizer and rollout limits.
+
+        Args:
+            tokenizer: Tokenizer used to apply chat templates and
+                tokenize observations.
+            max_steps: Maximum number of agent/environment interaction
+                steps per episode.
+            max_seq_length: Maximum cumulative trajectory length in
+                tokens (used to truncate state once exceeded).
+            system_prompt: Optional system prompt injected at the start
+                of every trajectory.
+            tool_schemas: Optional list of tool function-call schemas
+                forwarded to chat templates.
+        """
         self.tokenizer = tokenizer
         self.max_steps = max_steps
         self.max_seq_length = max_seq_length
@@ -288,6 +302,15 @@ class RolloutManager:
                 seeds.append(seed)
 
         def _unwrap(env: AgenticEnvironment) -> AgenticEnvironment:
+            """Unwrap a :class:`ToolEnvWrapper` and return the inner environment.
+
+            Args:
+                env: Possibly tool-wrapped environment.
+
+            Returns:
+                The inner environment when ``env`` is a
+                :class:`ToolEnvWrapper`, otherwise ``env`` unchanged.
+            """
             return env.env if isinstance(env, ToolEnvWrapper) else env
 
         inner_envs = [_unwrap(e) for e in envs]

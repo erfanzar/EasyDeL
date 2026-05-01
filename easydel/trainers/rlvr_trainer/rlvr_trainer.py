@@ -136,6 +136,51 @@ class RLVRTrainer(GRPOTrainer):
         external_reward_weights: list[float] | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
+        """Initialize the RLVR trainer.
+
+        Builds the reward function list from the verifier-related fields
+        on ``arguments``, appends any user-provided rewarders, validates
+        the matching reward processing classes, and forwards everything
+        to :class:`GRPOTrainer`.
+
+        Args:
+            arguments (RLVRConfig): Training configuration.
+            model (EasyDeLBaseModule | EasyDeLState | None): Policy
+                model or pre-built state.
+            reward_funcs (RewardFunc | list[RewardFunc] | None):
+                Backwards-compatible alias for additional reward
+                functions appended to the verifier ensemble.
+            external_reward_funcs (RewardFunc | list[RewardFunc] | None):
+                Explicit external reward functions appended after
+                built-in verifiers.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset with prompts and verifier sideband
+                fields (e.g. gold answer column).
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation dataset(s).
+            processing_class (ProcessingClassType | None): Tokenizer or
+                processor for prompt encoding and generation.
+            reward_processing_classes (ProcessingClassType | None):
+                Processing classes for the entire reward function list.
+                Mutually exclusive with
+                ``external_reward_processing_classes``.
+            external_reward_processing_classes (ProcessingClassType |
+                list[ProcessingClassType] | None): Processing classes
+                applying only to ``external_reward_funcs``; verifiers
+                are padded with ``None``.
+            external_reward_weights (list[float] | None): Optional
+                weights for external reward functions. When omitted the
+                trainer falls back to ``arguments.reward_weights`` or
+                ``[1.0, 1.0, ...]``.
+            data_tokenize_fn (tp.Callable | None): Optional custom
+                tokenization function forwarded to the GRPO trainer.
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`RLVRConfig`.
+            ValueError: If reward-weight / reward-function counts are
+                inconsistent or if no verifier or external rewarder is
+                ultimately configured.
+        """
         if not isinstance(arguments, RLVRConfig):
             raise TypeError(f"arguments must be RLVRConfig, got {type(arguments)}")
 
@@ -194,8 +239,15 @@ class RLVRTrainer(GRPOTrainer):
     def _build_verifiers(config: RLVRConfig) -> tuple[list[tp.Callable], list[float]]:
         """Construct reward verifiers from config.
 
+        Args:
+            config (RLVRConfig): Training configuration.
+
         Returns:
-            Tuple of (verifier_list, weight_list).
+            tuple[list[tp.Callable], list[float]]: ``(verifier_list,
+            weight_list)`` -- two equal-length lists ordered as
+            ``MathVerifier``, ``FormatVerifier``, ``LengthPenaltyVerifier``
+            (only the verifiers whose corresponding config fields are set
+            are included).
         """
         verifiers: list[tp.Callable] = []
         weights: list[float] = []
@@ -218,6 +270,16 @@ class RLVRTrainer(GRPOTrainer):
     def _coerce_reward_func_list(
         reward_funcs: RewardFunc | list[RewardFunc] | None,
     ) -> list[RewardFunc]:
+        """Normalize an optional rewarder argument into a list.
+
+        Args:
+            reward_funcs (RewardFunc | list[RewardFunc] | None): A
+                single rewarder, a list of rewarders, or ``None``.
+
+        Returns:
+            list[RewardFunc]: A (possibly empty) list of reward
+            functions.
+        """
         if reward_funcs is None:
             return []
         return list(reward_funcs) if isinstance(reward_funcs, list) else [reward_funcs]
@@ -229,6 +291,26 @@ class RLVRTrainer(GRPOTrainer):
         expected_len: int,
         field_name: str,
     ) -> list[ProcessingClassType | None]:
+        """Normalize an optional processing-class arg into a fixed-length list.
+
+        Args:
+            processing_classes (ProcessingClassType |
+                list[ProcessingClassType] | None): Tokenizer / processor
+                spec for one or more reward functions.
+            expected_len (int): Required output length.
+            field_name (str): Name of the underlying field (used in
+                error messages).
+
+        Returns:
+            list[ProcessingClassType | None]: Output list of length
+            ``expected_len``. ``None`` placeholders are inserted when
+            ``processing_classes`` is ``None``.
+
+        Raises:
+            ValueError: If a list is supplied whose length does not
+                match ``expected_len``, or if a single processor is
+                supplied for a multi-rewarder ensemble.
+        """
         if expected_len == 0:
             return []
         if processing_classes is None:
@@ -252,6 +334,32 @@ class RLVRTrainer(GRPOTrainer):
         reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None,
         external_reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None,
     ) -> list[ProcessingClassType | None] | None:
+        """Merge processing-class specifications into a single ordered list.
+
+        Either ``reward_processing_classes`` (for the entire ensemble)
+        or ``external_reward_processing_classes`` (for the external
+        rewarders only, with built-in verifiers padded with ``None``)
+        may be supplied -- not both.
+
+        Args:
+            verifier_count (int): Number of built-in verifiers.
+            external_reward_count (int): Number of external rewarders.
+            reward_processing_classes (ProcessingClassType |
+                list[ProcessingClassType] | None): Processing classes
+                covering the full reward list.
+            external_reward_processing_classes (ProcessingClassType |
+                list[ProcessingClassType] | None): Processing classes
+                covering only the external rewarders.
+
+        Returns:
+            list[ProcessingClassType | None] | None: Combined ordered
+            list ready to be passed to :class:`GRPOTrainer`, or ``None``
+            when there are no rewarders.
+
+        Raises:
+            ValueError: If both processing-class arguments are provided
+                simultaneously.
+        """
         if external_reward_processing_classes is not None and reward_processing_classes is not None:
             raise ValueError(
                 "Pass either `reward_processing_classes` for the full reward list or "

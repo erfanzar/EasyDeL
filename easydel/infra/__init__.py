@@ -183,4 +183,10 @@ def __getattr__(name: str):  # pragma: no cover
 
 
 def __dir__():  # pragma: no cover
+    """Return the union of module globals and ``__all__`` for ``dir()`` callers.
+
+    Returns:
+        list[str]: Sorted attribute names, including lazy attributes resolved
+            by :func:`__getattr__` that are not present in ``globals()``.
+    """
     return sorted(set(globals().keys()) | set(__all__))

@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen3-MoE model implementation for EasyDeL.
+
+This module implements the Mixture-of-Experts variant of Qwen3. It
+preserves Qwen3's attention/decoder skeleton (RMSNorm, GQA with per-head
+QK-norm, RoPE, layer-type-aware masking) and replaces the dense MLP
+with a sparse routed MoE block.
+
+Components:
+- :class:`Qwen3MoeAttention` and :class:`Qwen3MoeDecoderLayer` provide
+  per-layer transformer logic.
+- :class:`Qwen3MoeSparseMoeBlock` performs token-to-expert routing.
+- :class:`Qwen3MoeModel` is the transformer trunk; :class:`Qwen3MoeForCausalLM`
+  wraps it with an LM head and the load-balancing auxiliary loss.
+"""
 
 import typing
 from functools import partial
@@ -720,6 +734,13 @@ class Qwen3MoeModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden
+            states, attention weights and MoE router logits, and returns
+            the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1060,5 +1081,10 @@ class Qwen3MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen3Mo
         return self.model.get_embedding()
 
     def get_task_head(self):
-        """Returns the sequence classification head."""
+        """Return the per-class scoring head.
+
+        Returns:
+            ColumnParallelLinear: The classification ``score`` layer
+            mapping the pooled hidden state to ``num_labels`` logits.
+        """
         return self.score

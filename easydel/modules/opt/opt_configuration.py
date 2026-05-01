@@ -22,11 +22,29 @@ from easydel.infra.factory import register_config
 
 @register_config("opt")
 class OPTConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for Meta's OPT (Open Pre-trained Transformer) decoder family.
 
-    Args:
+    OPT is a *pre-modern* decoder LLM and differs from current LLaMA-style
+    architectures in several ways that this config makes explicit:
+
+    * **LayerNorm with bias** (not RMSNorm) and **biased linear layers**
+      throughout (``enable_bias=True``).
+    * **Learned absolute position embeddings** of length
+      ``max_position_embeddings`` rather than RoPE — there is no
+      ``rope_theta`` here.
+    * **ReLU activation** by default (``activation_function="relu"``)
+      instead of SwiGLU/SiLU; the FFN is the classic
+      ``up -> ReLU -> down``.
+    * **Optional embedding projection** (``word_embed_proj_dim``) — OPT
+      models with smaller embedding tables (e.g. OPT-IML) project the
+      embeddings up to ``hidden_size`` before the first decoder layer.
+    * **Configurable pre/post-norm** via ``do_layer_norm_before`` and
+      **optional removal of the final LayerNorm** via
+      ``_remove_final_layer_norm`` (toggled in some checkpoints).
+    * **LayerDrop** (``layerdrop``) — randomly skip whole layers during
+      training as a regularizer.
+
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 50272):
             Vocabulary size of the OPT model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.
@@ -132,6 +150,9 @@ class OPTConfig(EasyDeLBaseConfig):
                 Defaults to True.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
                 Defaults to EasyDeLGradientCheckPointers.NONE.
+            layer_types (list[str] | None, optional): Per-layer attention type;
+                defaults to ``"full_attention"`` for every layer when ``None``.
+                Defaults to None.
             **kwargs: Additional keyword arguments passed to the parent class.
         """
         super().__init__(

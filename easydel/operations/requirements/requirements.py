@@ -36,14 +36,30 @@ class MetadataRequirements:
     optional: MetadataField = MetadataField.NONE
 
     def __or__(self, other: MetadataRequirements) -> MetadataRequirements:
-        """Union of two metadata requirements."""
+        """Compute the union of two metadata requirements.
+
+        Args:
+            other: The metadata requirements to merge with.
+
+        Returns:
+            MetadataRequirements: A new instance whose ``required`` and
+            ``optional`` flags are the bitwise OR of the operands.
+        """
         return MetadataRequirements(
             required=self.required | other.required,
             optional=self.optional | other.optional,
         )
 
     def __and__(self, other: MetadataRequirements) -> MetadataRequirements:
-        """Intersection of two metadata requirements."""
+        """Compute the intersection of two metadata requirements.
+
+        Args:
+            other: The metadata requirements to intersect with.
+
+        Returns:
+            MetadataRequirements: A new instance with the bitwise AND of the
+            operand flags (only fields present in both remain).
+        """
         return MetadataRequirements(
             required=self.required & other.required,
             optional=self.optional & other.optional,
@@ -51,7 +67,11 @@ class MetadataRequirements:
 
     @property
     def all_fields(self) -> MetadataField:
-        """All fields (required + optional)."""
+        """All metadata fields touched by the operation.
+
+        Returns:
+            MetadataField: ``required | optional``.
+        """
         return self.required | self.optional
 
     def is_satisfied_by(self, available: MetadataField) -> bool:
@@ -96,7 +116,19 @@ class CacheRequirements:
     cache_view_class: type | None = None
 
     def __or__(self, other: CacheRequirements) -> CacheRequirements:
-        """Union of two cache requirements (intersection of supported types)."""
+        """Combine two cache-requirements specs.
+
+        Despite the symbol, the *supported* set is intersected (an operation
+        only supports a cache type if both inputs do), the *requires_cache*
+        flag is OR-ed, and the preferred/cache-view-class are merged when
+        compatible (otherwise the non-``None`` side wins).
+
+        Args:
+            other: The cache requirements to merge with.
+
+        Returns:
+            CacheRequirements: The merged requirements.
+        """
         new_supported = self.supported & other.supported
         new_preferred = None
         if self.preferred == other.preferred:
@@ -149,7 +181,16 @@ class OperationRequirements:
     name: str = ""
 
     def __or__(self, other: OperationRequirements) -> OperationRequirements:
-        """Union of two operation requirements."""
+        """Combine two operation requirements.
+
+        Args:
+            other: The operation requirements to merge with.
+
+        Returns:
+            OperationRequirements: A new spec whose metadata is the union of
+            the operands and whose cache requirements are produced by
+            :meth:`CacheRequirements.__or__`.
+        """
         return OperationRequirements(
             metadata=self.metadata | other.metadata,
             cache=self.cache | other.cache,

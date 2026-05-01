@@ -32,6 +32,14 @@ except ModuleNotFoundError:  # pragma: no cover
     import logging
 
     def get_logger(name: str | None = None) -> logging.Logger:
+        """Return a stdlib logger when ``eformer.loggings`` is unavailable.
+
+        Args:
+            name: Logger name; ``None`` falls back to this module's name.
+
+        Returns:
+            A ``logging.Logger`` instance.
+        """
         return logging.getLogger(name or __name__)
 
 
@@ -48,12 +56,30 @@ logger = get_logger(__name__)
 
 
 def _collapse_extra_blank_lines(text: str) -> str:
+    """Normalize line endings and collapse runs of blank lines.
+
+    Args:
+        text: Raw rendered Markdown text.
+
+    Returns:
+        ``text`` with ``\\r\\n`` / ``\\r`` normalized to ``\\n`` and any
+        sequences of three or more newlines collapsed to two.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
 def _get_default_easydel_version() -> str:
-    """Best-effort EasyDeL version without importing the whole package."""
+    """Best-effort EasyDeL version without importing the whole package.
+
+    Tries (in order) ``importlib.metadata.version("easydel")``, scanning the
+    installed package's ``__init__.py`` for a ``__version__`` literal, and
+    finally checking the sibling ``__init__.py`` next to this file.
+
+    Returns:
+        The detected version string, or ``"unknown"`` when none of the
+        strategies succeeds.
+    """
     try:
         from importlib.metadata import version as pkg_version
 
@@ -87,6 +113,15 @@ def _get_default_easydel_version() -> str:
 
 
 def _slugify(value: str) -> str:
+    """Convert a free-form label into a hyphenated slug for lookup tables.
+
+    Args:
+        value: Any string-like value.
+
+    Returns:
+        Lower-cased ASCII slug with whitespace and underscores replaced by
+        ``"-"`` and runs of hyphens collapsed.
+    """
     value = str(value).strip().lower()
     value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"-{2,}", "-", value)
@@ -94,6 +129,15 @@ def _slugify(value: str) -> str:
 
 
 def _normalize_identifier(value: str) -> str:
+    """Convert a free-form label into a snake_case identifier.
+
+    Args:
+        value: Any string-like value.
+
+    Returns:
+        Lower-cased ASCII identifier with whitespace and hyphens replaced by
+        ``"_"`` and runs of underscores collapsed.
+    """
     value = str(value).strip().lower()
     value = re.sub(r"[\s\-]+", "_", value)
     value = re.sub(r"_+", "_", value)
@@ -586,6 +630,13 @@ class ModelInfo:
     overview: str | None = field(default=None, metadata={"help": "Custom overview text for the model."})
 
     def __post_init__(self):
+        """Coerce enum-valued model fields into their underlying ``.value``.
+
+        EasyDeL config classes occasionally pass ``Enum`` values for
+        ``model_type``/``model_task``/``attn_mechanism``; the README template
+        always wants the plain string form, so we unwrap any enum-like
+        attribute eagerly.
+        """
         for attribute in ("model_type", "model_task", "attn_mechanism"):
             value = getattr(self, attribute, None)
             if hasattr(value, "value"):
@@ -593,29 +644,64 @@ class ModelInfo:
 
     @property
     def model_type_for_display(self) -> str:
+        """Return the model type that should be shown to users.
+
+        Returns:
+            ``model_type`` when set, otherwise the more generic ``type``.
+        """
         return self.model_type or self.type
 
     @property
     def task_display(self) -> str:
+        """Return the canonical capitalized task name (e.g. ``"CausalLM"``).
+
+        Returns:
+            The display name from ``_TASK_DISPLAY_BY_SLUG`` for the current
+            ``model_task``; falls back to the raw value when no slug matches.
+        """
         raw = str(self.model_task or "").strip() or "CausalLM"
         slug = _slugify(raw)
         return _TASK_DISPLAY_BY_SLUG.get(slug, raw)
 
     @property
     def pipeline_tag(self) -> str | None:
+        """Return the HuggingFace ``pipeline_tag`` for the current task.
+
+        Returns:
+            The mapped pipeline tag (e.g. ``"text-generation"``) or ``None``
+            when no tag is configured for the task.
+        """
         return _PIPELINE_TAG_BY_TASK_DISPLAY.get(self.task_display)
 
     @property
     def auto_class(self) -> str:
+        """Return the EasyDeL ``Auto*`` class name for the current task.
+
+        Returns:
+            One of ``AutoEasyDeLModelForCausalLM``, ``AutoEasyDeLModel``,
+            etc. Defaults to ``"AutoEasyDeLModel"`` when the task is unknown.
+        """
         return _AUTO_CLASS_BY_TASK_DISPLAY.get(self.task_display, "AutoEasyDeLModel")
 
     @property
     def attn_enum(self) -> str:
+        """Return the ``AttentionMechanisms`` enum name for the configured kernel.
+
+        Returns:
+            A string suitable for ``AttentionMechanisms.<NAME>`` substitution
+            in README snippets, defaulting to ``"AUTO"``.
+        """
         key = _normalize_identifier(self.attn_mechanism or "auto")
         return _ATTN_ENUM_BY_MECHANISM_KEY.get(key, "AUTO")
 
     @property
     def repo_is_local(self) -> bool:
+        """Return whether ``repo_id`` looks like a local filesystem path.
+
+        Returns:
+            ``True`` if ``repo_id`` starts with ``/``/``./``/``../``, looks
+            like a Windows drive path, or resolves to an existing path.
+        """
         rid = str(self.repo_id or "")
         if not rid:
             return False
@@ -630,6 +716,12 @@ class ModelInfo:
 
     @property
     def repo_badge_message(self) -> str:
+        """Return a short label safe to embed in a shields.io badge.
+
+        Returns:
+            The base name of a local path when ``repo_is_local`` is ``True``,
+            otherwise the raw repo id.
+        """
         rid = str(self.repo_id or "")
         if self.repo_is_local:
             try:
@@ -667,6 +759,15 @@ class ReadmeGenerator:
         self._compiled_template = None
 
     def _get_template(self):
+        """Resolve and cache the Jinja template used by ``generate_readme``.
+
+        Tries the explicitly named template first (when set on construction),
+        then ``README.md.jinja``, and finally falls back to the in-module
+        ``JINJA_TEMPLATE`` string. The result is memoized on the instance.
+
+        Returns:
+            A Jinja ``Template`` ready for rendering.
+        """
         if self._compiled_template is not None:
             return self._compiled_template
 

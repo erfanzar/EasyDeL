@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Xerxes model implementation for EasyDeL.
+
+This module implements the Xerxes experimental decoder-only language
+model used in EasyDeL research and ablations. The architecture follows
+a modern GQA + RMSNorm + RoPE + SwiGLU template; consult
+:class:`XerxesConfig` for the precise hyperparameter surface.
+
+Exposes :class:`XerxesModel` (transformer trunk) and the task wrapper
+:class:`XerxesForCausalLM`.
+"""
 
 import functools
 
@@ -252,7 +262,18 @@ class XerxesAttention(UnifiedAttention):
         self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
-        """Override to conditionally create Q norm based on xe_kvnorm flag."""
+        """Conditionally build the per-head query RMSNorm.
+
+        Xerxes attention may add an RMSNorm to the query / key
+        projections before attention, controlled by ``xe_kvnorm``
+        (analogous to Qwen3's QK normalization). When the flag is
+        disabled this method returns ``None`` so :class:`UnifiedAttention`
+        skips the normalization branch entirely.
+
+        Returns:
+            RMSNorm | None: A per-head RMSNorm of size ``head_dim``
+            if ``xe_kvnorm`` is set, otherwise ``None``.
+        """
         if not self.xe_kvnorm:
             return None
         return RMSNorm(
@@ -264,7 +285,15 @@ class XerxesAttention(UnifiedAttention):
         )
 
     def _create_k_norm(self, config, dtype, param_dtype, rngs):
-        """Override to conditionally create K norm based on xe_kvnorm flag."""
+        """Conditionally build the per-head key RMSNorm.
+
+        Mirrors :meth:`_create_q_norm` for the key projection so that
+        QK normalization is applied symmetrically when ``xe_kvnorm`` is
+        enabled.
+
+        Returns:
+            RMSNorm | None: A per-head RMSNorm or ``None``.
+        """
         if not self.xe_kvnorm:
             return None
         return RMSNorm(
@@ -276,7 +305,17 @@ class XerxesAttention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config, rngs):
-        """Override to set dropout_prob to 0.0 for Xerxes."""
+        """Build a dropout-free FlexibleAttention performer for Xerxes.
+
+        Xerxes pretraining was performed without attention dropout, so
+        the override forces ``dropout_prob=0.0`` regardless of
+        ``config.attention_dropout`` to keep inference numerics
+        consistent with the released checkpoints.
+
+        Returns:
+            FlexibleAttentionModule: Attention dispatcher with the
+            standard ``head_dim**-0.5`` softmax scale and zero dropout.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -285,6 +324,26 @@ class XerxesAttention(UnifiedAttention):
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Optionally apply Xerxes' query/key normalization to QKV states.
+
+        Overrides :class:`UnifiedAttention._postprocess_qkv` to honor the
+        ``xe_kvnorm`` config flag: when enabled, the per-head
+        :attr:`query_normalization` and :attr:`key_normalization` modules
+        are applied to the query and key projections before attention;
+        the value tensor is returned unchanged.
+
+        Args:
+            query_states: Projected query of shape
+                ``(batch, seq_len, num_heads, head_dim)``.
+            key_states: Projected key of shape
+                ``(batch, seq_len, num_kv_heads, head_dim)``.
+            value_states: Projected value of shape
+                ``(batch, seq_len, num_kv_heads, head_dim)``.
+
+        Returns:
+            ``(query_states, key_states, value_states)`` triple,
+            optionally with QK normalization applied.
+        """
         if not self.xe_kvnorm:
             return query_states, key_states, value_states
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
@@ -729,6 +788,13 @@ class XerxesModel(EasyDeLBaseModule):
         outputs = None
 
         def _layer_loop(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden
+            states, attention weights and decoder-layer outputs, and
+            returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, outputs, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

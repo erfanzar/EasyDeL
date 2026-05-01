@@ -58,10 +58,25 @@ from .gidd_configuration import GiddConfig
 
 
 class GiddMLP(spx.Module):
-    """Multi-Layer Perceptron module for GIDD models.
+    """Two-layer FFN with squared-ReLU (``ReLU(x)**2``) activation.
 
-    Implements the feedforward network with squared ReLU activation function
-    for enhanced representation learning in GIDD diffusion architecture.
+    Unlike the gated MLPs used by Llama / Gemma, GIDD uses a plain
+    ``up -> activation -> down`` two-projection feedforward and replaces the
+    usual SiLU/GeLU with **squared ReLU** (the ReLU squared elementwise).
+    This activation has been shown by the Primer line of work to slightly
+    outperform GeLU on autoregressive transformers and is also used by GIDD
+    for its diffusion variant. Both projections are ``fan_in`` scaled to
+    keep activation variance stable across the discrete denoising chain
+    GIDD relies on for sampling.
+
+    Attributes:
+        config: Source ``GiddConfig`` (reads ``hidden_size``,
+            ``intermediate_size``, ``mlp_bias``, ``init_scale``).
+        dtype: Activation/compute dtype.
+        param_dtype: Storage dtype for the projection kernels.
+        precision: ``jax.lax.PrecisionLike`` for the two matmuls.
+        up_proj: ColumnParallel ``hidden -> intermediate`` linear.
+        down_proj: RowParallel ``intermediate -> hidden`` linear.
     """
 
     def __init__(
@@ -142,9 +157,30 @@ class GiddMLP(spx.Module):
 
 
 class GiddAttention(AttentionModule):
-    """Multi-head attention layer with RoPE embeddings and optional QK normalization for GIDD models.
+    """Bidirectional attention with log-init QK-norm scale for diffusion denoising.
 
-    Implements bidirectional attention with noise masking support for diffusion language modeling.
+    GIDD performs **non-causal** attention because the diffusion objective
+    must let every position see every other position when refining a noisy
+    sequence. The mask is a noise mask (which positions are *known* clean vs.
+    diffusion-corrupted) rather than the lower-triangular causal mask used by
+    autoregressive LMs. Beyond that, two GIDD-specific design choices live
+    in this module:
+
+    1. **QK normalization with log-position-init scale.** When
+       ``config.use_qk_norm`` is true, the per-head QK softmax temperature
+       is parameterised by a learned ``qk_scale`` of shape
+       ``(1, 1, num_heads, 1)``, initialised to
+       ``2 * log(max_position_embeddings)``. This log-scaled init is the
+       Primer-style fix for head temperature collapse at long context: it
+       starts the temperature high enough that early-training softmaxes do
+       not over-sharpen and lets backprop tune each head's effective
+       sharpness independently.
+    2. **Fan-in scaled projections** with ``init_scale`` from ``config`` so
+       the bidirectional attention preserves activation variance during the
+       reverse diffusion process.
+
+    The ``head_dim`` defaults to ``hidden_size // num_attention_heads`` but
+    can be overridden via ``config.head_dim`` for non-square head geometry.
     """
 
     def __init__(
@@ -440,9 +476,14 @@ class GiddAttention(AttentionModule):
 
 
 class GiddRMSNorm(spx.Module):
-    """Root Mean Square Layer Normalization for GIDD models.
+    """RMSNorm with the ``(1 + weight)`` scale, zero-init weight, fp32 variance.
 
-    A simplified variant of LayerNorm that normalizes by RMS value with learnable scale.
+    Same formulation as Gemma's RMSNorm (variance reduced in float32, scale
+    applied as ``1 + weight`` so the layer is the identity at initialization)
+    used here for the diffusion decoder. The zero-init weight is essential
+    for diffusion training because the reverse process is sensitive to the
+    initial noise level — a layer that is the identity at step 0 lets the
+    denoiser's residual stream survive the early gradient updates intact.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -492,10 +533,16 @@ class GiddRMSNorm(spx.Module):
 
 
 class GiddLayer(spx.Module):
-    """Single transformer layer for GIDD models.
+    """Pre-norm bidirectional transformer block with optional residual gating.
 
-    Combines multi-head attention and feedforward networks with
-    RMS normalization, residual connections, and optional residual scaling.
+    Standard pre-norm shape ``x + attn(norm(x))`` followed by ``x +
+    mlp(norm(x))`` but with two GIDD-specific knobs: attention is
+    bidirectional (the diffusion denoiser must see future positions to
+    refine the corrupted ones), and the residual additions optionally pass
+    through a per-layer scalar gate so the model can learn how much of each
+    sub-block's contribution to inject into the chain — useful when the
+    same network is reused across many denoising steps and the effective
+    residual magnitude needs to vary per timestep.
     """
 
     def __init__(

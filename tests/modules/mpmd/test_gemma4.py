@@ -49,7 +49,7 @@ class TestGemma4:
         vision_config = ed.Gemma4VisionConfig(
             hidden_size=64,
             intermediate_size=128,
-            num_hidden_layers=2,
+            num_hidden_layers=small_model_config["num_hidden_layers"],
             num_attention_heads=4,
             num_key_value_heads=4,
             head_dim=16,

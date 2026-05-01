@@ -253,6 +253,20 @@ def _(
     *args,
     **kwargs,
 ) -> JAXArray:
+    """Handler for ``dynamic_update_slice`` when only ``update`` is implicit.
+
+    Materializes the implicit update tensor before delegating to the primitive.
+
+    Args:
+        primitive: The ``dynamic_update_slice`` JAX primitive.
+        operand: The destination array (concrete).
+        update: The replacement values (``ImplicitArray``, will be materialized).
+        *args: Additional positional arguments forwarded to the primitive.
+        **kwargs: Additional keyword arguments (ignored).
+
+    Returns:
+        The result of binding the primitive to the materialized arrays.
+    """
     update = update.materialize()
     return primitive.bind(operand, update, *args)
 
@@ -265,6 +279,20 @@ def _(
     *args,
     **kwargs,
 ) -> JAXArray:
+    """Handler for ``dynamic_update_slice`` when both inputs are implicit.
+
+    Materializes both arrays before delegating to the primitive.
+
+    Args:
+        primitive: The ``dynamic_update_slice`` JAX primitive.
+        operand: The destination ``ImplicitArray`` (will be materialized).
+        update: The replacement ``ImplicitArray`` (will be materialized).
+        *args: Additional positional arguments forwarded to the primitive.
+        **kwargs: Additional keyword arguments (ignored).
+
+    Returns:
+        The result of binding the primitive to the materialized arrays.
+    """
     operand = operand.materialize()
     update = update.materialize()
     return primitive.bind(operand, update, *args)
@@ -640,6 +668,14 @@ class TransformerCacheView(BaseCacheView):
         def _kv_struct_shard(
             x: Float[JAXArray, "batch seq_len num_heads head_dim"],
         ) -> Float[JAXArray, "batch seq_len num_heads head_dim"]:
+            """Apply the view's KV logical sharding axes to ``x``.
+
+            Args:
+                x: KV tensor to shard.
+
+            Returns:
+                The same tensor with its sharding refreshed.
+            """
             axes = getattr(self, "kv_sharding_axes", (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM))
             return apply_logical_sharding(x, axes=axes, **sharding_statics)
 
@@ -649,6 +685,18 @@ class TransformerCacheView(BaseCacheView):
             new: Float[JAXArray, "query_len num_heads head_dim"],
             slot: Int[JAXArray, ""],
         ) -> Float[JAXArray, "seq_len num_heads head_dim"]:
+            """Insert ``new`` into ``old`` at ``slot`` along the sequence dim.
+
+            Vectorized over the batch dimension via ``jax.vmap``.
+
+            Args:
+                old: Existing per-batch cache slice.
+                new: New tokens to write.
+                slot: Sequence position to begin writing at.
+
+            Returns:
+                The updated cache slice for this batch element.
+            """
             return lax.dynamic_update_slice(old, new.astype(old.dtype), (slot, 0, 0))
 
         @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
@@ -657,7 +705,17 @@ class TransformerCacheView(BaseCacheView):
             new_values: Float[JAXArray, "query_len num_heads head_dim"],
             current_index: Int[JAXArray, ""],
         ) -> Float[JAXArray, "window_size num_heads head_dim"]:
-            """Update sliding window KV cache."""
+            """Update a sliding-window KV cache slot in-place.
+
+            Args:
+                old_cache: The existing window-sized slot.
+                new_values: New tokens to append.
+                current_index: Logical write position into the window.
+
+            Returns:
+                The updated window contents, either by overwriting in place or
+                by rolling the buffer when the new tokens overflow the window.
+            """
             new_len = new_values.shape[0]
             window_size = old_cache.shape[0]
             if new_len >= window_size:
@@ -666,9 +724,11 @@ class TransformerCacheView(BaseCacheView):
             total_tokens = current_index + new_len
 
             def _fits_in_window():
+                """Branch: write at ``current_index`` without rolling."""
                 return lax.dynamic_update_slice(old_cache, new_values.astype(old_cache.dtype), (current_index, 0, 0))
 
             def _overflow_window():
+                """Branch: shift older tokens out and append the new ones."""
                 return jnp.concatenate([old_cache[new_len:, :, :], new_values.astype(old_cache.dtype)], axis=0)
 
             return lax.cond(total_tokens <= window_size, _fits_in_window, _overflow_window)
@@ -714,6 +774,14 @@ class TransformerCacheView(BaseCacheView):
         )
 
     def __repr__(self):
+        """Return a short ``repr`` showing key/value shapes and layer index.
+
+        Falls back to printing the raw values when shape attributes aren't
+        available (for example before allocation).
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         try:
             return (
                 self.__class__.__name__
@@ -724,6 +792,11 @@ class TransformerCacheView(BaseCacheView):
 
     @property
     def is_empty(self) -> bool:
+        """Whether this view has no allocated key tensor.
+
+        Returns:
+            ``True`` when ``self.key`` is ``None`` (placeholder/uninitialized).
+        """
         return self.key is None
 
     __str__ = __repr__
@@ -1022,6 +1095,11 @@ class TransformerCache(BaseCache):
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def __repr__(self):
+        """Return a multi-line ``repr`` listing each layer's view.
+
+        Returns:
+            A string containing one ``repr`` per layer, indented for clarity.
+        """
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
 
     __str__ = __repr__

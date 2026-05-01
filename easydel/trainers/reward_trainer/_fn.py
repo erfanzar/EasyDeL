@@ -66,36 +66,45 @@ def training_step(
     center_rewards_coefficient: float | None = None,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """
-    Performs a single training step by computing gradients via minibatch processing,
-    updating the model state, and returning updated state and loss metrics.
+    """Run one reward-model training step (forward + Bradley-Terry loss + update).
 
-    The function first determines the batch and minibatch sizes using assertions.
-    It then applies sharding constraints to the batch. The loss function is defined
-    as an inner function that merges the current model state with an updated tree,
-    prepares the inputs, and computes the loss using the model's compute_loss method.
-    Gradients are computed using `jax.value_and_grad` over minibatches. The state is updated
-    respectfully using the computed gradients and updated metrics.
+    The reward model produces a scalar score for the chosen and the
+    rejected branch via two forward passes; the optimisation target is
+    the (optionally margin-shifted) Bradley-Terry log-sigmoid loss
+
+    ``L_BT = -E[ log sigmoid(r_chosen - r_rejected - margin) ]``
+
+    plus an optional centring penalty
+    ``center_rewards_coefficient * E[(r_chosen + r_rejected)^2]`` that
+    discourages the model from drifting away from mean-zero rewards.
+    The loss is differentiated under :func:`minibatch_call`, which
+    handles gradient accumulation; the resulting gradients are passed
+    to :func:`update_state_respectfully` for the optimiser update and
+    to :func:`update_metrics` for diagnostic reporting.
 
     Args:
-        state (EasyDeLState): The current model state, which includes parameters and model graph.
-        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for the current batch.
-        loss_config (tp.Optional[LossConfig], optional): Configuration settings for the loss
-            computation. Defaults to None.
-        learning_rate_fn (optax.Schedule, optional): A schedule function for the learning rate.
-            Defaults to None.
-        partition_spec (tp.Optional[PartitionSpec], optional): Specification for data sharding.
-            Defaults to None.
-        gradient_accumulation_steps (int, optional): Number of steps over which to accumulate gradients.
-            Defaults to 1.
-        center_rewards_coefficient (int, optional): Coefficient to incentivize the reward model to
-        output mean-zero rewards.
+        state: Current reward model state (parameters + optimiser).
+        batch: Mapping carrying ``input_ids_chosen``,
+            ``attention_mask_chosen``, ``input_ids_rejected``,
+            ``attention_mask_rejected`` and optionally a per-pair
+            ``margin`` array.
+        loss_config: Optional :class:`LossConfig` consumed by
+            :func:`update_state_respectfully` (clipping, etc.).
+        learning_rate_fn: Optional schedule used by
+            :func:`update_metrics` for per-step LR logging.
+        partition_spec: Sharding spec applied to the batch by
+            :func:`make_assertions_and_get_sizes`.
+        gradient_accumulation_steps: Number of microbatches whose
+            gradients are accumulated per optimiser step.
+        center_rewards_coefficient: Optional scalar weight on the
+            centring penalty; ``None`` disables centring.
+        straight_through_emulator: Optional STE wrapper applied to the
+            parameter tree inside the loss closure to simulate
+            quantised forwards while keeping gradients differentiable.
 
     Returns:
-        tp.Tuple[EasyDeLState, LossMetrics]:
-            A tuple containing:
-                - The updated EasyDeLState after applying gradients.
-                - LossMetrics containing computed loss and other related metrics.
+        ``(updated_state, metrics)`` where ``metrics`` carries the
+        scalar loss alongside the per-branch reward arrays.
     """
     # Determine batch size, minibatch size, and enforce partition spec.
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -106,21 +115,29 @@ def training_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
-        """
-        Computes the loss and additional metrics for a given minibatch and tree state.
+        """Compute the reward-model Bradley-Terry loss for one microbatch.
 
-        The inner function merges the current graph state with an updated tree,
-        prepares inputs for a model call, pops the labels from the inputs, and calls
-        the model's compute_loss method.
+        The closure rebinds ``tree`` to the trainer state's graph
+        definition (optionally through ``straight_through_emulator`` to
+        emulate quantised forwards), runs two independent forward passes
+        -- one on the chosen branch and one on the rejected branch --
+        and reads the scalar score from the model's ``logits`` output.
+        Pairwise log-sigmoid is computed on the score difference, with a
+        per-pair ``margin`` shift when provided. When
+        ``center_rewards_coefficient`` is not ``None`` the centring
+        regulariser is added.
 
         Args:
-            tree: The current update to the model's graph state.
-            minibatch: A minibatch of input data.
+            tree: Differentiable parameter tree.
+            minibatch: Mapping with ``input_ids_chosen``,
+                ``attention_mask_chosen``, ``input_ids_rejected``,
+                ``attention_mask_rejected``, and optionally ``margin``.
 
         Returns:
-            A tuple containing:
-                - The computed loss (scalar).
-                - Additional metrics (LossMetrics) produced during loss computation.
+            ``(loss, LossMetrics(loss, chosen_rewards, rejected_rewards))``
+            where ``loss`` is the scalar BT objective and the two reward
+            arrays carry per-sample scalar predictions for downstream
+            accuracy/diagnostic computation.
         """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
@@ -171,6 +188,16 @@ def training_step(
 
 
 def _reward_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build the cache key for a scheduled reward-loss specialization.
+
+    Args:
+        call: Scheduled call descriptor capturing the bound static arguments.
+
+    Returns:
+        tuple[tp.Any, ...]: Hashable identifier for the
+        ``(partition_spec, center_rewards_coefficient,
+        straight_through_emulator)`` tuple.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("partition_spec", "center_rewards_coefficient"),
@@ -179,10 +206,35 @@ def _reward_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_reward_scheduled_loss(call):
+    """Build a scalar reward-model loss closure for the scheduled-loss adapter.
+
+    Concatenates chosen/rejected sequences, runs a single forward pass and
+    splits the resulting scalar rewards before applying the (optionally
+    margin-shifted) Bradley-Terry log-sigmoid loss with optional
+    reward-centering.
+
+    Args:
+        call: Scheduled call descriptor providing ``partition_spec`` and
+            ``center_rewards_coefficient``.
+
+    Returns:
+        tp.Callable: A function ``(tree, batch) -> Array`` returning the
+        scalar pairwise ranking loss.
+    """
     partition_spec = call.get("partition_spec")
     center_rewards_coefficient = call.get("center_rewards_coefficient")
 
     def scheduled_loss(tree: spx.State, batch: collections.abc.Mapping[str, jax.Array]):
+        """Compute the reward-model scalar loss for the scheduled-loss adapter.
+
+        Args:
+            tree (spx.State): Current parameter tree.
+            batch (collections.abc.Mapping[str, jax.Array]): Minibatch with
+                ``input_ids_chosen`` / ``_rejected`` and optional ``margin``.
+
+        Returns:
+            jax.Array: Scalar loss.
+        """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
 
@@ -226,29 +278,30 @@ def evaluation_step(
     partition_spec: PartitionSpec | None = None,
     center_rewards_coefficient: float | None = None,
 ) -> LossMetrics:
-    """
-    Performs a single evaluation step by computing loss metrics for the input batch.
+    """Run one reward-model evaluation step (forward + loss only, no gradients).
 
-    The function determines the required partitioning for the batch, applies sharding constraints,
-    and defines an inner loss function. This inner function merges the current state with the graph state,
-    sets the model to evaluation mode, and computes loss and metrics via the model's compute_loss method.
-    The computed LossMetrics are then returned.
+    Identical algorithmically to :func:`training_step` minus the
+    backward and optimiser update: chosen and rejected branches are
+    each forwarded through the reward backbone, the Bradley-Terry
+    log-sigmoid loss is computed (with optional per-pair ``margin``
+    and centring penalty), and the per-branch scalar rewards are
+    returned for downstream accuracy diagnostics. The loss closure
+    receives the current ``state.graphstate`` directly because no
+    gradient accumulation is needed.
 
     Args:
-        state (EasyDeLState): The current model state.
-        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for evaluation.
-        loss_config (tp.Optional[LossConfig], optional): Configuration for loss computation.
-            Defaults to None.
-        partition_spec (tp.Optional[PartitionSpec], optional): Specification for sharding the batch.
-            Defaults to None.
-        center_rewards_coefficient (int, optional): Coefficient to incentivize the reward
-            model to output mean-zero rewards.
+        state: Current reward model state.
+        batch: Mapping carrying the same keys consumed by
+            :func:`training_step`.
+        loss_config: Reserved for parity with the training step; not
+            consumed by the eval closure.
+        partition_spec: Sharding spec applied to the batch.
+        center_rewards_coefficient: Optional centring weight; ``None``
+            disables centring.
 
     Returns:
-        tp.Tuple[tp.Any, LossMetrics]:
-            A tuple containing:
-                - (Any): An additional output from loss computation (if any).
-                - LossMetrics: The computed loss metrics for the evaluation batch.
+        :class:`LossMetrics` carrying the scalar BT loss together with
+        the per-branch reward arrays.
     """
     # Enforce partitioning constraints and determine required sharding.
     *_, partition_spec = make_assertions_and_get_sizes(
@@ -259,18 +312,22 @@ def evaluation_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree):
-        """
-        Computes loss metrics for the evaluation batch given a merged graph state.
+        """Compute the reward-model BT loss/metrics for an eval batch (no gradient).
 
-        This inner function merges the provided tree with the current state,
-        sets the module to evaluation mode, removes the labels from the batch,
-        and computes the loss metrics via the module's compute_loss method.
+        Mirrors the training-mode closure but receives the full eval
+        batch (no microbatch splitting) and skips the
+        straight-through-emulator branch -- evaluation runs the model
+        in its natural precision. Returns a :class:`LossMetrics`
+        instance instead of the ``(loss, metrics)`` pair expected by
+        :func:`jax.value_and_grad` because no gradient is taken.
 
         Args:
-            tree: The current update of the model's graph state.
+            tree: Parameter tree (typically ``state.graphstate``)
+                used directly without straight-through emulation.
 
         Returns:
-            LossMetrics: The computed metrics from the loss function.
+            :class:`LossMetrics` with ``loss``, ``chosen_rewards``, and
+            ``rejected_rewards`` populated.
         """
 
         # Merge the state with the provided tree update.

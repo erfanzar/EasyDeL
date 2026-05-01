@@ -63,6 +63,16 @@ def adapt_legacy_checkpoint_collections(
     The decision is made per-key, not globally: a checkpoint may legitimately
     contain keys for several collections (e.g. ``rng`` plus the bare module
     tree), so we only rewrite the keys that don't already match.
+
+    Args:
+        flat_state: Flat dict mapping path tuples to leaf values from a
+            legacy checkpoint.
+        required_keys: Set of path tuples expected by the current model.
+            The first element of each tuple is the collection name.
+
+    Returns:
+        A new dict with collection-prefixed keys aligned with ``required_keys``.
+        Keys that already use a known collection are passed through unchanged.
     """
     if not flat_state or not required_keys:
         return flat_state
@@ -111,6 +121,15 @@ def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]
     checkpoint into a freshly built model only requires a leaf-name rewrite.
     Quantized leaves (``quant_kernel``/``quant_scales``/``quant_biases``) are
     left untouched.
+
+    Args:
+        flat_state: Flat dict mapping path tuples to leaf values from a
+            legacy checkpoint.
+
+    Returns:
+        A new dict with the legacy suffixes rewritten to ``"weight"``. When
+        both new- and old-style leaves are present for the same path the
+        old-style value wins and a warning is logged.
     """
     renamed: dict[tuple[tp.Any, ...], tp.Any] = {}
     legacy_count = 0

@@ -174,6 +174,34 @@ class SDPOTrainer(GRPOTrainer):
         data_tokenize_fn: tp.Callable | None = None,
         feedback_func: FeedbackFunc | None = None,
     ):
+        """Initialize the SDPO trainer.
+
+        Args:
+            arguments (SDPOConfig): SDPO configuration. Must be an
+                :class:`SDPOConfig` instance.
+            model (EasyDeLBaseModule | EasyDeLState | None): Policy model
+                or pre-built state.
+            reward_funcs (RewardFunc | list[RewardFunc]): Reward
+                function(s) for scoring completions; rewards drive the
+                self-feedback path.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset of prompts.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation dataset(s).
+            processing_class (ProcessingClassType): Tokenizer / processor.
+            reward_processing_classes (ProcessingClassType): Optional
+                processor(s) for reward models.
+            data_tokenize_fn (tp.Callable | None): Optional custom
+                tokenizer.
+            feedback_func (FeedbackFunc | None): Optional callable
+                ``(prompts, completions, rewards) -> list[str]`` that
+                generates rich textual feedback. When ``None`` the
+                trainer uses the self-feedback fallback (Section 3 of
+                the paper).
+
+        Raises:
+            TypeError: If ``arguments`` is not an :class:`SDPOConfig`.
+        """
         if not isinstance(arguments, SDPOConfig):
             raise TypeError(f"arguments must be SDPOConfig, got {type(arguments)}")
 
@@ -195,7 +223,18 @@ class SDPOTrainer(GRPOTrainer):
 
     @staticmethod
     def _resolve_model_context_window(config: tp.Any) -> int | None:
-        """Best-effort extraction of model context window from config."""
+        """Best-effort extraction of model context window from config.
+
+        Searches a list of common attribute names (``max_position_embeddings``,
+        ``n_positions``, etc.) and returns the smallest positive value found.
+
+        Args:
+            config (tp.Any): Model configuration object.
+
+        Returns:
+            int | None: Resolved context window size, or ``None`` if no
+            suitable attribute is found.
+        """
         candidates: list[int] = []
         for attr in (
             "granted_mask_max_position_embedding",
@@ -212,7 +251,17 @@ class SDPOTrainer(GRPOTrainer):
         return min(candidates) if candidates else None
 
     def _configure_teacher_context(self) -> None:
-        """Cap feedback tokens so prompt+feedback+completion fits model context."""
+        """Cap feedback tokens so prompt+feedback+completion fits model context.
+
+        Updates ``self._effective_feedback_length`` and
+        ``self.teacher_prompt_length`` after consulting the model's
+        context window. Logs a warning when feedback tokens are
+        truncated below the requested ``max_feedback_length``.
+
+        Raises:
+            ValueError: If the model context window cannot accommodate
+                even the prompt and completion (without any feedback).
+        """
         base_len = int(self.arguments.max_prompt_length + self.arguments.max_completion_length)
         requested_feedback_len = int(self.arguments.max_feedback_length)
         requested_teacher_len = base_len + requested_feedback_len
@@ -246,7 +295,44 @@ class SDPOTrainer(GRPOTrainer):
             )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile the SDPO training / evaluation steps."""
+        """Compile the SDPO training/eval step plus the reference-model log-prob helper.
+
+        SDPO needs three compiled artefacts:
+
+        * **Training step** -- :func:`sdpo_step` partial-applied with the
+          group size ``num_generations``, the *teacher* prompt length
+          (``max_prompt_length + effective_feedback_length``), the
+          optional KL ``beta``, the distillation kind (``"kl"`` or
+          ``"jsd"``), and the usual sharding/scheduler/accumulation
+          knobs. State is donated and round-trips at
+          ``self.state_shardings``; batch and metrics ride on a
+          replicated sharding.
+        * **Evaluation step** -- the same :func:`sdpo_step` recompiled
+          with ``is_training=False`` so the gradient/optimiser branch is
+          short-circuited and only the loss/metrics path runs.
+        * **Reference-model log-prob helper**
+          ``self.compute_refmodel_logps`` -- only consulted when
+          ``arguments.beta != 0``. Built via
+          :func:`compile_trainer_step` over the closure
+          ``_compute_refmodel_logps`` which binds the frozen reference
+          graph definition, applies the step partition spec to the
+          prompt+completion ids, and delegates to
+          :func:`get_per_token_logps` so the per-token reference log-
+          probs are aligned with the completion positions used by
+          :func:`sdpo_step`.
+
+        Side effects:
+            Mutates ``self._train_shared_fn_static_args`` and
+            ``self._eval_shared_fn_static_args``, stamps the static
+            argnums onto the compiled step closures for downstream
+            introspection, ensures the checkpoint directory exists, and
+            constructs the streaming checkpoint manager.
+
+        Returns:
+            A :class:`TrainerConfigureFunctionOutput` bundling the
+            compiled training step, the compiled evaluation step, the
+            active mesh, and the streaming checkpoint manager.
+        """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
 
@@ -297,6 +383,19 @@ class SDPOTrainer(GRPOTrainer):
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+            """Compute frozen reference-model per-token log probabilities.
+
+            Args:
+                graphtree: Reference-model graph state (parameters).
+                graphother: Reference-model auxiliary state.
+                ids (jax.Array): Concatenated prompt+completion token ids.
+                mask (jax.Array): Concatenated attention mask.
+                graphdef: Reference-model graph definition for binding.
+
+            Returns:
+                jax.Array: Per-token log probabilities for the completion
+                portion only.
+            """
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
@@ -469,6 +568,17 @@ class SDPOTrainer(GRPOTrainer):
         Empty prompt rows can appear with malformed / partially tokenized
         datasets and propagate to eSurge as ``prompt_len=0`` requests. This
         inserts a fallback token at the last prompt position for such rows.
+
+        Args:
+            prompt_ids (jax.Array): Prompt token ids of shape
+                ``[batch, prompt_len]``.
+            prompt_mask (jax.Array): Prompt attention mask of the same
+                shape.
+
+        Returns:
+            tuple[jax.Array, jax.Array, int]: ``(prompt_ids, prompt_mask,
+            num_repaired_rows)`` -- arrays with empty rows patched and a
+            count of how many rows were modified.
         """
         prompt_mask_np = np.asarray(jax.device_get(prompt_mask))
         if prompt_mask_np.ndim != 2 or prompt_mask_np.shape[1] == 0:
@@ -496,14 +606,28 @@ class SDPOTrainer(GRPOTrainer):
         """Build the SDPO batch from raw prompts.
 
         Steps:
-        1. Generate ``G`` completions per prompt (identical to GRPO).
-        2. Evaluate rewards from ``reward_funcs`` (for logging + feedback).
-        3. Build feedback separator texts (rich or self-feedback).
-        4. Tokenise feedback separators → ``feedback_ids`` / ``feedback_mask``.
-        5. Construct teacher context:
-           ``teacher_ids = [prompt_ids | feedback_ids | completion_ids]``
-        6. Optionally compute ref-model log-probs when ``beta > 0``.
-        7. Return the batch dict consumed by :func:`sdpo_step`.
+            1. Generate ``G`` completions per prompt (identical to GRPO).
+            2. Evaluate rewards from ``reward_funcs`` (for logging and
+               feedback selection).
+            3. Build feedback separator texts (rich or self-feedback).
+            4. Tokenise feedback separators into ``feedback_ids`` and
+               ``feedback_mask``.
+            5. Construct the teacher context
+               ``teacher_ids = [prompt_ids | feedback_ids | completion_ids]``.
+            6. Optionally compute reference-model log-probabilities when
+               ``beta > 0``.
+            7. Return the batch dict consumed by :func:`sdpo_step`.
+
+        Args:
+            state (EasyDeLState): Current policy state used for rollout
+                generation.
+            batch (dict[str, jax.Array]): Raw input batch.
+            is_train (bool): Whether this preprocessing is for training
+                (controls conversational handling).
+
+        Returns:
+            tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+            ``(processed_batch, metrics_dict)``.
         """
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
@@ -760,7 +884,23 @@ class SDPOTrainer(GRPOTrainer):
         metrics: MetricsType,
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
-        """Post-step hook - syncs reference model when requested."""
+        """Post-step hook -- syncs the reference model when requested.
+
+        When ``arguments.sync_ref_model`` is enabled and ``step`` lies on
+        a sync boundary, mixes the current policy parameters into the
+        reference model with linear coefficient
+        ``arguments.ref_model_mixup_alpha``.
+
+        Args:
+            state (EasyDeLState): Updated policy state at the end of
+                this step.
+            metrics (MetricsType): Metrics produced by the step.
+            step (int): Current global training step.
+
+        Returns:
+            tuple[EasyDeLState, MetricsType]: The (unchanged) policy
+            state and metrics; the reference model is mutated in place.
+        """
         if (
             self.arguments.sync_ref_model
             and self.ref_state is not None

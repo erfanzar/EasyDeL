@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mistral3 (Pixtral) vision-language model implementation.
+
+Combines a Pixtral vision encoder, a spatial-merge + GELU multimodal projector,
+and a Mistral text decoder. Visual features are extracted from a configurable
+vision-encoder layer, downsampled by ``spatial_merge_size``, projected into the
+text embedding space, and merged into the input sequence at positions marked
+by the ``image_token_index``.
+
+Exports:
+    - ``Mistral3ModelOutput``, ``Mistral3CausalLMOutputWithPast``: structured outputs.
+    - ``Mistral3PatchMerger``: spatial-merge module.
+    - ``Mistral3MultiModalProjector``: vision-to-text projector.
+    - ``Mistral3Model``: base multimodal model returning hidden states.
+    - ``Mistral3ForConditionalGeneration``: full model with LM head for generation.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -95,10 +110,27 @@ class Mistral3CausalLMOutputWithPast(ModelOutput):
 
 
 class Mistral3PatchMerger(spx.Module):
-    """Spatially merges neighboring vision patches before projecting into text space.
+    """Concatenates neighbouring patches into channels, then projects back to ``hidden_size``.
 
-    Reduces the spatial resolution of vision patch tokens by merging adjacent patches
-    together, decreasing the sequence length while preserving visual information.
+    Mistral-3 / Pixtral patch tokens come in with one token per ``patch_size``
+    pixels of the original image. This module reduces the token count by a
+    factor of ``spatial_merge_size**2`` (typically 4× — every ``2×2`` patch
+    block becomes one token) while preserving information by concatenating
+    the ``k*k`` patches along the channel dimension and projecting back to
+    ``hidden_size`` with a learnable bias-free linear. Critically, the
+    operation is *aspect-ratio aware*: ``image_sizes`` carries the per-image
+    pixel dimensions so the merge is computed on each image's actual
+    rectangular patch grid (``H/patch_size`` × ``W/patch_size``) rather than
+    a fixed square assumption. The split-merge-project loop iterates over
+    images one at a time because each may have a different token count.
+
+    Attributes:
+        spatial_merge_size (int): Side of the spatial merge window
+            (``k`` in the description above).
+        patch_size (int): Vision tower's pixel patch size, used to convert
+            ``image_sizes`` to grid coordinates.
+        merging_layer (ParallelLinear): Concatenation projection
+            ``hidden_size * k**2 -> hidden_size``.
     """
 
     def __init__(
@@ -180,11 +212,28 @@ class Mistral3PatchMerger(spx.Module):
 
 
 class Mistral3MultiModalProjector(spx.Module):
-    """Projects vision tower features into the language model embedding space.
+    """Vision-to-text bridge for Mistral-3 / Pixtral: norm + patch merge + MLP.
 
-    Transforms vision encoder outputs into a representation compatible with
-    the language model's hidden dimension through normalization, patch merging,
-    and a two-layer MLP projection.
+    Mistral-3 (and Pixtral, the underlying vision tower) supports
+    *aspect-ratio aware* image encoding, so the patch grid is rectangular
+    and the number of vision tokens varies per image. The projector first
+    pre-normalizes the patch features (``RMSNorm`` at the *text* model's
+    epsilon — the vision tower already RMSNorm'd internally, but cross-
+    modality fine-tuning behaves better with another normalization here),
+    then runs a :class:`Mistral3PatchMerger` that downsamples the patch
+    grid by concatenating ``spatial_merge_size**2`` neighbouring patches
+    along the channel dimension, and finally applies the standard
+    LLaVA-style ``linear -> act -> linear`` MLP to land in the LM hidden
+    space. Per-image tokens are produced respecting the actual aspect ratio
+    described by ``image_sizes``.
+
+    Attributes:
+        norm (RMSNorm): Pre-projection RMSNorm at the text model's epsilon.
+        patch_merger (Mistral3PatchMerger): Spatial-to-channel concatenation
+            using ``image_sizes`` to handle non-square inputs.
+        linear_1 (RowParallelLinear): Vision-to-text expansion projection.
+        act (Callable): Activation between the two linears (typically GELU).
+        linear_2 (RowParallelLinear): Square ``text_hidden_size`` projection.
     """
 
     def __init__(
@@ -273,17 +322,23 @@ class Mistral3MultiModalProjector(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Mistral3Config, model_type="mistral3")
 class Mistral3Model(EasyDeLBaseModule):
-    """Multimodal Mistral3 wrapper combining a vision tower, projector, and language model.
+    """Mistral-3 base trunk: Pixtral vision tower + patch-merging projector + Mistral text decoder.
 
-    This model implements the Mistral3 vision-language architecture, integrating a vision
-    tower for image encoding, a multimodal projector for feature alignment, and a
-    language model for text generation based on both visual and textual inputs.
+    Same three-stage architecture as :class:`LlavaModel` but with a
+    *Pixtral* aspect-ratio-aware vision tower instead of CLIP-ViT and a
+    :class:`Mistral3PatchMerger` inside the projector to compress the
+    rectangular patch grid before the LM consumes it. The trunk does not
+    own an LM head — that lives on
+    :class:`Mistral3ForConditionalGeneration`. Image features are spliced
+    into the embedding sequence at every position whose token id equals
+    ``config.image_token_index``.
 
     Attributes:
-        config (Mistral3Config): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        vision_tower: Pixtral vision encoder built via
+            :class:`AutoEasyDeLVisionModel`.
+        multi_modal_projector (Mistral3MultiModalProjector): RMSNorm + patch
+            merge + two-layer MLP bridge.
+        language_model: Mistral text decoder trunk (no LM head).
     """
 
     def __init__(
@@ -630,23 +685,25 @@ class Mistral3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Mistral3Config, model_type="mistral3")
 class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, Mistral3Config]):  # type: ignore
-    """Mistral3 model for conditional generation with vision-language capabilities.
+    """Mistral-3 / Pixtral image-to-text VLM with LM head.
 
-    Combines a vision tower, patch merger/projector, and language model for
-    image-to-text generation. Inherits from BaseVisionLanguageModule.
+    Adds the language modelling head on top of :class:`Mistral3Model` and
+    plumbs in the VLM-specific configuration consumed by
+    :class:`BaseVisionLanguageModule` (vision feature layer index,
+    feature-select strategy, image token id). Image-only — does not
+    consume video frames — and uses standard RoPE on the text decoder
+    rather than M-RoPE.
 
-    Attributes:
-        config (Mistral3Config): Configuration object.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (spx.Rngs): Random number generators.
+    The image embedding API is sligthly richer than LLaVA's: this model's
+    :meth:`get_image_features` requires ``image_sizes`` so the patch
+    merger can handle each image's actual aspect ratio rather than
+    assuming a fixed square grid.
 
-    Class Attributes:
-        _task_type: IMAGE_TEXT_TO_TEXT task type
-        _model_type: "mistral3" model identifier
-        _supports_video: False (Mistral3 is image-only)
-        _uses_mrope: False (uses standard RoPE)
+    Class flags expose the capability surface that the surrounding
+    ``BaseVisionLanguageModule`` machinery uses for routing:
+
+    * ``_supports_video = False`` — image-only.
+    * ``_uses_mrope = False`` — text decoder uses standard 1-D RoPE.
     """
 
     # Class attributes for registration and capabilities

@@ -13,7 +13,22 @@
 # limitations under the License.
 
 
-"""Dbrx configuration."""
+"""Configuration classes for the DBRX model.
+
+DBRX is Databricks' fine-grained Mixture-of-Experts (MoE) decoder transformer.
+A typical configuration uses 16 experts per MoE layer with top-4 routing,
+multi-query attention (``kv_n_heads=1``), QKV clipping, and standard RoPE.
+
+Exports:
+
+- :class:`DbrxAttentionConfig` — attention sub-config (clip_qkv, kv_n_heads,
+  rope_theta, attn_pdrop).
+- :class:`DbrxFFNConfig` — MoE FFN sub-config (ffn_hidden_size, num/top_k
+  experts, jitter eps, load-balancing loss weight, expert weight
+  normalization).
+- :class:`DbrxConfig` — top-level config that owns both sub-configs plus the
+  decoder shape (``d_model``, ``n_heads``, ``n_layers``, ``max_seq_len``).
+"""
 
 import typing as tp
 import warnings
@@ -48,6 +63,25 @@ class DbrxAttentionConfig(EasyDeLBaseConfig):
         rope_theta: float = 10000.0,
         **kwargs: tp.Any,
     ):
+        """Initialize the DBRX attention sub-configuration.
+
+        Args:
+            attn_pdrop (float, optional): Dropout probability on attention
+                outputs. Defaults to ``0``.
+            clip_qkv (float | None, optional): Symmetric clip value applied to
+                the Q/K/V projections (``None`` disables). Defaults to ``8``.
+            kv_n_heads (int, optional): Number of key/value heads. Set to ``1``
+                for multi-query attention; larger values for grouped-query.
+                Defaults to ``1``.
+            rope_theta (float, optional): Base frequency for rotary position
+                embeddings. Defaults to ``10000.0``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`. ``model_type``
+                is silently dropped; any other unknown key raises.
+
+        Raises:
+            ValueError: If ``kwargs`` contains unknown keys other than
+                ``model_type``.
+        """
         super().__init__(**kwargs)
         self.attn_pdrop = attn_pdrop
         self.clip_qkv = clip_qkv
@@ -62,6 +96,21 @@ class DbrxAttentionConfig(EasyDeLBaseConfig):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: tp.Any) -> "PretrainedConfig":  # type: ignore[misc] # noqa: F821
+        """Load a DBRX attention sub-config from a pretrained checkpoint.
+
+        Looks at the resolved config JSON; when ``model_type == "dbrx"`` the
+        nested ``attn_config`` dict is unwrapped before construction. Mismatched
+        ``model_type`` values trigger a warning but still proceed.
+
+        Args:
+            pretrained_model_name_or_path (str): HuggingFace Hub identifier or
+                local path containing a ``config.json``.
+            **kwargs: Forwarded to :meth:`get_config_dict` and to the final
+                :meth:`from_dict` call.
+
+        Returns:
+            PretrainedConfig: A populated :class:`DbrxAttentionConfig`.
+        """
         cls._set_token_in_kwargs(kwargs)
 
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
@@ -114,6 +163,33 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
         uniform_expert_assignment: bool = False,
         **kwargs: tp.Any,
     ):
+        """Initialize the DBRX MoE feed-forward sub-configuration.
+
+        Args:
+            ffn_act_fn (dict | None, optional): Activation spec dict (e.g.
+                ``{"name": "silu"}``). Defaults to ``{"name": "silu"}``.
+            ffn_hidden_size (int, optional): Per-expert FFN intermediate
+                width. Defaults to ``3584``.
+            moe_num_experts (int, optional): Total number of experts per MoE
+                layer. Defaults to ``4``.
+            moe_top_k (int, optional): Active experts per token. Defaults to
+                ``1``.
+            moe_jitter_eps (float | None, optional): Multiplicative jitter on
+                router logits during training (``None`` disables). Defaults to
+                ``None``.
+            moe_loss_weight (float, optional): Weight on the MoE auxiliary
+                load-balancing loss. Defaults to ``0.01``.
+            moe_normalize_expert_weights (float | None, optional): Lp-norm
+                exponent for normalizing expert outputs. Defaults to ``1``.
+            uniform_expert_assignment (bool, optional): Force uniform
+                expert assignment (debug). Defaults to ``False``.
+            **kwargs: Unknown keys (other than ``model_type``) raise
+                ``ValueError``.
+
+        Raises:
+            ValueError: If ``kwargs`` contains unknown keys other than
+                ``model_type``.
+        """
         super().__init__()
         if ffn_act_fn is None:
             ffn_act_fn = {"name": "silu"}
@@ -134,6 +210,20 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: tp.Any) -> "EasyDeLBaseConfig":
+        """Load a DBRX FFN sub-config from a pretrained checkpoint.
+
+        When the resolved JSON's ``model_type == "dbrx"``, the nested
+        ``ffn_config`` dict is unwrapped before construction.
+
+        Args:
+            pretrained_model_name_or_path (str): HuggingFace Hub identifier or
+                local path with a ``config.json``.
+            **kwargs: Forwarded to :meth:`get_config_dict` and the final
+                :meth:`from_dict` call.
+
+        Returns:
+            EasyDeLBaseConfig: A populated :class:`DbrxFFNConfig`.
+        """
         cls._set_token_in_kwargs(kwargs)
 
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)

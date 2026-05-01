@@ -12,6 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of FalconH1 — hybrid attention + SSM decoder.
+
+Each FalconH1 decoder layer runs two mixers in parallel: a Mamba2-style
+selective state-space mixer (with causal convolution and structured
+discretization) and a RoPE grouped-query attention mixer. Their outputs are
+summed into the residual before a SwiGLU MLP. The KV side uses a
+:class:`HybridCache` that owns both the standard transformer cache and the
+SSM state.
+
+Helpers:
+
+- :func:`compute_mup_vector` — broadcastable MuP scaling vector for the SSM
+  projection.
+- :func:`apply_mask_to_padding_states` — zero out padding rows so SSM scans
+  see the same view as attention.
+
+Building blocks:
+
+- :class:`FalconH1Attention` — :class:`UnifiedAttention` subclass with the
+  HF-compatible MuP knobs.
+- :class:`Conv1D` — depthwise causal convolution used by the SSM front-end.
+- :class:`FalconH1RMSNormGated` — RMSNorm with an inline gating projection.
+- :class:`FalconH1Mixer` — full Mamba2 mixer (in-proj, conv, dt/B/C splits,
+  SSM scan, gated norm, out-proj).
+- :class:`FalconH1MLP` — SwiGLU FFN.
+- :class:`FalconH1DecoderLayer` — single hybrid decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`FalconH1Model` — base decoder.
+- :class:`FalconH1ForCausalLM` — causal LM head.
+"""
+
 from __future__ import annotations
 
 import functools

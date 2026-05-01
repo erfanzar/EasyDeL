@@ -12,7 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-latent ragged paged attention operation wrapper."""
+"""Multi-Latent Attention (MLA) operations over ragged paged KV caches.
+
+This module provides :class:`MultiLatentRaggedPageAttn` (v1) and
+:class:`MultiLatentRaggedPageAttnV2`, both registered :class:`OperationImpl`
+classes that wrap ejkernel's MLA paged-attention kernels for the
+DeepSeek-style decoder. MLA factorises the standard QK projection into:
+
+* ``queries_nope`` / ``queries_pe`` - non-positional and positional-embedding
+  query halves (the latter carries the rotary frequencies).
+* ``keys_values`` - the low-rank latent representation that replaces the
+  full-rank K/V tensors. May be rank-2 (shared-head) or rank-3 (head-aware).
+* ``keys_pe`` - positional-embedding key projections, always rank-2.
+
+The op handles ragged (variable-length) batches via per-request page tables
+and ``query_start_loc``, performs request distribution bookkeeping, and
+dispatches to one of two ``shard_map`` paths: the DP-local path that slices
+context lengths and page tables per shard (active when
+``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH=True`` and the request count divides the
+DP axis size), or the globally replicated path that runs the kernel against
+the full batch on every shard.
+
+Both versions share the same MLA cache view (:class:`MLARaggedPagesCacheView`)
+and request-distribution layout; v2 differs only in the underlying ejkernel
+entry point and config dataclass.
+"""
 
 from functools import partial
 
@@ -169,7 +193,21 @@ def _resolve_num_queries_per_block(
 
 
 def _request_distribution_bounds(scheduled: jax.Array, context_lens: jax.Array) -> jax.Array:
-    """Compute a ``[decode_end, prefill_end, total]`` request distribution vector."""
+    """Compute a ``[decode_end, prefill_end, total]`` request distribution vector.
+
+    Classifies each scheduled request as decode (one new token, non-empty
+    context) vs prefill (everything else) and returns prefix-sum bounds that
+    the kernel uses to dispatch the right code path per request.
+
+    Args:
+        scheduled: ``int32[num_requests]`` count of newly scheduled tokens
+            per request.
+        context_lens: ``int32[num_requests]`` total context lengths.
+
+    Returns:
+        jax.Array: ``int32[3]`` array ``[decode_end, prefill_end, total]``
+        suitable for indexing into the request list.
+    """
     scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
     context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
 
@@ -188,6 +226,15 @@ def _resolve_distribution(cache_metadata: RaggedPagesMetadata) -> jax.Array:
     If ``cache_metadata.request_distribution`` is already set, it is returned
     directly (cast to int32). Otherwise the distribution is inferred from
     ``query_start_loc`` and ``context_lens``.
+
+    Args:
+        cache_metadata: Ragged-pages cache metadata describing the current
+            batch. Either provides ``request_distribution`` directly or the
+            ``query_start_loc`` / ``context_lens`` arrays needed to compute
+            it.
+
+    Returns:
+        jax.Array: ``int32[3]`` array ``[decode_end, prefill_end, total]``.
     """
     if cache_metadata.request_distribution is not None:
         return jnp.asarray(cache_metadata.request_distribution, dtype=jnp.int32)
@@ -749,6 +796,11 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
+        """Return the registered operation name.
+
+        Returns:
+            str: ``"multi_latent_ragged_page_attention_v2"``.
+        """
         return "multi_latent_ragged_page_attention_v2"
 
     def forward_core(
@@ -769,7 +821,39 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
         v_scale: float | None = None,
         **ignore,
     ) -> AttentionOutput:
-        """Run the MLA ragged-paged attention kernel (v2 implementation)."""
+        """Run the MLA ragged-paged attention kernel (v2 implementation).
+
+        v2 differs from v1 only in the underlying ejkernel call and config
+        type; the surrounding sharding, distribution-vector handling and
+        DP-local fast path are otherwise identical.
+
+        Args:
+            queries_nope: Non-positional query projections.
+            queries_pe: Positional-embedding query projections.
+            keys_values: Low-rank latent KV (rank-2 shared-head, or rank-3
+                head-aware).
+            keys_pe: Positional-embedding key projections.
+            cache_view: MLA ragged-pages cache view.
+            cache_metadata: Batch scheduling metadata.
+            softmax_scale: Multiplicative scale applied before softmax.
+            logits_soft_cap: Optional soft-capping of logits.
+            sliding_window: Sliding-window size for local attention.
+            vmem_limit_bytes: VMEM budget hint forwarded to the kernel
+                config.
+            mask_value: Value used for masked positions; defaults to
+                ``-0.7 * float32_max``.
+            q_scale: Optional quantization scale for queries.
+            k_scale: Optional quantization scale for keys.
+            v_scale: Optional quantization scale for values.
+            **ignore: Extra kwargs accepted for forward-compatibility.
+
+        Returns:
+            AttentionOutput: Attended output and updated cache view.
+
+        Raises:
+            ValueError: When ``keys_pe`` is missing, tensor ranks are wrong,
+                or token-axis sizes disagree across inputs.
+        """
         if keys_pe is None:
             raise ValueError("multi_latent_ragged_page_attention_v2 requires `keys_pe`.")
 
@@ -1056,29 +1140,101 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
         return AttentionOutput(attention_weights=None, attention_outputs=output, cache_view=cache_view)
 
     def forward_native(self, *args, **kwargs) -> AttentionOutput:
+        """Platform-agnostic forward; delegates to :meth:`forward_core`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: Result of :meth:`forward_core`.
+        """
         return self.forward_core(*args, **kwargs)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
+        """GPU dispatch; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
+        """TPU dispatch; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
+        """CPU dispatch; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
+        """CUDA dispatch; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
+        """ROCm dispatch; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def __call__(self, **kwargs) -> AttentionOutput:
+        """Dispatch through the base-class backend selector.
+
+        Args:
+            **kwargs: All keyword arguments accepted by :meth:`forward_core`.
+
+        Returns:
+            AttentionOutput: Attended representations and updated cache view.
+        """
         output: AttentionOutput = super().__call__(**kwargs)
         return output
 
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
+        """Declare metadata and cache requirements for v2.
+
+        Args:
+            mode: Execution mode (ignored; v2 has the same requirements
+                across modes).
+
+        Returns:
+            OperationRequirements: Identical requirements to v1, scoped to
+            the v2 implementation name.
+        """
         del mode
         return (
             RequirementsBuilder("multi_latent_ragged_page_attention_v2")

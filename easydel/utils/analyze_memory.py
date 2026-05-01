@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""JAX device memory monitoring helpers.
+
+This module exposes a few related utilities for inspecting and tracking HBM
+usage on the local JAX devices:
+
+* :class:`SMPMemoryMonitor` -- single-process monitor with a background
+  polling thread that records per-device memory snapshots into an in-memory
+  history buffer.
+* :class:`DeviceStats` -- pickleable dataclass payload for transporting
+  per-device memory analytics between hosts.
+* :class:`MemoryMonitorServer` / :class:`MemoryMonitorClient` -- a tiny
+  TCP server/client pair for collecting :class:`DeviceStats` from many
+  workers in a SPMD/cluster setup.
+* :func:`start_server` / :func:`start_client` -- convenience constructors
+  that build and start the corresponding object on default ports.
+
+Pandas is used opportunistically in :meth:`SMPMemoryMonitor.get_summary`;
+when it isn't installed the module gracefully falls back to plain Python
+lists.
+"""
+
 import logging
 import pickle
 import queue
@@ -53,12 +74,17 @@ class SMPMemoryMonitor:
     """
 
     def __init__(self, check_interval: int = 60, quiet: bool = False):
-        """
-        Initialize the memory monitor.
+        """Configure the monitor without starting any background thread.
 
         Args:
-            check_interval: How often to check memory in seconds (default: 60)
-            quiet: If True, suppresses output messages (default: False)
+            check_interval: Number of seconds the background thread sleeps
+                between successive sweeps over ``jax.local_devices()``. Has
+                no effect until :meth:`start_monitoring` is called.
+            quiet: When ``True`` the background loop calls
+                :meth:`check_all_devices` (silent), recording history and
+                logging only WARNING-level events. When ``False`` (default)
+                each cycle additionally prints the formatted status block
+                produced by :meth:`print_current_status`.
         """
         self.check_interval = check_interval
         self.quiet = quiet
@@ -67,8 +93,18 @@ class SMPMemoryMonitor:
         self._monitor_thread = None
 
     def analyze_device(self, device_stats: dict, dev) -> dict:
-        """
-        Analyze memory stats for a single device.
+        """Analyze memory stats for a single device.
+
+        Args:
+            device_stats: Raw stats dict returned by ``device.memory_stats()``.
+                Must contain ``bytes_limit``, ``bytes_in_use``,
+                ``peak_bytes_in_use`` and ``num_allocs``.
+            dev: The JAX ``Device`` the stats belong to (used only for its
+                ``str()`` representation).
+
+        Returns:
+            A dict containing rounded GB usage, percent-utilization fields,
+            allocation count, and a ``"OK"``/``"WARNING"`` status string.
         """
         bytes_limit = device_stats["bytes_limit"]
         current_usage = device_stats["bytes_in_use"]
@@ -89,7 +125,14 @@ class SMPMemoryMonitor:
         return analysis
 
     def start_monitoring(self):
-        """Start automatic memory monitoring."""
+        """Spawn a daemon thread that records memory snapshots periodically.
+
+        Sets :attr:`running` to ``True`` and starts a daemon thread running
+        :meth:`_monitor_loop`. The method returns immediately; call
+        :meth:`stop_monitoring` to cleanly halt the loop. Calling this
+        method while monitoring is already running starts an additional
+        thread (avoid).
+        """
         self.running = True
         self._monitor_thread = threading.Thread(target=self._monitor_loop)
         self._monitor_thread.daemon = True
@@ -97,14 +140,25 @@ class SMPMemoryMonitor:
         print(f"Started monitoring memory every {self.check_interval} seconds")
 
     def stop_monitoring(self):
-        """Stop automatic memory monitoring."""
+        """Signal the monitor thread to exit and wait for it to join.
+
+        Flips :attr:`running` to ``False`` so the next iteration of
+        :meth:`_monitor_loop` exits, then blocks on the thread until it
+        finishes. Safe to call when monitoring was never started.
+        """
         self.running = False
         if self._monitor_thread:
             self._monitor_thread.join()
         print("Stopped memory monitoring")
 
     def _monitor_loop(self):
-        """Internal monitoring loop."""
+        """Background thread body that polls all devices on a fixed cadence.
+
+        Runs until :attr:`running` is set to ``False``. Each iteration calls
+        :meth:`check_all_devices` (silent) or :meth:`print_current_status`
+        (verbose) depending on :attr:`quiet`, then sleeps for
+        :attr:`check_interval` seconds.
+        """
         while self.running:
             if self.quiet:
                 self.check_all_devices()
@@ -113,9 +167,18 @@ class SMPMemoryMonitor:
             time.sleep(self.check_interval)
 
     def check_all_devices(self) -> list[dict]:
-        """
-        Check memory usage on all available devices.
-        Returns list of analysis results.
+        """Snapshot every local JAX device and append the analyses to ``history``.
+
+        Iterates over ``jax.local_devices()``, calls ``device.memory_stats()``
+        on each, runs :meth:`analyze_device` on the result, appends the dict
+        to :attr:`history` (truncated to the most recent 1000 entries), and
+        prints a one-line WARNING for any device whose status is
+        ``"WARNING"``. Devices that raise are logged but skipped so a single
+        bad device does not abort the sweep.
+
+        Returns:
+            list[dict]: The freshly produced analyses, in the same order as
+            ``jax.local_devices()``. Failed devices are omitted.
         """
         results = []
         for device in jax.local_devices():
@@ -137,16 +200,25 @@ class SMPMemoryMonitor:
         return results
 
     def get_summary(self, format: str = "auto") -> list[dict] | tp.Any:  # noqa
-        """
-        Get a summary of memory usage history.
+        """Return the recorded history sorted newest-first.
 
         Args:
-            format: Output format - 'pandas' (force pandas DataFrame),
-                   'list' (force list), or 'auto' (use pandas if available)
+            format: Output container selector. ``"pandas"`` forces a pandas
+                ``DataFrame`` (raises :class:`ImportError` when pandas is
+                not installed); ``"list"`` forces a plain list of dicts;
+                ``"auto"`` (default) returns a ``DataFrame`` when pandas is
+                available and falls back to the list form otherwise.
 
         Returns:
-            Either pandas DataFrame or list of dictionaries depending on format
-            and pandas availability
+            list[dict] | pandas.DataFrame: Either a list of analysis dicts
+            (matching :meth:`analyze_device` output) or a DataFrame of the
+            same data, ordered by ``timestamp`` descending. An empty list
+            (or empty DataFrame) is returned when no entries have been
+            recorded yet.
+
+        Raises:
+            ImportError: If ``format == "pandas"`` and pandas is not
+                installed in the environment.
         """
         if not self.history:
             return [] if format == "list" else pd.DataFrame() if _pandas_available else []
@@ -160,8 +232,13 @@ class SMPMemoryMonitor:
         return sorted(self.history, key=lambda x: x["timestamp"], reverse=True)
 
     def print_current_status(self):
-        """
-        Print current memory status for all devices.
+        """Run a fresh sweep and pretty-print one block per device to stdout.
+
+        Calls :meth:`check_all_devices` and then prints a multi-line block
+        per result containing device id, status, used/limit GB, utilization
+        percent, peak usage, and active allocation count. Used by the
+        non-quiet variant of :meth:`_monitor_loop` and intended for ad-hoc
+        debugging — it is not parsing-stable.
         """
         results = self.check_all_devices()
         print("\nCurrent Memory Status:")
@@ -176,25 +253,31 @@ class SMPMemoryMonitor:
             print(f"Active Allocations: {r['num_allocations']}")
 
     def get_device_history(self, device_id: str | None = None) -> list[dict]:
-        """
-        Get memory history for a specific device or all devices.
+        """Return the recorded history, optionally filtered to one device.
 
         Args:
-            device_id: tp.Optional device ID to filter by
+            device_id: When supplied, only entries whose ``device_id`` field
+                equals this string (set by :meth:`analyze_device` to
+                ``str(device)``) are returned. ``None`` (default) returns
+                the full history.
 
         Returns:
-            tp.List of history entries for the specified device(s)
+            list[dict]: A list of analysis dicts in insertion order
+            (oldest first); the list is the underlying buffer when no
+            filter is given, so callers should not mutate it.
         """
         if device_id:
             return [entry for entry in self.history if entry["device_id"] == device_id]
         return self.history
 
     def print_history_summary(self, n_entries: int = 5):
-        """
-        Print a summary of recent memory usage without using pandas.
+        """Print the ``n_entries`` most recent history entries newest-first.
 
         Args:
-            n_entries: Number of most recent entries to show
+            n_entries: Maximum number of recent entries to print. ``5`` by
+                default; pass a larger value to inspect a longer window.
+                When ``self.history`` is shorter than ``n_entries`` only the
+                available entries are printed.
         """
         if not self.history:
             print("No history available")
@@ -213,19 +296,43 @@ class SMPMemoryMonitor:
 
 @auto_pytree
 class DeviceStats:
-    """
-    Dataclass to store device statistics.
+    """Wire-format snapshot of one device's memory state for cluster monitoring.
+
+    Produced by :meth:`MemoryMonitorClient.analyze_memory` once per polling
+    cycle and pickled to a :class:`MemoryMonitorServer`. Each instance
+    represents a single ``(host, device, timestamp)`` measurement: clients
+    emit a stream of these so the server can build a multi-host time series
+    of HBM utilisation and react to pressure events.
 
     Attributes:
-        device_id (str): The ID of the device.
-        hostname (str): The hostname of the machine.
-        timestamp (datetime): The timestamp of the statistics.
-        utilization_percent (float): The utilization percentage of the device.
-        peak_utilization_percent (float): The peak utilization percentage of the device.
-        fragmentation_ratio (float): The fragmentation ratio of the device memory.
-        allocation_efficiency (float): The allocation efficiency of the device memory.
-        memory_pressure (str): The memory pressure status (e.g., 'low', 'medium', 'high').
-        raw_stats (Dict[str, Any]): A dictionary containing the raw statistics from the device.
+        device_id (str): String form of the JAX device the snapshot describes
+            (typically ``"TpuDevice(...)"`` or ``"GpuDevice(...)"``); used as
+            the primary grouping key on the server side.
+        hostname (str): ``socket.gethostname()`` of the reporting client; lets
+            the server distinguish two devices that happen to share a string
+            id across different physical hosts.
+        timestamp (datetime): Wall-clock time the snapshot was taken on the
+            client. The server orders trends by this field rather than by
+            arrival time.
+        utilization_percent (float): ``bytes_in_use / bytes_limit * 100``
+            rounded to 2dp. Above 90 the server logs a critical warning.
+        peak_utilization_percent (float): Same ratio computed against
+            ``peak_bytes_in_use`` — useful for spotting transient spikes
+            that a sampling-based monitor would miss.
+        fragmentation_ratio (float): ``largest_free_block_bytes / total_free``
+            (rounded to 4dp). Values near ``1`` mean the free pool is one
+            contiguous block; values near ``0`` indicate severe fragmentation
+            that may starve large allocations.
+        allocation_efficiency (float): ``avg_alloc_size / largest_alloc_size``
+            (rounded to 4dp). Diagnoses whether memory is held by many small
+            objects (low ratio) or by a few large tensors (ratio close to 1).
+        memory_pressure (str): Coarse label derived from ``utilization_percent``:
+            one of ``"Low"`` (≤50), ``"Moderate"`` (≤75), ``"High"`` (≤90)
+            or ``"Critical"`` (>90).
+        raw_stats (dict[str, Any]): Verbatim copy of the JAX
+            ``device.memory_stats()`` dict the snapshot was derived from,
+            preserved so the server can compute additional metrics without
+            another round-trip to the client.
     """
 
     device_id: str = field(
@@ -274,6 +381,12 @@ class MemoryMonitorServer:
     """
 
     def __init__(self, host="0.0.0.0", port=5000):
+        """Initialize the server but do not bind to the socket yet.
+
+        Args:
+            host: Address to listen on. Defaults to all interfaces.
+            port: TCP port to listen on. Defaults to 5000.
+        """
         self.host = host
         self.port = port
         self.stats_queue = queue.Queue()
@@ -282,7 +395,15 @@ class MemoryMonitorServer:
         self.lock = threading.Lock()
 
     def start(self):
-        """Start the monitoring server"""
+        """Bind the server socket and spawn the receive/process daemon threads.
+
+        Two daemon threads are started: ``_run_server`` (accepts incoming
+        TCP connections and pushes pickled :class:`DeviceStats` payloads
+        onto :attr:`stats_queue`) and ``_process_data`` (drains the queue
+        into :attr:`data_store` under :attr:`lock` and runs trend analysis
+        for warnings). The method returns immediately after both threads
+        are running.
+        """
         self.running = True
 
         server_thread = threading.Thread(target=self._run_server)
@@ -296,8 +417,21 @@ class MemoryMonitorServer:
         logger.info(f"Memory monitor server started on {self.host}:{self.port}")
 
     def _run_server(self):
+        """Run the TCP server loop on the configured host/port.
+
+        Blocks the calling thread; intended to be run from a daemon thread
+        spawned by :meth:`start`.
+        """
+
         class RequestHandler(socketserver.BaseRequestHandler):
+            """Per-connection handler that decodes one pickled payload."""
+
             def handle(self):
+                """Read a pickled :class:`DeviceStats` and enqueue it.
+
+                Errors are logged and swallowed so that one bad client does
+                not bring the server down.
+                """
                 try:
                     data = pickle.loads(self.request.recv(4096))
                     self.server.stats_queue.put(data)
@@ -305,6 +439,8 @@ class MemoryMonitorServer:
                     logger.error(f"Error handling request: {e}")
 
         class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            """Threaded TCP server that exposes the outer queue to handlers."""
+
             stats_queue = self.stats_queue
             allow_reuse_address = True
 
@@ -312,6 +448,11 @@ class MemoryMonitorServer:
             server.serve_forever()
 
     def _process_data(self):
+        """Drain the stats queue, persist entries and emit warnings.
+
+        Loops until ``self.running`` becomes ``False`` and per-iteration
+        errors are logged but do not stop the loop.
+        """
         while self.running:
             try:
                 stats = self.stats_queue.get(timeout=1)
@@ -326,12 +467,24 @@ class MemoryMonitorServer:
                 logger.error(f"Error processing data: {e}")
 
     def _cleanup_old_data(self):
-        """Keep only recent data to prevent memory issues"""
+        """Cap :attr:`data_store` at 1000 entries to bound server memory.
+
+        Called from :meth:`_process_data` after each enqueue so the in-memory
+        buffer stays bounded regardless of cluster size. Older entries are
+        discarded silently — durable archival is the consumer's job.
+        """
         if len(self.data_store) > 1000:
             self.data_store = self.data_store[-1000:]
 
     def _analyze_trends(self, stats: DeviceStats):
-        """Analyze memory usage trends and log warnings"""
+        """Analyze memory usage trends and log warnings.
+
+        Emits warnings for high utilization (>90%) and high fragmentation
+        (largest-free-block ratio < 0.5).
+
+        Args:
+            stats: A single :class:`DeviceStats` snapshot to inspect.
+        """
         if stats.utilization_percent > 90:
             logger.warning(
                 f"Critical memory usage on {stats.hostname} ({stats.device_id}): {stats.utilization_percent}%"
@@ -342,7 +495,16 @@ class MemoryMonitorServer:
             )
 
     def get_device_stats(self, device_id=None):
-        """Get statistics for all devices or a specific device"""
+        """Get statistics for all devices or a specific device.
+
+        Args:
+            device_id: When provided, filters the data store to entries with
+                a matching ``device_id``. When ``None`` returns everything.
+
+        Returns:
+            A list of :class:`DeviceStats` objects (a snapshot of the
+            internal store under the lock).
+        """
         with self.lock:
             if device_id:
                 return [s for s in self.data_store if s.device_id == device_id]
@@ -365,6 +527,13 @@ class MemoryMonitorClient:
     """
 
     def __init__(self, server_host, server_port=5000, interval=60):
+        """Configure the client without starting any background thread.
+
+        Args:
+            server_host: Hostname or IP address of the monitoring server.
+            server_port: TCP port of the monitoring server. Defaults to 5000.
+            interval: Polling interval in seconds. Defaults to 60.
+        """
         self.server_host = server_host
         self.server_port = server_port
         self.interval = interval
@@ -372,7 +541,18 @@ class MemoryMonitorClient:
         self.hostname = socket.gethostname()
 
     def analyze_memory(self, memory_stats: dict[str, tp.Any]) -> DeviceStats:
-        """Analyze memory statistics for a single device"""
+        """Analyze memory statistics for a single device.
+
+        Args:
+            memory_stats: Raw stats dict from ``device.memory_stats()``;
+                expected keys include ``bytes_limit``, ``bytes_in_use``,
+                ``peak_bytes_in_use``, ``largest_free_block_bytes``,
+                ``num_allocs``, and ``largest_alloc_size``.
+
+        Returns:
+            A :class:`DeviceStats` summarizing utilization, peak utilization,
+            fragmentation, allocation efficiency, and memory pressure.
+        """
         bytes_limit = memory_stats["bytes_limit"]
         current_usage = memory_stats["bytes_in_use"]
         peak_usage = memory_stats["peak_bytes_in_use"]
@@ -406,7 +586,11 @@ class MemoryMonitorClient:
         )
 
     def start_monitoring(self):
-        """Start monitoring memory usage"""
+        """Start monitoring memory usage.
+
+        Spawns a daemon thread running :meth:`_monitor_loop` and returns
+        immediately.
+        """
         self.running = True
         monitor_thread = threading.Thread(target=self._monitor_loop)
         monitor_thread.daemon = True
@@ -414,11 +598,16 @@ class MemoryMonitorClient:
         logger.info(f"Started monitoring on {self.hostname}")
 
     def stop_monitoring(self):
-        """Stop monitoring memory usage"""
+        """Stop monitoring memory usage by signalling the monitor loop to exit."""
         self.running = False
 
     def _monitor_loop(self):
-        """Main monitoring loop"""
+        """Main monitoring loop.
+
+        Polls every local JAX device, sends snapshots to the server, and
+        sleeps ``self.interval`` seconds between iterations until
+        ``self.running`` becomes ``False``.
+        """
         while self.running:
             try:
                 for device in jax.local_devices():
@@ -430,7 +619,12 @@ class MemoryMonitorClient:
             time.sleep(self.interval)
 
     def _send_stats(self, stats: DeviceStats):
-        """Send statistics to the server"""
+        """Send statistics to the server.
+
+        Args:
+            stats: A :class:`DeviceStats` payload pickled and sent over a new
+                short-lived TCP connection. Errors are logged and swallowed.
+        """
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.connect((self.server_host, self.server_port))

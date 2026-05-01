@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mixins composing the public :class:`eSurge` engine surface.
+
+The eSurge engine class is built up from focused mixins so each concern
+(I/O, lifecycle, monitoring, parsing, request bookkeeping, utilities) lives
+in its own module. ``eSurge`` inherits from all of them.
+
+Exports:
+    EngineIOMixin: text/multimodal I/O entry points (``generate``, ``stream``).
+    EngineLifecycleMixin: start/pause/terminate, AOT compile, idle resets.
+    EngineMonitoringMixin: Prometheus / Grafana / console monitor lifecycle.
+    EngineParsingMixin: tool-call and reasoning-block parsing helpers.
+    EngineRequestsMixin: request creation / cancellation / output retrieval.
+    EngineUtilsMixin: misc utilities shared across the other mixins.
+"""
+
 from .io import EngineIOMixin
 from .lifecycle import EngineLifecycleMixin
 from .monitoring import EngineMonitoringMixin

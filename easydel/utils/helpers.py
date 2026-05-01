@@ -80,13 +80,35 @@ except ImportError:
                 auto_flush: bool = True,
                 **kwargs: tp.Any,
             ):
+                """Build a TensorBoard-backed Spectrax logger.
+
+                Args:
+                    log_dir: Directory under which TensorBoard files should be
+                        written. Falls back to ``kwargs["logdir"]`` and finally
+                        ``"runs"`` when not provided.
+                    auto_flush: Whether the underlying logger should auto-flush
+                        after each call.
+                    **kwargs: Forwarded to the parent ``Logger`` (a stale
+                        ``logdir`` keyword is consumed for backward compat).
+                """
                 log_dir = log_dir or kwargs.pop("logdir", None) or "runs"
                 super().__init__([TensorBoardBackend(log_dir)], auto_flush=auto_flush)
 
     except ImportError:
 
         class SummaryWriter:  # type: ignore[no-redef]
+            """Stand-in raised when neither ``spectrax`` API is importable."""
+
             def __init__(self, *args: tp.Any, **kwargs: tp.Any):
+                """Raise ``ModuleNotFoundError`` to surface the missing dependency.
+
+                Args:
+                    *args: Ignored.
+                    **kwargs: Ignored.
+
+                Raises:
+                    ModuleNotFoundError: Always, with the missing package name.
+                """
                 raise ModuleNotFoundError("spectrax")
 
 
@@ -103,6 +125,14 @@ def is_remote_path(path: os.PathLike[str] | str | object) -> bool:
 
     Treats URI-style paths with a non-``file`` scheme as remote, such as
     ``gs://...`` or ``s3://...``. Plain filesystem paths are treated as local.
+
+    Args:
+        path: A ``str``, ``os.PathLike``, or any object whose ``str()`` form
+            looks like a URI or filesystem path.
+
+    Returns:
+        ``True`` if ``path`` has a URI scheme other than ``file``; ``False``
+        for local paths and ``file://`` URIs.
     """
     try:
         path_str = os.fspath(path)
@@ -173,10 +203,12 @@ class Timer:
     """
 
     def __init__(self, name):
-        """Initialize Timer.
+        """Initialize a fresh, stopped timer with zero accumulated time.
 
         Args:
-            name: Name for this timer.
+            name: A short label used in error messages and any log output the
+                ``Timers`` manager produces. The label is never parsed by
+                EasyDeL — only displayed back to humans.
         """
         self.name = name
         self.elapsed = 0.0
@@ -212,13 +244,23 @@ class Timer:
         self.start_time = 0.0
 
     def elapsed_time(self, reset=True):
-        """Get total elapsed time.
+        """Stop the timer if running and return its total accumulated runtime.
+
+        If the timer is currently running it is first stopped (so the value
+        returned includes the in-flight cycle). When ``reset`` is true the
+        accumulator is cleared so the next ``start()`` begins from zero,
+        matching the behaviour expected by ``Timers.write`` and
+        ``Timers.log``.
 
         Args:
-            reset: Whether to reset timer after reading.
+            reset: When ``True`` (default) the accumulator is reset to ``0``
+                after the value is read; when ``False`` the same elapsed
+                value can be read repeatedly.
 
         Returns:
-            Total elapsed time in seconds.
+            float: Total accumulated wall-clock seconds across all start/stop
+            cycles since the last reset, including the cycle that was just
+            stopped if applicable.
         """
         if self.started:
             self.stop()
@@ -228,10 +270,22 @@ class Timer:
         return total_time
 
     def __enter__(self):
+        """Start the timer and return ``self`` for ``with`` blocks.
+
+        Returns:
+            This timer instance, useful when binding it via ``as``.
+        """
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Stop the timer when exiting the ``with`` block.
+
+        Args:
+            exc_type: Exception type (unused).
+            exc_val: Exception value (unused).
+            exc_tb: Exception traceback (unused).
+        """
         self.stop()
 
 
@@ -254,24 +308,43 @@ class Timers:
     """
 
     def __init__(self, use_wandb, tensorboard_writer: SummaryWriter):
-        """Initialize Timers.
+        """Initialize a per-trainer timer registry with its logging backends.
+
+        The instance owns no actual ``Timer`` objects yet — they are created
+        lazily by :meth:`__call__`/:meth:`timed` the first time each name is
+        used. Both backends are optional; ``write()`` simply skips a backend
+        that is unavailable.
 
         Args:
-            use_wandb: Enable Weights & Biases logging.
-            tensorboard_writer: TensorBoard writer instance.
+            use_wandb: When truthy, :meth:`write` mirrors timer values into
+                Weights & Biases via ``wandb.log``. If ``wandb`` is not
+                installed at write time, the flag is downgraded to ``False``
+                and a warning is emitted once.
+            tensorboard_writer: A Spectrax ``SummaryWriter`` (or compatibility
+                shim) into which ``write()`` will record ``timers/<name>``
+                scalars. Pass ``None`` to disable TensorBoard mirroring.
         """
         self.timers = {}
         self.use_wandb = use_wandb
         self.tensorboard_writer = tensorboard_writer
 
     def __call__(self, name):
-        """Get or create a timer by name.
+        """Look up a timer by name, creating it on first use.
+
+        ``Timers`` is intentionally lazy about timer construction: training
+        code typically asks for a timer with a stable label (``"forward"``,
+        ``"backward"``, ``"optimizer"``, …) and the first call materialises a
+        fresh :class:`Timer`; later calls return the same instance so that
+        elapsed time accumulates across iterations.
 
         Args:
-            name: Timer name.
+            name: Stable identifier for the timer. The same string is later
+                used as a key in :meth:`write` / :meth:`log` and as the
+                ``timers/<name>`` metric tag in TensorBoard / W&B.
 
         Returns:
-            Timer instance.
+            Timer: The (possibly freshly created) ``Timer`` registered under
+            ``name``.
         """
         if name not in self.timers:
             self.timers[name] = Timer(name)
@@ -335,6 +408,12 @@ class Timers:
             self._print_log(name, elapsed_time)
 
     def _print_log(self, name, elapsed_time):
+        """Pretty-print an elapsed time in ms/sec/min/hr with color coding.
+
+        Args:
+            name: Timer name displayed alongside the elapsed time.
+            elapsed_time: Elapsed time in milliseconds.
+        """
         if elapsed_time < 1000:
             time_str = f"{elapsed_time:.4f} ms"
             color = "\033[94m"  # Blue

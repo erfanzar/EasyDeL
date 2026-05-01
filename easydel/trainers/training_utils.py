@@ -11,6 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Utility helpers for compiling and running EasyDeL training/eval steps.
+
+This module hosts the lower-level building blocks used by trainers:
+
+* Quantization helpers and straight-through-estimator emulators for
+  low-precision training (``mxfp8``, ``nvfp8``, ``nf4``, ...).
+* :func:`compile_trainer_step`, the thin wrapper around ``jax.jit`` /
+  ``jax.pjit`` that produces sharded and (optionally) scan-friendly step
+  functions.
+* Pipeline-parallel scheduling utilities (``scheduled_training_step`` and
+  friends) that drive MPMD schedulers.
+* Generation kwarg normalization helpers used by every trainer that calls
+  into the model's ``generate`` / eSurge entry points.
+* Misc utilities such as ``filter_kwargs_for_callable`` for safely
+  dispatching to user-supplied reward callables.
+"""
+
 from __future__ import annotations
 
 import collections
@@ -130,7 +147,47 @@ _SCHEDULED_AUXILIARY_CACHE: dict[tuple[int, int], tp.Callable[..., tp.Any]] = {}
 
 @dataclasses.dataclass(frozen=True)
 class ScheduledStepCall:
-    """Bound call context used by trainer-specific scheduled loss adapters."""
+    """Frozen snapshot of one trainer step invocation, passed to scheduled-loss adapters.
+
+    When a training step decorated with :func:`compile_trainer_step` is invoked
+    under an MPMD pipeline schedule, the wrapper packages the live arguments
+    of *that* call into a ``ScheduledStepCall`` and forwards it to the adapter
+    registered for the underlying step function (see
+    :func:`register_scheduled_loss_adapter`). The adapter uses the snapshot
+    to (a) build a *trainer-specific* scalar loss closure consumed by
+    ``spx.jit(..., schedule=...)`` / :func:`spx.sxvalue_and_grad`, (b) compute
+    a cache key so that repeated calls with the same shape/dtype signature
+    reuse the compiled scheduled loss, and (c) optionally rewrite the batch
+    that flows into the scheduled loss.
+
+    Instances are frozen and hashable-by-identity; do not mutate the captured
+    mappings — the contained pytrees are still live state from the caller.
+
+    Attributes:
+        step_fn (Callable[..., Any]): The original (undecorated) trainer step
+            function whose adapter is being looked up. Used purely for
+            adapter-registry lookups and naming; never invoked from inside
+            the adapter.
+        state (EasyDeLState): The current trainer state pytree (model graphdef
+            + optimizer state + step counter). This is the differentiation
+            target the resulting value-and-grad runs against.
+        batch (Mapping[str, jax.Array]): The mini-batch dict as passed to the
+            step function (may be modified by ``ScheduledLossAdapter.prepare_batch``
+            before reaching the compiled loss).
+        args (tuple[Any, ...]): The positional arguments the wrapper received,
+            preserved verbatim so adapters can access trailer args (e.g.
+            optional reference logps).
+        kwargs (Mapping[str, Any]): The keyword arguments the wrapper received,
+            preserved verbatim alongside ``args``.
+        bound_arguments (Mapping[str, Any]): A flat ``name -> value`` mapping
+            produced by binding ``args`` / ``kwargs`` against the wrapped
+            step function's signature. Use :meth:`get` for safe lookup of
+            optional parameters.
+        schedule (Any): The active MPMD schedule object (typically an
+            ``MpMdSchedulers`` instance) under which the scheduled loss will
+            be compiled. Adapters use this to specialize compilation (e.g.
+            change pipeline microbatch handling).
+    """
 
     step_fn: tp.Callable[..., tp.Any]
     state: EasyDeLState
@@ -141,12 +198,66 @@ class ScheduledStepCall:
     schedule: tp.Any
 
     def get(self, name: str, default: tp.Any = None) -> tp.Any:
+        """Look up a bound argument by name.
+
+        Args:
+            name: The argument name as it appears in the original step
+                function signature.
+            default: Returned when ``name`` is not present in
+                ``bound_arguments``.
+
+        Returns:
+            The bound argument value or ``default``.
+        """
         return self.bound_arguments.get(name, default)
 
 
 @dataclasses.dataclass(frozen=True)
 class ScheduledLossAdapter:
-    """Trainer-specific scalar loss builder for SpectraX scheduled VJPs."""
+    """Trainer-specific glue between a step function and ``spx.jit(schedule=...)``.
+
+    A ``ScheduledLossAdapter`` is registered once per *step function flavor*
+    (SFT, DPO, KTO, GRPO, …) via :func:`register_scheduled_loss_adapter`, and
+    is consulted by :func:`_compile_scheduled_training_step` whenever that
+    step function is compiled under a non-trivial MPMD schedule.
+
+    The adapter must satisfy three responsibilities, modelled as the three
+    callable fields below:
+
+    1. **Build a scalar loss** the SpectraX scheduler can differentiate. The
+       loss is what will be compiled with ``spx.jit(loss, schedule=...)`` and
+       passed to :func:`spx.sxvalue_and_grad`, so it must take exactly
+       ``(state_tree, batch_dict) -> scalar`` regardless of the underlying
+       trainer's richer step signature.
+    2. **Produce a cache key**. The compiled scheduled value-and-grad is
+       expensive; the key returned here decides when it is safe to reuse the
+       cached compilation versus retrace. Include any tensor shapes/dtypes
+       and trainer flags that change the loss closure.
+    3. **Optionally rewrite the batch**. If the trainer needs to inject extra
+       tensors (reference logps, scheduling masks, …) before the compiled
+       loss sees the batch, ``prepare_batch`` returns the modified mapping;
+       the original ``batch`` on :class:`ScheduledStepCall` is left untouched.
+
+    Adapters are stored in the module-level ``_SCHEDULED_LOSS_ADAPTERS``
+    registry keyed by ``(module, qualname)`` of the step function.
+
+    Attributes:
+        name (str): Short, human-readable adapter tag (``"sft"``, ``"dpo"``,
+            ``"grpo"``, …). Embedded into the generated step function's
+            ``__name__`` for traceability in profiles and logs.
+        make_loss (Callable[[ScheduledStepCall], _ScheduledLossFn]): Factory
+            that, given the live call context, returns the scalar
+            ``(tree, batch) -> jax.Array`` loss closure to be JIT-compiled
+            under the schedule.
+        make_cache_key (Callable[[ScheduledStepCall], tuple[Any, ...]]):
+            Factory that returns a hashable cache key derived from the call
+            context. Two calls returning equal keys must be safe to share
+            the same compiled loss.
+        prepare_batch (Callable[[ScheduledStepCall], Mapping[str, jax.Array]] | None):
+            Optional pre-processor invoked on every call to produce the
+            mapping that flows into the compiled loss. ``None`` means the
+            untouched ``ScheduledStepCall.batch`` is forwarded as-is.
+    """
 
     name: str
     make_loss: tp.Callable[[ScheduledStepCall], _ScheduledLossFn]
@@ -156,7 +267,42 @@ class ScheduledLossAdapter:
 
 @dataclasses.dataclass
 class _ScheduledValueAndGradCompiler:
-    """Small cache around ``spx.jit(..., schedule=...)`` + ``sxvalue_and_grad``."""
+    """Per-step lazy compiler/cache for ``spx.jit(schedule=...)`` + ``sxvalue_and_grad``.
+
+    One instance is created inside the closure of each scheduled training step
+    produced by :func:`_compile_scheduled_training_step`. On every call the
+    instance asks its adapter for a cache key built from the current
+    :class:`ScheduledStepCall`; if that key matches the previously seen one,
+    the cached compiled value-and-grad function is reused directly. Otherwise
+    the compiler:
+
+    1. Asks the adapter to materialise the scalar loss closure.
+    2. Compiles it through ``spx.jit`` with the step's mesh, MPMD schedule,
+       and ``batch_argnums`` (so the scheduler knows which positional argument
+       carries the per-microbatch tensors).
+    3. Wraps the compiled function with :func:`spx.sxvalue_and_grad` against
+       the state tree (``argnums=0``) and stores it for future reuse.
+
+    The class is mutable on purpose — mutation is the cache update. There is
+    no thread safety here because each compiler lives behind a single
+    ``scheduled_training_step`` closure that is invoked sequentially by the
+    trainer loop.
+
+    Attributes:
+        mesh (MeshLike): Spectrax/JAX mesh the compiled loss runs on.
+            Forwarded to ``spx.jit``.
+        schedule (Any): MPMD schedule object passed to ``spx.jit(..., schedule=...)``.
+        batch_argnums (int | Sequence[int] | None): Positional indices of the
+            scheduled-loss arguments that carry per-microbatch data. ``None``
+            disables microbatch slicing.
+        adapter (ScheduledLossAdapter): Trainer-specific adapter used to build
+            both the loss closure and the cache key.
+        cached_key (tuple[Any, ...] | None): Last cache key returned by
+            ``adapter.make_cache_key``. ``None`` until the first compilation.
+        cached_value_and_grad (_ScheduledValueAndGradFn | None): Last
+            compiled ``(tree, batch) -> (loss, gradients)`` function. ``None``
+            until the first compilation; reused while ``cached_key`` matches.
+    """
 
     mesh: MeshLike
     schedule: tp.Any
@@ -166,6 +312,20 @@ class _ScheduledValueAndGradCompiler:
     cached_value_and_grad: _ScheduledValueAndGradFn | None = None
 
     def get(self, call: ScheduledStepCall) -> _ScheduledValueAndGradFn:
+        """Return a cached scheduled value-and-grad callable for ``call``.
+
+        On a cache miss, builds a fresh ``spx.jit``-compiled loss with the
+        configured schedule and wraps it in :func:`spx.sxvalue_and_grad`.
+        Subsequent calls with the same adapter cache key reuse the existing
+        compiled callable.
+
+        Args:
+            call: The current scheduled step call context.
+
+        Returns:
+            A function ``(tree, batch) -> (loss, gradients)`` ready to be
+            applied by the trainer.
+        """
         key = self.adapter.make_cache_key(call)
         if self.cached_value_and_grad is not None and self.cached_key == key:
             return self.cached_value_and_grad
@@ -181,6 +341,16 @@ class _ScheduledValueAndGradCompiler:
         scheduled_value_and_grad = spx.sxvalue_and_grad(scheduled_loss, argnums=0)
 
         def value_and_grad(tree, batch):
+            """Run the scheduled value-and-grad and unwrap the gradient tuple.
+
+            Args:
+                tree: The state pytree to differentiate against.
+                batch: The minibatch dictionary forwarded to the loss.
+
+            Returns:
+                A ``(loss, gradients)`` tuple where ``gradients`` matches
+                the structure of ``tree``.
+            """
             loss, (gradients,) = scheduled_value_and_grad(tree, batch)
             return loss, gradients
 
@@ -228,11 +398,55 @@ def register_scheduled_loss_adapter(
     step_fn: tp.Callable[..., tp.Any],
     adapter: ScheduledLossAdapter,
 ) -> tp.Callable[..., tp.Any]:
-    """Register a scalar-loss adapter for scheduled MPMD training.
+    """Bind a :class:`ScheduledLossAdapter` to a trainer step function.
 
-    The adapter owns only trainer-specific loss construction. The shared path
-    still owns SpectraX scheduled VJP, gradient accumulation, stage-local
-    placement, and the optimizer update.
+    The registry maintained here lets :func:`_compile_scheduled_training_step`
+    discover, given a raw step function, how to build the scalar loss that
+    SpectraX's scheduled VJP needs. Concretely the adapter is the
+    *trainer-specific* piece (DPO/KTO/PPO/SFT/...) that knows how to:
+
+    * project the live ``state``/``batch`` into a
+      ``(tree, batch) -> jax.Array`` scalar loss closure,
+    * build a hashable cache key so equivalent calls reuse the compiled
+      ``spx.jit(..., schedule=...)`` artifact, and
+    * optionally pre-process the batch before it reaches the compiled loss.
+
+    Everything else — gradient accumulation, scheduled VJP, stage-local
+    gradient placement, and the optimizer update — stays in the shared
+    pipeline-parallel path and is *not* the adapter's concern.
+
+    Registration writes to two locations so lookups via
+    :func:`get_scheduled_loss_adapter` succeed regardless of how the caller
+    holds the function:
+
+    1. The module-level ``_SCHEDULED_LOSS_ADAPTERS`` dict, keyed by
+       ``(module, qualname)`` of ``step_fn``. This survives even when
+       ``step_fn`` is wrapped or copied later.
+    2. The function attribute ``step_fn.__easydel_scheduled_loss_adapter__``,
+       a fast-path direct pointer used when the caller still has the
+       original object.
+
+    The function is intentionally usable as a decorator factory (returns
+    ``step_fn`` unchanged) so trainers can write
+    ``register_scheduled_loss_adapter(step_fn, adapter)`` at module import
+    time.
+
+    Args:
+        step_fn (Callable[..., Any]): The trainer's raw, unwrapped step
+            function (e.g. the SFT ``training_step``, DPO ``training_step``,
+            …) that will later be compiled under an MPMD schedule. Used only
+            for registry-key derivation and attribute attachment; never
+            invoked by this function.
+        adapter (ScheduledLossAdapter): The trainer-specific adapter that
+            knows how to materialise a scalar loss / cache key / batch
+            override from a live :class:`ScheduledStepCall`. Stored by
+            reference, so the caller must not mutate it after registration.
+
+    Returns:
+        Callable[..., Any]: The same ``step_fn`` object passed in,
+        unmodified except for the freshly-attached
+        ``__easydel_scheduled_loss_adapter__`` attribute. Returning
+        ``step_fn`` lets this function be chained or used as a decorator.
     """
 
     _SCHEDULED_LOSS_ADAPTERS[_scheduled_step_key(step_fn)] = adapter
@@ -241,6 +455,19 @@ def register_scheduled_loss_adapter(
 
 
 def get_scheduled_loss_adapter(fn: tp.Callable[..., tp.Any]) -> ScheduledLossAdapter | None:
+    """Return the :class:`ScheduledLossAdapter` registered for ``fn``, if any.
+
+    Adapters can be attached either directly via the
+    ``__easydel_scheduled_loss_adapter__`` attribute or through
+    :func:`register_scheduled_loss_adapter`.  Both lookup paths are
+    consulted.
+
+    Args:
+        fn: A trainer step callable.
+
+    Returns:
+        The associated adapter, or ``None`` when none has been registered.
+    """
     adapter = getattr(fn, "__easydel_scheduled_loss_adapter__", None)
     if adapter is not None:
         return adapter
@@ -784,6 +1011,16 @@ def repeat_prompt_aligned_model_kwargs(
 
 
 def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
+    """Straight-through estimator: ``q`` on the forward pass, identity on the backward pass.
+
+    Args:
+        x: The original (full-precision) tensor.
+        q: A quantized approximation of ``x``.
+
+    Returns:
+        ``x + stop_gradient(q - x)``, equal to ``q`` numerically while
+        passing gradients through unchanged.
+    """
     q = q.astype(x.dtype)
     return x + lax.stop_gradient(q - x)
 
@@ -849,6 +1086,19 @@ def make_default_tensor_straight_through(
     mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
 
     def _quantize_dequantize(y: jax.Array) -> jax.Array:
+        """Simulate the quantize/dequantize round-trip for a single tensor leaf.
+
+        Handles 0-d and 1-d edge cases, pads the last dim to a multiple of
+        ``group_size``, and dispatches to the appropriate ejkernel quantizer
+        (with or without zero-points / biases).
+
+        Args:
+            y: Float tensor to round-trip through the quantization scheme.
+
+        Returns:
+            A tensor of the same shape and dtype as ``y`` whose values are
+            the quantize-then-dequantize image of ``y``.
+        """
         input_dtype = y.dtype
         if y.ndim == 0:
             # Scalar leaves can appear in graphstate pytrees; keep them unchanged.
@@ -884,6 +1134,17 @@ def make_default_tensor_straight_through(
         return dequantized.astype(input_dtype)
 
     def tensor_straight_through(x: jax.Array) -> jax.Array:
+        """Apply STE quantization to a single tensor leaf.
+
+        Non-floating tensors are returned unchanged so that integer
+        bookkeeping leaves (e.g. step counters) are not perturbed.
+
+        Args:
+            x: Tensor leaf to quantize on the forward pass only.
+
+        Returns:
+            The straight-through quantized tensor.
+        """
         if not jnp.issubdtype(x.dtype, jnp.floating):
             return x
         return _ste(x, _quantize_dequantize(x))
@@ -939,6 +1200,16 @@ def resolve_straight_through_emulator(
         )
 
     def _default_emulator(graphstate: tp.Any) -> tp.Any:
+        """Apply ``tensor_straight_through`` over every leaf of ``graphstate``.
+
+        Args:
+            graphstate: Pytree of tensor leaves (typically the model's
+                graph-state).
+
+        Returns:
+            A pytree of identical shape with each float leaf passed through
+            the per-tensor STE.
+        """
         return tu.tree_map(tensor_straight_through, graphstate)
 
     return _default_emulator
@@ -1018,6 +1289,15 @@ def make_assertions_and_get_sizes(
 
 
 def _normalize_static_argnums(static_argnums: int | tp.Sequence[int] | None) -> tuple[int, ...]:
+    """Coerce a static_argnums spec into a tuple of ints.
+
+    Args:
+        static_argnums: Either a single int, an iterable of ints, or
+            ``None``.
+
+    Returns:
+        A (possibly empty) tuple of ints.
+    """
     if static_argnums is None:
         return ()
     if isinstance(static_argnums, int):
@@ -1026,6 +1306,15 @@ def _normalize_static_argnums(static_argnums: int | tp.Sequence[int] | None) -> 
 
 
 def _normalize_static_argnames(static_argnames: str | tp.Iterable[str] | None) -> tuple[str, ...]:
+    """Coerce a static_argnames spec into a tuple of names.
+
+    Args:
+        static_argnames: Either a single name, an iterable of names, or
+            ``None``.
+
+    Returns:
+        A (possibly empty) tuple of names.
+    """
     if static_argnames is None:
         return ()
     if isinstance(static_argnames, str):
@@ -1103,6 +1392,15 @@ def _slice_batch_for_scheduled_step(batch: dict, batch_size: int, start_index: i
     """Slice leading-batch leaves while passing shared leaves through."""
 
     def _slice_leaf(arr):
+        """Slice a single leaf along axis 0 when it carries the full batch dim.
+
+        Args:
+            arr: A pytree leaf (typically a JAX array).
+
+        Returns:
+            The dynamically sliced minibatch view, or ``arr`` unchanged
+            when it does not carry the leading batch dimension.
+        """
         if not hasattr(arr, "shape") or arr.ndim == 0:
             return arr
         if arr.shape[0] == batch_size:
@@ -1113,12 +1411,32 @@ def _slice_batch_for_scheduled_step(batch: dict, batch_size: int, start_index: i
 
 
 def _scheduled_step_key(fn: tp.Callable[..., tp.Any]) -> tuple[str, str]:
+    """Return a stable ``(module, qualname)`` key for an unwrapped step function.
+
+    Unwraps :class:`functools.partial` so registrations made on the
+    original function are still discoverable through partial wrappers.
+
+    Args:
+        fn: The trainer step callable.
+
+    Returns:
+        A tuple of strings suitable for use as a dictionary key.
+    """
     while isinstance(fn, functools.partial):
         fn = fn.func
     return getattr(fn, "__module__", ""), getattr(fn, "__name__", "")
 
 
 def _scheduled_step_name(fn: tp.Callable[..., tp.Any]) -> str:
+    """Return a human-readable name for a (possibly partial) step function.
+
+    Args:
+        fn: The trainer step callable.
+
+    Returns:
+        The function name when available, otherwise its module name or
+        the class name of the wrapper.
+    """
     module, name = _scheduled_step_key(fn)
     return name or module or type(fn).__name__
 
@@ -1131,6 +1449,30 @@ def _apply_stage_local_gradients(
     loss_config: LossConfig | None,
     learning_rate_fn: tp.Any,
 ) -> tuple[EasyDeLState, LossMetrics]:
+    """Apply stage-local gradients via the optimizer's PP-aware update path.
+
+    Used by the scheduled training-step path so each pipeline stage updates
+    only its local shard of parameters and optimizer state.  Honors a
+    ``break_on_nan`` LossConfig by returning the unchanged state when the
+    loss is ``NaN``.
+
+    Args:
+        state: Current model/optimizer state.
+        gradients: Stage-local gradient pytree.
+        loss: Scalar loss value used for metrics and NaN detection.
+        loss_config: Optional :class:`LossConfig`; ``break_on_nan`` is
+            consulted.
+        learning_rate_fn: Schedule function for the optimizer.
+
+    Returns:
+        ``(new_state, metrics)`` after applying the optimizer update; or
+        ``(state, metrics)`` unchanged on a NaN loss when ``break_on_nan``
+        is set.
+
+    Raises:
+        RuntimeError: If the state's optimizer is missing or does not
+            implement :meth:`apply_gradients_stage_local`.
+    """
     metrics = update_metrics(
         metrics=LossMetrics(loss=loss),
         learning_rate_fn=learning_rate_fn,
@@ -1176,6 +1518,21 @@ def _run_scheduled_value_and_grad(
     batch_size: int,
     minibatch_size: int,
 ) -> tuple[jax.Array, tp.Any]:
+    """Run the scheduled value-and-grad with optional gradient accumulation.
+
+    When ``batch_size > minibatch_size``, the input batch is split into
+    equal-sized minibatches and the gradients are averaged.
+
+    Args:
+        value_and_grad: The compiled scheduled value-and-grad callable.
+        graphstate: The state pytree to differentiate against.
+        batch: The full minibatch dictionary.
+        batch_size: Total batch size (leading dimension of ``batch``).
+        minibatch_size: Size of each accumulation step.
+
+    Returns:
+        ``(loss, gradients)`` aggregated across all accumulation steps.
+    """
     num_accum_steps = batch_size // minibatch_size
     if num_accum_steps == 1:
         return value_and_grad(graphstate, batch)
@@ -1206,6 +1563,31 @@ def _compile_scheduled_training_step(
     static_argnums: int | tp.Sequence[int] | None,
     adapter: ScheduledLossAdapter,
 ) -> tp.Callable[..., tp.Any]:
+    """Build the scheduled-VJP version of a registered trainer step.
+
+    Wraps the trainer-supplied ``step_fn`` with a SpectraX-scheduled
+    value-and-grad path: gradient accumulation is run via
+    :func:`_run_scheduled_value_and_grad` and the resulting stage-local
+    gradients are applied through :func:`_apply_stage_local_gradients`.
+
+    Args:
+        step_fn: The original trainer step function.
+        mesh: Device mesh used for the scheduled compilation.
+        schedule: The MPMD pipeline schedule (e.g. 1F1B, GPipe).
+        batch_argnums: Position(s) of batch-typed arguments inside the
+            trainer step signature.
+        static_argnums: Position(s) of static (compile-time constant)
+            arguments.
+        adapter: The :class:`ScheduledLossAdapter` describing how to
+            extract the scalar loss from ``step_fn``.
+
+    Returns:
+        A callable with the same ``(state, batch, ...)`` signature as
+        ``step_fn`` that runs through the scheduled VJP path.
+
+    Raises:
+        ValueError: If ``mesh`` is ``None``.
+    """
     if mesh is None:
         raise ValueError("mpmd_scheduler requires compile_trainer_step(..., mesh=...).")
 
@@ -1223,6 +1605,18 @@ def _compile_scheduled_training_step(
         *step_args: tp.Any,
         **step_kwargs: tp.Any,
     ) -> tuple[EasyDeLState, LossMetrics]:
+        """Run one scheduled-VJP training step with optional gradient accumulation.
+
+        Args:
+            state: Current model/optimizer state.
+            batch: Minibatch dictionary of sharded JAX arrays.
+            *step_args: Forwarded positional arguments matching
+                ``step_fn``'s signature.
+            **step_kwargs: Forwarded keyword arguments.
+
+        Returns:
+            ``(new_state, metrics)`` after applying the optimizer update.
+        """
         batch = dict(batch)
         bound = step_signature.bind(state, batch, *step_args, **step_kwargs)
         bound.apply_defaults()
@@ -1368,10 +1762,26 @@ def update_state_respectfully(
     else:
 
         def update_fn(args):
+            """Apply ``gradients`` to ``state`` via ``apply_gradients``.
+
+            Args:
+                args: ``(state, gradients)`` tuple.
+
+            Returns:
+                The updated state.
+            """
             state, gradients = args
             return state.apply_gradients(grads=gradients)
 
         def skip_fn(args):
+            """Return ``state`` unchanged (used when the gradient step is skipped).
+
+            Args:
+                args: ``(state, gradients)`` tuple; gradients are ignored.
+
+            Returns:
+                The original state.
+            """
             state, _ = args
             return state
 
@@ -1424,6 +1834,15 @@ def minibatch_call(
             """Extract one minibatch while leaving shared/global leaves untouched."""
 
             def _slice_leaf(arr):
+                """Slice a single leaf along axis 0 if it carries the full batch dim.
+
+                Args:
+                    arr: Pytree leaf (typically a JAX array).
+
+                Returns:
+                    The minibatch slice (when ``arr`` has the full batch
+                    leading dim) or ``arr`` unchanged otherwise.
+                """
                 if not hasattr(arr, "shape") or arr.ndim == 0:
                     return arr
                 if arr.shape[0] == batch_size:

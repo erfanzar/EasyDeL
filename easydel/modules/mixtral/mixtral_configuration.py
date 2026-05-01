@@ -21,11 +21,31 @@ from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 @register_config("mixtral")
 class MixtralConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for Mistral AI's Mixtral sparse-MoE decoder family.
 
-    Args:
+    Mixtral is a LLaMA-style transformer where every FFN is replaced by a
+    Top-``num_experts_per_tok``-of-``num_local_experts`` Mixture-of-Experts.
+    The reference 8x7B variant uses 8 experts and routes each token to 2,
+    giving an 8x7B-parameter model with only ~14B active parameters per
+    token. Routing is *softmax-based*: the router produces a distribution
+    over experts via softmax, the top-k weights are kept, and the surviving
+    weights are renormalized to sum to one before scaling expert outputs.
+    The auxiliary load-balancing loss (``router_aux_loss_coef``) is the
+    standard Switch-Transformer objective minimizing
+    :math:`N_e \\cdot \\sum_i f_i p_i` over experts (fraction of tokens
+    routed and mean router probability).
+
+    Other notable features mirrored in this config:
+        * **Sliding-window attention** (``sliding_window``) restricts each
+          token to attend to only the most recent ``W`` tokens, dropping
+          attention cost from O(L²) to O(L·W); long-range mixing is
+          recovered by stacking layers.
+        * **Grouped-query attention** with ``num_key_value_heads = 8``
+          shrinks the KV cache footprint relative to full MHA.
+        * **Long RoPE base** (``rope_theta = 1e6``) enables the
+          ``max_position_embeddings ≈ 130k`` context.
+
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 32000):
             Vocabulary size of the Mixtral model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.
@@ -149,6 +169,63 @@ class MixtralConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize the Mixtral configuration.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 32000.
+            hidden_size (int, optional): Hidden dimension. Defaults to 4096.
+            intermediate_size (int, optional): Per-expert MLP intermediate dimension.
+                Defaults to 14336.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to 32.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+            num_key_value_heads (int | None, optional): Number of key/value heads for
+                grouped-query attention. Defaults to 8.
+            hidden_act (str, optional): MLP activation. Defaults to "silu".
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``4096 * 32``.
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            rms_norm_eps (float, optional): Epsilon for RMSNorm. Defaults to 1e-5.
+            use_cache (bool, optional): Whether to enable KV caching. Defaults to True.
+            pad_token_id (int | None, optional): Padding token id. Defaults to None.
+            bos_token_id (int, optional): Beginning-of-sequence token id. Defaults to 1.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 2.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            rope_theta (float, optional): RoPE base period. Defaults to 1e6.
+            sliding_window (int | None, optional): Sliding-window size for sliding
+                attention layers. Defaults to 4096.
+            attention_dropout (float, optional): Attention dropout. Defaults to 0.0.
+            num_experts_per_tok (int, optional): MoE top-k routing parameter.
+                Defaults to 2.
+            num_local_experts (int, optional): Total experts per MoE layer. Defaults to 8.
+            output_router_logits (bool, optional): Whether to output router logits.
+                Defaults to False.
+            router_aux_loss_coef (float, optional): Auxiliary load-balancing loss
+                coefficient. Defaults to 0.001.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient
+                checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            use_scan_mlp (bool, optional): Whether to use the scan implementation for
+                the MLP. Defaults to False.
+            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+            number_rep_kv (int, optional): Number of repetitions for key/value heads.
+                Defaults to 1.
+            bits (int | None, optional): Quantization bits. Defaults to None.
+            rope_scaling (dict[str, str | float] | None, optional): RoPE scaling
+                configuration. Defaults to None.
+            attention_bias (bool, optional): Whether attention projections use bias.
+                Defaults to False.
+            initialization_of_moe (bool, optional): Whether to initialize MoE layers
+                explicitly. Defaults to False.
+            router_jitter_noise (float, optional): Uniform noise amplitude added to
+                router logits during training. Defaults to 0.0.
+            head_dim (int | None, optional): Per-head dimension; defaults to
+                ``hidden_size // num_attention_heads`` when ``None``. Defaults to None.
+            layer_types (list[str] | None, optional): Per-layer attention type. If
+                ``None``, defaults to ``"sliding_attention"`` (or ``"full_attention"``
+                if ``sliding_window`` is ``None``) for every layer. Defaults to None.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

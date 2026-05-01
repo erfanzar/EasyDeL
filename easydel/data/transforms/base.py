@@ -30,10 +30,24 @@ Example = dict[str, tp.Any]
 
 
 class Transform(ABC):
-    """Base class for all transforms.
+    """Abstract one-in / one-out transformation primitive of the data DSL.
 
-    Transforms are lazy operations that modify examples during iteration.
-    They can be chained together using the >> operator to form transform pipelines.
+    A :class:`Transform` is a callable that consumes one example dict
+    and returns either a (possibly modified) example dict or ``None``
+    to drop the example. Transforms are deliberately small and pure
+    so they compose: the ``>>`` operator constructs a
+    :class:`ChainedTransform` running the operands in order, sharing
+    a single dict between them. Concrete subclasses live in
+    :mod:`easydel.data.transforms.field_ops`,
+    :mod:`easydel.data.transforms.filter_ops`,
+    :mod:`easydel.data.transforms.map_ops`, etc.
+
+    Two flag properties — :attr:`is_filter` and :attr:`is_expand` —
+    let downstream code (the source wrappers, packers, …) reason about
+    a transform's cardinality without inspecting the implementation:
+    a "filter" may return ``None``, an "expand" yields multiple
+    examples per input. The base class is non-filtering and
+    non-expanding; specialised subclasses override the flags.
 
     Example:
         >>> transform = RenameFields({"old": "new"}) >> FilterNonEmpty(["text"])
@@ -43,18 +57,34 @@ class Transform(ABC):
 
     @abstractmethod
     def __call__(self, example: Example) -> Example | None:
-        """Apply transform to a single example.
+        """Apply this transform to a single row dict.
 
         Args:
-            example: Input example dictionary.
+            example: Input row as a plain ``dict``. The transform may
+                mutate it in place or return a new dict.
 
         Returns:
-            Transformed example, or None to filter out the example.
+            dict | None: The transformed example to forward downstream,
+            or ``None`` to drop the example entirely (useful for
+            filter-style transforms).
         """
         ...
 
     def __rshift__(self, other: "Transform") -> "ChainedTransform":
-        """Chain transforms using >> operator.
+        """Compose two transforms into a single :class:`ChainedTransform` via ``self >> other``.
+
+        Flattens cleanly: when ``self`` is already a
+        :class:`ChainedTransform`, its component list is extended
+        rather than nested, so successive ``>>`` applications produce
+        a flat chain instead of a tree.
+
+        Args:
+            other: The transform to run after ``self`` on every
+                example.
+
+        Returns:
+            ChainedTransform: A new chain that applies ``self`` then
+            ``other``.
 
         Example:
             >>> transform = RenameFields(...) >> MapTransform(...) >> FilterTransform(...)
@@ -65,24 +95,57 @@ class Transform(ABC):
 
     @property
     def is_filter(self) -> bool:
-        """Whether this transform can filter out examples (return None)."""
+        """Hint that this transform may drop examples (return ``None``).
+
+        Used by source wrappers and packers to pre-allocate buffers
+        and to decide whether to short-circuit downstream work.
+
+        Returns:
+            bool: ``False`` on the base class. Subclasses such as
+            :class:`~easydel.data.transforms.filter_ops.FilterTransform`
+            override to ``True``.
+        """
         return False
 
     @property
     def is_expand(self) -> bool:
-        """Whether this transform can produce multiple examples from one input."""
+        """Hint that this transform may emit several examples per input.
+
+        :class:`ExpandTransform` is the canonical implementer; the
+        regular :class:`Transform` contract is one-in / one-out so
+        the base class returns ``False``.
+
+        Returns:
+            bool: ``False`` on the base class.
+        """
         return False
 
     def __repr__(self) -> str:
+        """Compact developer-facing repr (subclass name with no fields).
+
+        Subclasses with non-trivial state are encouraged to override.
+
+        Returns:
+            str: ``"<ClassName>()"``.
+        """
         return f"{self.__class__.__name__}()"
 
 
 class ExpandTransform(ABC):
-    """Transform that can produce multiple examples from a single input.
+    """Abstract one-in / many-out transformation primitive.
 
-    Unlike Transform which returns Example | None, ExpandTransform
-    yields zero or more examples via a generator. This is useful for
-    operations like unpairing preference data (1 pair → 2 examples).
+    Whereas :class:`Transform` returns ``Example | None``,
+    :class:`ExpandTransform` yields an arbitrary number of derived
+    examples via a generator — including zero (acts as a filter)
+    or many (acts as an unroller). Common use cases include
+    unpairing preference data (``chosen`` + ``rejected`` -> two rows
+    with labels), expanding multiple-choice questions into per-option
+    rows, and chunking long documents.
+
+    Note that :class:`ExpandTransform` does **not** subclass
+    :class:`Transform` — the call signatures differ — so transforms
+    that wish to consume an expand transform should detect via
+    :attr:`is_expand` and use a generator-aware iteration loop.
 
     Example:
         >>> class UnpairTransform(ExpandTransform):
@@ -93,52 +156,77 @@ class ExpandTransform(ABC):
 
     @abstractmethod
     def __call__(self, example: Example) -> Iterator[Example]:
-        """Apply transform, yielding zero or more examples.
+        """Apply this expand transform, yielding zero or more derived examples.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict.
 
         Yields:
-            Transformed examples. Can yield 0, 1, or many examples.
+            Example: Derived rows; the iterator may yield zero (filter
+            semantics), one (rare — typically use :class:`Transform`
+            for that case), or many examples.
         """
         ...
 
     @property
     def is_expand(self) -> bool:
-        """Always True for ExpandTransform."""
+        """Identifying flag — every :class:`ExpandTransform` is an expand transform.
+
+        Returns:
+            bool: Always ``True``.
+        """
         return True
 
     @property
     def is_filter(self) -> bool:
-        """ExpandTransform can filter by yielding nothing."""
+        """Marks expand transforms as potential filters (zero-yield drops the row).
+
+        Returns:
+            bool: Always ``True``.
+        """
         return True
 
     def __repr__(self) -> str:
+        """Compact developer-facing repr (subclass name with no fields).
+
+        Returns:
+            str: ``"<ClassName>()"``.
+        """
         return f"{self.__class__.__name__}()"
 
 
 class ChainedTransform(Transform):
-    """A chain of transforms applied sequentially.
+    """Sequential composition of multiple :class:`Transform` instances.
 
-    This is created automatically when using the >> operator between transforms.
+    Constructed implicitly by the ``>>`` operator on
+    :class:`Transform` (or explicitly with a list). Applying the chain
+    runs each component in order, threading the row through; the
+    first ``None`` short-circuits the rest of the chain so filtered
+    rows do not waste work in later transforms. Re-chaining via
+    ``>>`` flattens — chained transforms compose into a single flat
+    chain rather than nesting.
     """
 
     def __init__(self, transforms: list[Transform]):
-        """Initialize ChainedTransform.
+        """Capture the ordered list of transforms that compose this chain.
 
         Args:
-            transforms: List of transforms to apply in order.
+            transforms: Transforms applied in iteration order. Empty
+                lists are technically permitted (the chain becomes
+                identity) but typically the chain is built by the
+                ``>>`` operator with at least two members.
         """
         self._transforms = transforms
 
     def __call__(self, example: Example) -> Example | None:
-        """Apply all transforms in sequence.
+        """Run every transform in the chain on ``example``, short-circuiting on ``None``.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict.
 
         Returns:
-            Transformed example, or None if any filter transform removed it.
+            dict | None: The example after all transforms, or ``None``
+            if any filter transform in the chain dropped it.
         """
         result = example
         for transform in self._transforms:
@@ -148,22 +236,55 @@ class ChainedTransform(Transform):
         return result
 
     def __rshift__(self, other: Transform) -> "ChainedTransform":
-        """Append another transform to the chain."""
+        """Extend the chain with one more transform, returning a flat new chain.
+
+        Overrides :meth:`Transform.__rshift__` to avoid producing a
+        nested ``ChainedTransform`` of ``ChainedTransform`` — a long
+        chain remains flat regardless of how it was assembled.
+
+        Args:
+            other: Transform appended after the existing components.
+
+        Returns:
+            ChainedTransform: New chain ``[*self._transforms, other]``.
+        """
         return ChainedTransform([*self._transforms, other])
 
     @property
     def is_filter(self) -> bool:
-        """True if any transform in the chain is a filter."""
+        """A chain is a filter if any of its components is.
+
+        Returns:
+            bool: ``True`` when at least one component reports
+            :attr:`Transform.is_filter`.
+        """
         return any(t.is_filter for t in self._transforms)
 
     def __repr__(self) -> str:
+        """Developer-facing repr that mirrors the ``>>`` syntax.
+
+        Returns:
+            str: ``"ChainedTransform(t1 >> t2 >> ...)"`` with each
+            component repr'd individually.
+        """
         transform_names = " >> ".join(repr(t) for t in self._transforms)
         return f"ChainedTransform({transform_names})"
 
     def __len__(self) -> int:
-        """Number of transforms in the chain."""
+        """Number of components in the chain.
+
+        Returns:
+            int: Length of the underlying transform list.
+        """
         return len(self._transforms)
 
     def __iter__(self):
-        """Iterate over transforms in the chain."""
+        """Iterate over the chain's component transforms in execution order.
+
+        Useful for tests and for debug tooling that wants to walk the
+        chain (e.g. to print a pipeline diagram).
+
+        Returns:
+            Iterator[Transform]: Iterator over the underlying list.
+        """
         return iter(self._transforms)

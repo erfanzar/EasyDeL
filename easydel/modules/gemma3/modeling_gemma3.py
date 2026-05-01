@@ -12,6 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of Google's Gemma3 multimodal language model.
+
+Gemma3 is a vision-language model combining a SigLIP vision tower with a
+Gemma2-derived text decoder. The text decoder adds Q/K normalization, per-layer
+RoPE settings (a separate base for sliding-window layers), and supports very
+long context lengths via RoPE scaling.
+
+Architectural traits:
+    - Hybrid attention: alternates ``sliding_attention`` and ``full_attention``
+      with a configurable pattern interval (default 6) and window (default 4096).
+    - Per-layer RoPE: full-attention layers use ``rope_theta`` (default 1e6) and
+      may apply RoPE scaling; sliding layers use ``rope_local_base_freq``.
+    - Q/K normalization with :class:`Gemma3RMSNorm` and a custom softmax scale
+      derived from ``query_pre_attn_scalar``.
+    - Pre/post-norm decoder layers with optional final logit soft-capping.
+    - Multimodal path: SigLIP vision encoder + :class:`Gemma3MultiModalProjector`
+      (avg-pool + RMSNorm + projection) merging image tokens into text embeddings.
+
+Exports:
+    - :class:`Gemma3TextModel`: Text-only backbone.
+    - :class:`Gemma3ForCausalLM`: Decoder LM head with soft-capped logits.
+    - :class:`Gemma3ForSequenceClassification`: Pooled classifier head.
+    - :class:`Gemma3MultiModalProjector`: Vision-to-text projector.
+    - :class:`Gemma3Model`: Multimodal backbone (vision tower + projector + text).
+    - :class:`Gemma3ForConditionalGeneration`: Vision-language generation head.
+"""
 
 from functools import cached_property, partial
 
@@ -122,11 +148,20 @@ class Gemma3CausalLMOutputWithPast(ModelOutput):
 
 
 class Gemma3RMSNorm(spx.Module):
-    """Root Mean Square Layer Normalization for Gemma3 models.
+    """Gemma3 RMSNorm with the ``(1 + weight)`` scale and Float8-safe output cast.
 
-    Implements RMS normalization with Float8 support for efficient computation
-    and memory usage in Gemma3 architecture. This normalization technique
-    normalizes inputs by the root mean square, providing training stability.
+    Identical mathematics to the earlier Gemma/Gemma2 RMSNorms (variance in
+    float32, scale applied as ``1 + weight`` so the layer is the identity at
+    initialization), with two production-time wrinkles for Gemma3:
+
+    1. **Configurable dimension** — the same module is reused for ``hidden_size``
+       normalization in the decoder and for ``head_dim`` Q/K normalization
+       inside :class:`Gemma3Attention`. The dimension and epsilon can be
+       overridden via constructor arguments to support both call sites.
+    2. **Float8 down-cast guard** — Gemma3 supports lowfloat (Float8) output
+       activations; if the post-scale dtype is in :data:`lowfloats`, the
+       normalised value is cast back to bfloat16 instead, since Float8 cannot
+       reliably represent the scaled outputs near the unit-RMS regime.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -1185,17 +1220,40 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
 
 
 class Gemma3MultiModalProjector(spx.Module):
-    """Multi-modal projector for Gemma3 vision-language models.
+    """SigLIP-vision-tower → text-embedding projector for Gemma3.
 
-    Projects vision features into the text embedding space, enabling
-    cross-modal understanding and generation in Gemma3. Uses average pooling
-    to reduce spatial dimensions followed by linear projection.
+    The Gemma3 VLM contract: the SigLIP vision tower returns one feature
+    vector per image patch (``vision_hidden_dim`` channels per
+    ``patch_size``-pixel patch over a ``patches_per_image x patches_per_image``
+    grid). The text decoder reserves a fixed budget of
+    ``config.mm_tokens_per_image`` "soft" tokens per image — typically 256, so
+    16 along each axis. This module bridges the two by:
+
+    1. **Spatial average pooling** to reduce the patch grid down to
+       ``tokens_per_side x tokens_per_side`` patches via a non-overlapping
+       ``kernel_size``-square window (``kernel_size = patches_per_image //
+       tokens_per_side``). This is implemented with
+       :func:`jax.lax.reduce_window` so the gradient backs through cleanly.
+    2. **RMSNorm** of the pooled features in the *vision* hidden size, with
+       its own ``layer_norm_eps`` from ``vision_config``.
+    3. **Linear projection** by the zero-initialised
+       ``mm_input_projection_weight`` of shape
+       ``(text_hidden_size, vision_hidden_size)``. Zero init means the vision
+       contribution is gated off at step 0 and grows smoothly during alignment
+       fine-tuning.
+
+    The final output has shape ``(batch, mm_tokens_per_image, text_hidden_size)``
+    and is later spliced into the text embedding stream at positions marked by
+    ``image_token_id``.
 
     Attributes:
-        config (Gemma3Config): Model configuration.
-        patches_per_image (int): Number of patches per image side from vision encoder.
-        tokens_per_side (int): Target tokens per image side after pooling.
-        kernel_size (int): Pooling kernel size for spatial reduction.
+        config: Source ``Gemma3Config``.
+        patches_per_image: ``image_size // patch_size`` — patch grid side.
+        tokens_per_side: ``sqrt(mm_tokens_per_image)`` — soft-token grid side.
+        kernel_size: Side length of the average-pooling window.
+        mm_soft_emb_norm: RMSNorm applied in the vision hidden space.
+        mm_input_projection_weight: Bound parameter of shape
+            ``(text_hidden, vision_hidden)`` used as the final projection.
     """
 
     def __init__(

@@ -25,7 +25,22 @@ from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLVisionConfig
 
 
 def _hf_supports_mrope_rope_type() -> bool:
-    """Check whether the installed HF rope validator supports ``rope_type='mrope'``."""
+    """Probe whether the installed transformers exposes the ``"mrope"`` validator.
+
+    Multimodal RoPE was added to ``transformers.modeling_rope_utils``
+    after the original Qwen2-VL release; older installations only know
+    about ``"default"``/``"linear"``/``"dynamic"``/etc. and reject
+    ``rope_type="mrope"`` during config validation.
+
+    This helper imports ``modeling_rope_utils`` defensively (returning
+    ``False`` on any import error so EasyDeL stays usable without
+    transformers) and reports whether the global
+    ``ROPE_VALIDATION_FUNCTIONS`` mapping contains an ``"mrope"`` key.
+
+    Returns:
+        ``True`` iff the installed ``transformers`` version recognises
+        ``rope_type="mrope"``; ``False`` otherwise.
+    """
     try:
         from transformers import modeling_rope_utils
     except Exception:
@@ -36,7 +51,24 @@ def _hf_supports_mrope_rope_type() -> bool:
 
 
 def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
-    """Normalize mRoPE config while remaining compatible with older HF validators."""
+    """Patch a Qwen3.5 ``rope_scaling`` dict for HF cross-version use.
+
+    When a Qwen3.5 config carries multimodal-RoPE keys
+    (``mrope_section`` / ``mrope_interleaved``) but no explicit
+    ``rope_type``, this helper picks the right value depending on
+    whether the installed HF version recognises ``"mrope"``:
+
+    - Modern HF: stamp ``rope_type``/``type`` to ``"mrope"`` so the
+      validator picks the dedicated mRoPE schema.
+    - Older HF: stamp them to ``"default"`` to avoid validation
+      errors while still preserving the mRoPE-specific keys (which
+      the old validator ignores).
+
+    Returns:
+        A new dict with normalised keys, the original mapping
+        unchanged when no mRoPE keys are present, or ``None`` when the
+        input was ``None``.
+    """
     if not isinstance(rope_scaling, dict):
         return rope_scaling
     normalized = dict(rope_scaling)
@@ -51,7 +83,14 @@ def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
 
 
 def _has_hf_qwen3_5_text_impl() -> bool:
-    """Whether the installed transformers version exposes Qwen3.5 text classes."""
+    """Detect whether ``transformers`` ships native Qwen3.5 text modules.
+
+    Returns:
+        ``True`` iff ``transformers.models.qwen3_5.modeling_qwen3_5``
+        can be located. Used by the registry to decide whether to
+        defer to the upstream implementation or fall back to EasyDeL's
+        own Qwen3-Next based class.
+    """
     return importlib.util.find_spec("transformers.models.qwen3_5.modeling_qwen3_5") is not None
 
 
@@ -226,7 +265,20 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         self.rope_parameters = rope_scaling
 
     def is_moe_layer(self, layer_idx: int) -> bool:
-        """Qwen3.5 text checkpoints are dense (no MoE FFN layers)."""
+        """Indicate that no Qwen3.5 text decoder layer is sparse.
+
+        The Qwen3.5 text variant is a dense Qwen3-Next derivative —
+        every layer carries a standard SwiGLU MLP. Returning ``False``
+        unconditionally suppresses MoE-specific code paths inherited
+        from :class:`Qwen3NextConfig` (such as router auxiliary loss
+        bookkeeping).
+
+        Args:
+            layer_idx: Decoder layer index (ignored).
+
+        Returns:
+            Always ``False``.
+        """
         return False
 
 
@@ -333,7 +385,22 @@ class Qwen3_5Config(EasyDeLBaseConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_text_config(self, decoder: bool = True) -> Qwen3_5TextConfig:
-        """Get the text configuration object."""
+        """Return the embedded text-decoder configuration.
+
+        HuggingFace's PreTrainedConfig contract uses
+        ``get_text_config`` to expose the language portion of a
+        composite multimodal config. For Qwen3.5 the entire decoder
+        side lives on :attr:`text_config`, so this accessor returns it
+        directly. The ``decoder`` flag is accepted for protocol
+        compatibility but ignored here because the model has no
+        separate encoder text config.
+
+        Args:
+            decoder: Ignored — Qwen3.5 only owns a decoder text config.
+
+        Returns:
+            Qwen3_5TextConfig: ``self.text_config``.
+        """
         return self.text_config  # pyright: ignore[reportReturnType]
 
 

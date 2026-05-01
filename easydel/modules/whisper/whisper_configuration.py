@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Whisper speech model family.
+
+Defines :class:`WhisperConfig`, the EasyDeL configuration object for
+OpenAI's Whisper encoder-decoder speech-to-text architecture. The
+configuration captures the audio-frontend parameters (number of mel
+filters, max source positions), encoder/decoder depth and width,
+sinusoidal position embedding choices, and decoder-side
+LM/cross-attention dimensions.
+"""
 
 import typing
 

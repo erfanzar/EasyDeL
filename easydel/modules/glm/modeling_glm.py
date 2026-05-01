@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of THUDM's GLM (General Language Model) decoder.
+
+GLM is a decoder-only transformer with grouped-query attention, partial rotary
+position embeddings, and a gated SwiGLU MLP, designed for both natural language
+understanding and generation tasks.
+
+Architectural traits:
+    - Grouped-query attention with optional bias on Q/K/V/O projections.
+    - Partial rotary embeddings: ``partial_rotary_factor`` of the head dim
+      receives RoPE; the rest is left unrotated.
+    - Pre-normalization with RMSNorm (high-precision ``rms_norm_eps``).
+    - Gated MLP using a fused ``gate_up_proj`` design with SwiGLU.
+    - Configurable per-layer attention types.
+
+Exports:
+    - :class:`GlmModel`: Backbone returning hidden states.
+    - :class:`GlmForCausalLM`: Decoder LM with optional tied LM head.
+    - :class:`GlmForSequenceClassification`: Pooled classifier head.
+"""
+
 from functools import partial
 
 import jax
@@ -44,11 +64,19 @@ from .glm_configuration import GlmConfig
 
 
 class GlmMLP(spx.Module):
-    """Multi-Layer Perceptron module for GLM models.
+    """Gated MLP with a fused ``[gate; up]`` first projection.
 
-    Implements the feedforward network with gated activation function
-    using fused gate-up projections for enhanced representation learning
-    in the GLM architecture.
+    Functionally identical to the SwiGLU/GeGLU MLP used by Llama and
+    Gemma but stores the gate and up projections **as a single fused
+    weight** of shape ``(hidden, 2 * intermediate)``: each forward pass
+    multiplies once and then splits the result along the last axis. This
+    saves one matmul launch and matches the Hugging Face GLM checkpoint
+    layout, which stores the same parameter as ``gate_up_proj``.
+
+    The activation read from ``config.hidden_act`` is applied to the gate
+    half only; the result is multiplied by the up half before the
+    RowParallel ``down_proj`` brings the dimensionality back to
+    ``hidden_size``.
     """
 
     def __init__(
@@ -124,7 +152,17 @@ class GlmMLP(spx.Module):
 
 
 class GlmAttention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for GLM models."""
+    """Causal GQA attention with biasless output projection for GLM.
+
+    Standard :class:`UnifiedAttention` specialisation: causal grouped-query
+    attention with rotary position embeddings (the GLM family uses
+    *partial* RoPE — only the first ``partial_rotary_factor * head_dim``
+    channels are rotated, controlled by the config). The single override
+    here is :meth:`_create_o_proj`, which forces the output projection to
+    be biasless even though Q/K/V allow biases — this matches the HF GLM
+    weight layout where ``o_proj`` is the only attention linear without a
+    bias parameter.
+    """
 
     def __init__(
         self,
@@ -178,10 +216,14 @@ class GlmAttention(UnifiedAttention):
 
 
 class GlmDecoderLayer(spx.Module):
-    """Single decoder layer for GLM models.
+    """Pre-norm causal decoder block for GLM (RMSNorm + GQA + fused-gate MLP).
 
-    Combines multi-head attention and feedforward networks with
-    RMS normalization and residual connections.
+    Standard pre-norm shape ``x + attn(input_norm(x))`` followed by
+    ``x + mlp(post_attention_norm(x))``. Both norms are
+    :class:`spectrax.layers.RMSNorm` at the GLM epsilon. The attention is
+    :class:`GlmAttention` (causal GQA with partial RoPE) and the MLP is
+    :class:`GlmMLP` (fused ``gate_up_proj`` GeGLU). Residual additions are
+    plain elementwise sums; no per-layer scalar gate is applied.
     """
 
     def __init__(

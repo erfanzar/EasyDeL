@@ -217,27 +217,46 @@ def embedding_training_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """Training step for contrastive embedding learning.
+    """Run one contrastive embedding training step.
 
-    Expects batch to contain:
-    - ``query_input_ids``, ``query_attention_mask``
-    - ``positive_input_ids``, ``positive_attention_mask``
-    - Optionally: ``negative_input_ids``, ``negative_attention_mask``
+    Encodes the ``query``, ``positive``, and optional ``negative``
+    streams through the same encoder module, then computes the
+    selected contrastive loss. With ``matryoshka_dims`` set, the loss
+    is evaluated at every requested truncation dim and averaged
+    (Matryoshka Representation Learning). The encoder is run in
+    ``eval()`` mode inside the loss closure so dropout-style noise
+    does not pollute the embeddings (it is, however, still
+    differentiated against -- only the internal stochastic layers are
+    disabled).
+
+    The batch must carry tokenised ``query_*`` and ``positive_*``
+    streams; ``negative_*`` is optional and triggers explicit hard
+    negatives when present (in addition to in-batch negatives for
+    InfoNCE/MNRL).
 
     Args:
-        state: Current model state.
-        batch: Dictionary of batched inputs.
+        state: Encoder ``EasyDeLState`` being differentiated.
+        batch: Dict with at minimum ``query_input_ids``,
+            ``query_attention_mask``, ``positive_input_ids``,
+            ``positive_attention_mask``. Optionally
+            ``negative_input_ids`` / ``negative_attention_mask``.
         loss_type: One of ``"infonce"``, ``"triplet"``, ``"mnrl"``.
-        temperature: Temperature for InfoNCE/MNRL.
-        margin: Margin for triplet loss.
-        normalize: Whether to L2-normalize embeddings.
-        matryoshka_dims: Optional MRL dimensions.
-        learning_rate_fn: Learning rate schedule.
-        partition_spec: Sharding spec for the batch.
-        gradient_accumulation_steps: Gradient accumulation count.
+        temperature: Logit-scale temperature for InfoNCE/MNRL.
+        margin: Triplet-loss margin.
+        normalize: When ``True``, L2-normalises encoded embeddings
+            before the similarity / distance computation.
+        matryoshka_dims: Optional list of truncation dims for MRL.
+            ``None`` disables MRL.
+        learning_rate_fn: Schedule mapping step to learning rate.
+        partition_spec: Sharding spec applied to the input batch.
+        gradient_accumulation_steps: Gradient-accumulation factor;
+            the batch must be evenly divisible.
 
     Returns:
-        Tuple of (updated state, loss metrics).
+        ``(new_state, metrics)`` where ``metrics`` is a ``LossMetrics``
+        instance with ``loss``, ``accuracy`` (in-batch retrieval
+        accuracy for InfoNCE/MNRL), and any per-dimension MRL
+        diagnostics in ``other_metrics``.
     """
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -254,6 +273,22 @@ def embedding_training_step(
     base_loss_fn = loss_fns[loss_type]
 
     def loss_fn(tree, minibatch):
+        """Compute the embedding contrastive loss for one minibatch.
+
+        Embeds the query, positive and (optionally) hard-negative
+        sequences, dispatches to the configured base loss
+        (``infonce`` / ``mnrl`` / ``triplet``), and applies the
+        Matryoshka projection wrapper when requested.
+
+        Args:
+            tree: Encoder graphstate to differentiate against.
+            minibatch: Minibatch with at least ``query_*`` and
+                ``positive_*`` ``input_ids`` / ``attention_mask`` fields.
+
+        Returns:
+            ``(loss, metrics)`` with optional contrastive accuracy
+            recorded in ``metrics.accuracy``.
+        """
         module = state.merge(tree)
         module.eval()
 
@@ -341,6 +376,27 @@ def _embedding_loss_values(
     normalize: bool,
     matryoshka_dims: list[int] | None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Run the encoder and compute the chosen contrastive loss.
+
+    Computes embeddings for the concatenated query / positive / negative
+    sequences in a single forward pass before splitting them again,
+    which is friendlier to sharding than three separate forwards.
+
+    Args:
+        module: Encoder module.
+        batch: Minibatch dict with ``query_*``, ``positive_*`` and
+            optional ``negative_*`` ``input_ids`` / ``attention_mask``.
+        loss_type: One of ``"infonce"``, ``"mnrl"``, ``"triplet"``.
+        temperature: Temperature for InfoNCE / MNRL.
+        margin: Margin for triplet loss.
+        normalize: Whether embeddings are L2-normalised before the loss.
+        matryoshka_dims: Optional list of nested dimensions for
+            Matryoshka representation learning.
+
+    Returns:
+        ``(loss, extra_metrics)`` from the chosen base loss; for the
+        triplet loss without negatives the loss is zero.
+    """
     loss_fns = {
         "infonce": infonce_loss,
         "mnrl": mnrl_loss,
@@ -390,6 +446,15 @@ def _embedding_loss_values(
 
 
 def _embedding_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the embedding scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering the loss type, temperature, margin, embedding
+        normalisation flag, Matryoshka dim list, and partition spec.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("loss_type", "temperature", "margin", "normalize", "matryoshka_dims", "partition_spec"),
@@ -397,6 +462,15 @@ def _embedding_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_embedding_scheduled_loss(call):
+    """Build a SpectraX-scheduled embedding scalar-loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` carrying loss config.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready for
+        :func:`spx.sxvalue_and_grad`.
+    """
     loss_type = call.get("loss_type", "infonce")
     temperature = call.get("temperature", 0.05)
     margin = call.get("margin", 0.2)
@@ -405,6 +479,15 @@ def _make_embedding_scheduled_loss(call):
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree, batch):
+        """Compute the scalar contrastive loss inside the SpectraX scheduled VJP.
+
+        Args:
+            tree: Encoder graphstate to differentiate against.
+            batch: Minibatch with query/positive/negative sequences.
+
+        Returns:
+            The scalar contrastive loss (extra metrics are dropped).
+        """
         module = bind_scheduled_module(call, tree)
         batch = constrain_scheduled_batch(module, batch, partition_spec)
         loss, _extra_metrics = _embedding_loss_values(

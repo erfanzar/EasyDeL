@@ -12,6 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of DeepSeek-V2.
+
+DeepSeek-V2 combines two architectural ideas:
+
+1. **Multi-head Latent Attention (MLA)**: queries and key/values are first
+   compressed through low-rank projections (``q_lora_rank`` /
+   ``kv_lora_rank``), then split into a non-positional (nope) head
+   component and a smaller RoPE head component. Only the compressed
+   representation is cached, dramatically shrinking the KV cache.
+2. **DeepSeekMoE**: a fine-grained MoE FFN with separate routed and shared
+   experts, configurable group routing, and an auxiliary load-balancing
+   loss.
+
+Building blocks:
+
+- :class:`DeepseekV2MLP` — dense SwiGLU FFN used by the dense (non-MoE)
+  layers.
+- :class:`DeepseekV2MLPMoE` — expert-parallel SwiGLU FFN.
+- :class:`MoEGate` — score-based router (softmax/sigmoid, optional groups,
+  optional sequence-level auxiliary loss).
+- :class:`DeepseekV2MoE` — router + routed/shared experts wired together.
+- :class:`DeepseekV2Attention` — Multi-head Latent Attention (MLA) attention
+  module.
+- :class:`DeepseekV2DecoderLayer` — single decoder layer (dense or MoE).
+
+Public model classes (registered with the factory):
+
+- :class:`DeepseekV2Model` — base decoder.
+- :class:`DeepseekV2ForCausalLM` — causal LM head + auxiliary load-balancing
+  loss.
+"""
 
 import functools
 import typing
@@ -65,10 +96,15 @@ from .deepseek_configuration import DeepseekV2Config
 
 
 class DeepseekV2MLPMoE(spx.Module):
-    """Mixture-of-experts feed-forward module for DeepSeek V2 MoE layers.
+    """Expert-parallel SwiGLU FFN used inside DeepSeek-V2 MoE layers.
 
-    Implements the expert network with SwiGLU activation function for
-    mixture-of-experts routing in DeepSeek V2 architecture.
+    Per-expert variant of the dense :class:`DeepseekV2MLP`: each call
+    evaluates ``w_down(silu(w_gate(x)) * w_up(x))`` independently per
+    expert via ``ColumnParallelMoELinear`` / ``RowParallelMoELinear``, with
+    the expert axis sharded across the EP/TP mesh. Tokens have already been
+    grouped by :class:`DeepseekV2MoE` into per-expert ragged segments;
+    ``group_sizes`` and the sorted-expert indices arrive with the call.
+    Intermediate width is ``config.moe_intermediate_size``.
     """
 
     reform_param: typing.ClassVar = {
@@ -193,10 +229,14 @@ class DeepseekV2MLPMoE(spx.Module):
 
 
 class DeepseekV2MLP(spx.Module):
-    """Multi-Layer Perceptron module for DeepSeek V2 dense layers.
+    """SwiGLU feed-forward used by DeepSeek-V2 dense layers and shared experts.
 
-    Implements the feedforward network with SwiGLU activation function
-    for enhanced representation learning in dense (non-MoE) layers.
+    Computes ``down_proj(silu(gate_proj(x)) * up_proj(x))``. Used in two
+    places: as the FFN of the first ``config.first_k_dense_replace`` layers
+    (which run as dense transformer blocks), and as the shared-expert
+    branch inside :class:`DeepseekV2MoE` when ``config.n_shared_experts``
+    is set (intermediate width
+    ``config.moe_intermediate_size * n_shared_experts``).
     """
 
     def __init__(
@@ -269,10 +309,24 @@ class DeepseekV2MLP(spx.Module):
 
 
 class MoEGate(spx.Module):
-    """Router module that scores tokens and selects experts for DeepSeek V2 MoE.
+    """DeepSeek-V2 router with optional group routing and aux load-balancing loss.
 
-    Implements token-to-expert routing with support for group-limited greedy
-    selection and top-k expert assignment for mixture-of-experts layers.
+    Pipeline per token:
+
+    1. ``hidden -> n_routed_experts`` linear (no bias) -> per-expert score.
+    2. Score is softmaxed (or sigmoid-normalised, depending on
+       ``config.scoring_func``).
+    3. **Group routing.** When ``config.topk_method == "group_limited_greedy"``,
+       experts are partitioned into ``n_group`` groups and only the top
+       ``topk_group`` groups (ranked by their best member score per token)
+       remain eligible; this caps cross-device routing fan-out.
+    4. ``num_experts_per_tok`` experts are picked from eligible scores; if
+       ``norm_topk_prob`` is true the chosen weights are renormalised to sum
+       to 1.
+    5. When ``alpha > 0``, an auxiliary sequence-level load-balancing loss
+       is accumulated for the trainer to consume.
+
+    Returned tuple: ``(top_idx, top_weight, aux_loss)``.
     """
 
     def __init__(
@@ -353,10 +407,24 @@ class MoEGate(spx.Module):
 
 
 class DeepseekV2MoE(BaseMoeModule):
-    """Mixture-of-experts module combining gating and expert networks for DeepSeek V2.
+    """DeepSeek-V2 MoE layer: routed experts + optional shared expert.
 
-    Implements the complete MoE layer with token routing through gating network
-    and expert processing with optional shared experts for enhanced performance.
+    Composes the routing path and the dense fall-back path used by
+    DeepSeekMoE:
+
+    * **Router** (:class:`MoEGate`) scores tokens, optionally groups
+      experts, and emits ``num_experts_per_tok`` (top-k) expert ids per
+      token together with normalised gating weights.
+    * **Routed experts** (:class:`DeepseekV2MLPMoE`) run a SwiGLU FFN per
+      expert; tokens are dispatched through ``BaseMoeModule.moe_call`` with
+      ``MoeLoadBalancingStrategy.STANDARD`` (the auxiliary loss is the one
+      the gate exposes via ``alpha``).
+    * **Shared expert** (:class:`DeepseekV2MLP`, optional). When
+      ``config.n_shared_experts`` is set, every token also goes through one
+      large dense expert with intermediate width
+      ``moe_intermediate_size * n_shared_experts``; its output is summed
+      onto the routed-expert output. This stabilises representations even
+      at low expert activation.
     """
 
     def __init__(
@@ -499,10 +567,26 @@ class DeepseekV2MoE(BaseMoeModule):
 
 
 class DeepseekV2Attention(UnifiedAttention):
-    """Multi-head Latent Attention (MLA) layer for DeepSeek V2 models.
+    """Multi-head Latent Attention (MLA) for DeepSeek-V2.
 
-    Implements MLA with low-rank key-value compression for efficient memory usage
-    and improved inference performance. Inherits from UnifiedAttention base class.
+    Same MLA construction as DeepSeek-V3 but tuned for V2's hyperparameter
+    set. Queries/keys are split into a no-position part of width
+    ``qk_nope_head_dim`` and a RoPE part of width ``qk_rope_head_dim``;
+    keys/values pass through a low-rank latent of width ``kv_lora_rank``,
+    which is what gets cached at inference (cache footprint per token =
+    ``kv_lora_rank + qk_rope_head_dim`` instead of full per-head KV).
+
+    * **Query path.** When ``config.q_lora_rank`` is set, queries route
+      through ``q_a_proj -> RMSNorm -> q_b_proj`` (LoRA-style); otherwise
+      a single ``q_proj`` produces ``num_heads * q_head_dim`` directly.
+    * **KV path.** ``kv_a_proj_with_mqa`` produces both the latent
+      (``kv_lora_rank``) and the shared RoPE-K (``qk_rope_head_dim``); the
+      latent is RMSNorm'd by ``kv_a_layernorm`` and then ``kv_b_proj``
+      expands it to per-head NoPE-K and value channels.
+    * **Softmax scale.** ``q_head_dim ** -0.5`` × YARN ``mscale ** 2`` when
+      ``rope_scaling.mscale_all_dim`` is configured.
+    * **Output.** Heads merged at ``v_head_dim``; row-parallel ``o_proj``
+      projects back to ``hidden_size``.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -724,10 +808,19 @@ class DeepseekV2Attention(UnifiedAttention):
 
 
 class DeepseekV2DecoderLayer(spx.Module):
-    """Single decoder layer for DeepSeek V2 models.
+    """One DeepSeek-V2 decoder layer (sequential pre-norm MLA + FFN/MoE).
 
-    Combines Multi-head Latent Attention (MLA) and feedforward networks
-    (dense or MoE) with RMS normalization and residual connections.
+    Standard pre-norm transformer block:
+
+        ``x = x + mla(input_ln(x))``
+        ``x = x + ffn(post_attn_ln(x))``
+
+    The FFN swap-out is layer-aware:
+
+    * Layers ``0..first_k_dense_replace - 1`` use the dense
+      :class:`DeepseekV2MLP` with width ``intermediate_size``.
+    * Remaining layers use :class:`DeepseekV2MoE` with optional shared
+      expert and routed experts of width ``moe_intermediate_size``.
     """
 
     def __init__(
@@ -887,10 +980,15 @@ class DeepseekV2DecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, DeepseekV2Config, model_type="deepseek_v2")
 class DeepseekV2Model(EasyDeLBaseModule):
-    """DeepSeek V2 base model implementation.
+    """DeepSeek-V2 backbone (registered as ``BASE_MODULE``).
 
-    This implements the DeepSeek V2 language model architecture with Multi-head Latent
-    Attention (MLA), mixture-of-experts (MoE) layers, and RMS normalization.
+    Stack: token embedding -> ``num_hidden_layers`` :class:`DeepseekV2DecoderLayer`
+    blocks (first ``first_k_dense_replace`` layers are dense, the rest are
+    MoE) -> final RMSNorm. Attention uses MLA with low-rank KV compression
+    and YARN-scaled RoPE for long context. Returns
+    :class:`MoeModelOutput` carrying the final hidden state, optional
+    per-layer hidden states / attentions, optional router logits (one per
+    MoE layer; ``None`` for the dense prefix), and the updated KV cache.
 
     Attributes:
         config (DeepseekV2Config): Configuration for the model.
@@ -1144,10 +1242,13 @@ class DeepseekV2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, DeepseekV2Config, model_type="deepseek_v2")
 class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config]):
-    """DeepSeek V2 model with a language modeling head for causal language modeling tasks.
+    """DeepSeek-V2 backbone + ``vocab_size`` LM head for autoregressive generation.
 
-    This model extends the base DeepSeek V2 model by adding a linear language modeling head
-    for autoregressive text generation with MoE routing and auxiliary loss support.
+    Wraps :class:`DeepseekV2Model` with an unbiased linear ``lm_head``.
+    Goes through ``forward_moe`` and folds the auxiliary load-balancing
+    loss (computed in :meth:`_compute_aux_loss` from the per-MoE-layer
+    router logits, weighted by ``config.aux_loss_alpha``) into the main
+    objective.
 
     Attributes:
         config (DeepseekV2Config): Configuration for the model.
