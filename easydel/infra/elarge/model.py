@@ -52,6 +52,7 @@ from .benchmarking import (
     run_lm_eval_with_esurge,
 )
 from .builders import (
+    _extract_dataset_name,
     build_dataset,
     build_esurge,
     build_model,
@@ -84,7 +85,9 @@ from .types import (
 if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
+    from easydel.data import WriteStats
     from easydel.data.core.protocols import ShardedDataSource
+    from easydel.data.transforms import ExpandTransform, Transform
     from easydel.inference import eSurge
     from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.tools.abstract_tool import ToolParserName
@@ -1404,6 +1407,286 @@ class eLargeModel:
             ...     process(batch)
         """
         return build_sharded_source(self._config)
+
+    def _build_training_arguments_for_type(self, trainer_type: str | None = None):
+        """Build trainer arguments while normalizing defaults for a requested trainer."""
+        trainer_cfg = dict(self._config.get("trainer", {}))
+        if trainer_type is not None:
+            trainer_cfg["trainer_type"] = trainer_type
+        trainer_cfg = normalize_trainer_config(trainer_cfg)
+        args_class = get_training_arguments_class(trainer_cfg.get("trainer_type", "sft"))
+        config_for_args = {key: value for key, value in trainer_cfg.items() if key != "trainer_type"}
+
+        try:
+            return trainer_cfg, args_class(**config_for_args)
+        except TypeError:
+            import inspect
+
+            sig = inspect.signature(args_class.__init__)
+            valid_params = set(sig.parameters.keys()) - {"self"}
+            filtered_config = {key: value for key, value in config_for_args.items() if key in valid_params}
+            return trainer_cfg, args_class(**filtered_config)
+
+    def _build_pre_tokenize_transform(
+        self,
+        trainer_type: str | None = None,
+        formatting_func: typing.Callable | None = None,
+    ) -> "Transform | ExpandTransform":
+        """Resolve the same raw-data preprocessing transform used by trainer data loaders."""
+        import easydel.trainers  # noqa: F401
+        from easydel.trainers.prompt_transforms import (
+            BCOPreprocessTransform,
+            CPOPreprocessTransform,
+            DPOPreprocessTransform,
+            EmbeddingPreprocessTransform,
+            GRPOPreprocessTransform,
+            KTOPreprocessTransform,
+            ORPOPreprocessTransform,
+            PPOPreprocessTransform,
+            RewardPreprocessTransform,
+            SFTPreprocessTransform,
+        )
+
+        trainer_cfg, arguments = self._build_training_arguments_for_type(trainer_type)
+        trainer_type = trainer_cfg.get("trainer_type", trainer_type)
+        tokenizer = self.build_tokenizer()
+        mixture_cfg = self._config.get("mixture", {})
+
+        if trainer_type in {"sft", "gkd", "distillation"}:
+            text_field = getattr(arguments, "dataset_text_field", None) or mixture_cfg.get("text_target_field", "text")
+            mask_prompt = bool(getattr(arguments, "assistant_only_loss", False))
+            completion_only_loss = getattr(arguments, "completion_only_loss", None)
+            if completion_only_loss is not None:
+                mask_prompt = bool(completion_only_loss)
+            return SFTPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length,
+                text_field=text_field,
+                mask_prompt=mask_prompt,
+                formatting_func=formatting_func,
+            )
+
+        if trainer_type == "dpo":
+            return DPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "orpo":
+            return ORPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "cpo":
+            return CPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "kto":
+            return KTOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                label_pad_token_id=arguments.label_pad_token_id,
+                tools=getattr(arguments, "tools", None),
+            )
+
+        if trainer_type == "bco":
+            return BCOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                label_pad_token_id=arguments.label_pad_token_id,
+                tools=getattr(arguments, "tools", None),
+            )
+
+        if trainer_type == "reward":
+            return RewardPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length,
+            )
+
+        if trainer_type == "embedding":
+            return EmbeddingPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length or 512,
+                query_field=arguments.query_field,
+                positive_field=arguments.positive_field,
+                negative_field=getattr(arguments, "negative_field", None),
+            )
+
+        prompt_only_trainers = {
+            "agentic-moshpit",
+            "gfpo",
+            "grpo",
+            "gspo",
+            "nash-md",
+            "on_policy_distillation",
+            "ppo",
+            "rlvr",
+            "sdpo",
+            "seq_kd",
+            "sparse_distillation",
+            "xpo",
+        }
+        if trainer_type in prompt_only_trainers:
+            transform_cls = PPOPreprocessTransform if trainer_type == "ppo" else GRPOPreprocessTransform
+            return transform_cls(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                tools=getattr(arguments, "tools", None),
+                skip_apply_chat_template=getattr(arguments, "skip_apply_chat_template", False),
+            )
+
+        raise ValueError(f"pre_tokenize does not know how to build a transform for trainer_type={trainer_type!r}")
+
+    @staticmethod
+    def _sanitize_pre_tokenize_path_part(value: Any, default: str = "NA") -> str:
+        """Make one generated pre-tokenization folder segment path-safe."""
+        import re
+
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+        text = text.strip("._-")
+        return text or default
+
+    def _build_pre_tokenize_folder_name(self, trainer_cfg: Mapping[str, Any], arguments: Any, tokenizer: Any) -> str:
+        """Build the deterministic child folder for pre-tokenized data."""
+        mixture_cfg = self._config.get("mixture", {})
+        informs = mixture_cfg.get("informs", [])
+        dataset_names = [
+            self._sanitize_pre_tokenize_path_part(_extract_dataset_name(inform, fallback_index=index))
+            for index, inform in enumerate(informs)
+        ]
+        dataset_name = "_".join(dataset_names) if dataset_names else "mixture"
+        tokenizer_class = self._sanitize_pre_tokenize_path_part(tokenizer.__class__.__name__, default="Tokenizer")
+        trainer_type = self._sanitize_pre_tokenize_path_part(trainer_cfg.get("trainer_type", "sft"))
+        max_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_length", None))
+        max_prompt_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_prompt_length", None))
+        max_completion_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_completion_length", None))
+        return (
+            f"{trainer_type}-{tokenizer_class}-"
+            f"MXL{max_length}-PL{max_prompt_length}-CL{max_completion_length}-{dataset_name}"
+        )
+
+    def _resolve_pre_tokenize_output_path(
+        self,
+        path_to_save: str | os.PathLike | ePathLike | None,
+        trainer_cfg: Mapping[str, Any],
+        arguments: Any,
+        tokenizer: Any,
+    ) -> str:
+        """Resolve the pre-tokenized output path from a base path plus generated metadata."""
+        if path_to_save is not None:
+            base_path = os.fspath(path_to_save)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer)
+            return f"{base_path.rstrip('/')}/{folder_name}"
+
+        mixture_cfg = self._config.get("mixture", {})
+        save_cfg = mixture_cfg.get("save", {})
+        output_path = save_cfg.get("output_path")
+        if output_path:
+            base_path = os.fspath(output_path)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer)
+            return f"{base_path.rstrip('/')}/{folder_name}"
+
+        raw_trainer_cfg = self._config.get("trainer", {})
+        save_directory = raw_trainer_cfg.get("save_directory")
+        if save_directory:
+            save_directory = os.fspath(save_directory).rstrip("/")
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer)
+            return f"{save_directory}/pretokenized/{folder_name}"
+
+        raise ValueError(
+            "path_to_save is required for pre_tokenize when neither "
+            "mixture.save.output_path nor trainer.save_directory is configured"
+        )
+
+    def pre_tokenize(
+        self,
+        path_to_save: str | os.PathLike | ePathLike | None = None,
+        *,
+        trainer_type: str | None = None,
+        output_format: str | None = None,
+        max_shard_size: str | int | None = None,
+        num_shards: int | None = None,
+        compression: str | None = None,
+        num_proc: int | None = None,
+        show_progress: bool = True,
+        log_process: bool | int | None = None,
+        formatting_func: typing.Callable | None = None,
+    ) -> "WriteStats":
+        """Pre-tokenize the configured data mixture for a trainer and save shards.
+
+        Args:
+            path_to_save: Base output directory for the materialized tokenized
+                shards. The final folder is generated as
+                ``{trainer_type}-{tokenizer_class}-MXL{max_length}-PL{max_prompt_length}-CL{max_completion_length}-{dataset_names}``.
+                When omitted, uses ``mixture.save.output_path`` and then falls
+                back to ``<trainer.save_directory>/pretokenized`` as the base.
+            trainer_type: Trainer family whose preprocessing should be applied.
+                When omitted, uses ``trainer.trainer_type`` from the eLarge config.
+            output_format: Optional output format override. Defaults to
+                ``mixture.save.format`` and falls back to ``"parquet"``.
+            max_shard_size: Optional shard size override. Defaults to
+                ``mixture.save.max_shard_size`` and falls back to ``"500MB"``.
+            num_shards: Optional fixed shard count override. Defaults to
+                ``mixture.save.num_shards``.
+            compression: Optional compression override. Defaults to
+                ``mixture.save.compression`` and falls back to ``"snappy"``.
+            num_proc: Reserved for the underlying pretokenize helper.
+            show_progress: Whether the underlying helper should show progress.
+            log_process: When enabled, show a tqdm progress bar for transformed
+                examples as they pass into the writer. ``True`` refreshes every
+                1,000 examples; an integer refreshes every N examples. Defaults
+                to ``mixture.save.log_process`` when present.
+            formatting_func: Optional SFT-style formatting callable.
+
+        Returns:
+            WriteStats: Number of written examples, shards, bytes, and paths.
+        """
+        from easydel.data import pretokenize
+
+        source = self.build_sharded_source()
+        if source is None:
+            raise ValueError("mixture.informs is required for pre_tokenize")
+
+        save_cfg = self._config.get("mixture", {}).get("save", {})
+        resolved_format = output_format or save_cfg.get("format", "parquet")
+        if resolved_format == "json":
+            resolved_format = "jsonl"
+
+        trainer_cfg, arguments = self._build_training_arguments_for_type(trainer_type)
+        tokenizer = self.build_tokenizer()
+        resolved_output_path = self._resolve_pre_tokenize_output_path(path_to_save, trainer_cfg, arguments, tokenizer)
+        transform = self._build_pre_tokenize_transform(trainer_type, formatting_func=formatting_func)
+        return pretokenize(
+            source=source,
+            transform=transform,
+            output_path=resolved_output_path,
+            output_format=resolved_format,
+            max_shard_size=max_shard_size or save_cfg.get("max_shard_size", "500MB"),
+            compression=compression if compression is not None else save_cfg.get("compression", "snappy"),
+            num_shards=num_shards if num_shards is not None else save_cfg.get("num_shards"),
+            num_proc=num_proc,
+            show_progress=show_progress,
+            log_process=log_process if log_process is not None else save_cfg.get("log_process", False),
+        )
 
     def get_train_source(self) -> "ShardedDataSource | Dataset | IterableDataset | None":
         """Get training data as ShardedDataSource or Dataset.

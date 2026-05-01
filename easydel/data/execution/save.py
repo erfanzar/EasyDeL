@@ -39,6 +39,35 @@ if tp.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def estimate_row_size(value: tp.Any) -> int:
+    """Cheap approximate serialized size without stringifying large token lists."""
+    if value is None:
+        return 0
+    if isinstance(value, str | bytes | bytearray):
+        return len(value)
+    if isinstance(value, bool):
+        return 1
+    if isinstance(value, int | float):
+        return 8
+    if isinstance(value, dict):
+        return sum(len(str(key)) + estimate_row_size(item) for key, item in value.items())
+    if isinstance(value, list | tuple):
+        if not value:
+            return 0
+        first = value[0]
+        if isinstance(first, int | float | bool):
+            return len(value) * 8
+        return sum(estimate_row_size(item) for item in value)
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return int(value.nbytes)
+    except Exception:
+        pass
+    return len(str(value))
+
+
 def parse_size(size: str | int) -> int:
     """Convert a human-readable size string into a raw byte count.
 
@@ -270,11 +299,10 @@ class ParquetWriter(DatasetWriter):
         for shard_name in source.shard_names:
             for example in source.open_shard(shard_name):
                 current_rows.append(example)
-                # Rough size estimate
-                current_size += len(str(example))
+                current_size += estimate_row_size(example)
                 stats.num_examples += 1
 
-                if self.num_shards is None and current_size >= self.max_shard_size:
+                if current_size >= self.max_shard_size:
                     flush_shard()
 
         # Final flush
@@ -355,10 +383,10 @@ class ArrowWriter(DatasetWriter):
         for shard_name in source.shard_names:
             for example in source.open_shard(shard_name):
                 current_rows.append(example)
-                current_size += len(str(example))
+                current_size += estimate_row_size(example)
                 stats.num_examples += 1
 
-                if self.num_shards is None and current_size >= self.max_shard_size:
+                if current_size >= self.max_shard_size:
                     flush_shard()
 
         flush_shard()
@@ -444,7 +472,7 @@ class JsonlWriter(DatasetWriter):
                 current_size += len(line)
                 stats.num_examples += 1
 
-                if self.num_shards is None and current_size >= self.max_shard_size:
+                if current_size >= self.max_shard_size:
                     flush_shard()
 
         flush_shard()

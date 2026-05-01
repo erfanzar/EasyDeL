@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 import os
 import typing as tp
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from ..core.config import (
     DatasetConfig,
@@ -39,6 +41,7 @@ from ..core.config import (
 from ..core.protocols import PipelineContext, ShardedDataSource
 from ..core.types import DatasetMixture, TextDatasetInform
 from ..sources import create_source, load_for_inform
+from ..transforms.base import ExpandTransform
 from ..transforms.mixture import MixStage, block_mixture_interleave
 from ..transforms.pack import PackStage, pack_constant_length, pack_pre_tokenized
 from ..transforms.tokenize import TokenizeStage
@@ -477,10 +480,12 @@ def pretokenize(
     transform: tp.Any,
     output_path: str,
     output_format: str = "parquet",
-    max_shard_size: str = "500MB",
+    max_shard_size: str | int = "500MB",
     compression: str | None = "snappy",
     num_proc: int | None = None,
     show_progress: bool = True,
+    num_shards: int | None = None,
+    log_process: bool | int = False,
 ) -> WriteStats:
     """Pretokenize a data source using a trainer transform and save to disk.
 
@@ -496,8 +501,13 @@ def pretokenize(
         output_format: Output format - "parquet" (default), "arrow", or "jsonl".
         max_shard_size: Maximum size per output shard (e.g., "500MB", "1GB").
         compression: Compression algorithm (default: "snappy" for parquet).
-        num_proc: Number of parallel processes (currently unused, reserved for future).
+        num_proc: Number of parallel transform workers. Uses bounded threads
+            so tokenizer/GCS work can overlap without staging the dataset.
         show_progress: Whether to show progress information.
+        num_shards: Optional fixed number of output shards.
+        log_process: When enabled, show a tqdm progress bar for transformed
+            examples as they pass into the writer. ``True`` refreshes the bar
+            every 1,000 examples; an integer refreshes every N examples.
 
     Returns:
         WriteStats with num_examples, num_shards, total_bytes, output_paths.
@@ -542,14 +552,22 @@ def pretokenize(
     from ..transforms.source import TransformedShardedSource
     from .save import save_dataset
 
-    _ = num_proc  # Reserved for future parallel processing
-
     if show_progress:
         logger.info(f"Pretokenizing with {transform.__class__.__name__}...")
         logger.info(f"Output: {output_path} ({output_format})")
 
     # Wrap source with transform
-    transformed_source = TransformedShardedSource(source, transform)
+    if num_proc and num_proc > 1:
+        transformed_source = _ParallelTransformedShardedSource(
+            source,
+            transform,
+            num_workers=int(num_proc),
+        )
+    else:
+        transformed_source = TransformedShardedSource(source, transform)
+    progress_update_interval = _resolve_log_process_update_interval(log_process)
+    if progress_update_interval is not None:
+        transformed_source = _ProgressBarShardedSource(transformed_source, progress_update_interval)
 
     # Save to disk
     stats = save_dataset(
@@ -557,6 +575,7 @@ def pretokenize(
         output_path=output_path,
         format=output_format,
         max_shard_size=max_shard_size,
+        num_shards=num_shards,
         compression=compression,
     )
 
@@ -567,6 +586,148 @@ def pretokenize(
         )
 
     return stats
+
+
+def _resolve_log_process_update_interval(log_process: bool | int) -> int | None:
+    """Normalize the optional pretokenization tqdm update interval."""
+    if log_process is False:
+        return None
+    if log_process is True:
+        return 1_000
+    interval = int(log_process)
+    if interval <= 0:
+        return None
+    return interval
+
+
+def _make_pre_tokenize_progress_bar():
+    """Create the tqdm progress bar for streaming pretokenization."""
+    from tqdm.auto import tqdm
+
+    return tqdm(desc="Pretokenizing", unit="examples", unit_scale=True)
+
+
+def _apply_transform_to_example(transform: tp.Any, example: dict) -> list[dict]:
+    """Apply one regular or expanding transform and materialize the output."""
+    if isinstance(transform, ExpandTransform):
+        return list(transform(example))
+    result = transform(example)
+    return [] if result is None else [result]
+
+
+class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
+    """Bounded ordered parallel transform wrapper for pretokenization."""
+
+    def __init__(
+        self,
+        source: ShardedDataSource[dict],
+        transform: tp.Any,
+        num_workers: int,
+        max_pending: int | None = None,
+    ):
+        self._source = source
+        self._transform = transform
+        self._num_workers = max(1, int(num_workers))
+        self._max_pending = max_pending or self._num_workers * 8
+
+    @property
+    def shard_names(self) -> tp.Sequence[str]:
+        return self._source.shard_names
+
+    def num_shards(self) -> int:
+        return self._source.num_shards()
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        return self._source.get_shard_info(shard_name)
+
+    def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        yield from self._iter_parallel(self._source.open_shard(shard_name))
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        yield from self._iter_parallel(self._source.open_shard_at_row(shard_name, row))
+
+    def _iter_parallel(self, examples: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        pending: deque[Future[list[dict]]] = deque()
+
+        with ThreadPoolExecutor(max_workers=self._num_workers) as executor:
+            for example in examples:
+                pending.append(executor.submit(_apply_transform_to_example, self._transform, example))
+                if len(pending) >= self._max_pending:
+                    for transformed in pending.popleft().result():
+                        yield transformed
+
+            while pending:
+                for transformed in pending.popleft().result():
+                    yield transformed
+
+
+class _ProgressBarShardedSource(ShardedDataSource[dict]):
+    """Pass-through source wrapper that updates a tqdm bar as rows are yielded."""
+
+    def __init__(self, source: ShardedDataSource[dict], update_interval: int):
+        self._source = source
+        self._update_interval = update_interval
+        self._count = 0
+        self._pending_updates = 0
+        self._bar = None
+
+    @property
+    def shard_names(self) -> tp.Sequence[str]:
+        return self._source.shard_names
+
+    def num_shards(self) -> int:
+        return self._source.num_shards()
+
+    def _get_bar(self):
+        if self._bar is None:
+            self._bar = _make_pre_tokenize_progress_bar()
+        return self._bar
+
+    def _update_bar(self, force: bool = False) -> None:
+        if self._pending_updates and (force or self._pending_updates >= self._update_interval):
+            self._get_bar().update(self._pending_updates)
+            self._pending_updates = 0
+
+    def _close_bar(self) -> None:
+        self._update_bar(force=True)
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+
+    def _is_last_shard(self, shard_name: str) -> bool:
+        shard_names = self.shard_names
+        return bool(shard_names) and shard_name == shard_names[-1]
+
+    def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        try:
+            for example in self._source.open_shard(shard_name):
+                self._count += 1
+                self._pending_updates += 1
+                self._update_bar()
+                yield example
+        except Exception:
+            self._close_bar()
+            raise
+        finally:
+            if self._is_last_shard(shard_name):
+                self._close_bar()
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        try:
+            for example in self._source.open_shard_at_row(shard_name, row):
+                self._count += 1
+                self._pending_updates += 1
+                self._update_bar()
+                yield example
+        except Exception:
+            self._close_bar()
+            raise
+        finally:
+            if self._is_last_shard(shard_name):
+                self._close_bar()
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        return self._source.get_shard_info(shard_name)
 
 
 def build_dataset(mixture: DatasetMixture) -> "DS | IDS":

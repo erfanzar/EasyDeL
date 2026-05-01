@@ -363,6 +363,8 @@ class BaseTrainerCfg(TypedDict, total=False):
         esurge_max_num_batched_tokens: Max num tokens to batch together for eSurge generation.
         esurge_enable_prefix_caching: Enable/disable eSurge prefix caching.
         esurge_data_parallelism_axis: Mesh axis name for eSurge data-parallel KV pages.
+        esurge_async_scheduling: Enable/disable asynchronous eSurge scheduling.
+        esurge_overlap_execution: Enable/disable overlapped eSurge execution.
         esurge_max_num_seq_buckets: Optional explicit sequence-capacity buckets for eSurge runner compilation.
 
     Example:
@@ -547,6 +549,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     esurge_max_num_batched_tokens: NotRequired[int | None]
     esurge_enable_prefix_caching: NotRequired[bool | None]
     esurge_data_parallelism_axis: NotRequired[str | None]
+    esurge_async_scheduling: NotRequired[bool | None]
+    esurge_overlap_execution: NotRequired[bool | None]
     esurge_max_num_seq_buckets: NotRequired[list[int] | None]
 
 
@@ -1601,6 +1605,8 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "esurge_max_num_batched_tokens": None,
     "esurge_enable_prefix_caching": None,
     "esurge_data_parallelism_axis": None,
+    "esurge_async_scheduling": None,
+    "esurge_overlap_execution": None,
     "esurge_max_num_seq_buckets": None,
 }
 """Default configuration values shared across all trainer types.
