@@ -84,6 +84,7 @@ from ..requirements import (
     MetadataField,
     OperationRequirements,
 )
+from ._mask_info import align_mask_info_to_qkv_specs
 from .vanilla_attention import VanillaAttn
 
 if tp.TYPE_CHECKING:
@@ -328,6 +329,12 @@ class BlockSparseAttn(OperationImpl):
             shardings.output,
             tensor=query_transposed,
             preserved_indices=[0, 1],
+        )
+        mask_info = align_mask_info_to_qkv_specs(
+            mask_info,
+            query_spec=query_sharding,
+            key_spec=key_sharding,
+            layout="bhtd",
         )
 
         try:

@@ -19,6 +19,7 @@ import functools
 import typing as tp
 
 import jax
+import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import with_sharding_constraint
@@ -27,10 +28,18 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    cached_scheduled_auxiliary,
+    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
+    scheduled_loss_cache_key,
+    stop_gradient_tree,
+    sync_module_schedule_config,
     update_metrics,
     update_state_respectfully,
 )
@@ -126,6 +135,21 @@ def generalized_jsd_loss(
         return jnp.mean(per_token)
     normalizer = jnp.maximum(mask.sum(), jnp.array(1.0, dtype=student_logits.dtype))
     return jnp.sum(per_token * mask) / normalizer
+
+
+def _gkd_forward_logits(model, batch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
+    call_kwargs = dict(batch)
+    call_kwargs.pop("labels", None)
+    call_kwargs.pop("completion_mask", None)
+    call_kwargs.pop("assistant_masks", None)
+    call_kwargs.pop("teacher_logits", None)
+    call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
+    call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+    outputs = model(**call_kwargs)
+    logits = getattr(outputs, "logits", None)
+    if logits is None:
+        raise TypeError(f"{type(model).__name__} did not return logits for GKD.")
+    return logits
 
 
 def gkd_step(
@@ -247,3 +271,66 @@ def gkd_step(
         return student_state, metrics
     _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
     return metrics
+
+
+def _prepare_gkd_scheduled_batch(call) -> dict[str, tp.Any]:
+    batch = dict(call.batch)
+    if "teacher_logits" in batch:
+        return batch
+
+    teacher_state = call.get("teacher_state")
+    if teacher_state is None:
+        raise RuntimeError("GKD scheduled MPMD training requires teacher_state.")
+
+    teacher_model = teacher_state.model
+    teacher_model.eval()
+    sync_module_schedule_config(teacher_model, call.schedule)
+    constrained_batch = constrain_scheduled_batch(teacher_model, batch, call.get("partition_spec"))
+    teacher_forward = cached_scheduled_auxiliary(_gkd_forward_logits, teacher_model.mesh)
+    batch["teacher_logits"] = stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))
+    return batch
+
+
+def _gkd_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("beta", "temperature", "partition_spec"),
+        object_fields=("straight_through_emulator",),
+    )
+
+
+def _make_gkd_scheduled_loss(call):
+    beta = call.get("beta", 0.5)
+    temperature = call.get("temperature", 1.0)
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        labels = call_batch.get("labels")
+        teacher_logits = jax.lax.stop_gradient(call_batch["teacher_logits"])
+        student_logits = _gkd_forward_logits(module, call_batch)
+        completion_mask = call_batch.get("completion_mask")
+        attention_mask = call_batch.get("attention_mask")
+        mask = completion_mask if completion_mask is not None else attention_mask
+        return generalized_jsd_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            labels=labels,
+            mask=mask,
+            beta=beta,
+            temperature=temperature,
+        )
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    gkd_step,
+    ScheduledLossAdapter(
+        name="gkd",
+        make_loss=_make_gkd_scheduled_loss,
+        make_cache_key=_gkd_scheduled_loss_cache_key,
+        prepare_batch=_prepare_gkd_scheduled_batch,
+    ),
+)

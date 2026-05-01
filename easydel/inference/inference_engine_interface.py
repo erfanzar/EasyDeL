@@ -1038,9 +1038,11 @@ class BaseInferenceApiServer(ABC):
     def _infer_sequence_length_from_engine(self, engine: tp.Any | None = None) -> int:
         """Infer maximum sequence length from the engine or fall back to 128 tokens."""
 
-        if engine is not None and getattr(engine, "max_model_len", None):
+        runtime_config = getattr(engine, "runtime_config", None)
+        max_model_len = getattr(runtime_config, "max_model_len", None) if runtime_config is not None else None
+        if max_model_len:
             try:
-                return int(engine.max_model_len)
+                return int(max_model_len)
             except (TypeError, ValueError):
                 pass
         return 128

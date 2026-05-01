@@ -363,8 +363,8 @@ def test_quantized_linear_tpu_forces_shard_map_without_named_sharding(monkeypatc
 
     monkeypatch.setattr(linear_quantized_mod, "shard_map", _fake_shard_map)
     monkeypatch.setattr(linear_quantized_mod, "ej_quantized_matmul", _spy_qmm)
-    monkeypatch.setattr(linear_quantized_mod, "_pick_mesh_from_arrays", lambda *_args, **_kwargs: fake_mesh)
-    monkeypatch.setattr(linear_quantized_mod, "_spec_for_mesh", lambda *_args, **_kwargs: PartitionSpec())
+    monkeypatch.setattr(linear_quantized_mod, "pick_array_mesh", lambda *_args, **_kwargs: fake_mesh)
+    monkeypatch.setattr(linear_quantized_mod, "partition_spec_for_mesh", lambda *_args, **_kwargs: PartitionSpec())
     monkeypatch.setattr(linear_quantized_mod.jax, "default_backend", lambda: "tpu")
 
     layer = ColumnParallelLinearQuantized(

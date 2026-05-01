@@ -1280,15 +1280,16 @@ class FalconH1Model(EasyDeLBaseModule):
             if past_key_values is not None:
                 cache_view = past_key_values.get_view(layer_idx)
 
-            layer_output = layer(
-                hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=cache_view,
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-            )
+            with self._layer_stage_context(layer_idx, layers=self.layers):
+                layer_output = layer(
+                    hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=cache_view,
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                )
 
             hidden_states = self._mark_layer_stage_boundary(layer_output.hidden_states, layer_idx, layers=self.layers)
 

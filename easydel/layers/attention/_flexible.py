@@ -73,12 +73,18 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
 )
 from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.infra.sharding import StageMesh, resolve_stage_mesh
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry, ScaledDotProductAttn
 
 from ..quantization import EasyQuantizer, TurboQuantConfig
 
 logger = get_logger(__name__)
+
+
+def _attention_mesh_context(config: EasyDeLBaseConfig):
+    """Use the active stage mesh inside MPMD pipeline stages."""
+    return resolve_stage_mesh(config.mesh)
 
 
 def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
@@ -522,7 +528,7 @@ class FlexibleAttentionModule(spx.Module):
             )
             return ScaledDotProductAttn(metadata=self.metadata)
 
-        with self.config.mesh:  # pyright: ignore[reportOptionalContextManager]
+        with _attention_mesh_context(self.config):  # pyright: ignore[reportOptionalContextManager]
             input_dict: dict[str, tp.Any] = dict(
                 query=query_states,
                 key=key_states,
@@ -848,7 +854,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             NamedSharding: The default sharding configuration for K/V tensors.
         """
         paxis: tp.Any = self.config.partition_axis
-        mesh: tp.Any = self.config.mesh
+        mesh: StageMesh = resolve_stage_mesh(self.config.mesh)
         spec: PartitionSpec = PartitionSpec(
             paxis.batch_axis,
             paxis.key_sequence_axis,

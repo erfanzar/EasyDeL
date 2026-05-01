@@ -184,18 +184,14 @@ class _StateStub:
             setattr(self, key, value)
         return self
 
-    def shard_state(self, *, partition_rules, mesh):
-        self.shard_state_calls.append({"partition_rules": partition_rules, "mesh": mesh})
+    def shard_state(self, *, mesh):
+        self.shard_state_calls.append({"mesh": mesh})
         return self
 
 
 class _ModelStub:
-    def __init__(self, rules):
+    def __init__(self):
         self.mesh = _MeshCtx()
-        self._rules = rules
-
-    def _get_partition_rules(self, _):
-        return self._rules
 
 
 class _CheckpointerStub:
@@ -228,12 +224,12 @@ def test_configure_state_initializes_tx_then_shards_via_state_api():
     trainer._resumed_from_checkpoint = False
     trainer.tx = "tx-object"
     trainer.model_state = _StateStub(opt_state=None, tx=None, step=0)
-    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+    trainer._model = _ModelStub()
 
     BaseTrainer._configure_state(trainer)
 
     assert trainer.model_state.init_tx_calls == ["tx-object"]
-    assert trainer.model_state.shard_state_calls == [{"partition_rules": ((".*", "pspec"),), "mesh": trainer.model.mesh}]
+    assert trainer.model_state.shard_state_calls == [{"mesh": trainer.model.mesh}]
     assert trainer.state_shardings == "state-shardings"
     assert trainer.timer.logged == ["configure sharded state"]
 
@@ -245,14 +241,14 @@ def test_configure_state_resume_keeps_step_and_sets_runtime_tx_before_sharding()
     trainer._resumed_from_checkpoint = True
     trainer.tx = "new-tx"
     trainer.model_state = _StateStub(opt_state={"loaded": True}, tx="old-tx", step=17)
-    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+    trainer._model = _ModelStub()
 
     BaseTrainer._configure_state(trainer)
 
     assert trainer.model_state.init_tx_calls == []
     assert {"tx": "new-tx"} in trainer.model_state.replace_calls
     assert {"step": 17} in trainer.model_state.replace_calls
-    assert trainer.model_state.shard_state_calls == [{"partition_rules": ((".*", "pspec"),), "mesh": trainer.model.mesh}]
+    assert trainer.model_state.shard_state_calls == [{"mesh": trainer.model.mesh}]
     assert trainer.state_shardings == "state-shardings"
 
 
@@ -429,7 +425,7 @@ def test_configure_state_seeds_opt_state_counts_from_step_start_point():
     trainer._resumed_from_checkpoint = False
     trainer.tx = "tx-object"
     trainer.model_state = _StateStub(opt_state=None, tx=None, step=jnp.asarray(13, dtype=jnp.int32))
-    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+    trainer._model = _ModelStub()
 
     BaseTrainer._configure_state(trainer)
 
@@ -452,7 +448,7 @@ def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
         tx="old-tx",
         step=jnp.asarray(13, dtype=jnp.int32),
     )
-    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+    trainer._model = _ModelStub()
 
     BaseTrainer._configure_state(trainer)
 
@@ -476,7 +472,7 @@ def test_configure_state_force_seeds_opt_state_counts_from_loaded_nonzero_step()
         tx="old-tx",
         step=jnp.asarray(4, dtype=jnp.int32),
     )
-    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+    trainer._model = _ModelStub()
 
     BaseTrainer._apply_step_start_point(trainer)
     BaseTrainer._configure_state(trainer)

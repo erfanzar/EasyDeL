@@ -4,6 +4,7 @@ easydel.trainers package
 .. toctree::
    :maxdepth: 2
 
+   _shared/index
    agentic_moshpit/index
    binary_classifier_optimization_trainer/index
    contrastive_preference_optimization_trainer/index

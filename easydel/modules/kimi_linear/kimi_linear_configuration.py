@@ -25,8 +25,6 @@ References:
 
 import typing
 
-from jax.sharding import PartitionSpec
-
 from easydel.caching.hybrid import FULL_ATTENTION, KDA_LINEAR_ATTENTION
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -325,19 +323,6 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         if self.qk_nope_head_dim is not None and self.qk_rope_head_dim is not None:
             return self.qk_nope_head_dim + self.qk_rope_head_dim
         return self.head_dim
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
     def get_rope_config(self) -> RopeConfig:
         """Get RoPE configuration.

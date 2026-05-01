@@ -96,17 +96,20 @@ def main():
                 }
             },
             "esurge": {
-                "max_model_len": max_length,
-                "max_num_seqs": max_concurrent_decodes,
-                "min_input_pad": 8,
-                "hbm_utilization": 0.9,
-                "page_size": 128,
-                "enable_prefix_caching": True,
-                "verbose": True,
-                "max_num_batched_tokens": 2048,
-                "use_aot_forward": True,
-                "data_parallelism_axis": "fsdp",
-                "runner_verbose": False,
+                "runtime": {
+                    "max_model_len": max_length,
+                    "max_num_seqs": max_concurrent_decodes,
+                    "min_input_pad": 8,
+                    "max_num_batched_tokens": 2048,
+                    "use_aot_forward": True,
+                    "runner_verbose": False,
+                },
+                "cache": {
+                    "hbm_utilization": 0.9,
+                    "page_size": 128,
+                    "enable_prefix_caching": True,
+                    "data_parallelism_axis": "fsdp",
+                },
             },
         }
     )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ``EasyDeLBaseModule.resolve_shardings_automatically``.
+"""Tests for ``EasyDeLBaseModule.resolve_shardings_regex``.
 
 The contract under test:
   1. Returns a tuple of ``(slash-form regex, jax.sharding.NamedSharding)`` pairs.
@@ -134,7 +134,7 @@ def test_returns_tuple_of_str_and_named_sharding_spmd():
     assert config.mesh.mpmd_axis is None
 
     model = ed.LlamaForCausalLM(config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     _assert_common_invariants(rules)
     _assert_all_on_full_mesh(rules, n_devices=jax.device_count())
@@ -149,7 +149,7 @@ def test_pp4_each_variable_lives_on_its_stage_submesh():
     assert int(config.mesh.shape["pp"]) == jax.device_count()
 
     model = ed.LlamaForCausalLM(config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     _assert_common_invariants(rules)
     _assert_each_layer_on_single_submesh(rules)
@@ -175,7 +175,7 @@ def test_pp2_fsdp2_layers_on_two_chip_submeshes():
     assert int(config.mesh.shape["fsdp"]) == 2
 
     model = ed.LlamaForCausalLM(config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     _assert_common_invariants(rules)
     _assert_each_layer_on_single_submesh(rules)
@@ -196,7 +196,7 @@ def test_per_layer_rules_can_differ_between_stages():
     """Two different layers on different stages must produce DIFFERENT NamedShardings."""
     config = _tiny_llama_config(sharding_axis_dims=(-1, 1, 1, 1, 1, 1))
     model = ed.LlamaForCausalLM(config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     # Pick two layers known to land on different stages (loop schedule:
     # 0->stage0, 4->stage1 for an 8-layer / pp=4 setup with V=2 virtual stages).
@@ -224,7 +224,7 @@ def test_no_callers_get_partitionspec_objects():
     """
     config = _tiny_llama_config(sharding_axis_dims=(1, 1, -1, 1, 1, 1))
     model = ed.LlamaForCausalLM(config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     for pat, value in rules:
         assert not isinstance(value, jax.sharding.PartitionSpec), (

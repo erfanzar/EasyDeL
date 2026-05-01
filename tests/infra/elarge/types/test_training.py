@@ -192,9 +192,7 @@ def test_normalize_trainer_config_max_sequence_length_when_max_length_already_se
     """If both are set with different values, max_sequence_length is dropped + warns."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        out = normalize_trainer_config(
-            {"trainer_type": "sft", "max_sequence_length": 1024, "max_length": 2048}
-        )
+        out = normalize_trainer_config({"trainer_type": "sft", "max_sequence_length": 1024, "max_length": 2048})
     assert any(issubclass(w.category, FutureWarning) for w in caught)
     assert out["max_length"] == 2048
     assert "max_sequence_length" not in out
@@ -299,8 +297,6 @@ def test_trainers_with_completion_length_excludes_non_pairwise():
 
 def test_trainer_aliases_have_canonical_targets_in_specific_defaults():
     """Every alias's target must exist in TRAINER_SPECIFIC_DEFAULTS so normalization round-trips."""
-    for alias, canonical in training_mod._TRAINER_TYPE_ALIASES.items():
-
-
+    for alias, _canonical in training_mod._TRAINER_TYPE_ALIASES.items():
         defaults = get_trainer_defaults(alias)
         assert "learning_rate" in defaults

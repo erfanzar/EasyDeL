@@ -31,13 +31,13 @@ classifiers = [
 dependencies = [
 	"jax>=0.10.0",
 	"jaxlib>=0.10.0",
-	"ray[default]==2.54.0",
-	"eformer==0.0.99.12",
+	"eformer==0.0.100",
 	"ejkernel==0.0.79",
+	"spectrax-lib==0.0.5",
+	"ray[default]==2.54.0",
 	"einops~=0.8.0",
 	"transformers~=5.5.0",
 	"sentencepiece>=0.2.0",
-	"spectrax-lib>=0.0.3",
 	"fastapi>=0.115.2",
 	"wandb>=0.22.2",
 	"uvloop==0.21.0",
@@ -76,14 +76,9 @@ where = ["."]
 "easydel" = ["py.typed"]
 
 [project.optional-dependencies]
-torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
-cuda = [
-	"jax[cuda13]>=0.10.0",
-	"torch==2.8.0",
-	"tensorboard>=2.19.0",
-	"ejkernel[cuda,triton]==0.0.79",
-]
-tpu = ["jax[tpu]>=0.10.0", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.79"]
+torch = ["torch==2.8.0"]
+cuda = ["jax[cuda13]>=0.10.0", "torch==2.8.0", "ejkernel[cuda,triton]==0.0.79"]
+tpu = ["jax[tpu]>=0.10.0", "ejkernel[tpu]==0.0.79"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.11"]
 profile = [
@@ -92,6 +87,7 @@ profile = [
 	"xprof-nightly>=2.21.6a20250820",
 ]
 podutils = ["eopod==0.0.36"]
+mm = ["pillow>=12.1.1"]
 
 [tool.black]
 line-length = 121
@@ -105,12 +101,12 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
 ignore = [
-	"F722",  # Forward annotations needed for jaxtyping
-	"B008",  # Do not perform function calls in argument defaults
-	"UP015", # Unnecessary open mode
-	"A005",  # Module-level shadowing
-	"UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
-	"E501",  # Line too long (handled by formatter)
+	"F722",   # Forward annotations needed for jaxtyping
+	"B008",   # Do not perform function calls in argument defaults
+	"UP015",  # Unnecessary open mode
+	"A005",   # Module-level shadowing
+	"UP037",  # Remove quotes from type annotation - needed for jaxtyping string literals
+	"E501",   # Line too long (handled by formatter)
 	"RUF001", # Ruff's own complexity check - handled by other tools
 	"RUF002", # Ruff's own complexity check - handled by other tools
 ]

@@ -274,7 +274,7 @@ def model_tester(small_model_config, random_input_ids):
 
                 @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(ids, gd, gs, go):
-                    return spx.bind(gd, gs.merge(go, copy=True)).compute_loss(
+                    return spx.bind(gd, gs.merge(go, copy=False)).compute_loss(
                         input_ids=ids,
                         attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
                         output_router_logits=True,
@@ -286,7 +286,7 @@ def model_tester(small_model_config, random_input_ids):
 
                 @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(ids, gd, gs, go):
-                    return spx.bind(gd, gs.merge(go, copy=True)).compute_loss(
+                    return spx.bind(gd, gs.merge(go, copy=False)).compute_loss(
                         input_ids=ids,
                         attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
                         **kwargs_jax,

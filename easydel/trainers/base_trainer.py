@@ -268,7 +268,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self._resumed_from_checkpoint = False
         if self.arguments.resume_if_possible:
             try:
-                from eformer.serialization.checkpointer import find_latest_checkpoint
+                from spectrax.serialization import find_latest_checkpoint
 
                 checkpoint_path = find_latest_checkpoint(str(self.arguments._get_save_directory(create=False)))
                 if checkpoint_path is not None:
@@ -441,6 +441,23 @@ class BaseTrainer(BaseTrainerProtocol):
         self._apply_runtime_model_config_overrides_to_state(self.model_state, self.arguments)
         for attr_name in self._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS - {"model_state"}:
             self._apply_runtime_model_config_overrides_to_state(getattr(self, attr_name, None), self.arguments)
+
+    def _shard_auxiliary_model_states(self) -> None:
+        """Shard frozen/helper model states on their own meshes.
+
+        Trainers such as DPO/GRPO/PPO keep reference or teacher states outside
+        ``model_state``. Those states still participate in MPMD forwards, so
+        their leaves must be placed consistently with their model stage meshes
+        before any compiled auxiliary scorer sees them.
+        """
+        for attr_name in self._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS - {"model_state"}:
+            state = getattr(self, attr_name, None)
+            if not isinstance(state, EasyDeLState):
+                continue
+            mesh = getattr(getattr(state, "model", None), "mesh", None)
+            if mesh is None:
+                continue
+            object.__setattr__(self, attr_name, state.shard_state(mesh=mesh))
 
     def _apply_step_start_point(self) -> None:
         """Initialize a fresh training state from ``step_start_point`` when requested."""
@@ -3709,6 +3726,10 @@ class BaseTrainer(BaseTrainerProtocol):
             esurge_kwargs["enable_prefix_caching"] = args.esurge_enable_prefix_caching
         if args.esurge_data_parallelism_axis is not None:
             esurge_kwargs["data_parallelism_axis"] = args.esurge_data_parallelism_axis
+        if getattr(args, "esurge_async_scheduling", None) is not None:
+            esurge_kwargs["async_scheduling"] = args.esurge_async_scheduling
+        if getattr(args, "esurge_overlap_execution", None) is not None:
+            esurge_kwargs["overlap_execution"] = args.esurge_overlap_execution
         if args.esurge_max_num_seq_buckets is not None:
             esurge_kwargs["max_num_seq_buckets"] = [int(v) for v in args.esurge_max_num_seq_buckets]
         processor = self._get_processing_class()
@@ -4026,7 +4047,7 @@ class BaseTrainer(BaseTrainerProtocol):
         Sets up a timer instance for tracking training and evaluation
         performance metrics, with optional TensorBoard integration.
         """
-        self.timer = Timers(use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard)
+        self.timer = Timers(use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard())
 
     def _configure_dataloaders(self):
         """
@@ -4122,9 +4143,9 @@ class BaseTrainer(BaseTrainerProtocol):
                     self.model_state = self.model_state.replace(tx=self.tx)
 
                 self._apply_step_start_point_to_optimizer_state()
-                rules = self.model._get_partition_rules(None)
-                self.model_state = self.model_state.shard_state(partition_rules=rules, mesh=self.model.mesh)
+                self.model_state = self.model_state.shard_state(mesh=self.model.mesh)
                 self.state_shardings = self.model_state.shardings
+                self._shard_auxiliary_model_states()
 
         self.timer.log("configure sharded state")
 
@@ -4824,7 +4845,7 @@ class BaseTrainer(BaseTrainerProtocol):
         if self.arguments.save_total_limit is None:
             return
 
-        from eformer.serialization.checkpointer import _read_checkpoint_metadata
+        from spectrax.serialization import read_checkpoint_metadata
 
         if not save_dir.exists():
             return
@@ -4834,7 +4855,7 @@ class BaseTrainer(BaseTrainerProtocol):
         for path in save_dir.glob("run-*"):
             if path.is_dir() and (path / "metadata.json").exists():
                 try:
-                    metadata = _read_checkpoint_metadata(str(path))
+                    metadata = read_checkpoint_metadata(str(path))
                     # Only consider permanent checkpoints
                     if not metadata.get("is_temporary", False):
                         checkpoint_dirs.append(path)
@@ -4887,14 +4908,6 @@ class BaseTrainer(BaseTrainerProtocol):
         dst = ePath(save_directory) / "README.md"
         dst.write_text(self._get_information())
 
-    def _format_partition_rules(self) -> str:
-        """Format partition rules with proper indentation and formatting."""
-        try:
-            return pprint.pformat(self.model._get_partition_rules(None), indent=2, width=80)
-        except Exception as e:
-            logger.error(f"Error formatting partition rules: {e!s}")
-            return "Error retrieving partition rules"
-
     def _get_device_info(self) -> dict:
         """Get information about available devices."""
         try:
@@ -4941,7 +4954,6 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
         device_info = self._get_device_info()
-        partition_rules_str = self._format_partition_rules()
 
         _TASK_TYPE_TO_AUTO_CLASS_KEY = {
             TaskType.CAUSAL_LM: "CausalLM",
@@ -4973,7 +4985,6 @@ class BaseTrainer(BaseTrainerProtocol):
             "name": self.arguments.model_name,
             "architecture": str(getattr(self.config, "model_type", "N/A")),
             "device_info": device_info,
-            "partition_rules_str": partition_rules_str,
             "dtype_str": str(self.model.dtype) if self.model else "N/A",
             "param_dtype_str": str(self.model.param_dtype) if self.model else "N/A",
             "model_task_str": model_task_for_template,

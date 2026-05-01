@@ -23,8 +23,6 @@ The configuration includes custom sharding specifications for MoE components and
 comprehensive model hyperparameters.
 """
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
@@ -140,19 +138,6 @@ class GptOssConfig(EasyDeLBaseConfig):
         self.use_cache = use_cache
         self.mlp_activations_limit = mlp_activations_limit
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
 
 __all__ = ["GptOssConfig"]

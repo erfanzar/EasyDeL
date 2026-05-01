@@ -29,9 +29,7 @@ Classes:
 
 Functions:
     return_type_adjuster: Decorator to adjust return types for type checking
-    get_module_repr: Get string representation of module parameters
-    prettify_module: Format module structure for display
-    printify_module: Create printable representation of spectrax modules
+
 
 Type Aliases:
     PartitionLike: Type for partition rule specifications
@@ -82,11 +80,9 @@ from mimetypes import common_types
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
-from jax.sharding import Mesh
 from jaxtyping import Array, Bool, Float, Int, Shaped
-from spectrax import nn
 
-from easydel.layers import Embed, ParallelLinear, QuantizationConfig
+from easydel.layers import QuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig
 from ..loss_utils import LossConfig, LossMetrics
@@ -111,7 +107,6 @@ from ..modeling_outputs import (
     VLMCausalLMOutput,
 )
 
-PartitionLike = collections.abc.Mapping[str, tp.Callable] | collections.abc.Mapping[tuple, tp.Callable] | None
 _CP = type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 Self = tp.TypeVar("Self")
@@ -188,170 +183,6 @@ def return_type_adjuster(
         return wrapper
 
     return decorator
-
-
-def get_module_repr(module: spx.Module) -> str:
-    """Get a string representation of module parameters.
-
-    Creates a human-readable string representation of a spectrax module,
-    showing key parameters like input/output features for linear layers,
-    dropout rates, embedding dimensions, and normalization epsilon values.
-
-    Args:
-        module: The spectrax module to represent.
-
-    Returns:
-        A formatted string representation of the module. The format depends
-        on the module type:
-        - ParallelLinear: "Linear(in_features=X, out_features=Y, bias=Z)"
-        - Dropout: "Dropout(p=X)"
-        - Embed: "Embedding(num_embeddings, embedding_dim)"
-        - Modules with eps: "ModuleName(shape, eps=X)"
-        - Other modules: Just the class name
-
-    Example:
-        >>> linear = ParallelLinear(in_features=512, out_features=1024)
-        >>> get_module_repr(linear)
-        'Linear(in_features=512, out_features=1024, bias=False)'
-    """
-    module_name = type(module).__name__
-
-    if isinstance(module, ParallelLinear):
-        in_features = (
-            (module.weight.shape[0] if hasattr(module.weight, "shape") else "Null")
-            if hasattr(module, "weight")
-            else getattr(module.kernel_init, "__wrapped__", module.kernel_init).__code__.co_argcount - 1
-        )
-        out_features = (
-            module.features
-            if hasattr(module, "features")
-            else (module.weight.shape[-1] if hasattr(module.weight, "shape") else "Null")
-        )
-        use_bias = module.use_bias if hasattr(module, "use_bias") else False
-        return f"Linear(in_features={in_features}, out_features={out_features}, bias={use_bias})"
-
-    elif isinstance(module, nn.Dropout):
-        rate = module.rate if hasattr(module, "rate") else 0.0
-        return f"Dropout(p={rate})"
-
-    elif isinstance(module, nn.Embed):
-        if hasattr(module, "weight"):
-            num_embeddings, embedding_dim = module.weight.shape
-            return f"Embedding({num_embeddings}, {embedding_dim})"
-        return "Embedding(...)"
-    elif isinstance(module, Embed):
-        if hasattr(module, "weight"):
-            num_embeddings, embedding_dim = module.weight.shape
-            return f"Embedding({num_embeddings}, {embedding_dim})"
-        return "Embedding(...)"
-
-    elif hasattr(module, "eps"):
-        shape_str = ""
-        if hasattr(module, "weight"):
-            shape_str = str(tuple(module.weight.shape))
-        return f"{module_name}({shape_str}, eps={module.eps})"
-
-    return module_name
-
-
-def prettify_module(
-    module: spx.Module,
-    indent: str = "",
-    depth: int = 0,
-    max_depth: int | None = None,
-    module_param=None,
-) -> str:
-    """Format the structure of a spectrax module for display.
-
-    Recursively creates a human-readable representation of a module's
-    structure, similar to PyTorch's module printing.
-
-    Args:
-        module: The module to format.
-        indent: Current indentation string.
-        depth: Current recursion depth.
-        max_depth: Maximum depth to recurse.
-        module_param: Optional parameter dictionary.
-
-    Returns:
-        Formatted string representation of the module hierarchy.
-
-    Example:
-        >>> print(prettify_module(my_model, max_depth=2))
-        MyModel(
-          (encoder): Encoder(
-            (layers): ModuleList(...)
-          )
-          (decoder): Decoder(...)
-        )
-    """
-    if max_depth is not None and depth > max_depth:
-        return ""
-
-    output = []
-    module_repr = get_module_repr(module)
-
-    current_line = f"{indent}{module_repr}"
-
-    children = list(module.iter_children())
-
-    if module_param is not None:
-        params_children = {key: param for key, param in module_param.items()}
-    else:
-        params_children = {}
-
-    if children or any(
-        isinstance(value, list) and all(isinstance(item, spx.Module) for item in value)
-        for value in module.__dict__.values()
-    ):
-        output.append(current_line + "(")
-        new_indent = indent + "  "
-
-        for key, child in children:
-            child_param = params_children.get(key, None)
-            child_str = prettify_module(
-                child,
-                new_indent,
-                depth + 1,
-                max_depth,
-                child_param,
-            ).lstrip()
-            output.append(f"{new_indent}({key}): {child_str}")
-
-        for key, value in module.__dict__.items():
-            if isinstance(value, list) and all(isinstance(item, spx.Module) for item in value):
-                output.append(f"{new_indent}({key}): ModuleList(")
-
-                if value:
-                    first_item = value[0]
-                    item_param = params_children.get(key, [None])[0] if params_children else None
-
-                    if len(value) > 1:
-                        child_str = prettify_module(
-                            first_item,
-                            new_indent + "  ",
-                            depth + 1,
-                            max_depth,
-                            item_param,
-                        ).lstrip()
-                        output.append(f"{new_indent}  (0-{len(value) - 1}): {len(value)} x {child_str}")
-                    else:
-                        child_str = prettify_module(
-                            first_item,
-                            new_indent + "  ",
-                            depth + 1,
-                            max_depth,
-                            item_param,
-                        ).lstrip()
-                        output.append(f"{new_indent}  {child_str}")
-
-                output.append(f"{new_indent})")
-
-        output.append(f"{indent})")
-    else:
-        output.append(current_line)
-
-    return "\n".join(output)
 
 
 class BaseModuleProtocol(metaclass=ABCMeta):
@@ -2953,7 +2784,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def default_trainable_selector(self) -> spx.SelectorSugar:
+    def trainable_selector(self) -> spx.SelectorSugar:
         """Returns the canonical selector used for ``graphstate`` extraction."""
         ...
 
@@ -2969,7 +2800,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """Returns the default selected trainable state of the model.
 
         The graphstate mirrors :attr:`parameters` and is defined by
-        :attr:`default_trainable_selector`.
+        :attr:`trainable_selector`.
 
         Returns:
             spx.State: The selected trainable state containing model parameters.
@@ -3040,7 +2871,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    def _get_mesh(self, mesh: Mesh | None = None) -> Mesh:
+    def _get_mesh(self, mesh: spx.SpxMesh | None = None) -> spx.SpxMesh:
         """Retrieve the JAX mesh for distributed computation.
 
         Gets the mesh either from the provided argument or from the model's
@@ -3051,21 +2882,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
         Returns:
             Mesh: The JAX sharding mesh to use for distributed operations.
-        """
-
-    @abstractmethod
-    def _get_partition_rules(self, partition_rules: PartitionLike) -> PartitionLike:
-        """Retrieve partition rules for model sharding.
-
-        Gets the partition rules either from the provided argument or from
-        the model's configuration if no rules are provided.
-
-        Args:
-            partition_rules: Optional partition rules to use. If None,
-                uses the rules from config.
-
-        Returns:
-            PartitionLike: The partition rules for sharding model parameters.
         """
 
     @abstractmethod
@@ -3083,13 +2899,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def shard_model(
         self,
-        partition_rules: PartitionLike = None,
-        mesh: Mesh | None = None,
+        mesh: spx.SpxMesh | None = None,
     ):
-        """Shards the model's parameters using the specified partitioning rules and mesh.
+        """Shards the model's parameters across the device mesh.
 
         Args:
-            partition_rules (PartitionLike, optional): Partitioning rules for sharding.
             mesh (jax.sharding.Mesh, optional): The mesh to shard across.
 
         Returns:
@@ -3099,13 +2913,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def gather_model(
         self,
-        partition_rules: PartitionLike = None,
-        mesh: Mesh | None = None,
+        mesh: spx.SpxMesh | None = None,
     ):
-        """Gathers the model's parameters based on the specified partitioning rules and mesh.
+        """Gathers the model's parameters from the device mesh.
 
         Args:
-            partition_rules (PartitionLike, optional): Partitioning rules for gathering.
             mesh (jax.sharding.Mesh, optional): The mesh to gather from.
 
         Returns:
@@ -3311,20 +3123,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
         Returns:
             Callable: A pure function for weight transformation.
-        """
-        ...
-
-    @property
-    @abstractmethod
-    def parameters_sharding(self) -> dict:
-        """Get the sharding specification for model parameters.
-
-        Returns a dictionary mapping parameter paths to their sharding
-        specifications, describing how parameters are distributed across
-        devices.
-
-        Returns:
-            dict: A dictionary mapping parameter names to sharding specs.
         """
         ...
 
@@ -3628,35 +3426,3 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             The updated model_kwargs dictionary ready for the next generation step.
         """
         ...
-
-
-def printify_module(model: spx.Module) -> str:
-    """Create a printable string representation of an EasyDeL spectrax module.
-
-    This function wraps prettify_module to create a standardized string
-    representation prefixed with "EasyDeL-". It handles edge cases
-    gracefully by returning a fallback string if the module cannot
-    be properly formatted.
-
-    Args:
-        model: The spectrax module to create a string representation for.
-
-    Returns:
-        A string representation of the model prefixed with "EasyDeL-".
-        If the model cannot be formatted (e.g., it's a partition object
-        without proper attributes), returns "EasyDeL-Partitions".
-
-    Example:
-        >>> model = LlamaForCausalLM(config)
-        >>> print(printify_module(model))
-        EasyDeL-LlamaForCausalLM(
-          (model): LlamaModel(
-            (embed_tokens): Embedding(32000, 4096)
-            ...
-          )
-        )
-    """
-    try:
-        return "EasyDeL-" + prettify_module(model)
-    except AttributeError:
-        return "EasyDeL-Partitions"

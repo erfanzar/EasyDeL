@@ -56,6 +56,7 @@ from .builders import (
     build_esurge,
     build_model,
     build_sharded_source,
+    normalize_esurge_sections,
     to_data_mixture_kwargs,
     to_esurge_kwargs,
     to_from_pretrained_kwargs,
@@ -393,7 +394,7 @@ class eLargeModel:
 
         Args:
             updates: Dictionary with configuration updates. Can include nested
-                structures like {"model": {"dtype": "bf16"}, "esurge": {"max_num_seqs": 32}}
+                structures like {"model": {"dtype": "bf16"}, "esurge": {"runtime": {"max_num_seqs": 32}}}
 
         Returns:
             Self for method chaining
@@ -401,7 +402,7 @@ class eLargeModel:
         Example:
             >>> elm.update_config({
             ...     "loader": {"dtype": "bf16"},
-            ...     "esurge": {"max_model_len": 4096}
+            ...     "esurge": {"runtime": {"max_model_len": 4096}}
             ... })
         """
         from .processing import deep_merge
@@ -730,6 +731,7 @@ class eLargeModel:
             esurge["tool_parser"] = tool_parser
         if reasoning_parser is not _ESURGE_UNSET:
             esurge["reasoning_parser"] = reasoning_parser
+        self._config["esurge"] = normalize_esurge_sections(esurge)
         return self
 
     def set_mixture(
@@ -1061,9 +1063,8 @@ class eLargeModel:
 
         Example:
             >>> kwargs = elm.get_esurge_kwargs()
-            >>> # Can be used directly:
-            >>> from easydel.inference import eSurge
-            >>> engine = eSurge(model, **kwargs)
+            >>> # eSurge now takes grouped config sections.
+            >>> engine = elm.build_esurge()
         """
         return to_esurge_kwargs(self._config)
 
@@ -2130,12 +2131,13 @@ class eLargeModel:
         eval_config = self._config.get("eval", {}).copy()
         if eval_overrides:
             eval_config.update(eval_overrides)
+        esurge_sections = normalize_esurge_sections(self._config.get("esurge", {}))
         results = run_lm_eval_with_esurge(
             surge=self.build_esurge(),
             processor=self._tokenizer,
             tasks=task_list,
-            max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
-            fallback_batch_size=self._config.get("esurge", {}).get("max_num_seqs", 32),
+            max_length=esurge_sections["runtime"].get("max_model_len", 8192),
+            fallback_batch_size=esurge_sections["runtime"].get("max_num_seqs", 32),
             num_fewshot=num_fewshot,
             eval_config=eval_config,
             stop_engine=True,
@@ -2202,12 +2204,13 @@ class eLargeModel:
         try:
             for benchmark in resolved_benchmarks:
                 logger.info(f"Running benchmark {benchmark.name}: {benchmark.tasks}")
+                esurge_sections = normalize_esurge_sections(self._config.get("esurge", {}))
                 benchmark_results[benchmark.name] = run_lm_eval_with_esurge(
                     surge=engine_instance,
                     processor=self._tokenizer,
                     tasks=benchmark.tasks,
-                    max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
-                    fallback_batch_size=self._config.get("esurge", {}).get("max_num_seqs", 32),
+                    max_length=esurge_sections["runtime"].get("max_model_len", 8192),
+                    fallback_batch_size=esurge_sections["runtime"].get("max_num_seqs", 32),
                     eval_config=benchmark.eval_kwargs,
                     stop_engine=False,
                     summary_logger=logger,

@@ -72,6 +72,7 @@ from ..requirements import (
     MetadataField,
     OperationRequirements,
 )
+from ._mask_info import align_mask_info_to_qkv_specs
 from .scaled_dot_product_attention import ScaledDotProductAttn
 from .vanilla_attention import VanillaAttn
 
@@ -292,6 +293,12 @@ class FlashAttn(OperationImpl):
             tensor=query,
             preserved_indices=[0, 2],
         )
+        mask_info = align_mask_info_to_qkv_specs(
+            mask_info,
+            query_spec=query_sharding,
+            key_spec=key_sharding,
+            layout="bthd",
+        )
 
         attn: Float[Array, "batch seq_len_q num_heads head_dim"] = flash_attention(
             query,
@@ -324,7 +331,7 @@ class FlashAttn(OperationImpl):
         )
 
         attn_sharded: Float[Array, "batch seq_len_q num_heads head_dim"] = with_sharding_constraint(
-            arr=attn, sharding=shardings.output
+            arr=attn, sharding=shardings.output, mesh=self.metadata.mesh
         )
         output: AttentionOutput = AttentionOutput(attention_weights=None, attention_outputs=attn_sharded)
         return output

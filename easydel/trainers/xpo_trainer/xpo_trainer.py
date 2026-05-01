@@ -214,12 +214,16 @@ class XPOTrainer(GRPOTrainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
         sharded_evaluation_step_function = compile_trainer_step(
             xpo_step,
             in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self.arguments.ensure_checkpoint_path()

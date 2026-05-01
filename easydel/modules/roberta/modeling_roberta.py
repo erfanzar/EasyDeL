@@ -997,17 +997,18 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = layer(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                layer_head_mask=head_mask[i] if head_mask is not None else None,
-                mode=mode,
-                cache_view=past_key_values.views[i],
-                cache_metadata=cache_metadata,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_mask_info=encoder_mask_info,
-                output_attentions=output_attentions,
-            )
+            with self._layer_stage_context(i, layers=self.layer):
+                layer_outputs = layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    layer_head_mask=head_mask[i] if head_mask is not None else None,
+                    mode=mode,
+                    cache_view=past_key_values.views[i],
+                    cache_metadata=cache_metadata,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_mask_info=encoder_mask_info,
+                    output_attentions=output_attentions,
+                )
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, i, layers=self.layer)
 

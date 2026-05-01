@@ -25,24 +25,29 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+import spectrax as spx
 from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree
-from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 from spectrax import common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
-from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
+from easydel.infra.sharding import (
+    MeshLike,
+    RuntimeShardingResolver,
+    coerce_runtime_sharding_resolver,
+    mesh_axis_size,
+    resolve_stage_cache_mesh,
+)
 
 from ..ragged_page.cache import (
     HEAD_DIM_ALIGNMENT,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
     RaggedPagesCacheView,
-    _mesh_axis_size,
     align_to_multiple,
     cdiv,
     get_dtype_packing,
@@ -78,7 +83,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
     @staticmethod
     def _compute_free_hbm(
-        mesh: Mesh,
+        mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
     ):
@@ -98,7 +103,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             Total allocatable bytes across all devices on the page axis.
         """
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+        page_axis_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
         return available_alloc
@@ -106,7 +111,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
     @classmethod
     def create(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
@@ -185,7 +190,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if version != "v1":
             raise ValueError(f"MLA ragged cache only supports version='v1', got {version!r}")
 
-        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+        data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         if data_parallel_size > 1:
             logger.info(f"Scaling MLA KV page budget by data-parallel page axis: {data_parallel_size=}.")
 
@@ -316,7 +321,7 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         config: MLARaggedPagesCacheConfig,
         layer_index: int | None = None,
         *,
-        mesh: Mesh | None = None,
+        mesh: MeshLike | None = None,
         runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: EasyQuantizer | None = None,
     ) -> "MLARaggedPagesCacheView":
@@ -336,6 +341,7 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
+        mesh = resolve_stage_cache_mesh(mesh)
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         kv_pages_shape, axes = config.get_shape_and_axes()
@@ -424,7 +430,7 @@ class MLARaggedPagesCache(RaggedPagesCache):
     @classmethod
     def init_cache(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         config: MLARaggedPagesCacheConfig,
         runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
@@ -443,14 +449,16 @@ class MLARaggedPagesCache(RaggedPagesCache):
         Returns:
             An ``MLARaggedPagesCache`` containing ``config.num_hidden_layers`` views.
         """
-        views = [
-            MLARaggedPagesCacheView.init(
-                config=config,
-                layer_index=i,
-                mesh=mesh,
-                runtime_sharding_resolver=runtime_sharding_resolver,
-                quantizer=quantizer,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        views = []
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                views.append(
+                    MLARaggedPagesCacheView.init(
+                        config=config,
+                        layer_index=i,
+                        mesh=mesh,
+                        runtime_sharding_resolver=runtime_sharding_resolver,
+                        quantizer=quantizer,
+                    )
+                )
         return cls(views=views)

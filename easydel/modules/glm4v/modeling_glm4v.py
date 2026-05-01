@@ -858,7 +858,8 @@ class Glm4vVisionModel(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             hidden_states, idx = carry
-            hidden_states = block(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+            with self._layer_stage_context(idx, layers=self.blocks):
+                hidden_states = block(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
             return hidden_states, idx + 1
@@ -1374,16 +1375,17 @@ class Glm4vTextModel(EasyDeLBaseModule):
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
-            layer_outputs = block(
-                hidden_states=hs,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hs,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.frequencies,
+                )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             cv = self._layer_cache_view_update(
                 cv,

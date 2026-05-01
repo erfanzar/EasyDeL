@@ -795,17 +795,18 @@ class GiddModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                noise_mask=noise_mask,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    noise_mask=noise_mask,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.frequencies,
+                )
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 

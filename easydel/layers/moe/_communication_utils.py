@@ -34,7 +34,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 from spectrax import common_types
 
-from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
+from easydel.infra.sharding import MeshLike, RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -500,7 +500,7 @@ def canon_dim(ndim: int, dim: int) -> int:
 def psum_maybe(
     x: jax.Array,
     axes: tuple[str, ...],
-    mesh: jax.sharding.Mesh,
+    mesh: MeshLike,
     dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array:
     """Conditionally performs parallel sum across specified axes if they exist in mesh.
@@ -526,7 +526,7 @@ def psum_maybe(
 
 
 def rsum_scatter_maybe(
-    x: jax.Array, axis_name: str, dim: int, mesh: jax.sharding.Mesh, dtype: jnp.dtype = jnp.float32
+    x: jax.Array, axis_name: str, dim: int, mesh: MeshLike, dtype: jnp.dtype = jnp.float32
 ) -> jax.Array:
     """Conditionally performs reduce-scatter if the axis exists and has size > 1.
 
@@ -552,7 +552,7 @@ def rsum_scatter_maybe(
 
 
 def slice_k_for_param_shards(
-    x_mat: jax.Array, chunk: int, axes: tuple[str, ...], mesh: jax.sharding.Mesh, axis: int = 1
+    x_mat: jax.Array, chunk: int, axes: tuple[str, ...], mesh: MeshLike, axis: int = 1
 ) -> jax.Array:
     """Slices activation tensor to match the chunk size of parameter shards.
 

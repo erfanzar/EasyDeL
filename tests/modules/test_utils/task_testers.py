@@ -20,6 +20,7 @@ including CAUSAL_LM, BASE_MODULE, SEQUENCE_CLASSIFICATION, VLM, etc.
 
 import inspect
 import traceback
+import types
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,6 +62,96 @@ class TestResult:
 
 class BaseTester:
     """Base class for task-specific testers."""
+
+    @staticmethod
+    def _assert_scheduled_loss(output: Any) -> None:
+        assert hasattr(output, "loss"), "Scheduled MPMD output missing scalar loss"
+        assert bool(jnp.isfinite(output.loss).all()), "Scheduled MPMD loss is not finite"
+
+    @staticmethod
+    def _scheduled_result(ed_time: float, hf_time: float = 0.0, **extra_info: Any) -> TestResult:
+        return TestResult(
+            success=True,
+            ed_time=ed_time,
+            hf_time=hf_time,
+            extra_info={
+                "scheduled_loss": True,
+                **extra_info,
+            },
+        )
+
+    def _run_scheduled_compute_loss(
+        self,
+        ed_model: Any,
+        loss_kwargs: dict[str, Any],
+        schedule: Any,
+        output_hidden_states: bool = False,
+        output_router_logits: bool = False,
+    ) -> tuple[Any, float]:
+        """Run ``compute_loss`` through ``spx.jit(..., schedule=...)``.
+
+        The graph state/other arguments are intentionally not listed in
+        ``batch_argnums``. Only tensor inputs from ``loss_kwargs`` are
+        microbatched, matching the true MPMD training path.
+        """
+        graphdef, graphstate, graphother = ed_model.split_module()
+        names = tuple(loss_kwargs)
+        values = tuple(loss_kwargs.values())
+        batch_argnums = tuple(range(2, 2 + len(values)))
+
+        @spx.jit(
+            mesh=ed_model.mesh,
+            schedule=schedule,
+            batch_argnums=batch_argnums,
+        )
+        def jited(gs, go, *args):
+            model = spx.bind(graphdef, gs.merge(go, copy=False))
+            kwargs = dict(zip(names, args, strict=True))
+            outputs, _metrics = model.compute_loss(
+                output_router_logits=output_router_logits,
+                output_hidden_states=output_hidden_states,
+                **kwargs,
+            )
+            return jnp.mean(outputs.loss)
+
+        _ = jited(graphstate, graphother, *values)
+        with ed.utils.capture_time() as timer:
+            loss = jited(graphstate, graphother, *values)
+        return types.SimpleNamespace(loss=loss), timer()
+
+    def _run_scheduled_forward_scalar(
+        self,
+        ed_model: Any,
+        forward_kwargs: dict[str, Any],
+        schedule: Any,
+        output_hidden_states: bool = False,
+    ) -> tuple[Any, float]:
+        graphdef, graphstate, graphother = ed_model.split_module()
+        names = tuple(forward_kwargs)
+        values = tuple(forward_kwargs.values())
+        batch_argnums = tuple(range(2, 2 + len(values)))
+
+        @spx.jit(
+            mesh=ed_model.mesh,
+            schedule=schedule,
+            batch_argnums=batch_argnums,
+        )
+        def jited(gs, go, *args):
+            model = spx.bind(graphdef, gs.merge(go, copy=False))
+            kwargs = dict(zip(names, args, strict=True))
+            outputs = model(**kwargs, output_hidden_states=output_hidden_states)
+            tensor = getattr(outputs, "last_hidden_state", None)
+            if tensor is None:
+                tensor = getattr(outputs, "embeddings", None)
+            if tensor is None:
+                tensor = outputs[0] if isinstance(outputs, tuple | list) else outputs
+            return jnp.mean(tensor)
+
+        _ = jited(graphstate, graphother, *values)
+        with ed.utils.capture_time() as timer:
+            scalar = jited(graphstate, graphother, *values)
+        assert bool(jnp.isfinite(scalar).all()), "Scheduled MPMD forward scalar is not finite"
+        return types.SimpleNamespace(scalar=scalar), timer()
 
     def _run_hf_forward(
         self,
@@ -120,17 +211,27 @@ class BaseTester:
         inputs: dict,
         output_hidden_states: bool = False,
         output_router_logits: bool = False,
+        schedule: Any | None = None,
     ) -> tuple[Any, float]:
         """Run EasyDeL forward pass with timing.
 
         Returns:
             Tuple of (output, time_taken)
         """
+        if schedule is not None:
+            return self._run_scheduled_compute_loss(
+                ed_model=ed_model,
+                loss_kwargs=dict(inputs),
+                schedule=schedule,
+                output_hidden_states=output_hidden_states,
+                output_router_logits=output_router_logits,
+            )
+
         try:
 
             @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
             def jited(ids, gd, gs, go, attention_mask, **kwargs):
-                model = spx.bind(gd, gs.merge(go, copy=True))
+                model = spx.bind(gd, gs.merge(go, copy=False))
                 return model.compute_loss(
                     input_ids=ids,
                     attention_mask=attention_mask,
@@ -161,7 +262,7 @@ class BaseTester:
 
             @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
             def jited_fallback(ids, gd, gs, go, attention_mask, **kwargs):
-                model = spx.bind(gd, gs.merge(go, copy=True))
+                model = spx.bind(gd, gs.merge(go, copy=False))
                 return model.compute_loss(
                     input_ids=ids,
                     attention_mask=attention_mask,
@@ -233,7 +334,16 @@ class CausalLMTester(BaseTester):
 
                     # Run ED forward only
                     ed_inputs = inputs["jax"]
-                    ed_output, ed_time = self._run_ed_forward(ed_model, ed_inputs, output_router_logits=True)
+                    ed_output, ed_time = self._run_ed_forward(
+                        ed_model,
+                        ed_inputs,
+                        output_router_logits=True,
+                        schedule=small_model_config.get("mpmd_schedule"),
+                    )
+
+                    if small_model_config.get("mpmd_schedule") is not None:
+                        self._assert_scheduled_loss(ed_output)
+                        return self._scheduled_result(ed_time, easydel_only=True)
 
                     # Verify output has expected attributes
                     assert hasattr(ed_output, "logits"), "Output missing logits"
@@ -273,7 +383,17 @@ class CausalLMTester(BaseTester):
 
                 # Run ED forward
                 ed_inputs = inputs["jax"]
-                ed_output, ed_time = self._run_ed_forward(ed_model, ed_inputs, output_router_logits=True)
+                ed_output, ed_time = self._run_ed_forward(
+                    ed_model,
+                    ed_inputs,
+                    output_router_logits=True,
+                    schedule=small_model_config.get("mpmd_schedule"),
+                )
+
+                if small_model_config.get("mpmd_schedule") is not None:
+                    self._assert_scheduled_loss(ed_output)
+                    cleanup_models(hf_model)
+                    return self._scheduled_result(ed_time, hf_time)
 
                 # Get aux losses
                 hf_aux = getattr(hf_output, "aux_loss", 0)
@@ -360,6 +480,24 @@ class CausalLMTester(BaseTester):
                         batch_size=1,
                         seq_len=16,
                     )
+                    schedule = small_model_config.get("mpmd_schedule")
+                    if schedule is not None:
+                        loss_inputs = make_text_inputs(
+                            vocab_size=small_model_config["vocab_size"],
+                            batch_size=max(1, int(getattr(schedule, "microbatches", 1))),
+                            seq_len=16,
+                        )
+                        scheduled_output, ed_time = self._run_scheduled_compute_loss(
+                            ed_model=ed_model,
+                            loss_kwargs=dict(loss_inputs["jax"]),
+                            schedule=schedule,
+                        )
+                        self._assert_scheduled_loss(scheduled_output)
+                        return self._scheduled_result(
+                            ed_time,
+                            easydel_only=True,
+                            scheduled_generation=True,
+                        )
 
                     # Run generation
                     with ed.utils.capture_time() as timer:
@@ -414,6 +552,21 @@ class CausalLMTester(BaseTester):
                     batch_size=1,  # Single batch for generation
                     seq_len=16,  # Short prompt
                 )
+                schedule = small_model_config.get("mpmd_schedule")
+                if schedule is not None:
+                    loss_inputs = make_text_inputs(
+                        vocab_size=small_model_config["vocab_size"],
+                        batch_size=max(1, int(getattr(schedule, "microbatches", 1))),
+                        seq_len=16,
+                    )
+                    scheduled_output, ed_time = self._run_scheduled_compute_loss(
+                        ed_model=ed_model,
+                        loss_kwargs=dict(loss_inputs["jax"]),
+                        schedule=schedule,
+                    )
+                    self._assert_scheduled_loss(scheduled_output)
+                    cleanup_models(hf_model)
+                    return self._scheduled_result(ed_time, scheduled_generation=True)
 
                 # Run generation
                 with ed.utils.capture_time() as timer:
@@ -510,10 +663,20 @@ class BaseModuleTester(BaseTester):
 
                 # Run ED forward with hidden states
                 ed_inputs = inputs["jax"]
+                schedule = small_model_config.get("mpmd_schedule")
+                if schedule is not None:
+                    _ed_output, ed_time = self._run_scheduled_forward_scalar(
+                        ed_model=ed_model,
+                        forward_kwargs=ed_inputs,
+                        schedule=schedule,
+                        output_hidden_states=True,
+                    )
+                    cleanup_models(hf_model)
+                    return self._scheduled_result(ed_time, hf_time, scheduled_forward=True)
 
                 @ed.ejit(static_argnums=(0,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(gd, gs, go, **kwargs):
-                    model = spx.bind(gd, gs.merge(go, copy=True))
+                    model = spx.bind(gd, gs.merge(go, copy=False))
                     return model(**kwargs, output_hidden_states=True)
 
                 _ = jited(*ed_model.split_module(), **ed_inputs)
@@ -605,7 +768,16 @@ class SequenceClassificationTester(BaseTester):
 
                 # Run ED forward
                 ed_inputs = inputs["jax"]
-                ed_output, ed_time = self._run_ed_forward(ed_model, ed_inputs)
+                ed_output, ed_time = self._run_ed_forward(
+                    ed_model,
+                    ed_inputs,
+                    schedule=small_model_config.get("mpmd_schedule"),
+                )
+
+                if small_model_config.get("mpmd_schedule") is not None:
+                    self._assert_scheduled_loss(ed_output)
+                    cleanup_models(hf_model)
+                    return self._scheduled_result(ed_time, hf_time)
 
                 # Compare outputs
                 comparison = compare_logits(
@@ -838,35 +1010,52 @@ class VisionLanguageTester(BaseTester):
                     # Run ED forward only
                     ed_inputs = inputs["jax"]
                     forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
-
-                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
-                    def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
-                        model = spx.bind(gd, gs.merge(go, copy=True))
-                        return model.compute_loss(
-                            labels=labels,
-                            inputs_embeds=embeds,
-                            attention_mask=attention_mask,
-                            **kwargs,
+                    schedule = small_model_config.get("mpmd_schedule")
+                    if schedule is not None:
+                        ed_output, ed_time = self._run_scheduled_compute_loss(
+                            ed_model=ed_model,
+                            loss_kwargs={
+                                **forward_kwargs,
+                                **loss_kwargs,
+                            },
+                            schedule=schedule,
                         )
+                        self._assert_scheduled_loss(ed_output)
+                        return self._scheduled_result(ed_time, easydel_only=True)
+                    else:
 
-                    # Warmup
-                    _ = jited(
-                        forward_kwargs["inputs_embeds"],
-                        *ed_model.split_module(),
-                        attention_mask=forward_kwargs["attention_mask"],
-                        labels=loss_kwargs["labels"],
-                        **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
-                    )
+                        @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
+                        def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
+                            model = spx.bind(gd, gs.merge(go, copy=False))
+                            return model.compute_loss(
+                                labels=labels,
+                                inputs_embeds=embeds,
+                                attention_mask=attention_mask,
+                                **kwargs,
+                            )
 
-                    with ed.utils.capture_time() as timer:
-                        ed_output, _metrics = jited(
+                        # Warmup
+                        _ = jited(
                             forward_kwargs["inputs_embeds"],
                             *ed_model.split_module(),
                             attention_mask=forward_kwargs["attention_mask"],
                             labels=loss_kwargs["labels"],
                             **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
                         )
-                    ed_time = timer()
+
+                        with ed.utils.capture_time() as timer:
+                            ed_output, _metrics = jited(
+                                forward_kwargs["inputs_embeds"],
+                                *ed_model.split_module(),
+                                attention_mask=forward_kwargs["attention_mask"],
+                                labels=loss_kwargs["labels"],
+                                **{
+                                    k: v
+                                    for k, v in forward_kwargs.items()
+                                    if k not in ["inputs_embeds", "attention_mask"]
+                                },
+                            )
+                        ed_time = timer()
 
                     # Verify output has expected attributes
                     assert hasattr(ed_output, "logits"), "Output missing logits"
@@ -905,35 +1094,51 @@ class VisionLanguageTester(BaseTester):
                 # Run ED forward
                 ed_inputs = inputs["jax"]
                 forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
-
-                @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
-                def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
-                    model = spx.bind(gd, gs.merge(go, copy=True))
-                    return model.compute_loss(
-                        labels=labels,
-                        inputs_embeds=embeds,
-                        attention_mask=attention_mask,
-                        **kwargs,
+                schedule = small_model_config.get("mpmd_schedule")
+                if schedule is not None:
+                    ed_output, ed_time = self._run_scheduled_compute_loss(
+                        ed_model=ed_model,
+                        loss_kwargs={
+                            **forward_kwargs,
+                            **loss_kwargs,
+                        },
+                        schedule=schedule,
                     )
+                    self._assert_scheduled_loss(ed_output)
+                    cleanup_models(hf_model)
+                    return self._scheduled_result(ed_time, hf_time)
+                else:
 
-                # Warmup
-                _ = jited(
-                    forward_kwargs["inputs_embeds"],
-                    *ed_model.split_module(),
-                    attention_mask=forward_kwargs["attention_mask"],
-                    labels=loss_kwargs["labels"],
-                    **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
-                )
+                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
+                    def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
+                        model = spx.bind(gd, gs.merge(go, copy=False))
+                        return model.compute_loss(
+                            labels=labels,
+                            inputs_embeds=embeds,
+                            attention_mask=attention_mask,
+                            **kwargs,
+                        )
 
-                with ed.utils.capture_time() as timer:
-                    ed_output, _metrics = jited(
+                    # Warmup
+                    _ = jited(
                         forward_kwargs["inputs_embeds"],
                         *ed_model.split_module(),
                         attention_mask=forward_kwargs["attention_mask"],
                         labels=loss_kwargs["labels"],
                         **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
                     )
-                ed_time = timer()
+
+                    with ed.utils.capture_time() as timer:
+                        ed_output, _metrics = jited(
+                            forward_kwargs["inputs_embeds"],
+                            *ed_model.split_module(),
+                            attention_mask=forward_kwargs["attention_mask"],
+                            labels=loss_kwargs["labels"],
+                            **{
+                                k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]
+                            },
+                        )
+                    ed_time = timer()
 
                 # Compare outputs
                 comparison = compare_logits(
@@ -1022,29 +1227,44 @@ class Seq2SeqTester(BaseTester):
                         **audio_inputs["jax"],
                         "decoder_input_ids": decoder_inputs["jax"]["input_ids"],
                     }
-
-                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
-                    def jited(input_features, gd, gs, go, decoder_input_ids):
-                        model = spx.bind(gd, gs.merge(go, copy=True))
-                        return model.compute_loss(
-                            labels=decoder_input_ids,
-                            input_features=input_features,
-                            decoder_input_ids=decoder_input_ids,
+                    schedule = small_model_config.get("mpmd_schedule")
+                    if schedule is not None:
+                        ed_output, ed_time = self._run_scheduled_compute_loss(
+                            ed_model=ed_model,
+                            loss_kwargs={
+                                "labels": ed_inputs["decoder_input_ids"],
+                                "input_features": ed_inputs["input_features"],
+                                "decoder_input_ids": ed_inputs["decoder_input_ids"],
+                            },
+                            schedule=schedule,
                         )
+                        self._assert_scheduled_loss(ed_output)
+                        cleanup_models(hf_model)
+                        return self._scheduled_result(ed_time, hf_time)
+                    else:
 
-                    _ = jited(
-                        ed_inputs["input_features"],
-                        *ed_model.split_module(),
-                        decoder_input_ids=ed_inputs["decoder_input_ids"],
-                    )
+                        @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
+                        def jited(input_features, gd, gs, go, decoder_input_ids):
+                            model = spx.bind(gd, gs.merge(go, copy=False))
+                            return model.compute_loss(
+                                labels=decoder_input_ids,
+                                input_features=input_features,
+                                decoder_input_ids=decoder_input_ids,
+                            )
 
-                    with ed.utils.capture_time() as timer:
-                        ed_output, _metrics = jited(
+                        _ = jited(
                             ed_inputs["input_features"],
                             *ed_model.split_module(),
                             decoder_input_ids=ed_inputs["decoder_input_ids"],
                         )
-                    ed_time = timer()
+
+                        with ed.utils.capture_time() as timer:
+                            ed_output, _metrics = jited(
+                                ed_inputs["input_features"],
+                                *ed_model.split_module(),
+                                decoder_input_ids=ed_inputs["decoder_input_ids"],
+                            )
+                        ed_time = timer()
                 else:
                     # Generate inputs
                     inputs = make_seq2seq_inputs(
@@ -1063,36 +1283,47 @@ class Seq2SeqTester(BaseTester):
 
                     # Run ED forward
                     ed_inputs = {**inputs["jax"], "labels": inputs["jax"]["decoder_input_ids"]}
-
-                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
-                    def jited(input_ids, gd, gs, go, attention_mask, labels, **kwargs):
-                        model = spx.bind(gd, gs.merge(go, copy=True))
-                        return model.compute_loss(
-                            labels=labels,
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            **kwargs,
+                    schedule = small_model_config.get("mpmd_schedule")
+                    if schedule is not None:
+                        ed_output, ed_time = self._run_scheduled_compute_loss(
+                            ed_model=ed_model,
+                            loss_kwargs=ed_inputs,
+                            schedule=schedule,
                         )
+                        self._assert_scheduled_loss(ed_output)
+                        cleanup_models(hf_model)
+                        return self._scheduled_result(ed_time, hf_time)
+                    else:
 
-                    extra_kwargs = {
-                        k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask", "labels"]
-                    }
-                    _ = jited(
-                        ed_inputs["input_ids"],
-                        *ed_model.split_module(),
-                        attention_mask=ed_inputs["attention_mask"],
-                        labels=ed_inputs["labels"],
-                        **extra_kwargs,
-                    )
-                    with ed.utils.capture_time() as timer:
-                        ed_output, _metrics = jited(
+                        @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
+                        def jited(input_ids, gd, gs, go, attention_mask, labels, **kwargs):
+                            model = spx.bind(gd, gs.merge(go, copy=False))
+                            return model.compute_loss(
+                                labels=labels,
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                **kwargs,
+                            )
+
+                        extra_kwargs = {
+                            k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask", "labels"]
+                        }
+                        _ = jited(
                             ed_inputs["input_ids"],
                             *ed_model.split_module(),
                             attention_mask=ed_inputs["attention_mask"],
                             labels=ed_inputs["labels"],
                             **extra_kwargs,
                         )
-                    ed_time = timer()
+                        with ed.utils.capture_time() as timer:
+                            ed_output, _metrics = jited(
+                                ed_inputs["input_ids"],
+                                *ed_model.split_module(),
+                                attention_mask=ed_inputs["attention_mask"],
+                                labels=ed_inputs["labels"],
+                                **extra_kwargs,
+                            )
+                        ed_time = timer()
 
                 # Compare outputs
                 comparison = compare_logits(
@@ -1178,6 +1409,27 @@ class Seq2SeqTester(BaseTester):
                         audio_length=audio_length,
                         num_mel_bins=getattr(config, "num_mel_bins", 80),
                     )
+                    schedule = small_model_config.get("mpmd_schedule")
+                    if schedule is not None:
+                        schedule_batch_size = max(1, int(getattr(schedule, "microbatches", 1)))
+                        scheduled_inputs = make_audio_inputs(
+                            batch_size=schedule_batch_size,
+                            audio_length=audio_length,
+                            num_mel_bins=getattr(config, "num_mel_bins", 80),
+                        )
+                        decoder_input_ids = jnp.ones((schedule_batch_size, 1), dtype="i4")
+                        scheduled_output, ed_time = self._run_scheduled_compute_loss(
+                            ed_model=ed_model,
+                            loss_kwargs={
+                                "labels": decoder_input_ids,
+                                "input_features": scheduled_inputs["jax"]["input_features"],
+                                "decoder_input_ids": decoder_input_ids,
+                            },
+                            schedule=schedule,
+                        )
+                        self._assert_scheduled_loss(scheduled_output)
+                        cleanup_models(hf_model)
+                        return self._scheduled_result(ed_time, scheduled_generation=True)
 
                     # Run generation
                     with ed.utils.capture_time() as timer:
@@ -1194,6 +1446,24 @@ class Seq2SeqTester(BaseTester):
                         batch_size=1,
                         seq_len=32,
                     )
+                    schedule = small_model_config.get("mpmd_schedule")
+                    if schedule is not None:
+                        loss_inputs = make_text_inputs(
+                            vocab_size=small_model_config["vocab_size"],
+                            batch_size=max(1, int(getattr(schedule, "microbatches", 1))),
+                            seq_len=32,
+                        )
+                        scheduled_output, ed_time = self._run_scheduled_compute_loss(
+                            ed_model=ed_model,
+                            loss_kwargs={
+                                **loss_inputs["jax"],
+                                "labels": loss_inputs["jax"]["input_ids"],
+                            },
+                            schedule=schedule,
+                        )
+                        self._assert_scheduled_loss(scheduled_output)
+                        cleanup_models(hf_model)
+                        return self._scheduled_result(ed_time, scheduled_generation=True)
 
                     # Run generation
                     with ed.utils.capture_time() as timer:
@@ -1226,7 +1496,7 @@ class Seq2SeqTester(BaseTester):
             )
 
 
-class EasyDeLOnlyTester:
+class EasyDeLOnlyTester(BaseTester):
     """Test EasyDeL models without HuggingFace comparison.
 
     Used for models that don't have HuggingFace equivalents.
@@ -1271,12 +1541,21 @@ class EasyDeLOnlyTester:
                     seq_len=small_model_config["sequence_length"],
                 )
 
+                schedule = small_model_config.get("mpmd_schedule")
+                if schedule is not None:
+                    _ed_output, ed_time = self._run_scheduled_forward_scalar(
+                        ed_model=ed_model,
+                        forward_kwargs=inputs["jax"],
+                        schedule=schedule,
+                    )
+                    return self._scheduled_result(ed_time, easydel_only=True, scheduled_forward=True)
+
                 # Run forward pass
                 with ed.utils.capture_time() as timer:
 
                     @ed.ejit(static_argnums=(0,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(gd, gs, go, input_ids, attention_mask):
-                        model = spx.bind(gd, gs.merge(go, copy=True))
+                        model = spx.bind(gd, gs.merge(go, copy=False))
                         return model(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
@@ -1309,7 +1588,7 @@ class EasyDeLOnlyTester:
             )
 
 
-class EmbeddingTester:
+class EmbeddingTester(BaseTester):
     """Test EMBEDDING models (EasyDeL-only, no HF comparison).
 
     Verifies that embedding models:
@@ -1359,6 +1638,18 @@ class EmbeddingTester:
                     dtype="i4",
                 )
                 attention_mask = jnp.ones_like(input_ids, dtype="bool")
+
+                schedule = small_model_config.get("mpmd_schedule")
+                if schedule is not None:
+                    _output, ed_time = self._run_scheduled_forward_scalar(
+                        ed_model=ed_model,
+                        forward_kwargs={
+                            "input_ids": input_ids,
+                            "attention_mask": attention_mask,
+                        },
+                        schedule=schedule,
+                    )
+                    return self._scheduled_result(ed_time, scheduled_forward=True)
 
                 output = ed_model(input_ids=input_ids, attention_mask=attention_mask)
 

@@ -392,6 +392,8 @@ class BCOTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=train_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (forward_fn, self.arguments.beta)
@@ -401,6 +403,8 @@ class BCOTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
             out_shardings=empty_sharding,
             static_argnums=eval_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self.sharded_training_step_function = sharded_training_step_function

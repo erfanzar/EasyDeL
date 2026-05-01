@@ -27,7 +27,6 @@ The model consists of three main components:
 import typing
 
 from eformer.loggings import get_logger
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -413,19 +412,6 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
-
 
 @register_config("qwen3_omni_moe_talker_code_predictor")
 class Qwen3OmniMoeTalkerCodePredictorConfig(EasyDeLBaseConfig):
@@ -726,19 +712,6 @@ class Qwen3OmniMoeTalkerConfig(EasyDeLBaseConfig):
         self.speaker_id = speaker_id
         self.spatial_merge_size = spatial_merge_size
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
-
 
 @register_config("qwen3_omni_moe_code2wav")
 class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
@@ -825,19 +798,6 @@ class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
     def layer_types(self) -> list[str]:
         """All layers use sliding attention."""
         return ["sliding_attention"] * self.num_hidden_layers
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
 
 @register_config("qwen3_omni_moe")
@@ -930,19 +890,6 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
     def get_text_config(self, decoder: bool = True) -> Qwen3OmniMoeTextConfig:
         """Get the text configuration from thinker."""
         return self.thinker_config.get_text_config(decoder)  # pyright: ignore[reportReturnType]
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
 
 __all__ = [

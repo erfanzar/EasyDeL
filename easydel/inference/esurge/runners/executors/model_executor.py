@@ -73,6 +73,7 @@ from collections import OrderedDict
 import jax
 import spectrax as spx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.caching import (
     HybridCache,
@@ -82,12 +83,16 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.infra.sharding import MeshLike, replicate_on_array_mesh, resolve_stage_mesh
 from easydel.utils import set_inference_mode
 
 from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
+from ..pipeline_plan import PipelineInferencePlan
+from ..pipeline_runtime import PipelineStageRuntime
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
+    from easydel.infra.etils import MpMdSchedulers
 
 
 class ModelStepExecutor:
@@ -135,7 +140,7 @@ class ModelStepExecutor:
         self,
         *,
         model: "EasyDeLBaseModule",
-        mesh: tp.Any,
+        mesh: MeshLike,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
         kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
         graphstate_template: tp.Any,
@@ -146,6 +151,8 @@ class ModelStepExecutor:
         use_aot_forward: bool,
         bind_graphstate_for_aot: bool = False,
         cache_capacity: int = 64,
+        mpmd_scheduler: MpMdSchedulers | None = None,
+        pipeline_plan: PipelineInferencePlan | None = None,
     ) -> None:
         """Initialize the ModelStepExecutor.
 
@@ -167,6 +174,9 @@ class ModelStepExecutor:
                 concrete kernel policies (e.g. TPU predecode-once). Default: False.
             cache_capacity: Deprecated compatibility argument. Compiled
                 variants are retained until ``clear_cache()`` is called.
+            mpmd_scheduler: Optional ``spectrax.runtime.schedules.Schedule``
+                forwarded to ``spx.jit(schedule=...)`` when the mesh is MPMD.
+                ``None`` ⇒ forward-only marker-cluster MPMD path. Ignored on SPMD.
         """
         self.model = model
         self.mesh = mesh
@@ -178,6 +188,12 @@ class ModelStepExecutor:
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
         self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
+        self.mpmd_scheduler = mpmd_scheduler
+        self.pipeline_plan = pipeline_plan
+        self._pipeline_runtime = (
+            PipelineStageRuntime(plan=pipeline_plan) if pipeline_plan is not None and pipeline_plan.is_enabled else None
+        )
+        self._lm_head_uses_tied_projection = self._uses_tied_lm_head() if self._uses_mpmd_mesh() else False
         del cache_capacity
 
         self._backbone_fn = self._build_backbone_fn(
@@ -195,12 +211,28 @@ class ModelStepExecutor:
         self._lm_head_cache: OrderedDict[tuple[int, str, str], tp.Any] = OrderedDict()
         # Legacy combined cache (kept for backward compat with tests)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
+        self._lm_head_graphdef: tp.Any | None = None
+        self._lm_head_state: tp.Any | None = None
+        self._lm_head_clip_cap: float | None = None
+        self._lm_head_logit_scale: float | None = None
+        self._lm_head_soft_cap: float | None = None
+        if self._uses_mpmd_mesh():
+            self.refresh_lm_head_state(
+                graphdef=graphdef,
+                graphstate=graphstate_template,
+                graphother=graphother_template,
+            )
 
     def clear_cache(self) -> None:
         """Clear all cached compiled functions."""
         self._backbone_cache.clear()
         self._lm_head_cache.clear()
         self._cache.clear()
+
+    def shutdown(self) -> None:
+        """Release resident PP stage workers."""
+        if self._pipeline_runtime is not None:
+            self._pipeline_runtime.shutdown()
 
     @staticmethod
     def _cache_store(cache: OrderedDict, key, value) -> None:
@@ -215,6 +247,150 @@ class ModelStepExecutor:
 
     def _uses_mpmd_mesh(self) -> bool:
         return self.mesh.is_mpmd
+
+    def _final_stage_mesh(self):
+        if not self._uses_mpmd_mesh():
+            return None
+        if self.pipeline_plan is not None and self.pipeline_plan.is_enabled and self.pipeline_plan.stage_meshes:
+            return self.pipeline_plan.stage_meshes[int(self.pipeline_plan.final_stage)]
+        text_config = self.model.config.get_text_config()
+        total_layers = int(getattr(text_config, "num_hidden_layers", 1))
+        if hasattr(self.model, "_layer_physical_stage_assignment"):
+            stage = self.model._layer_physical_stage_assignment(total_layers - 1, total_layers)
+        else:
+            mpmd_dim = int(getattr(self.mesh, "mpmd_dim", 1))
+            stage = (mpmd_dim - 1, mpmd_dim)
+        return resolve_stage_mesh(self.mesh, stage=stage)
+
+    def _embedding_stage_mesh(self):
+        if not self._uses_mpmd_mesh():
+            return None
+        if self.pipeline_plan is not None and self.pipeline_plan.is_enabled and self.pipeline_plan.stage_meshes:
+            return self.pipeline_plan.stage_meshes[0]
+        mpmd_dim = int(getattr(self.mesh, "mpmd_dim", 1))
+        return resolve_stage_mesh(self.mesh, stage=(0, mpmd_dim))
+
+    def _lm_head_stage_mesh(self):
+        if self._lm_head_uses_tied_projection:
+            return self._embedding_stage_mesh()
+        return self._final_stage_mesh()
+
+    def _lm_head_replicated_sharding(self) -> NamedSharding | None:
+        stage_mesh = self._lm_head_stage_mesh()
+        if stage_mesh is None:
+            return None
+        return NamedSharding(stage_mesh, PartitionSpec())
+
+    def _uses_tied_lm_head(self) -> bool:
+        configs = [self.model.config]
+        get_text_config = getattr(self.model.config, "get_text_config", None)
+        if callable(get_text_config):
+            text_config = get_text_config()
+            if text_config is not self.model.config:
+                configs.append(text_config)
+
+        for config in configs:
+            for key in ("tie_word_embeddings", "share_input_output_layers"):
+                if hasattr(config, key) and bool(getattr(config, key)):
+                    return True
+        return False
+
+    def _lm_head_hidden_sharding(self, shape: tuple[int, ...]) -> NamedSharding | None:
+        stage_mesh = self._lm_head_stage_mesh()
+        if stage_mesh is None:
+            return None
+        resolver = self.model.config.runtime_sharding_resolver.with_mesh(stage_mesh)
+        spec = resolver.resolve(
+            axes=[spx.common_types.EMPTY, spx.common_types.EMBED],
+            mode=spx.common_types.MODE_DECODE,
+            shape=shape,
+        )
+        return NamedSharding(stage_mesh, spec)
+
+    def _place_lm_head_hidden(self, hidden_states: jax.Array) -> jax.Array:
+        if not self._uses_mpmd_mesh():
+            return hidden_states
+        sharding = self._lm_head_hidden_sharding(tuple(hidden_states.shape))
+        if sharding is None:
+            return hidden_states
+        current = getattr(hidden_states, "sharding", None)
+        if (
+            isinstance(current, NamedSharding)
+            and getattr(current, "mesh", None) == sharding.mesh
+            and getattr(current, "spec", None) == sharding.spec
+        ):
+            return hidden_states
+        return jax.device_put(hidden_states, sharding)
+
+    def _stage_local_lm_head_state(self, state: tp.Any) -> tp.Any:
+        if not self._uses_mpmd_mesh():
+            return state
+        stage_mesh = self._lm_head_stage_mesh()
+        if stage_mesh is None:
+            return state
+        shardings = spx.extract_sharding_structure(state, mesh=self.mesh, stage_mesh=stage_mesh)
+        return jax.tree_util.tree_map(
+            lambda x, s: jax.device_put(x, s) if s is not None and hasattr(x, "dtype") else x,
+            state,
+            shardings,
+        )
+
+    def _refresh_lm_head_postprocess(self, model: "EasyDeLBaseModule") -> None:
+        clip_feature = getattr(model, "_logit_cap_feature", None)
+        self._lm_head_clip_cap = getattr(clip_feature, "cap_value", None)
+
+        scale = None
+        for attr in ("logit_scale", "output_multiplier_scale"):
+            value = getattr(model, attr, None)
+            if value is not None:
+                scale = float(value) if scale is None else scale * float(value)
+        base_model = getattr(model, "base_model", None)
+        multiplier = getattr(base_model, "lm_head_multiplier", None)
+        if multiplier is not None:
+            scale = float(multiplier) if scale is None else scale * float(multiplier)
+        self._lm_head_logit_scale = scale
+
+        configs = [getattr(model, "config", None)]
+        config = configs[0]
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            configs.append(get_text_config())
+        elif hasattr(config, "text_config"):
+            configs.append(config.text_config)
+        self._lm_head_soft_cap = next(
+            (
+                float(cap)
+                for cfg in configs
+                if cfg is not None
+                for cap in (getattr(cfg, "final_logit_softcapping", None),)
+                if cap is not None
+            ),
+            None,
+        )
+
+    def refresh_lm_head_state(self, *, graphdef: tp.Any, graphstate: tp.Any, graphother: tp.Any) -> None:
+        """Refresh the stage-local LM-head state without touching backbone weights.
+
+        PP inference runs the transformer backbone through ``spx.jit`` and then
+        projects only sampled rows on the final stage.  The projection must not
+        close over a full bound model: that makes the head executable compile
+        too much state and can leave it stale after graph updates.
+        """
+        if not self._uses_mpmd_mesh():
+            return
+        self._lm_head_uses_tied_projection = self._uses_tied_lm_head()
+        stage_mesh = self._lm_head_stage_mesh()
+        mesh_context = stage_mesh if stage_mesh is not None else self.model.mesh
+        with mesh_context:
+            model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
+            self._refresh_lm_head_postprocess(model)
+            if self._lm_head_uses_tied_projection:
+                projection = model.get_embedding()
+            else:
+                projection = model.get_lm_head()
+            lm_head_graphdef, lm_head_state = spx.export(projection)
+        self._lm_head_graphdef = lm_head_graphdef
+        self._lm_head_state = self._stage_local_lm_head_state(lm_head_state)
 
     def _compile_mode(self) -> str:
         if self._uses_mpmd_mesh():
@@ -261,7 +437,11 @@ class ModelStepExecutor:
             backbone_out = backbone_fn(graphstate_, graphother_, kv_pages_, metadata_)
             # Gather outside the compiled lm_head so it always sees
             # [padded_num_reqs, hidden_dim] regardless of num_tokens.
-            gathered_hs = backbone_out.hidden_states[metadata_.logits_indices[:_pnr]]
+            logits_indices = metadata_.logits_indices[:_pnr]
+            if self._uses_mpmd_mesh():
+                logits_indices = replicate_on_array_mesh(logits_indices, backbone_out.hidden_states)
+            gathered_hs = backbone_out.hidden_states[logits_indices]
+            gathered_hs = self._place_lm_head_hidden(gathered_hs)
             logits = lm_head_fn(graphstate_, graphother_, gathered_hs)
             return ModelStepOutputs(
                 kv_pages=backbone_out.kv_pages,
@@ -335,7 +515,7 @@ class ModelStepExecutor:
         if self._uses_mpmd_mesh():
 
             def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
-                return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
+                return self._dispatch_pipeline_backbone(graphstate_, graphother_, kv_pages_, metadata_)
 
             out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
             self._cache_store(self._backbone_cache, key, wrapped_backbone)
@@ -368,6 +548,33 @@ class ModelStepExecutor:
         self._cache_store(self._backbone_cache, key, wrapped_backbone)
         return out
 
+    def _dispatch_pipeline_backbone(self, graphstate_, graphother_, kv_pages_, metadata_) -> BackboneOutputs:
+        pipeline_runtime = getattr(self, "_pipeline_runtime", None)
+        if pipeline_runtime is None:
+            return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
+        return pipeline_runtime.dispatch(
+            self._backbone_fn,
+            self.graphdef,
+            graphstate_,
+            graphother_,
+            kv_pages_,
+            metadata_,
+        )
+
+    def last_pipeline_stats(self) -> dict[str, float | int]:
+        if self._pipeline_runtime is None:
+            state = getattr(self._backbone_fn, "_mpmd_state", {})
+            launches = int(state.get("forward_stage_launches", 0) or 0)
+            if launches <= 0:
+                return {}
+            return {"pp_stage_launches": launches}
+        stats = self._pipeline_runtime.last_stats
+        return {
+            "pp_stage_launches": int(stats.stage_launches),
+            "pp_stage_dispatch_time": float(stats.stage_dispatch_time),
+            "pp_queue_wait_time": float(stats.queue_wait_time),
+        }
+
     def compile_lm_head(
         self,
         *,
@@ -397,11 +604,69 @@ class ModelStepExecutor:
         dummy_hs = jnp.zeros((int(padded_num_reqs), int(hidden_dim)), dtype=dtype)
 
         if self._uses_mpmd_mesh():
+            self.refresh_lm_head_state(graphdef=graphdef, graphstate=graphstate, graphother=graphother)
+            if self._lm_head_graphdef is None or self._lm_head_state is None:
+                raise ValueError("eSurge PP lm_head state was not initialized.")
+            stage_mesh = self._lm_head_stage_mesh()
+            hidden_sharding = self._lm_head_hidden_sharding(tuple(dummy_hs.shape))
+            if hidden_sharding is not None:
+                dummy_hs = jax.device_put(dummy_hs, hidden_sharding)
+            logits_sharding = self._lm_head_replicated_sharding()
+            lm_head_state = self._lm_head_state
+            lm_head_state_sharding = spx.extract_sharding_structure(
+                lm_head_state,
+                mesh=self.mesh,
+                stage_mesh=stage_mesh,
+            )
+
+            jit_kwargs = {}
+            if hidden_sharding is not None:
+                jit_kwargs["in_shardings"] = (lm_head_state_sharding, hidden_sharding)
+            if logits_sharding is not None:
+                jit_kwargs["out_shardings"] = logits_sharding
+
+            mesh_context = stage_mesh if stage_mesh is not None else self.model.mesh
+            lm_head_graphdef = self._lm_head_graphdef
+            clip_cap = self._lm_head_clip_cap
+            logit_scale = self._lm_head_logit_scale
+            soft_cap = self._lm_head_soft_cap
+            uses_tied_projection = self._lm_head_uses_tied_projection
+
+            @spx.jit(**jit_kwargs)  # pyright: ignore[reportUntypedFunctionDecorator]
+            def _stage_lm_head(head_state_, hs_):
+                with mesh_context:
+                    projection = spx.bind(lm_head_graphdef, head_state_)
+                    if uses_tied_projection:
+                        attend = getattr(projection, "attend", None)
+                        if attend is None:
+                            weight = projection.weight.value
+                            logits = jnp.dot(hs_, weight.T)
+                        else:
+                            logits = attend(hs_)
+                    else:
+                        native_forward = getattr(projection, "native_forward", None)
+                        if native_forward is None:
+                            logits = projection(hs_)
+                        else:
+                            logits = native_forward(hs_)
+                    if clip_cap is not None:
+                        cap = jnp.array(clip_cap, dtype=logits.dtype)
+                        logits = jnp.clip(logits, -cap, cap)
+                    if logit_scale is not None:
+                        logits = logits * jnp.array(logit_scale, dtype=logits.dtype)
+                    if soft_cap is not None:
+                        cap = jnp.array(soft_cap, dtype=logits.dtype)
+                        logits = cap * jax.nn.tanh(logits / cap)
+                    return logits
+
+            _ = _stage_lm_head(lm_head_state, dummy_hs)
 
             def wrapped_lm_head(graphstate_, graphother_, hs_):
-                return self._lm_head_fn(self.graphdef, graphstate_, graphother_, hs_)
+                del graphstate_, graphother_
+                if self._lm_head_state is None:
+                    raise ValueError("eSurge PP lm_head state was not initialized.")
+                return _stage_lm_head(self._lm_head_state, self._place_lm_head_hidden(hs_))
 
-            _ = wrapped_lm_head(graphstate, graphother, dummy_hs)
             self._cache_store(self._lm_head_cache, key, wrapped_lm_head)
             return
 
@@ -470,9 +735,14 @@ class ModelStepExecutor:
 
         kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
 
+        hidden_out_sharding = self._empty_sharding
+        if self._uses_mpmd_mesh():
+            hidden_size = int(self.model.config.get_text_config().hidden_size)
+            hidden_out_sharding = self._lm_head_hidden_sharding((1, hidden_size)) or hidden_out_sharding
+
         backbone_out_shardings = BackboneOutputs(
             kv_pages=spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh),
-            hidden_states=self._empty_sharding,
+            hidden_states=hidden_out_sharding,
         )
 
         # @erfanzar NOTE:
@@ -502,6 +772,8 @@ class ModelStepExecutor:
         }
         if self._uses_mpmd_mesh():
             jit_kwargs = {**common_jit_kwargs, "mesh": self.mesh}
+            if self.mpmd_scheduler is not None:
+                jit_kwargs["schedule"] = self.mpmd_scheduler
         else:
             jit_kwargs = dict(common_jit_kwargs)
 
@@ -514,7 +786,7 @@ class ModelStepExecutor:
             metadata: BatchMetadata,
         ) -> BackboneOutputs:
             with self.model.mesh:
-                model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
+                model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
                 input_ids_view = metadata.input_ids_buf
                 position_ids_view = metadata.position_ids_buf
 
@@ -611,14 +883,17 @@ class ModelStepExecutor:
             independent of ``num_tokens``.
         """
 
+        hidden_in_sharding = None if self._uses_mpmd_mesh() else self._empty_sharding
+        out_sharding = None if self._uses_mpmd_mesh() else self._empty_sharding
+
         @spx.jit(  # pyright: ignore[reportUntypedFunctionDecorator]
             static_argnums=(0,),
             in_shardings=(
                 spx.extract_sharding_structure(graphstate_template, mesh=self.mesh),
                 spx.extract_sharding_structure(graphother_template, mesh=self.mesh),
-                self._empty_sharding,
+                hidden_in_sharding,
             ),
-            out_shardings=self._empty_sharding,
+            out_shardings=out_sharding,
         )
         def _lm_head_step(
             graphdef,
@@ -629,7 +904,7 @@ class ModelStepExecutor:
             with self.model.mesh:
                 # spx.bind only runs at trace/compile time (inside @spx.jit),
                 # not at inference runtime; XLA sees through it.
-                model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
+                model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
                 return model.apply_lm_head(gathered_hidden_states)
 
         return _lm_head_step

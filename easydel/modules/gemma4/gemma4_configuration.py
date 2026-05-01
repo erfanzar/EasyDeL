@@ -32,8 +32,6 @@ the EasyDeL factory so they can be instantiated via
 import typing
 from typing import Literal
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
@@ -295,14 +293,6 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
             rope_parameters = default_rope_params
         self.rope_parameters = rope_parameters
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Return tensor-parallelism partition rules.
-
-        Returns ``None`` to use the default partitioning strategy provided by
-        the ``PartitionManager``.
-        """
-        return None
-
     def get_kv_shared_layer_mapping(self) -> dict[int, int]:
         """Return a mapping from KV-shared layer indices to their donor indices.
 
@@ -465,13 +455,6 @@ class Gemma4VisionConfig(EasyDeLBaseConfig):
             rope_parameters = {"rope_type": "default", "rope_theta": 100.0}
         self.rope_parameters = rope_parameters
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Return tensor-parallelism partition rules.
-
-        Returns ``None`` to use the default partitioning strategy.
-        """
-        return None
-
 
 @register_config("gemma4")
 class Gemma4Config(EasyDeLBaseConfig):
@@ -561,10 +544,3 @@ class Gemma4Config(EasyDeLBaseConfig):
         self.tie_word_embeddings = tie_word_embeddings
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Return tensor-parallelism partition rules.
-
-        Returns ``None`` to use the default partitioning strategy.
-        """
-        return None

@@ -104,7 +104,7 @@ def main():
         attention_mask,
         generation_config,
     ):
-        module = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
+        module = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
         with module.mesh:
             return module.generate(
                 input_ids=input_ids,

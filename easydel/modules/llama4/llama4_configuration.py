@@ -64,10 +64,6 @@ def _patch_hf_llama4_pooler_output() -> None:
 _patch_hf_llama4_pooler_output()
 
 
-def _get_partition_rules(self, *args, **kwargs):
-    return None
-
-
 @register_config("llama4_vision_model")
 class Llama4VisionConfig(EasyDeLBaseConfig):
     """Configuration for the Llama4 vision encoder and multi-modal projector.
@@ -167,8 +163,6 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
         self.vision_feature_select_strategy = vision_feature_select_strategy
         self.rope_theta = rope_theta
         super().__init__(**kwargs)
-
-    get_partition_rules = _get_partition_rules
 
 
 @register_config("llama4_text")
@@ -345,8 +339,6 @@ class Llama4TextConfig(EasyDeLBaseConfig):
             layer_types = ["chunked_attention" if no_rope else "full_attention" for no_rope in self.no_rope_layers]
         self.layer_types = layer_types
 
-    get_partition_rules = _get_partition_rules
-
 
 @register_config("llama4")
 class Llama4Config(EasyDeLBaseConfig):
@@ -412,8 +404,6 @@ class Llama4Config(EasyDeLBaseConfig):
             self.text_config = text_config
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-
-    get_partition_rules = _get_partition_rules
 
 
 __all__ = ["Llama4Config", "Llama4TextConfig", "Llama4VisionConfig"]

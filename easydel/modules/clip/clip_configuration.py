@@ -22,10 +22,6 @@ from easydel.infra.factory import register_config
 logger = get_logger(__name__)
 
 
-def _get_partition_rules(self, *arg, **kwargs):
-    return None
-
-
 @register_config("clip_text_model")
 class CLIPTextConfig(EasyDeLBaseConfig):
     r"""
@@ -130,8 +126,6 @@ class CLIPTextConfig(EasyDeLBaseConfig):
         self.initializer_factor = initializer_factor
         self.attention_dropout = attention_dropout
 
-    get_partition_rules = _get_partition_rules
-
 
 @register_config("clip_vision_model")
 class CLIPVisionConfig(EasyDeLBaseConfig):
@@ -224,8 +218,6 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
         self.hidden_act = hidden_act
-
-    get_partition_rules = _get_partition_rules
 
 
 @register_config("clip")
@@ -381,5 +373,3 @@ class CLIPConfig(EasyDeLBaseConfig):
             vision_config=vision_config.to_dict(),
             **kwargs,
         )
-
-    get_partition_rules = _get_partition_rules

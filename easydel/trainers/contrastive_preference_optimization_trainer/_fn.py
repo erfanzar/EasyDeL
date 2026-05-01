@@ -35,10 +35,15 @@ from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_
 from easydel.trainers.direct_preference_optimization_trainer._fn import concatenated_inputs
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -387,6 +392,69 @@ def training_step(
         metrics=metrics,
     )
     return new_state, metrics
+
+
+def _cpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=(
+            "beta",
+            "label_smoothing",
+            "loss_type",
+            "cpo_alpha",
+            "simpo_gamma",
+            "alpha",
+            "partition_spec",
+        ),
+        object_fields=("concatenated_forward_fn", "straight_through_emulator"),
+    )
+
+
+def _make_cpo_scheduled_loss(call):
+    concatenated_forward_fn = call.get("concatenated_forward_fn")
+    beta = call.get("beta")
+    label_smoothing = call.get("label_smoothing")
+    loss_type = call.get("loss_type")
+    cpo_alpha = call.get("cpo_alpha")
+    simpo_gamma = call.get("simpo_gamma")
+    alpha = call.get("alpha")
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        model_outputs = concatenated_forward_fn(module, call_batch)
+
+        losses, _, _ = cpo_loss(
+            model_outputs["chosen_logps"],
+            model_outputs["rejected_logps"],
+            beta=beta,
+            label_smoothing=label_smoothing,
+            loss_type=loss_type,
+            simpo_gamma=simpo_gamma,
+            alpha=alpha,
+        )
+        policy_nll_loss = _policy_nll_loss(
+            model_outputs["chosen_logps_raw"],
+            model_outputs["chosen_lengths"],
+        )
+        loss = losses.mean() + cpo_alpha * policy_nll_loss
+        aux_loss = model_outputs.get("aux_loss")
+        if aux_loss is not None:
+            loss = loss + aux_loss
+        return loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    training_step,
+    ScheduledLossAdapter(
+        name="cpo",
+        make_loss=_make_cpo_scheduled_loss,
+        make_cache_key=_cpo_scheduled_loss_cache_key,
+    ),
+)
 
 
 def evaluation_step(

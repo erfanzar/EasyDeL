@@ -8,3 +8,4 @@ easydel.infra.mixins package
    generation
    operation_cache
    protocol
+   sharding

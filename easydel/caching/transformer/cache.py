@@ -81,13 +81,19 @@ from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jax.extend.core import Primitive
-from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array as JAXArray
 from jaxtyping import Float, Int
 from spectrax import PartitionManager, apply_logical_sharding, common_types
 
-from ...infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
+from easydel.infra.sharding import (
+    MeshLike,
+    RuntimeShardingResolver,
+    coerce_runtime_sharding_resolver,
+    resolve_stage_cache_mesh,
+    sanitize_sharding_axes_for_shape,
+)
+
 from .._abstracts import (
     BaseCache,
     BaseCacheConfig,
@@ -163,67 +169,6 @@ KV_HEAD_DIM = common_types.KV_HEAD_DIM
 BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
 BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 MODE_PREFILL = common_types.MODE_PREFILL
-
-
-def _mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
-    """Return the number of shards implied by a PartitionSpec entry for a given mesh.
-
-    Args:
-        mesh: JAX device mesh containing axis name to size mappings.
-        axis_spec: A PartitionSpec entry, which can be None, a single
-            axis name string, or a tuple of axis name strings.
-
-    Returns:
-        int: Product of mesh axis sizes for the given spec. Returns 1
-            if axis_spec is None.
-    """
-    if axis_spec is None:
-        return 1
-    if isinstance(axis_spec, tuple):
-        prod = 1
-        for axis_name in axis_spec:
-            prod *= int(mesh.shape[axis_name])
-        return prod
-    return int(mesh.shape[axis_spec])
-
-
-def _sanitize_sharding_axes_for_shape(
-    *,
-    mesh: Mesh,
-    runtime_sharding_resolver: RuntimeShardingResolver,
-    axes: list[object | None],
-    mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-    shape: tuple[int, ...],
-) -> tuple[object | None, ...]:
-    """Disable incompatible sharding axes for a given shape.
-
-    Some logical axes (e.g., KV_HEAD) may map to a mesh axis whose size
-    larger than or not evenly dividing the corresponding tensor dimension.
-    This function replaces such axes with None (replication) to prevent
-    JAX sharding errors.
-
-    Args:
-        mesh: JAX device mesh for axis size lookups.
-        runtime_sharding_resolver: Resolver that maps logical axes to concrete shardings.
-        axes: List of logical axis names (or None for replicated dims).
-        mode: Runtime mode (e.g., MODE_PREFILL) for partition resolution.
-        shape: Tensor shape to validate axis compatibility against.
-
-    Returns:
-        tuple: Sanitized axes with incompatible entries replaced by None.
-    """
-    spec = runtime_sharding_resolver.resolve(axes=axes, mode=mode, shape=shape)
-    safe: list[object | None] = []
-    for logical_axis, axis_spec, dim in zip(axes, spec, shape, strict=False):
-        if logical_axis is None or axis_spec is None:
-            safe.append(logical_axis)
-            continue
-        shard_factor = _mesh_partition_product(mesh, axis_spec)
-        if dim % shard_factor != 0:
-            safe.append(None)
-        else:
-            safe.append(logical_axis)
-    return tuple(safe)
 
 
 def _expand_mask_kv_dim(
@@ -504,7 +449,7 @@ class TransformerCacheView(BaseCacheView):
         config: TransformerCacheConfig,
         layer_index: int | None = None,
         *,
-        mesh: Mesh | None = None,
+        mesh: MeshLike | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
         partition_manager: RuntimeShardingResolver | PartitionManager | None = None,
@@ -537,6 +482,7 @@ class TransformerCacheView(BaseCacheView):
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
+        mesh = resolve_stage_cache_mesh(mesh)
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(
             runtime_sharding_resolver if runtime_sharding_resolver is not None else partition_manager,
             mesh=mesh,
@@ -552,14 +498,14 @@ class TransformerCacheView(BaseCacheView):
                     kshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.key_heads, mt.key_dim)
                     vshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.value_heads, mt.value_dim)
 
-            kv_safe_k = _sanitize_sharding_axes_for_shape(
+            kv_safe_k = sanitize_sharding_axes_for_shape(
                 mesh=mesh,
                 runtime_sharding_resolver=runtime_sharding_resolver,
                 axes=kv_sharding_axes,
                 mode=MODE_PREFILL,
                 shape=kshape,
             )
-            kv_safe_v = _sanitize_sharding_axes_for_shape(
+            kv_safe_v = sanitize_sharding_axes_for_shape(
                 mesh=mesh,
                 runtime_sharding_resolver=runtime_sharding_resolver,
                 axes=kv_sharding_axes,
@@ -572,7 +518,7 @@ class TransformerCacheView(BaseCacheView):
             ]
 
             batch_axes: list[object | None] = [BATCH]
-            batch_safe = _sanitize_sharding_axes_for_shape(
+            batch_safe = sanitize_sharding_axes_for_shape(
                 mesh=mesh,
                 runtime_sharding_resolver=runtime_sharding_resolver,
                 axes=batch_axes,
@@ -807,7 +753,7 @@ class TransformerCache(BaseCache):
     @classmethod
     def init_cache(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         config: TransformerCacheConfig,
         runtime_sharding_resolver: RuntimeShardingResolver | PartitionManager | None = None,
         partition_manager: RuntimeShardingResolver | PartitionManager | None = None,

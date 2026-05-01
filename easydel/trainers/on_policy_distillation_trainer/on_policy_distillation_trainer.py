@@ -205,6 +205,8 @@ class OnPolicyDistillationTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -224,6 +226,8 @@ class OnPolicyDistillationTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)

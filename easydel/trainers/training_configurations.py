@@ -33,9 +33,9 @@ import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from eformer.paths import ePath, ePathLike
-from eformer.serialization import Checkpointer
 from jax.sharding import PartitionSpec
 from optax import GradientTransformation  # pyright: ignore[reportMissingTypeStubs]
+from spectrax.serialization import Checkpointer
 
 from easydel.infra.elarge.benchmarking import normalize_benchmark_configs
 from easydel.infra.elarge.types import BenchmarkConfig
@@ -46,6 +46,7 @@ from easydel.infra.etils import (
     AVAILABLE_SPARSE_MODULE_TYPES,
     EasyDeLOptimizers,
     EasyDeLSchedulers,
+    MpMdSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
 from easydel.utils import Registry
@@ -123,11 +124,15 @@ def _normalize_partition_spec_entry(value: tp.Any) -> tp.Any:
     return value
 
 
+_PARTITION_SPEC_REPR_PREFIXES: tuple[str, ...] = ("PartitionSpec(", "P(")
+
+
 def _parse_partition_spec(value: tp.Any) -> PartitionSpec:
     """Parse a value into a JAX PartitionSpec.
 
-    Handles PartitionSpec instances, None, string representations (including
-    ``"PartitionSpec(...)"`` format), and list/tuple inputs.
+    Handles PartitionSpec instances, None, string representations (both
+    ``"PartitionSpec(...)"`` and the JAX 0.10+ ``"P(...)"`` repr), and
+    list/tuple inputs.
 
     Args:
         value: The value to parse. Can be a PartitionSpec, None, a string
@@ -149,9 +154,10 @@ def _parse_partition_spec(value: tp.Any) -> PartitionSpec:
         stripped = value.strip()
         if not stripped:
             return PartitionSpec()
+        prefix = next((p for p in _PARTITION_SPEC_REPR_PREFIXES if stripped.startswith(p)), None)
         try:
-            if stripped.startswith("PartitionSpec(") and stripped.endswith(")"):
-                inner = stripped[len("PartitionSpec(") : -1].strip()
+            if prefix is not None and stripped.endswith(")"):
+                inner = stripped[len(prefix) : -1].strip()
                 parsed = [] if not inner else ast.literal_eval(f"[{inner}]")
             else:
                 parsed = ast.literal_eval(stripped)
@@ -425,6 +431,18 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Metrics to display in the rich progress bar."},
     )
+    mpmd_scheduler: MpMdSchedulers | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional MPMD pipeline schedule (``spx.runtime.schedules.Schedule`` instance, "
+                "e.g. ``Std1F1B(microbatches=N)`` / ``GPipe(microbatches=N)``). "
+                "Forwarded to ``spx.jit(schedule=...)`` when the model mesh is MPMD. "
+                "If None, the trainer step runs as a forward-only marker-cluster MPMD program "
+                "(no microbatch interleaving / 1F1B). Ignored on SPMD meshes."
+            )
+        },
+    )
     generation_top_p: float | None = field(
         default=None,
         metadata={"help": "Default nucleus sampling threshold used for preview generations."},
@@ -566,6 +584,16 @@ class TrainingArguments:
     esurge_data_parallelism_axis: str | None = field(
         default=None,
         metadata={"help": "Mesh axis name used by eSurge as the data-parallel KV-page axis (e.g. 'dp')."},
+    )
+    esurge_async_scheduling: bool | None = field(
+        default=None,
+        metadata={"help": "Enable/disable eSurge async scheduler token sampling. None keeps eSurge default behavior."},
+    )
+    esurge_overlap_execution: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Enable/disable eSurge double-buffered execution overlap. None keeps eSurge default behavior."
+        },
     )
     num_train_epochs: int = field(
         default=10,
@@ -1489,7 +1517,7 @@ class TrainingArguments:
             >>> policies = args.get_checkpoint_policies()
             >>> # Returns: [CheckpointInterval(every=1000, until=None)]
         """
-        from eformer.serialization.checkpointer import CheckpointInterval
+        from spectrax.serialization import CheckpointInterval
 
         if self.save_steps is None:
             return []
@@ -1512,36 +1540,31 @@ class TrainingArguments:
 
     @functools.cached_property
     def _tensorboard(self):
-        """Lazy initialization of TensorBoard writer.
+        """Lazy initialization of the SpectraX TensorBoard writer.
 
         Returns:
-            SummaryWriter | None: TensorBoard writer instance, or None if:
-                - Path is None
-                - Path is on Google Cloud Storage (gs://)
-                - TensorBoard is not installed
+            SummaryWriter | None: TensorBoard writer instance, or None if the
+                save path is not configured.
 
         Note:
             Cached property to avoid multiple initializations.
-            TensorBoard doesn't support cloud storage paths directly.
         """
         from easydel.utils.helpers import SummaryWriter
 
         path = self._get_save_directory(create=True)
         if path is None:
             return None
-        if str(path).startswith("gs://"):
-            return None
         return SummaryWriter(log_dir=str(path))
 
     def get_tensorboard(self) -> SummaryWriter | None:
-        """Get the TensorBoard SummaryWriter for logging metrics.
+        """Get the SpectraX TensorBoard SummaryWriter for logging metrics.
 
         Returns:
-            SummaryWriter | None: The TensorBoard writer instance, or None if
-                                 TensorBoard is not available or not configured.
+            SummaryWriter | None: The TensorBoard writer instance, or None if it
+                is not available or not configured.
 
         Note:
-            Handles ModuleNotFoundError gracefully if TensorBoard is not installed.
+            Handles ModuleNotFoundError gracefully if SpectraX is not installed.
             Uses cached property internally for efficiency.
         """
         try:
@@ -1856,7 +1879,7 @@ class TrainingArguments:
             for key, value in metrics.items():
                 try:
                     if isinstance(value, float | int):
-                        summary_writer.scalar(key, value, step)
+                        summary_writer.add_scalar(key, value, step)
                     elif isinstance(value, tuple) and len(value) == 2:
                         bin_counts, bin_edges = value
                         if isinstance(bin_counts, list | jax.Array) and isinstance(bin_edges, list | jax.Array):
@@ -1869,9 +1892,9 @@ class TrainingArguments:
                                     values.extend([bin_center] * int(count))
 
                             if values:
-                                summary_writer.histogram(key, np.array(values), step)
+                                summary_writer.add_histogram(key, np.array(values), step)
                     elif isinstance(value, list | np.ndarray | jnp.ndarray):
-                        summary_writer.histogram(key, np.array(value), step)
+                        summary_writer.add_histogram(key, np.array(value), step)
                 except Exception as e:
                     warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
                 finally:

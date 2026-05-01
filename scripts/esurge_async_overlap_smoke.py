@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import time
 
+from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.sampling_params import SamplingParams
 
@@ -35,12 +36,16 @@ def main() -> None:
     args = parse_args()
     engine = eSurge(
         model=args.model,
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        hbm_utilization=args.hbm_utilization,
-        async_scheduling=True,
-        overlap_execution=True,
-        enable_prefix_caching=True,
+        runtime=eSurgeRuntimeConfig.from_dict(
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.max_num_seqs,
+            async_scheduling=True,
+            overlap_execution=True,
+        ),
+        cache=eSurgeCacheRuntimeConfig.from_dict(
+            hbm_utilization=args.hbm_utilization,
+            enable_prefix_caching=True,
+        ),
     )
     engine.initiate()
 

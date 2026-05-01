@@ -50,10 +50,15 @@ from easydel.trainers._logprob_utils import (
 )
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -98,6 +103,7 @@ def concatenated_forward(
     """
     if padding_value is None:
         raise ValueError("`padding_value` can not be set as `None` it must be an integer.")
+    model = state.model if isinstance(state, EasyDeLState) else state
 
     # Concatenate inputs from chosen and rejected examples.
     concatenated_batch = concatenated_inputs(batch, is_encoder_decoder)
@@ -115,7 +121,7 @@ def concatenated_forward(
     )
     lmhead_chunksize = None
     if not is_encoder_decoder:
-        lmhead_chunksize = resolve_lmhead_chunksize(state.model)
+        lmhead_chunksize = resolve_lmhead_chunksize(model)
         if lmhead_chunksize is not None:
             model_kwargs["apply_lm_head"] = False
 
@@ -125,10 +131,10 @@ def concatenated_forward(
         "attention_mask": concatenated_batch["concatenated_attention_mask"],
         **model_kwargs,
     }
-    call_kwargs = filter_kwargs_for_callable(getattr(state.model, "forward", state.model), call_kwargs)
+    call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
     call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-    outputs = state.model(**call_kwargs)
-    all_logits = outputs.logits
+    outputs = model(**call_kwargs)
+    all_logits = getattr(outputs, "logits", None)
 
     effective_labels = concatenated_batch["concatenated_labels"]
     if is_encoder_decoder and all_logits is not None and effective_labels.shape != all_logits.shape[:-1]:
@@ -192,11 +198,11 @@ def concatenated_forward(
         hidden_states = outputs.last_hidden_state
         if hidden_states is None:
             raise TypeError(
-                f"{type(state.model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+                f"{type(model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
             )
         hidden_states = hidden_states[:, :-1, :]
         sum_logps, token_logit_sums, token_counts, correct_counts = compute_sequence_scores_from_hidden_states(
-            model=state.model,
+            model=model,
             hidden_states=hidden_states,
             labels=labels_safe,
             loss_mask=loss_mask,
@@ -590,3 +596,68 @@ def orpo_step(
         # In evaluation mode, compute loss metrics without updating the state.
         _, metrics = calculate_loss(state.graphstate, batch)
         return metrics
+
+
+def orpo_training_step(
+    state: EasyDeLState,
+    batch: dict,
+    concatenated_forward: tp.Callable,
+    beta: float = 0.1,
+    learning_rate_fn: tp.Callable | None = None,
+    loss_config: LossConfig | None = None,
+    partition_spec: PartitionSpec | None = None,
+    gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
+) -> tuple[EasyDeLState, LossMetrics]:
+    return orpo_step(
+        state=state,
+        batch=batch,
+        concatenated_forward=concatenated_forward,
+        beta=beta,
+        learning_rate_fn=learning_rate_fn,
+        mode="train",
+        loss_config=loss_config,
+        partition_spec=partition_spec,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        straight_through_emulator=straight_through_emulator,
+    )
+
+
+def _orpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("beta", "partition_spec"),
+        object_fields=("concatenated_forward", "straight_through_emulator"),
+    )
+
+
+def _make_orpo_scheduled_loss(call):
+    concatenated_forward = call.get("concatenated_forward")
+    beta = call.get("beta")
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree: spx.State, batch: dict):
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        (
+            policy_chosen_logps,
+            policy_rejected_logps,
+            _policy_chosen_logits,
+            _policy_rejected_logits,
+            policy_nll_loss,
+            _policy_accuracy,
+        ) = concatenated_forward(module, call_batch)
+        losses, *_ = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
+        return policy_nll_loss - losses.mean()
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    orpo_training_step,
+    ScheduledLossAdapter(
+        name="orpo",
+        make_loss=_make_orpo_scheduled_loss,
+        make_cache_key=_orpo_scheduled_loss_cache_key,
+    ),
+)

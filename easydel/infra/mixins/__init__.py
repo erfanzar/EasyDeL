@@ -49,11 +49,13 @@ from .operation_cache import (
     OperationsCacheInfo,
 )
 from .protocol import BaseModuleProtocol
+from .sharding import EasyShardingMixin
 
 __all__ = (
     "BaseModuleProtocol",
     "EasyBridgeMixin",
     "EasyGenerationMixin",
+    "EasyShardingMixin",
     "LayerOperationInfo",
     "OperationCacheMixin",
     "OperationsCacheInfo",

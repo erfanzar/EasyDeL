@@ -38,7 +38,7 @@ Example:
     >>> cfg = {
     ...     "model": {"name_or_path": "meta-llama/Llama-2-7b", "task": "causal_lm"},
     ...     "loader": {"dtype": "bf16"},
-    ...     "esurge": {"max_model_len": 4096}
+    ...     "esurge": {"runtime": {"max_model_len": 4096}}
     ... }
     >>> model = builders.build_model(cfg)
     >>> engine = builders.build_esurge(cfg, model=model)
@@ -59,9 +59,15 @@ if tp.TYPE_CHECKING:
 
     from easydel.data.core.protocols import ShardedDataSource
 
-from spectrax.common_types import NOT_GIVEN
-
-from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
+from easydel.inference.esurge.config import (
+    eSurgeCacheRuntimeConfig,
+    eSurgeContextConfig,
+    eSurgeDistributedConfig,
+    eSurgeParsingConfig,
+    eSurgeRuntimeConfig,
+    eSurgeVisionConfig,
+    eSurgeWorkerConfig,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
 from easydel.layers.quantization._quants import QuantizationConfig  # pyright: ignore[reportPrivateLocalImportUsage]
@@ -82,6 +88,198 @@ from .processing import coerce_dtype, coerce_precision, materialize_base_config,
 from .types import eLMConfig
 
 logger = get_logger(__name__)
+
+
+_ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
+    "runtime": frozenset(
+        {
+            "esurge_name",
+            "pipeline_inference",
+            "kernel_tile_policy",
+            "max_model_len",
+            "min_input_pad",
+            "min_token_pad",
+            "max_num_seqs",
+            "max_num_seq_buckets",
+            "async_scheduling",
+            "max_num_batched_tokens",
+            "use_aot_forward",
+            "bind_graphstate_for_aot",
+            "compile_runner",
+            "runner_verbose",
+            "overlap_execution",
+            "sampler_metrics",
+            "long_prefill_token_threshold",
+            "enable_window_aware_runtime_cap",
+            "mpmd_scheduler",
+        }
+    ),
+    "cache": frozenset(
+        {
+            "hbm_utilization",
+            "page_size",
+            "enable_prefix_caching",
+            "max_cache_tokens",
+            "cache_capacity_margin",
+            "data_parallelism_axis",
+            "destroy_pages_on_pause",
+        }
+    ),
+    "context": frozenset(
+        {
+            "reserve_tokens",
+            "auto_truncate_prompt",
+            "auto_cap_new_tokens",
+            "strict_context",
+            "truncate_mode",
+            "prefer_preserve_prompt",
+            "decode_truncated_prompt",
+        }
+    ),
+    "workers": frozenset(
+        {
+            "detokenizer_max_states",
+            "tokenizer_endpoint",
+            "detokenizer_endpoint",
+            "worker_startup_timeout",
+            "max_request_outputs",
+            "idle_reset_seconds",
+            "idle_reset_min_interval",
+        }
+    ),
+    "parsing": frozenset(
+        {
+            "sampling_params_callback",
+            "extra_eos_token_ids",
+            "extra_stops",
+            "ignore_stop_strings_in_reasoning",
+            "silent_mode",
+            "tool_parser",
+            "reasoning_parser",
+        }
+    ),
+    "vision": frozenset({"resolution_buckets", "vision_cache_capacity_mb"}),
+    "distributed": frozenset(
+        {
+            "distributed_mode",
+            "distributed_role",
+            "distributed_service_name",
+            "distributed_world_size",
+            "distributed_rank",
+            "distributed_control_port",
+            "distributed_control_bind_host",
+            "distributed_advertise_addr",
+            "distributed_auth_token",
+            "distributed_step_timeout_s",
+            "distributed_connect_timeout_s",
+            "distributed_verify_sampling_digest",
+        }
+    ),
+}
+_ESURGE_FIELD_TO_SECTION = {field: section for section, fields in _ESURGE_SECTION_FIELDS.items() for field in fields}
+_ESURGE_INT_FIELDS = frozenset(
+    {
+        "max_model_len",
+        "min_input_pad",
+        "min_token_pad",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "long_prefill_token_threshold",
+        "page_size",
+        "max_cache_tokens",
+        "reserve_tokens",
+        "detokenizer_max_states",
+        "max_request_outputs",
+        "vision_cache_capacity_mb",
+        "distributed_world_size",
+        "distributed_rank",
+        "distributed_control_port",
+    }
+)
+_ESURGE_FLOAT_FIELDS = frozenset(
+    {
+        "hbm_utilization",
+        "cache_capacity_margin",
+        "worker_startup_timeout",
+        "idle_reset_seconds",
+        "idle_reset_min_interval",
+        "distributed_step_timeout_s",
+        "distributed_connect_timeout_s",
+    }
+)
+_ESURGE_BOOL_FIELDS = frozenset(
+    {
+        "async_scheduling",
+        "use_aot_forward",
+        "bind_graphstate_for_aot",
+        "compile_runner",
+        "runner_verbose",
+        "overlap_execution",
+        "sampler_metrics",
+        "enable_window_aware_runtime_cap",
+        "enable_prefix_caching",
+        "destroy_pages_on_pause",
+        "auto_truncate_prompt",
+        "auto_cap_new_tokens",
+        "strict_context",
+        "prefer_preserve_prompt",
+        "decode_truncated_prompt",
+        "ignore_stop_strings_in_reasoning",
+        "silent_mode",
+        "distributed_mode",
+        "distributed_verify_sampling_digest",
+    }
+)
+
+
+def _coerce_esurge_value(key: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if key == "max_num_seq_buckets":
+        return [int(v) for v in value] if value is not None else None
+    if key == "extra_eos_token_ids":
+        return [int(v) for v in value] if value is not None else None
+    if key == "extra_stops" and not isinstance(value, str):
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        return [str(value)]
+    if key in _ESURGE_INT_FIELDS:
+        return int(value)
+    if key in _ESURGE_FLOAT_FIELDS:
+        return float(value)
+    if key in _ESURGE_BOOL_FIELDS:
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
+    return value
+
+
+def normalize_esurge_sections(esurge: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Normalize nested and legacy flat eSurge config into section dictionaries."""
+    source = dict(esurge or {})
+    sections: dict[str, dict[str, Any]] = {}
+    for section in _ESURGE_SECTION_FIELDS:
+        value = source.get(section)
+        if isinstance(value, Mapping):
+            sections[section] = {key: _coerce_esurge_value(key, item) for key, item in value.items()}
+        else:
+            sections[section] = {}
+
+    for key, value in source.items():
+        if key in _ESURGE_SECTION_FIELDS:
+            continue
+        if key == "verbose" and "runner_verbose" not in sections["runtime"]:
+            sections["runtime"]["runner_verbose"] = bool(value)
+            continue
+        section = _ESURGE_FIELD_TO_SECTION.get(key)
+        if section is not None:
+            sections[section][key] = _coerce_esurge_value(key, value)
+
+    return sections
 
 
 def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
@@ -158,7 +356,6 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         platform=platform.get("platform"),
         config_kwargs=config_kwargs,
         auto_shard_model=bool(sharding.get("auto_shard_model", True)),
-        partition_rules=sharding.get("partition_rules"),
         quantization_config=quant_model,
         apply_quantization=bool(quant.get("apply_quantization", False)),
         verbose=bool(loader.get("verbose", True)),
@@ -264,7 +461,6 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
         config_kwargs=config_kwargs,
         model_task=resolve_task(cfg),
         auto_shard_model=bool(sharding.get("auto_shard_model", True)),
-        partition_rules=sharding.get("partition_rules"),
         quantization_config=quant_model,
         apply_quantization=bool(quant.get("apply_quantization", False)),
         verbose=bool(loader.get("verbose", True)),
@@ -340,215 +536,55 @@ def build_model(cfg_like: eLMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
 
 
 def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
-    """Convert ELM configuration to kwargs for eSurge initialization.
+    """Convert eLM configuration into per-section eSurge kwargs.
 
-    Extracts eSurge-specific configuration values from the 'esurge' section
-    and infers defaults from base configuration when needed. This function
-    handles all eSurge engine parameters including memory management,
-    batching, caching, and execution settings.
+    Reads the seven sectioned sub-configs from :class:`eSurgeCfg`
+    (``cfg["esurge"]``) and returns them as typed-config instances ready to
+    spread into :class:`~easydel.inference.esurge.eSurge`::
 
-    The function processes numerous eSurge parameters with sensible defaults:
-        - Memory: hbm_utilization, page_size
-        - Batching: max_num_seqs, max_num_batched_tokens, min_input_pad
-        - Caching: enable_prefix_caching, destroy_pages_on_pause
-        - Execution: compile_runner, async_scheduling, overlap_execution,
-          use_aot_forward, bind_graphstate_for_aot
-        - Truncation: auto_truncate_prompt, truncate_mode, strict_context
-        - Tokenization: detokenizer_max_states, worker_startup_timeout,
-          extra_eos_token_ids, extra_stops
-        - Parsing: tool_parser, reasoning_parser
+        eSurge(model=..., **to_esurge_kwargs(cfg))
 
-    Args:
-        cfg_like: ELM configuration dictionary or mapping. The function
-            primarily uses the 'esurge' section but also reads from
-            'base_config.values' for selected defaults (for example
-            max_model_len).
+    ``runtime.max_model_len`` falls back to
+    ``cfg["base_config"]["values"]["mask_max_position_embeddings"]`` (or
+    ``freq_max_position_embeddings``) when not set in ``cfg["esurge"]["runtime"]``.
 
     Returns:
-        Dictionary of keyword arguments for eSurge initialization containing
-        all engine configuration parameters. See eSurge documentation for
-        complete parameter descriptions.
+        Mapping with keys ``runtime``, ``cache``, ``context``, ``workers``,
+        ``parsing``, ``vision``, ``distributed`` — each a typed-config instance.
 
     Example:
         >>> cfg = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
         ...     "esurge": {
-        ...         "max_model_len": 4096,
-        ...         "max_num_seqs": 32,
-        ...         "hbm_utilization": 0.9,
-        ...         "enable_prefix_caching": True
-        ...     }
+        ...         "runtime": {"max_model_len": 4096, "max_num_seqs": 32},
+        ...         "cache": {"hbm_utilization": 0.9},
+        ...     },
         ... }
-        >>> kwargs = to_esurge_kwargs(cfg)
-        >>> kwargs["max_model_len"]
+        >>> sections = to_esurge_kwargs(cfg)
+        >>> sections["runtime"].max_model_len
         4096
-        >>> kwargs["enable_prefix_caching"]
-        True
-
-    Note:
-        max_model_len is inferred from base_config values (mask_max_position_embeddings
-        or freq_max_position_embeddings) if not explicitly specified, defaulting to 8192.
     """
     cfg = normalize(cfg_like)
-    es = cfg.get("esurge", {})
-    base_vals = dict(cfg.get("base_config", {}).get("values", {}) or {})
-    max_model_len = (
-        es.get("max_model_len")
-        or base_vals.get("mask_max_position_embeddings")
-        or base_vals.get("freq_max_position_embeddings")
-        or 8192
-    )
-    min_input_pad_val = es.get("min_input_pad")
-    min_token_pad_val = es.get("min_token_pad")
-    max_num_seqs_val = es.get("max_num_seqs")
-    max_num_seq_buckets_val = es.get("max_num_seq_buckets")
-    page_size_val = es.get("page_size")
-    hbm_utilization_val = es.get("hbm_utilization")
-    use_aot_forward_val = es.get("use_aot_forward")
-    bind_graphstate_for_aot_val = es.get("bind_graphstate_for_aot")
-    enable_window_aware_runtime_cap_val = es.get("enable_window_aware_runtime_cap")
-    enable_prefix_caching_val = es.get("enable_prefix_caching")
-    auto_shard_model_val = es.get("auto_shard_model")
-    compile_runner_val = es.get("compile_runner")
-    async_scheduling_val = es.get("async_scheduling")
-    overlap_execution_val = es.get("overlap_execution")
-    sampler_metrics_val = es.get("sampler_metrics")
-    auto_truncate_prompt_val = es.get("auto_truncate_prompt")
-    auto_cap_new_tokens_val = es.get("auto_cap_new_tokens")
-    strict_context_val = es.get("strict_context")
-    prefer_preserve_prompt_val = es.get("prefer_preserve_prompt")
-    decode_truncated_prompt_val = es.get("decode_truncated_prompt")
-    destroy_pages_on_pause_val = es.get("destroy_pages_on_pause")
-    silent_mode_val = es.get("silent_mode")
-    distributed_mode_val = es.get("distributed_mode")
-    distributed_role_val = es.get("distributed_role")
-    distributed_service_name_val = es.get("distributed_service_name")
-    distributed_world_size_val = es.get("distributed_world_size")
-    distributed_rank_val = es.get("distributed_rank")
-    distributed_control_port_val = es.get("distributed_control_port")
-    distributed_control_bind_host_val = es.get("distributed_control_bind_host")
-    distributed_advertise_addr_val = es.get("distributed_advertise_addr")
-    distributed_auth_token_val = es.get("distributed_auth_token")
-    distributed_step_timeout_s_val = es.get("distributed_step_timeout_s")
-    distributed_connect_timeout_s_val = es.get("distributed_connect_timeout_s")
-    distributed_verify_sampling_digest_val = es.get("distributed_verify_sampling_digest")
+    es = normalize_esurge_sections(cfg.get("esurge", {}))
+    runtime = dict(es["runtime"])
 
-    sharding_axis_dims_val: tuple | list | None = es.get("sharding_axis_dims", (1, 1, 1, 1, -1, 1))
-    sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
+    if "max_model_len" not in runtime:
+        base_vals = dict(cfg.get("base_config", {}).get("values", {}) or {})
+        for key in ("mask_max_position_embeddings", "freq_max_position_embeddings"):
+            inferred = base_vals.get(key)
+            if inferred:
+                runtime["max_model_len"] = inferred
+                break
 
-    max_num_batched_tokens = es.get("max_num_batched_tokens", NOT_GIVEN)
-    if max_num_batched_tokens is not None and max_num_batched_tokens is not NOT_GIVEN:
-        max_num_batched_tokens = int(max_num_batched_tokens)
-
-    reserve_tokens = es.get("reserve_tokens")
-    if reserve_tokens is not None:
-        reserve_tokens = int(reserve_tokens)
-
-    detokenizer_max_states: int | str | None = es.get("detokenizer_max_states", DEFAULT_DETOKENIZER_MAX_STATES)
-    if detokenizer_max_states is not None:
-        detokenizer_max_states = int(detokenizer_max_states)
-    worker_startup_timeout = es.get("worker_startup_timeout")
-    if worker_startup_timeout is not None:
-        worker_startup_timeout = float(worker_startup_timeout)
-
-    idle_reset_seconds = es.get("idle_reset_seconds")
-    if idle_reset_seconds is not None:
-        idle_reset_seconds = float(idle_reset_seconds)
-    idle_reset_min_interval = float(es.get("idle_reset_min_interval", 60.0))
-
-    long_prefill_token_threshold_val = es.get("long_prefill_token_threshold")
-    if long_prefill_token_threshold_val is not None:
-        long_prefill_token_threshold_val = int(long_prefill_token_threshold_val)
-
-    extra_eos_token_ids = es.get("extra_eos_token_ids")
-    if extra_eos_token_ids is not None:
-        extra_eos_token_ids = list(extra_eos_token_ids)
-
-    extra_stops = es.get("extra_stops")
-    if extra_stops is not None and not isinstance(extra_stops, str):
-        if isinstance(extra_stops, (list, tuple, set)):
-            extra_stops = list(extra_stops)
-        else:
-            extra_stops = [str(extra_stops)]
-
-    runner_verbose = bool(es.get("runner_verbose", es.get("verbose", False)))
-    truncate_mode = es.get("truncate_mode", "left")
-    data_parallelism_axis_val = es.get("data_parallelism_axis")
-    if data_parallelism_axis_val is None:
-        data_parallelism_axis_val = "dp"
-
-    max_num_seq_buckets = None
-    if max_num_seq_buckets_val is not None:
-        max_num_seq_buckets = [int(v) for v in max_num_seq_buckets_val]
-
-    return dict(
-        max_model_len=int(max_model_len),
-        min_input_pad=int(min_input_pad_val) if min_input_pad_val is not None else 16,
-        min_token_pad=int(min_token_pad_val) if min_token_pad_val is not None else None,
-        max_num_seqs=int(max_num_seqs_val) if max_num_seqs_val is not None else 256,
-        max_num_seq_buckets=max_num_seq_buckets,
-        max_num_batched_tokens=max_num_batched_tokens,
-        hbm_utilization=float(hbm_utilization_val) if hbm_utilization_val is not None else 0.85,
-        page_size=int(page_size_val) if page_size_val is not None else 128,
-        use_aot_forward=True if use_aot_forward_val is None else bool(use_aot_forward_val),
-        bind_graphstate_for_aot=False if bind_graphstate_for_aot_val is None else bool(bind_graphstate_for_aot_val),
-        enable_window_aware_runtime_cap=(
-            False if enable_window_aware_runtime_cap_val is None else bool(enable_window_aware_runtime_cap_val)
-        ),
-        enable_prefix_caching=True if enable_prefix_caching_val is None else bool(enable_prefix_caching_val),
-        auto_shard_model=True if auto_shard_model_val is None else bool(auto_shard_model_val),
-        sharding_axis_dims=sharding_axis_dims,
-        compile_runner=True if compile_runner_val is None else bool(compile_runner_val),
-        async_scheduling=True if async_scheduling_val is None else bool(async_scheduling_val),
-        runner_verbose=runner_verbose,
-        overlap_execution=False if overlap_execution_val is None else bool(overlap_execution_val),
-        sampler_metrics=False if sampler_metrics_val is None else bool(sampler_metrics_val),
-        data_parallelism_axis=str(data_parallelism_axis_val),
-        esurge_name=es.get("esurge_name"),
-        reserve_tokens=reserve_tokens,
-        auto_truncate_prompt=True if auto_truncate_prompt_val is None else bool(auto_truncate_prompt_val),
-        auto_cap_new_tokens=True if auto_cap_new_tokens_val is None else bool(auto_cap_new_tokens_val),
-        strict_context=False if strict_context_val is None else bool(strict_context_val),
-        truncate_mode=truncate_mode,
-        prefer_preserve_prompt=True if prefer_preserve_prompt_val is None else bool(prefer_preserve_prompt_val),
-        decode_truncated_prompt=True if decode_truncated_prompt_val is None else bool(decode_truncated_prompt_val),
-        destroy_pages_on_pause=True if destroy_pages_on_pause_val is None else bool(destroy_pages_on_pause_val),
-        detokenizer_max_states=detokenizer_max_states,
-        worker_startup_timeout=worker_startup_timeout,
-        idle_reset_seconds=idle_reset_seconds,
-        idle_reset_min_interval=idle_reset_min_interval,
-        tokenizer_endpoint=es.get("tokenizer_endpoint"),
-        detokenizer_endpoint=es.get("detokenizer_endpoint"),
-        sampling_params_callback=es.get("sampling_params_callback"),
-        long_prefill_token_threshold=long_prefill_token_threshold_val,
-        extra_eos_token_ids=extra_eos_token_ids,
-        extra_stops=extra_stops,
-        silent_mode=False if silent_mode_val is None else bool(silent_mode_val),
-        tool_parser=es.get("tool_parser"),
-        reasoning_parser=es.get("reasoning_parser"),
-        distributed_mode=False if distributed_mode_val is None else bool(distributed_mode_val),
-        distributed_role="auto" if distributed_role_val is None else str(distributed_role_val),
-        distributed_service_name=distributed_service_name_val,
-        distributed_world_size=(int(distributed_world_size_val) if distributed_world_size_val is not None else None),
-        distributed_rank=int(distributed_rank_val) if distributed_rank_val is not None else None,
-        distributed_control_port=(
-            int(distributed_control_port_val) if distributed_control_port_val is not None else 19666
-        ),
-        distributed_control_bind_host=(
-            "0.0.0.0" if distributed_control_bind_host_val is None else str(distributed_control_bind_host_val)
-        ),
-        distributed_advertise_addr=distributed_advertise_addr_val,
-        distributed_auth_token=distributed_auth_token_val,
-        distributed_step_timeout_s=(
-            30.0 if distributed_step_timeout_s_val is None else float(distributed_step_timeout_s_val)
-        ),
-        distributed_connect_timeout_s=(
-            15.0 if distributed_connect_timeout_s_val is None else float(distributed_connect_timeout_s_val)
-        ),
-        distributed_verify_sampling_digest=(
-            True if distributed_verify_sampling_digest_val is None else bool(distributed_verify_sampling_digest_val)
-        ),
-    )
+    return {
+        "runtime": eSurgeRuntimeConfig.coerce_config(runtime),
+        "cache": eSurgeCacheRuntimeConfig.coerce_config(es["cache"]),
+        "context": eSurgeContextConfig.coerce_config(es["context"]),
+        "workers": eSurgeWorkerConfig.coerce_config(es["workers"]),
+        "parsing": eSurgeParsingConfig.coerce_config(es["parsing"]),
+        "vision": eSurgeVisionConfig.coerce_config(es["vision"]),
+        "distributed": eSurgeDistributedConfig.coerce_config(es["distributed"]),
+    }
 
 
 def build_esurge(cfg_like: eLMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):
@@ -587,9 +623,8 @@ def build_esurge(cfg_like: eLMConfig | Mapping[str, Any], model: EasyDeLBaseModu
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
         ...     "loader": {"dtype": "bf16"},
         ...     "esurge": {
-        ...         "max_model_len": 4096,
-        ...         "max_num_seqs": 32,
-        ...         "enable_prefix_caching": True
+        ...         "runtime": {"max_model_len": 4096, "max_num_seqs": 32},
+        ...         "cache": {"enable_prefix_caching": True},
         ...     }
         ... }
         >>> engine = build_esurge(cfg)
@@ -639,9 +674,25 @@ def build_esurge(cfg_like: eLMConfig | Mapping[str, Any], model: EasyDeLBaseModu
 
     if processor is None:
         processor = AutoTokenizer.from_pretrained(proc_path, trust_remote_code=trust_remote_code)
+
+    sharding_cfg = cfg.get("sharding", {}) or {}
+    esurge_cfg = dict(cfg.get("esurge", {}) or {})
+    model_section: dict[str, Any] = {
+        "dtype": coerce_dtype(loader_cfg.get("dtype")),
+    }
+    if "auto_shard_model" in sharding_cfg:
+        model_section["auto_shard_model"] = sharding_cfg["auto_shard_model"]
+    elif "auto_shard_model" in esurge_cfg:
+        model_section["auto_shard_model"] = esurge_cfg["auto_shard_model"]
+    if "axis_dims" in sharding_cfg:
+        model_section["sharding_axis_dims"] = tuple(sharding_cfg["axis_dims"])
+    elif "sharding_axis_dims" in esurge_cfg:
+        model_section["sharding_axis_dims"] = tuple(esurge_cfg["sharding_axis_dims"])
+
     return eSurge(
         model=model,
         processor=processor,
+        loading_kwargs=model_section,
         **to_esurge_kwargs(cfg),
     )
 

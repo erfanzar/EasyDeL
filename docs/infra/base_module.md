@@ -126,9 +126,6 @@ model.gather_model()
 # Get partition rules
 rules = model._get_partition_rules()
 
-# Get sharding specifications
-specs = model._specs_sharding(rules)
-
 # Get named shardings
 named_shardings = model._named_shardings(rules, mesh)
 

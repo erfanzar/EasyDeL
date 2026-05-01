@@ -6,6 +6,7 @@ easydel.inference package
 
    esurge/index
    evaluations/index
+   parsing/index
    reasoning/index
    tools/index
    vwhisper/index
@@ -16,3 +17,5 @@ easydel.inference package
    openai_api_modules
    sampling_funcs
    sampling_params
+   stream_protocol
+   typed_models

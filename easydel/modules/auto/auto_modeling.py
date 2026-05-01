@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import contextlib
 import os
 from collections.abc import Callable, Mapping, Sequence
+from typing import Any, NotRequired, Required, TypedDict, Unpack
 
 import jax
 import spectrax as spx
 from eformer.paths import ePath
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 from spectrax import PartitionAxis
 
 from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
@@ -29,18 +31,108 @@ from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
 from easydel.infra.mixins.bridge import TENSORSTORE_INDEX_NAME
 from easydel.layers import QuantizationConfig
+from easydel.typings import typed_config
 
 SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
 MODEL_INDEX_NAME = "model_structure.json"
 
 
-class BaseAutoEasyModel:
+def _normalize_pretrained_loading(self) -> None:
+    if self.precision is None:
+        self.precision = jax.lax.Precision("fastest")
+    if self.partition_axis is None:
+        self.partition_axis = PartitionAxis()
+
+
+@typed_config(
+    defaults={
+        "tokenizer": None,
+        "processor": None,
+        "device": None,
+        "dtype": jnp.float32,
+        "param_dtype": jnp.float32,
+        "precision": None,
+        "sharding_axis_dims": (1, 1, -1, 1, 1, 1),
+        "sharding_dcn_axis_dims": None,
+        "sharding_axis_names": ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        "partition_axis": None,
+        "shard_fns": None,
+        "backend": None,
+        "platform": None,
+        "config_kwargs": None,
+        "auto_shard_model": True,
+        "quantization_config": None,
+        "apply_quantization": False,
+        "verbose": True,
+        "from_torch": None,
+    },
+    post_init=_normalize_pretrained_loading,
+)
+class PreTrainedLoading(TypedDict, total=False):
+    """Unified loading config for pretrained EasyDeL models.
+
+    Single source of truth for ``from_pretrained`` kwargs. Type checkers can use
+    ``Unpack[PreTrainedLoading]`` to validate ``**kwargs`` at call sites; the
+    runtime instance is a :class:`~easydel.typings.ConfigDict` that round-trips
+    through ``from_dict`` / ``to_dict`` and supports both attribute and dict
+    access.
+
+    ``pretrained_model_name_or_path`` is the only required field — pass a
+    model name/path or an already-loaded module. The field name matches
+    :meth:`EasyDeLBaseModule.from_pretrained`'s positional argument so
+    ``**config.to_dict()`` spreads cleanly into the underlying loader.
+    ``tokenizer`` / ``processor`` are kept here for callers that bundle them
+    with the loader config (e.g. eSurge); they are popped before forwarding to
+    the underlying ``EasyDeLBaseModule`` loader.
     """
-    Base class for all Auto EasyDeL model classes. Provides common class methods
-    for loading models from configurations or pretrained checkpoints.
+
+    pretrained_model_name_or_path: Required[Any]
+    tokenizer: NotRequired[Any | None]
+    processor: NotRequired[Any | None]
+    device: NotRequired[jax.Device | None]  # type: ignore
+    dtype: NotRequired[Any]
+    param_dtype: NotRequired[Any]
+    precision: NotRequired[jax.lax.Precision | None]
+    sharding_axis_dims: NotRequired[Sequence[int]]
+    sharding_dcn_axis_dims: NotRequired[Sequence[int] | None]
+    sharding_axis_names: NotRequired[Sequence[str]]
+    partition_axis: NotRequired[PartitionAxis | None]
+    shard_fns: NotRequired[Mapping[tuple, Callable] | dict | None]
+    backend: NotRequired[EasyDeLBackends | None]
+    platform: NotRequired[EasyDeLPlatforms | None]
+    config_kwargs: NotRequired[EasyDeLBaseConfigDict | None]
+    auto_shard_model: NotRequired[bool]
+    quantization_config: NotRequired[QuantizationConfig | None]
+    apply_quantization: NotRequired[bool]
+    verbose: NotRequired[bool]
+    from_torch: NotRequired[bool | None]
+    # Hugging Face Hub options forwarded to ``EasyDeLBaseModule.from_pretrained``.
+    trust_remote_code: NotRequired[bool]
+    cache_dir: NotRequired[str | os.PathLike | None]
+    force_download: NotRequired[bool]
+    local_files_only: NotRequired[bool]
+    token: NotRequired[str | bool | None]
+    revision: NotRequired[str]
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["PreTrainedLoading"],
+    ) -> "PreTrainedLoading": ...
+
+
+class BaseAutoEasyModel:
+    """Base class for all Auto EasyDeL model classes.
+
+    Provides ``from_config`` and ``from_pretrained`` class methods. The latter
+    accepts kwargs typed via :class:`PreTrainedLoading` —
+    ``pretrained_model_name_or_path`` is required (a model name, path, or
+    pre-loaded module).
 
     Attributes:
-            model_task (TaskType): The specific task the model class is designed for (e.g., CAUSAL_LM).
+        model_task: The specific task the model class is designed for
+            (e.g. ``TaskType.CAUSAL_LM``).
     """
 
     model_task: TaskType
@@ -55,18 +147,7 @@ class BaseAutoEasyModel:
         *,
         rngs: spx.Rngs | None = None,
     ) -> EasyDeLBaseModule:
-        """Instantiates a model module directly from a configuration object.
-
-        Args:
-                config (EasyDeLBaseConfig): The configuration object for the model.
-                dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-                param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-                precision (Optional[jax.lax.Precision]): JAX precision level. Defaults to None.
-                rngs (Optional[spx.Rngs]): Random number generators. Defaults to Rngs(42).
-
-        Returns:
-                EasyDeLBaseModule: An instance of the specific EasyDeL model module.
-        """
+        """Instantiate a model module directly from a configuration object."""
         registration = registry.get_module_registration(cls.model_task, config.model_type)
         if rngs is None:
             rngs = spx.Rngs(42)
@@ -79,277 +160,69 @@ class BaseAutoEasyModel:
         )
 
     @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,  # type: ignore
-        dtype: jax.numpy.dtype = jax.numpy.float32,
-        param_dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis | None = None,
-        shard_fns: Mapping[tuple, Callable] | dict | None = None,
-        backend: EasyDeLBackends | None = None,
-        platform: EasyDeLPlatforms | None = None,
-        config_kwargs: EasyDeLBaseConfigDict | None = None,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: QuantizationConfig | None = None,
-        apply_quantization: bool = False,
-        verbose: bool = True,
-        from_torch: bool | None = None,
-        **kwargs,
-    ) -> EasyDeLBaseModule:
-        """
-        Loads and shards a pretrained model from the Hugging Face Hub and converts it into an EasyDeL compatible model.
+    def from_pretrained(cls, **kwargs: Unpack[PreTrainedLoading]) -> EasyDeLBaseModule:
+        """Load and shard a pretrained model into an EasyDeL-compatible module.
 
         Args:
-            pretrained_model_name_or_path: Path or name of the pretrained model in the Hugging Face Hub.
-            device: Device to load the model on. Defaults to the first CPU.
-            dtype: Data type of the model. Defaults to jnp.float32.
-            param_dtype: Data type of the model parameters. Defaults to jnp.float32.
-            precision: Precision for computations. Defaults to jax.lax.Precision("fastest").
-            sharding_axis_dims: Dimensions of each sharding axis. Defaults to (1, 1, -1, 1, 1, 1).
-            sharding_axis_names: Names of the sharding axes.
-            partition_axis: PartitionAxis for partitioning arrays.
-            shard_fns: Sharding functions for the model.
-            platform: Platform to use for the model.
-            backend: Backend to use for the model.
-            config_kwargs: Configuration keyword arguments.
-            auto_shard_model: Whether to automatically shard the model parameters.
-            partition_rules: Custom partition rules for parameter sharding.
-            quantization_config: Quantization configuration. Pass None to disable.
-            apply_quantization: Whether to apply module-level quantization.
-            from_torch: Whether to load the model from transformers-pytorch.
-            **kwargs: Additional keyword arguments.
+            **kwargs: Loading options. See :class:`PreTrainedLoading` for the
+                full set of accepted fields. ``pretrained_model_name_or_path``
+                is required (model name, path, or pre-loaded module).
 
         Returns:
-            The loaded EasyDeL model.
+            The loaded EasyDeL model module.
         """
-        if precision is None:
-            precision = jax.lax.Precision("fastest")
-        if partition_axis is None:
-            partition_axis = PartitionAxis()
-        if from_torch is None:
+        config = PreTrainedLoading.coerce_config(kwargs)
+
+        if config.from_torch is None:
             try:
-                from_torch = not cls._is_easydel(pretrained_model_name_or_path)
+                config.from_torch = not cls._is_easydel(config.pretrained_model_name_or_path)
             except OSError as e:
-                from_torch = False
-                if "Error no file named easydel-model.parameters" in str(e):
-                    from_torch = True
-        if from_torch:
-            return cls._from_torch_pretrained(
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                device=device,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                sharding_axis_dims=sharding_axis_dims,
-                sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-                sharding_axis_names=sharding_axis_names,
-                partition_axis=partition_axis,
-                shard_fns=shard_fns,
-                backend=backend,
-                platform=platform,
-                config_kwargs=config_kwargs,
-                auto_shard_model=auto_shard_model,
-                partition_rules=partition_rules,
-                quantization_config=quantization_config,
-                apply_quantization=apply_quantization,
-                verbose=verbose,
-                **kwargs,
-            )
-        cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
+                config.from_torch = "Error no file named easydel-model.parameters" in str(e)
+
+        if config.from_torch:
+            return cls._from_torch_pretrained(config)
+
+        cmg = jax.default_device(config.device) if config.device is not None else contextlib.nullcontext()
         with cmg:
-            return cls._from_easydel_params(
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                device=device,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                sharding_axis_dims=sharding_axis_dims,
-                sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-                sharding_axis_names=sharding_axis_names,
-                partition_axis=partition_axis,
-                shard_fns=shard_fns,
-                backend=backend,
-                platform=platform,
-                config_kwargs=config_kwargs,
-                auto_shard_model=auto_shard_model,
-                partition_rules=partition_rules,
-                quantization_config=quantization_config,
-                apply_quantization=apply_quantization,
-                verbose=verbose,
-                **kwargs,
-            )
+            return cls._from_easydel_params(config)
+
+    # Fields on :class:`PreTrainedLoading` that must NOT flow into the
+    # underlying ``EasyDeLBaseModule`` loader: ``device`` is consumed at this
+    # layer (used as a JAX default-device context manager); ``from_torch`` is
+    # a routing flag for picking between the two loaders; ``tokenizer`` /
+    # ``processor`` are bundled here for callers like eSurge but aren't loader
+    # arguments.
+    _LOADER_PASSTHROUGH_DROP: tuple[str, ...] = (
+        "device",
+        "from_torch",
+        "tokenizer",
+        "processor",
+    )
 
     @classmethod
-    def _from_easydel_params(
-        cls,
-        pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,  # type: ignore
-        dtype: jax.numpy.dtype = jax.numpy.float32,
-        param_dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis | None = None,
-        shard_fns: Mapping[tuple, Callable] | dict | None = None,
-        backend: EasyDeLBackends | None = None,
-        platform: EasyDeLPlatforms | None = None,
-        config_kwargs: EasyDeLBaseConfigDict | None = None,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: QuantizationConfig | None = None,
-        apply_quantization: bool = False,
-        verbose: bool = True,
-        **kwargs,
-    ):
-        """Loads a model from EasyDeL saved parameters.
+    def _loader_kwargs(cls, config: PreTrainedLoading) -> dict[str, Any]:
+        data = config.to_dict()
+        for key in cls._LOADER_PASSTHROUGH_DROP:
+            data.pop(key, None)
+        return data
 
-        This is a helper method called by `from_pretrained` when the source
-        is identified as an EasyDeL checkpoint.
-
-        Args:
-            pretrained_model_name_or_path (str): Path or name of the pretrained model.
-            device (jax.Device, optional): Device to load the model on. Defaults to None.
-            dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
-            param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
-            precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
-            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
-                Defaults to (1, 1, -1, 1, 1, 1).
-            sharding_dcn_axis_dims (tp.Optional[Sequence[int]], optional): Dimensions for DCN sharding.
-                Defaults to None.
-            sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
-                Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
-            partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
-            shard_fns (tp.Optional[Mapping[tuple, Callable] | dict], optional): Custom sharding functions.
-                Defaults to None.
-            backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
-            platform (tp.Optional[EasyDeLPlatforms], optional): Platform to use. Defaults to None.
-            config_kwargs (tp.Optional[EasyDeLBaseConfigDict], optional): Configuration overrides. Defaults to None.
-            auto_shard_model (bool, optional): Whether to automatically shard. Defaults to False.
-            partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules.
-                Defaults to None.
-            quantization_config: Quantization configuration. Pass None to disable.
-            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
-            verbose (bool): Enable verbose logging. Defaults to True.
-            **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule.from_pretrained`.
-
-        Returns:
-            EasyDeLBaseModule: The loaded and potentially sharded EasyDeL model module.
-        """
+    @classmethod
+    def _from_easydel_params(cls, config: PreTrainedLoading) -> EasyDeLBaseModule:
+        """Load a model from EasyDeL-saved parameters using the resolved config."""
 
         class Base(EasyDeLBaseModule):
             _model_task = cls.model_task
 
-        return Base.from_pretrained(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            device=device,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            shard_fns=shard_fns,
-            backend=backend,
-            platform=platform,
-            config_kwargs=config_kwargs,
-            auto_shard_model=auto_shard_model,
-            partition_rules=partition_rules,
-            quantization_config=quantization_config,
-            apply_quantization=apply_quantization,
-            verbose=verbose,
-            **kwargs,
-        )
+        return Base.from_pretrained(**cls._loader_kwargs(config))
 
     @classmethod
-    def _from_torch_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,  # type: ignore
-        dtype: jax.numpy.dtype = jax.numpy.float32,
-        param_dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis | None = None,
-        shard_fns: Mapping[tuple, Callable] | dict | None = None,
-        backend: EasyDeLBackends | None = None,
-        platform: EasyDeLPlatforms | None = None,
-        config_kwargs: EasyDeLBaseConfigDict | None = None,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: QuantizationConfig | None = None,
-        apply_quantization: bool = False,
-        verbose: bool = True,
-        **kwargs,
-    ):
-        """Loads a model from PyTorch pretrained weights.
-
-        This is a helper method called by `from_pretrained` when the source
-        is identified as a PyTorch checkpoint (or requires conversion).
-
-        Args:
-            pretrained_model_name_or_path (str): Path or name of the pretrained model.
-            device (jax.Device, optional): Device to load the model on. Defaults to None.
-            dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
-            param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
-            precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
-            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
-                Defaults to (1, 1, -1, 1, 1, 1).
-            sharding_dcn_axis_dims (tp.Optional[Sequence[int]], optional): Dimensions for DCN sharding.
-                Defaults to None.
-            sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
-                Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
-            partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
-            shard_fns (tp.Optional[Mapping[tuple, Callable] | dict], optional): Custom sharding functions.
-                Defaults to None.
-            backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
-            platform (tp.Optional[EasyDeLPlatforms], optional): Platform to use. Defaults to None.
-            config_kwargs (tp.Optional[EasyDeLBaseConfigDict], optional): Configuration overrides. Defaults to None.
-            auto_shard_model (bool, optional): Whether to automatically shard. Defaults to False.
-            partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules.
-                Defaults to None.
-            quantization_config: Quantization configuration. Pass None to disable.
-            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
-            verbose (bool): Enable verbose logging. Defaults to True.
-            **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule._from_torch_pretrained`.
-
-        Returns:
-            EasyDeLBaseModule: The loaded, converted, and potentially sharded EasyDeL model module.
-        """
+    def _from_torch_pretrained(cls, config: PreTrainedLoading) -> EasyDeLBaseModule:
+        """Load a model from PyTorch weights using the resolved config."""
 
         class Base(EasyDeLBaseModule):
             _model_task = cls.model_task
 
-        return Base._from_torch_pretrained(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            device=device,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            shard_fns=shard_fns,
-            backend=backend,
-            platform=platform,
-            config_kwargs=config_kwargs,
-            auto_shard_model=auto_shard_model,
-            partition_rules=partition_rules,
-            quantization_config=quantization_config,
-            apply_quantization=apply_quantization,
-            verbose=verbose,
-            **kwargs,
-        )
+        return Base._from_torch_pretrained(**cls._loader_kwargs(config))
 
     @classmethod
     def _is_easydel(
@@ -363,20 +236,7 @@ class BaseAutoEasyModel:
         token: str | bool | None = None,
         revision: str = "main",
     ):
-        """Checks if the given path or identifier points to an EasyDeL model checkpoint.
-
-        Args:
-            pretrained_model_name_or_path: Identifier or path to check.
-            SPX_WEIGHTS_NAME (str): The standard filename for EasyDeL weights.
-            cache_dir (Optional[Union[str, os.PathLike]]): Cache directory.
-            force_download (bool): Force download even if cached.
-            local_files_only (bool): Only check local files.
-            token (Optional[Union[str, bool]]): Hugging Face Hub token.
-            revision (str): Git revision identifier.
-
-        Returns:
-            bool: True if it's an EasyDeL checkpoint, False otherwise.
-        """
+        """Check whether the given path/identifier points to an EasyDeL checkpoint."""
         from transformers.utils import cached_file as _cached_file
 
         proxies = None
@@ -439,12 +299,13 @@ class BaseAutoEasyModel:
 
 
 class BaseAutoEasyState:
-    """
-    Base class for Auto EasyDeL state classes. Provides common class methods
-    for creating model states from configurations or pretrained checkpoints.
+    """Base class for Auto EasyDeL state classes.
+
+    Provides ``from_config`` and ``from_pretrained`` class methods built on top
+    of the corresponding :class:`BaseAutoEasyModel` subclass.
 
     Attributes:
-            _base (BaseAutoEasyModel): The corresponding Auto EasyDeL model class.
+        _base: The corresponding Auto EasyDeL model class.
     """
 
     _base: BaseAutoEasyModel
@@ -459,18 +320,7 @@ class BaseAutoEasyState:
         *,
         rngs: spx.Rngs | None = None,
     ) -> EasyDeLState:
-        """Creates an EasyDeLState directly from a configuration object.
-
-        Args:
-                config (EasyDeLBaseConfig): The configuration object for the model.
-                dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-                param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-                precision (Optional[jax.lax.Precision]): JAX precision level. Defaults to None.
-                rngs (Optional[spx.Rngs]): Random number generators. Defaults to Rngs(42).
-
-        Returns:
-                EasyDeLState: An initialized EasyDeLState for the model.
-        """
+        """Create an :class:`EasyDeLState` directly from a configuration object."""
         return cls._base.from_config(
             config=config,
             dtype=dtype,
@@ -480,83 +330,13 @@ class BaseAutoEasyState:
         ).to_state()
 
     @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,  # type: ignore
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: Sequence[int] = (1, 1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: Sequence[int] | None = None,
-        sharding_axis_names: Sequence[str] = ("pp", "dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis | None = None,
-        shard_fns: Mapping[tuple, Callable] | dict | None = None,
-        backend: EasyDeLBackends | None = None,
-        platform: EasyDeLPlatforms | None = None,
-        config_kwargs: EasyDeLBaseConfigDict | None = None,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: QuantizationConfig | None = None,
-        from_torch: bool | None = None,
-        **kwargs,
-    ) -> EasyDeLState:
-        """
-        Loads and shards a pretrained model from the Hugging Face Hub and converts it into an EasyDeL compatible state.
+    def from_pretrained(cls, **kwargs: Unpack[PreTrainedLoading]) -> EasyDeLState:
+        """Load a pretrained model and wrap it in an :class:`EasyDeLState`.
 
-        Args:
-            pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
-            device (jax.Device, optional): Device to load the model on. Defaults to the first CPU.
-            dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
-            param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
-            precision (jax.lax.Precision, optional): Precision for computations.
-                Defaults to jax.lax.Precision("fastest").
-            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
-                Defaults to (1, 1, -1, 1, 1, 1).
-            sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
-                Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
-            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-            shard_fns (tp.Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for
-                the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
-            backend (tp.Optional[str], optional): Backend to use for the model. Defaults to None.
-            config_kwargs (tp.Optional[tp.Mapping[str, tp.Any]], optional): Configuration keyword
-                arguments to pass to the model config. Defaults to None.
-            auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
-            partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]], optional): Custom partition
-                rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-            quantization_config: Quantization configuration. Pass None to disable.
-            bit_targeted_params (tp.Optional[tp.List[str]], optional): tp.List of parameter names to
-                convert to 8-bit precision. If  None and int8 is True, all kernels and embeddings are
-                converted to 8-bit. Defaults to None.
-            verbose_params (bool): whenever to log number of parameters in converting state.
-            safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters
-                to be saved with safe=True while saving them)
-            from_torch (bool): whenever to load the model from transformers-pytorch.
-            **kwargs: Additional keyword arguments to pass to the model and config classes.
-
-        Returns:
-            EasyDeLState: containing the EasyDeL state and the loaded and sharded model parameters.
+        Accepts the same kwargs as :meth:`BaseAutoEasyModel.from_pretrained` —
+        see :class:`PreTrainedLoading`.
         """
-        model = cls._base.from_pretrained(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            param_dtype=param_dtype,
-            dtype=dtype,
-            shard_fns=shard_fns,
-            auto_shard_model=auto_shard_model,
-            precision=precision,
-            backend=backend,
-            platform=platform,
-            partition_axis=partition_axis,
-            quantization_config=quantization_config,
-            partition_rules=partition_rules,
-            sharding_axis_names=sharding_axis_names,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            config_kwargs=config_kwargs,
-            device=device,
-            from_torch=from_torch,
-            **kwargs,
-        )
+        model = cls._base.from_pretrained(**kwargs)
         return EasyDeLState.create(
             model=model,
             tx=None,
@@ -566,40 +346,29 @@ class BaseAutoEasyState:
 
 
 class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
-
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-
-    Attributes:
-        None
+    """Auto loader for causal-LM models.
 
     Examples:
 
         >>> import jax
         >>> from easydel import AutoEasyDeLModelForCausalLM
 
-        >>> # Load a GPT-2 model on a single CPU
+        >>> # Load on a single CPU
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
-        >>>   "gpt2", device=jax.devices("cpu")[0]
-        >>> )
+        ...     pretrained_model_name_or_path="gpt2", device=jax.devices("cpu")[0]
+        ... )
 
-        >>> # Load a GPT-2 model sharded across 8 GPUs with data parallelism (DP) and
-        >>> # fully sharded data parallelism (FSDP)
+        >>> # Load sharded across 8 devices (DP + FSDP)
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
-        ...  "gpt2",
-        ...  sharding_axis_dims=(1, 1, 8, 1, 1, 1),
-        ...  sharding_axis_names=("pp", "dp", "fsdp",  "ep", "tp", "sp"),
-        ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
-        ...  from_torch=True,
-        >>> )
-        ```
+        ...     pretrained_model_name_or_path="gpt2",
+        ...     sharding_axis_dims=(1, 1, 8, 1, 1, 1),
+        ...     sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        ...     device=jax.devices("cpu")[0],
+        ...     from_torch=True,
+        ... )
     """
 
-    model_task: TaskType = TaskType.CAUSAL_LM  # Static
+    model_task: TaskType = TaskType.CAUSAL_LM
 
 
 class AutoStateForCausalLM(BaseAutoEasyState):
@@ -609,17 +378,9 @@ class AutoStateForCausalLM(BaseAutoEasyState):
 
 
 class AutoEasyDeLModelForDiffusionLM(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for diffusion-based language models."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-
-    """
-
-    model_task: TaskType = TaskType.DIFFUSION_LM  # Static
+    model_task: TaskType = TaskType.DIFFUSION_LM
 
 
 class AutoStateForDiffusionLM(BaseAutoEasyState):
@@ -629,17 +390,9 @@ class AutoStateForDiffusionLM(BaseAutoEasyState):
 
 
 class AutoEasyDeLModelForZeroShotImageClassification(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for zero-shot image classification models."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-
-    """
-
-    model_task: TaskType = TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION  # Static
+    model_task: TaskType = TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
 
 
 class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
@@ -649,41 +402,28 @@ class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
 
 
 class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
-
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-
-    Attributes:
-        None
+    """Auto loader for speech sequence-to-sequence models.
 
     Examples:
 
         >>> import jax
         >>> from easydel import AutoEasyDeLModelForSpeechSeq2Seq
 
-        >>> # Load a openai/whisper-large-v3-turbo sharded
         >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
-        ...  "openai/whisper-large-v3-turbo",
-        ...  auto_shard_model=True,
-        >>> )
+        ...     pretrained_model_name_or_path="openai/whisper-large-v3-turbo",
+        ...     auto_shard_model=True,
+        ... )
 
-        >>> # Load a openai/whisper-large-v3-turbo model sharded across 8 GPUs with data parallelism (DP) and
-        >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
-        ...  "openai/whisper-large-v3-turbo",
-        ...  sharding_axis_dims=(1, 1, 8, 1, 1, 1),
-        ...  sharding_axis_names=("pp", "dp", "fsdp",  "ep", "tp", "sp"),
-        ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
-        ...  from_torch=True,
-        >>> )
-        ```
+        ...     pretrained_model_name_or_path="openai/whisper-large-v3-turbo",
+        ...     sharding_axis_dims=(1, 1, 8, 1, 1, 1),
+        ...     sharding_axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        ...     device=jax.devices("cpu")[0],
+        ...     from_torch=True,
+        ... )
     """
 
-    model_task: TaskType = TaskType.SPEECH_SEQUENCE_TO_SEQUENCE  # Static
+    model_task: TaskType = TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
 
 
 class AutoStateForSpeechSeq2Seq(BaseAutoEasyState):
@@ -693,16 +433,9 @@ class AutoStateForSpeechSeq2Seq(BaseAutoEasyState):
 
 
 class AutoEasyDeLModelForSeq2SeqLM(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for text-to-text sequence-to-sequence models."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-    """
-
-    model_task: TaskType = TaskType.SEQUENCE_TO_SEQUENCE  # Static
+    model_task: TaskType = TaskType.SEQUENCE_TO_SEQUENCE
 
 
 class AutoStateForSeq2SeqLM(BaseAutoEasyState):
@@ -712,16 +445,9 @@ class AutoStateForSeq2SeqLM(BaseAutoEasyState):
 
 
 class AutoEasyDeLModelForImageTextToText(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for image-conditioned text-to-text models."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-    """
-
-    model_task: TaskType = TaskType.IMAGE_TEXT_TO_TEXT  # Static
+    model_task: TaskType = TaskType.IMAGE_TEXT_TO_TEXT
 
 
 class AutoStateForImageTextToText(BaseAutoEasyState):
@@ -731,16 +457,9 @@ class AutoStateForImageTextToText(BaseAutoEasyState):
 
 
 class AutoEasyDeLModelForSequenceClassification(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for sequence classification models."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-    """
-
-    model_task: TaskType = TaskType.SEQUENCE_CLASSIFICATION  # Static
+    model_task: TaskType = TaskType.SEQUENCE_CLASSIFICATION
 
 
 class AutoStateForImageSequenceClassification(BaseAutoEasyState):
@@ -757,7 +476,7 @@ class AutoEasyDeLModelForEmbedding(BaseAutoEasyModel):
     Compatible with models like GTE-Qwen2, E5-Mistral, BGE, and others.
     """
 
-    model_task: TaskType = TaskType.EMBEDDING  # Static
+    model_task: TaskType = TaskType.EMBEDDING
 
 
 class AutoStateForEmbedding(BaseAutoEasyState):
@@ -767,16 +486,9 @@ class AutoStateForEmbedding(BaseAutoEasyState):
 
 
 class AutoEasyDeLModel(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for generic text-only EasyDeL modules."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-    """
-
-    model_task: TaskType = TaskType.BASE_MODULE  # Static
+    model_task: TaskType = TaskType.BASE_MODULE
 
 
 class AutoState(BaseAutoEasyState):
@@ -786,16 +498,9 @@ class AutoState(BaseAutoEasyState):
 
 
 class AutoEasyDeLVisionModel(BaseAutoEasyModel):
-    """
-    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
-    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
-    training and inference with JAX.
+    """Auto loader for vision-only EasyDeL modules."""
 
-    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-    parameter sharding, and interaction with the EasyDeL framework.
-    """
-
-    model_task: TaskType = TaskType.BASE_VISION  # Static
+    model_task: TaskType = TaskType.BASE_VISION
 
 
 class AutoStateVisionModel(BaseAutoEasyState):

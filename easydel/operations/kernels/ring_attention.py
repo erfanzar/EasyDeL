@@ -77,6 +77,7 @@ from ..requirements import (
     MetadataField,
     OperationRequirements,
 )
+from ._mask_info import align_mask_info_to_qkv_specs
 from .vanilla_attention import VanillaAttn
 
 
@@ -230,6 +231,12 @@ class RingAttn(OperationImpl):
         )
         softmax_aux_sharding = self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux)
         output_sharding = self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 1, 2])
+        mask_info = align_mask_info_to_qkv_specs(
+            mask_info,
+            query_spec=query_sharding,
+            key_spec=key_sharding,
+            layout="bthd",
+        )
 
         outputs: Float[Array, "batch seq_len_q num_heads head_dim"] = ring_attention(
             query,

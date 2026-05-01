@@ -95,10 +95,7 @@ def test_mistral_extracts_single_tool_call(mistral_parser: MistralToolParser):
 
 def test_mistral_extracts_multiple_tool_calls(mistral_parser: MistralToolParser):
     output = (
-        '[TOOL_CALLS]['
-        '{"name": "search", "arguments": {"q": "x"}},'
-        '{"name": "translate", "arguments": {"text": "y"}}'
-        ']'
+        '[TOOL_CALLS][{"name": "search", "arguments": {"q": "x"}},{"name": "translate", "arguments": {"text": "y"}}]'
     )
     result = mistral_parser.extract_tool_calls(output, _make_request())
     assert result.tools_called is True
@@ -125,7 +122,7 @@ def test_mistral_preserves_content_before_token(mistral_parser: MistralToolParse
 
 def test_mistral_returns_no_tool_on_malformed_json(mistral_parser: MistralToolParser):
     """Malformed JSON inside [TOOL_CALLS] is caught by the broad except path."""
-    output = '[TOOL_CALLS]{this is broken json'
+    output = "[TOOL_CALLS]{this is broken json"
     result = mistral_parser.extract_tool_calls(output, _make_request())
     assert result.tools_called is False
     assert result.tool_calls == []
@@ -212,10 +209,10 @@ def test_hunyuan_extracts_single_tool_call(hunyuan_parser: HunyuanA13BToolParser
 
 def test_hunyuan_extracts_multiple_tool_calls(hunyuan_parser: HunyuanA13BToolParser):
     output = (
-        '<tool_calls>['
+        "<tool_calls>["
         '{"name": "search", "arguments": {"q": "x"}},'
         '{"name": "translate", "arguments": {"text": "y"}}'
-        ']</tool_calls>'
+        "]</tool_calls>"
     )
     result = hunyuan_parser.extract_tool_calls(output, _make_request())
     assert result.tools_called is True
@@ -231,10 +228,7 @@ def test_hunyuan_no_tool_when_tag_absent(hunyuan_parser: HunyuanA13BToolParser):
 
 def test_hunyuan_ignores_tool_calls_inside_think_block(hunyuan_parser: HunyuanA13BToolParser):
     """Per the parser's docstring, ``<tool_calls>`` inside ``<think>`` are filtered out."""
-    output = (
-        "<think>I might call <tool_calls>[{\"name\": \"search\", \"arguments\": {}}]</tool_calls></think>"
-        " But I won't."
-    )
+    output = '<think>I might call <tool_calls>[{"name": "search", "arguments": {}}]</tool_calls></think> But I won\'t.'
     result = hunyuan_parser.extract_tool_calls(output, _make_request())
     assert result.tools_called is False
 

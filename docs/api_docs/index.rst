@@ -16,3 +16,4 @@ easydel API Reference
    utils/index
    workers/index
    axis
+   typings

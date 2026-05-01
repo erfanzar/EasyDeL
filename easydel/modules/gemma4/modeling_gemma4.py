@@ -787,14 +787,15 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = layer(
-                hidden_states=hidden_states,
-                rotary_emb=self.rotary_emb,
-                pixel_position_ids=pixel_position_ids,
-                mask_info=mask_info,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = layer(
+                    hidden_states=hidden_states,
+                    rotary_emb=self.rotary_emb,
+                    pixel_position_ids=pixel_position_ids,
+                    mask_info=mask_info,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
@@ -2573,19 +2574,20 @@ class Gemma4TextModel(EasyDeLBaseModule):
             if cache_view is None and attn.is_kv_shared_layer:
                 cache_view = donor_cache_views.get(attn.kv_shared_layer_index)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=layer_mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=cache_view,
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=self.global_frequencies,
-                default_frequencies=self.default_frequencies,
-                per_layer_input=per_layer_input,
-                shared_key_value=shared_key_value,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=layer_mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=cache_view,
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.global_frequencies,
+                    default_frequencies=self.default_frequencies,
+                    per_layer_input=per_layer_input,
+                    shared_key_value=shared_key_value,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             # Store captured K/V for potential downstream sharing.

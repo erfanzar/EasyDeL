@@ -9,3 +9,4 @@ easydel.scripts package
    download_hf_large_weights_to_gcs
    download_hf_repo_chunked_to_gcs
    elarge
+   normalize_openai_tool_dataset

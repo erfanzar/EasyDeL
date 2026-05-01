@@ -21,11 +21,11 @@ from abc import ABCMeta, abstractmethod
 import jax
 import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
+import spectrax as spx
 from eformer.paths import ePathLike
 from eformer.pytree import auto_pytree
-from eformer.serialization import AsyncCheckpointManager
-from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule  # pyright: ignore[reportMissingTypeStubs]
+from spectrax.serialization import AsyncCheckpointManager
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
@@ -125,7 +125,7 @@ class TrainerConfigureFunctionOutput:
     """
 
     sharded_training_step_function: JitWrapped
-    mesh: Mesh
+    mesh: spx.SpxMesh
     checkpoint_manager: AsyncCheckpointManager
     sharded_evaluation_step_function: JitWrapped | None = None
 
@@ -145,7 +145,7 @@ class TrainerOutput:
     """
 
     state: EasyDeLState
-    mesh: jax.sharding.Mesh | None
+    mesh: spx.SpxMesh | None
     last_save_file_name: str | None = None
     checkpoint_path: str | None = None
 
@@ -195,7 +195,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     sharded_evaluation_step_function: JitWrapped
     evalu_tracker: CompilationTracker
 
-    mesh: tp.Any
+    mesh: spx.SpxMesh
     checkpoint_manager: tp.Any
     state_shape: tp.Any
     state_partition_spec: tp.Any
@@ -577,11 +577,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         """
         Saves a README file with model and training information.
         """
-        ...
-
-    @abstractmethod
-    def _format_partition_rules(self) -> str:
-        """Format partition rules with proper indentation and formatting."""
         ...
 
     @abstractmethod

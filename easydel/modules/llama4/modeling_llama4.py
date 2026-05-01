@@ -939,16 +939,17 @@ class Llama4TextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
@@ -1704,11 +1705,12 @@ class Llama4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
             if output_hidden_states:
                 assert encoder_states is not None
                 encoder_states = (*encoder_states, hidden_states)
-            layer_outputs = encoder_layer(
-                hidden_states=hidden_states,
-                output_attentions=output_attentions,
-                frequencies=frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = encoder_layer(
+                    hidden_states=hidden_states,
+                    output_attentions=output_attentions,
+                    frequencies=frequencies,
+                )
 
             if output_attentions:
                 assert all_attentions is not None

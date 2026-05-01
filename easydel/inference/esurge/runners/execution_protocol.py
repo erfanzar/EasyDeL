@@ -54,6 +54,7 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.infra.sharding import MeshLike
 
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 
@@ -97,7 +98,7 @@ class ExecutionManagerProtocol(Protocol):
     """
 
     model: "EasyDeLBaseModule"
-    mesh: tp.Any
+    mesh: MeshLike
     kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
     rng_key: jax.Array
     max_model_len: int

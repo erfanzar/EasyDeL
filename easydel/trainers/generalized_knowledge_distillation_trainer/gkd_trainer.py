@@ -172,6 +172,8 @@ class GKDTrainer(SFTTrainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
         sharded_training_step_function.static_argnums_ = static_argnums
 
@@ -191,6 +193,8 @@ class GKDTrainer(SFTTrainer):
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
         sharded_evaluation_step_function.static_argnums_ = static_argnums
 
@@ -390,7 +394,7 @@ class GKDTrainer(SFTTrainer):
         completion_mask *= attention_mask
 
         labels_dtype = np.asarray(original_batch.get("labels", seq_np)).dtype
-        labels = seq_np.astype(labels_dtype, copy=True)
+        labels = seq_np.astype(labels_dtype, copy=False)
         labels[attention_mask == 0] = -100
         if prompt_cutoff > 0:
             labels[:, :prompt_cutoff] = -100

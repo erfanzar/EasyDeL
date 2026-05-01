@@ -58,13 +58,18 @@ from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
-from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float, Int
 from spectrax import PartitionAxis, common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
-from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
+from easydel.infra.sharding import (
+    MeshLike,
+    RuntimeShardingResolver,
+    coerce_runtime_sharding_resolver,
+    mesh_axis_size,
+    resolve_stage_cache_mesh,
+)
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
@@ -91,11 +96,6 @@ HEAD_DIM_ALIGNMENT = 128
 KV_UPDATE_WINDOW_BYTES = 16 * 1024 * 1024
 # Hard cap on slices per processing page; matches the kernel's loop unroll budget.
 MAX_SLICES_PER_UPDATE_PAGE = 64
-
-
-def _attention_dp_axis(runtime_sharding_resolver: RuntimeShardingResolver):
-    """Resolve the concrete mesh axis used for KV-page data parallelism."""
-    return resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -178,28 +178,6 @@ def align_to_multiple(value: int, multiple: int) -> int:
         int: Smallest multiple of `multiple` >= `value`.
     """
     return cdiv(value, multiple) * multiple
-
-
-def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) -> int:
-    """Return product of mesh sizes for a semantic axis mapping.
-
-    Args:
-        mesh: JAX device mesh containing axis name to size mappings.
-        axis: Axis name, tuple/list of axis names, or None.
-
-    Returns:
-        int: Product of mesh sizes for the given axes. Returns 1 if
-            axis is None, EMPTY, or not found in mesh.
-    """
-    if axis is None or axis is EMPTY:
-        return 1
-    if isinstance(axis, tuple | list):
-        size = 1
-        for ax in axis:
-            if ax in mesh.shape:
-                size *= int(mesh.shape[ax])
-        return max(1, int(size))
-    return int(mesh.shape[axis]) if axis in mesh.shape else 1
 
 
 def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, kvdtype: jnp.dtype) -> int:
@@ -370,6 +348,9 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             continue
 
         free = max(0, int(limit) - int(used))
+        largest_free = s.get("largest_free_block_bytes")
+        if largest_free is not None:
+            free = min(free, max(0, int(largest_free)))
         if mode == "free":
             usable = max(0, int(free * float(util)) - safety_margin)
         else:
@@ -450,7 +431,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
     @staticmethod
     def _compute_free_hbm(
-        mesh: Mesh,
+        mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
         kv_head_shards: int | None = None,
@@ -467,10 +448,12 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 both KV-head and data-parallel page-axis factors.
         """
         physical_kv_head_axis = runtime_sharding_resolver.paxis.kv_head_axis
-        physical_kv_head_size = _mesh_axis_size(mesh, physical_kv_head_axis)
+        physical_kv_head_size = mesh_axis_size(mesh, physical_kv_head_axis)
         kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(runtime_sharding_resolver))
+        page_axis_size = mesh_axis_size(
+            mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
+        )
         available_alloc = budget * kv_head_size * page_axis_size
         effective_kv_head_axis = physical_kv_head_axis if kv_head_size > 1 else "replicated"
         logger.info(
@@ -490,7 +473,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     @classmethod
     def create(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
@@ -544,8 +527,10 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             raise ValueError("`num_kv_heads` must be positive")
         if kv_head_dim_size is None or kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
-        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(runtime_sharding_resolver))
-        physical_kv_head_size = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
+        data_parallel_size = mesh_axis_size(
+            mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
+        )
+        physical_kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
         kvdtype = _canonicalize_dtype(kvdtype)
         kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
             kvdtype,
@@ -790,7 +775,7 @@ class RaggedPagesCacheView(BaseCacheView):
         config: RaggedPagesCacheConfig,
         layer_index: int | None = None,
         *,
-        mesh: "Mesh | None" = None,
+        mesh: MeshLike | None = None,
         runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: "EasyQuantizer | None" = None,
     ) -> "RaggedPagesCacheView":
@@ -813,6 +798,7 @@ class RaggedPagesCacheView(BaseCacheView):
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
+        mesh = resolve_stage_cache_mesh(mesh)
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         # Allocate KV pages
@@ -876,7 +862,7 @@ class RaggedPagesCacheView(BaseCacheView):
                 # Keep shard_map enabled so each shard can derive its own page index.
                 use_shardmap = True
 
-            data_parallel_axis = _attention_dp_axis(self.runtime_sharding_resolver)
+            data_parallel_axis = resolve_attention_data_parallel_axis(self.runtime_sharding_resolver, mode=MODE_PREFILL)
 
             def _update_fn(
                 kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
@@ -930,7 +916,7 @@ class RaggedPagesCacheView(BaseCacheView):
                         resolve([EMPTY], mode=MODE_PREFILL),
                     ),
                     out_specs=resolve([page_axis, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
-                    mesh=spx.to_jax_mesh(spx.get_incontext_mesh()),
+                    mesh=resolve_stage_cache_mesh(self.runtime_sharding_resolver.mesh, arr=self.kv_pages),
                     check_vma=False,
                 )
 
@@ -1011,7 +997,7 @@ class RaggedPagesCache(BaseCache):
     @classmethod
     def init_cache(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         config: RaggedPagesCacheConfig,
         runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
@@ -1031,16 +1017,18 @@ class RaggedPagesCache(BaseCache):
         Returns:
             RaggedPagesCache: An initialized cache object containing views for all layers.
         """
-        views = [
-            RaggedPagesCacheView.init(
-                config=config,
-                layer_index=i,
-                mesh=mesh,
-                runtime_sharding_resolver=runtime_sharding_resolver,
-                quantizer=quantizer,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        views = []
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                views.append(
+                    RaggedPagesCacheView.init(
+                        config=config,
+                        layer_index=i,
+                        mesh=mesh,
+                        runtime_sharding_resolver=runtime_sharding_resolver,
+                        quantizer=quantizer,
+                    )
+                )
         return cls(views=views)
 
     def init_empty(self, *args, **kwargs) -> None:

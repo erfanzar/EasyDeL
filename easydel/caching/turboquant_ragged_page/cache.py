@@ -31,15 +31,21 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 import numpy as np
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree, field
-from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 from spectrax import common_types
 
 from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
-from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver
+from easydel.infra.sharding import (
+    MeshLike,
+    RuntimeShardingResolver,
+    coerce_runtime_sharding_resolver,
+    mesh_axis_size,
+    resolve_stage_cache_mesh,
+)
 from easydel.layers.quantization import TurboQuantConfig, TurboQuantConstants
 
 from .._abstracts import OperationsMetadata
@@ -48,7 +54,6 @@ from ..ragged_page.cache import (
     RaggedPagesCacheConfig,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
-    _mesh_axis_size,
     cdiv,
     per_device_hbm_budget_bytes,
 )
@@ -79,7 +84,7 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
     @classmethod
     def create(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         turboquant_config: TurboQuantConfig,
         num_hidden_layers: int,
@@ -108,9 +113,10 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
         Returns:
             Configured TurboQuantRaggedPagesCacheConfig.
         """
+        mesh = resolve_stage_cache_mesh(mesh)
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
-        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
-        kv_head_size = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
+        data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+        kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
 
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
         page_axis_size = data_parallel_size if data_parallel_size > 1 else 1
@@ -193,7 +199,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         config: TurboQuantRaggedPagesCacheConfig,
         layer_index: int | None = None,
         *,
-        mesh: "Mesh | None" = None,
+        mesh: MeshLike | None = None,
         runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: "EasyQuantizer | None" = None,
         constants: TurboQuantConstants | None = None,
@@ -212,6 +218,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         Returns:
             Initialized TurboQuantRaggedPagesCacheView.
         """
+        mesh = resolve_stage_cache_mesh(mesh)
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
         layer_idx = layer_index or 0
@@ -268,7 +275,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         config: TurboQuantRaggedPagesCacheConfig,
         num_layers: int,
         *,
-        mesh: "Mesh | None" = None,
+        mesh: MeshLike | None = None,
         runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         layer_indices: list[int] | None = None,
     ) -> list["TurboQuantRaggedPagesCacheView"]:
@@ -411,7 +418,7 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
     @classmethod
     def init_cache(
         cls,
-        mesh: Mesh,
+        mesh: MeshLike,
         config: TurboQuantRaggedPagesCacheConfig,
         runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
@@ -427,10 +434,15 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
         Returns:
             TurboQuantRaggedPagesCache with one view per layer.
         """
-        views = TurboQuantRaggedPagesCacheView.init_all_layers(
-            config=config,
-            num_layers=config.num_hidden_layers,
-            mesh=mesh,
-            runtime_sharding_resolver=runtime_sharding_resolver,
-        )
+        views = []
+        for i in range(config.num_hidden_layers):
+            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+                views.append(
+                    TurboQuantRaggedPagesCacheView.init(
+                        config=config,
+                        layer_index=i,
+                        mesh=mesh,
+                        runtime_sharding_resolver=runtime_sharding_resolver,
+                    )
+                )
         return cls(views=views)

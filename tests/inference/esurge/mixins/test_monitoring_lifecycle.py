@@ -35,7 +35,6 @@ import os
 import threading
 import time
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 
@@ -124,7 +123,6 @@ def test_prepare_grafana_provisioning_creates_expected_files(tmp_path, monkeypat
     assert os.path.isfile(os.path.join(root, "dashboards", "provider.yaml"))
     assert os.path.isfile(os.path.join(root, "dashboard_json", "esurge-overview.json"))
 
-
     with open(os.path.join(root, "dashboards", "provider.yaml")) as fh:
         provider = fh.read()
     assert os.path.join(root, "dashboard_json") in provider
@@ -166,8 +164,13 @@ def test_is_nonrecoverable_scheduler_error_unrelated_value_error():
 
 def test_is_nonrecoverable_scheduler_error_non_value_error():
     """RuntimeError, KeyError, etc. are recoverable per the predicate's contract."""
-    assert EngineLifecycleMixin._is_nonrecoverable_scheduler_error(RuntimeError("Non-DP-local page IDs detected")) is False
-    assert EngineLifecycleMixin._is_nonrecoverable_scheduler_error(KeyError("Distributed step synchronization failure")) is False
+    assert (
+        EngineLifecycleMixin._is_nonrecoverable_scheduler_error(RuntimeError("Non-DP-local page IDs detected")) is False
+    )
+    assert (
+        EngineLifecycleMixin._is_nonrecoverable_scheduler_error(KeyError("Distributed step synchronization failure"))
+        is False
+    )
 
 
 def test_model_overrides_esurge_graphdef_returns_false_for_plain_class():

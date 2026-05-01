@@ -7,3 +7,4 @@ easydel.layers.quantization package
    _configs
    _quants
    _straight_through
+   _turboquant

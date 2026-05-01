@@ -30,8 +30,14 @@ from easydel.infra.factory import (
     ModuleRegistration,
     Registry,
     TaskType,
+)
+from easydel.infra.factory import (
     register_config as global_register_config,
+)
+from easydel.infra.factory import (
     register_module as global_register_module,
+)
+from easydel.infra.factory import (
     registry as global_registry,
 )
 
@@ -84,7 +90,6 @@ def test_new_registry_has_empty_pre_initialized_dictionaries():
 
 def test_global_registry_is_a_registry_instance():
     assert isinstance(global_registry, Registry)
-
 
     assert getattr(global_register_config, "__self__", None) is global_registry
     assert getattr(global_register_module, "__self__", None) is global_registry
@@ -264,7 +269,6 @@ def test_config_registry_property_exposes_internal_state():
 def test_global_registry_has_canonical_models_registered():
     """Touching ``LlamaForCausalLM`` triggers its registration into the global registry."""
     import easydel as ed
-
 
     _ = ed.LlamaForCausalLM
 

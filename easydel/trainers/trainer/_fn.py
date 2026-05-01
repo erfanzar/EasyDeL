@@ -38,52 +38,29 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
 
 
-def training_step(
+def base_step(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    is_training: bool = True,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-) -> tuple[EasyDeLState, LossMetrics]:
-    """
-    Performs a single training step by computing gradients via minibatch processing,
-    updating the model state, and returning updated state and loss metrics.
-
-    The function first determines the batch and minibatch sizes using assertions.
-    It then applies sharding constraints to the batch. The loss function is defined
-    as an inner function that merges the current model state with an updated tree,
-    prepares the inputs, and computes the loss using the model's compute_loss method.
-    Gradients are computed using `jax.value_and_grad` over minibatches. The state is updated
-    respectfully using the computed gradients and updated metrics.
-
-    Args:
-        state (EasyDeLState): The current model state, which includes parameters and model graph.
-        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for the current batch.
-        loss_config (tp.Optional[LossConfig], optional): Configuration settings for the loss
-            computation. Defaults to None.
-        learning_rate_fn (optax.Schedule, optional): A schedule function for the learning rate.
-            Defaults to None.
-        partition_spec (tp.Optional[PartitionSpec], optional): Specification for data sharding.
-            Defaults to None.
-        gradient_accumulation_steps (int, optional): Number of steps over which to accumulate gradients.
-            Defaults to 1.
-
-    Returns:
-        tp.Tuple[EasyDeLState, LossMetrics]:
-            A tuple containing:
-                - The updated EasyDeLState after applying gradients.
-                - LossMetrics containing computed loss and other related metrics.
-    """
-    # Determine batch size, minibatch size, and enforce partition spec.
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
+    """Run the shared base trainer loss path for train or eval."""
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -108,10 +85,11 @@ def training_step(
                 - The computed loss (scalar).
                 - Additional metrics (LossMetrics) produced during loss computation.
         """
-        if straight_through_emulator is not None:
+        if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree)
-        # Prepare inputs for the model call.
+        if not is_training:
+            module.eval()
         call_batch = module.prepare_inputs_for_call(**minibatch)
         labels = call_batch.pop("labels", None)
         outputs, metrics = module.compute_loss(
@@ -121,14 +99,16 @@ def training_step(
         )
         return outputs.loss, metrics
 
-    # Compute gradients and metrics across minibatches.
+    if not is_training:
+        _, metrics = loss_fn(state.graphstate, batch)
+        return metrics
+
     gradients, metrics = minibatch_call(
         state=state,
         batch=batch,
         minibatch_size=minibatch_size,
         grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
     )
-    # Update state using the computed gradients and updated metrics.
     state = update_state_respectfully(
         state=state,
         gradients=gradients,
@@ -143,66 +123,77 @@ def training_step(
     return state, metrics
 
 
+def training_step(
+    state: EasyDeLState,
+    batch: collections.abc.Mapping[str, jax.Array],
+    loss_config: LossConfig | None = None,
+    learning_rate_fn: optax.Schedule = None,
+    partition_spec: PartitionSpec | None = None,
+    gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
+) -> tuple[EasyDeLState, LossMetrics]:
+    """Perform one base trainer update step."""
+    return base_step(
+        state=state,
+        batch=batch,
+        loss_config=loss_config,
+        learning_rate_fn=learning_rate_fn,
+        partition_spec=partition_spec,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        is_training=True,
+        straight_through_emulator=straight_through_emulator,
+    )
+
+
 def evaluation_step(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
-    """
-    Performs a single evaluation step by computing loss metrics for the input batch.
-
-    The function determines the required partitioning for the batch, applies sharding constraints,
-    and defines an inner loss function. This inner function merges the current state with the graph state,
-    sets the model to evaluation mode, and computes loss and metrics via the model's compute_loss method.
-    The computed LossMetrics are then returned.
-
-    Args:
-        state (EasyDeLState): The current model state.
-        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for evaluation.
-        loss_config (tp.Optional[LossConfig], optional): Configuration for loss computation.
-            Defaults to None.
-        partition_spec (tp.Optional[PartitionSpec], optional): Specification for sharding the batch.
-            Defaults to None.
-
-    Returns:
-        tp.Tuple[tp.Any, LossMetrics]:
-            A tuple containing:
-                - (Any): An additional output from loss computation (if any).
-                - LossMetrics: The computed loss metrics for the evaluation batch.
-    """
-    # Enforce partitioning constraints and determine required sharding.
-    *_, partition_spec = make_assertions_and_get_sizes(
+    """Perform one base trainer evaluation step."""
+    return base_step(
+        state=state,
         batch=batch,
+        loss_config=loss_config,
+        partition_spec=partition_spec,
         gradient_accumulation_steps=1,
-        batch_partition_spec=partition_spec,
+        is_training=False,
     )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    def loss_fn(tree):
-        """
-        Computes loss metrics for the evaluation batch given a merged graph state.
 
-        This inner function merges the provided tree with the current state,
-        sets the module to evaluation mode, excludes labels from the forward-pass
-        batch, and computes the loss metrics via the module's compute_loss method.
+def _base_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("partition_spec",),
+        object_fields=("loss_config", "straight_through_emulator"),
+    )
 
-        Args:
-            tree: The current update of the model's graph state.
 
-        Returns:
-            LossMetrics: The computed metrics from the loss function.
-        """
-        module = state.merge(tree)
-        module.eval()
-        call_batch = {k: v for k, v in batch.items() if k != "labels"}
-        labels = batch.get("labels", None)
-        _outputs, metrics = module.compute_loss(
+def _make_base_scheduled_loss(call):
+    loss_config = call.get("loss_config")
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree, batch):
+        module = bind_scheduled_module(call, tree)
+        batch = constrain_scheduled_batch(module, batch, partition_spec)
+        call_batch = module.prepare_inputs_for_call(**batch)
+        labels = call_batch.pop("labels", None)
+        outputs, _metrics = module.compute_loss(
             labels=labels,
             loss_config=loss_config,
-            **call_batch,  # Additional inputs passed directly to the model.
+            **call_batch,
         )
-        return metrics
+        return outputs.loss
 
-    metrics = loss_fn(state.graphstate)
-    return metrics
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    training_step,
+    ScheduledLossAdapter(
+        name="base",
+        make_loss=_make_base_scheduled_loss,
+        make_cache_key=_base_scheduled_loss_cache_key,
+    ),
+)

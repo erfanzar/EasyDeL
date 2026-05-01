@@ -18,8 +18,6 @@ import importlib.util
 import typing
 from collections.abc import Mapping
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
@@ -231,10 +229,6 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         """Qwen3.5 text checkpoints are dense (no MoE FFN layers)."""
         return False
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding."""
-        return None
-
 
 @register_config("qwen3_5_vision")
 class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
@@ -341,10 +335,6 @@ class Qwen3_5Config(EasyDeLBaseConfig):
     def get_text_config(self, decoder: bool = True) -> Qwen3_5TextConfig:
         """Get the text configuration object."""
         return self.text_config  # pyright: ignore[reportReturnType]
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding."""
-        return None
 
 
 __all__ = [

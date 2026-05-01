@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -157,19 +156,6 @@ class GiddConfig(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
     def attach_custom_arguments(
         self,

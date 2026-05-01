@@ -16,6 +16,7 @@
 import asyncio
 
 from easydel.inference.esurge import eSurge
+from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig
 from easydel.inference.sampling_params import SamplingParams
 
 
@@ -43,6 +44,14 @@ def print_output_details(output, method_name):
             print(f"  {key}: {value}")
 
 
+def make_engine():
+    return eSurge(
+        model="microsoft/phi-2",
+        runtime=eSurgeRuntimeConfig.from_dict(max_model_len=128, max_num_seqs=4),
+        cache=eSurgeCacheRuntimeConfig.from_dict(hbm_utilization=0.3),
+    )
+
+
 def test_generate():
     """Test synchronous generation."""
     print("\n" + "=" * 60)
@@ -50,12 +59,7 @@ def test_generate():
     print("=" * 60)
 
     # Initialize eSurge with small model
-    engine = eSurge(
-        model="microsoft/phi-2",
-        max_model_len=128,
-        max_num_seqs=4,
-        hbm_utilization=0.3,
-    )
+    engine = make_engine()
 
     # Test generation
     sampling_params = SamplingParams(max_tokens=20, temperature=0.7)
@@ -81,12 +85,7 @@ async def test_agenerate():
     print("=" * 60)
 
     # Initialize eSurge
-    engine = eSurge(
-        model="microsoft/phi-2",
-        max_model_len=128,
-        max_num_seqs=4,
-        hbm_utilization=0.3,
-    )
+    engine = make_engine()
 
     # Test async generation
     sampling_params = SamplingParams(max_tokens=20, temperature=0.7)
@@ -115,12 +114,7 @@ def test_stream():
     print("=" * 60)
 
     # Initialize eSurge
-    engine = eSurge(
-        model="microsoft/phi-2",
-        max_model_len=128,
-        max_num_seqs=4,
-        hbm_utilization=0.3,
-    )
+    engine = make_engine()
 
     # Test streaming
     sampling_params = SamplingParams(max_tokens=20, temperature=0.7)
@@ -152,12 +146,7 @@ async def test_astream():
     print("=" * 60)
 
     # Initialize eSurge
-    engine = eSurge(
-        model="microsoft/phi-2",
-        max_model_len=128,
-        max_num_seqs=4,
-        hbm_utilization=0.3,
-    )
+    engine = make_engine()
 
     # Test async streaming
     sampling_params = SamplingParams(max_tokens=20, temperature=0.7)

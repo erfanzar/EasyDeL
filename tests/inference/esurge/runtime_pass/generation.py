@@ -14,6 +14,7 @@
 
 """Example usage of the eSurge engine for text generation."""
 
+from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.sampling_params import SamplingParams
 
@@ -27,10 +28,8 @@ def run_all_examples():
     # Create a single engine instance
     engine = eSurge(
         model="meta-llama/Llama-3.2-3B-Instruct",
-        max_model_len=512,
-        max_num_seqs=8,
-        hbm_utilization=0.4,
-        enable_prefix_caching=True,
+        runtime=eSurgeRuntimeConfig.from_dict(max_model_len=512, max_num_seqs=8),
+        cache=eSurgeCacheRuntimeConfig.from_dict(hbm_utilization=0.4, enable_prefix_caching=True),
     )
 
     # Simple generation

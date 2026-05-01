@@ -34,7 +34,6 @@ This test covers both branches plus the non-MPMD path.
 from __future__ import annotations
 
 import jax
-import numpy as np
 import pytest
 import spectrax as spx
 
@@ -100,7 +99,6 @@ def test_stage_spmd_devices_disjoint_per_stage_under_assign_stage():
             stage_devices = config._stage_spmd_devices()
         devices_by_logical_layer[layer_idx] = set(stage_devices.tolist())
 
-
     expected_stage0 = set(mpmd.submesh(0).devices.flatten().tolist())
     expected_stage1 = set(mpmd.submesh(1).devices.flatten().tolist())
 
@@ -108,7 +106,6 @@ def test_stage_spmd_devices_disjoint_per_stage_under_assign_stage():
     assert devices_by_logical_layer[1] == expected_stage0
     assert devices_by_logical_layer[2] == expected_stage1
     assert devices_by_logical_layer[3] == expected_stage1
-
 
     assert devices_by_logical_layer[0].isdisjoint(devices_by_logical_layer[2])
     assert devices_by_logical_layer[1].isdisjoint(devices_by_logical_layer[3])
@@ -131,7 +128,6 @@ def test_expert_mesh_reshape_uses_stage_local_devices():
         "auto_expert_mesh built under assign_stage(current=3) must reshape over stage 1's "
         f"devices; got {expert_devices} vs expected {expected_stage1}"
     )
-
 
     assert "pp" not in expert_mesh.jax_mesh.axis_names
     assert expert_mesh.is_mpmd is False

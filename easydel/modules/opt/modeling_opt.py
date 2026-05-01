@@ -744,14 +744,15 @@ class OPTDecoder(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = decoder_layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                )
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:

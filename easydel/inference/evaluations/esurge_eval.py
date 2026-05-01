@@ -34,7 +34,7 @@ Example:
     >>> from easydel.inference.evaluations import eSurgeLMEvalAdapter
     >>> from lm_eval.evaluator import simple_evaluate
     >>>
-    >>> surge = eSurge(model, processor, max_num_seqs=4)
+    >>> surge = eSurge(model=model, processor=processor)
     >>> adapter = eSurgeLMEvalAdapter(
     ...     surge=surge,
     ...     processor=processor,
@@ -493,7 +493,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         >>> from easydel.inference import eSurge
         >>> from easydel.inference.evaluations import eSurgeLMEvalAdapter
         >>>
-        >>> surge = eSurge(model, processor)
+        >>> surge = eSurge(model=model, processor=processor)
         >>> adapter = eSurgeLMEvalAdapter(surge, processor, max_length=4096)
         >>>
         >>> # Use with lm-eval

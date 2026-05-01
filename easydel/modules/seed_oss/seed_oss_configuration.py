@@ -140,9 +140,6 @@ class SeedOssConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, tp.Any], ...]:
-        return None  # type: ignore
-
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Return per-layer attention mask settings."""
         mapping: dict[int, AttnMaskDetail] = {}

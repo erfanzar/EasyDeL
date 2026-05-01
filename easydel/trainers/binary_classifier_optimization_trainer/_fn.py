@@ -17,6 +17,7 @@ import collections.abc
 import typing as tp
 
 import jax
+import spectrax as spx
 from jax import numpy as jnp
 from jax.nn import log_sigmoid
 from jax.sharding import PartitionSpec
@@ -33,10 +34,16 @@ from easydel.trainers._logprob_utils import (
 from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_kwargs
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    prepare_scheduled_reference_outputs,
+    register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -420,6 +427,91 @@ def training_step(
         metrics=metrics,
     )
     return new_state, metrics
+
+
+def _prepare_bco_scheduled_batch(call) -> dict[str, tp.Any]:
+    batch = dict(call.batch)
+    if "reference_logps" in batch:
+        return batch
+
+    return prepare_scheduled_reference_outputs(
+        call,
+        reference_state_field="reference_state",
+        forward_field="concatenated_forward_fn",
+        output_to_batch={"completion_logps": "reference_logps"},
+        missing_error="BCO scheduled MPMD training requires reference_state and concatenated_forward_fn.",
+    )
+
+
+def _bco_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("beta", "partition_spec"),
+        object_fields=("concatenated_forward_fn", "straight_through_emulator"),
+    )
+
+
+def _make_bco_scheduled_loss(call):
+    concatenated_forward_fn = call.get("concatenated_forward_fn")
+    beta = call.get("beta")
+    partition_spec = call.get("partition_spec")
+    call.get("straight_through_emulator")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        running_delta = batch.get("running_mean")
+        if running_delta is None:
+            running_delta = jnp.array(0.0, dtype=jnp.float32)
+        else:
+            running_delta = jnp.asarray(running_delta).reshape(())
+
+        call_batch = dict(batch)
+        call_batch.pop("running_mean", None)
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, call_batch, partition_spec)
+
+        policy_outputs = concatenated_forward_fn(module, call_batch)
+        completion_logps = policy_outputs["completion_logps"]
+
+        reference_completion_logps = call_batch.get("reference_logps")
+        if reference_completion_logps is None:
+            raise RuntimeError("BCO scheduled MPMD loss requires precomputed reference_logps in the batch.")
+        reference_completion_logps = jax.lax.stop_gradient(reference_completion_logps)
+
+        labels = call_batch["label"].astype(bool)
+        chosen_mask = labels
+        rejected_mask = jnp.logical_not(labels)
+        udm_weights = call_batch.get("udm_weights", None)
+        rejected_weights = (
+            jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
+            if udm_weights is not None
+            else None
+        )
+
+        loss, *_ = compute_bco_loss(
+            completion_logps,
+            reference_completion_logps,
+            chosen_mask,
+            rejected_mask,
+            beta=beta,
+            delta=running_delta,
+            udm_weights=rejected_weights,
+        )
+        if policy_outputs.get("aux_loss") is not None:
+            loss = loss + policy_outputs["aux_loss"]
+        return loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    training_step,
+    ScheduledLossAdapter(
+        name="bco",
+        make_loss=_make_bco_scheduled_loss,
+        make_cache_key=_bco_scheduled_loss_cache_key,
+        prepare_batch=_prepare_bco_scheduled_batch,
+    ),
+)
 
 
 def evaluation_step(

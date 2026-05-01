@@ -112,3 +112,163 @@ def test_compile_trainer_step_delegates_to_spx_jit(monkeypatch):
     assert set(out) == {"loss", "aux"}
     assert float(out["aux"]) == 7.0
     assert float(out["loss"]) == 10.0
+
+
+def test_compile_trainer_step_does_not_schedule_unregistered_steps(monkeypatch):
+    class _Mesh:
+        is_mpmd = True
+
+    captured = {}
+    schedule = object()
+
+    def fake_jit(fn, **kwargs):
+        captured.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(training_utils.spx, "jit", fake_jit)
+
+    def fn(state, batch):
+        return state, batch
+
+    compile_trainer_step(fn, mesh=_Mesh(), schedule=schedule)
+
+    assert captured["mesh"].is_mpmd
+    assert "schedule" not in captured
+    assert "batch_argnums" not in captured
+
+
+def test_compile_trainer_step_does_not_schedule_full_trainer_steps(monkeypatch):
+    class _Mesh:
+        is_mpmd = True
+
+    captured = {}
+    schedule = object()
+
+    def fake_jit(fn, **kwargs):
+        captured.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(training_utils.spx, "jit", fake_jit)
+
+    def training_step(state, batch):
+        return state, batch
+
+    compile_trainer_step(training_step, mesh=_Mesh(), schedule=schedule)
+
+    assert "schedule" not in captured
+    assert "batch_argnums" not in captured
+
+
+def test_compile_trainer_step_uses_scheduled_wrapper_for_base_training_step(monkeypatch):
+    from easydel.trainers.trainer._fn import training_step
+
+    class _Mesh:
+        is_mpmd = True
+
+    captured = {}
+    schedule = object()
+
+    def fake_jit(fn, **kwargs):
+        captured.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(training_utils.spx, "jit", fake_jit)
+
+    compiled = compile_trainer_step(
+        training_step,
+        mesh=_Mesh(),
+        schedule=schedule,
+        static_argnums=(2, 3, 4, 5, 6),
+        donate_argnums=(0,),
+    )
+
+    assert captured == {}
+    assert compiled.static_argnums_ == (2, 3, 4, 5, 6)
+
+
+def test_registered_scheduled_adapter_uses_shared_scheduled_wrapper(monkeypatch):
+    class _Mesh:
+        is_mpmd = True
+
+    @dataclasses.dataclass
+    class _State:
+        graphstate: jax.Array
+
+    def custom_training_step(
+        state,
+        batch,
+        loss_config=None,
+        learning_rate_fn=None,
+        partition_spec=None,
+        gradient_accumulation_steps=1,
+        custom_scale=1.0,
+    ):
+        return state, batch
+
+    seen = {}
+
+    def make_loss(call):
+        seen["custom_scale"] = call.get("custom_scale")
+        seen["partition_spec"] = call.get("partition_spec")
+
+        def loss_fn(tree, batch):
+            return tree * batch["x"].mean() * call.get("custom_scale")
+
+        return loss_fn
+
+    adapter = training_utils.ScheduledLossAdapter(
+        name="custom",
+        make_loss=make_loss,
+        make_cache_key=lambda call: (
+            call.get("custom_scale"),
+            training_utils.scheduled_cache_token(call.get("partition_spec")),
+        ),
+    )
+    training_utils.register_scheduled_loss_adapter(custom_training_step, adapter)
+    jit_calls = []
+
+    def fake_jit(fn, **kwargs):
+        jit_calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(training_utils.spx, "jit", fake_jit)
+    monkeypatch.setattr(
+        training_utils.spx,
+        "sxvalue_and_grad",
+        lambda fn, argnums=0: lambda tree, batch: (fn(tree, batch), (tree + 1,)),
+    )
+    monkeypatch.setattr(
+        training_utils,
+        "_apply_stage_local_gradients",
+        lambda **kwargs: (kwargs["state"], kwargs["loss"]),
+    )
+
+    try:
+        schedule = object()
+        compiled = compile_trainer_step(
+            custom_training_step,
+            mesh=_Mesh(),
+            schedule=schedule,
+            static_argnums=(2, 3, 4, 5, 6),
+        )
+        state, loss = compiled(
+            _State(graphstate=jnp.asarray(2.0, dtype=jnp.float32)),
+            {"x": jnp.ones((4,), dtype=jnp.float32)},
+            None,
+            None,
+            None,
+            2,
+            3.0,
+        )
+    finally:
+        training_utils._SCHEDULED_LOSS_ADAPTERS.pop(training_utils._scheduled_step_key(custom_training_step), None)
+        if hasattr(custom_training_step, "__easydel_scheduled_loss_adapter__"):
+            delattr(custom_training_step, "__easydel_scheduled_loss_adapter__")
+
+    assert float(jax.device_get(state.graphstate)) == 2.0
+    assert float(jax.device_get(loss)) == 6.0
+    assert jit_calls[0]["schedule"] is schedule
+    assert jit_calls[0]["batch_argnums"] == (1,)
+    assert seen["custom_scale"] == 3.0
+    assert seen["partition_spec"] is not None
+    assert compiled.static_argnums_ == (2, 3, 4, 5, 6)

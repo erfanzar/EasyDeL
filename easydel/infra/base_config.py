@@ -68,7 +68,7 @@ from jax import numpy as jnp
 from jax.sharding import AxisType
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array
-from spectrax import PartitionAxis, common_types
+from spectrax import PartitionAxis
 from spectrax.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
 from spectrax.core.stage_assignment import current_stage_assignment, resolve_stage_rank
 
@@ -93,7 +93,7 @@ from .etils import (
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
 )
-from .sharding import AxisPolicy, LogicalAxisRules, RuntimeShardingResolver
+from .sharding import AxisPolicy, LogicalAxisRules, MeshLike, RuntimeShardingResolver
 
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
@@ -432,6 +432,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     scan_ring_attention: NotRequired[bool]
     scan_attention_layers: NotRequired[bool]
     scan_layers: NotRequired[bool]
+    pipeline_stage_regions: NotRequired[bool]
     pipeline_virtual_stages: NotRequired[int]
     pipeline_stage_layout: NotRequired[tp.Literal["contiguous", "interleaved", "loop"]]
     use_scan_mlp: NotRequired[bool]
@@ -601,10 +602,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
-        def _return_none_partition_rules(self, *args, **kwargs):
-            return None
-
-        cls.get_partition_rules = _return_none_partition_rules
         # PreTrainedConfig provides value-based equality, which causes Python to
         # set ``__hash__ = None`` on subclasses unless we restore it explicitly.
         # EasyDeL passes configs through static JIT paths, so config subclasses
@@ -811,6 +808,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = True,
         scan_attention_layers: bool = False,
         scan_layers: bool = False,
+        pipeline_stage_regions: bool = False,
         pipeline_virtual_stages: int = 1,
         pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = "loop",
         use_scan_mlp: bool = False,
@@ -906,6 +904,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
         self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
         self.scan_layers = getattr(self, "scan_layers", scan_layers)
+        self.pipeline_stage_regions = getattr(self, "pipeline_stage_regions", pipeline_stage_regions)
         self.pipeline_virtual_stages = getattr(self, "pipeline_virtual_stages", pipeline_virtual_stages)
         self.pipeline_stage_layout = getattr(self, "pipeline_stage_layout", pipeline_stage_layout)
         if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
@@ -1090,7 +1089,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             use_jax=not eformer_craft_mesh,
             axis_types=axis_types,
         )
-        return spx.SpxMesh(jax_mesh=mesh.jax_mesh, mpmd_axis=_compute_mpmd_axis(mesh.jax_mesh))
+        jax_mesh = getattr(mesh, "jax_mesh", None)
+        if jax_mesh is None:
+            return mesh
+        return spx.SpxMesh(jax_mesh=jax_mesh, mpmd_axis=_compute_mpmd_axis(jax_mesh))
 
     def _build_mesh(
         self,
@@ -1326,14 +1328,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
 
     @staticmethod
-    def _as_spx_mesh(mesh: common_types.Mesh | spx.SpxMesh) -> spx.SpxMesh:
+    def _as_spx_mesh(mesh: MeshLike) -> spx.SpxMesh:
         if isinstance(mesh, spx.SpxMesh):
             return mesh
-        return spx.SpxMesh(jax_mesh=mesh, mpmd_axis=_compute_mpmd_axis(mesh))
+        jax_mesh = spx.to_jax_mesh(mesh)
+        return spx.SpxMesh(jax_mesh=jax_mesh, mpmd_axis=_compute_mpmd_axis(jax_mesh))
 
     def _propagate_mesh_to_sub_configs(
         self,
-        mesh: common_types.Mesh | spx.SpxMesh,
+        mesh: MeshLike,
         attr_name_on_self: str,
         setter_method_name: str,
     ):
@@ -1366,7 +1369,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 except (AttributeError, TypeError):
                     pass
 
-    def set_model_mesh(self, mesh: common_types.Mesh | spx.SpxMesh):
+    def set_model_mesh(self, mesh: MeshLike):
         """Sets a custom mesh for the model, overriding the auto-generated one.
 
         Args:
@@ -1374,7 +1377,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh")
 
-    def set_explicit_mesh(self, mesh: common_types.Mesh | spx.SpxMesh):
+    def set_explicit_mesh(self, mesh: MeshLike):
         """Sets a custom explicit-axis mesh for the model.
 
         Args:
@@ -1382,7 +1385,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh")
 
-    def set_manual_mesh(self, mesh: common_types.Mesh | spx.SpxMesh):
+    def set_manual_mesh(self, mesh: MeshLike):
         """Sets a custom manual-axis mesh for the model.
 
         Args:
@@ -1410,40 +1413,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return
         if "token" not in kwargs and "use_auth_token" in kwargs:
             kwargs["token"] = kwargs.pop("use_auth_token")
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, Ps], ...] | None:
-        """Gets the parameter sharding partition rules for the model.
-
-        Partition rules define how model parameters should be sharded across the device mesh.
-        Each rule maps a parameter name pattern (regex) to a PartitionSpec that specifies
-        which mesh axes the parameter dimensions should be distributed across.
-
-        Providing explicit partition rules is preferred over relying on automatic sharding
-        resolution, as it gives full control over how parameters are distributed.
-
-        Returning ``None`` signals that partition rules should be resolved
-        automatically from spectrax parameter metadata.
-
-        Args:
-            *args: Positional arguments (model-specific).
-            **kwargs: Keyword arguments (model-specific).
-
-        Returns:
-            Tuple of (pattern, PartitionSpec) pairs defining how to shard parameters,
-            or ``None`` to enable automatic sharding rule resolution.
-            For example: (("model/embed.*", PartitionSpec("tp", None)),
-                         ("model/layers/\\d+/attn/.*", PartitionSpec(None, "tp")))
-
-        Example:
-            >>> class MyModelConfig(EasyDeLBaseConfig):
-            ...     def get_partition_rules(self):
-            ...         return (
-            ...             ("embed.*", PartitionSpec("tp", None)),
-            ...             ("attn.*", PartitionSpec(None, "tp", None)),
-            ...             ("mlp.*", PartitionSpec(None, "tp")),
-            ...         )
-        """
-        return None
 
     def get_axis_dims(self) -> collections.abc.Sequence[int]:
         """Returns the device mesh axis dimensions for parallelism.
@@ -1529,6 +1498,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "scan_ring_attention",
             "scan_attention_layers",
             "scan_layers",
+            "pipeline_stage_regions",
             "pipeline_virtual_stages",
             "pipeline_stage_layout",
             "use_sharding_constraint",
@@ -1587,6 +1557,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
         scan_layers: bool = NOT_GIVEN,
+        pipeline_stage_regions: bool = NOT_GIVEN,
         pipeline_virtual_stages: int = NOT_GIVEN,
         pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
@@ -1652,6 +1623,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             scan_ring_attention: Enable scan for ring attention (default ``True``).
             scan_attention_layers: Enable scan for attention blocks (default ``True``).
             scan_layers: Enable scan for repeated model layers when supported.
+            pipeline_stage_regions: Emit SpectraX ``sxstage_region`` markers around EasyDeL module calls.
             pipeline_virtual_stages: Logical virtual pipeline stages per physical pipeline rank.
             pipeline_stage_layout: Virtual-stage to physical PP-rank layout.
             use_sharding_constraint: Insert sharding constraints (default ``False``).
@@ -1715,6 +1687,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "scan_attention_layers", False, scan_attention_layers)
         set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
         set_attrs_smartly(self, "scan_layers", False, scan_layers)
+        set_attrs_smartly(self, "pipeline_stage_regions", False, pipeline_stage_regions)
         set_attrs_smartly(self, "pipeline_virtual_stages", 1, pipeline_virtual_stages)
         set_attrs_smartly(self, "pipeline_stage_layout", "loop", pipeline_stage_layout)
         if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
@@ -1791,6 +1764,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "scan_ring_attention",
         "scan_attention_layers",
         "scan_layers",
+        "pipeline_stage_regions",
         "pipeline_virtual_stages",
         "pipeline_stage_layout",
         "use_scan_mlp",
@@ -2970,39 +2944,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             if k not in tkey:
                 result[k] = v
         return result
-
-    @staticmethod
-    def _prefix_partition_rules(rules: tuple, prefix: str) -> tuple:
-        """Add a prefix to all regex patterns in partition rules.
-
-        Internal utility for namespacing partition rules when composing models
-        from sub-models. Used to avoid pattern conflicts when multiple models
-        share the same parameter name patterns.
-
-        Patterns matching ".*" (catch-all) are excluded as they would match
-        everything regardless of prefix.
-
-        Args:
-            rules (tuple): Tuple of (regex_pattern, PartitionSpec) pairs defining
-                how parameters matching each pattern should be sharded.
-            prefix (str): Prefix to prepend to each pattern, typically the
-                sub-model name (e.g., "encoder", "decoder", "thinker").
-
-        Returns:
-            tuple: New tuple of (prefixed_pattern, PartitionSpec) pairs.
-                Catch-all patterns ".*" are excluded from the output.
-
-        Example:
-            >>> rules = (("embed.*", PartitionSpec("tp")), (".*", PartitionSpec()))
-            >>> prefixed = EasyDeLBaseConfig._prefix_partition_rules(rules, "encoder")
-            >>> # prefixed = (("encoder/embed.*", PartitionSpec("tp")),)
-        """
-        prefixed = []
-        for pattern, spec in rules:
-            if pattern in (".*", r".*"):
-                continue
-            prefixed.append((f"{prefix}/{pattern}", spec))
-        return tuple(prefixed)
 
     @property
     def runtime_sharding_resolver(self) -> RuntimeShardingResolver:

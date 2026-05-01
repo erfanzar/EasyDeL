@@ -26,8 +26,17 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    cached_scheduled_auxiliary,
+    constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,
+    prepare_scheduled_reference_outputs,
+    register_scheduled_loss_adapter,
+    scheduled_loss_cache_key,
+    stop_gradient_tree,
+    sync_module_schedule_config,
     update_metrics,
     update_state_respectfully,
 )
@@ -257,6 +266,117 @@ def training_step(
         metrics=metrics,
     )
     return state, metrics
+
+
+def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
+    batch = dict(call.batch)
+    if "reference_logps" not in batch:
+        batch = prepare_scheduled_reference_outputs(
+            call,
+            reference_state_field="reference_state",
+            forward_field="forward_fn",
+            output_to_batch={"completion_logps": "reference_logps"},
+            missing_error="KTO scheduled MPMD training requires reference_state and forward_fn.",
+        )
+
+    if not bool(call.get("calculate_kl", False)):
+        return batch
+
+    if "_reference_kl_logps" in batch and "_policy_kl_logps" in batch:
+        return batch
+
+    reference_state = call.get("reference_state")
+    forward_fn = call.get("forward_fn")
+    if reference_state is None or forward_fn is None:
+        raise RuntimeError("KTO scheduled MPMD KL requires reference_state and forward_fn.")
+
+    kl_batch = _build_kl_batch(batch)
+    partition_spec = call.get("partition_spec")
+
+    ref_model = reference_state.model
+    ref_model.eval()
+    sync_module_schedule_config(ref_model, call.schedule)
+    ref_kl_batch = constrain_scheduled_batch(ref_model, kl_batch, partition_spec)
+    ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
+    ref_out = stop_gradient_tree(ref_forward(ref_model, ref_kl_batch))
+    batch["_reference_kl_logps"] = ref_out["completion_logps"]
+
+    policy_model = call.state.model
+    sync_module_schedule_config(policy_model, call.schedule)
+    policy_kl_batch = constrain_scheduled_batch(policy_model, kl_batch, partition_spec)
+    policy_forward = cached_scheduled_auxiliary(forward_fn, policy_model.mesh)
+    policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
+    batch["_policy_kl_logps"] = policy_out["completion_logps"]
+    return batch
+
+
+def _kto_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=(
+            "beta",
+            "desirable_weight",
+            "undesirable_weight",
+            "loss_type",
+            "calculate_kl",
+            "aux_loss_coef",
+            "partition_spec",
+        ),
+        object_fields=("forward_fn", "straight_through_emulator"),
+    )
+
+
+def _make_kto_scheduled_loss(call):
+    forward_fn = call.get("forward_fn")
+    beta = call.get("beta")
+    desirable_weight = call.get("desirable_weight")
+    undesirable_weight = call.get("undesirable_weight")
+    loss_type = call.get("loss_type")
+    calculate_kl = bool(call.get("calculate_kl", False))
+    aux_loss_coef = float(call.get("aux_loss_coef", 0.0))
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        policy_out = forward_fn(module, call_batch)
+        policy_logps = policy_out["completion_logps"]
+        reference_logps = jax.lax.stop_gradient(call_batch["reference_logps"])
+
+        if calculate_kl:
+            policy_kl_logps = jax.lax.stop_gradient(call_batch["_policy_kl_logps"])
+            reference_kl_logps = jax.lax.stop_gradient(call_batch["_reference_kl_logps"])
+        else:
+            policy_kl_logps = reference_kl_logps = None
+
+        loss, *_ = kto_objective(
+            policy_logps,
+            reference_logps,
+            call_batch["label"],
+            beta=beta,
+            desirable_weight=desirable_weight,
+            undesirable_weight=undesirable_weight,
+            loss_type=loss_type,
+            policy_kl_logps=policy_kl_logps,
+            reference_kl_logps=reference_kl_logps,
+        )
+
+        if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
+            loss = loss + aux_loss_coef * policy_out["aux_loss"]
+        return loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    training_step,
+    ScheduledLossAdapter(
+        name="kto",
+        make_loss=_make_kto_scheduled_loss,
+        make_cache_key=_kto_scheduled_loss_cache_key,
+        prepare_batch=_prepare_kto_scheduled_batch,
+    ),
+)
 
 
 def evaluation_step(

@@ -280,7 +280,7 @@ def test_source_layout_signature_does_not_touch_esurge_compatible_model():
             return "dummy-model"
 
         @property
-        def default_trainable_selector(self):
+        def trainable_selector(self):
             return "parameters"
 
         @property

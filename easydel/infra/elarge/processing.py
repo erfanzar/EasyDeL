@@ -775,10 +775,12 @@ def normalize(cfg: eLMConfig | Mapping[str, Any]) -> eLMConfig:
     merged = deep_merge(DEFAULTS, raw)
 
     vals = dict(merged.get("base_config", {}).get("values", {}) or {})
-    if merged.get("esurge", {}).get("max_model_len") is None:
+    esurge_cfg = merged.setdefault("esurge", {})
+    runtime_cfg = esurge_cfg.setdefault("runtime", {})
+    if runtime_cfg.get("max_model_len") is None and esurge_cfg.get("max_model_len") is None:
         mlen = vals.get("mask_max_position_embeddings") or vals.get("freq_max_position_embeddings")
         if mlen is not None:
-            merged.setdefault("esurge", {})["max_model_len"] = int(mlen)
+            runtime_cfg["max_model_len"] = int(mlen)
 
     return cast(eLMConfig, cast(object, merged))
 
@@ -893,7 +895,8 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
     set_maybe("qmm_platform_override", quant.get("qmm_platform_override"))
     set_maybe("qmm_tpu_path_override", quant.get("qmm_tpu_path_override"))
 
-    max_model_len = esurge.get("max_model_len")
+    runtime = esurge.get("runtime", {}) if isinstance(esurge.get("runtime"), Mapping) else {}
+    max_model_len = runtime.get("max_model_len", esurge.get("max_model_len"))
     if max_model_len is not None:
         mlen = int(max_model_len)
         set_maybe("mask_max_position_embeddings", mlen)

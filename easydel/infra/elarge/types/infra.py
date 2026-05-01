@@ -28,8 +28,6 @@ from spectrax import PartitionAxis
 
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 
-from .aliases import PartitionRules
-
 
 class ShardingCfg(TypedDict, total=False):
     """Model sharding configuration for distributed training and inference.
@@ -45,8 +43,6 @@ class ShardingCfg(TypedDict, total=False):
             map to mesh axes. ``None`` for default partitioning.
         shard_fns: Custom sharding functions keyed by parameter path tuples.
         auto_shard_model: Automatically shard the model using partition rules.
-        partition_rules: Regex-based rules mapping parameter names to
-            ``PartitionSpec`` values.
         use_ring_of_experts: Use ring-based expert parallelism for MoE layers.
         fsdp_is_ep_bound: Bind FSDP axis to expert parallelism axis.
         sp_is_ep_bound: Bind sequence parallelism axis to expert parallelism.
@@ -58,7 +54,6 @@ class ShardingCfg(TypedDict, total=False):
     partition_axis: NotRequired[PartitionAxis | None]
     shard_fns: NotRequired[collections.abc.Mapping[tuple, tp.Callable[..., Any]] | dict]
     auto_shard_model: NotRequired[bool]
-    partition_rules: NotRequired[PartitionRules]
     use_ring_of_experts: NotRequired[bool]
     fsdp_is_ep_bound: NotRequired[bool]
     sp_is_ep_bound: NotRequired[bool]

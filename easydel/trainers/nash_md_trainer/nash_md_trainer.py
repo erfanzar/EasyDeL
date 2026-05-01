@@ -213,12 +213,16 @@ class NashMDTrainer(GRPOTrainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
         sharded_evaluation_step_function = compile_trainer_step(
             nash_md_step,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         def _compute_model_logps(
@@ -232,7 +236,7 @@ class NashMDTrainer(GRPOTrainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
             with apply.mesh:
                 ids = with_sharding_constraint(
                     ids,

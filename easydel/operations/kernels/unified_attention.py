@@ -36,6 +36,7 @@ from spectrax import common_types as ct
 from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, unwrap_metadata
 from easydel.caching.unified_attention import UnifiedAttentionCacheView
+from easydel.infra.sharding import axis_index, mesh_axis_size, normalize_axis_names
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
@@ -43,36 +44,6 @@ from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
-
-
-def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
-    """Normalize a partition axis spec into concrete mesh axis names."""
-    if axis is None:
-        return ()
-    if isinstance(axis, (tuple, list)):
-        return tuple(str(a) for a in axis if a)
-    return (str(axis),)
-
-
-def _mesh_axis_size(mesh, axis_names: tuple[str, ...]) -> int:
-    """Compute the product of mesh axis sizes for the provided axis names."""
-    size = 1
-    if mesh is None:
-        return size
-    for axis_name in axis_names:
-        size *= int(mesh.shape.get(axis_name, 1))
-    return int(size)
-
-
-def _axis_index(axis_names: tuple[str, ...]) -> jax.Array:
-    """Return a linearized axis index over one or more mesh axes."""
-    if not axis_names:
-        return jnp.int32(0)
-    idx = jax.lax.axis_index(axis_names[0]).astype(jnp.int32)
-    for axis_name in axis_names[1:]:
-        axis_size = jax.lax.psum(jnp.int32(1), axis_name)
-        idx = idx * axis_size + jax.lax.axis_index(axis_name).astype(jnp.int32)
-    return idx
 
 
 def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
@@ -242,8 +213,8 @@ class UnifiedAttn(OperationImpl):
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
-        page_axis_names = _normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
-        page_axis_size = _mesh_axis_size(self.metadata.mesh, page_axis_names)
+        page_axis_names = normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
+        page_axis_size = mesh_axis_size(self.metadata.mesh, page_axis_names)
         kv_pages_spec_replicated = resolve(
             axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
@@ -294,7 +265,7 @@ class UnifiedAttn(OperationImpl):
                 local_qq_bias,
                 local_softmax_aux,
             ):
-                shard_idx = _axis_index(page_axis_names)
+                shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
                 local_context_lens = jax.lax.dynamic_slice_in_dim(
                     full_context_lens,

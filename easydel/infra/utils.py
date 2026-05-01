@@ -66,7 +66,6 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
 from jax import numpy as jnp
-from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from spectrax import nn, with_sharding_constraint
 from tqdm.auto import tqdm
@@ -1837,37 +1836,9 @@ else:
     ProcessingClassType = tp.Any
 
 
-# Canonical implementation lives in `easydel.infra.sharding`. This re-export
-# preserves the `from easydel.infra.utils import sanitize_partition_spec_for_shape`
-# import path used by `base_module.py` and `base_state.py`.
-from .sharding import sanitize_partition_spec_for_shape  # noqa: E402
-
-
-def sanitize_partition_specs_for_shape_tree(
-    partition_specs: tp.Any,
-    shape_tree: tp.Any,
-    mesh: Mesh,
-) -> tuple[tp.Any, int]:
-    """Sanitize a partition-spec tree against concrete parameter shapes."""
-    flat_specs = flatten_dict(partition_specs)
-    flat_shapes = flatten_dict(shape_tree)
-    adjusted = 0
-
-    for key, spec in flat_specs.items():
-        if not isinstance(spec, PartitionSpec):
-            continue
-        shape_obj = flat_shapes.get(key)
-        shape = tuple(getattr(shape_obj, "shape", ()))
-        if not shape:
-            continue
-        safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
-        if safe_spec != spec:
-            flat_specs[key] = safe_spec
-            adjusted += 1
-
-    if adjusted == 0:
-        return partition_specs, adjusted
-    return unflatten_dict(flat_specs), adjusted
+# Canonical implementations live in `easydel.infra.sharding`. These re-exports
+# preserve the historical `easydel.infra.utils` import paths.
+from .sharding import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree  # noqa: E402,F401
 
 
 def device_put_or_shard_abstract(leaf: tp.Any, sharding: tp.Any) -> tp.Any:
@@ -1932,3 +1903,22 @@ def materialize_meta_leaves(tree: tp.Any, *, seed: int = 0) -> tp.Any:
     if not changed:
         return tree
     return unflatten_dict(flat_tree)
+
+
+def jax_path_to_string(path: tuple[tp.Any, ...], sep: str = "/") -> str:
+    """Render a JAX tree-key path as a forward-slash-separated string."""
+    parts: list[str] = []
+    for key in path:
+        if isinstance(key, tuple | list):
+            parts.append(jax_path_to_string(key, sep=sep))
+        elif isinstance(key, jax.tree_util.SequenceKey):
+            parts.append(str(key.idx))
+        elif isinstance(key, jax.tree_util.DictKey):
+            parts.append(str(key.key))
+        elif isinstance(key, jax.tree_util.GetAttrKey):
+            parts.append(str(key.name))
+        elif isinstance(key, jax.tree_util.FlattenedIndexKey):
+            parts.append(str(key.key))
+        else:
+            parts.append(str(key))
+    return sep.join(parts)

@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import collections
 import collections.abc
+import dataclasses
+import functools
 import inspect
 import typing as tp
 import warnings
@@ -26,7 +30,11 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.infra.sharding import MeshLike
 from easydel.utils.helpers import check_bool_flag
+
+if tp.TYPE_CHECKING:
+    from easydel.infra.etils import MpMdSchedulers
 
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
@@ -48,42 +56,6 @@ FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
     "mxfp8": 8,
     "nvfp8": 8,
 }
-
-
-def filter_kwargs_for_callable(
-    callable_obj: tp.Callable[..., tp.Any],
-    kwargs: collections.abc.Mapping[str, tp.Any],
-) -> dict[str, tp.Any]:
-    """Filter kwargs so only parameters accepted by ``callable_obj`` are forwarded.
-
-    This prevents runtime failures when dataset batches carry auxiliary metadata
-    fields (for example preference scores) that a model forward signature does
-    not accept.
-    """
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return dict(kwargs)
-
-    parameters = signature.parameters
-    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return dict(kwargs)
-
-    accepted_keys = set(parameters.keys())
-    return {key: value for key, value in kwargs.items() if key in accepted_keys}
-
-
-def sanitize_model_call_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
-    """Normalize model call kwargs to avoid known incompatible combinations.
-
-    Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
-    but not both at the same time. Prefer token IDs when both are present.
-    """
-    normalized_kwargs = dict(kwargs)
-    if normalized_kwargs.get("input_ids", None) is not None and normalized_kwargs.get("inputs_embeds", None) is not None:
-        normalized_kwargs.pop("inputs_embeds", None)
-    return normalized_kwargs
-
 
 GENERATION_MODEL_INPUT_KEYS = (
     "inputs_embeds",
@@ -150,6 +122,289 @@ PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS = frozenset(
     }
 )
 
+_ScheduledLossFn = tp.Callable[[tp.Any, collections.abc.Mapping[str, jax.Array]], jax.Array]
+_ScheduledValueAndGradFn = tp.Callable[[tp.Any, dict], tuple[jax.Array, tp.Any]]
+_SCHEDULED_LOSS_ADAPTERS: dict[tuple[str, str], ScheduledLossAdapter] = {}
+_SCHEDULED_AUXILIARY_CACHE: dict[tuple[int, int], tp.Callable[..., tp.Any]] = {}
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduledStepCall:
+    """Bound call context used by trainer-specific scheduled loss adapters."""
+
+    step_fn: tp.Callable[..., tp.Any]
+    state: EasyDeLState
+    batch: collections.abc.Mapping[str, jax.Array]
+    args: tuple[tp.Any, ...]
+    kwargs: collections.abc.Mapping[str, tp.Any]
+    bound_arguments: collections.abc.Mapping[str, tp.Any]
+    schedule: tp.Any
+
+    def get(self, name: str, default: tp.Any = None) -> tp.Any:
+        return self.bound_arguments.get(name, default)
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduledLossAdapter:
+    """Trainer-specific scalar loss builder for SpectraX scheduled VJPs."""
+
+    name: str
+    make_loss: tp.Callable[[ScheduledStepCall], _ScheduledLossFn]
+    make_cache_key: tp.Callable[[ScheduledStepCall], tuple[tp.Any, ...]]
+    prepare_batch: tp.Callable[[ScheduledStepCall], collections.abc.Mapping[str, jax.Array]] | None = None
+
+
+@dataclasses.dataclass
+class _ScheduledValueAndGradCompiler:
+    """Small cache around ``spx.jit(..., schedule=...)`` + ``sxvalue_and_grad``."""
+
+    mesh: MeshLike
+    schedule: tp.Any
+    batch_argnums: int | tp.Sequence[int] | None
+    adapter: ScheduledLossAdapter
+    cached_key: tuple[tp.Any, ...] | None = None
+    cached_value_and_grad: _ScheduledValueAndGradFn | None = None
+
+    def get(self, call: ScheduledStepCall) -> _ScheduledValueAndGradFn:
+        key = self.adapter.make_cache_key(call)
+        if self.cached_value_and_grad is not None and self.cached_key == key:
+            return self.cached_value_and_grad
+
+        loss_fn = self.adapter.make_loss(call)
+        scheduled_loss = spx.jit(
+            loss_fn,
+            mesh=self.mesh,
+            schedule=self.schedule,
+            static_argnums=(),
+            batch_argnums=self.batch_argnums,
+        )
+        scheduled_value_and_grad = spx.sxvalue_and_grad(scheduled_loss, argnums=0)
+
+        def value_and_grad(tree, batch):
+            loss, (gradients,) = scheduled_value_and_grad(tree, batch)
+            return loss, gradients
+
+        self.cached_key = key
+        self.cached_value_and_grad = value_and_grad
+        return value_and_grad
+
+
+def filter_kwargs_for_callable(
+    callable_obj: tp.Callable[..., tp.Any],
+    kwargs: collections.abc.Mapping[str, tp.Any],
+) -> dict[str, tp.Any]:
+    """Filter kwargs so only parameters accepted by ``callable_obj`` are forwarded.
+
+    This prevents runtime failures when dataset batches carry auxiliary metadata
+    fields (for example preference scores) that a model forward signature does
+    not accept.
+    """
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+
+    accepted_keys = set(parameters.keys())
+    return {key: value for key, value in kwargs.items() if key in accepted_keys}
+
+
+def sanitize_model_call_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Normalize model call kwargs to avoid known incompatible combinations.
+
+    Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
+    but not both at the same time. Prefer token IDs when both are present.
+    """
+    normalized_kwargs = dict(kwargs)
+    if normalized_kwargs.get("input_ids", None) is not None and normalized_kwargs.get("inputs_embeds", None) is not None:
+        normalized_kwargs.pop("inputs_embeds", None)
+    return normalized_kwargs
+
+
+def register_scheduled_loss_adapter(
+    step_fn: tp.Callable[..., tp.Any],
+    adapter: ScheduledLossAdapter,
+) -> tp.Callable[..., tp.Any]:
+    """Register a scalar-loss adapter for scheduled MPMD training.
+
+    The adapter owns only trainer-specific loss construction. The shared path
+    still owns SpectraX scheduled VJP, gradient accumulation, stage-local
+    placement, and the optimizer update.
+    """
+
+    _SCHEDULED_LOSS_ADAPTERS[_scheduled_step_key(step_fn)] = adapter
+    step_fn.__easydel_scheduled_loss_adapter__ = adapter
+    return step_fn
+
+
+def get_scheduled_loss_adapter(fn: tp.Callable[..., tp.Any]) -> ScheduledLossAdapter | None:
+    adapter = getattr(fn, "__easydel_scheduled_loss_adapter__", None)
+    if adapter is not None:
+        return adapter
+    return _SCHEDULED_LOSS_ADAPTERS.get(_scheduled_step_key(fn))
+
+
+def scheduled_cache_token(value: tp.Any) -> tp.Hashable:
+    """Return a stable token for scheduled-loss cache keys."""
+
+    try:
+        hash(value)
+    except TypeError:
+        return id(value)
+    return value
+
+
+def scheduled_loss_cache_key(
+    call: ScheduledStepCall,
+    *,
+    value_fields: collections.abc.Iterable[str] = (),
+    object_fields: collections.abc.Iterable[str] = (),
+    include_graph: bool = True,
+) -> tuple[tp.Any, ...]:
+    """Build a cache key for scheduled scalar-loss compilation.
+
+    ``value_fields`` are hashed by value when possible, while
+    ``object_fields`` are keyed by identity.  This keeps trainer adapters from
+    open-coding the same graph/config/function identity tuple.
+    """
+
+    pieces: list[tp.Any] = []
+    if include_graph:
+        pieces.extend((id(call.state.graphdef), id(call.state.graphother)))
+    pieces.extend(scheduled_cache_token(call.get(name)) for name in value_fields)
+    pieces.extend(id(call.get(name)) for name in object_fields)
+    return tuple(pieces)
+
+
+def _sync_schedule_config(config: tp.Any, schedule: tp.Any, seen: set[int]) -> None:
+    """Keep a config and its nested sub-configs aligned with the runtime schedule."""
+    if config is None:
+        return
+    config_id = id(config)
+    if config_id in seen:
+        return
+    seen.add(config_id)
+
+    virtual_stages = getattr(schedule, "virtual_stages_per_rank", None)
+    if callable(virtual_stages) and hasattr(config, "pipeline_virtual_stages"):
+        config.pipeline_virtual_stages = int(virtual_stages())
+    stage_layout = getattr(schedule, "stage_layout", None)
+    if stage_layout is not None and hasattr(config, "pipeline_stage_layout"):
+        config.pipeline_stage_layout = stage_layout
+
+    for attr_name in ("text_config", "vision_config", "encoder_config", "decoder_config"):
+        _sync_schedule_config(getattr(config, attr_name, None), schedule, seen)
+
+
+def sync_module_schedule_config(module: tp.Any, schedule: tp.Any) -> None:
+    """Keep model-side PP marker generation in sync with the runtime schedule."""
+    _sync_schedule_config(getattr(module, "config", None), schedule, set())
+
+    for attr_name in ("model", "base_model", "language_model", "visual"):
+        child = getattr(module, attr_name, None)
+        _sync_schedule_config(getattr(child, "config", None), schedule, set())
+
+
+def bind_scheduled_module(
+    call: ScheduledStepCall,
+    tree: tp.Any,
+    *,
+    straight_through_field: str = "straight_through_emulator",
+) -> tp.Any:
+    """Merge a scheduled trainable tree and sync its PP marker config."""
+
+    straight_through = call.get(straight_through_field)
+    if straight_through is not None:
+        tree = straight_through(tree)
+    module = call.state.merge(tree)
+    sync_module_schedule_config(module, call.schedule)
+    return module
+
+
+def constrain_scheduled_batch(
+    module: tp.Any,
+    batch: collections.abc.Mapping[str, tp.Any],
+    partition_spec: tp.Any,
+) -> dict[str, tp.Any]:
+    """Apply the standard EasyDeL scheduled batch sharding constraint."""
+
+    return spx.with_sharding_constraint(
+        dict(batch),
+        partition_spec,
+        mesh=module.mesh,
+        ignore_mpmd=True,
+    )
+
+
+def cached_scheduled_auxiliary(fn: tp.Callable[..., tp.Any], mesh: MeshLike) -> tp.Callable[..., tp.Any]:
+    """Return a cached regular ``spx.jit`` for non-gradient auxiliary forwards."""
+
+    key = (id(fn), id(mesh))
+    cached = _SCHEDULED_AUXILIARY_CACHE.get(key)
+    if cached is None:
+        cached = spx.jit(fn, mesh=mesh)
+        _SCHEDULED_AUXILIARY_CACHE[key] = cached
+    return cached
+
+
+def stop_gradient_tree(value: tp.Any) -> tp.Any:
+    """Stop gradients for array leaves while preserving non-array metadata."""
+
+    return jax.tree_util.tree_map(
+        lambda leaf: jax.lax.stop_gradient(leaf) if hasattr(leaf, "shape") else leaf,
+        value,
+    )
+
+
+def prepare_scheduled_reference_outputs(
+    call: ScheduledStepCall,
+    *,
+    reference_state_field: str,
+    forward_field: str,
+    output_to_batch: collections.abc.Mapping[str, str],
+    partition_spec_field: str = "partition_spec",
+    skip_field: str | None = None,
+    missing_error: str | None = None,
+) -> dict[str, tp.Any]:
+    """Precompute reference-model outputs before the scheduled VJP.
+
+    Preference/RL trainers often need frozen reference log-probs.  Computing
+    those inside the policy scheduled loss would trace two model forwards into a
+    single PP graph, so this helper runs the reference forward once as a regular
+    auxiliary JIT and appends its requested outputs to the batch.
+    """
+
+    batch = dict(call.batch)
+    if skip_field is not None and bool(call.get(skip_field, False)):
+        return batch
+    if all(batch_key in batch for batch_key in output_to_batch.values()):
+        return batch
+
+    reference_state = call.get(reference_state_field)
+    forward_fn = call.get(forward_field)
+    if reference_state is None or forward_fn is None:
+        raise RuntimeError(
+            missing_error or f"scheduled MPMD training requires {reference_state_field!r} and {forward_field!r}."
+        )
+
+    ref_model = reference_state.model
+    ref_model.eval()
+    sync_module_schedule_config(ref_model, call.schedule)
+    constrained_batch = spx.with_sharding_constraint(
+        batch,
+        call.get(partition_spec_field),
+        mesh=ref_model.mesh,
+        ignore_mpmd=True,
+    )
+    ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
+    ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch))
+    for output_key, batch_key in output_to_batch.items():
+        batch[batch_key] = ref_out[output_key]
+    return batch
+
 
 def normalize_generation_model_kwargs(
     kwargs: collections.abc.Mapping[str, tp.Any] | None,
@@ -185,9 +440,7 @@ def normalize_generation_model_kwargs(
     return normalized
 
 
-def compact_generation_model_kwargs(
-    kwargs: collections.abc.Mapping[str, tp.Any] | None,
-) -> dict[str, tp.Any]:
+def compact_generation_model_kwargs(kwargs: collections.abc.Mapping[str, tp.Any] | None) -> dict[str, tp.Any]:
     """Drop ``None`` leaves from normalized generation model kwargs.
 
     Args:
@@ -202,10 +455,7 @@ def compact_generation_model_kwargs(
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
-def _flatten_grouped_multimodal_model_value(
-    key: str,
-    value: tp.Any,
-) -> tp.Any:
+def _flatten_grouped_multimodal_model_value(key: str, value: tp.Any) -> tp.Any:
     """Flatten grouped multimodal leaves before the actual model call."""
 
     if key not in GROUPED_MULTIMODAL_MODEL_INPUT_KEYS or not hasattr(value, "shape"):
@@ -787,18 +1037,46 @@ def compile_trainer_step(
     fn: tp.Callable[..., tp.Any],
     *,
     mutable: tp.Any = (),
-    mesh: tp.Any | None = None,
-    schedule: tp.Any | None = None,
+    mesh: MeshLike | None = None,
+    schedule: MpMdSchedulers | None = None,
+    arguments: tp.Any | None = None,
     in_shardings: tp.Any = _UNSPECIFIED,
     out_shardings: tp.Any = _UNSPECIFIED,
     static_argnums: int | tp.Sequence[int] | None = None,
     static_argnames: str | tp.Iterable[str] | None = None,
     donate_argnums: int | tp.Sequence[int] | None = None,
     donate_argnames: str | tp.Iterable[str] | None = None,
+    batch_argnums: int | tp.Sequence[int] | None = None,
     keep_unused: bool = False,
     **jit_kwargs,
 ) -> tp.Callable[..., tp.Any]:
-    """Compile a trainer step with the SpectraX MPMD path when the mesh requires it."""
+    """Compile a trainer step with the SpectraX MPMD path when the mesh requires it.
+
+    When ``schedule`` is None, falls back to ``arguments.mpmd_scheduler`` if
+    ``arguments`` is supplied -- so trainers can opt in to 1F1B / GPipe
+    microbatching by setting ``TrainingArguments.mpmd_scheduler`` once,
+    without touching every trainer's call site. Trainer steps that register a
+    :class:`ScheduledLossAdapter` are run through the shared scheduled-VJP path;
+    unregistered full trainer steps keep the regular marker-based JIT path.
+    """
+
+    if schedule is None and arguments is not None:
+        schedule = getattr(arguments, "mpmd_scheduler", None)
+    scheduled_adapter = get_scheduled_loss_adapter(fn) if schedule is not None else None
+    if scheduled_adapter is not None:
+        return _compile_scheduled_training_step(
+            step_fn=fn,
+            mesh=mesh,
+            schedule=schedule,
+            batch_argnums=(1,) if batch_argnums is None else batch_argnums,
+            static_argnums=static_argnums,
+            adapter=scheduled_adapter,
+        )
+    # SpectraX's schedule= path is a scalar-loss custom-VJP runtime. Whole
+    # EasyDeL trainer steps usually return (state, metrics) or metrics, and
+    # auxiliary forwards return logits/log-probs. Keep all unregistered
+    # callables on the regular marker-based MPMD path so custom trainers keep
+    # their full metrics and is_training behavior.
 
     static_nums = _normalize_static_argnums(static_argnums)
     kwargs = {
@@ -810,8 +1088,6 @@ def compile_trainer_step(
         "keep_unused": keep_unused,
         **jit_kwargs,
     }
-    if schedule is not None:
-        kwargs["schedule"] = schedule
     if mesh is not None:
         kwargs["mesh"] = mesh
     if in_shardings is not _UNSPECIFIED:
@@ -823,10 +1099,191 @@ def compile_trainer_step(
     return compiled
 
 
+def _slice_batch_for_scheduled_step(batch: dict, batch_size: int, start_index: int, minibatch_size: int) -> dict:
+    """Slice leading-batch leaves while passing shared leaves through."""
+
+    def _slice_leaf(arr):
+        if not hasattr(arr, "shape") or arr.ndim == 0:
+            return arr
+        if arr.shape[0] == batch_size:
+            return lax.dynamic_slice_in_dim(arr, start_index, minibatch_size, axis=0)
+        return arr
+
+    return jax.tree_util.tree_map(_slice_leaf, batch)
+
+
+def _scheduled_step_key(fn: tp.Callable[..., tp.Any]) -> tuple[str, str]:
+    while isinstance(fn, functools.partial):
+        fn = fn.func
+    return getattr(fn, "__module__", ""), getattr(fn, "__name__", "")
+
+
+def _scheduled_step_name(fn: tp.Callable[..., tp.Any]) -> str:
+    module, name = _scheduled_step_key(fn)
+    return name or module or type(fn).__name__
+
+
+def _apply_stage_local_gradients(
+    *,
+    state: EasyDeLState,
+    gradients: tp.Any,
+    loss: jax.Array,
+    loss_config: LossConfig | None,
+    learning_rate_fn: tp.Any,
+) -> tuple[EasyDeLState, LossMetrics]:
+    metrics = update_metrics(
+        metrics=LossMetrics(loss=loss),
+        learning_rate_fn=learning_rate_fn,
+        step=state.step,
+        gradients=None,
+    )
+    if loss_config is not None and bool(getattr(loss_config, "break_on_nan", False)):
+        if bool(jax.device_get(jnp.isnan(loss))):
+            return state, metrics
+
+    if state.tx is None:
+        raise RuntimeError("mpmd_scheduler requires an initialized optimizer transformation.")
+    if state.opt_state is None:
+        raise RuntimeError("mpmd_scheduler requires initialized optimizer state.")
+
+    apply_stage_local = getattr(state.tx, "apply_gradients_stage_local", None)
+    if not callable(apply_stage_local):
+        raise RuntimeError(
+            "mpmd_scheduler produced stage-local gradients, but the optimizer does not expose "
+            "`apply_gradients_stage_local`. Use an eFormer optimizer with PP stage-local support."
+        )
+
+    try:
+        graphstate, opt_state = apply_stage_local(
+            params=state.graphstate,
+            grads=gradients,
+            opt_state=state.opt_state,
+            learning_rate_fn=learning_rate_fn,
+            delete_grads=True,
+        )
+    except NotImplementedError as exc:
+        raise RuntimeError(f"Optimizer does not support PP stage-local updates: {exc}") from exc
+
+    new_state = state.replace(step=state.step + 1, graphstate=graphstate, opt_state=opt_state)
+    return new_state, metrics
+
+
+def _run_scheduled_value_and_grad(
+    *,
+    value_and_grad: _ScheduledValueAndGradFn,
+    graphstate: tp.Any,
+    batch: dict,
+    batch_size: int,
+    minibatch_size: int,
+) -> tuple[jax.Array, tp.Any]:
+    num_accum_steps = batch_size // minibatch_size
+    if num_accum_steps == 1:
+        return value_and_grad(graphstate, batch)
+
+    loss_acc = None
+    grad_acc = None
+    for accum_idx in range(num_accum_steps):
+        minibatch = _slice_batch_for_scheduled_step(
+            batch,
+            batch_size,
+            accum_idx * minibatch_size,
+            minibatch_size,
+        )
+        loss_i, gradients_i = value_and_grad(graphstate, minibatch)
+        loss_acc = loss_i if loss_acc is None else loss_acc + loss_i
+        grad_acc = gradients_i if grad_acc is None else jax.tree_util.tree_map(jnp.add, grad_acc, gradients_i)
+
+    inv_steps = jnp.asarray(1.0 / num_accum_steps, dtype=jnp.float32)
+    return loss_acc * inv_steps, jax.tree_util.tree_map(lambda x: x * inv_steps, grad_acc)
+
+
+def _compile_scheduled_training_step(
+    *,
+    step_fn: tp.Callable[..., tp.Any],
+    mesh: MeshLike | None,
+    schedule: tp.Any,
+    batch_argnums: int | tp.Sequence[int] | None,
+    static_argnums: int | tp.Sequence[int] | None,
+    adapter: ScheduledLossAdapter,
+) -> tp.Callable[..., tp.Any]:
+    if mesh is None:
+        raise ValueError("mpmd_scheduler requires compile_trainer_step(..., mesh=...).")
+
+    step_signature = inspect.signature(step_fn)
+    scheduled_vag = _ScheduledValueAndGradCompiler(
+        mesh=mesh,
+        schedule=schedule,
+        batch_argnums=batch_argnums,
+        adapter=adapter,
+    )
+
+    def scheduled_training_step(
+        state: EasyDeLState,
+        batch: collections.abc.Mapping[str, jax.Array],
+        *step_args: tp.Any,
+        **step_kwargs: tp.Any,
+    ) -> tuple[EasyDeLState, LossMetrics]:
+        batch = dict(batch)
+        bound = step_signature.bind(state, batch, *step_args, **step_kwargs)
+        bound.apply_defaults()
+        bound_arguments = dict(bound.arguments)
+        loss_config = bound_arguments.get("loss_config")
+        learning_rate_fn = bound_arguments.get("learning_rate_fn")
+        gradient_accumulation_steps = bound_arguments.get("gradient_accumulation_steps", 1)
+        batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=bound_arguments.get("partition_spec"),
+        )
+        bound_arguments["batch"] = batch
+        bound_arguments["partition_spec"] = partition_spec
+        call = ScheduledStepCall(
+            step_fn=step_fn,
+            state=state,
+            batch=batch,
+            args=step_args,
+            kwargs=step_kwargs,
+            bound_arguments=bound_arguments,
+            schedule=schedule,
+        )
+        if adapter.prepare_batch is not None:
+            batch = dict(adapter.prepare_batch(call))
+            bound_arguments["batch"] = batch
+            call = ScheduledStepCall(
+                step_fn=step_fn,
+                state=state,
+                batch=batch,
+                args=step_args,
+                kwargs=step_kwargs,
+                bound_arguments=bound_arguments,
+                schedule=schedule,
+            )
+        value_and_grad = scheduled_vag.get(call)
+        loss, gradients = _run_scheduled_value_and_grad(
+            value_and_grad=value_and_grad,
+            graphstate=state.graphstate,
+            batch=batch,
+            batch_size=batch_size,
+            minibatch_size=minibatch_size,
+        )
+        return _apply_stage_local_gradients(
+            state=state,
+            gradients=gradients,
+            loss=loss,
+            loss_config=loss_config,
+            learning_rate_fn=learning_rate_fn,
+        )
+
+    scheduled_training_step.__name__ = f"{type(schedule).__name__}_{adapter.name}_{_scheduled_step_name(step_fn)}"
+    scheduled_training_step.static_argnums_ = _normalize_static_argnums(static_argnums)
+    return scheduled_training_step
+
+
 def compile_trainer_auxiliary(
     fn: tp.Callable[..., tp.Any],
     *,
-    mesh: tp.Any | None = None,
+    mesh: MeshLike | None = None,
+    arguments: tp.Any | None = None,
     in_shardings: tp.Any = _UNSPECIFIED,
     out_shardings: tp.Any = _UNSPECIFIED,
     **jit_kwargs,
@@ -836,6 +1293,7 @@ def compile_trainer_auxiliary(
     return compile_trainer_step(
         fn,
         mesh=mesh,
+        arguments=arguments,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
         **jit_kwargs,

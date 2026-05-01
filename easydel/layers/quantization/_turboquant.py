@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 
 if TYPE_CHECKING:
-    pass
+    from easydel.infra.sharding import MeshLike
 
 
 @functools.lru_cache(maxsize=32)
@@ -122,7 +122,7 @@ class TurboQuantConstants:
     qjl_dim: int
     bits: int
 
-    def replicate(self, mesh: "jax.sharding.Mesh") -> "TurboQuantConstants":
+    def replicate(self, mesh: "MeshLike") -> "TurboQuantConstants":
         """Return a copy with all arrays replicated across the mesh.
 
         Shard-map kernels pass these constants with ``PartitionSpec()``
@@ -146,7 +146,7 @@ class TurboQuantConstants:
         config: TurboQuantConfig,
         head_dim: int,
         layer_index: int = 0,
-        mesh: "jax.sharding.Mesh | None" = None,
+        mesh: "MeshLike | None" = None,
     ) -> TurboQuantConstants:
         """Generate all precomputed constants from config.
 

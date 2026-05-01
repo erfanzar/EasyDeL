@@ -15,8 +15,6 @@
 import typing
 import typing as tp
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
@@ -259,9 +257,6 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        return None
 
 
 __all__ = ["GlmMoeDsaConfig"]

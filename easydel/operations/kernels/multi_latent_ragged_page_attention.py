@@ -28,6 +28,7 @@ from spectrax import common_types as ct
 
 from easydel.axis import ATTN_DP
 from easydel.caching import MLARaggedPagesCacheView, RaggedPagesMetadata
+from easydel.infra.sharding import axis_index, mesh_axis_size, normalize_axis_names
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
@@ -41,67 +42,6 @@ from ..requirements import (
 )
 
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
-
-
-def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
-    """Convert an axis specification into a canonical tuple of axis name strings.
-
-    Args:
-        axis: A single axis name, a sequence of axis names, or None.
-
-    Returns:
-        A tuple of non-empty axis name strings. Returns ``()`` when *axis* is None.
-    """
-    if axis is None:
-        return ()
-    if isinstance(axis, (tuple, list)):
-        return tuple(str(a) for a in axis if a)
-    return (str(axis),)
-
-
-def _mesh_axis_size(mesh, axis_names: tuple[str, ...]) -> int:
-    """Compute the total size of one or more mesh axes.
-
-    Multiplies together the sizes of the requested axes from a JAX mesh.
-    Missing axis names are treated as size 1.
-
-    Args:
-        mesh: A ``jax.sharding.Mesh`` (or None).
-        axis_names: Tuple of mesh axis names whose sizes are multiplied.
-
-    Returns:
-        Product of the sizes of *axis_names* in *mesh*. Returns 1 when
-        *mesh* is None or *axis_names* is empty.
-    """
-    size = 1
-    if mesh is None:
-        return size
-    for axis_name in axis_names:
-        size *= int(mesh.shape.get(axis_name, 1))
-    return int(size)
-
-
-def _axis_index(axis_names: tuple[str, ...]) -> jax.Array:
-    """Compute a linearized device index across multiple mesh axes.
-
-    For a single axis this returns ``jax.lax.axis_index(axis)``.  For
-    multiple axes the indices are combined in row-major order so that
-    each device gets a unique int32 index in ``[0, product_of_sizes)``.
-
-    Args:
-        axis_names: Tuple of mesh axis names. May be empty.
-
-    Returns:
-        A scalar int32 ``jax.Array`` representing the linearized index
-        of the current device. Returns ``0`` when *axis_names* is empty.
-    """
-    if not axis_names:
-        return jnp.int32(0)
-    idx = jax.lax.axis_index(axis_names[0]).astype(jnp.int32)
-    for axis_name in axis_names[1:]:
-        axis_size = jax.lax.psum(jnp.int32(1), axis_name)
-        idx = idx * axis_size + jax.lax.axis_index(axis_name).astype(jnp.int32)
-    return idx
 
 
 def _dp_page_axis(cache_view: MLARaggedPagesCacheView):
@@ -401,8 +341,8 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
-        page_axis_names = _normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
-        page_axis_size = _mesh_axis_size(self.metadata.mesh, page_axis_names)
+        page_axis_names = normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
+        page_axis_size = mesh_axis_size(self.metadata.mesh, page_axis_names)
         kv_pages_spec_replicated = resolve(
             axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
@@ -426,8 +366,8 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             mode=ct.MODE_PREFILL,
             shape=(queries_nope.shape[1],),
         )
-        head_axis_names = _normalize_axis_names(head_spec[0] if len(head_spec) > 0 else None)
-        head_axis_size = _mesh_axis_size(self.metadata.mesh, head_axis_names) if not head_aware_kv else 1
+        head_axis_names = normalize_axis_names(head_spec[0] if len(head_spec) > 0 else None)
+        head_axis_size = mesh_axis_size(self.metadata.mesh, head_axis_names) if not head_aware_kv else 1
 
         resolved_num_queries_per_block = _resolve_num_queries_per_block(
             num_q_heads=queries_nope.shape[1],
@@ -503,7 +443,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 full_distribution,
             ):
                 del full_distribution
-                shard_idx = _axis_index(page_axis_names)
+                shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
 
                 local_context_lens = jax.lax.dynamic_slice_in_dim(
@@ -887,8 +827,8 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
-        page_axis_names = _normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
-        page_axis_size = _mesh_axis_size(self.metadata.mesh, page_axis_names)
+        page_axis_names = normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
+        page_axis_size = mesh_axis_size(self.metadata.mesh, page_axis_names)
         kv_pages_spec_replicated = resolve(
             axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
@@ -909,8 +849,8 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
             mode=ct.MODE_PREFILL,
             shape=(queries_nope.shape[1],),
         )
-        head_axis_names = _normalize_axis_names(head_spec[0] if len(head_spec) > 0 else None)
-        head_axis_size = _mesh_axis_size(self.metadata.mesh, head_axis_names) if not head_aware_kv else 1
+        head_axis_names = normalize_axis_names(head_spec[0] if len(head_spec) > 0 else None)
+        head_axis_size = mesh_axis_size(self.metadata.mesh, head_axis_names) if not head_aware_kv else 1
 
         resolved_num_queries_per_block = _resolve_num_queries_per_block(
             num_q_heads=queries_nope.shape[1],
@@ -984,7 +924,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 full_distribution,
             ):
                 del full_distribution
-                shard_idx = _axis_index(page_axis_names)
+                shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
 
                 local_context_lens = jax.lax.dynamic_slice_in_dim(

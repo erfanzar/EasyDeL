@@ -28,7 +28,7 @@ def test_to_esurge_kwargs_forwards_string_extra_stops():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["extra_stops"] == "<|user|>"
+    assert kwargs["parsing"].extra_stops == "<|user|>"
 
 
 def test_to_esurge_kwargs_normalizes_iterable_extra_stops():
@@ -39,7 +39,7 @@ def test_to_esurge_kwargs_normalizes_iterable_extra_stops():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["extra_stops"] == ["<|user|>", "</assistant>"]
+    assert kwargs["parsing"].extra_stops == ["<|user|>", "</assistant>"]
 
 
 def test_to_esurge_kwargs_keeps_extra_stops_none_by_default():
@@ -47,9 +47,9 @@ def test_to_esurge_kwargs_keeps_extra_stops_none_by_default():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["extra_stops"] is None
-    assert kwargs["bind_graphstate_for_aot"] is False
-    assert kwargs["enable_window_aware_runtime_cap"] is False
+    assert kwargs["parsing"].extra_stops is None
+    assert kwargs["runtime"].bind_graphstate_for_aot is False
+    assert kwargs["runtime"].enable_window_aware_runtime_cap is False
 
 
 def test_to_esurge_kwargs_forwards_enable_window_aware_runtime_cap():
@@ -60,7 +60,7 @@ def test_to_esurge_kwargs_forwards_enable_window_aware_runtime_cap():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["enable_window_aware_runtime_cap"] is False
+    assert kwargs["runtime"].enable_window_aware_runtime_cap is False
 
 
 def test_to_esurge_kwargs_treats_null_window_aware_runtime_cap_as_default_false():
@@ -71,7 +71,7 @@ def test_to_esurge_kwargs_treats_null_window_aware_runtime_cap_as_default_false(
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["enable_window_aware_runtime_cap"] is False
+    assert kwargs["runtime"].enable_window_aware_runtime_cap is False
 
 
 def test_to_esurge_kwargs_defaults_data_parallelism_axis_to_dp():
@@ -79,7 +79,7 @@ def test_to_esurge_kwargs_defaults_data_parallelism_axis_to_dp():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["data_parallelism_axis"] == "dp"
+    assert kwargs["cache"].data_parallelism_axis == "dp"
 
 
 def test_to_esurge_kwargs_forwards_data_parallelism_axis():
@@ -90,7 +90,7 @@ def test_to_esurge_kwargs_forwards_data_parallelism_axis():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["data_parallelism_axis"] == "ep"
+    assert kwargs["cache"].data_parallelism_axis == "ep"
 
 
 def test_to_esurge_kwargs_forwards_bind_graphstate_for_aot():
@@ -101,7 +101,7 @@ def test_to_esurge_kwargs_forwards_bind_graphstate_for_aot():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["bind_graphstate_for_aot"] is True
+    assert kwargs["runtime"].bind_graphstate_for_aot is True
 
 
 def test_to_esurge_kwargs_forwards_worker_startup_timeout():
@@ -112,7 +112,7 @@ def test_to_esurge_kwargs_forwards_worker_startup_timeout():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["worker_startup_timeout"] == 75.5
+    assert kwargs["workers"].worker_startup_timeout == 75.5
 
 
 def test_to_esurge_kwargs_forwards_async_scheduling():
@@ -123,7 +123,7 @@ def test_to_esurge_kwargs_forwards_async_scheduling():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["async_scheduling"] is False
+    assert kwargs["runtime"].async_scheduling is False
 
 
 def test_to_esurge_kwargs_defaults_distributed_controls():
@@ -131,15 +131,15 @@ def test_to_esurge_kwargs_defaults_distributed_controls():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["distributed_mode"] is False
-    assert kwargs["distributed_role"] == "auto"
-    assert kwargs["distributed_world_size"] is None
-    assert kwargs["distributed_rank"] is None
-    assert kwargs["distributed_control_port"] == 19666
-    assert kwargs["distributed_control_bind_host"] == "0.0.0.0"
-    assert kwargs["distributed_step_timeout_s"] == 30.0
-    assert kwargs["distributed_connect_timeout_s"] == 15.0
-    assert kwargs["distributed_verify_sampling_digest"] is True
+    assert kwargs["distributed"].distributed_mode is False
+    assert kwargs["distributed"].distributed_role == "auto"
+    assert kwargs["distributed"].distributed_world_size is None
+    assert kwargs["distributed"].distributed_rank is None
+    assert kwargs["distributed"].distributed_control_port == 19666
+    assert kwargs["distributed"].distributed_control_bind_host == "0.0.0.0"
+    assert kwargs["distributed"].distributed_step_timeout_s == 30.0
+    assert kwargs["distributed"].distributed_connect_timeout_s == 15.0
+    assert kwargs["distributed"].distributed_verify_sampling_digest is True
 
 
 def test_to_esurge_kwargs_forwards_distributed_controls():
@@ -163,18 +163,18 @@ def test_to_esurge_kwargs_forwards_distributed_controls():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["distributed_mode"] is True
-    assert kwargs["distributed_role"] == "worker"
-    assert kwargs["distributed_service_name"] == "esurge-workers.internal"
-    assert kwargs["distributed_world_size"] == 4
-    assert kwargs["distributed_rank"] == 2
-    assert kwargs["distributed_control_port"] == 21001
-    assert kwargs["distributed_control_bind_host"] == "127.0.0.1"
-    assert kwargs["distributed_advertise_addr"] == "10.0.0.12"
-    assert kwargs["distributed_auth_token"] == "secret"
-    assert kwargs["distributed_step_timeout_s"] == 45.0
-    assert kwargs["distributed_connect_timeout_s"] == 20.0
-    assert kwargs["distributed_verify_sampling_digest"] is False
+    assert kwargs["distributed"].distributed_mode is True
+    assert kwargs["distributed"].distributed_role == "worker"
+    assert kwargs["distributed"].distributed_service_name == "esurge-workers.internal"
+    assert kwargs["distributed"].distributed_world_size == 4
+    assert kwargs["distributed"].distributed_rank == 2
+    assert kwargs["distributed"].distributed_control_port == 21001
+    assert kwargs["distributed"].distributed_control_bind_host == "127.0.0.1"
+    assert kwargs["distributed"].distributed_advertise_addr == "10.0.0.12"
+    assert kwargs["distributed"].distributed_auth_token == "secret"
+    assert kwargs["distributed"].distributed_step_timeout_s == 45.0
+    assert kwargs["distributed"].distributed_connect_timeout_s == 20.0
+    assert kwargs["distributed"].distributed_verify_sampling_digest is False
 
 
 def test_set_esurge_preserves_parsers_when_omitted_and_clears_when_none():
@@ -183,18 +183,18 @@ def test_set_esurge_preserves_parsers_when_omitted_and_clears_when_none():
 
     elm.set_esurge(tool_parser="openai", reasoning_parser="deepseek_r1")
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["tool_parser"] == "openai"  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["reasoning_parser"] == "deepseek_r1"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["parsing"]["tool_parser"] == "openai"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["parsing"]["reasoning_parser"] == "deepseek_r1"  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(max_num_seqs=8)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["tool_parser"] == "openai"  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["reasoning_parser"] == "deepseek_r1"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["parsing"]["tool_parser"] == "openai"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["parsing"]["reasoning_parser"] == "deepseek_r1"  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(tool_parser=None, reasoning_parser=None)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["tool_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["reasoning_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["parsing"]["tool_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["parsing"]["reasoning_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
 def test_set_esurge_bind_graphstate_for_aot_override_is_optional():
@@ -203,15 +203,15 @@ def test_set_esurge_bind_graphstate_for_aot_override_is_optional():
 
     elm.set_esurge(bind_graphstate_for_aot=True)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["runtime"]["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(max_num_seqs=8)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["runtime"]["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(bind_graphstate_for_aot=False)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["bind_graphstate_for_aot"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["runtime"]["bind_graphstate_for_aot"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
 def test_set_esurge_window_aware_runtime_cap_override_is_optional():
@@ -220,15 +220,15 @@ def test_set_esurge_window_aware_runtime_cap_override_is_optional():
 
     elm.set_esurge(enable_window_aware_runtime_cap=False)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["enable_window_aware_runtime_cap"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["runtime"]["enable_window_aware_runtime_cap"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(max_num_seqs=8)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["enable_window_aware_runtime_cap"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["runtime"]["enable_window_aware_runtime_cap"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(enable_window_aware_runtime_cap=True)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["enable_window_aware_runtime_cap"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["runtime"]["enable_window_aware_runtime_cap"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
 def test_serve_action_migrates_deprecated_tool_parser_name_to_esurge(monkeypatch):

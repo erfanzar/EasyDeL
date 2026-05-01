@@ -12,6 +12,7 @@ import os
 os.environ["HF_HOME"] = "/dev/shm/huggingface"
 os.environ["TRANSFORMERS_CACHE"] = "/dev/shm/huggingface"
 
+from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.sampling_params import SamplingParams
 
@@ -19,10 +20,8 @@ from easydel.inference.sampling_params import SamplingParams
 def main() -> None:
     engine = eSurge(
         model="Qwen/Qwen3-0.6B",
-        max_model_len=512,
-        max_num_seqs=64,
-        hbm_utilization=0.85,
-        enable_prefix_caching=True,
+        runtime=eSurgeRuntimeConfig.from_dict(max_model_len=512, max_num_seqs=64),
+        cache=eSurgeCacheRuntimeConfig.from_dict(hbm_utilization=0.85, enable_prefix_caching=True),
     )
     engine.initiate()
 

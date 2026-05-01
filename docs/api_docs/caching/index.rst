@@ -11,6 +11,7 @@ easydel.caching package
    ragged_page/index
    recurrent/index
    transformer/index
+   turboquant_ragged_page/index
    unified_attention/index
    _abstracts
    _metadatabuilder

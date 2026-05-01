@@ -13,8 +13,6 @@
 # limitations under the License.
 
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
@@ -170,19 +168,6 @@ class LlamaConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
-
 
 class VisionLlamaConfig(LlamaConfig):
     """Configuration for Llama models extended with a discrete vision token vocabulary.
@@ -224,16 +209,3 @@ class VisionLlamaConfig(LlamaConfig):
         self.vision_vocab_size = vision_vocab_size
         self.tie_vision_embeddings = tie_vision_embeddings
         self.sample_mode = sample_mode
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
