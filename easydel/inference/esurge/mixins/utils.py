@@ -618,9 +618,9 @@ class EngineUtilsMixin:
         """
         metadata = getattr(getattr(self.runner, "executor_manager", None), "metadata", None)
         details: dict[str, Any] = {
-            "max_model_len": self.max_model_len,
-            "max_num_seqs": self.max_num_seqs,
-            "page_size": self.page_size,
+            "max_model_len": self.runtime_config.max_model_len,
+            "max_num_seqs": self.runtime_config.max_num_seqs,
+            "page_size": self.cache_config.page_size,
         }
         if metadata is not None:
             for attr in ("num_pages", "page_size", "max_model_length", "hbm_utilization"):
@@ -693,31 +693,31 @@ class EngineUtilsMixin:
 
     def _touch_activity(self) -> None:
         """Update the last-activity timestamp for idle reset tracking."""
-        if self._idle_reset_seconds is None:
+        if self.worker_config.idle_reset_seconds is None:
             return
         self._idle_reset_last_activity = time.time()
 
     def _start_idle_monitor(self) -> None:
         """Start the idle-reset monitor thread if enabled."""
-        if self._idle_reset_seconds is None:
+        if self.worker_config.idle_reset_seconds is None:
             return
         if self._idle_monitor_thread and self._idle_monitor_thread.is_alive():
             return
         self._idle_monitor_event.clear()
 
-        check_interval = min(1.0, max(self._idle_reset_seconds / 4.0, 0.1))
+        check_interval = min(1.0, max(self.worker_config.idle_reset_seconds / 4.0, 0.1))
 
         def _idle_loop() -> None:
             while not self._idle_monitor_event.wait(check_interval):
                 if not self._scheduler_running:
                     continue
                 now = time.time()
-                if self._idle_reset_seconds is None:
+                if self.worker_config.idle_reset_seconds is None:
                     continue
                 idle_for = now - self._idle_reset_last_activity
-                if idle_for < self._idle_reset_seconds:
+                if idle_for < self.worker_config.idle_reset_seconds:
                     continue
-                if now - self._idle_reset_last_reset < self._idle_reset_min_interval:
+                if now - self._idle_reset_last_reset < self.worker_config.idle_reset_min_interval:
                     continue
                 if self.num_running_requests != 0 or self.num_pending_requests != 0 or self._active_requests:
                     # Activity resumed while waiting.

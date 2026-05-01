@@ -60,9 +60,12 @@ Note:
 from __future__ import annotations
 
 import warnings
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
 from .eval import BenchmarkConfig
+
+if TYPE_CHECKING:
+    from easydel.infra.etils import MpMdSchedulers
 
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
@@ -234,6 +237,10 @@ class BaseTrainerCfg(TypedDict, total=False):
         clip_grad: Maximum gradient norm for gradient clipping. None disables clipping.
         extra_optimizer_kwargs: Additional keyword arguments passed to the optimizer.
         custom_scheduler: Custom scheduler function or configuration.
+        mpmd_scheduler: Optional MPMD pipeline schedule (``spectrax.runtime.schedules.Schedule``
+            instance, e.g. ``Std1F1B(microbatches=N)`` / ``GPipe(microbatches=N)``). Forwarded
+            to ``spx.jit(schedule=...)`` when the model mesh is MPMD. None ⇒ forward-only
+            marker-cluster MPMD program (no microbatch interleaving). Ignored on SPMD meshes.
         dataloader_num_workers: Number of worker processes for data loading.
         dataloader_pin_memory: Whether to pin memory in data loaders for faster
             GPU transfer.
@@ -415,6 +422,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     clip_grad: NotRequired[float | None]
     extra_optimizer_kwargs: NotRequired[dict]
     custom_scheduler: NotRequired[Any]
+    mpmd_scheduler: NotRequired[MpMdSchedulers | None]
 
     dataloader_num_workers: NotRequired[int | None]
     dataloader_pin_memory: NotRequired[bool | None]
@@ -1527,6 +1535,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "scheduler": "none",
     "warmup_steps": 0,
     "weight_decay": 0.01,
+    "mpmd_scheduler": None,
     "dataloader_num_workers": 0,
     "dataloader_pin_memory": False,
     "remove_unused_columns": True,

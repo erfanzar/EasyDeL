@@ -64,12 +64,32 @@ warnings.filterwarnings("ignore", message=".*'repr' attribute.*", category=UserW
 warnings.filterwarnings("ignore", message=".*'frozen' attribute.*", category=UserWarning)
 
 try:
-    from tensorboardX import SummaryWriter
+    from spectrax.loggers import SummaryWriter
 except ImportError:
     try:
-        from torch.utils.tensorboard import SummaryWriter
+        from spectrax.loggers import Logger as _SpectraXLogger
+        from spectrax.loggers import TensorBoardBackend
+
+        class SummaryWriter(_SpectraXLogger):  # type: ignore[no-redef]
+            """Compatibility wrapper for SpectraX versions without SummaryWriter."""
+
+            def __init__(
+                self,
+                log_dir: str | os.PathLike[str] | None = None,
+                *,
+                auto_flush: bool = True,
+                **kwargs: tp.Any,
+            ):
+                log_dir = log_dir or kwargs.pop("logdir", None) or "runs"
+                super().__init__([TensorBoardBackend(log_dir)], auto_flush=auto_flush)
+
     except ImportError:
-        SummaryWriter = tp.Any  # type: ignore[misc,assignment]
+
+        class SummaryWriter:  # type: ignore[no-redef]
+            def __init__(self, *args: tp.Any, **kwargs: tp.Any):
+                raise ModuleNotFoundError("spectrax")
+
+
 try:
     import wandb
 except ModuleNotFoundError:

@@ -32,8 +32,6 @@ import jax.numpy as jnp
 import pytest
 import spectrax as spx
 
-import easydel as ed
-
 AXIS_NAMES = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
 
@@ -90,17 +88,12 @@ def test_ring_of_experts_assertion_dormant_when_disabled():
     block = _build_qwen3_moe_block(num_experts=10, ep_axis=4, use_ring_of_experts=False)
     x = jnp.ones((1, 4, 32), dtype=jnp.float32)
 
-
     try:
         with block.config.mesh:
             block(x)
     except ValueError as ve:
-        assert "use_ring_of_experts" not in str(ve), (
-            f"divisibility assertion fired with use_ring_of_experts=False: {ve}"
-        )
+        assert "use_ring_of_experts" not in str(ve), f"divisibility assertion fired with use_ring_of_experts=False: {ve}"
     except Exception:
-
-
         pass
 
 
@@ -114,9 +107,6 @@ def test_ring_of_experts_even_divisibility_passes_assertion():
         with block.config.mesh:
             block(x)
     except ValueError as ve:
-        assert "use_ring_of_experts" not in str(ve), (
-            f"divisibility assertion fired on clean (8, 4) config: {ve}"
-        )
+        assert "use_ring_of_experts" not in str(ve), f"divisibility assertion fired on clean (8, 4) config: {ve}"
     except Exception:
-
         pass

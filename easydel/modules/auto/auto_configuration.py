@@ -21,12 +21,12 @@ import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath
 from jax.sharding import PartitionSpec
-from spectrax import PartitionAxis, make_shard_and_gather_fns, match_partition_rules
+from spectrax import PartitionAxis, make_shard_and_gather_fns
 
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
-from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.sharding import MeshLike, replicated_named_sharding
 from easydel.utils.instrumentation import phase_timer
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -341,7 +341,7 @@ class AutoEasyDeLConfig:
 
 def _shard_gather_fns_from_named_shardings(
     named_shardings: tp.Any,
-    mesh: tp.Any,
+    mesh: MeshLike,
 ) -> tuple[tp.Any, tp.Any]:
     """Build per-leaf shard/gather closures from a tree of ``NamedShardings``.
 
@@ -402,7 +402,6 @@ class AutoShardAndGatherFunctions:
     def from_config(
         cls,
         config: EasyDeLBaseConfig,
-        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         flatten: bool = True,
         model_task: TaskType = TaskType.CAUSAL_LM,
         depth_target: list[str] | None = None,
@@ -412,8 +411,6 @@ class AutoShardAndGatherFunctions:
 
         Args:
             config: An `EasyDeLBaseConfig` object containing the model configuration.
-            partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
-              If None, uses the default partition rules from the `config`.
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
                         model_task (TaskType): Task type of model load and find.
             depth_target: Pad the sharding to depth, for example make {params:tensor} with
@@ -432,13 +429,12 @@ class AutoShardAndGatherFunctions:
         _, module = get_modules_by_type(config.model_type, model_task)
         with _shardgen_phase("from_config: module.lazy_init"):
             model = module.lazy_init(config=config, rngs=spx.Rngs(0))
-        return cls.from_model(model, partition_rules=partition_rules, flatten=flatten)
+        return cls.from_model(model, flatten=flatten)
 
     @classmethod
     def from_model(
         cls,
         model: EasyDeLBaseModule,
-        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         flatten: bool = True,
     ):
         """Derive shard/gather functions from an already lazy-initialized model.
@@ -447,29 +443,16 @@ class AutoShardAndGatherFunctions:
         already paid the lazy_init cost — it avoids running ``lazy_init`` a
         second time just to compute parameter shapes.
 
-        # @erfanzar NOTE: when ``partition_rules`` is None we go through the
-        # MPMD-aware path: ``spx.extract_sharding_structure`` reads each
-        # Variable's *live* ``NamedSharding`` (with per-stage submeshes
-        # preserved) and we build per-leaf ``device_put`` closures from
-        # that.  The legacy regex/PartitionSpec path -- which routes through
-        # ``make_shard_and_gather_fns(mesh=...)`` -- rebinds every leaf to
-        # the *full* mesh, the same regression class that nuked opt-state
-        # placement in ``init_tx``.  We only fall through to it when the
-        # caller hands us explicit rules.
+        Uses the MPMD-aware path: ``spx.extract_sharding_structure`` reads each
+        Variable's *live* ``NamedSharding`` (with per-stage submeshes
+        preserved) and we build per-leaf ``device_put`` closures from
+        that.
         """
-        if partition_rules is None:
-            with _shardgen_phase("from_model: extract_sharding_structure"):
-                _gdef, gstate = spx.export(model)
-                named_shardings = spx.extract_sharding_structure(gstate.raw(), mesh=model.mesh)
-            with _shardgen_phase("from_model: build per-leaf shard/gather fns"):
-                shard_fns, gather_fns = _shard_gather_fns_from_named_shardings(named_shardings, model.mesh)
-        else:
-            with _shardgen_phase("from_model: _get_partition_rules"):
-                partition_rules = model._get_partition_rules(partition_rules)
-            with _shardgen_phase("from_model: match_partition_rules(graphtree_shape)"):
-                partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)
-            with _shardgen_phase("from_model: make_shard_and_gather_fns"):
-                shard_fns, gather_fns = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=model.mesh)
+        with _shardgen_phase("from_model: extract_sharding_structure"):
+            _gdef, gstate = spx.export(model)
+            named_shardings = spx.extract_sharding_structure(gstate.raw(), mesh=model.mesh)
+        with _shardgen_phase("from_model: build per-leaf shard/gather fns"):
+            shard_fns, gather_fns = _shard_gather_fns_from_named_shardings(named_shardings, model.mesh)
 
         if flatten and not is_flatten(shard_fns):
             gather_fns = flatten_dict(gather_fns)
@@ -481,19 +464,18 @@ class AutoShardAndGatherFunctions:
         return shard_fns, gather_fns
 
     @staticmethod
-    def from_params(params, partition_rules, mesh):
+    def from_params(params, mesh):
         """
-        Generates shard and gather functions directly from model parameters, partition rules, and a mesh.
+        Generates shard and gather functions directly from model parameters and a mesh.
 
         Args:
             params: The model parameters (pytree) to generate functions for.
-            partition_rules: A tuple of tuples defining the partitioning strategy.
             mesh: The JAX device mesh to use for sharding.
 
         Returns:
             A tuple containing the shard and gather functions.
         """
-        partition_specs = match_partition_rules(partition_rules, params)
+        partition_specs = jax.tree_util.tree_map(lambda x: PartitionSpec() if hasattr(x, "shape") else None, params)
         return make_shard_and_gather_fns(
             partition_specs=partition_specs,
             mesh=mesh,
@@ -509,7 +491,6 @@ class AutoShardAndGatherFunctions:
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
-        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         flatten: bool = True,
         config_kwargs: Mapping[str, tp.Any] | None = None,
         model_task: TaskType = TaskType.CAUSAL_LM,
@@ -525,8 +506,6 @@ class AutoShardAndGatherFunctions:
             sharding_axis_names: The names of the sharding axes. Defaults to ("pp", "dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             backend: The backend to use for custom kernels. Defaults to None.
-            partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
-                If None, uses the default partition rules from the `config`.
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
             config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
                         model_task (TaskType): Task type of model load and find.
@@ -554,7 +533,6 @@ class AutoShardAndGatherFunctions:
                 setattr(config, k, v)
         return cls.from_config(  # pyright: ignore[reportReturnType]
             config=config,
-            partition_rules=partition_rules,
             flatten=flatten,
             model_task=model_task,
         )

@@ -33,6 +33,7 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
+import spectrax as spx
 from jax import Array as JaxArray
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -43,10 +44,18 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    cached_scheduled_auxiliary,
+    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
+    scheduled_loss_cache_key,
+    stop_gradient_tree,
+    sync_module_schedule_config,
     update_metrics,
     update_state_respectfully,
 )
@@ -442,6 +451,67 @@ def _stop_gradient_tree(tree):
     return jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
 
 
+def _distillation_forward_outputs(
+    model,
+    batch: collections.abc.Mapping[str, jax.Array],
+    *,
+    use_chunked: bool,
+    request_hidden_states: bool,
+    request_attentions: bool,
+) -> dict[str, tp.Any]:
+    call_kwargs = dict(batch)
+    call_kwargs.pop("labels", None)
+    call_kwargs.pop("completion_mask", None)
+    call_kwargs.pop("assistant_masks", None)
+    for key in ("teacher_logits", "teacher_hidden_for_kl", "teacher_hidden_states", "teacher_attentions"):
+        call_kwargs.pop(key, None)
+    if use_chunked:
+        call_kwargs["apply_lm_head"] = False
+    if request_hidden_states:
+        call_kwargs["output_hidden_states"] = True
+    if request_attentions:
+        call_kwargs["output_attentions"] = True
+    call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
+    call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+    outputs = model(**call_kwargs)
+
+    result: dict[str, tp.Any] = {}
+    if use_chunked:
+        result["hidden_for_kl"] = outputs.last_hidden_state
+    else:
+        logits = getattr(outputs, "logits", None)
+        if logits is None:
+            raise TypeError(f"{type(model).__name__} did not return logits for distillation.")
+        result["logits"] = logits
+    if request_hidden_states:
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is not None:
+            result["hidden_states"] = tuple(hidden_states)
+    if request_attentions:
+        attentions = getattr(outputs, "attentions", None)
+        if attentions is not None:
+            result["attentions"] = tuple(attentions)
+    return result
+
+
+@functools.lru_cache(maxsize=16)
+def _make_distillation_aux_forward(
+    use_chunked: bool,
+    request_hidden_states: bool,
+    request_attentions: bool,
+):
+    def forward(model, batch):
+        return _distillation_forward_outputs(
+            model,
+            batch,
+            use_chunked=use_chunked,
+            request_hidden_states=request_hidden_states,
+            request_attentions=request_attentions,
+        )
+
+    return forward
+
+
 def distillation_step(
     student_state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
@@ -603,7 +673,7 @@ def distillation_step(
         completion_mask = minibatch.get("completion_mask", None)
 
         if use_chunked:
-            total_loss, loss_components = chunked_distillation_loss(
+            total_loss, _loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs.last_hidden_state,
                 teacher_hidden=teacher_hidden_for_kl,
                 student_lm_head_fn=module.make_lm_head_fn(),
@@ -708,3 +778,170 @@ def distillation_step(
     else:
         _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
         return metrics
+
+
+def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
+    batch = dict(call.batch)
+    use_chunked = call.get("logits_chunk_size") is not None and call.get("logits_chunk_size") > 0
+    request_hidden_states = call.get("hidden_state_weight", 0.0) != 0.0
+    request_attentions = call.get("attention_weight", 0.0) != 0.0
+    required_key = "teacher_hidden_for_kl" if use_chunked else "teacher_logits"
+    if required_key in batch:
+        return batch
+
+    teacher_state = call.get("teacher_state")
+    if teacher_state is None:
+        raise RuntimeError("Distillation scheduled MPMD training requires teacher_state.")
+
+    teacher_model = teacher_state.model
+    teacher_model.eval()
+    sync_module_schedule_config(teacher_model, call.schedule)
+    constrained_batch = constrain_scheduled_batch(teacher_model, batch, call.get("partition_spec"))
+    forward_fn = _make_distillation_aux_forward(use_chunked, request_hidden_states, request_attentions)
+    teacher_forward = cached_scheduled_auxiliary(forward_fn, teacher_model.mesh)
+    teacher_outputs = stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))
+    if use_chunked:
+        batch["teacher_hidden_for_kl"] = teacher_outputs["hidden_for_kl"]
+    else:
+        batch["teacher_logits"] = teacher_outputs["logits"]
+    if request_hidden_states and "hidden_states" in teacher_outputs:
+        batch["teacher_hidden_states"] = teacher_outputs["hidden_states"]
+    if request_attentions and "attentions" in teacher_outputs:
+        batch["teacher_attentions"] = teacher_outputs["attentions"]
+    return batch
+
+
+def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=(
+            "partition_spec",
+            "temperature",
+            "alpha",
+            "hidden_state_weight",
+            "hidden_state_layers",
+            "hidden_state_loss",
+            "attention_weight",
+            "attention_layers",
+            "attention_normalize",
+            "logits_chunk_size",
+        ),
+        object_fields=("straight_through_emulator", "teacher_state"),
+    )
+
+
+def _make_distillation_scheduled_loss(call):
+    partition_spec = call.get("partition_spec")
+    temperature = call.get("temperature", 4.0)
+    alpha = call.get("alpha", 0.9)
+    hidden_state_weight = call.get("hidden_state_weight", 0.0)
+    hidden_state_layers = call.get("hidden_state_layers")
+    hidden_state_loss = call.get("hidden_state_loss", "mse")
+    attention_weight = call.get("attention_weight", 0.0)
+    attention_layers = call.get("attention_layers")
+    attention_normalize = call.get("attention_normalize", False)
+    logits_chunk_size = call.get("logits_chunk_size")
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
+    request_hidden_states = hidden_state_weight != 0.0
+    request_attentions = attention_weight != 0.0
+    teacher_state = call.get("teacher_state")
+
+    if hidden_state_loss != "mse":
+        raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        student_outputs = _distillation_forward_outputs(
+            module,
+            call_batch,
+            use_chunked=use_chunked,
+            request_hidden_states=request_hidden_states,
+            request_attentions=request_attentions,
+        )
+        labels = call_batch.get("labels", None)
+        attention_mask = call_batch.get("attention_mask", None)
+        completion_mask = call_batch.get("completion_mask", None)
+
+        if use_chunked:
+            if teacher_state is None:
+                raise RuntimeError("Chunked distillation scheduled MPMD training requires teacher_state.")
+            total_loss, _loss_components = chunked_distillation_loss(
+                student_hidden=student_outputs["hidden_for_kl"],
+                teacher_hidden=jax.lax.stop_gradient(call_batch["teacher_hidden_for_kl"]),
+                student_lm_head_fn=module.make_lm_head_fn(),
+                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
+                attention_mask=attention_mask,
+                loss_mask=completion_mask,
+                labels=labels,
+                use_hard_labels=(labels is not None),
+                temperature=temperature,
+                alpha=alpha,
+                chunk_size=int(logits_chunk_size),
+            )
+        else:
+            total_loss, _loss_components = distillation_loss(
+                student_logits=student_outputs["logits"],
+                teacher_logits=jax.lax.stop_gradient(call_batch["teacher_logits"]),
+                attention_mask=attention_mask,
+                loss_mask=completion_mask,
+                labels=labels,
+                use_hard_labels=(labels is not None),
+                temperature=temperature,
+                alpha=alpha,
+            )
+
+        if request_hidden_states:
+            student_hidden = student_outputs.get("hidden_states")
+            teacher_hiddens = call_batch.get("teacher_hidden_states")
+            if student_hidden is None or teacher_hiddens is None:
+                raise ValueError(
+                    "Hidden-state distillation requested but models did not return hidden states. "
+                    "Please ensure `output_hidden_states` is supported."
+                )
+            student_indices = _resolve_indices(len(student_hidden), hidden_state_layers, default_all=False)
+            teacher_indices = _resolve_indices(len(teacher_hiddens), hidden_state_layers, default_all=False)
+            hidden_losses = []
+            for s_idx, t_idx in zip(student_indices, teacher_indices, strict=True):
+                hidden_losses.append(
+                    _masked_mse(student_hidden[s_idx], jax.lax.stop_gradient(teacher_hiddens[t_idx]), attention_mask)
+                )
+            hidden_loss_value = jnp.mean(jnp.stack(hidden_losses)).astype(total_loss.dtype)
+            total_loss = total_loss + jnp.asarray(hidden_state_weight, dtype=total_loss.dtype) * hidden_loss_value
+
+        if request_attentions:
+            student_attentions = student_outputs.get("attentions")
+            teacher_attns = call_batch.get("teacher_attentions")
+            if student_attentions is None or teacher_attns is None:
+                raise ValueError(
+                    "Attention distillation requested but models did not return attention probabilities. "
+                    "Please ensure `output_attentions` is supported."
+                )
+            student_indices = _resolve_indices(len(student_attentions), attention_layers, default_all=True)
+            teacher_indices = _resolve_indices(len(teacher_attns), attention_layers, default_all=True)
+            attn_mask = _build_attention_mask(attention_mask, dtype=total_loss.dtype)
+            attention_losses = []
+            for s_idx, t_idx in zip(student_indices, teacher_indices, strict=True):
+                s_attn = student_attentions[s_idx]
+                t_attn = jax.lax.stop_gradient(teacher_attns[t_idx])
+                if attention_normalize:
+                    s_attn = _normalize_attention(s_attn)
+                    t_attn = _normalize_attention(t_attn)
+                attention_losses.append(_masked_mse(s_attn, t_attn, attn_mask))
+            attention_loss_value = jnp.mean(jnp.stack(attention_losses)).astype(total_loss.dtype)
+            total_loss = total_loss + jnp.asarray(attention_weight, dtype=total_loss.dtype) * attention_loss_value
+
+        return total_loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    distillation_step,
+    ScheduledLossAdapter(
+        name="distillation",
+        make_loss=_make_distillation_scheduled_loss,
+        make_cache_key=_distillation_scheduled_loss_cache_key,
+        prepare_batch=_prepare_distillation_scheduled_batch,
+    ),
+)

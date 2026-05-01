@@ -324,7 +324,9 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
             raise SystemExit("`serve.tool_parser_name` must be a non-empty string.")
         tool_parser_name = tool_parser_name.strip()
         if tool_parser_name.lower() != "auto":
-            configured_tool_parser = elm.config.get("esurge", {}).get("tool_parser")
+            esurge_config = elm.config.get("esurge", {})
+            parsing_config = esurge_config.get("parsing", {}) if isinstance(esurge_config, dict) else {}
+            configured_tool_parser = parsing_config.get("tool_parser", esurge_config.get("tool_parser"))
             if configured_tool_parser is None:
                 logger.warning(
                     "`serve.tool_parser_name=%s` is deprecated; migrating it to `esurge.tool_parser` for this run.",

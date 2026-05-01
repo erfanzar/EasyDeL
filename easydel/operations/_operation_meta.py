@@ -19,16 +19,22 @@ import enum
 import typing as tp
 from typing import NamedTuple
 
-__all__ = ["AttnShardingRules", "OperationMetadata"]
-
 import jax
 import jaxtyping
+import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from spectrax import PartitionAxis, common_types
 
-from easydel.infra.sharding import AxisPolicy, RuntimeShardingResolver, coerce_runtime_sharding_resolver
+from easydel.infra.sharding import (
+    AxisPolicy,
+    MeshLike,
+    RuntimeShardingResolver,
+    StageMesh,
+    coerce_runtime_sharding_resolver,
+    resolve_stage_mesh,
+)
 
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
@@ -40,6 +46,8 @@ else:
     EasyDeLBackends = enum.Enum | str
     EasyDeLBaseConfig = object
     BaseOperationConfig = object
+
+__all__ = ["AttnShardingRules", "OperationMetadata"]
 
 logger = get_logger("EasyDeL-OperationOperator")
 NOT_GIVEN = common_types.NOT_GIVEN
@@ -137,7 +145,7 @@ class OperationMetadata:
     # True forces cache requirement.
     requires_cache: bool | None = None
 
-    _stored_mesh: jax.sharding.Mesh | None = NOT_GIVEN
+    _stored_mesh: MeshLike | None = NOT_GIVEN
 
     def __post_init__(self) -> None:
         """
@@ -169,8 +177,10 @@ class OperationMetadata:
         self.set_attrs_carefully("operation_configs", None, "operation_configs")
         # fmt:on
         if self._stored_mesh is NOT_GIVEN and self.base_config is None:
-            mesh: jax.sharding.Mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-            if mesh.empty:
+            mesh: MeshLike | None = spx.get_incontext_mesh(raise_error=False)
+            if mesh is None:
+                mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
+            if mesh is None or getattr(mesh, "empty", False):
                 raise ValueError(
                     "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
                 )
@@ -221,16 +231,18 @@ class OperationMetadata:
         )
 
     @property
-    def mesh(self) -> jax.sharding.Mesh | None:
+    def mesh(self) -> StageMesh:
         """Get current mesh from base_config if available, otherwise return stored mesh."""
         if self.base_config is not None:
             mesh = self.base_config.mesh
         else:
             mesh = self._stored_mesh
-        return getattr(mesh, "jax_mesh", mesh)
+        if mesh is None or mesh is NOT_GIVEN:
+            return None
+        return resolve_stage_mesh(mesh)
 
     @mesh.setter
-    def mesh(self, value: jax.sharding.Mesh | None):
+    def mesh(self, value: MeshLike | None):
         """Set mesh value for cases where base_config is not available."""
         self._stored_mesh = value
 

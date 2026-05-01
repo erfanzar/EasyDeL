@@ -204,6 +204,17 @@ class SamplerExecutor:
         """
         return list(self._cache.keys())
 
+    def cache_key(self, *, padded_num_reqs: int) -> tuple[int, int, str, str]:
+        """Return the sampler cache key.
+
+        Sampler executable shapes are independent of the model token bucket:
+        every token bucket passes the same ``[padded_num_reqs, vocab]`` logits
+        and scalar ``total_tokens``.  Keying by ``num_tokens`` creates many
+        redundant compiles during startup.
+        """
+        mode = "aot" if self.use_aot_forward else "jit"
+        return (0, int(padded_num_reqs), "sampler", mode)
+
     def has(self, key: tuple[int, int, str, str]) -> bool:
         """Check if a key exists in the cache.
 
@@ -229,8 +240,8 @@ class SamplerExecutor:
             KeyError: If no compiled function exists for this configuration.
                 Call compile() first to create the cached entry.
         """
-        mode = "aot" if self.use_aot_forward else "jit"
-        key = (int(num_tokens), int(padded_num_reqs), "sampler", mode)
+        del num_tokens
+        key = self.cache_key(padded_num_reqs=padded_num_reqs)
         return self._cache_get(key)
 
     def compile(
@@ -258,8 +269,7 @@ class SamplerExecutor:
             compiled XLA executable. For JIT compilation, performs a warmup
             call to trigger tracing and compilation.
         """
-        mode = "aot" if self.use_aot_forward else "jit"
-        key = (int(num_tokens), int(padded_num_reqs), "sampler", mode)
+        key = self.cache_key(padded_num_reqs=padded_num_reqs)
         if key in self._cache:
             return
 
@@ -278,7 +288,7 @@ class SamplerExecutor:
             jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
             jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
             jnp.ones((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jnp.arange(int(padded_num_reqs), dtype=jnp.int32),
+            jax.device_put(jnp.arange(int(padded_num_reqs), dtype=jnp.int32), self._empty_sharding),
             jnp.ones((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
             jnp.ones((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
             jax.device_put(jnp.int32(int(padded_num_reqs)), self._empty_sharding),
@@ -286,7 +296,7 @@ class SamplerExecutor:
             jnp.ones((int(padded_num_reqs),), dtype=inputs.req_num_tokens_full.dtype, out_sharding=self._empty_sharding),
             jnp.ones((int(padded_num_reqs),), dtype=jnp.bool_, out_sharding=self._empty_sharding),
             dummy_logits,
-            inputs.rng_key,
+            jax.device_put(inputs.rng_key, self._empty_sharding),
             jnp.zeros(
                 (int(inputs.req_num_tokens_full.shape[0]), vocab_size),
                 dtype=jnp.uint32,

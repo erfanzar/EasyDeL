@@ -24,8 +24,8 @@ import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from jax.interpreters import pxla
-from jax.sharding import Mesh, NamedSharding
+
+from easydel.infra.sharding import MeshLike, specs_to_named_sharding
 
 T = tp.TypeVar("T", bound=spx.Module)
 ModulePath = tuple[str, ...]
@@ -322,21 +322,9 @@ def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
     return bound
 
 
-def specs_to_name_sharding(tree: dict, mesh: Mesh | None = None) -> dict:
-    """
-    Converts a dictionary of specifications to a dictionary of NamedSharding objects.
-
-    Args:
-            tree (Dict): A dictionary where the keys are names and the values are specifications.
-            mesh (Optional[Mesh]): An optional Mesh object. If not provided, the default physical mesh from
-                                                             pxla.thread_resources.env.physical_mesh is used.
-
-    Returns:
-            Dict: A dictionary where the keys are the same as the input dictionary, and the values are NamedSharding
-                            objects created from the specifications and the provided or default mesh.
-    """
-    mesh = mesh or pxla.thread_resources.env.physical_mesh
-    return jax.tree_util.tree_map(lambda spec: NamedSharding(spec=spec, mesh=mesh), tree)
+def specs_to_name_sharding(tree: dict, mesh: MeshLike | None = None) -> dict:
+    """Convert a PyTree of PartitionSpecs to a PyTree of NamedShardings."""
+    return specs_to_named_sharding(tree, mesh)
 
 
 def tree_apply(fns: FnDict, tree: TreeDict) -> TreeDict:

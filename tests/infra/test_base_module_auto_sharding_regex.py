@@ -118,7 +118,7 @@ class _CompoundModel(_ConfigBypassMixin, EasyDeLBaseModule):
 
 def test_resolve_shardings_compacts_layer_indices():
     model = _DummyModel(config=_DummyConfig(), rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     assert rules, "Expected sharding rules to be generated."
     assert rules[-1][0] == ".*"
@@ -134,7 +134,7 @@ def test_resolve_shardings_compacts_layer_indices():
 
 def test_resolve_shardings_matches_optimizer_prefixed_paths():
     model = _DummyModel(config=_DummyConfig(), rngs=spx.Rngs(0))
-    rules = model.resolve_shardings_automatically()
+    rules = model.resolve_shardings_regex()
 
     for path in ("mu/layers/5/weight", "0/mu/layers/5/weight"):
         matching = [(pat, spec) for pat, spec in rules if re.match(pat, path)]
@@ -151,17 +151,6 @@ def test_metadata_for_layout_uses_spectrax_sharding_for_compound_axes():
     assert "tensor_layout" not in metadata
 
 
-def test_builtin_parameter_axis_names_support_compound_mesh_axes():
-    model = _CompoundModel(config=_CompoundConfig(), rngs=spx.Rngs(0), layer_type=_CompoundParameterLayer)
-
-    specs = model._parameter_partition_specs()
-    spec = (
-        specs.get("parameters", "layer.weight") if isinstance(specs, spx.State) else specs["parameters"]["layer.weight"]
-    )
-
-    assert spec == PartitionSpec(("fsdp", "sp"), "tp")
-
-
 def test_builtin_parameter_axis_names_shard_during_model_init():
     model = _CompoundModel(config=_CompoundConfig(), rngs=spx.Rngs(0), layer_type=_CompoundParameterLayer)
 
@@ -170,17 +159,6 @@ def test_builtin_parameter_axis_names_shard_during_model_init():
     assert isinstance(sharding, NamedSharding)
     assert sharding.spec == PartitionSpec(("fsdp", "sp"), "tp")
     assert np.array_equal(sharding.mesh.devices, _CompoundConfig.mesh.devices)
-
-
-def test_array_param_axis_names_support_compound_mesh_axes():
-    model = _CompoundModel(config=_CompoundConfig(), rngs=spx.Rngs(0), layer_type=_CompoundArrayParamLayer)
-
-    specs = model._parameter_partition_specs()
-    spec = (
-        specs.get("parameters", "layer.weight") if isinstance(specs, spx.State) else specs["parameters"]["layer.weight"]
-    )
-
-    assert spec == PartitionSpec(("fsdp", "sp"), "tp")
 
 
 def test_array_param_axis_names_shard_during_model_init():

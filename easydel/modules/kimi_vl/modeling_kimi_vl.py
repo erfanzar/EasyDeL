@@ -728,7 +728,8 @@ class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
 
         def _layer_loop(block, carry):
             hidden_states, idx = carry
-            hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)
+            with self._layer_stage_context(idx, layers=self.blocks):
+                hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
             return hidden_states, idx + 1

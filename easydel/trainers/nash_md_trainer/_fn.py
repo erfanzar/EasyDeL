@@ -27,8 +27,13 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -170,3 +175,50 @@ def nash_md_step(
 
     _, metrics = loss_fn(state.graphstate, batch)
     return metrics
+
+
+def _nash_md_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("beta", "logprob_vocab_chunk_size", "partition_spec"),
+        object_fields=("straight_through_emulator",),
+    )
+
+
+def _make_nash_md_scheduled_loss(call):
+    beta = jnp.asarray(call.get("beta"), dtype=jnp.float32)
+    logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        batch = constrain_scheduled_batch(module, batch, partition_spec)
+        completion_mask = batch["completion_mask"]
+        policy_token_logps = _compute_policy_logps(
+            module,
+            batch["prompt_ids"],
+            batch["prompt_mask"],
+            batch["completion_ids"],
+            completion_mask,
+            logprob_vocab_chunk_size,
+        )
+        mask = completion_mask.astype(policy_token_logps.dtype)
+        policy_token_logps = policy_token_logps * mask
+        ref_token_logps = jax.lax.stop_gradient(batch["ref_token_logps"]) * mask
+        policy_logps = policy_token_logps.sum(axis=1)
+        log_ratio = policy_token_logps - ref_token_logps
+        kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
+        score = (batch["probabilities"] - 0.5) * policy_logps
+        return (beta * kl_loss - score).mean()
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    nash_md_step,
+    ScheduledLossAdapter(
+        name="nash_md",
+        make_loss=_make_nash_md_scheduled_loss,
+        make_cache_key=_nash_md_scheduled_loss_cache_key,
+    ),
+)

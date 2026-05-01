@@ -34,7 +34,9 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 
 import jax
+import jax.numpy as jnp
 import spectrax as spx
+from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from spectrax import PartitionAxis, common_types
 from spectrax.common_types import EMPTY, MODE_DECODE, MODE_TRAIN, NOT_GIVEN
@@ -47,10 +49,12 @@ from spectrax.core.stage_assignment import (
 from spectrax.runtime.types.mesh import MpMdMesh
 from spectrax.sharding import current_axis_rules as spx_current_axis_rules
 from spectrax.sharding import logical_axis_rules as spx_logical_axis_rules
-from spectrax.sharding.mesh import SpxMesh
 
 _HAS_SPECTRAX_MESH_TYPES = True
 
+MeshLike: tp.TypeAlias = spx.SpxMesh | Mesh | MpMdMesh
+OptionalMesh: tp.TypeAlias = MeshLike | None
+StageMesh: tp.TypeAlias = Mesh | None
 AxisEntry = str | tuple[str, ...] | None
 AxisEntries = tuple[AxisEntry, ...]
 LogicalAxisRules = Sequence[tuple[str, str | None]] | Mapping[str, str | None]
@@ -146,34 +150,193 @@ def _simple_rule_value(value: tp.Any) -> str | None | object:
     return normalized
 
 
-def _mesh_axis_size(mesh: Mesh, axis_name: str) -> int:
+def is_valid_mesh(mesh: OptionalMesh | tp.Any) -> bool:
+    """Return whether *mesh* looks like a usable JAX/SpectraX mesh."""
+    if mesh is None:
+        return False
+    if getattr(mesh, "empty", False):
+        return False
+    return getattr(mesh, "shape", None) is not None
+
+
+def resolve_stage_mesh(
+    mesh: OptionalMesh = None,
+    *,
+    arr: tp.Any = None,
+    stage: int | tuple[int, int] | None = None,
+    fallback_to_context: bool = True,
+) -> StageMesh:
+    """Resolve the mesh that should own work or buffers in the current MPMD context."""
     try:
-        return int(mesh.shape[axis_name])
+        stage_mesh = spx.get_current_stage_mesh(mesh, arr=arr, stage=stage, raise_error=False)
+        if is_valid_mesh(stage_mesh):
+            return stage_mesh
+    except TypeError:
+        stage_mesh = spx.get_current_stage_mesh(mesh, arr=arr, raise_error=False)
+        if is_valid_mesh(stage_mesh):
+            return stage_mesh
+
+    if fallback_to_context:
+        try:
+            stage_mesh = spx.get_current_stage_mesh(arr=arr, stage=stage, raise_error=False)
+            if is_valid_mesh(stage_mesh):
+                return stage_mesh
+        except TypeError:
+            stage_mesh = spx.get_current_stage_mesh(arr=arr, raise_error=False)
+            if is_valid_mesh(stage_mesh):
+                return stage_mesh
+
+    try:
+        jax_mesh = spx.to_jax_mesh(mesh)
+        if is_valid_mesh(jax_mesh):
+            return jax_mesh
+    except Exception:
+        pass
+
+    return mesh if is_valid_mesh(mesh) else None
+
+
+def resolve_stage_cache_mesh(mesh: OptionalMesh = None, *, arr: tp.Any = None) -> StageMesh:
+    """Resolve the mesh that should own a cache buffer."""
+    return resolve_stage_mesh(mesh, arr=arr)
+
+
+def resolve_array_mesh(arr: tp.Any) -> StageMesh:
+    """Resolve a JAX mesh from an array's named sharding, if present."""
+    sharding = getattr(arr, "sharding", None)
+    if isinstance(sharding, NamedSharding) and is_valid_mesh(sharding.mesh):
+        return sharding.mesh
+    return None
+
+
+def mesh_matches(lhs: OptionalMesh | tp.Any, rhs: OptionalMesh | tp.Any) -> bool:
+    """Return whether two mesh objects describe the same concrete device mesh."""
+    if lhs is rhs:
+        return True
+    if lhs is None or rhs is None:
+        return False
+    try:
+        if getattr(lhs, "axis_names", None) != getattr(rhs, "axis_names", None):
+            return False
+        if getattr(lhs, "devices", None).shape != getattr(rhs, "devices", None).shape:
+            return False
+
+        lhs_fingerprint = tuple(
+            (
+                getattr(device, "process_index", None),
+                getattr(device, "id", None),
+                getattr(device, "platform", None),
+                getattr(device, "device_kind", None),
+            )
+            for device in lhs.devices.flat
+        )
+        rhs_fingerprint = tuple(
+            (
+                getattr(device, "process_index", None),
+                getattr(device, "id", None),
+                getattr(device, "platform", None),
+                getattr(device, "device_kind", None),
+            )
+            for device in rhs.devices.flat
+        )
+        return lhs_fingerprint == rhs_fingerprint
+    except Exception:
+        return False
+
+
+def pick_array_mesh(*arrays: tp.Any) -> StageMesh | jax.sharding.AbstractMesh:
+    """Pick the first named-sharding mesh from arrays, then fall back to context."""
+    for array in arrays:
+        if array is None:
+            continue
+        mesh = resolve_array_mesh(array)
+        if mesh is not None:
+            return mesh
+    return resolve_stage_mesh(spx.get_incontext_mesh(raise_error=False), fallback_to_context=False)
+
+
+def partition_spec_for_mesh(array: tp.Any, mesh: OptionalMesh | tp.Any) -> PartitionSpec:
+    """Return an array's PartitionSpec when it is already on ``mesh``."""
+    if array is None:
+        return PartitionSpec()
+    sharding = getattr(array, "sharding", None)
+    if isinstance(sharding, NamedSharding) and mesh_matches(sharding.mesh, mesh):
+        return sharding.spec
+    return PartitionSpec()
+
+
+def normalize_axis_names(axis: tp.Any) -> tuple[str, ...]:
+    """Normalize one axis, many axes, or no axis into concrete mesh axis names."""
+    if axis is None or axis is EMPTY:
+        return ()
+    if isinstance(axis, (tuple, list)):
+        return tuple(str(item) for item in axis if item and item is not EMPTY)
+    return (str(axis),)
+
+
+def axis_index(axis: tp.Any) -> jax.Array:
+    """Return a row-major linearized index for one or more mesh axes."""
+    axis_names = normalize_axis_names(axis)
+    if not axis_names:
+        return jnp.int32(0)
+    idx = jax.lax.axis_index(axis_names[0]).astype(jnp.int32)
+    for axis_name in axis_names[1:]:
+        axis_size = jax.lax.psum(jnp.int32(1), axis_name)
+        idx = idx * axis_size + jax.lax.axis_index(axis_name).astype(jnp.int32)
+    return idx
+
+
+def mesh_axis_size(mesh: OptionalMesh | tp.Any, axis_name: tp.Any) -> int:
+    """Return product of mesh sizes for one axis, many axes, or no axis."""
+    if axis_name is None or axis_name is EMPTY:
+        return 1
+    if isinstance(axis_name, (list, tuple)):
+        product = 1
+        for name in axis_name:
+            if name is not None and name is not EMPTY:
+                product *= mesh_axis_size(mesh, str(name))
+        return max(1, int(product))
+
+    shape = getattr(mesh, "shape", None)
+    if shape is None:
+        return 1
+    try:
+        return int(shape[axis_name])
+    except Exception:
+        pass
+    try:
+        return int(shape.get(axis_name, 1))
     except Exception:
         return 1
 
 
-def mesh_partition_product(mesh: Mesh, axis_spec: AxisEntry) -> int:
+def _mesh_axis_size(mesh: MeshLike, axis_name: str) -> int:
+    return mesh_axis_size(mesh, axis_name)
+
+
+def _mesh_partition_product(mesh: MeshLike, axis_spec: AxisEntry) -> int:
+    return mesh_partition_product(mesh, axis_spec)
+
+
+def mesh_partition_product(mesh: MeshLike, axis_spec: AxisEntry) -> int:
     """Return shard multiplicity implied by a PartitionSpec entry."""
-    if axis_spec is None:
-        return 1
-    if isinstance(axis_spec, (tuple, list)):
-        product = 1
-        for axis_name in axis_spec:
-            if axis_name is None:
-                continue
-            product *= _mesh_axis_size(mesh, axis_name)
-        return int(product)
-    return _mesh_axis_size(mesh, axis_spec)
+    return mesh_axis_size(mesh, axis_spec)
 
 
-_mesh_partition_product = mesh_partition_product
+def coerce_partition_spec(spec: tp.Any) -> PartitionSpec | None:
+    """Coerce a tuple/list PartitionSpec-like value into ``PartitionSpec``."""
+    if isinstance(spec, PartitionSpec):
+        return spec
+    if isinstance(spec, (tuple, list)):
+        try:
+            return PartitionSpec(*tuple(spec))
+        except Exception:
+            return None
+    return None
 
 
-def _resolve_named_sharding_mesh(
-    mesh: Mesh | tp.Any,
-) -> tuple[Mesh, tp.Any | None]:
-    if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, SpxMesh):
+def _resolve_named_sharding_mesh(mesh: MeshLike) -> tuple[Mesh, MpMdMesh | None]:
+    if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, spx.SpxMesh):
         return mesh.jax_mesh, mesh.mpmd_mesh
     if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
         return mesh.jax_mesh, mesh
@@ -181,12 +344,12 @@ def _resolve_named_sharding_mesh(
 
 
 def _stage_local_mesh(
-    mesh: Mesh | tp.Any,
+    mesh: MeshLike,
     metadata: dict[str, tp.Any] | None,
-) -> Mesh | tp.Any:
+) -> Mesh:
     assignment = metadata_stage_assignment(metadata)
     if assignment is None:
-        if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, SpxMesh):
+        if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, spx.SpxMesh):
             return mesh.jax_mesh
         if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
             return mesh.jax_mesh
@@ -201,21 +364,30 @@ def _stage_local_mesh(
     return mpmd_mesh.submesh(owner)
 
 
-def _is_mpmd_mesh(mesh: Mesh | tp.Any | None) -> bool:
+def is_mpmd_mesh(mesh: OptionalMesh) -> bool:
+    """Return whether a mesh is a SpectraX MPMD mesh wrapper."""
     if mesh is None or not _HAS_SPECTRAX_MESH_TYPES:
         return False
-    if isinstance(mesh, SpxMesh):
+    if isinstance(mesh, spx.SpxMesh):
         return bool(mesh.is_mpmd)
     return isinstance(mesh, MpMdMesh)
 
 
+def _is_mpmd_mesh(mesh: OptionalMesh) -> bool:
+    return is_mpmd_mesh(mesh)
+
+
 def sanitize_partition_spec_for_shape(
-    spec: PartitionSpec,
+    spec: tp.Any,
     shape: tuple[int, ...],
-    mesh: Mesh,
-) -> PartitionSpec:
+    mesh: MeshLike,
+) -> tp.Any:
     """Drop non-divisible sharding axes for a concrete tensor shape."""
-    axes = list(tuple(spec))
+    pspec = coerce_partition_spec(spec)
+    if pspec is None:
+        return spec
+
+    axes = list(tuple(pspec))
     changed = False
 
     if len(axes) > len(shape):
@@ -231,8 +403,137 @@ def sanitize_partition_spec_for_shape(
             changed = True
 
     if not changed:
-        return spec
+        return pspec
     return PartitionSpec(*axes)
+
+
+def sanitize_sharding_axes_for_shape(
+    *,
+    mesh: MeshLike,
+    runtime_sharding_resolver: tp.Any,
+    axes: tp.Sequence[object | None],
+    mode: tp.Any,
+    shape: tuple[int, ...],
+) -> tuple[object | None, ...]:
+    """Drop logical axes whose resolved mesh sharding cannot divide ``shape``."""
+    spec = runtime_sharding_resolver.resolve(axes=axes, mode=mode, shape=shape)
+    safe: list[object | None] = []
+    for logical_axis, axis_spec, dim in zip(axes, spec, shape, strict=False):
+        if logical_axis is None or axis_spec is None:
+            safe.append(logical_axis)
+            continue
+        shard_factor = mesh_partition_product(mesh, axis_spec)
+        safe.append(None if int(dim) % shard_factor != 0 else logical_axis)
+    return tuple(safe)
+
+
+def _flatten_mapping(tree: tp.Any, prefix: tuple[tp.Any, ...] = ()) -> dict[tuple[tp.Any, ...], tp.Any]:
+    if not isinstance(tree, dict):
+        return {prefix: tree}
+    flat: dict[tuple[tp.Any, ...], tp.Any] = {}
+    for key, value in tree.items():
+        flat.update(_flatten_mapping(value, (*prefix, key)))
+    return flat
+
+
+def _unflatten_mapping(flat: Mapping[tuple[tp.Any, ...], tp.Any]) -> dict[tp.Any, tp.Any]:
+    root: dict[tp.Any, tp.Any] = {}
+    for path, value in flat.items():
+        cursor = root
+        for key in path[:-1]:
+            cursor = cursor.setdefault(key, {})
+        if path:
+            cursor[path[-1]] = value
+    return root
+
+
+def sanitize_partition_specs_for_shape_tree(
+    partition_specs: tp.Any,
+    shape_tree: tp.Any,
+    mesh: MeshLike,
+) -> tuple[tp.Any, int]:
+    """Sanitize a PartitionSpec tree against concrete tensor shapes."""
+    adjusted = {"count": 0}
+
+    def _sanitize(spec: tp.Any, shape_obj: tp.Any) -> tp.Any:
+        if not isinstance(spec, PartitionSpec) or not hasattr(shape_obj, "shape"):
+            return spec
+        safe_spec = sanitize_partition_spec_for_shape(
+            spec=spec,
+            shape=tuple(shape_obj.shape),
+            mesh=mesh,
+        )
+        if safe_spec != spec:
+            adjusted["count"] += 1
+        return safe_spec
+
+    try:
+        sanitized = jax.tree_util.tree_map(_sanitize, partition_specs, shape_tree)
+        return sanitized, adjusted["count"]
+    except Exception:
+        flat_specs = _flatten_mapping(partition_specs)
+        flat_shapes = _flatten_mapping(shape_tree)
+        adjusted_count = 0
+        for key, spec in flat_specs.items():
+            if not isinstance(spec, PartitionSpec):
+                continue
+            shape_obj = flat_shapes.get(key)
+            shape = tuple(getattr(shape_obj, "shape", ()))
+            if not shape:
+                continue
+            safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+            if safe_spec != spec:
+                flat_specs[key] = safe_spec
+                adjusted_count += 1
+        if adjusted_count == 0:
+            return partition_specs, adjusted_count
+        return _unflatten_mapping(flat_specs), adjusted_count
+
+
+def pick_mesh(*, partition_manager: tp.Any | None = None, mesh: OptionalMesh = None) -> StageMesh:
+    """Pick the best mesh from an explicit mesh, resolver-like object, or context."""
+    candidate = resolve_stage_mesh(mesh, fallback_to_context=False)
+    if candidate is not None:
+        return candidate
+
+    if partition_manager is not None:
+        for attr_name in ("mesh", "_mesh", "device_mesh"):
+            candidate = resolve_stage_mesh(getattr(partition_manager, attr_name, None), fallback_to_context=False)
+            if candidate is not None:
+                return candidate
+
+    candidate = resolve_stage_mesh(spx.get_incontext_mesh(raise_error=False), fallback_to_context=False)
+    if candidate is not None:
+        return candidate
+
+    return None
+
+
+def resolve_safe_sharding(
+    *,
+    axes: tp.Any,
+    shape: tuple[int, ...],
+    runtime_sharding_resolver: tp.Any | None = None,
+    axis_policy: tp.Any | None = None,
+    partition_manager: tp.Any | None = None,
+    mesh: OptionalMesh = None,
+    mode: str = MODE_TRAIN,
+) -> tp.Any:
+    """Resolve sharding axes through ``RuntimeShardingResolver`` with safe fallback."""
+    mesh_obj = pick_mesh(partition_manager=runtime_sharding_resolver or partition_manager, mesh=mesh)
+    resolver = coerce_runtime_sharding_resolver(
+        runtime_sharding_resolver if runtime_sharding_resolver is not None else axis_policy,
+        mesh=mesh_obj,
+    )
+    try:
+        return resolver.resolve(axes=axes, mode=mode, shape=shape)
+    except Exception:
+        if partition_manager is None or not hasattr(partition_manager, "resolve"):
+            return axes
+        resolved = partition_manager.resolve(axes=axes, mode=mode, shape=shape)
+        if mesh_obj is None:
+            return resolved
+        return sanitize_partition_spec_for_shape(spec=resolved, shape=shape, mesh=mesh_obj)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -409,9 +710,9 @@ class RuntimeShardingResolver:
     """Lower semantic sharding declarations to concrete JAX shardings."""
 
     axis_policy: AxisPolicy
-    mesh: Mesh | tp.Any | None = None
+    mesh: OptionalMesh = None
 
-    def with_mesh(self, mesh: Mesh | tp.Any | None) -> RuntimeShardingResolver:
+    def with_mesh(self, mesh: OptionalMesh) -> RuntimeShardingResolver:
         return RuntimeShardingResolver(axis_policy=self.axis_policy, mesh=mesh)
 
     @property
@@ -460,7 +761,7 @@ class RuntimeShardingResolver:
         spec: PartitionSpec,
         *,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> PartitionSpec:
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None or shape is NOT_GIVEN:
@@ -497,7 +798,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> PartitionSpec:
         return self.resolve_layout(layout=layout, mode=mode, shape=shape, mesh=mesh)
 
@@ -507,7 +808,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> PartitionSpec:
         if isinstance(layout, PartitionSpec):
             return self._sanitize_spec(layout, shape=shape, mesh=mesh)
@@ -541,7 +842,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
         metadata: dict[str, tp.Any] | None = None,
     ) -> NamedSharding:
         active_mesh = self.mesh if mesh is None else mesh
@@ -557,7 +858,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> PartitionSpec | None:
         if not metadata:
             return None
@@ -587,7 +888,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> PartitionSpec | None:
         return self.resolve_metadata(metadata=metadata, mode=mode, shape=shape, mesh=mesh)
 
@@ -597,7 +898,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> NamedSharding | None:
         if not metadata:
             return None
@@ -624,7 +925,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> PartitionSpec | None:
         active_mesh = self.mesh if mesh is None else mesh
         if (
@@ -660,7 +961,7 @@ class RuntimeShardingResolver:
         spec: PartitionSpec,
         *,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> NamedSharding:
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None:
@@ -675,7 +976,7 @@ class RuntimeShardingResolver:
         *,
         mode: str | int | object = NOT_GIVEN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
-        mesh: Mesh | tp.Any | None = None,
+        mesh: OptionalMesh = None,
     ) -> NamedSharding | None:
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None:
@@ -753,7 +1054,7 @@ class RuntimeShardingResolver:
 def coerce_runtime_sharding_resolver(
     value: RuntimeShardingResolver | AxisPolicy | PartitionAxis | dict[str, tp.Any] | None = None,
     *,
-    mesh: Mesh | tp.Any | None = None,
+    mesh: OptionalMesh = None,
 ) -> RuntimeShardingResolver:
     """Normalize supported sharding inputs to a runtime resolver."""
     if isinstance(value, RuntimeShardingResolver):
@@ -774,7 +1075,7 @@ def coerce_runtime_sharding_resolver(
 def logical_axis_rules(
     value: RuntimeShardingResolver | AxisPolicy | PartitionAxis | dict[str, tp.Any] | None = None,
     *,
-    mesh: Mesh | tp.Any | None = None,
+    mesh: OptionalMesh = None,
     mode: str | int | object = MODE_TRAIN,
     shape: tuple[int, ...] | object = NOT_GIVEN,
     overrides: LogicalAxisRules | None = None,
@@ -785,7 +1086,7 @@ def logical_axis_rules(
         yield active_rules
 
 
-def replicated_named_sharding(mesh: tp.Any) -> jax.sharding.NamedSharding:
+def replicated_named_sharding(mesh: MeshLike) -> jax.sharding.NamedSharding:
     """Return a fully-replicated ``NamedSharding`` for the given mesh.
 
     Centralised constructor for the ``NamedSharding(mesh, PartitionSpec())``
@@ -797,18 +1098,80 @@ def replicated_named_sharding(mesh: tp.Any) -> jax.sharding.NamedSharding:
     return jax.sharding.NamedSharding(jax_mesh, PartitionSpec())
 
 
+def replicate_on_array_mesh(value: jax.Array, reference: jax.Array) -> jax.Array:
+    """Replicate ``value`` on ``reference``'s named-sharding mesh."""
+    reference_mesh = resolve_array_mesh(reference)
+    if reference_mesh is None:
+        return value
+    target = replicated_named_sharding(reference_mesh)
+    current = getattr(value, "sharding", None)
+    if isinstance(current, NamedSharding) and mesh_matches(current.mesh, reference_mesh) and current.spec == target.spec:
+        return value
+    return jax.device_put(value, target)
+
+
+def final_stage_replicated_sharding(
+    model: tp.Any,
+    mesh: OptionalMesh,
+    fallback_sharding: jax.sharding.Sharding,
+) -> jax.sharding.Sharding:
+    """Return replicated sharding on the model's final PP stage when mesh is MPMD."""
+    if not is_mpmd_mesh(mesh):
+        return fallback_sharding
+    text_config = model.config.get_text_config()
+    total_layers = int(getattr(text_config, "num_hidden_layers", 1))
+    if hasattr(model, "_layer_physical_stage_assignment"):
+        stage = model._layer_physical_stage_assignment(total_layers - 1, total_layers)
+    else:
+        mpmd_dim = int(getattr(mesh, "mpmd_dim", 1))
+        stage = (mpmd_dim - 1, mpmd_dim)
+    stage_mesh = resolve_stage_mesh(mesh, stage=stage)
+    if stage_mesh is None:
+        return fallback_sharding
+    return replicated_named_sharding(stage_mesh)
+
+
+def specs_to_named_sharding(tree: tp.Any, mesh: OptionalMesh = None) -> tp.Any:
+    """Convert a PyTree of PartitionSpecs into a PyTree of NamedShardings."""
+    active_mesh = mesh or pxla.thread_resources.env.physical_mesh
+    jax_mesh, _ = _resolve_named_sharding_mesh(active_mesh)
+    return jax.tree_util.tree_map(lambda spec: NamedSharding(spec=spec, mesh=jax_mesh), tree)
+
+
 __all__ = [
     "CANONICAL_MESH_AXIS_NAMES",
     "AxisPolicy",
     "LogicalAxisRules",
+    "MeshLike",
+    "OptionalMesh",
     "RuntimeShardingResolver",
+    "StageMesh",
     "TensorLayout",
+    "axis_index",
     "coerce_axis_policy",
+    "coerce_partition_spec",
     "coerce_runtime_sharding_resolver",
+    "final_stage_replicated_sharding",
+    "is_mpmd_mesh",
+    "is_valid_mesh",
     "logical_axis_rules",
+    "mesh_axis_size",
+    "mesh_matches",
     "mesh_partition_product",
     "metadata_for_layout",
+    "normalize_axis_names",
+    "partition_spec_for_mesh",
+    "pick_array_mesh",
+    "pick_mesh",
+    "replicate_on_array_mesh",
     "replicated_named_sharding",
+    "resolve_array_mesh",
+    "resolve_safe_sharding",
+    "resolve_stage_cache_mesh",
+    "resolve_stage_mesh",
     "sanitize_partition_spec_for_shape",
+    "sanitize_partition_specs_for_shape_tree",
+    "sanitize_sharding_axes_for_shape",
     "sharding_for_layout",
+    "specs_to_named_sharding",
 ]

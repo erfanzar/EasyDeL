@@ -28,23 +28,19 @@ Classes:
     Scheduler: Main request scheduler implementation.
 
 Example:
-    Creating a scheduler from configuration::
+    Creating a scheduler directly::
 
-        >>> from easydel.inference.esurge.config import Config, SchedulerConfig, CacheConfig
         >>> from easydel.inference.esurge.scheduler import Scheduler
         >>>
-        >>> config = Config(
-        ...     scheduler_config=SchedulerConfig(
-        ...         max_num_seqs=16,
-        ...         max_num_batched_tokens=2048,
-        ...         max_model_len=8192
-        ...     ),
-        ...     cache_config=CacheConfig(
-        ...         num_pages=1000,
-        ...         page_size=16
-        ...     )
+        >>> scheduler = Scheduler(
+        ...     kv_cache_config=kv_cache_config,
+        ...     max_num_seqs=16,
+        ...     max_num_batched_tokens=2048,
+        ...     max_model_len=8192,
+        ...     num_pages=1000,
+        ...     page_size=16,
+        ...     enable_prefix_caching=True,
         ... )
-        >>> scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
 
     Creating from an eSurgeRunner (recommended)::
 
@@ -64,7 +60,6 @@ from collections.abc import Iterable
 
 from eformer.loggings import get_logger
 
-from ..config import Config
 from ..core.dp_sharding import dp_shard_for_page_id, pages_per_dp_shard
 from ..core.interface import CacheGroupsConfig
 from ..core.manager import CacheManager
@@ -106,14 +101,16 @@ class Scheduler(SchedulerInterface):
         5. Return batch information for model runner
 
     Attributes:
-        config: The complete engine configuration.
-        scheduler_config: Scheduler-specific configuration.
-        cache_config: KV cache configuration.
         kv_cache_config: KV cache groups configuration.
         max_num_running_reqs: Maximum concurrent requests.
         max_num_scheduled_tokens: Maximum tokens per batch.
         max_model_len: Maximum sequence length.
+        num_pages: Total KV cache pages.
         page_size: Tokens per KV cache page.
+        enable_prefix_caching: Whether prefix caching is enabled.
+        async_scheduling: Whether async scheduler/runner overlap is enabled.
+        long_prefill_token_threshold: Per-step prefill token cap.
+        chunked_prefill_enabled: Whether prefill may span multiple steps.
         requests: Dictionary mapping request_id to EngineRequest.
         policy: The scheduling policy (FCFS or PRIORITY).
         waiting: Queue of waiting requests.
@@ -125,7 +122,7 @@ class Scheduler(SchedulerInterface):
         max_num_seq_buckets: Bucket sizes for batch optimization.
 
     Example:
-        >>> scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+        >>> scheduler = Scheduler.from_runner(runner)
         >>> scheduler.add_request(request)
         >>> output = scheduler.schedule()
         >>> # ... run model ...
@@ -134,76 +131,88 @@ class Scheduler(SchedulerInterface):
 
     def __init__(
         self,
-        config: Config,
+        *,
         kv_cache_config: CacheGroupsConfig,
-        include_finished_set: bool = False,
+        max_num_seqs: int,
+        max_num_batched_tokens: int | None,
+        max_model_len: int,
+        num_pages: int,
+        page_size: int,
+        enable_prefix_caching: bool = True,
         max_num_seq_buckets: list[int] | None = None,
+        async_scheduling: bool = True,
+        long_prefill_token_threshold: int | None = None,
+        chunked_prefill_enabled: bool = False,
+        token_safety_margin: int | None = None,
+        policy: typing.Literal["priority", "fcfs"] = "fcfs",
+        num_speculative_tokens: int = 0,
+        use_eagle: bool = False,
+        include_finished_set: bool = False,
     ) -> None:
-        """Initialize the Scheduler with configuration.
-
-        Sets up the scheduler with the provided configuration, initializing
-        request queues, KV cache manager, and scheduling parameters.
+        """Initialize the Scheduler.
 
         Args:
-            config: Complete engine configuration containing scheduler_config,
-                cache_config, and optionally speculative_config.
-            kv_cache_config: Configuration for KV cache groups including
-                num_pages and kv_cache_groups specifications.
-            include_finished_set: If True, track finished request IDs per
-                client for multi-client scenarios. Defaults to False.
-            max_num_seq_buckets: Optional list of bucket sizes for batch
-                optimization. If None, uses values from scheduler_config
-                or defaults to [max_num_seqs].
+            kv_cache_config: KV cache groups configuration.
+            max_num_seqs: Maximum concurrent running requests.
+            max_num_batched_tokens: Per-step token budget; if ``None``, falls
+                back to ``max_model_len``.
+            max_model_len: Maximum context length supported by the model.
+            num_pages: Total number of KV cache pages available.
+            page_size: KV cache page size in tokens.
+            enable_prefix_caching: Enable prefix caching across requests.
+            max_num_seq_buckets: Bucket sizes for batch shape stability;
+                defaults to ``[max_num_seqs]`` if not provided.
+            async_scheduling: Enable async scheduler / runner overlap.
+            long_prefill_token_threshold: Cap each prefill step at this many
+                tokens (chunked prefill); ``None`` disables capping.
+            chunked_prefill_enabled: Allow prefill to span multiple steps when
+                a single chunk exceeds the per-step token budget.
+            token_safety_margin: Tokens reserved for safety; ``None`` disables
+                the token-budget manager.
+            policy: Request scheduling policy (``"fcfs"`` or ``"priority"``).
+            num_speculative_tokens: Number of speculative tokens (0 disables).
+            use_eagle: Enable EAGLE-style speculative decoding.
+            include_finished_set: Track finished request IDs per client.
 
         Raises:
-            ValueError: If an unknown scheduling policy is specified.
-            ValueError: If num_pages is not positive.
-
-        Example:
-            >>> scheduler = Scheduler(
-            ...     config=config,
-            ...     kv_cache_config=kv_cache_config,
-            ...     include_finished_set=True  # For multi-client
-            ... )
+            ValueError: For unknown scheduling policy or non-positive num_pages.
         """
-        self.config = config
-        self.scheduler_config = config.scheduler_config
-        self.cache_config = config.cache_config
         self.kv_cache_config = kv_cache_config
 
         self.finished_req_ids_dict: dict[int, set[str]] | None = defaultdict(set) if include_finished_set else None
 
-        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
-        self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
-        self.max_model_len = self.scheduler_config.max_model_len
-        if self.max_num_scheduled_tokens is None:
-            # Keep runtime behavior aligned with engine docs: unset budget
-            # falls back to model context length.
-            self.max_num_scheduled_tokens = self.max_model_len
+        self.max_num_running_reqs = max_num_seqs
+        # Unset budget falls back to model context length (matches engine docs).
+        self.max_num_scheduled_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else max_model_len
+        self.max_model_len = max_model_len
         self.data_parallel_size = 1
-        num_pages = self.cache_config.num_pages
+
         if num_pages is None or num_pages <= 0:
             raise ValueError(f"num_pages must be a positive integer, got {num_pages}")
+        self.num_pages = num_pages
+        self.page_size = page_size
+        self.enable_prefix_caching = enable_prefix_caching
+        self.async_scheduling = async_scheduling
+        self.long_prefill_token_threshold = long_prefill_token_threshold
+        self.chunked_prefill_enabled = chunked_prefill_enabled
 
-        self.page_size = self.cache_config.page_size
-        safety_margin = self.scheduler_config.token_safety_margin
-        if safety_margin is None:
+        if token_safety_margin is None:
             self._token_budget_manager = None
         else:
             self._token_budget_manager = TokenBudgetManager(
                 max_batch_tokens=self.max_num_scheduled_tokens,
                 page_size=self.page_size,
-                safety_margin_tokens=safety_margin,
+                safety_margin_tokens=token_safety_margin,
             )
 
         self.requests: dict[str, EngineRequest] = {}
 
-        if self.scheduler_config.policy == "priority":
+        if policy == "priority":
             self.policy = SchedulingPolicy.PRIORITY
-        elif self.scheduler_config.policy == "fcfs":
+        elif policy == "fcfs":
             self.policy = SchedulingPolicy.FCFS
         else:
-            raise ValueError(f"Unknown scheduling policy: {self.scheduler_config.policy}")
+            raise ValueError(f"Unknown scheduling policy: {policy}")
 
         self.waiting = create_request_queue(self.policy)
         self.running: list[EngineRequest] = []
@@ -212,27 +221,21 @@ class Scheduler(SchedulerInterface):
         self.req_id_to_row_index: dict[str, int] = {}
 
         self.finished_req_ids: set[str] = set()
-
         self.finished_recving_kv_req_ids: set[str] = set()
 
-        speculative_config = config.speculative_config
-        self.use_eagle = False
-        self.num_spec_tokens = self.num_lookahead_tokens = 0
-        if speculative_config:
-            self.num_spec_tokens = speculative_config.num_speculative_tokens
-            if speculative_config.use_eagle():
-                self.use_eagle = True
-                self.num_lookahead_tokens = self.num_spec_tokens
+        self.use_eagle = bool(use_eagle and num_speculative_tokens > 0)
+        self.num_spec_tokens = num_speculative_tokens
+        self.num_lookahead_tokens = num_speculative_tokens if self.use_eagle else 0
 
         self.kv_cache_manager = CacheManager(
             num_pages=num_pages,
             kv_cache_groups=kv_cache_config.kv_cache_groups,
             max_model_len=self.max_model_len,
-            enable_caching=self.cache_config.enable_prefix_caching,
+            enable_caching=self.enable_prefix_caching,
             use_eagle=self.use_eagle,
         )
 
-        buckets = max_num_seq_buckets or list(self.scheduler_config.max_num_seq_buckets or ())
+        buckets = max_num_seq_buckets or []
         if not buckets:
             buckets = [self.max_num_running_reqs]
         buckets = sorted({int(b) for b in buckets if b > 0})
@@ -288,7 +291,6 @@ class Scheduler(SchedulerInterface):
             ...     enable_prefix_caching=True
             ... )
         """
-        from ..config import CacheConfig, SchedulerConfig
         from ..core.interface import create_kv_cache_specs_from_config
 
         metadata = runner.metadata
@@ -308,29 +310,26 @@ class Scheduler(SchedulerInterface):
                 use_mla=False,
             )
 
-        config = Config(
-            scheduler_config=SchedulerConfig(
-                max_num_seqs=runner.max_num_seqs,
-                max_num_batched_tokens=max_num_batched_tokens,
-                max_model_len=runner.max_model_len,
-                max_num_seq_buckets=tuple(runner.max_num_seq_buckets),
-                async_scheduling=async_scheduling,
-                long_prefill_token_threshold=long_prefill_token_threshold,
-            ),
-            cache_config=CacheConfig(
-                num_pages=metadata.num_pages,
-                page_size=metadata.page_size,
-                enable_prefix_caching=enable_prefix_caching,
-            ),
-        )
         kv_cache_cfg = CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups)
+        scheduler_kwargs = dict(
+            kv_cache_config=kv_cache_cfg,
+            max_num_seqs=runner.max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=runner.max_model_len,
+            num_pages=metadata.num_pages,
+            page_size=metadata.page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            max_num_seq_buckets=list(runner.max_num_seq_buckets) if runner.max_num_seq_buckets else None,
+            async_scheduling=async_scheduling,
+            long_prefill_token_threshold=long_prefill_token_threshold,
+        )
 
         if async_scheduling:
             from .async_scheduler import AsyncScheduler
 
-            scheduler = AsyncScheduler(config=config, kv_cache_config=kv_cache_cfg)
+            scheduler = AsyncScheduler(**scheduler_kwargs)
         else:
-            scheduler = Scheduler(config=config, kv_cache_config=kv_cache_cfg)
+            scheduler = Scheduler(**scheduler_kwargs)
         scheduler.data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
         return scheduler
 
@@ -415,7 +414,7 @@ class Scheduler(SchedulerInterface):
         token_budget_initial = int(token_budget)
 
         dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
-        num_pages = int(getattr(self.cache_config, "num_pages", 0) or 0)
+        num_pages = self.num_pages
         pages_per_shard = pages_per_dp_shard(num_pages, dp_size)
         use_dp_local_shard_hints = (
             dp_size > 1
@@ -498,11 +497,8 @@ class Scheduler(SchedulerInterface):
             request = self.running[req_index]
 
             num_new_tokens = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
-            if (
-                self.scheduler_config.long_prefill_token_threshold is not None
-                and 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
-            ):
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if self.long_prefill_token_threshold is not None and 0 < self.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             num_new_tokens = min(num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens)
@@ -637,12 +633,12 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     if (
-                        self.scheduler_config.long_prefill_token_threshold is not None
-                        and 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
+                        self.long_prefill_token_threshold is not None
+                        and 0 < self.long_prefill_token_threshold < num_new_tokens
                     ):
-                        num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                        num_new_tokens = self.long_prefill_token_threshold
 
-                    if not self.scheduler_config.chunked_prefill_enabled and num_new_tokens > token_budget:
+                    if not self.chunked_prefill_enabled and num_new_tokens > token_budget:
                         is_inherently_too_large = (
                             self.max_num_scheduled_tokens is not None and num_new_tokens >= self.max_num_scheduled_tokens
                         )
@@ -791,7 +787,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             preempted_req_ids={r.request_id for r in preempted_reqs},
             suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
-            async_scheduling=self.scheduler_config.async_scheduling,  # Pass async config to runner
+            async_scheduling=self.async_scheduling,  # Pass async config to runner
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             free_pages=self.kv_cache_manager.page_pool.get_num_free_pages(),

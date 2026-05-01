@@ -30,7 +30,7 @@ from ..prompt_transforms import ORPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DPODataCollatorWithPaddingGrain, DPODataCollatorWithPaddingTFDS
-from ._fn import concatenated_forward, orpo_step
+from ._fn import concatenated_forward, orpo_step, orpo_training_step
 from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
@@ -207,21 +207,22 @@ class ORPOTrainer(Trainer):
             partial_concatenated_forward,
             self.arguments.beta,
             self.scheduler,
-            "train",
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             straight_through_emulator,
         )
 
-        static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
+        train_static_argnums = (2, 3, 4, 5, 6, 7, 8)
 
         sharded_training_step_function = compile_trainer_step(
-            orpo_step,
+            orpo_training_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
-            static_argnums=static_argnums,
+            static_argnums=train_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -235,11 +236,14 @@ class ORPOTrainer(Trainer):
             None,
         )
 
+        eval_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
         sharded_evaluation_step_function = compile_trainer_step(
             orpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
-            static_argnums=static_argnums,
+            static_argnums=eval_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._extra_forward_flops_per_token = 0

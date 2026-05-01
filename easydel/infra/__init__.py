@@ -81,6 +81,8 @@ from eformer.pytree import PyTree, auto_pytree
 from spectrax import PartitionAxis
 from spectrax import sharding as _spectrax_sharding
 
+from easydel.typings import ConfigDataclass
+
 from .sharding import AxisPolicy, RuntimeShardingResolver, TensorLayout, logical_axis_rules, sharding_for_layout
 
 Rngs = spx.Rngs

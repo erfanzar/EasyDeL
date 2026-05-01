@@ -261,7 +261,7 @@ class PagedFlashAttn(OperationImpl):
             out_specs=output_sharding,
         )
 
-        attn_sharded = with_sharding_constraint(arr=attn, sharding=shardings.output)
+        attn_sharded = with_sharding_constraint(arr=attn, sharding=shardings.output, mesh=self.metadata.mesh)
         return AttentionOutput(attention_weights=None, attention_outputs=attn_sharded)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:

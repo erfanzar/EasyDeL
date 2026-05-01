@@ -83,7 +83,7 @@ def _loss_make_lm_head_fn_scan(graphdef, graphother, model):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             graphother,
         )
-        mdl = spx.bind(graphdef, params.merge(other, copy=True))
+        mdl = spx.bind(graphdef, params.merge(other, copy=False))
         outputs = mdl(input_ids=jnp.ones((B, L), dtype=jnp.int32), apply_lm_head=False)
         hidden = outputs.last_hidden_state
 
@@ -115,7 +115,7 @@ def _loss_distillation_chunked(graphdef, graphother, model):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             graphother,
         )
-        mdl = spx.bind(graphdef, params.merge(other, copy=True))
+        mdl = spx.bind(graphdef, params.merge(other, copy=False))
         outputs = mdl(input_ids=jnp.ones((B, L), dtype=jnp.int32), apply_lm_head=False)
         student_h = outputs.last_hidden_state
         teacher_h = jax.lax.stop_gradient(student_h)
@@ -146,7 +146,7 @@ def _loss_logprob_utils(graphdef, graphother, model):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             graphother,
         )
-        mdl = spx.bind(graphdef, params.merge(other, copy=True))
+        mdl = spx.bind(graphdef, params.merge(other, copy=False))
         outputs = mdl(input_ids=jnp.ones((B, L), dtype=jnp.int32), apply_lm_head=False)
         hidden = outputs.last_hidden_state
         logp_sums, _, _ = compute_sequence_scores_from_hidden_states(
@@ -230,7 +230,7 @@ def test_make_lm_head_fn_bypasses_remat():
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            mdl = spx.bind(graphdef, params.merge(other, copy=True))
+            mdl = spx.bind(graphdef, params.merge(other, copy=False))
             lm_fn = mdl.make_lm_head_fn()
 
             def _scan_body(carry, _):

@@ -911,7 +911,8 @@ class GatedDeltaRuleOp(OperationImpl):
 
         in_specs = None
         out_specs = None
-        if self.metadata.mesh is not None:
+        mesh = self.metadata.mesh
+        if mesh is not None:
             in_specs = (
                 query_sharding,
                 key_sharding,
@@ -941,15 +942,15 @@ class GatedDeltaRuleOp(OperationImpl):
             use_chunked=use_chunked_gdr,
             return_state=True,
             cfg=kernel_cfg,
-            mesh=self.metadata.mesh,
+            mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             platform=platform,
         )
 
-        if self.metadata.mesh is not None:
-            with self.metadata.mesh:
-                outputs = with_sharding_constraint(arr=outputs, sharding=shardings_bthd.output)
+        if mesh is not None:
+            with mesh:
+                outputs = with_sharding_constraint(arr=outputs, sharding=shardings_bthd.output, mesh=mesh)
 
         return GatedDeltaRuleOutput(
             attention_outputs=outputs,

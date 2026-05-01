@@ -229,6 +229,9 @@ def setup_config(
     """
     config.sharding_axis_dims = small_model_config["sharding_axis_dims"]
     config.pad_token_id = 0
+    for key in ("pipeline_stage_regions", "pipeline_stage_layout", "pipeline_virtual_stages"):
+        if key in small_model_config:
+            setattr(config, key, small_model_config[key])
 
     # Set head_dim if not already set
     if not hasattr(config, "head_dim") or config.head_dim is None:

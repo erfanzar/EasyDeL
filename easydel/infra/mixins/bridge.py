@@ -75,13 +75,12 @@ import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
-from eformer.serialization import Checkpointer
-from eformer.serialization.checkpointer import find_latest_checkpoint
 from huggingface_hub import CommitOperationAdd, create_branch, create_commit, create_repo
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import PartitionAxis, match_partition_rules, nn
+from spectrax.serialization import Checkpointer, find_latest_checkpoint
 from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers import QuantizationConfig, eLoRA
@@ -108,7 +107,7 @@ from easydel.utils.traversals import (
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from ..base_config import download_url as _download_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
-from ..sharding import sanitize_partition_spec_for_shape
+from ..sharding import MeshLike, sanitize_partition_spec_for_shape
 
 if tp.TYPE_CHECKING:
     from ..base_module import EasyDeLBaseModule
@@ -306,7 +305,7 @@ def _rebuild_lora_modules_from_checkpoint(
 def _build_safe_checkpoint_partition_rules(
     *,
     model: "EasyDeLBaseModule",
-    mesh: jax.sharding.Mesh,
+    mesh: MeshLike,
     partition_rules: tuple[tuple[str, PartitionSpec], ...] | list[tuple[str, PartitionSpec]] | None,
 ) -> tuple[tuple[str, PartitionSpec], ...] | None:
     """Create path-specific override rules for non-divisible shardings.
@@ -604,14 +603,7 @@ class EasyBridgeMixin(PushToHubMixin):
             base_path=str(save_directory),
             save_interval=None,
             step_policies=[],
-        ).save_pytree(
-            tree=state_dict,
-            prefix="model",
-            mesh=self.mesh,
-            dtype=float_dtype,
-            # Don't pass step here - save_directory is already the checkpoint directory
-            # Passing step would create duplicate run-{step}/run-{step} structure
-        )
+        ).save_pytree(tree=state_dict, prefix="model", dtype=float_dtype)
 
         logger.info(f"Model weights saved in {output_model_file}")
 
@@ -877,7 +869,7 @@ class EasyBridgeMixin(PushToHubMixin):
         resolved_archive_file: str | None,
         model: EasyDeLBaseModule,
         param_dtype: jnp.dtype,
-        mesh: jax.sharding.Mesh,
+        mesh: MeshLike,
         shard_fns: dict[str, tp.Callable] | None,
         quantization_config: QuantizationConfig | None,
         apply_quantization: bool,
@@ -966,7 +958,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 checkpoint_partition_rules = _build_safe_checkpoint_partition_rules(
                     model=model,
                     mesh=mesh,
-                    partition_rules=model._get_partition_rules(None),
+                    partition_rules=None,
                 )
                 print(checkpoint_partition_rules)
             with _phase_timer("  load: Checkpointer.load_pytree"):
@@ -977,19 +969,29 @@ class EasyBridgeMixin(PushToHubMixin):
                 ).load_pytree(
                     mesh=mesh,
                     dtype=param_dtype,  # legacy
-                    partition_rules=checkpoint_partition_rules,
+                    sharding_rules=model.resolve_shardings_regex(),
                     prefix="model",
-                    discover_latest=True,
-                    discover_raise=False,
+                    discover_latest=False,
                     load_treedef=False,
                     **extraargs,
                 )
             with _phase_timer("  load: flatten + legacy rename + lora rebuild"):
                 if isinstance(state, spx.State):
                     state = state.raw()
+                # When load_treedef=False, Spectrax returns a flat dict with
+                # dot-separated string keys (e.g. "layer0.weight"). Convert
+                # these to tuple keys so downstream flatten/unflatten works.
+                if (
+                    isinstance(state, dict)
+                    and state
+                    and isinstance(next(iter(state.keys())), str)
+                    and not any(isinstance(v, dict) for v in state.values())
+                ):
+                    state = {tuple(k.split(".")): v for k, v in state.items()}
                 # Keep all collections (params, lora, buffers, rng, ...) —
                 # downstream flatten/unflatten handles the nested structure.
-                state = flatten_dict(state)
+                if any(isinstance(v, dict) for v in state.values()):
+                    state = flatten_dict(state)
                 state = string_key_to_int(state)
                 state = _rename_legacy_checkpoint_leaves(state)
                 model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
@@ -1153,7 +1155,6 @@ class EasyBridgeMixin(PushToHubMixin):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
         config_kwargs: dict[str, tp.Any] | None = None,
-        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = "jax",
         shard_fns: dict[str, tp.Callable] | None = None,
@@ -1190,8 +1191,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 Defaults to jax.lax.Precision("fastest").
             config_kwargs (dict[str, Any] | None): Additional configuration parameters to override.
                 Defaults to None.
-            partition_rules (tuple[tuple[str, PartitionSpec]] | None): Custom partitioning rules
-                for sharding. Defaults to None.
             backend (EasyDeLBackends | None): The backend to use. Defaults to None.
             platform (EasyDeLPlatforms | None): The platform to use. Defaults to "jax".
             shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
@@ -1305,7 +1304,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 shard_fns, _ = AutoShardAndGatherFunctions.from_config(
                     config=config,
                     flatten=False,
-                    partition_rules=partition_rules,
                     model_task=cls._model_task,
                 )
                 fns = {"parameters": shard_fns}
@@ -1477,7 +1475,7 @@ class EasyBridgeMixin(PushToHubMixin):
             # double check to make sure weights are correct or just a simple non-op.
             model.assert_parameters_materialized(context="before shard_model in from_pretrained")
             with _phase_timer("model.shard_model", accumulator=timings):
-                model = model.shard_model(partition_rules=partition_rules)
+                model = model.shard_model()
 
         total_elapsed = time.perf_counter() - total_start
         breakdown = ", ".join(f"{k}={v:.2f}s" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))
@@ -1501,7 +1499,6 @@ class EasyBridgeMixin(PushToHubMixin):
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
         quantization_config: QuantizationConfig | None = None,
         apply_quantization: bool = False,
         verbose: bool = True,
@@ -1537,8 +1534,6 @@ class EasyBridgeMixin(PushToHubMixin):
             config_kwargs (EasyDeLBaseConfigDict | None): Additional configuration parameters.
                 Defaults to None.
             auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
-            partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Custom partitioning
-                rules for sharding. Defaults to None.
             quantization_config (QuantizationConfig | None): Quantization configuration.
                 Pass None to disable. Defaults to None.
             apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
@@ -1646,7 +1641,6 @@ class EasyBridgeMixin(PushToHubMixin):
         elif auto_shard_model:
             shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
-                partition_rules=partition_rules,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_dcn_axis_dims=sharding_dcn_axis_dims,
                 sharding_axis_names=sharding_axis_names,
@@ -2271,7 +2265,6 @@ class EasyBridgeMixin(PushToHubMixin):
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
         trust_remote_code: bool = False,
         torch_streaming_cache: str = "temp",
         torch_streaming_tmp_dir: str | None = None,
@@ -2310,8 +2303,6 @@ class EasyBridgeMixin(PushToHubMixin):
             platform (EasyDeLPlatforms | None): The platform to use. Defaults to None.
             config_kwargs (EasyDeLBaseConfigDict | None): Additional configuration parameters
                 to override. Defaults to None.
-            partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Custom partitioning
-                rules for sharding. Defaults to None.
             trust_remote_code (bool): Whether to trust remote code from HuggingFace Hub.
                 Defaults to False.
             torch_streaming_cache (str): Where to cache downloaded shards. Options are
@@ -2334,7 +2325,6 @@ class EasyBridgeMixin(PushToHubMixin):
         from huggingface_hub.errors import EntryNotFoundError
         from jax.experimental.array_serialization import serialization as jax_ser
         from jax.experimental.array_serialization import tensorstore_impl as ts_impl
-        from spectrax import match_partition_rules
         from transformers import AutoConfig
 
         from easydel.modules.auto.auto_configuration import get_modules_by_type
@@ -2426,14 +2416,13 @@ class EasyBridgeMixin(PushToHubMixin):
         )
 
         required_params = set(flatten_dict(model.graphtree_parameters_shape))
-        partition_rules = model._get_partition_rules(partition_rules)
-        spec_map: dict[tuple, PartitionSpec] = {}
-        if partition_rules is not None:
-            try:
-                specs_tree = match_partition_rules(partition_rules, model.graphtree_parameters_shape)
-                spec_map = flatten_dict(specs_tree)
-            except Exception:
-                spec_map = {}
+        # spec_map: dict[tuple, PartitionSpec] = {}
+        # if partition_rules is not None:
+        #     try:
+        #         specs_tree = match_partition_rules(partition_rules, model.graphtree_parameters_shape)
+        #         spec_map = flatten_dict(specs_tree)
+        #     except Exception:
+        #         spec_map = {}
 
         transformer = model.pure_transform_fn
         embedding_layer_names = transformer.keywords.get("embedding_layer_names")
@@ -2610,16 +2599,21 @@ class EasyBridgeMixin(PushToHubMixin):
         }
 
         def _chunk_shape_for(
-            key_tuple: tuple, global_shape: tuple[int, ...], dtype_: jnp.dtype, *, moe: bool
+            key_tuple: tuple,
+            global_shape: tuple[int, ...],
+            dtype_: jnp.dtype,
+            *,
+            moe: bool,
         ) -> list[int]:
-            spec = spec_map.get(key_tuple)
+            # TODO: Comeafter this
+            # spec = spec_map.get(key_tuple)
             local_shape = global_shape
-            if spec is not None:
-                try:
-                    sharding = jax.sharding.NamedSharding(ed_config.mesh, spec)
-                    local_shape = tuple(int(x) for x in sharding.shard_shape(global_shape))
-                except Exception:
-                    local_shape = global_shape
+            # if spec is not None:
+            #     try:
+            #         sharding = jax.sharding.NamedSharding(ed_config.mesh, spec)
+            #         local_shape = tuple(int(x) for x in sharding.shard_shape(global_shape))
+            #     except Exception:
+            #         local_shape = global_shape
             chunk = ts_impl._compute_chunk_shape(
                 tuple(int(max(1, d)) for d in local_shape), dtype_, tensorstore_chunk_bytes
             )

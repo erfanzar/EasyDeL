@@ -28,11 +28,19 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
+    scheduled_loss_cache_key,
+    sync_module_schedule_config,
     update_metrics,
     update_state_respectfully,
 )
+
+_XPO_REFERENCE_FORWARD_CACHE: dict[int, tp.Callable[..., tp.Any]] = {}
 
 
 def _compute_logps(
@@ -70,6 +78,32 @@ def _compute_logps(
     )
 
 
+def _compute_pair_logps(
+    module: spx.Module,
+    prompt_ids: jax.Array,
+    prompt_mask: jax.Array,
+    policy_completion_ids: jax.Array,
+    policy_completion_mask: jax.Array,
+    ref_completion_ids: jax.Array,
+    ref_completion_mask: jax.Array,
+    logprob_vocab_chunk_size: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    prompt_ids = jnp.concatenate([prompt_ids, prompt_ids], axis=0)
+    prompt_mask = jnp.concatenate([prompt_mask, prompt_mask], axis=0)
+    completion_ids = jnp.concatenate([policy_completion_ids, ref_completion_ids], axis=0)
+    completion_mask = jnp.concatenate([policy_completion_mask, ref_completion_mask], axis=0)
+    token_logps = _compute_logps(
+        module,
+        prompt_ids,
+        prompt_mask,
+        completion_ids,
+        completion_mask,
+        logprob_vocab_chunk_size,
+    )
+    split = policy_completion_ids.shape[0]
+    return token_logps[:split], token_logps[split:]
+
+
 def _sum_logps(token_logps: jax.Array, completion_mask: jax.Array) -> jax.Array:
     """Sum log probabilities over completion tokens, respecting the attention mask.
 
@@ -82,6 +116,28 @@ def _sum_logps(token_logps: jax.Array, completion_mask: jax.Array) -> jax.Array:
     """
     mask = completion_mask.astype(token_logps.dtype)
     return (token_logps * mask).sum(axis=1)
+
+
+def _xpo_pair_forward(module: spx.Module, batch: dict[str, tp.Any], logprob_vocab_chunk_size: int | None):
+    return _compute_pair_logps(
+        module,
+        batch["prompt_ids"],
+        batch["prompt_mask"],
+        batch["policy_completion_ids"],
+        batch["policy_completion_mask"],
+        batch["ref_completion_ids"],
+        batch["ref_completion_mask"],
+        logprob_vocab_chunk_size,
+    )
+
+
+def _cached_xpo_reference_forward(mesh: spx.SpxMesh) -> tp.Callable[..., tp.Any]:
+    key = id(mesh)
+    cached = _XPO_REFERENCE_FORWARD_CACHE.get(key)
+    if cached is None:
+        cached = spx.jit(_xpo_pair_forward, mesh=mesh, static_argnums=(2,))
+        _XPO_REFERENCE_FORWARD_CACHE[key] = cached
+    return cached
 
 
 def xpo_step(
@@ -254,3 +310,107 @@ def xpo_step(
 
     _, metrics = loss_fn(state.graphstate, batch)
     return metrics
+
+
+def _xpo_loss_from_logps(
+    *,
+    policy_on_policy: jax.Array,
+    policy_on_ref: jax.Array,
+    ref_on_policy: jax.Array,
+    ref_on_ref: jax.Array,
+    policy_completion_mask: jax.Array,
+    ref_completion_mask: jax.Array,
+    chosen_mask: jax.Array,
+    beta: jax.Array,
+    alpha: jax.Array,
+    loss_type: jax.Array,
+) -> jax.Array:
+    policy_logps_policy = _sum_logps(policy_on_policy, policy_completion_mask)
+    policy_logps_ref = _sum_logps(policy_on_ref, ref_completion_mask)
+    ref_logps_policy = _sum_logps(ref_on_policy, policy_completion_mask)
+    ref_logps_ref = _sum_logps(ref_on_ref, ref_completion_mask)
+
+    chosen_policy_logps = jnp.where(chosen_mask, policy_logps_policy, policy_logps_ref)
+    chosen_ref_logps = jnp.where(chosen_mask, ref_logps_policy, ref_logps_ref)
+    rejected_policy_logps = jnp.where(chosen_mask, policy_logps_ref, policy_logps_policy)
+    rejected_ref_logps = jnp.where(chosen_mask, ref_logps_ref, ref_logps_policy)
+
+    chosen_log_ratio = chosen_policy_logps - chosen_ref_logps
+    rejected_log_ratio = rejected_policy_logps - rejected_ref_logps
+    logits = chosen_log_ratio - rejected_log_ratio
+    sigmoid_losses = -jnn.log_sigmoid(beta * logits)
+    ipo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
+    dpo_losses = jnp.where(loss_type == 0, sigmoid_losses, ipo_losses)
+    xpo_losses = alpha * policy_logps_ref
+    return (dpo_losses + xpo_losses).mean()
+
+
+def _prepare_xpo_scheduled_batch(call) -> dict[str, tp.Any]:
+    batch = dict(call.batch)
+    if "_ref_on_policy" in batch and "_ref_on_ref" in batch:
+        return batch
+    reference_state = call.get("reference_state")
+    if reference_state is None:
+        raise RuntimeError("XPO scheduled MPMD training requires reference_state.")
+    ref_module = reference_state.merge(reference_state.graphstate)
+    ref_module.eval()
+    sync_module_schedule_config(ref_module, call.schedule)
+    partition_spec = call.get("partition_spec")
+    batch_for_ref = constrain_scheduled_batch(ref_module, batch, partition_spec)
+    ref_forward = _cached_xpo_reference_forward(ref_module.mesh)
+    ref_on_policy, ref_on_ref = ref_forward(ref_module, batch_for_ref, call.get("logprob_vocab_chunk_size"))
+    batch["_ref_on_policy"] = jax.lax.stop_gradient(ref_on_policy)
+    batch["_ref_on_ref"] = jax.lax.stop_gradient(ref_on_ref)
+    return batch
+
+
+def _xpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("logprob_vocab_chunk_size", "partition_spec"),
+        object_fields=("straight_through_emulator",),
+    )
+
+
+def _make_xpo_scheduled_loss(call):
+    logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        batch = constrain_scheduled_batch(module, batch, partition_spec)
+        policy_on_policy, policy_on_ref = _compute_pair_logps(
+            module,
+            batch["prompt_ids"],
+            batch["prompt_mask"],
+            batch["policy_completion_ids"],
+            batch["policy_completion_mask"],
+            batch["ref_completion_ids"],
+            batch["ref_completion_mask"],
+            logprob_vocab_chunk_size,
+        )
+        return _xpo_loss_from_logps(
+            policy_on_policy=policy_on_policy,
+            policy_on_ref=policy_on_ref,
+            ref_on_policy=jax.lax.stop_gradient(batch["_ref_on_policy"]),
+            ref_on_ref=jax.lax.stop_gradient(batch["_ref_on_ref"]),
+            policy_completion_mask=batch["policy_completion_mask"],
+            ref_completion_mask=batch["ref_completion_mask"],
+            chosen_mask=batch["chosen_mask"].astype(bool),
+            beta=batch["beta"][0],
+            alpha=batch["alpha"][0],
+            loss_type=batch["loss_type"][0],
+        )
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    xpo_step,
+    ScheduledLossAdapter(
+        name="xpo",
+        make_loss=_make_xpo_scheduled_loss,
+        make_cache_key=_xpo_scheduled_loss_cache_key,
+        prepare_batch=_prepare_xpo_scheduled_batch,
+    ),
+)

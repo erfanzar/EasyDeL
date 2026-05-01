@@ -768,17 +768,18 @@ class Gemma3TextModel(EasyDeLBaseModule):
             layer_mask_info = (
                 mask_info_sliding if self.config.layer_types[idx] == "sliding_attention" else mask_info_full
             )
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=layer_mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=self.frequencies,
-                default_frequencies=self.default_frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=layer_mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.frequencies,
+                    default_frequencies=self.default_frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:

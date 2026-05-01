@@ -36,6 +36,7 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
+import spectrax as spx
 from jax.sharding import PartitionSpec
 from spectrax import with_sharding_constraint
 
@@ -43,8 +44,13 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -162,6 +168,55 @@ def training_step(
         ),
     )
     return state, metrics
+
+
+def _reward_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("partition_spec", "center_rewards_coefficient"),
+        object_fields=("straight_through_emulator",),
+    )
+
+
+def _make_reward_scheduled_loss(call):
+    partition_spec = call.get("partition_spec")
+    center_rewards_coefficient = call.get("center_rewards_coefficient")
+
+    def scheduled_loss(tree: spx.State, batch: collections.abc.Mapping[str, jax.Array]):
+        module = bind_scheduled_module(call, tree)
+        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+
+        input_ids = jax.numpy.concatenate(
+            [call_batch["input_ids_chosen"], call_batch["input_ids_rejected"]],
+            axis=0,
+        )
+        attention_mask = jax.numpy.concatenate(
+            [call_batch["attention_mask_chosen"], call_batch["attention_mask_rejected"]],
+            axis=0,
+        )
+        rewards = module(input_ids=input_ids, attention_mask=attention_mask).logits
+        rewards_chosen, rewards_rejected = jax.numpy.split(rewards, 2, axis=0)
+
+        if "margin" in call_batch:
+            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - call_batch["margin"]))
+        else:
+            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
+
+        if center_rewards_coefficient is not None:
+            loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+        return loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    training_step,
+    ScheduledLossAdapter(
+        name="reward",
+        make_loss=_make_reward_scheduled_loss,
+        make_cache_key=_reward_scheduled_loss_cache_key,
+    ),
+)
 
 
 def evaluation_step(

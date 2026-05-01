@@ -316,7 +316,7 @@ def test_hybrid_rejects_two_different_full_attention_types():
 
 def test_hybrid_rejects_two_different_other_attention_types():
     """Two sliding-window groups with DIFFERENT windows have different type_ids -> error."""
-    with pytest.raises(ValueError, match="exactly one (other type|type of other groups)"):
+    with pytest.raises(ValueError, match="exactly one (other type|type of other groups)"):  # noqa: RUF043
         HybridCacheCoordinator(
             num_pages=64,
             kv_cache_groups=[

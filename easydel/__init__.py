@@ -419,7 +419,14 @@ _import_structure = {
         "ToolParserManager",
         "eSurge",
         "eSurgeApiServer",
+        "eSurgeCacheRuntimeConfig",
+        "eSurgeContextConfig",
+        "eSurgeDistributedConfig",
+        "eSurgeParsingConfig",
         "eSurgeRunner",
+        "eSurgeRuntimeConfig",
+        "eSurgeVisionConfig",
+        "eSurgeWorkerConfig",
         "vWhisperInference",
         "vWhisperInferenceConfig",
     ],
@@ -1058,7 +1065,14 @@ if _tp.TYPE_CHECKING:
         ToolParserManager,
         eSurge,
         eSurgeApiServer,
+        eSurgeCacheRuntimeConfig,
+        eSurgeContextConfig,
+        eSurgeDistributedConfig,
+        eSurgeParsingConfig,
         eSurgeRunner,
+        eSurgeRuntimeConfig,
+        eSurgeVisionConfig,
+        eSurgeWorkerConfig,
         vWhisperInference,
         vWhisperInferenceConfig,
     )
@@ -1450,7 +1464,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.99.12"]
+    _targeted_eformer_versions = ["0.0.100"]
     _targeted_ejkernel_versions = ["0.0.79"]
 
     from eformer import __version__ as _eform_version

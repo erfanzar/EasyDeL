@@ -50,10 +50,16 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 from .._logprob_utils import compute_token_logps_and_entropies_chunked, resolve_lmhead_chunksize
 from .._shared import apply_paired_truncation, gather_multimodal_kwargs
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    prepare_scheduled_reference_outputs,
+    register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -1111,6 +1117,89 @@ def training_step(
         metrics=metrics,
     )
     return (state, metrics)
+
+
+def _prepare_dpo_scheduled_batch(call) -> dict[str, tp.Any]:
+    batch = dict(call.batch)
+    ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+    if ref_chosen_logps is not None and ref_rejected_logps is not None:
+        return batch
+
+    return prepare_scheduled_reference_outputs(
+        call,
+        reference_state_field="reference_state",
+        forward_field="concatenated_forward",
+        output_to_batch={
+            "chosen_logps": "ref_chosen_logps",
+            "rejected_logps": "ref_rejected_logps",
+        },
+        skip_field="reference_free",
+        missing_error="DPO scheduled MPMD training requires reference_state and concatenated_forward.",
+    )
+
+
+def _dpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("beta", "label_smoothing", "loss_type", "reference_free", "partition_spec"),
+        object_fields=("concatenated_forward", "straight_through_emulator"),
+    )
+
+
+def _make_dpo_scheduled_loss(call):
+    concatenated_forward_fn = call.get("concatenated_forward")
+    beta = call.get("beta", 0.1)
+    label_smoothing = call.get("label_smoothing", 0)
+    loss_type = call.get("loss_type", "sigmoid")
+    reference_free = bool(call.get("reference_free", False))
+    partition_spec = call.get("partition_spec")
+    loss_func = get_loss_function(
+        loss_type=loss_type,
+        beta=beta,
+        label_smoothing=label_smoothing,
+    )
+
+    def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        module = bind_scheduled_module(call, tree)
+        batch = constrain_scheduled_batch(module, batch, partition_spec)
+        model_output = concatenated_forward_fn(module, batch)
+
+        chosen_logps = model_output["chosen_logps"]
+        rejected_logps = model_output["rejected_logps"]
+        if reference_free:
+            ref_chosen_logps = jnp.zeros_like(chosen_logps)
+            ref_rejected_logps = jnp.zeros_like(rejected_logps)
+        else:
+            ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+            if ref_chosen_logps is None or ref_rejected_logps is None:
+                raise RuntimeError("DPO scheduled MPMD loss requires precomputed reference log-probs in the batch.")
+            ref_chosen_logps = jax.lax.stop_gradient(ref_chosen_logps)
+            ref_rejected_logps = jax.lax.stop_gradient(ref_rejected_logps)
+
+        losses = loss_func(
+            chosen_logps,
+            rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+            beta,
+            label_smoothing,
+        )
+        if "aux_loss" in model_output:
+            losses += model_output["aux_loss"]
+        return losses.mean()
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    training_step,
+    ScheduledLossAdapter(
+        name="dpo",
+        make_loss=_make_dpo_scheduled_loss,
+        make_cache_key=_dpo_scheduled_loss_cache_key,
+        prepare_batch=_prepare_dpo_scheduled_batch,
+    ),
+)
 
 
 def evaluation_step(

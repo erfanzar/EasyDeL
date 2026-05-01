@@ -142,19 +142,19 @@ class EngineRequestsMixin:
         tokens_dropped = 0
 
         if prompt_len > max_prompt_budget:
-            if not self.auto_truncate_prompt and self.strict_context:
+            if not self.context_config.auto_truncate_prompt and self.context_config.strict_context:
                 raise ValueError(
                     f"Prompt too long: length={prompt_len} > budget={max_prompt_budget} "
                     f"(model_max={max_model_len}, reserve={self.reserve_tokens})."
                 )
-            new_tokens, dropped = truncate_tokens(token_ids, max_prompt_budget, self.truncate_mode)
+            new_tokens, dropped = truncate_tokens(token_ids, max_prompt_budget, self.context_config.truncate_mode)
             token_ids = new_tokens
             prompt_len = len(token_ids)
             truncated = dropped > 0
             tokens_dropped += dropped
             logger.warn(
                 f"Truncated prompt by {dropped} tokens to fit model budget "
-                f"(mode={self.truncate_mode}, new_len={prompt_len}, budget={max_prompt_budget})."
+                f"(mode={self.context_config.truncate_mode}, new_len={prompt_len}, budget={max_prompt_budget})."
             )
 
         if auto_infer_new_tokens:
@@ -173,10 +173,10 @@ class EngineRequestsMixin:
         allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len - self.reserve_tokens)
 
         if requested_new > allowed_new_if_keep_prompt:
-            do_cap_first = self.prefer_preserve_prompt or not self.auto_truncate_prompt
+            do_cap_first = self.context_config.prefer_preserve_prompt or not self.context_config.auto_truncate_prompt
 
             if do_cap_first:
-                if self.auto_cap_new_tokens:
+                if self.context_config.auto_cap_new_tokens:
                     logger.warn(
                         f"Capping max_new_tokens from {requested_new} to {allowed_new_if_keep_prompt} "
                         f"to preserve prompt (prompt_len={prompt_len}, reserve={self.reserve_tokens}, "
@@ -185,7 +185,7 @@ class EngineRequestsMixin:
                     requested_new = allowed_new_if_keep_prompt
                     _set_requested_new(sampling_params, requested_new)
                 else:
-                    if self.strict_context:
+                    if self.context_config.strict_context:
                         raise ValueError(
                             f"Requested max_new_tokens={requested_new} exceeds allowed={allowed_new_if_keep_prompt} "
                             f"for prompt_len={prompt_len}."
@@ -199,7 +199,7 @@ class EngineRequestsMixin:
             else:
                 target_prompt_budget = max(0, max_model_len - requested_new - self.reserve_tokens)
                 if target_prompt_budget == 0 and requested_new > 0:
-                    if self.auto_cap_new_tokens:
+                    if self.context_config.auto_cap_new_tokens:
                         logger.warn(
                             f"Requested max_new_tokens={requested_new} leaves no room for prompt; "
                             f"capping to {allowed_new_if_keep_prompt} to preserve prompt."
@@ -207,26 +207,28 @@ class EngineRequestsMixin:
                         requested_new = allowed_new_if_keep_prompt
                         _set_requested_new(sampling_params, requested_new)
                     else:
-                        if self.strict_context:
+                        if self.context_config.strict_context:
                             raise ValueError("Requested output too large; would require dropping entire prompt.")
                         requested_new = allowed_new_if_keep_prompt
                         _set_requested_new(sampling_params, requested_new)
                 else:
                     if prompt_len > target_prompt_budget:
-                        new_tokens, dropped = truncate_tokens(token_ids, target_prompt_budget, self.truncate_mode)
+                        new_tokens, dropped = truncate_tokens(
+                            token_ids, target_prompt_budget, self.context_config.truncate_mode
+                        )
                         token_ids = new_tokens
                         prompt_len = len(token_ids)
                         truncated = truncated or dropped > 0
                         tokens_dropped += dropped
                         self._info(
-                            f"Truncated prompt by {dropped} tokens (mode={self.truncate_mode}) "
+                            f"Truncated prompt by {dropped} tokens (mode={self.context_config.truncate_mode}) "
                             f"to honor requested max_new_tokens={requested_new}. "
                             f"New prompt_len={prompt_len}, target_prompt_budget={target_prompt_budget}."
                         )
 
         allowed_new_final = max(0, max_model_len - prompt_len - self.reserve_tokens)
         if requested_new > allowed_new_final:
-            if self.strict_context and not self.auto_cap_new_tokens:
+            if self.context_config.strict_context and not self.context_config.auto_cap_new_tokens:
                 raise ValueError(
                     f"After adjustments, requested_new={requested_new} still exceeds allowed={allowed_new_final}."
                 )
@@ -238,7 +240,7 @@ class EngineRequestsMixin:
             _set_requested_new(sampling_params, requested_new)
 
         prompt_for_engine = prompt
-        if truncated and self.decode_truncated_prompt:
+        if truncated and self.context_config.decode_truncated_prompt:
             try:
                 prompt_for_engine = self.tokenizer.decode(token_ids, skip_special_tokens=False)
             except Exception:

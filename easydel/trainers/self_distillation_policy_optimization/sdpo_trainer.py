@@ -281,6 +281,8 @@ class SDPOTrainer(GRPOTrainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (*shared_static, False, straight_through_emulator)
@@ -290,6 +292,8 @@ class SDPOTrainer(GRPOTrainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
@@ -297,7 +301,7 @@ class SDPOTrainer(GRPOTrainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
             with apply.mesh:
                 ids = with_sharding_constraint(
                     ids,

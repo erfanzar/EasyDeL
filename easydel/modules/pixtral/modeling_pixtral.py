@@ -623,13 +623,14 @@ class PixtralTransformer(EasyDeLLayerStackMixin, spx.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                output_attentions=output_attentions,
-                frequencies=position_embeddings,
-            )
+            with self._layer_stage_context(_idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    frequencies=position_embeddings,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, _idx, layers=self.layers)
 
             if output_attentions:

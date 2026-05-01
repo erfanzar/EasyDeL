@@ -29,7 +29,8 @@ Key Features:
     - Rich console monitoring with real-time metrics display
 
 Components:
-    Config: Main configuration classes for scheduler and cache
+    eSurgeRuntimeConfig: Runtime and scheduler configuration.
+    eSurgeCacheRuntimeConfig: KV cache and paging configuration.
     CacheCoordinator: KV cache coordination and management
     Scheduler: Request scheduling and batching
     eSurgeRunner: Model execution runner
@@ -37,9 +38,8 @@ Components:
 
 Classes:
     eSurge: High-level engine interface for text generation.
-    Config: Unified configuration combining scheduler and cache settings.
-    SchedulerConfig: Configuration for request scheduling behavior.
-    CacheConfig: Configuration for KV cache management.
+    eSurgeRuntimeConfig: Runtime and scheduler configuration.
+    eSurgeCacheRuntimeConfig: KV cache and paging configuration.
     RequestOutput: Container for generation results and metrics.
     CompletionOutput: Individual completion within a request.
     EngineRequest: Internal request tracking object.
@@ -53,27 +53,14 @@ Classes:
 Example:
     >>> from easydel.inference.esurge import (
     ...     eSurge,
-    ...     Config,
-    ...     SchedulerConfig,
-    ...     CacheConfig
-    ... )
-    >>>
-    >>> # Create configuration
-    >>> config = Config(
-    ...     scheduler_config=SchedulerConfig(
-    ...         max_num_seqs=16,
-    ...         max_num_batched_tokens=2048,
-    ...         max_model_len=8192
-    ...     ),
-    ...     cache_config=CacheConfig(
-    ...         num_pages=1000,
-    ...         page_size=16,
-    ...         enable_prefix_caching=True
-    ...     )
+    ...     eSurgeRuntimeConfig,
     ... )
     >>>
     >>> # Initialize and use the engine
-    >>> engine = eSurge(model="model-name", max_model_len=8192)
+    >>> engine = eSurge(
+    ...     model="model-name",
+    ...     runtime=eSurgeRuntimeConfig.from_dict(max_model_len=8192),
+    ... )
     >>> engine.initiate()
     >>>
     >>> # Generate text with streaming
@@ -85,7 +72,15 @@ Note:
     For production use, ensure thorough testing and monitoring.
 """
 
-from .config import CacheConfig, Config, SchedulerConfig
+from .config import (
+    eSurgeCacheRuntimeConfig,
+    eSurgeContextConfig,
+    eSurgeDistributedConfig,
+    eSurgeParsingConfig,
+    eSurgeRuntimeConfig,
+    eSurgeVisionConfig,
+    eSurgeWorkerConfig,
+)
 from .core import (
     AttentionSpec,
     CacheCoordinator,
@@ -154,7 +149,6 @@ from .server import eSurgeApiServer
 
 __all__ = (
     "AttentionSpec",
-    "CacheConfig",
     "CacheCoordinator",
     "CacheCoordinatorNoPrefixCache",
     "CacheGroupSpec",
@@ -167,7 +161,6 @@ __all__ = (
     "ChunkedLocalAttentionManager",
     "ChunkedLocalAttentionSpec",
     "CompletionOutput",
-    "Config",
     "DistributedController",
     "EngineRequest",
     "EngineRequestStatus",
@@ -189,7 +182,6 @@ __all__ = (
     "RequestQueue",
     "RichConsoleMonitor",
     "Scheduler",
-    "SchedulerConfig",
     "SchedulerInterface",
     "SchedulerMetrics",
     "SchedulerOutput",
@@ -205,8 +197,15 @@ __all__ = (
     "create_kv_cache_specs_from_config",
     "eSurge",
     "eSurgeApiServer",
+    "eSurgeCacheRuntimeConfig",
+    "eSurgeContextConfig",
+    "eSurgeDistributedConfig",
     "eSurgeMonitoringServer",
+    "eSurgeParsingConfig",
     "eSurgeRunner",
+    "eSurgeRuntimeConfig",
+    "eSurgeVisionConfig",
+    "eSurgeWorkerConfig",
     "get_metrics_collector",
     "initialize_metrics",
     "log_metrics_summary",

@@ -33,6 +33,8 @@ from threading import Event, Thread
 
 import numpy as np
 
+from easydel.infra.sharding import MeshLike
+
 from ..core.config import LoadStageConfig
 from ..core.protocols import AsyncDataset, BaseStage, PipelineContext, ShardedDataSource
 
@@ -179,7 +181,7 @@ class ShardingSpec:
         partition_specs: Mapping of field names to PartitionSpec objects.
     """
 
-    mesh: tp.Any = None  # jax.sharding.Mesh
+    mesh: MeshLike | None = None
     partition_specs: dict[str, tp.Any] = field(default_factory=dict)  # field -> PartitionSpec
 
     def apply(self, batch: dict[str, np.ndarray]) -> dict[str, tp.Any]:

@@ -72,9 +72,10 @@ from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
 
-from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.inference.esurge.config import KernelTilePolicy, PipelineInferenceMode
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
+from easydel.operations.kernels.inference_gdn import set_gdn_kernel_tile_policy
 
 from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
 from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
@@ -84,6 +85,8 @@ from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults, AsyncWindowResult
 from .execution_manager import ExecutionManager
+from .pipeline_execution_manager import PipelineExecutionManager
+from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
 from .sequence_buffer import (
     SequenceBuffer,
     build_allowed_mask,
@@ -97,6 +100,7 @@ from .states import CachedRequestState
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
+    from easydel.infra.etils import MpMdSchedulers
 
 logger = get_logger("eSurge")
 
@@ -254,6 +258,10 @@ class eSurgeRunner:
         model: EasyDeLBaseModule,
         hbm_utilization: float = 0.5,
         page_size: int = 128,
+        pipeline_inference: PipelineInferenceMode = "auto",
+        max_cache_tokens: int | None = None,
+        cache_capacity_margin: float = 0.92,
+        kernel_tile_policy: KernelTilePolicy = "auto",
         max_model_len: int = 2**13,
         max_num_batched_tokens: int | None = None,
         min_input_pad: int = 256,
@@ -267,6 +275,7 @@ class eSurgeRunner:
         enable_overlap_execution: bool = True,
         enable_sampler_metrics: bool = False,
         enable_window_aware_runtime_cap: bool = False,
+        mpmd_scheduler: MpMdSchedulers | None = None,
     ):
         """Initialize the model runner.
 
@@ -297,6 +306,15 @@ class eSurgeRunner:
         self.model = model.esurge_compatible_model
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
+        self.pipeline_plan = build_pipeline_inference_plan(
+            model=self.model,
+            mpmd_scheduler=mpmd_scheduler,
+            pipeline_inference=pipeline_inference,
+            max_cache_tokens=max_cache_tokens,
+            cache_capacity_margin=cache_capacity_margin,
+            kernel_tile_policy=kernel_tile_policy,
+        )
+        set_gdn_kernel_tile_policy(self.pipeline_plan.kernel_tile_policy)
 
         backend = jax.default_backend()
         attn_mechanism = getattr(self.model.config.get_text_config(), "attn_mechanism", None)
@@ -336,6 +354,7 @@ class eSurgeRunner:
                 page_size=page_size,
                 max_length=max_model_len,
             )
+        cap_metadata_pages(self.metadata, self.pipeline_plan)
         self.max_num_batched_tokens = (
             int(max_model_len)
             if max_num_batched_tokens is None
@@ -353,7 +372,15 @@ class eSurgeRunner:
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
 
-        min_token_pad_i = self.min_input_pad if min_token_pad is None else int(min_token_pad)
+        if min_token_pad is None:
+            # Request-count padding and token-count padding have different
+            # latency tradeoffs.  In PP inference a decode step is commonly
+            # one token; tying token buckets to min_input_pad forces those
+            # steps through b4/b8/... backbone executables and directly
+            # increases per-token latency.
+            min_token_pad_i = 1 if self.pipeline_plan.is_enabled else self.min_input_pad
+        else:
+            min_token_pad_i = int(min_token_pad)
         min_token_pad_i = min(min_token_pad_i, int(self.max_model_len))
         self.num_tokens_paddings = self._get_token_paddings(
             min_token_size=min_token_pad_i,
@@ -363,7 +390,8 @@ class eSurgeRunner:
         self.max_num_tokens = self.num_tokens_paddings[-1]
 
         logger.debug("Creating ExecutionManager and initializing pages cache")
-        self.executor_manager = ExecutionManager(
+        manager_cls = PipelineExecutionManager if self.pipeline_plan.is_enabled else ExecutionManager
+        self.executor_manager = manager_cls(
             model=self.model,
             use_aot_forward=use_aot_forward,
             bind_graphstate_for_aot=bind_graphstate_for_aot,
@@ -373,6 +401,8 @@ class eSurgeRunner:
             max_num_tokens=self.max_num_tokens,
             metadata=self.metadata,
             verbose=verbose,
+            mpmd_scheduler=mpmd_scheduler,
+            pipeline_plan=self.pipeline_plan,
         )
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
@@ -588,6 +618,9 @@ class eSurgeRunner:
                 seq_cap = int((n_pages * p_size) / 1000)
                 cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
                 cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+            if self.pipeline_plan.is_enabled:
+                cache_parts.append(f"pp_stages={self.pipeline_plan.mpmd_dim}")
+                cache_parts.append(f"pp_cache_layers/stage={self.pipeline_plan.max_stage_cache_layers}")
             window_pages_per_req = int(getattr(self.metadata, "window_aware_pages_per_request", -1) or -1)
             if window_pages_per_req > 0:
                 cache_parts.append(f"pages/request={window_pages_per_req}")
@@ -1280,7 +1313,7 @@ class eSurgeRunner:
                 raise ValueError("graphstate must not be None when model is None")
             if graphother is None:
                 raise ValueError("graphother must not be None when model is None")
-            model = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
+            model = spx.bind(graphdef, graphstate.overlay(graphother))
 
         model = model.esurge_compatible_model
         graphdef = model.graphdef
@@ -1346,16 +1379,9 @@ class eSurgeRunner:
         else:
             quantizer = self.model._quant_class(quantization_config=kv_quant_cfg)
 
-        self.executor_manager.kv_pages = self.model.init_operations_cache(
-            batch_size=int(self.max_num_reqs),
-            max_length=int(self.max_model_len),
-            page_size=int(getattr(self.metadata, "page_size", 128)),
-            hbm_utilization=float(getattr(self.metadata, "hbm_utilization", 0.9)),
-            dtype=getattr(self.metadata, "kvdtype", None),
+        self.executor_manager.kv_pages = self.executor_manager._init_operations_cache_with_retry(
             quantizer=quantizer,
             masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
-            ragged_config=self.metadata if isinstance(self.metadata, RaggedPagesCacheConfig) else None,
-            unified_config=self.metadata if isinstance(self.metadata, UnifiedAttentionCacheConfig) else None,
         )
         return
 
@@ -2007,6 +2033,12 @@ class eSurgeRunner:
         total_prep_put_time = 0.0
         total_prep_extra_put_time = 0.0
         total_execute_overhead_time = 0.0
+        total_pp_stage_dispatch_time = 0.0
+        total_pp_queue_wait_time = 0.0
+        total_pp_stage_launches = 0
+        total_pp_stage_compute_time = 0.0
+        total_pp_stage_max_time = 0.0
+        pp_stage_times_by_index: dict[int, float] = {}
         total_runner_host_time = 0.0
         total_d2h_time = 0.0
         token_buckets_used: set[int] = set()
@@ -2307,6 +2339,20 @@ class eSurgeRunner:
             total_prep_put_time += float(window_metrics.get("prep_put_time", 0.0))
             total_prep_extra_put_time += float(window_metrics.get("prep_extra_put_time", 0.0))
             total_execute_overhead_time += float(window_metrics.get("execute_overhead_time", 0.0))
+            total_pp_stage_dispatch_time += float(window_metrics.get("pp_stage_dispatch_time", 0.0))
+            total_pp_queue_wait_time += float(window_metrics.get("pp_queue_wait_time", 0.0))
+            total_pp_stage_launches += int(window_metrics.get("pp_stage_launches", 0))
+            total_pp_stage_compute_time += float(window_metrics.get("pp_stage_compute_time", 0.0))
+            total_pp_stage_max_time = max(
+                total_pp_stage_max_time,
+                float(window_metrics.get("pp_stage_max_time", 0.0)),
+            )
+            for stage_idx in range(8):
+                key = f"pp_stage_{stage_idx}_time"
+                if key in window_metrics:
+                    pp_stage_times_by_index[stage_idx] = pp_stage_times_by_index.get(stage_idx, 0.0) + float(
+                        window_metrics[key]
+                    )
             token_buckets_used.add(int(window_metrics.get("token_bucket", num_tokens_static)))
             req_buckets_used.add(int(window_metrics.get("padded_num_reqs", padded_num_reqs)))
 
@@ -2544,6 +2590,19 @@ class eSurgeRunner:
             f"budget={getattr(scheduler_output, 'token_budget_remaining', '?')}/"
             f"{getattr(scheduler_output, 'token_budget_initial', '?')}) "
         )
+        pp_detail = (
+            f"pp(stage={total_pp_stage_launches},dispatch={total_pp_stage_dispatch_time * 1e3:.2f}ms,"
+            f"queue={total_pp_queue_wait_time * 1e3:.2f}ms)"
+        )
+        if total_pp_stage_compute_time > 0:
+            stage_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_times_by_index.items())
+            )
+            pp_detail = (
+                f"pp(stage={total_pp_stage_launches},compute={total_pp_stage_compute_time * 1e3:.2f}ms,"
+                f"max={total_pp_stage_max_time * 1e3:.2f}ms" + (f",{stage_detail}" if stage_detail else "") + ")"
+            )
 
         self.log_it(
             f"[perf] it={self._perf_iteration:06d} "
@@ -2552,6 +2611,7 @@ class eSurgeRunner:
             f"tok={total_tokens}/b{_fmt_bucket(token_buckets_used)} "
             f"{queue_detail}"
             f"agg_tps={agg_tps:,.0f} req_tps={req_tps:,.1f} ema={self._perf_tps_ema:,.0f} "
+            f"{pp_detail} "
             f"runner={total_runner_host_time * 1e3:.2f}ms d2h={total_d2h_time * 1e3:.2f}ms "
             f"prep={total_prep_time * 1e3:.2f}ms {prep_detail}"
             f"fwd={total_exec_time * 1e3:.2f}ms samp={total_sample_time * 1e3:.2f}ms "
@@ -2642,3 +2702,5 @@ class eSurgeRunner:
             logger.debug("Shutting down async executor")
             self._executor.shutdown(wait=True)
             self._executor = None
+        if getattr(self, "executor_manager", None) is not None:
+            self.executor_manager.shutdown()

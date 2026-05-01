@@ -93,7 +93,7 @@ def test_load_optimizer_falls_back_to_saved_structure_when_template_init_fails(t
         np.testing.assert_array_equal(np.asarray(jax.device_get(loaded)), np.asarray(jax.device_get(original)))
 
 
-def test_create_model_uses_default_trainable_selector():
+def test_create_model_uses_trainable_selector():
     model = _build_tiny_lora_llama(0)
     tx = optax.adam(1e-3)
 

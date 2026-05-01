@@ -15,8 +15,6 @@
 
 import typing
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
@@ -232,16 +230,3 @@ class SmolLM3Config(EasyDeLBaseConfig):
         for idx, layer_type in enumerate(self.layer_types):
             if layer_type not in valid_types:
                 raise ValueError(f"`layer_types[{idx}]` must be one of {valid_types}, got '{layer_type}'")
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None

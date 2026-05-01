@@ -14,301 +14,296 @@
 
 """Configuration classes for the eSurge inference engine.
 
-This module provides configuration dataclasses for controlling the behavior
-of the eSurge engine's scheduler, KV cache, and speculative decoding.
+Each class is a ``TypedDict`` decorated with :func:`easydel.typings.typed_config`.
+That keeps a single source of truth for the schema:
 
-Classes:
-    SchedulerConfig: Configuration for request scheduling and batching.
-    CacheConfig: Configuration for KV cache memory management.
-    SpeculativeConfig: Configuration for speculative decoding (Eagle).
-    Config: Unified configuration combining all subsystems.
-
-Constants:
-    LONG_PREFILL_TRS: Default threshold for long prefill detection (2048 tokens).
+- Type checkers see a ``TypedDict`` (so ``Unpack[eSurgeRuntimeConfig]`` works in ``**kwargs``).
+- At runtime, ``Cls.from_dict(**kwargs)`` returns a ``ConfigDict`` instance — a
+  ``dict`` subclass with attribute access, ``to_dict()``, and ``replace(**)``.
 
 Example:
-    >>> from easydel.inference.esurge.config import (
-    ...     Config,
-    ...     SchedulerConfig,
-    ...     CacheConfig
-    ... )
-    >>>
-    >>> # Create scheduler config
-    >>> scheduler_config = SchedulerConfig(
-    ...     max_num_seqs=16,
-    ...     max_num_batched_tokens=2048,
-    ...     max_model_len=8192,
-    ...     policy="fcfs"
-    ... )
-    >>>
-    >>> # Create cache config
-    >>> cache_config = CacheConfig(
-    ...     num_pages=1000,
-    ...     page_size=128,
-    ...     enable_prefix_caching=True
-    ... )
-    >>>
-    >>> # Combine into unified config
-    >>> config = Config(
-    ...     scheduler_config=scheduler_config,
-    ...     cache_config=cache_config
-    ... )
+    >>> from easydel.inference.esurge.config import eSurgeRuntimeConfig
+    >>> runtime = eSurgeRuntimeConfig.from_dict(max_num_seqs=16, max_model_len=8192)
+    >>> runtime.max_num_seqs       # attribute access
+    16
+    >>> runtime["max_num_seqs"]    # dict access
+    16
 """
 
-from dataclasses import dataclass
-from typing import Literal
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack, cast
+
+from spectrax.common_types import NOT_GIVEN, _Empty
+
+from easydel.operations.kernels._gdn_policy import KernelTilePolicy, normalize_kernel_tile_policy
+from easydel.typings import typed_config
+
+if TYPE_CHECKING:
+    from easydel.infra.etils import MpMdSchedulers
+else:
+    MpMdSchedulers = object
 
 LONG_PREFILL_TRS: int = 2048
 
+PipelineInferenceMode: TypeAlias = Literal["auto", "on", "off"]
+PIPELINE_INFERENCE_MODES: frozenset[str] = frozenset(("auto", "on", "off"))
 
-@dataclass
-class SchedulerConfig:
-    """Configuration for the request scheduler.
 
-    Controls how requests are scheduled and batched for processing,
-    including capacity limits, scheduling policy, and advanced features
-    like chunked prefill and async scheduling.
+def normalize_pipeline_inference_mode(mode: str | None) -> PipelineInferenceMode:
+    normalized = "auto" if mode is None else str(mode).lower()
+    if normalized not in PIPELINE_INFERENCE_MODES:
+        raise ValueError(f"pipeline_inference must be one of 'auto', 'on', or 'off'; got {mode!r}.")
+    return cast(PipelineInferenceMode, normalized)
 
-    Attributes:
-        max_num_seqs: Maximum number of sequences running simultaneously.
-            This limits the batch size in terms of requests.
-        max_num_batched_tokens: Maximum tokens processed in a single batch.
-            This limits the total compute per forward pass.
-        max_model_len: Maximum input length the model can handle.
-            Requests exceeding this will be rejected or truncated.
-        policy: Scheduling policy ('fcfs' for first-come-first-served,
-            'priority' for priority-based). Defaults to 'fcfs'.
-        long_prefill_token_threshold: Token count threshold for identifying
-            long prefill requests. Requests above this threshold may be
-            chunked. Defaults to max_num_batched_tokens.
-        chunked_prefill_enabled: Enable chunked processing of long prefill
-            requests to prevent head-of-line blocking.
-        token_safety_margin: Reserved tokens per running request to prevent
-            over-allocation and OOM errors. Defaults to None.
-        max_num_seq_buckets: Optional explicit request-capacity buckets for
-            compilation (e.g., (8, 16, 32, 64)). Helps reduce JIT recompilation.
-        async_scheduling: Enable async token sampling to overlap with next
-            forward pass, providing 30-40% latency reduction.
 
-    Example:
-        >>> config = SchedulerConfig(
-        ...     max_num_seqs=16,
-        ...     max_num_batched_tokens=2048,
-        ...     max_model_len=8192,
-        ...     policy="priority",
-        ...     chunked_prefill_enabled=True
-        ... )
-
-    Raises:
-        ValueError: If configuration parameters are invalid (negative values,
-            incompatible settings, etc.).
-    """
-
-    max_num_seqs: int
-    """The maximum number of sequences running at the same time."""
-
-    max_num_batched_tokens: int | None
-    """The maximum number of tokens to be processed in a single batch."""
-
-    max_model_len: int
-    """The maximum length of the model's input."""
-
-    policy: Literal["priority", "fcfs"] = "fcfs"
-    """The scheduling policy to use, such as 'priority' or 'fcfs'."""
-
-    long_prefill_token_threshold: int | None = None
-    """A token threshold for handling long prefill requests (this can overwrite the max_num_batched_tokens)."""
-
-    chunked_prefill_enabled: bool = False
-    """A flag to enable or disable chunked prefilling."""
-
-    token_safety_margin: int | None = None
-    """Reserved tokens per running request to prevent over-allocation."""
-
-    max_num_seq_buckets: tuple[int, ...] | None = None
-    """Optional explicit request-capacity buckets (e.g., (8, 16, 32, 64))."""
-
-    async_scheduling: bool = True
-    """Enable async token sampling to overlap with next forward pass (30-40% latency reduction)."""
-
-    def __post_init__(self):
-        """Validate configuration parameters.
-
-        Raises:
-            ValueError: If any configuration parameter is invalid.
-        """
-        if self.max_num_seqs <= 0:
-            raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
-
-        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
+def _validate_esurge_runtime_config(self):
+    if self.max_model_len <= 0:
+        raise ValueError(f"max_model_len must be positive, got {self.max_model_len}")
+    if self.min_input_pad <= 0:
+        raise ValueError(f"min_input_pad must be positive, got {self.min_input_pad}")
+    if self.min_token_pad is not None and self.min_token_pad <= 0:
+        raise ValueError(f"min_token_pad must be positive when specified, got {self.min_token_pad}")
+    if self.max_num_seqs <= 0:
+        raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
+    if self.max_num_batched_tokens is not NOT_GIVEN and self.max_num_batched_tokens is not None:
+        if self.max_num_batched_tokens <= 0:
             raise ValueError(f"max_num_batched_tokens must be positive, got {self.max_num_batched_tokens}")
-
-        if self.max_model_len <= 0:
-            raise ValueError(f"max_model_len must be positive, got {self.max_model_len}")
-
-        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens > self.max_model_len:
-            raise ValueError(
-                f"max_num_batched_tokens ({self.max_num_batched_tokens}) cannot exceed "
-                f"max_model_len ({self.max_model_len})"
-            )
-        if self.long_prefill_token_threshold is None:
-            if self.max_num_batched_tokens is not None:
-                self.long_prefill_token_threshold = self.max_num_batched_tokens
-            else:
-                self.long_prefill_token_threshold = LONG_PREFILL_TRS
-        if self.long_prefill_token_threshold < 0:
-            raise ValueError(
-                f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}"
-            )
-
-        if self.token_safety_margin is not None and self.token_safety_margin < 0:
-            raise ValueError(f"token_safety_margin must be non-negative, got {self.token_safety_margin}")
-
-        if self.max_num_seq_buckets is not None:
-            if not self.max_num_seq_buckets:
-                raise ValueError("max_num_seq_buckets cannot be empty")
-            if any(b <= 0 for b in self.max_num_seq_buckets):
-                raise ValueError(f"All bucket sizes must be positive, got {self.max_num_seq_buckets}")
+    if self.long_prefill_token_threshold is not None and self.long_prefill_token_threshold < 0:
+        raise ValueError(f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}")
+    self.pipeline_inference = normalize_pipeline_inference_mode(self.pipeline_inference)
+    self.kernel_tile_policy = normalize_kernel_tile_policy(self.kernel_tile_policy)
 
 
-@dataclass
-class CacheConfig:
-    """Configuration for the KV (key-value) cache.
+@typed_config(
+    defaults={
+        "max_model_len": 8192,
+        "esurge_name": None,
+        "pipeline_inference": "auto",
+        "kernel_tile_policy": "auto",
+        "min_input_pad": 16,
+        "min_token_pad": None,
+        "max_num_seqs": 256,
+        "max_num_seq_buckets": None,
+        "async_scheduling": True,
+        "max_num_batched_tokens": NOT_GIVEN,
+        "use_aot_forward": True,
+        "bind_graphstate_for_aot": False,
+        "compile_runner": True,
+        "runner_verbose": False,
+        "overlap_execution": True,
+        "sampler_metrics": False,
+        "long_prefill_token_threshold": None,
+        "enable_window_aware_runtime_cap": False,
+        "mpmd_scheduler": None,
+    },
+    post_init=_validate_esurge_runtime_config,
+)
+class eSurgeRuntimeConfig(TypedDict, total=False):
+    esurge_name: NotRequired[str | None]
+    pipeline_inference: NotRequired[PipelineInferenceMode]
+    kernel_tile_policy: NotRequired[KernelTilePolicy]
+    max_model_len: NotRequired[int]
+    min_input_pad: NotRequired[int]
+    min_token_pad: NotRequired[int | None]
+    max_num_seqs: NotRequired[int]
+    max_num_seq_buckets: NotRequired[list[int] | tuple[int, ...] | None]
+    async_scheduling: NotRequired[bool]
+    max_num_batched_tokens: NotRequired[int | None | _Empty]
+    use_aot_forward: NotRequired[bool]
+    bind_graphstate_for_aot: NotRequired[bool]
+    compile_runner: NotRequired[bool]
+    runner_verbose: NotRequired[bool]
+    overlap_execution: NotRequired[bool]
+    sampler_metrics: NotRequired[bool]
+    long_prefill_token_threshold: NotRequired[int | None]
+    enable_window_aware_runtime_cap: NotRequired[bool]
+    mpmd_scheduler: NotRequired[MpMdSchedulers | None]
 
-    Manages memory allocation and caching strategies for attention mechanisms.
-    The cache uses page-based allocation for efficient memory management and
-    optional prefix caching for sharing common prefixes between sequences.
-
-    Attributes:
-        num_pages: Number of GPU pages allocated for cache. Set to None for
-            automatic calculation based on available memory.
-        page_size: Size of each cache page in tokens. Recommended >=256 for
-            GPUs to ensure efficient memory access patterns.
-        enable_prefix_caching: Enable caching of common prefixes across requests.
-            This can significantly improve throughput for similar prompts.
-
-    Example:
-        >>> config = CacheConfig(
-        ...     num_pages=1000,
-        ...     page_size=128,
-        ...     enable_prefix_caching=True
-        ... )
-
-    Note:
-        Page-based allocation allows efficient memory management and
-        sharing of cache blocks between sequences. Larger page sizes
-        reduce metadata overhead but may waste memory for short sequences.
-
-    Raises:
-        ValueError: If page_size is not positive or num_pages is invalid.
-    """
-
-    num_pages: int | None
-    """The number of GPU pages allocated for the cache."""
-
-    page_size: int
-    """The size of each cache page."""
-
-    enable_prefix_caching: bool
-    """A flag to enable or disable prefix caching."""
-
-    def __post_init__(self):
-        """Validate configuration parameters.
-
-        Raises:
-            ValueError: If any configuration parameter is invalid.
-        """
-        if self.page_size <= 0:
-            raise ValueError(f"page_size must be positive, got {self.page_size}")
-
-        if self.num_pages is not None and self.num_pages <= 0:
-            raise ValueError(f"num_pages must be positive when specified, got {self.num_pages}")
-
-
-@dataclass
-class SpeculativeConfig:
-    """Configuration for speculative decoding.
-
-    Speculative decoding uses a smaller draft model to predict multiple
-    tokens ahead, which are then verified by the main model in parallel.
-    This can significantly improve throughput for autoregressive generation.
-
-    Attributes:
-        num_speculative_tokens: Number of speculative tokens to generate
-            per verification step. Higher values may improve throughput
-            but reduce acceptance rate. Defaults to 0 (disabled).
-        speculative_model: Path to the speculative draft model (e.g., an
-            Eagle model trained for the base model). Required when
-            num_speculative_tokens > 0.
-
-    Example:
-        >>> config = SpeculativeConfig(
-        ...     num_speculative_tokens=5,
-        ...     speculative_model="path/to/eagle-model"
-        ... )
-
-    Note:
-        Currently supports Eagle-style speculative decoding. The draft
-        model must be compatible with the base model's vocabulary.
-    """
-
-    num_speculative_tokens: int = 0
-    """Number of speculative tokens to generate per step."""
-
-    speculative_model: str | None = None
-    """Path to the speculative/draft model."""
-
-    def use_eagle(self) -> bool:
-        """Check if Eagle speculative decoding is enabled.
-
-        Returns:
-            True if both num_speculative_tokens > 0 and a speculative_model
-            is specified, False otherwise.
-        """
-        return self.num_speculative_tokens > 0 and self.speculative_model is not None
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeRuntimeConfig"],
+    ) -> "eSurgeRuntimeConfig": ...
 
 
-@dataclass
-class Config:
-    """Unified configuration for the eSurge engine.
+def _validate_esurge_cache_runtime_config(self):
+    if not (0.0 < float(self.hbm_utilization) <= 1.0):
+        raise ValueError(f"hbm_utilization must be in (0, 1], got {self.hbm_utilization}")
+    if self.page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {self.page_size}")
+    if self.max_cache_tokens is not None and self.max_cache_tokens <= 0:
+        raise ValueError(f"max_cache_tokens must be positive when specified, got {self.max_cache_tokens}")
+    if not (0.0 < float(self.cache_capacity_margin) <= 1.0):
+        raise ValueError(f"cache_capacity_margin must be in (0, 1], got {self.cache_capacity_margin}")
 
-    Combines scheduler, cache, and speculative decoding configurations
-    into a single object for easy management and passing to the engine.
 
-    Attributes:
-        scheduler_config: Configuration for request scheduling and batching.
-        cache_config: Configuration for KV cache memory management.
-        speculative_config: Optional configuration for speculative decoding.
-            Defaults to None (no speculative decoding).
+@typed_config(
+    defaults={
+        "hbm_utilization": 0.85,
+        "page_size": 128,
+        "enable_prefix_caching": True,
+        "max_cache_tokens": None,
+        "cache_capacity_margin": 0.92,
+        "data_parallelism_axis": "dp",
+        "destroy_pages_on_pause": True,
+    },
+    post_init=_validate_esurge_cache_runtime_config,
+)
+class eSurgeCacheRuntimeConfig(TypedDict, total=False):
+    hbm_utilization: NotRequired[float]
+    page_size: NotRequired[int]
+    enable_prefix_caching: NotRequired[bool]
+    max_cache_tokens: NotRequired[int | None]
+    cache_capacity_margin: NotRequired[float]
+    data_parallelism_axis: NotRequired[str]
+    destroy_pages_on_pause: NotRequired[bool]
 
-    Example:
-        >>> from easydel.inference.esurge.config import (
-        ...     Config, SchedulerConfig, CacheConfig, SpeculativeConfig
-        ... )
-        >>>
-        >>> config = Config(
-        ...     scheduler_config=SchedulerConfig(
-        ...         max_num_seqs=16,
-        ...         max_num_batched_tokens=2048,
-        ...         max_model_len=8192
-        ...     ),
-        ...     cache_config=CacheConfig(
-        ...         num_pages=1000,
-        ...         page_size=128,
-        ...         enable_prefix_caching=True
-        ...     ),
-        ...     speculative_config=SpeculativeConfig(
-        ...         num_speculative_tokens=5,
-        ...         speculative_model="eagle-model"
-        ...     )
-        ... )
-    """
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeCacheRuntimeConfig"],
+    ) -> "eSurgeCacheRuntimeConfig": ...
 
-    scheduler_config: SchedulerConfig
-    """Nested configuration for the scheduler."""
 
-    cache_config: CacheConfig
-    """Nested configuration for the cache."""
+@typed_config(
+    defaults={
+        "reserve_tokens": None,
+        "auto_truncate_prompt": True,
+        "auto_cap_new_tokens": True,
+        "strict_context": False,
+        "truncate_mode": "left",
+        "prefer_preserve_prompt": True,
+        "decode_truncated_prompt": True,
+    },
+)
+class eSurgeContextConfig(TypedDict, total=False):
+    reserve_tokens: NotRequired[int | None]
+    auto_truncate_prompt: NotRequired[bool]
+    auto_cap_new_tokens: NotRequired[bool]
+    strict_context: NotRequired[bool]
+    truncate_mode: NotRequired[Literal["left", "right", "middle"]]
+    prefer_preserve_prompt: NotRequired[bool]
+    decode_truncated_prompt: NotRequired[bool]
 
-    speculative_config: SpeculativeConfig | None = None
-    """Nested configuration for speculative decoding."""
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeContextConfig"],
+    ) -> "eSurgeContextConfig": ...
+
+
+@typed_config(
+    defaults={
+        "detokenizer_max_states": 1 << 16,
+        "tokenizer_endpoint": None,
+        "detokenizer_endpoint": None,
+        "worker_startup_timeout": None,
+        "max_request_outputs": 1000,
+        "idle_reset_seconds": None,
+        "idle_reset_min_interval": 60.0,
+    },
+)
+class eSurgeWorkerConfig(TypedDict, total=False):
+    detokenizer_max_states: NotRequired[int]
+    tokenizer_endpoint: NotRequired[str | None]
+    detokenizer_endpoint: NotRequired[str | None]
+    worker_startup_timeout: NotRequired[float | None]
+    max_request_outputs: NotRequired[int | None]
+    idle_reset_seconds: NotRequired[float | None]
+    idle_reset_min_interval: NotRequired[float]
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeWorkerConfig"],
+    ) -> "eSurgeWorkerConfig": ...
+
+
+@typed_config(
+    defaults={
+        "sampling_params_callback": None,
+        "extra_eos_token_ids": None,
+        "extra_stops": None,
+        "ignore_stop_strings_in_reasoning": True,
+        "silent_mode": False,
+        "tool_parser": None,
+        "reasoning_parser": None,
+    },
+)
+class eSurgeParsingConfig(TypedDict, total=False):
+    sampling_params_callback: NotRequired[Any]
+    extra_eos_token_ids: NotRequired[list[int] | None]
+    extra_stops: NotRequired[str | list[str] | None]
+    ignore_stop_strings_in_reasoning: NotRequired[bool]
+    silent_mode: NotRequired[bool]
+    tool_parser: NotRequired[Any | None]
+    reasoning_parser: NotRequired[Any | None]
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeParsingConfig"],
+    ) -> "eSurgeParsingConfig": ...
+
+
+@typed_config(
+    defaults={
+        "resolution_buckets": None,
+        "vision_cache_capacity_mb": 1024,
+    },
+)
+class eSurgeVisionConfig(TypedDict, total=False):
+    resolution_buckets: NotRequired[list[tuple[int, int]] | None]
+    vision_cache_capacity_mb: NotRequired[int]
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeVisionConfig"],
+    ) -> "eSurgeVisionConfig": ...
+
+
+@typed_config(
+    defaults={
+        "distributed_mode": False,
+        "distributed_role": "auto",
+        "distributed_service_name": None,
+        "distributed_world_size": None,
+        "distributed_rank": None,
+        "distributed_control_port": 19666,
+        "distributed_control_bind_host": "0.0.0.0",
+        "distributed_advertise_addr": None,
+        "distributed_auth_token": None,
+        "distributed_step_timeout_s": 30.0,
+        "distributed_connect_timeout_s": 15.0,
+        "distributed_verify_sampling_digest": True,
+    },
+)
+class eSurgeDistributedConfig(TypedDict, total=False):
+    distributed_mode: NotRequired[bool]
+    distributed_role: NotRequired[Literal["auto", "leader", "worker"]]
+    distributed_service_name: NotRequired[str | None]
+    distributed_world_size: NotRequired[int | None]
+    distributed_rank: NotRequired[int | None]
+    distributed_control_port: NotRequired[int]
+    distributed_control_bind_host: NotRequired[str]
+    distributed_advertise_addr: NotRequired[str | None]
+    distributed_auth_token: NotRequired[str | None]
+    distributed_step_timeout_s: NotRequired[float]
+    distributed_connect_timeout_s: NotRequired[float]
+    distributed_verify_sampling_digest: NotRequired[bool]
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeDistributedConfig"],
+    ) -> "eSurgeDistributedConfig": ...

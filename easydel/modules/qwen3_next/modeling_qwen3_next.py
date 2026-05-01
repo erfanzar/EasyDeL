@@ -37,7 +37,6 @@ from spectrax import (
     PartitionAxis,
     apply_logical_sharding,
     common_types,
-    get_corrected_named_sharding,
     nn,
     with_sharding_constraint,
 )
@@ -63,7 +62,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.sharding import RuntimeShardingResolver
+from easydel.infra.sharding import RuntimeShardingResolver, resolve_stage_mesh
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -117,13 +116,14 @@ def _preserve_array_sharding(
     if partition_manager is None or partition_axis is None:
         return value
 
-    spec = partition_manager.resolve(
+    mesh = resolve_stage_mesh(partition_manager.mesh)
+    resolver = partition_manager.with_mesh(mesh)
+    spec = resolver.resolve(
         axes=[common_types.BATCH, common_types.HEAD, common_types.EMPTY, common_types.EMPTY],
         mode=common_types.MODE_PREFILL,
         shape=value.shape,
     )
-    sharding = get_corrected_named_sharding(tuple(value.shape), spec, raise_mesh_error=False)
-    return with_sharding_constraint(value, sharding)
+    return with_sharding_constraint(value, spec, mesh=mesh)
 
 
 def apply_grouped_single_step_gdr(
@@ -2365,17 +2365,18 @@ class Qwen3NextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                output_router_logits=output_router_logits,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    frequencies=self.frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)

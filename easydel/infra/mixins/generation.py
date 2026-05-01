@@ -92,6 +92,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
+from easydel.infra.sharding import mesh_axis_size
 from easydel.utils import set_inference_mode
 
 from ..base_config import EasyDeLBaseConfig
@@ -402,6 +403,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
     version: tp.Literal["v3", "v2"],
     layer_indices: tp.Iterable[int] | None = None,
     num_pages_override: int | None = None,
+    stage_layer_groups: tp.Iterable[tp.Iterable[int]] | None = None,
 ):
     """Create per-layer ragged configs that share a common page pool budget.
 
@@ -438,7 +440,6 @@ def _create_mixed_standard_ragged_page_cache_configs(
     from easydel.caching.ragged_page.cache import (
         _canonicalize_dtype,
         _dtype_to_string,
-        _mesh_axis_size,
         _resolve_ragged_cache_layout,
         cdiv,
         get_num_slices_per_kv_cache_update_page,
@@ -451,8 +452,8 @@ def _create_mixed_standard_ragged_page_cache_configs(
 
     kvdtype = _canonicalize_dtype(dtype)
     requested_kvdtype = kvdtype
-    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
-    physical_kv_head_shards = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
+    data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+    physical_kv_head_shards = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
     effective_kv_head_shards = physical_kv_head_shards
 
     if version == "v3":
@@ -502,6 +503,14 @@ def _create_mixed_standard_ragged_page_cache_configs(
             )
             num_pages_override = None
 
+    if stage_layer_groups is None:
+        charged_layer_count = len(geometries)
+    else:
+        charged_layer_count = max(
+            (len([idx for idx in group if int(idx) in geometries]) for group in stage_layer_groups),
+            default=1,
+        )
+
     if num_pages_override is None:
         free = RaggedPagesCacheConfig._compute_free_hbm(
             mesh=mesh,
@@ -510,12 +519,39 @@ def _create_mixed_standard_ragged_page_cache_configs(
             kv_head_shards=effective_kv_head_shards,
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
-        page_bytes = (
-            2
-            * int(page_size)
-            * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in geometries.values())
-            * bytes_av
-        )
+        if stage_layer_groups is None:
+            charged_geometries = list(geometries.values())
+            charged_layer_count = len(charged_geometries)
+            page_bytes = (
+                2
+                * int(page_size)
+                * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in charged_geometries)
+                * bytes_av
+            )
+        else:
+            charged_layer_count = 1
+            page_bytes = 0
+            for group in stage_layer_groups:
+                group_geometries = [geometries[int(idx)] for idx in group if int(idx) in geometries]
+                if not group_geometries:
+                    continue
+                charged_layer_count = max(charged_layer_count, len(group_geometries))
+                group_page_bytes = (
+                    2
+                    * int(page_size)
+                    * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in group_geometries)
+                    * bytes_av
+                )
+                page_bytes = max(page_bytes, group_page_bytes)
+            if page_bytes <= 0:
+                charged_geometries = list(geometries.values())
+                charged_layer_count = len(charged_geometries)
+                page_bytes = (
+                    2
+                    * int(page_size)
+                    * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in charged_geometries)
+                    * bytes_av
+                )
         num_pages = int(free) // int(page_bytes)
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
@@ -548,7 +584,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
             A fully populated ``RaggedPagesCacheConfig``.
         """
         return RaggedPagesCacheConfig(
-            num_hidden_layers=max(1, len(geometries)),
+            num_hidden_layers=max(1, int(charged_layer_count)),
             max_model_length=int(max_length),
             num_kv_heads=int(num_kv_heads),
             k_headdim=int(head_dim),
@@ -596,6 +632,7 @@ def _create_mixed_standard_unified_attention_cache_configs(
     dtype: jnp.dtype,
     layer_indices: tp.Iterable[int] | None = None,
     num_pages_override: int | None = None,
+    stage_layer_groups: tp.Iterable[tp.Iterable[int]] | None = None,
 ):
     """Create per-layer unified configs that share one mixed-geometry page pool.
 
@@ -621,13 +658,13 @@ def _create_mixed_standard_unified_attention_cache_configs(
     Raises:
         ValueError: If the computed page budget is non-positive.
     """
-    from easydel.caching.unified_attention.cache import _mesh_axis_size, _previous_power_of_2, cdiv
+    from easydel.caching.unified_attention.cache import _previous_power_of_2, cdiv
 
     geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
     runtime_sharding_resolver = text_config.runtime_sharding_resolver
     mesh = text_config.mesh
     kvdtype = dtype
-    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+    data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
     bytes_av = jnp.finfo(kvdtype).bits // 8
 
     if num_pages_override is None:
@@ -636,12 +673,34 @@ def _create_mixed_standard_unified_attention_cache_configs(
             runtime_sharding_resolver=runtime_sharding_resolver,
             hbm_utilization=hbm_utilization,
         )
-        page_bytes = (
-            2
-            * int(page_size)
-            * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in geometries.values())
-            * bytes_av
-        )
+        if stage_layer_groups is None:
+            charged_geometries = list(geometries.values())
+            page_bytes = (
+                2
+                * int(page_size)
+                * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in charged_geometries)
+                * bytes_av
+            )
+        else:
+            page_bytes = 0
+            for group in stage_layer_groups:
+                group_geometries = [geometries[int(idx)] for idx in group if int(idx) in geometries]
+                if not group_geometries:
+                    continue
+                group_page_bytes = (
+                    2
+                    * int(page_size)
+                    * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in group_geometries)
+                    * bytes_av
+                )
+                page_bytes = max(page_bytes, group_page_bytes)
+            if page_bytes <= 0:
+                page_bytes = (
+                    2
+                    * int(page_size)
+                    * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in geometries.values())
+                    * bytes_av
+                )
         num_pages = int(free) // int(page_bytes)
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
@@ -660,7 +719,13 @@ def _create_mixed_standard_unified_attention_cache_configs(
     else:
         num_pages = int(num_pages_override)
 
-    num_hidden_layers = max(1, len(geometries))
+    if stage_layer_groups is None:
+        num_hidden_layers = max(1, len(geometries))
+    else:
+        num_hidden_layers = max(
+            (len([idx for idx in group if int(idx) in geometries]) for group in stage_layer_groups),
+            default=1,
+        )
 
     def _build_config(num_kv_heads: int, head_dim: int) -> UnifiedAttentionCacheConfig:
         """Create a ``UnifiedAttentionCacheConfig`` for one layer geometry.
@@ -743,14 +808,14 @@ def _create_mixed_turboquant_ragged_page_cache_configs(
     Raises:
         ValueError: If the computed page budget is non-positive.
     """
-    from easydel.caching.ragged_page.cache import _mesh_axis_size, cdiv, per_device_hbm_budget_bytes
+    from easydel.caching.ragged_page.cache import cdiv, per_device_hbm_budget_bytes
     from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig
 
     geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
     runtime_sharding_resolver = text_config.runtime_sharding_resolver
     mesh = text_config.mesh
-    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
-    kv_head_size = _mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
+    data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
+    kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
 
     def _page_bytes(num_kv_heads: int, head_dim: int) -> int:
         """Estimate bytes consumed by one page of TurboQuant KV cache.
@@ -1161,6 +1226,53 @@ class EasyGenerationMixin:
     base_model_prefix: str
     _model_task: str | None = None
     _model_type: str | None = None
+
+    def _pp_stage_groups_for_cache_budget(
+        self,
+        layer_indices: tp.Iterable[int],
+        *,
+        total_layers: int,
+    ) -> list[list[int]]:
+        """Group cache-bearing layers by physical PP owner for capacity sizing."""
+        indices = [int(idx) for idx in layer_indices]
+        if not indices:
+            return []
+        if self._pipeline_physical_stage_count() <= 1:
+            return [indices]
+        groups: dict[int, list[int]] = collections.defaultdict(list)
+        for idx in indices:
+            stage_idx, _ = self._layer_physical_stage_assignment(idx, total_layers)
+            groups[int(stage_idx)].append(idx)
+        return list(groups.values())
+
+    def _pp_stage_cache_layer_count(
+        self,
+        layer_indices: tp.Iterable[int],
+        *,
+        total_layers: int,
+    ) -> int:
+        """Return the max number of cache-bearing layers owned by one PP stage."""
+        groups = self._pp_stage_groups_for_cache_budget(layer_indices, total_layers=total_layers)
+        if not groups:
+            return 0
+        return max(len(group) for group in groups)
+
+    def _standard_ragged_layer_indices_for_cache_budget(self) -> list[int]:
+        """Return layers whose attention cache is backed by standard ragged pages."""
+        from easydel.caching import ParallelHybridCacheView, RaggedPagesCacheView
+
+        cache_view_mapping = self.get_operations_cache_view()
+        cache_view_mapping_by_slot = self.get_operations_cache_view_by_slot()
+        indices: list[int] = []
+        for layer_idx, view_class in cache_view_mapping.items():
+            if view_class is RaggedPagesCacheView:
+                indices.append(int(layer_idx))
+                continue
+            if view_class is ParallelHybridCacheView and RaggedPagesCacheView in set(
+                cache_view_mapping_by_slot.get(layer_idx, {}).values()
+            ):
+                indices.append(int(layer_idx))
+        return sorted(set(indices))
 
     def init_ragged_pages(
         self,
@@ -1870,9 +1982,17 @@ class EasyGenerationMixin:
             if hidden_size and num_heads:
                 head_dim = hidden_size // num_heads
 
-        num_hidden_layers = (
-            int(num_hidden_layers_override) if num_hidden_layers_override is not None else _count_kv_layers(text_config)
-        )
+        if num_hidden_layers_override is not None:
+            num_hidden_layers = int(num_hidden_layers_override)
+        else:
+            layer_indices = self._standard_ragged_layer_indices_for_cache_budget()
+            if layer_indices:
+                num_hidden_layers = self._pp_stage_cache_layer_count(
+                    layer_indices,
+                    total_layers=int(getattr(text_config, "num_hidden_layers", max(layer_indices) + 1)),
+                )
+            else:
+                num_hidden_layers = _count_kv_layers(text_config)
         if num_hidden_layers <= 0:
             num_hidden_layers = 1
         if num_kv_heads is None or int(num_kv_heads) <= 0:
@@ -2004,6 +2124,7 @@ class EasyGenerationMixin:
         page_size: int = 128,
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
+        layer_indices: tp.Iterable[int] | None = None,
     ):
         """Create UnifiedAttentionCacheConfig for vLLM-style unified attention.
 
@@ -2017,13 +2138,23 @@ class EasyGenerationMixin:
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
 
-        if _has_mixed_standard_ragged_geometry(text_config=text_config):
+        if layer_indices is None:
+            layer_indices = list(range(int(getattr(text_config, "num_hidden_layers", 1) or 1)))
+        else:
+            layer_indices = [int(idx) for idx in layer_indices]
+
+        if _has_mixed_standard_ragged_geometry(text_config=text_config, layer_indices=layer_indices):
             representative_config, _ = _create_mixed_standard_unified_attention_cache_configs(
                 text_config=text_config,
                 max_length=max_length,
                 page_size=page_size,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
+                layer_indices=layer_indices,
+                stage_layer_groups=self._pp_stage_groups_for_cache_budget(
+                    layer_indices,
+                    total_layers=int(getattr(text_config, "num_hidden_layers", len(layer_indices))),
+                ),
             )
             return representative_config
 
@@ -2032,7 +2163,13 @@ class EasyGenerationMixin:
             mesh=text_config.mesh,
             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=dtype,
-            num_hidden_layers=_count_kv_layers(text_config),
+            num_hidden_layers=max(
+                1,
+                self._pp_stage_cache_layer_count(
+                    layer_indices,
+                    total_layers=int(getattr(text_config, "num_hidden_layers", len(layer_indices))),
+                ),
+            ),
             num_kv_heads=num_kv_heads,
             max_model_length=max_length,
             head_dim=head_dim,
@@ -2050,6 +2187,7 @@ class EasyGenerationMixin:
         dtype: jnp.dtype | None = None,
         ragged_config=None,
         unified_config=None,
+        pipeline_plan=None,
     ):
         """Initialize cache configurations for each layer based on operation types.
 
@@ -2235,7 +2373,13 @@ class EasyGenerationMixin:
                     mesh=text_config.mesh,
                     runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                     turboquant_config=kv_quant_cfg,
-                    num_hidden_layers=max(1, num_standard_ragged_layers),
+                    num_hidden_layers=max(
+                        1,
+                        self._pp_stage_cache_layer_count(
+                            standard_ragged_layer_indices,
+                            total_layers=int(num_hidden_layers),
+                        ),
+                    ),
                     num_kv_heads=text_config.num_key_value_heads,
                     max_model_length=max_length,
                     kv_head_dim_size=text_config.head_dim,
@@ -2248,7 +2392,13 @@ class EasyGenerationMixin:
                 page_size=page_size,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
-                num_hidden_layers_override=max(1, num_standard_ragged_layers),
+                num_hidden_layers_override=max(
+                    1,
+                    self._pp_stage_cache_layer_count(
+                        standard_ragged_layer_indices,
+                        total_layers=int(num_hidden_layers),
+                    ),
+                ),
             )
         if needs_standard_ragged and has_mixed_standard_ragged and not _is_turboquant:
             cached_per_layer_configs = _get_cached_mixed_standard_ragged_configs(
@@ -2271,6 +2421,10 @@ class EasyGenerationMixin:
                             getattr(shared_ragged_config, "num_pages", None)
                             if user_provided_standard_ragged_config
                             else None
+                        ),
+                        stage_layer_groups=self._pp_stage_groups_for_cache_budget(
+                            standard_ragged_layer_indices,
+                            total_layers=int(num_hidden_layers),
                         ),
                     )
                 )
@@ -2301,6 +2455,10 @@ class EasyGenerationMixin:
                         num_pages_override=(
                             getattr(shared_unified_config, "num_pages", None) if user_provided_unified_config else None
                         ),
+                        stage_layer_groups=self._pp_stage_groups_for_cache_budget(
+                            unified_layer_indices,
+                            total_layers=int(num_hidden_layers),
+                        ),
                     )
                 )
             elif shared_unified_config is None:
@@ -2309,6 +2467,7 @@ class EasyGenerationMixin:
                     page_size=page_size,
                     hbm_utilization=hbm_utilization,
                     dtype=dtype,
+                    layer_indices=unified_layer_indices,
                 )
         with self.mesh:
             views_config = [None] * num_hidden_layers
@@ -2387,6 +2546,7 @@ class EasyGenerationMixin:
         starts: jnp.array | None = None,
         ragged_config=None,
         unified_config=None,
+        pipeline_plan=None,
     ):
         """Initialize cache using HybridCache as the universal per-layer container.
 
@@ -2439,6 +2599,7 @@ class EasyGenerationMixin:
             dtype=dtype,
             ragged_config=ragged_config,
             unified_config=unified_config,
+            pipeline_plan=pipeline_plan,
         )
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
@@ -2507,7 +2668,7 @@ class EasyGenerationMixin:
                         _tq_groups.setdefault(_tq_signature(_cfg), []).append((_i, _cfg))
 
                 for _group in _tq_groups.values():
-                    if len(_group) <= 1:
+                    if self._pipeline_stage_count() > 1 or len(_group) <= 1:
                         continue
                     _layer_indices = [_li for _li, _ in _group]
                     _batch_views = _TQView.init_all_layers(
@@ -2540,44 +2701,68 @@ class EasyGenerationMixin:
                     )
                 assert config_classes is not None, f"Missing config for layer {idx}"
 
-                if view_class is ParallelHybridCacheView:
-                    # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
-                    # The attention config can be ragged, unified, or standard transformer.
-                    t_config = config_classes[0]
+                with self._layer_stage_context(idx, total_layers=num_hidden_layers):
+                    if view_class is ParallelHybridCacheView:
+                        # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
+                        # The attention config can be ragged, unified, or standard transformer.
+                        t_config = config_classes[0]
 
-                    from easydel.caching import (
-                        MLARaggedPagesCacheConfig,
-                        RaggedPagesCacheConfig,
-                        UnifiedAttentionCacheConfig,
-                    )
+                        from easydel.caching import (
+                            MLARaggedPagesCacheConfig,
+                            RaggedPagesCacheConfig,
+                            UnifiedAttentionCacheConfig,
+                        )
 
-                    if isinstance(t_config, MLARaggedPagesCacheConfig):
-                        attn_view = MLARaggedPagesCacheView.init(
-                            config=t_config,
+                        if isinstance(t_config, MLARaggedPagesCacheConfig):
+                            attn_view = MLARaggedPagesCacheView.init(
+                                config=t_config,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                            )
+                        elif isinstance(t_config, RaggedPagesCacheConfig):
+                            attn_view = RaggedPagesCacheView.init(
+                                config=t_config,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                            )
+                        elif isinstance(t_config, UnifiedAttentionCacheConfig):
+                            attn_view = UnifiedAttentionCacheView.init(
+                                config=t_config,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                            )
+                        else:
+                            attn_view = TransformerCacheView.init(
+                                config=t_config,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                dtype=dtype,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                                masking_details=_resolve_masking_details(idx),
+                                starts=starts,
+                            )
+
+                        recurrent_view = RecurrentCacheView.init(
+                            config=config_classes[1],
                             layer_index=idx,
-                            mesh=text_config.mesh,
-                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                            quantizer=quantizer,
+                            dtype=dtype,
                         )
-                    elif isinstance(t_config, RaggedPagesCacheConfig):
-                        attn_view = RaggedPagesCacheView.init(
-                            config=t_config,
+
+                        view = ParallelHybridCacheView(
+                            transformer=attn_view,
+                            recurrent=recurrent_view,
                             layer_index=idx,
-                            mesh=text_config.mesh,
-                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                            quantizer=quantizer,
                         )
-                    elif isinstance(t_config, UnifiedAttentionCacheConfig):
-                        attn_view = UnifiedAttentionCacheView.init(
-                            config=t_config,
-                            layer_index=idx,
-                            mesh=text_config.mesh,
-                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                            quantizer=quantizer,
-                        )
-                    else:
-                        attn_view = TransformerCacheView.init(
-                            config=t_config,
+                    elif view_class is TransformerCacheView:
+                        view = view_class.init(
+                            config=config_classes,
                             layer_index=idx,
                             mesh=text_config.mesh,
                             dtype=dtype,
@@ -2586,55 +2771,40 @@ class EasyGenerationMixin:
                             masking_details=_resolve_masking_details(idx),
                             starts=starts,
                         )
-
-                    recurrent_view = RecurrentCacheView.init(
-                        config=config_classes[1],
-                        layer_index=idx,
-                        dtype=dtype,
-                    )
-
-                    view = ParallelHybridCacheView(
-                        transformer=attn_view,
-                        recurrent=recurrent_view,
-                        layer_index=idx,
-                    )
-                elif view_class is TransformerCacheView:
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        mesh=text_config.mesh,
-                        dtype=dtype,
-                        runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                        quantizer=quantizer,
-                        masking_details=_resolve_masking_details(idx),
-                        starts=starts,
-                    )
-                elif view_class is RecurrentCacheView:
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        dtype=dtype,
-                    )
-                elif view_class is KDACacheView:
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        dtype=dtype,
-                    )
-                elif view_class in (RaggedPagesCacheView, MLARaggedPagesCacheView):
-                    from easydel.caching.turboquant_ragged_page import (
-                        TurboQuantRaggedPagesCacheConfig,
-                        TurboQuantRaggedPagesCacheView,
-                    )
-
-                    if isinstance(config_classes, TurboQuantRaggedPagesCacheConfig):
-                        view = TurboQuantRaggedPagesCacheView.init(
+                    elif view_class is RecurrentCacheView:
+                        view = view_class.init(
                             config=config_classes,
                             layer_index=idx,
-                            mesh=text_config.mesh,
-                            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                            dtype=dtype,
                         )
-                    else:
+                    elif view_class is KDACacheView:
+                        view = view_class.init(
+                            config=config_classes,
+                            layer_index=idx,
+                            dtype=dtype,
+                        )
+                    elif view_class in (RaggedPagesCacheView, MLARaggedPagesCacheView):
+                        from easydel.caching.turboquant_ragged_page import (
+                            TurboQuantRaggedPagesCacheConfig,
+                            TurboQuantRaggedPagesCacheView,
+                        )
+
+                        if isinstance(config_classes, TurboQuantRaggedPagesCacheConfig):
+                            view = TurboQuantRaggedPagesCacheView.init(
+                                config=config_classes,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                            )
+                        else:
+                            view = view_class.init(
+                                config=config_classes,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                            )
+                    elif view_class is UnifiedAttentionCacheView:
                         view = view_class.init(
                             config=config_classes,
                             layer_index=idx,
@@ -2642,22 +2812,14 @@ class EasyGenerationMixin:
                             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                         )
-                elif view_class is UnifiedAttentionCacheView:
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        mesh=text_config.mesh,
-                        runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                        quantizer=quantizer,
-                    )
-                elif view_class is LightningCacheView:
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        dtype=dtype,
-                    )
-                else:
-                    raise ValueError(f"Unknown cache view class: {view_class}")
+                    elif view_class is LightningCacheView:
+                        view = view_class.init(
+                            config=config_classes,
+                            layer_index=idx,
+                            dtype=dtype,
+                        )
+                    else:
+                        raise ValueError(f"Unknown cache view class: {view_class}")
 
                 views[idx] = view
 
@@ -4701,11 +4863,11 @@ class EasyGenerationMixin:
         }
 
         try:
-            trainable_selector = self.default_trainable_selector
+            trainable_selector = self.trainable_selector
         except Exception:
             trainable_selector = None
         if trainable_selector is not None:
-            payload["default_trainable_selector"] = repr(trainable_selector)
+            payload["trainable_selector"] = repr(trainable_selector)
 
         try:
             payload["lora_is_enabled"] = bool(self.lora_is_enabled)
@@ -5111,6 +5273,8 @@ class EasyGenerationMixin:
         silent_mode: bool | None = None,
         max_num_seq_buckets: list[int] | None = None,
         data_parallelism_axis: str | None = None,
+        async_scheduling: bool | None = None,
+        overlap_execution: bool | None = None,
     ):
         """Gets or creates an eSurge engine with the specified parameters.
 
@@ -5135,6 +5299,8 @@ class EasyGenerationMixin:
             destroy_pages_on_pause: Free memory on pause. Defaults to True.
             max_num_seq_buckets: Optional explicit sequence-capacity buckets for runner compilation.
             data_parallelism_axis: Mesh axis name used by eSurge for KV-page data parallelism. Defaults to "dp".
+            async_scheduling: Enable eSurge async scheduler token sampling. Defaults to the cached engine or True.
+            overlap_execution: Enable eSurge double-buffered execution overlap. Defaults to the cached engine or True.
 
         Returns:
             eSurge engine instance, either from cache or newly created.
@@ -5166,6 +5332,8 @@ class EasyGenerationMixin:
                 page_size,
                 enable_prefix_caching,
                 data_parallelism_axis,
+                async_scheduling,
+                overlap_execution,
                 runner_verbose,
                 decode_truncated_prompt,
                 destroy_pages_on_pause,
@@ -5204,6 +5372,8 @@ class EasyGenerationMixin:
                 page_size,
                 enable_prefix_caching,
                 data_parallelism_axis,
+                async_scheduling,
+                overlap_execution,
                 runner_verbose,
                 decode_truncated_prompt,
                 destroy_pages_on_pause,
@@ -5249,6 +5419,12 @@ class EasyGenerationMixin:
             enable_prefix_caching = getattr(cached_engine, "_enable_prefix_caching", True) if cached_engine else True
         if data_parallelism_axis is None:
             data_parallelism_axis = getattr(cached_engine, "data_parallelism_axis", "dp") if cached_engine else "dp"
+        if async_scheduling is None:
+            async_scheduling = (
+                getattr(getattr(cached_engine, "runner", None), "async_scheduling", True) if cached_engine else True
+            )
+        if overlap_execution is None:
+            overlap_execution = getattr(cached_engine, "_overlap_execution", True) if cached_engine else True
         if runner_verbose is None:
             runner_verbose = getattr(cached_engine, "_runner_verbose", False) if cached_engine else False
         if decode_truncated_prompt is None:
@@ -5271,6 +5447,8 @@ class EasyGenerationMixin:
             page_size=page_size,
             enable_prefix_caching=enable_prefix_caching,
             data_parallelism_axis=data_parallelism_axis,
+            async_scheduling=async_scheduling,
+            overlap_execution=overlap_execution,
             runner_verbose=runner_verbose,
             decode_truncated_prompt=decode_truncated_prompt,
             destroy_pages_on_pause=destroy_pages_on_pause,
@@ -5289,8 +5467,38 @@ class EasyGenerationMixin:
         else:
             # Create new engine
             from easydel.inference import eSurge
+            from easydel.inference.esurge.config import (
+                eSurgeCacheRuntimeConfig,
+                eSurgeContextConfig,
+                eSurgeParsingConfig,
+                eSurgeRuntimeConfig,
+            )
 
-            esurge = eSurge(model=self, **extra_dict)
+            esurge = eSurge(
+                model=self,
+                processor=extra_dict["tokenizer"],
+                runtime=eSurgeRuntimeConfig.from_dict(
+                    max_model_len=extra_dict["max_model_len"],
+                    min_input_pad=extra_dict["min_input_pad"],
+                    max_num_seqs=extra_dict["max_num_seqs"],
+                    max_num_seq_buckets=extra_dict["max_num_seq_buckets"],
+                    max_num_batched_tokens=extra_dict["max_num_batched_tokens"],
+                    async_scheduling=extra_dict["async_scheduling"],
+                    overlap_execution=extra_dict["overlap_execution"],
+                    runner_verbose=extra_dict["runner_verbose"],
+                ),
+                cache=eSurgeCacheRuntimeConfig.from_dict(
+                    hbm_utilization=extra_dict["hbm_utilization"],
+                    page_size=extra_dict["page_size"],
+                    enable_prefix_caching=extra_dict["enable_prefix_caching"],
+                    data_parallelism_axis=extra_dict["data_parallelism_axis"],
+                    destroy_pages_on_pause=extra_dict["destroy_pages_on_pause"],
+                ),
+                context=eSurgeContextConfig.from_dict(
+                    decode_truncated_prompt=extra_dict["decode_truncated_prompt"],
+                ),
+                parsing=eSurgeParsingConfig.from_dict(silent_mode=extra_dict["silent_mode"]),
+            )
             _ESURGE_MAP_CACHE[esurge_hash] = esurge
             created_new_engine = True
             self._remember_esurge_engine_source_graphdef(esurge, self._maybe_source_graphdef_for_esurge_metadata())

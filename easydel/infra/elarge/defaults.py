@@ -118,15 +118,21 @@ DEFAULTS: eLMConfig = {
     # - enable_prefix_caching: Cache common prefixes across requests.
     # - verbose: Print inference engine diagnostics and statistics.
     "esurge": {
-        "min_input_pad": 16,
-        "max_num_seqs": 32,
-        "hbm_utilization": 0.80,
-        "page_size": 128,
-        "bind_graphstate_for_aot": False,
-        "enable_window_aware_runtime_cap": False,
-        "enable_prefix_caching": True,
-        "extra_stops": None,
-        "verbose": False,
+        "runtime": {
+            "min_input_pad": 16,
+            "max_num_seqs": 32,
+            "bind_graphstate_for_aot": False,
+            "enable_window_aware_runtime_cap": False,
+            "runner_verbose": False,
+        },
+        "cache": {
+            "hbm_utilization": 0.80,
+            "page_size": 128,
+            "enable_prefix_caching": True,
+        },
+        "parsing": {
+            "extra_stops": None,
+        },
     },
     # Mixture configuration: Settings for data loading and mixing during training.
     # - cache_dir: Directory for caching downloaded datasets.

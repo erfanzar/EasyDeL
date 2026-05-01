@@ -10,6 +10,7 @@ easydel.inference.tools.parsers package
    deepseekv3_tool_parser
    ernie45_tool_parser
    functiongemma_tool_parser
+   gemma4_tool_parser
    gigachat3_tool_parser
    glm47_moe_tool_parser
    glm4_moe_tool_parser

@@ -28,8 +28,13 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 
 from ..training_utils import (
+    ScheduledLossAdapter,
+    bind_scheduled_module,
+    constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,
+    register_scheduled_loss_adapter,
+    scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
@@ -324,3 +329,103 @@ def embedding_training_step(
         ),
     )
     return state, metrics
+
+
+def _embedding_loss_values(
+    *,
+    module,
+    batch: dict[str, jax.Array],
+    loss_type: str,
+    temperature: float,
+    margin: float,
+    normalize: bool,
+    matryoshka_dims: list[int] | None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    loss_fns = {
+        "infonce": infonce_loss,
+        "mnrl": mnrl_loss,
+        "triplet": triplet_loss,
+    }
+    base_loss_fn = loss_fns[loss_type]
+
+    input_ids = [batch["query_input_ids"], batch["positive_input_ids"]]
+    attention_mask = [batch["query_attention_mask"], batch["positive_attention_mask"]]
+    has_negatives = "negative_input_ids" in batch
+    if has_negatives:
+        input_ids.append(batch["negative_input_ids"])
+        attention_mask.append(batch["negative_attention_mask"])
+
+    q_size = batch["query_input_ids"].shape[0]
+    p_size = batch["positive_input_ids"].shape[0]
+    all_embeds = _embed_batch(
+        module,
+        jnp.concatenate(input_ids, axis=0),
+        jnp.concatenate(attention_mask, axis=0),
+        normalize=normalize,
+    )
+    q_embeds = all_embeds[:q_size]
+    p_embeds = all_embeds[q_size : q_size + p_size]
+    n_embeds = all_embeds[q_size + p_size :] if has_negatives else None
+
+    loss_kwargs = {}
+    if loss_type in ("infonce", "mnrl"):
+        loss_kwargs["temperature"] = temperature
+    elif loss_type == "triplet":
+        loss_kwargs["margin"] = margin
+
+    if matryoshka_dims is not None:
+        return matryoshka_loss(
+            base_loss_fn,
+            q_embeds,
+            p_embeds,
+            n_embeds,
+            matryoshka_dims,
+            **loss_kwargs,
+        )
+    if n_embeds is not None:
+        return base_loss_fn(q_embeds, p_embeds, n_embeds, **loss_kwargs)
+    if loss_type == "triplet":
+        return jnp.float32(0.0), {"fraction_active_triplets": jnp.float32(0.0)}
+    return base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
+
+
+def _embedding_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=("loss_type", "temperature", "margin", "normalize", "matryoshka_dims", "partition_spec"),
+    )
+
+
+def _make_embedding_scheduled_loss(call):
+    loss_type = call.get("loss_type", "infonce")
+    temperature = call.get("temperature", 0.05)
+    margin = call.get("margin", 0.2)
+    normalize = call.get("normalize", True)
+    matryoshka_dims = call.get("matryoshka_dims")
+    partition_spec = call.get("partition_spec")
+
+    def scheduled_loss(tree, batch):
+        module = bind_scheduled_module(call, tree)
+        batch = constrain_scheduled_batch(module, batch, partition_spec)
+        loss, _extra_metrics = _embedding_loss_values(
+            module=module,
+            batch=batch,
+            loss_type=loss_type,
+            temperature=temperature,
+            margin=margin,
+            normalize=normalize,
+            matryoshka_dims=matryoshka_dims,
+        )
+        return loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    embedding_training_step,
+    ScheduledLossAdapter(
+        name="embedding",
+        make_loss=_make_embedding_scheduled_loss,
+        make_cache_key=_embedding_scheduled_loss_cache_key,
+    ),
+)

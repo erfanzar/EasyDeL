@@ -593,7 +593,8 @@ class EngineIOMixin:
 
         Note:ƒ
             For multimodal support, you must configure the engine with a processor
-            during initialization: eSurge(..., processor=AutoProcessor.from_pretrained(...))
+            in the model loading config:
+            eSurge(model="model-id", processor=AutoProcessor.from_pretrained(...))
         """
         has_multimodal = self._messages_have_multimodal_content(messages)
 

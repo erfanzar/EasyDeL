@@ -295,6 +295,8 @@ class DPOTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=sharded_training_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -316,6 +318,8 @@ class DPOTrainer(Trainer):
             ),
             out_shardings=empty_sharding,
             static_argnums=sharded_evaluation_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         sharded_training_step_function.static_argnums_ = sharded_training_static_argnums

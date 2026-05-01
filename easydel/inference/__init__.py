@@ -45,7 +45,20 @@ Attributes:
     vWhisperInferenceConfig: Configuration for vWhisper inference.
 """
 
-from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer, eSurgeRunner
+from .esurge import (
+    EngineRequest,
+    EngineRequestStatus,
+    eSurge,
+    eSurgeApiServer,
+    eSurgeCacheRuntimeConfig,
+    eSurgeContextConfig,
+    eSurgeDistributedConfig,
+    eSurgeParsingConfig,
+    eSurgeRunner,
+    eSurgeRuntimeConfig,
+    eSurgeVisionConfig,
+    eSurgeWorkerConfig,
+)
 from .oai_proxies import InferenceApiRouter
 from .sampling_params import JitableSamplingParams, SamplingParams
 from .tools import ToolParser, ToolParserManager
@@ -61,7 +74,14 @@ __all__ = (
     "ToolParserManager",
     "eSurge",
     "eSurgeApiServer",
+    "eSurgeCacheRuntimeConfig",
+    "eSurgeContextConfig",
+    "eSurgeDistributedConfig",
+    "eSurgeParsingConfig",
     "eSurgeRunner",
+    "eSurgeRuntimeConfig",
+    "eSurgeVisionConfig",
+    "eSurgeWorkerConfig",
     "vWhisperInference",
     "vWhisperInferenceConfig",
 )

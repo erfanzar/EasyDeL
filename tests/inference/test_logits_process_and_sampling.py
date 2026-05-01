@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
 from easydel.inference.logits_process import (
@@ -213,10 +212,8 @@ def test_forced_bos_token_active_only_at_position_one():
     scores = jnp.array([[1.0, 2.0, 3.0, 4.0]])
     proc = ForcedBOSTokenLogitsProcessor(bos_token_id=2)
 
-
     out_other = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 5)
     assert jnp.allclose(out_other, scores)
-
 
     out_first = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 1)
     assert int(jnp.argmax(out_first[0])) == 2
@@ -227,10 +224,8 @@ def test_forced_eos_token_at_max_length():
     scores = jnp.array([[1.0, 2.0, 3.0, 4.0]])
     proc = ForcedEOSTokenLogitsProcessor(max_length=10, eos_token_id=3)
 
-
     out_before = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 5)
     assert jnp.allclose(out_before, scores)
-
 
     out_at = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 9)
     assert int(jnp.argmax(out_at[0])) == 3
@@ -246,14 +241,11 @@ def test_min_length_processor_suppresses_eos_below_min_length():
     scores = jnp.array([[1.0, 2.0, 3.0, 10.0]])
     proc = MinLengthLogitsProcessor(min_length=5, eos_token_id=3)
 
-
     out_below = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 2)
     assert not jnp.isfinite(out_below[0, 3])
 
-
     out_at = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 5)
     assert not jnp.isfinite(out_at[0, 3])
-
 
     out_above = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 6)
     assert jnp.isfinite(out_above[0, 3])
@@ -264,10 +256,8 @@ def test_suppress_tokens_at_begin_only_at_begin_index():
     scores = jnp.array([[1.0, 2.0, 3.0, 4.0]])
     proc = SuppressTokensAtBeginLogitsProcessor(begin_suppress_tokens=jnp.array([1, 3]), begin_index=2)
 
-
     out_other = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 5)
     assert jnp.allclose(out_other, scores)
-
 
     out_at = proc(jnp.zeros((1, 0), dtype=jnp.int32), scores, 2)
     assert not jnp.isfinite(out_at[0, 1])
@@ -364,7 +354,7 @@ def test_sample_top_p_efficient_low_p_concentrates_to_argmax():
     logits = jnp.array([1.0, 50.0, 3.0, 2.0])
 
     tokens = []
-    for i in range(20):
+    for _i in range(20):
         rng, sub = jax.random.split(rng)
         token = sample_top_p_efficient(
             logits=logits,

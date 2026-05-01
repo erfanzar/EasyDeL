@@ -22,6 +22,7 @@ easydel.modules package
    gemma/index
    gemma2/index
    gemma3/index
+   gemma4/index
    gidd/index
    glm/index
    glm4/index

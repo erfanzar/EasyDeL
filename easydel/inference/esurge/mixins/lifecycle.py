@@ -317,7 +317,7 @@ class EngineLifecycleMixin:
 
                 _diag_iter = 0
                 _diag_last_log = time.time()
-                if not self._overlap_execution:
+                if not self.runtime_config.overlap_execution:
                     while self._scheduler_running:
                         try:
                             _diag_iter += 1
@@ -543,7 +543,7 @@ class EngineLifecycleMixin:
         self.terminate()
         self._paused = True
         self._drain_pipeline_workers("pause")
-        if self.destroy_pages_on_pause:
+        if self.cache_config.destroy_pages_on_pause:
             if self.num_running_requests > 0 or self.num_pending_requests > 0:
                 logger.warning(
                     f"Active or pending requests detected; skipping KV cache destruction (num running requests "
@@ -571,7 +571,7 @@ class EngineLifecycleMixin:
             return
         self._info("Resuming eSurge scheduler loop...")
         self._drain_pipeline_workers("resume")
-        if self.destroy_pages_on_pause and not self._kv_cache_valid:
+        if self.cache_config.destroy_pages_on_pause and not self._kv_cache_valid:
             self.runner.initialize_kv_cache()
             self._kv_cache_valid = True
             self._log_cache_event("kv_cache_reinitialized", {"reason": "resume"})
@@ -652,7 +652,7 @@ class EngineLifecycleMixin:
             )
 
         if model is None:
-            model = spx.bind(graphdef, graphstate.merge(graphother, copy=True))
+            model = spx.bind(graphdef, graphstate.overlay(graphother))
         if using_compatible_split and graphdef is None:
             if graphstate is None:
                 graphstate = split_graphstate
@@ -691,7 +691,7 @@ class EngineLifecycleMixin:
         self.scheduler = Scheduler.from_runner(
             self.runner,
             max_num_batched_tokens=self._scheduler_max_num_batched_tokens,
-            enable_prefix_caching=self._scheduler_enable_prefix_caching,
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
         )
 
         if restart_scheduler and was_running:

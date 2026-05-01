@@ -811,11 +811,12 @@ class WhisperEncoder(EasyDeLBaseModule):
                 # skip the layer
                 layer_outputs = (None, None)
             else:
-                layer_outputs = encoder_layer(
-                    hidden_states=hidden_states,
-                    mask_info=mask_info,
-                    output_attentions=output_attentions,
-                )
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = encoder_layer(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        output_attentions=output_attentions,
+                    )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
             if output_attentions:
                 assert all_attentions is not None
@@ -1028,16 +1029,17 @@ class WhisperDecoder(EasyDeLBaseModule):
             if self.training and (dropout_probability < self.layerdrop):
                 layer_outputs = (None, None, None, None)
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states=hidden_states,
-                    mask_info=mask_info,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_mask_info=encoder_mask_info,
-                    mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                    cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                )
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = decoder_layer(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_mask_info=encoder_mask_info,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                    )
             self._layer_cache_view_update(None, idx, layer_outputs[-1], enabled=True, cache=past_key_values)
             hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
             if output_attentions:

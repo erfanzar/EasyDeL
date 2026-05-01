@@ -92,7 +92,7 @@ def test_optimizer_gather_works_without_mesh_context_and_create_validation(tiny_
     assert isinstance(gathered_opt_state, EasyDeLState)
 
     gdef, gstate = spx.export(tiny_sharded_llama)
-    gstate = gstate.filter("parameters", copy=True)
+    gstate = gstate.filter("parameters", copy=False)
     gstate.exclude("parameters")
     with pytest.raises(ValueError):
         EasyDeLState.create(graphdef=gdef, graphstate=gstate, graphother=None)
@@ -102,7 +102,7 @@ def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
     import spectrax as spx
 
     state = EasyDeLState.create(model=tiny_sharded_llama)
-    rules = state.model._get_partition_rules(None)
+    rules = state.model.resolve_shardings_regex()
     eval_opt_state = jax.eval_shape(lambda: optax.adam(1e-3).init(state.graphstate))
     partition_specs = spx.match_partition_rules(rules, eval_opt_state)
 
@@ -120,7 +120,7 @@ def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
 
 def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):
     state = EasyDeLState.create(model=tiny_sharded_llama)
-    rules = state.model._get_partition_rules(None)
+    rules = state.model.resolve_shardings_regex()
     target_pattern = next(pattern for pattern, _ in rules if "model/norm/kernel" in pattern)
 
     assert target_pattern.endswith("(?:/.*)?$")

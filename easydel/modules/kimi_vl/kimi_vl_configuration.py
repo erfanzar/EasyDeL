@@ -24,8 +24,6 @@ from __future__ import annotations
 import typing as tp
 from collections.abc import Mapping
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
@@ -83,19 +81,6 @@ class MoonViTConfig(EasyDeLBaseConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.merge_kernel_size = tuple(merge_kernel_size)
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
 
 @register_config("kimi_vl")
@@ -165,19 +150,6 @@ class KimiVLConfig(EasyDeLBaseConfig):
 
     def get_text_config(self, decoder: bool = True) -> DeepseekV3Config:
         return self.text_config  # type: ignore
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
 
 
 __all__ = ["KimiVLConfig", "MoonViTConfig"]

@@ -16,10 +16,7 @@ from types import SimpleNamespace
 
 from jax.sharding import PartitionSpec
 
-from easydel.layers.linears._linear_quantized import (
-    _mesh_partition_product,
-    _sanitize_spec_for_shape,
-)
+from easydel.infra.sharding import mesh_partition_product, sanitize_partition_spec_for_shape
 
 
 def _fake_mesh(shape: dict):
@@ -27,43 +24,43 @@ def _fake_mesh(shape: dict):
 
 
 def test_mesh_partition_product_none():
-    assert _mesh_partition_product(_fake_mesh({"tp": 4}), None) == 1
+    assert mesh_partition_product(_fake_mesh({"tp": 4}), None) == 1
 
 
 def test_mesh_partition_product_single():
-    assert _mesh_partition_product(_fake_mesh({"tp": 4}), "tp") == 4
+    assert mesh_partition_product(_fake_mesh({"tp": 4}), "tp") == 4
 
 
 def test_mesh_partition_product_tuple():
-    assert _mesh_partition_product(_fake_mesh({"tp": 4, "dp": 2}), ("tp", "dp")) == 8
+    assert mesh_partition_product(_fake_mesh({"tp": 4, "dp": 2}), ("tp", "dp")) == 8
 
 
 def test_mesh_partition_product_missing_axis():
-    assert _mesh_partition_product(_fake_mesh({"tp": 4}), "fsdp") == 1
+    assert mesh_partition_product(_fake_mesh({"tp": 4}), "fsdp") == 1
 
 
 def test_sanitize_noop_when_divisible():
     spec = PartitionSpec(None, "tp")
-    result = _sanitize_spec_for_shape(spec, (128, 96), _fake_mesh({"tp": 4}))
+    result = sanitize_partition_spec_for_shape(spec, (128, 96), _fake_mesh({"tp": 4}))
     # 96 % 4 == 0 -> no change
     assert result == PartitionSpec(None, "tp")
 
 
 def test_sanitize_drops_axis_when_not_divisible():
     spec = PartitionSpec(None, "tp")
-    result = _sanitize_spec_for_shape(spec, (128, 97), _fake_mesh({"tp": 4}))
+    result = sanitize_partition_spec_for_shape(spec, (128, 97), _fake_mesh({"tp": 4}))
     # 97 % 4 != 0 -> drop "tp"
     assert result == PartitionSpec(None, None)
 
 
 def test_sanitize_preserves_other_axes():
     spec = PartitionSpec("dp", "tp")
-    result = _sanitize_spec_for_shape(spec, (8, 97), _fake_mesh({"dp": 2, "tp": 4}))
+    result = sanitize_partition_spec_for_shape(spec, (8, 97), _fake_mesh({"dp": 2, "tp": 4}))
     # dim0: 8 % 2 == 0 -> keep; dim1: 97 % 4 != 0 -> drop
     assert result == PartitionSpec("dp", None)
 
 
 def test_sanitize_unsharded_spec_unchanged():
     spec = PartitionSpec(None, None)
-    result = _sanitize_spec_for_shape(spec, (7, 3), _fake_mesh({"tp": 4}))
+    result = sanitize_partition_spec_for_shape(spec, (7, 3), _fake_mesh({"tp": 4}))
     assert result == PartitionSpec(None, None)

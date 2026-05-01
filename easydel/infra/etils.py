@@ -75,6 +75,19 @@ import argparse
 import typing as tp
 from enum import StrEnum
 
+from spectrax.runtime import (
+    DualPipeV,
+    Eager1F1B,
+    GPipe,
+    Interleaved1F1BPlusOne,
+    InterleavedGPipe,
+    InterleavedH1,
+    KimiK2,
+    Schedule,
+    Std1F1B,
+    ZeroBubbleH1,
+)
+
 
 class EasyDeLOptimizers(StrEnum):
     """Enumeration of available optimizers in the EasyDeL library.
@@ -638,3 +651,17 @@ class StoreTupleAction(argparse.Action):
             raise argparse.ArgumentTypeError(
                 f"Invalid value for {option_string}: {values} (should be comma-separated integers)"
             ) from None
+
+
+MpMdSchedulers = (
+    DualPipeV
+    | Eager1F1B
+    | GPipe
+    | Interleaved1F1BPlusOne
+    | InterleavedGPipe
+    | InterleavedH1
+    | KimiK2
+    | Schedule
+    | Std1F1B
+    | ZeroBubbleH1
+)

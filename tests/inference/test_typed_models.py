@@ -39,11 +39,11 @@ from easydel.inference.typed_models import (
     ResponseMessageItem,
     ResponseOutputTextPart,
     ResponseReasoningItem,
-    ResponseSummaryText,
     ResponsesFinalizationOptions,
     ResponsesResponse,
     ResponsesTextConfig,
     ResponsesTextFormat,
+    ResponseSummaryText,
     ResponsesUsage,
     StreamEventFrame,
     assistant_message_from_output_items,
@@ -162,7 +162,7 @@ def test_responses_response_discriminator_dispatches_reasoning():
 
 def test_responses_response_unknown_output_type_raises():
     """Pydantic's discriminator rejects an unrecognized type."""
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa
         ResponsesResponse.model_validate(
             {
                 "id": "resp_1",

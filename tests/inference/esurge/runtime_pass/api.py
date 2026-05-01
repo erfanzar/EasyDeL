@@ -17,6 +17,11 @@
 import argparse
 
 from easydel.inference.esurge import eSurge
+from easydel.inference.esurge.config import (
+    eSurgeCacheRuntimeConfig,
+    eSurgeDistributedConfig,
+    eSurgeRuntimeConfig,
+)
 from easydel.inference.esurge.server import eSurgeApiServer
 from easydel.inference.openai_api_modules import FunctionCallFormat
 
@@ -90,20 +95,24 @@ def main():
     # Initialize eSurge engine
     engine = eSurge(
         model=args.model,
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        hbm_utilization=args.hbm_utilization,
-        enable_prefix_caching=True,
-        # Distributed serving runs in lockstep, so keep overlap disabled even
-        # though the engine default is now True.
-        overlap_execution=False,
-        distributed_mode=args.distributed_mode,
-        distributed_role=args.distributed_role,
-        distributed_service_name=args.distributed_service_name,
-        distributed_world_size=args.distributed_world_size,
-        distributed_rank=args.distributed_rank,
-        distributed_control_port=args.distributed_control_port,
-        distributed_auth_token=args.distributed_auth_token,
+        runtime=eSurgeRuntimeConfig.from_dict(
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.max_num_seqs,
+            overlap_execution=False,
+        ),
+        cache=eSurgeCacheRuntimeConfig.from_dict(
+            hbm_utilization=args.hbm_utilization,
+            enable_prefix_caching=True,
+        ),
+        distributed=eSurgeDistributedConfig.from_dict(
+            distributed_mode=args.distributed_mode,
+            distributed_role=args.distributed_role,
+            distributed_service_name=args.distributed_service_name,
+            distributed_world_size=args.distributed_world_size,
+            distributed_rank=args.distributed_rank,
+            distributed_control_port=args.distributed_control_port,
+            distributed_auth_token=args.distributed_auth_token,
+        ),
     )
 
     if args.distributed_mode and engine.distributed_role == "worker":

@@ -1039,11 +1039,12 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             hidden_states, layer_num = carry
-            hidden_states = block(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary_pos_emb,
-            )
+            with self._layer_stage_context(layer_num, layers=self.blocks):
+                hidden_states = block(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    rotary_pos_emb=rotary_pos_emb,
+                )
             hidden_states = self._mark_layer_stage_boundary(hidden_states, layer_num, layers=self.blocks)
             if layer_num in self.config.deepstack_visual_indexes:
                 deepstack_idx = self.config.deepstack_visual_indexes.index(layer_num)
@@ -1577,16 +1578,17 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
-            layer_outputs = block(
-                hidden_states=hs,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hs,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.frequencies,
+                )
             hs = layer_outputs.hidden_states
             if deepstack_visual_embeds is not None and idx < len(deepstack_visual_embeds):
                 hs = self._deepstack_process(

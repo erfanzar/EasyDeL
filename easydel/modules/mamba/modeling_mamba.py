@@ -717,12 +717,13 @@ class MambaModel(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             hidden_states, all_hidden_states, idx = carry
-            hidden_states, cache_view = block(
-                hidden_states=hidden_states,
-                cache=cache.views[idx],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                hidden_states, cache_view = block(
+                    hidden_states=hidden_states,
+                    cache=cache.views[idx],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             cache[idx] = cache_view
             if output_hidden_states:

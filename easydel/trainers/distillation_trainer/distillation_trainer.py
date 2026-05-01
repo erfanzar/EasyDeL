@@ -167,6 +167,8 @@ class DistillationTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -192,6 +194,8 @@ class DistillationTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)
@@ -262,7 +266,7 @@ class DistillationTrainer(Trainer):
             batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
 
             if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
+                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=False)
                 labels[completion_mask_np == 0] = -100
                 if attention_mask is not None:
                     labels[np.asarray(attention_mask) == 0] = -100

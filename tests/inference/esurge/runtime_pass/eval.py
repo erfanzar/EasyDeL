@@ -20,6 +20,7 @@ from lm_eval import evaluator  # pyright: ignore[reportMissingImports]
 from transformers import AutoTokenizer
 
 import easydel as ed
+from easydel.inference.esurge.config import eSurgeContextConfig, eSurgeRuntimeConfig
 
 
 def main():
@@ -37,16 +38,20 @@ def main():
     # Create eSurge instance for evaluation
     surge = ed.eSurge(
         model=model_id,
-        tokenizer=processor,
-        dtype=jnp.bfloat16,
-        max_model_len=max_model_len,
-        max_num_seqs=max_num_seqs,
-        reserve_tokens=800,  # Reserve tokens for generation safety
-        auto_truncate_prompt=True,  # Auto-truncate if prompt too long
-        auto_cap_new_tokens=True,  # Auto-cap generation to fit context
-        compile_runner=True,  # Pre-compile for better performance
-        esurge_name="esurge-eval",
-        runner_verbose=False,
+        processor=processor,
+        loading_kwargs={"dtype": jnp.bfloat16},
+        runtime=eSurgeRuntimeConfig.from_dict(
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            compile_runner=True,
+            esurge_name="esurge-eval",
+            runner_verbose=False,
+        ),
+        context=eSurgeContextConfig.from_dict(
+            reserve_tokens=800,
+            auto_truncate_prompt=True,
+            auto_cap_new_tokens=True,
+        ),
     )
 
     # Create eSurge adapter

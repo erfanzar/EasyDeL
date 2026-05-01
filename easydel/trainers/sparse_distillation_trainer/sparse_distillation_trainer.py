@@ -230,6 +230,8 @@ class SparseDistillationTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -248,6 +250,8 @@ class SparseDistillationTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         if self.teacher_state is not None:

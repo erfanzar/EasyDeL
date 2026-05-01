@@ -588,7 +588,8 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         # Note: For simplicity, we process without cu_seqlens chunking
         def _layer_loop(layer, carry):
             hidden_states, idx = carry
-            hidden_states = layer(hidden_states, attention_mask)
+            with self._layer_stage_context(idx, layers=self.layers):
+                hidden_states = layer(hidden_states, attention_mask)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
 
             return hidden_states, idx + 1
@@ -1204,7 +1205,8 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             hidden_states, idx = carry
-            hidden_states = block(hidden_states, cu_seqlens, rotary_pos_emb)
+            with self._layer_stage_context(idx, layers=self.blocks):
+                hidden_states = block(hidden_states, cu_seqlens, rotary_pos_emb)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
 
             return hidden_states, idx + 1
@@ -2576,16 +2578,17 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
@@ -2887,17 +2890,18 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                output_router_logits=output_router_logits,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    frequencies=self.frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
@@ -3520,7 +3524,8 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
 
         def _layer_loop(layer, carry):
             hidden_states, idx = carry
-            hidden_states = layer(hidden_states, attention_mask, position_ids)
+            with self._layer_stage_context(idx, layers=self.layers):
+                hidden_states = layer(hidden_states, attention_mask, position_ids)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
 
             return hidden_states, idx + 1
@@ -3786,15 +3791,16 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = layer(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                output_attentions=output_attentions,
-                mode=mode,
-                cache_view=past_key_values.views[layer_idx] if past_key_values is not None else None,
-                cache_metadata=cache_metadata,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    mode=mode,
+                    cache_view=past_key_values.views[layer_idx] if past_key_values is not None else None,
+                    cache_metadata=cache_metadata,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
@@ -4152,17 +4158,18 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                output_router_logits=output_router_logits,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    frequencies=self.frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:

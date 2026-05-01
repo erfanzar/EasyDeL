@@ -216,7 +216,7 @@ class PPOTrainer(Trainer):
                             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                             gt,
                         )
-                        module = spx.bind(gd, gs.merge(gt, copy=True))
+                        module = spx.bind(gd, gs.merge(gt, copy=False))
                         batch = with_sharding_constraint(
                             arr=batch,
                             sharding=self.arguments.step_partition_spec,
@@ -391,6 +391,8 @@ class PPOTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -412,6 +414,8 @@ class PPOTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
@@ -419,7 +423,7 @@ class PPOTrainer(Trainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
             with apply.mesh:
                 ids = with_sharding_constraint(
                     ids,
@@ -481,7 +485,7 @@ class PPOTrainer(Trainer):
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
             )
-            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=True))
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
             with apply.mesh:
                 ids = with_sharding_constraint(
                     ids,

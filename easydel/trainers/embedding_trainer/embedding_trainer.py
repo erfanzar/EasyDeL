@@ -189,6 +189,8 @@ class EmbeddingTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -200,6 +202,8 @@ class EmbeddingTrainer(Trainer):
             static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         mesh = self.model.mesh

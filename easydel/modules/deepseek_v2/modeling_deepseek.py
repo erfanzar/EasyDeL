@@ -1073,16 +1073,17 @@ class DeepseekV2Model(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            output = layer(
-                hidden_states=hidden_states,
-                frequencies=self.frequencies,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                output_attentions=output_attentions,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                output = layer(
+                    hidden_states=hidden_states,
+                    frequencies=self.frequencies,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                )
             hidden_states = self._mark_layer_stage_boundary(output.hidden_states, idx, layers=self.layers)
 
             if output_attentions:

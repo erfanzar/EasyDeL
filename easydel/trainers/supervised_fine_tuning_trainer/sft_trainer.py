@@ -250,7 +250,7 @@ class SFTTrainer(Trainer):
             batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
 
             if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
+                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=False)
                 labels[completion_mask_np == 0] = -100
                 if attention_mask is not None:
                     labels[np.asarray(attention_mask) == 0] = -100

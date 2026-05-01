@@ -172,6 +172,8 @@ class RewardTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         self._eval_shared_fn_static_args = (
@@ -186,6 +188,8 @@ class RewardTrainer(Trainer):
             static_argnums=sharded_evaluation_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
 
         sharded_training_step_function.static_argnums_ = sharded_training_static_argnums

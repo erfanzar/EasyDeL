@@ -69,6 +69,7 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import common_types
 
+from easydel.infra.sharding import resolve_stage_mesh
 from easydel.utils.helpers import check_bool_flag
 
 from ._communication_utils import (
@@ -159,7 +160,7 @@ class BaseMoeModule(spx.Module, ABC):
         """
         super().__init__()
         self.config = config
-        self.mesh = config.mesh
+        self._mesh = config.mesh
         self.runtime_sharding_resolver = config.runtime_sharding_resolver
         self.n_routed_experts = n_routed_experts or config.n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok or config.num_experts_per_tok
@@ -176,6 +177,10 @@ class BaseMoeModule(spx.Module, ABC):
         self.expert_abstract_mesh = self.config.expert_abstract_mesh
 
         self.dtype = getattr(self, "dtype", jnp.bfloat16)
+
+    @property
+    def mesh(self):
+        return resolve_stage_mesh(self._mesh)
 
     def get_moe_spec(
         self,
@@ -254,7 +259,8 @@ class BaseMoeModule(spx.Module, ABC):
         Note:
             Sizes default to 1 if the axis doesn't exist in the mesh.
         """
-        runtime_sharding_resolver = self.runtime_sharding_resolver
+        mesh = self.mesh
+        runtime_sharding_resolver = self.runtime_sharding_resolver.with_mesh(mesh)
         data_axis_name = resolve_eformer_axis(DP, runtime_sharding_resolver)
 
         if self.config.use_expert_tensor_mode:
@@ -267,11 +273,11 @@ class BaseMoeModule(spx.Module, ABC):
         fsdp_axis_name = resolve_eformer_axis(FSDP, runtime_sharding_resolver)
         sp_axis_name = resolve_eformer_axis(SP, runtime_sharding_resolver)
 
-        dp_size = self.mesh.shape.get(data_axis_name, 1)
-        ep_size = self.mesh.shape.get(expert_axis_name, 1)
-        tp_size = self.mesh.shape.get(tensor_axis_name, 1)
-        fsdp_size = self.mesh.shape.get(fsdp_axis_name, 1)
-        sp_size = self.mesh.shape.get(sp_axis_name, 1)
+        dp_size = mesh.shape.get(data_axis_name, 1) if mesh is not None else 1
+        ep_size = mesh.shape.get(expert_axis_name, 1) if mesh is not None else 1
+        tp_size = mesh.shape.get(tensor_axis_name, 1) if mesh is not None else 1
+        fsdp_size = mesh.shape.get(fsdp_axis_name, 1) if mesh is not None else 1
+        sp_size = mesh.shape.get(sp_axis_name, 1) if mesh is not None else 1
 
         return (
             data_axis_name,
@@ -636,7 +642,10 @@ class BaseMoeModule(spx.Module, ABC):
             >>> sharded_weight = _apply_expert_sharding(weight, "weight_col")
             >>> # weight is now sharded across devices according to mesh configuration
         """
-        runtime_sharding_resolver = self.runtime_sharding_resolver
+        mesh = self.mesh
+        if mesh is None:
+            return tensor
+        runtime_sharding_resolver = self.runtime_sharding_resolver.with_mesh(mesh)
 
         if tensor_type == "weight_col":
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
@@ -684,13 +693,9 @@ class BaseMoeModule(spx.Module, ABC):
             else:
                 sharding_spec = runtime_sharding_resolver.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
-        # # @erfanzar NOTE: get_corrected_named_sharding is MPMD-aware --
-        # routes through the resolver and lands on the per-stage submesh.
-        # Hand-rolling NamedSharding(self.mesh, spec) would collapse stages.
-        return jax.device_put(
-            tensor,
-            spx.get_corrected_named_sharding(tuple(tensor.shape), sharding_spec, raise_mesh_error=False),
-        )
+        with mesh:
+            sharding = spx.get_corrected_named_sharding(tuple(tensor.shape), sharding_spec, raise_mesh_error=False)
+        return jax.device_put(tensor, sharding)
 
     def _get_gate_layer_sharding(self, weight_shape: tuple) -> PartitionSpec:
         """Returns the partition specification for gate/router layer weights.

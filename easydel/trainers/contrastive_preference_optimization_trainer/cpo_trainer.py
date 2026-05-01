@@ -232,6 +232,8 @@ class CPOTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=training_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
         sharded_training_step_function.static_argnums_ = training_static_argnums
 
@@ -252,6 +254,8 @@ class CPOTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=evaluation_static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
         )
         sharded_evaluation_step_function.static_argnums_ = evaluation_static_argnums
 

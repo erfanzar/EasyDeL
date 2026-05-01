@@ -32,7 +32,7 @@ from __future__ import annotations
 import pytest
 
 from easydel.inference.esurge.core.page_pool import PagePool
-from easydel.inference.esurge.core.utils import CachePage, PageHash, PageHashWithGroupId
+from easydel.inference.esurge.core.utils import PageHash, PageHashWithGroupId
 
 
 def test_construct_with_positive_num_pages():
@@ -84,7 +84,7 @@ def test_get_new_pages_exhaustion_raises():
     """Asking for more pages than available raises (no caching -> nothing to evict)."""
     pool = PagePool(num_pages=4, enable_caching=False)
     pool.get_new_pages(num_pages=3)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa
         pool.get_new_pages(num_pages=1)
 
 
@@ -134,7 +134,6 @@ def test_touch_skips_null_page():
     free_before = pool.get_num_free_pages()
     pool.touch([[pool.null_page]])
 
-
     assert pool.get_num_free_pages() == free_before
 
 
@@ -149,7 +148,6 @@ def test_cache_full_pages_then_get_cached_page_hits():
     pool = PagePool(num_pages=8, enable_caching=True)
     [p] = pool.get_new_pages(num_pages=1)
     page_hash = PageHash(hash_value=12345, token_ids=(1, 2, 3, 4))
-
 
     page_hash_with_gid = PageHashWithGroupId(page_hash, 0)
     p.page_hash = page_hash_with_gid
@@ -181,14 +179,12 @@ def test_get_cached_page_dp_shard_hint_filters_by_page_id_range():
     low_page = pool.pages[1]
     high_page = pool.pages[5]
 
-
     low_page._page_hash = PageHashWithGroupId(page_hash, 0)
     high_page._page_hash = PageHashWithGroupId(page_hash, 0)
     pool.cached_page_hash_to_page[PageHashWithGroupId(page_hash, 0)] = {
         low_page.page_id: low_page,
         high_page.page_id: high_page,
     }
-
 
     hit_lo = pool.get_cached_page(
         page_hash,
@@ -198,7 +194,6 @@ def test_get_cached_page_dp_shard_hint_filters_by_page_id_range():
     )
     assert hit_lo is not None
     assert hit_lo[0].page_id < 4
-
 
     hit_hi = pool.get_cached_page(
         page_hash,

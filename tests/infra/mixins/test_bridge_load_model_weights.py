@@ -18,9 +18,6 @@ class _LoadModelStub:
         self.abstract_error = abstract_error
         self.materialize_contexts: list[str] = []
 
-    def _get_partition_rules(self, _):
-        return None
-
     def assert_parameters_materialized(self, *, context="parameter materialization", **_):
         self.materialize_contexts.append(context)
         if self.abstract_error:

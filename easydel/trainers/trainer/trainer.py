@@ -240,6 +240,8 @@ class Trainer(BaseTrainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
+            schedule=self.arguments.mpmd_scheduler,
+            mesh=self.mesh,
         )
 
         self._eval_shared_fn_static_args = (
@@ -251,6 +253,8 @@ class Trainer(BaseTrainer):
             static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(empty_sharding),
+            schedule=self.arguments.mpmd_scheduler,
+            mesh=self.mesh,
         )
 
         mesh = self.model.mesh

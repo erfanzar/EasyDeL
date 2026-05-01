@@ -8,6 +8,7 @@ easydel.inference.reasoning.parsers package
    deepseek_r1_reasoning_parser
    deepseek_v3_reasoning_parser
    ernie45_reasoning_parser
+   gemma4_reasoning_parser
    gptoss_reasoning_parser
    granite_reasoning_parser
    hunyuan_a13b_reasoning_parser

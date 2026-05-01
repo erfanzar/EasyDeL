@@ -23,7 +23,7 @@ from __future__ import annotations
 import collections.abc
 import typing as tp
 
-import jax
+import spectrax as spx
 from eformer.pytree import auto_pytree
 
 if tp.TYPE_CHECKING:
@@ -50,7 +50,7 @@ class TrainerOutput:
     """
 
     state: EasyDeLState
-    mesh: jax.sharding.Mesh | None
+    mesh: spx.SpxMesh | None
     checkpoint_manager: tp.Any
     shard_fns: CallFN | None = None
     last_save_file_name: str | None = None

@@ -75,6 +75,7 @@ import hashlib
 import os
 import time
 import typing
+import typing as tp
 from functools import partial
 
 import jax
@@ -95,19 +96,21 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.sharding import final_stage_replicated_sharding, replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.sampler import build_history_token_counts
 from ..utils import model_uses_mrope
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor
+from .pipeline_plan import PipelineInferencePlan, metadata_num_pages, set_metadata_num_pages
 from .sequence_buffer import SequenceBuffer
 
 DEBUG_MODE = False
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
+    from easydel.infra.etils import MpMdSchedulers
 
 logger = get_logger("eSurge-ExecutionManager")
 
@@ -356,6 +359,8 @@ class ExecutionManager:
         max_num_tokens: int | None = None,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
         verbose: bool = False,
+        mpmd_scheduler: MpMdSchedulers | None = None,
+        pipeline_plan: PipelineInferencePlan | None = None,
     ):
         """Initialize the executor manager.
 
@@ -387,6 +392,8 @@ class ExecutionManager:
 
         self.use_aot_forward = use_aot_forward
         self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
+        self.mpmd_scheduler = mpmd_scheduler
+        self.pipeline_plan = pipeline_plan
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -403,16 +410,9 @@ class ExecutionManager:
 
         # Prefer HybridCache (per-operation cache views) as the universal container.
         # Keep paged-cache parameters consistent with the scheduler config.
-        self.kv_pages = model.init_operations_cache(
-            batch_size=int(self.max_num_reqs),
-            max_length=int(self.max_model_len),
-            page_size=int(getattr(metadata, "page_size", 128)),
-            hbm_utilization=float(getattr(metadata, "hbm_utilization", 0.9)),
-            dtype=getattr(metadata, "kvdtype", None),
+        self.kv_pages = self._init_operations_cache_with_retry(
             quantizer=quantizer,
             masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
-            ragged_config=metadata if isinstance(metadata, RaggedPagesCacheConfig) else None,
-            unified_config=metadata if isinstance(metadata, UnifiedAttentionCacheConfig) else None,
         )
 
         self.graphdef, self.graphstate, self.graphother = model.split_module()
@@ -421,8 +421,18 @@ class ExecutionManager:
         self._verbose = verbose
 
         self._empty_sharding = replicated_named_sharding(model.mesh)
+        self._final_stage_sharding = final_stage_replicated_sharding(
+            model=self.model,
+            mesh=self.mesh,
+            fallback_sharding=self._empty_sharding,
+        )
+        # Keep the sampler on the stable global replicated sharding.  The
+        # final-stage LM-head owns the projection; only compact logits are
+        # copied here.  TPU currently rejects the ejit sampler executable on a
+        # PP submesh with an enhanced-barrier logical-z halt.
+        self._sampler_sharding = self._empty_sharding
 
-        self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._empty_sharding)
+        self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._sampler_sharding)
 
         self._debug_baselines = {}
 
@@ -446,24 +456,26 @@ class ExecutionManager:
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
             bind_graphstate_for_aot=self.bind_graphstate_for_aot,
+            mpmd_scheduler=self.mpmd_scheduler,
+            pipeline_plan=self.pipeline_plan,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_executor = SamplerExecutor(
             model=self.model,
             max_model_len=self.max_model_len,
-            empty_sharding=self._empty_sharding,
+            empty_sharding=self._sampler_sharding,
             use_aot_forward=self.use_aot_forward,
         )
         self._sampler_min_input_pad = 1
         self._sampler_zero_token_counts = jnp.zeros(
             (self.max_num_reqs, self._sampler_vocab_size),
             dtype=jnp.uint32,
-            out_sharding=self._empty_sharding,
+            out_sharding=self._sampler_sharding,
         )
         self._sampler_zero_window_row_indices = jnp.zeros(
             (self.max_num_reqs,),
             dtype=jnp.int32,
-            out_sharding=self._empty_sharding,
+            out_sharding=self._sampler_sharding,
         )
         self._sampler_token_counts = self._sampler_zero_token_counts
         self._sampler_penalty_state_dirty = True
@@ -512,6 +524,47 @@ class ExecutionManager:
 
         self._scatter_sampler_outputs = _scatter_sampler_outputs
 
+    def _init_operations_cache_with_retry(self, *, quantizer: tp.Any, masking_details: tp.Any) -> tp.Any:
+        """Allocate operation caches, shrinking PP page pools on real HBM OOM."""
+
+        def _allocate() -> tp.Any:
+            return self.model.init_operations_cache(
+                batch_size=int(self.max_num_reqs),
+                max_length=int(self.max_model_len),
+                page_size=int(getattr(self.metadata, "page_size", 128)),
+                hbm_utilization=float(getattr(self.metadata, "hbm_utilization", 0.9)),
+                dtype=getattr(self.metadata, "kvdtype", None),
+                quantizer=quantizer,
+                masking_details=masking_details,
+                ragged_config=self.metadata if isinstance(self.metadata, RaggedPagesCacheConfig) else None,
+                unified_config=self.metadata if isinstance(self.metadata, UnifiedAttentionCacheConfig) else None,
+                pipeline_plan=self.pipeline_plan,
+            )
+
+        max_attempts = 10 if getattr(self.pipeline_plan, "is_enabled", False) else 1
+        for attempt in range(max_attempts):
+            try:
+                return _allocate()
+            except Exception as exc:
+                msg = str(exc)
+                oom = "RESOURCE_EXHAUSTED" in msg or "RuntimeBufferAllocationFailure" in msg
+                current_pages = metadata_num_pages(self.metadata)
+                if not oom or current_pages is None or attempt + 1 >= max_attempts:
+                    raise
+                next_pages = max(1, int(current_pages * 0.78))
+                if next_pages >= current_pages:
+                    raise
+                logger.warning(
+                    "PP cache allocation failed with num_pages=%s; retrying with num_pages=%s (%s/%s).",
+                    current_pages,
+                    next_pages,
+                    attempt + 1,
+                    max_attempts,
+                )
+                set_metadata_num_pages(self.metadata, next_pages)
+
+        raise RuntimeError("unreachable: cache allocation retry loop exhausted")
+
     def clear_cache(self) -> None:
         """Clear all cached compiled functions.
 
@@ -551,8 +604,8 @@ class ExecutionManager:
         _seq_lens_cpu = self._sampler_penalty_rebuild_seq_lens_cpu
         if jax.process_count() > 1:
             _token_ids_cpu, _seq_lens_cpu = multihost_utils.broadcast_one_to_all((_token_ids_cpu, _seq_lens_cpu))
-        token_history = jax.device_put(_token_ids_cpu, self._empty_sharding)
-        seq_lens = jax.device_put(_seq_lens_cpu, self._empty_sharding)
+        token_history = jax.device_put(_token_ids_cpu, self._sampler_sharding)
+        seq_lens = jax.device_put(_seq_lens_cpu, self._sampler_sharding)
         self._sampler_token_counts = self._rebuild_penalty_counts(token_history, seq_lens)
         self._sampler_penalty_state_dirty = False
         self._sampler_penalty_state_ready = True
@@ -720,6 +773,18 @@ class ExecutionManager:
                 lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
                 graphother,
                 shardings,
+            )
+
+        if (
+            self.mesh.is_mpmd
+            and self.graphdef is not None
+            and self.graphstate is not None
+            and self.graphother is not None
+        ):
+            self._model_executor.refresh_lm_head_state(
+                graphdef=self.graphdef,
+                graphstate=self.graphstate,
+                graphother=self.graphother,
             )
 
         # AOT mode may capture graphstate/graphother as compile-time constants.
@@ -986,6 +1051,7 @@ class ExecutionManager:
             "sampler_padded_num_reqs": int(sampler_padded_num_reqs),
             "sampler_num_reqs": int(sampler_num_reqs),
         }
+        metrics.update(self._model_executor.last_pipeline_stats())
         try:
             metrics.update(getattr(self._batch_preparer, "last_prep_stats", {}) or {})
         except Exception:
@@ -1038,6 +1104,11 @@ class ExecutionManager:
             outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
         self.kv_pages = outputs.kv_pages
         return outputs
+
+    def shutdown(self) -> None:
+        """Release resident executors owned by this manager."""
+        if hasattr(self, "_model_executor"):
+            self._model_executor.shutdown()
 
     def clear_recurrent_slots(self, slot_indices: list[int]) -> None:
         """Zero out recurrent/SSM state for freed request slots.
@@ -1168,6 +1239,7 @@ class ExecutionManager:
             num_tokens=num_tokens,
             padded_num_reqs=sampler_padded_num_reqs,
         )
+        sampler_sharding = getattr(self, "_sampler_sharding", self._empty_sharding)
         if need_penalties:
             self._ensure_sampler_penalty_state()
         token_counts_full = (
@@ -1210,7 +1282,7 @@ class ExecutionManager:
             gather_positions,
             scatter_positions,
             window_row_indices,
-        ) = _device_put_tree_uniform(sampler_host_payload, self._empty_sharding)
+        ) = _device_put_tree_uniform(sampler_host_payload, sampler_sharding)
         identity_layout = (
             sampler_padded_num_reqs == padded_num_reqs
             and sampler_num_reqs == padded_num_reqs
@@ -1221,10 +1293,11 @@ class ExecutionManager:
         )
         if identity_layout:
             compact_logits = logits[:sampler_padded_num_reqs]
-            compact_req_num_tokens = req_num_tokens_full[:sampler_padded_num_reqs]
+            compact_req_num_tokens = jax.device_put(req_num_tokens_full, sampler_sharding)[:sampler_padded_num_reqs]
         else:
             compact_logits = logits[gather_positions]
-            compact_req_num_tokens = req_num_tokens_full[gather_positions]
+            compact_req_num_tokens = jax.device_put(req_num_tokens_full, sampler_sharding)[gather_positions]
+        compact_logits = jax.device_put(compact_logits, sampler_sharding)
 
         rng_key, compact_tokens, compact_valid_mask, token_counts_full = sampler_fn(
             temperatures,
@@ -1362,8 +1435,9 @@ class ExecutionManager:
         backbone_progress.complete(f"All {len(model_tokens)} backbone compilations completed")
 
         all_reqs_padds = sorted({int(r) for _, r in sampler_compile_pairs})
-        lm_head_progress = ProgressLogger("eSurge-head", logger)
-        total_phase2 = len(all_reqs_padds) + len(sampler_compile_pairs)
+        lm_head_progress = ProgressLogger("eSurge-head-sampler", logger)
+        sampler_reqs_padds_to_compile = all_reqs_padds
+        total_phase2 = len(all_reqs_padds) + len(sampler_reqs_padds_to_compile)
         phase2_idx = 0
         for reqs_padd in all_reqs_padds:
             lm_head_progress.update(
@@ -1377,11 +1451,13 @@ class ExecutionManager:
                 metadata=metadata,
             )
             phase2_idx += 1
-        for num_tokens, reqs_padd in sampler_compile_pairs:
+        sampler_dummy_tokens = max(model_tokens, default=max_num_reqs)
+        for reqs_padd in sampler_reqs_padds_to_compile:
+            num_tokens = max(int(sampler_dummy_tokens), int(reqs_padd))
             lm_head_progress.update(
                 phase2_idx,
                 total_phase2,
-                f"Compiling [{phase2_idx + 1}/{total_phase2}]: {num_tokens:5d} tokens, {reqs_padd:2d} padded requests",
+                f"Compiling [{phase2_idx + 1}/{total_phase2}]: sampler {reqs_padd:2d} padded requests",
             )
             self._compile_sampler_variant(
                 num_tokens=num_tokens,
@@ -1390,7 +1466,7 @@ class ExecutionManager:
                 metadata=metadata,
             )
             phase2_idx += 1
-        lm_head_progress.complete(f"All {total_phase2} lm_head + sampler compilations completed")
+        lm_head_progress.complete(f"All {total_phase2} lm_head/sampler compilations completed")
 
     def _compile_backbone_variant(
         self,
@@ -1472,8 +1548,7 @@ class ExecutionManager:
         inputs: StepFunctionInputs | None = None,
     ) -> None:
         """Compile a sampler variant without requiring a matching model variant."""
-        mode = "aot" if self.use_aot_forward else "jit"
-        sampler_key = (int(num_tokens), int(padded_num_reqs), "sampler", mode)
+        sampler_key = self._sampler_executor.cache_key(padded_num_reqs=padded_num_reqs)
         if self._sampler_executor.has(sampler_key):
             return
         if inputs is None:
@@ -1496,27 +1571,29 @@ class ExecutionManager:
             dummy_logits = jnp.zeros(
                 (padded_num_reqs, vocab_size),
                 dtype=self.model.dtype,
-                out_sharding=self._empty_sharding,
+                out_sharding=self._sampler_sharding,
             )
             sampler_args = (
-                jnp.ones((padded_num_reqs, 1), dtype=jnp.float32, out_sharding=self._empty_sharding),
-                jnp.ones((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._empty_sharding),
-                jnp.zeros((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._empty_sharding),
-                jnp.zeros((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._empty_sharding),
-                jnp.zeros((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._empty_sharding),
-                jnp.zeros((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._empty_sharding),
-                jnp.ones((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._empty_sharding),
-                jnp.arange(padded_num_reqs, dtype=jnp.int32),
-                jnp.ones((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._empty_sharding),
-                jnp.ones((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._empty_sharding),
-                jax.device_put(jnp.int32(padded_num_reqs), self._empty_sharding),
-                jax.device_put(jnp.int32(num_tokens), self._empty_sharding),
-                jnp.ones((padded_num_reqs,), dtype=inputs.req_num_tokens_full.dtype, out_sharding=self._empty_sharding),
-                jnp.ones((padded_num_reqs,), dtype=jnp.bool_, out_sharding=self._empty_sharding),
+                jnp.ones((padded_num_reqs, 1), dtype=jnp.float32, out_sharding=self._sampler_sharding),
+                jnp.ones((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._sampler_sharding),
+                jnp.zeros((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._sampler_sharding),
+                jnp.zeros((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._sampler_sharding),
+                jnp.zeros((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._sampler_sharding),
+                jnp.zeros((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._sampler_sharding),
+                jnp.ones((padded_num_reqs,), dtype=jnp.float32, out_sharding=self._sampler_sharding),
+                jax.device_put(jnp.arange(padded_num_reqs, dtype=jnp.int32), self._sampler_sharding),
+                jnp.ones((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._sampler_sharding),
+                jnp.ones((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._sampler_sharding),
+                jax.device_put(jnp.int32(padded_num_reqs), self._sampler_sharding),
+                jax.device_put(jnp.int32(num_tokens), self._sampler_sharding),
+                jnp.ones(
+                    (padded_num_reqs,), dtype=inputs.req_num_tokens_full.dtype, out_sharding=self._sampler_sharding
+                ),
+                jnp.ones((padded_num_reqs,), dtype=jnp.bool_, out_sharding=self._sampler_sharding),
                 dummy_logits,
-                inputs.rng_key,
+                jax.device_put(inputs.rng_key, self._sampler_sharding),
                 self._sampler_zero_token_counts,
-                jnp.zeros((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._empty_sharding),
+                jnp.zeros((padded_num_reqs,), dtype=jnp.int32, out_sharding=self._sampler_sharding),
             )
             self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"] = _tree_hash(sampler_args)
 
@@ -1753,7 +1830,6 @@ class ExecutionManager:
             Tuple of (compiled_model_fn, compiled_sampler_fn).
         """
 
-        mode = "aot" if self.use_aot_forward else "jit"
         if self._model_executor.has_backbone(num_tokens):
             logger.debug(f"[CACHE HIT] backbone num_tokens={num_tokens}")
         else:
@@ -1763,7 +1839,7 @@ class ExecutionManager:
             logger.debug(f"[CACHE HIT] lm_head padded_num_reqs={padded_num_reqs}")
         else:
             logger.warning(f"[CACHE MISS] lm_head padded_num_reqs={padded_num_reqs}! Will trigger recompilation")
-        sampler_key = (num_tokens, padded_num_reqs, "sampler", mode)
+        sampler_key = self._sampler_executor.cache_key(padded_num_reqs=padded_num_reqs)
         if self._sampler_executor.has(sampler_key):
             logger.debug(f"[CACHE HIT] sampler_key={sampler_key}")
         else:

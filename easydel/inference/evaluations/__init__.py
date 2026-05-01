@@ -29,7 +29,7 @@ Example:
         >>> from lm_eval.evaluator import simple_evaluate
         >>>
         >>> # Create eSurge engine
-        >>> surge = eSurge(model, processor)
+        >>> surge = eSurge(model=model, processor=processor)
         >>>
         >>> # Wrap with evaluation adapter
         >>> adapter = eSurgeLMEvalAdapter(surge, processor)

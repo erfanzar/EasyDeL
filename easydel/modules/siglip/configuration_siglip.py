@@ -23,10 +23,6 @@ from easydel.infra.factory import register_config
 logger = get_logger(__name__)
 
 
-def _get_partition_rules(self, *args, **kwargs):
-    return None
-
-
 @register_config("siglip_text_model")
 class SiglipTextConfig(EasyDeLBaseConfig):
     r"""
@@ -119,8 +115,6 @@ class SiglipTextConfig(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
         self.projection_size = projection_size if projection_size is not None else hidden_size
 
-    get_partition_rules = _get_partition_rules
-
 
 @register_config("siglip_vision_model")
 class SiglipVisionConfig(EasyDeLBaseConfig):
@@ -181,8 +175,6 @@ class SiglipVisionConfig(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
         self.hidden_act = hidden_act
-
-    get_partition_rules = _get_partition_rules
 
 
 @register_config("siglip")
@@ -256,8 +248,6 @@ class SiglipConfig(EasyDeLBaseConfig):
             vision_config=vision_config.to_dict(),
             **kwargs,
         )
-
-    get_partition_rules = _get_partition_rules
 
 
 __all__ = ["SiglipConfig", "SiglipTextConfig", "SiglipVisionConfig"]

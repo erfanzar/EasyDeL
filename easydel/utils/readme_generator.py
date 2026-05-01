@@ -351,15 +351,6 @@ model = elm.build_model()
 | Max eval steps | `{{ arguments.max_evaluation_steps if arguments.max_evaluation_steps is not none else "Not Set" }}` |
 | Training time limit | `{{ arguments.training_time_limit if arguments.training_time_limit is not none else "Not Set" }}` |
 
-{% if model.partition_rules_str %}
-<details>
-<summary>Partition rules</summary>
-
-```text
-{{ model.partition_rules_str }}
-```
-</details>
-{% endif %}
 
 ## Citation
 

@@ -5,8 +5,11 @@ easydel.utils package
    :maxdepth: 2
 
    analyze_memory
+   checkpoint_compat
    compiling_utils
    helpers
+   inference_mode
+   instrumentation
    jit_context
    lazy_import
    parameters_transformation

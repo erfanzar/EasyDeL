@@ -16,6 +16,7 @@
 
 import enum
 import functools
+import os
 from functools import partial
 
 import jax
@@ -33,6 +34,7 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
+from ._gdn_policy import normalize_kernel_tile_policy
 
 
 def newton_schulz_inverse_ref(A, n=None):
@@ -695,19 +697,52 @@ def _pallas_gdn_decode_kernel(
         new_state_ref[b_idx] = new_state_masked
 
 
-_PALLAS_GDN_BTOK = 16
+_PALLAS_GDN_TILE_POLICY = normalize_kernel_tile_policy(os.environ.get("EASYDEL_GDN_TILE_POLICY", "auto"))
+_PALLAS_GDN_BTOK_CANDIDATES = (16, 8, 4)
 
 
-def _pallas_gdn_decode_call(q, k, v, beta, exp_g, state, valid):
+def set_gdn_kernel_tile_policy(policy: str) -> None:
+    """Set the TPU Pallas GDN decode tile policy for future traces."""
+
+    global _PALLAS_GDN_TILE_POLICY
+    _PALLAS_GDN_TILE_POLICY = normalize_kernel_tile_policy(policy)
+
+
+def _select_pallas_gdn_btok(num_tokens: int, n_v: int, d_k: int, d_v: int, dtype) -> int | None:
+    """Choose a TPU tile that keeps Mosaic VMEM windows under control."""
+
+    policy = _PALLAS_GDN_TILE_POLICY
+    if policy != "auto":
+        b_tok = int(policy[1:])
+        return b_tok if num_tokens >= b_tok and num_tokens % b_tok == 0 else None
+
+    bytes_per = 2
+    try:
+        bytes_per = jnp.dtype(dtype).itemsize
+    except Exception:
+        pass
+    # TPU Mosaic may double-buffer these windows and still needs spill space.
+    # Keep the raw input+output state window pair small enough that buffering
+    # does not push the program over the 64MiB VMEM ceiling.
+    max_window_pair_bytes = 14 << 20
+    for b_tok in _PALLAS_GDN_BTOK_CANDIDATES:
+        if num_tokens < b_tok or num_tokens % b_tok != 0:
+            continue
+        pair_bytes = 2 * b_tok * int(n_v) * int(d_k) * int(d_v) * int(bytes_per)
+        if pair_bytes <= max_window_pair_bytes:
+            return b_tok
+    return None
+
+
+def _pallas_gdn_decode_call(q, k, v, beta, exp_g, state, valid, *, b_tok: int):
     """Run the fused Pallas kernel. Returns (new_state_pool, outputs_3d).
 
     Assumes:
         - state_indices is identity: token i corresponds to slot i.
-        - ``q.shape[0]`` is divisible by ``_PALLAS_GDN_BTOK``.
+        - ``q.shape[0]`` is divisible by the selected Pallas tile.
     """
     T, H, D_K = q.shape
     D_V = v.shape[-1]
-    b_tok = _PALLAS_GDN_BTOK
     assert T % b_tok == 0, f"num_tokens={T} must be divisible by pallas b_tok={b_tok}"
 
     beta_p = jnp.broadcast_to(beta[..., None], (T, H, 128)).astype(beta.dtype)
@@ -817,6 +852,7 @@ def ragged_gated_delta_rule_decode_only(
     """
     num_tokens = query.shape[0]
     max_reqs = recurrent_state.shape[0]
+    n_v = query.shape[1]
     d_k = query.shape[-1]
     d_v = value.shape[-1]
 
@@ -843,14 +879,12 @@ def ragged_gated_delta_rule_decode_only(
     # splice those into the pre-existing pool prefix, leaving slots
     # `[num_tokens, max_reqs)` untouched (they hold stale state for idle
     # requests not scheduled in this step).
-    use_pallas = (
-        jax.default_backend() == "tpu"
-        and d_k == 128
-        and d_v == 128
-        and num_tokens <= max_reqs
-        and num_tokens >= _PALLAS_GDN_BTOK
-        and num_tokens % _PALLAS_GDN_BTOK == 0
+    pallas_btok = (
+        _select_pallas_gdn_btok(num_tokens, n_v, d_k, d_v, query.dtype)
+        if jax.default_backend() == "tpu" and d_k == 128 and d_v == 128 and num_tokens <= max_reqs
+        else None
     )
+    use_pallas = pallas_btok is not None
     if use_pallas:
         # Kernel expects slot[t] = recurrent_state[t] for t in [0, num_tokens).
         # Slice the prefix for the kernel (and recompose afterwards).
@@ -863,6 +897,7 @@ def ragged_gated_delta_rule_decode_only(
             exp_g,
             state_prefix,
             valid_mask,
+            b_tok=int(pallas_btok),
         )
         outputs = outputs_3d.reshape(num_tokens, -1)
         if num_tokens == max_reqs:

@@ -61,7 +61,13 @@ from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[r
 from jax import shard_map
 from spectrax.common_types import ColumnWise, Replicated, RowWise
 
-from easydel.infra.sharding import sharding_for_layout
+from easydel.infra.sharding import (
+    MeshLike,
+    partition_spec_for_mesh,
+    pick_array_mesh,
+    sanitize_partition_spec_for_shape,
+    sharding_for_layout,
+)
 from easydel.layers.quantization._configs import QuantizationType, resolve_ejkernel_quant_params
 from easydel.layers.quantization._quants import quantize
 
@@ -212,100 +218,6 @@ def _effective_ejkernel_group_size(mode: str, requested_group_size: int, array_s
     return requested_group_size
 
 
-def _mesh_matches(lhs: jax.sharding.Mesh, rhs: jax.sharding.Mesh) -> bool:
-    if lhs.axis_names != rhs.axis_names:
-        return False
-    if lhs.devices.shape != rhs.devices.shape:
-        return False
-
-    lhs_fingerprint = tuple(
-        (
-            getattr(device, "process_index", None),
-            getattr(device, "id", None),
-            getattr(device, "platform", None),
-            getattr(device, "device_kind", None),
-        )
-        for device in lhs.devices.flat
-    )
-    rhs_fingerprint = tuple(
-        (
-            getattr(device, "process_index", None),
-            getattr(device, "id", None),
-            getattr(device, "platform", None),
-            getattr(device, "device_kind", None),
-        )
-        for device in rhs.devices.flat
-    )
-    return lhs_fingerprint == rhs_fingerprint
-
-
-def _pick_mesh_from_arrays(*arrays: jax.Array | None) -> jax.sharding.Mesh | jax.sharding.AbstractMesh | None:
-    for array in arrays:
-        if array is None:
-            continue
-        sharding = getattr(array, "sharding", None)
-        if isinstance(sharding, jax.sharding.NamedSharding):
-            return sharding.mesh
-    try:
-        from spectrax import get_incontext_mesh
-
-        mesh = spx.to_jax_mesh(get_incontext_mesh(raise_error=False))
-        if mesh is None or getattr(mesh, "empty", True):
-            return None
-        return mesh
-    except Exception:
-        return None
-
-
-def _spec_for_mesh(array: jax.Array | None, mesh: jax.sharding.Mesh) -> jax.sharding.PartitionSpec:
-    if array is None:
-        return jax.sharding.PartitionSpec()
-    sharding = getattr(array, "sharding", None)
-    if isinstance(sharding, jax.sharding.NamedSharding) and _mesh_matches(sharding.mesh, mesh):
-        return sharding.spec
-    return jax.sharding.PartitionSpec()
-
-
-def _mesh_partition_product(mesh: jax.sharding.Mesh, axis_spec: tp.Any) -> int:
-    if axis_spec is None:
-        return 1
-    if isinstance(axis_spec, (list, tuple)):
-        product = 1
-        for axis_name in axis_spec:
-            if axis_name is None:
-                continue
-            product *= int(mesh.shape.get(str(axis_name), 1))
-        return int(product)
-    return int(mesh.shape.get(str(axis_spec), 1))
-
-
-def _sanitize_spec_for_shape(
-    spec: jax.sharding.PartitionSpec,
-    shape: tuple[int, ...],
-    mesh: jax.sharding.Mesh,
-) -> jax.sharding.PartitionSpec:
-    axes = list(tuple(spec))
-    changed = False
-    for dim_index, axis_spec in enumerate(axes):
-        if axis_spec is None or dim_index >= len(shape):
-            continue
-        shard_factor = _mesh_partition_product(mesh, axis_spec)
-        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
-            logger.warning(
-                "Dropping partition axis %r on dim %d: shape[%d]=%d is not divisible by shard_factor=%d.",
-                axis_spec,
-                dim_index,
-                dim_index,
-                int(shape[dim_index]),
-                shard_factor,
-            )
-            axes[dim_index] = None
-            changed = True
-    if not changed:
-        return spec
-    return jax.sharding.PartitionSpec(*axes)
-
-
 def _spec_is_sharded(spec: jax.sharding.PartitionSpec) -> bool:
     return any(axis is not None for axis in tuple(spec))
 
@@ -353,7 +265,7 @@ def _axis_names(axis_spec: tp.Any) -> tuple[str, ...]:
 def _extract_tp_axis_name(
     kernel_spec: jax.sharding.PartitionSpec,
     direction: tp.Literal["row", "column"] | None,
-    mesh: jax.sharding.Mesh,
+    mesh: MeshLike,
 ) -> str | None:
     if direction not in {"row", "column"}:
         return None
@@ -375,7 +287,7 @@ def _extract_tp_axis_name(
     return None
 
 
-def _pick_tensor_axis_name(mesh: jax.sharding.Mesh) -> str | None:
+def _pick_tensor_axis_name(mesh: MeshLike) -> str | None:
     """Pick a multi-device tensor axis from mesh, preferring canonical names."""
 
     for axis_name in ("tp", "tensor"):
@@ -985,7 +897,7 @@ class ParallelLinearQuantized(spx.Module):
 
     def _resolve_shard_specs(
         self,
-        mesh: jax.sharding.Mesh,
+        mesh: MeshLike,
         inputs_2d: Array,
         kernel_value: Array,
         scale_value: Array,
@@ -998,10 +910,10 @@ class ParallelLinearQuantized(spx.Module):
         output_spec, tp_axis_name)`` when sharded execution is viable,
         or ``None`` to signal the caller should fall back to a direct matmul.
         """
-        input_spec = _spec_for_mesh(inputs_2d, mesh)
-        kernel_spec = _spec_for_mesh(kernel_value, mesh)
-        scale_spec = _spec_for_mesh(scale_value, mesh)
-        bias_spec = _spec_for_mesh(bias_value, mesh)
+        input_spec = partition_spec_for_mesh(inputs_2d, mesh)
+        kernel_spec = partition_spec_for_mesh(kernel_value, mesh)
+        scale_spec = partition_spec_for_mesh(scale_value, mesh)
+        bias_spec = partition_spec_for_mesh(bias_value, mesh)
 
         tp_axis_name = None
         use_forced_layout = False
@@ -1031,10 +943,10 @@ class ParallelLinearQuantized(spx.Module):
                 else:
                     bias_spec = jax.sharding.PartitionSpec()
 
-                kernel_spec = _sanitize_spec_for_shape(kernel_spec, tuple(kernel_value.shape), mesh)
-                scale_spec = _sanitize_spec_for_shape(scale_spec, tuple(scale_value.shape), mesh)
+                kernel_spec = sanitize_partition_spec_for_shape(kernel_spec, tuple(kernel_value.shape), mesh)
+                scale_spec = sanitize_partition_spec_for_shape(scale_spec, tuple(scale_value.shape), mesh)
                 if bias_value is not None:
-                    bias_spec = _sanitize_spec_for_shape(bias_spec, tuple(bias_value.shape), mesh)
+                    bias_spec = sanitize_partition_spec_for_shape(bias_spec, tuple(bias_value.shape), mesh)
 
         if not use_forced_layout:
             if not any(_spec_is_sharded(s) for s in (input_spec, kernel_spec, scale_spec, bias_spec)):
@@ -1104,7 +1016,7 @@ class ParallelLinearQuantized(spx.Module):
                 **runtime_kwargs,
             )
 
-        mesh = _pick_mesh_from_arrays(inputs_2d, kernel_value, scale_value, bias_value)
+        mesh = pick_array_mesh(inputs_2d, kernel_value, scale_value, bias_value)
         if mesh is None:
             try:
                 return _direct_matmul()

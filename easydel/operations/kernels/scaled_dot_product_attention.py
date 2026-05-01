@@ -85,6 +85,7 @@ from ..requirements import (
     MetadataField,
     OperationRequirements,
 )
+from ._mask_info import align_mask_info_to_qkv_specs
 
 
 @OperationRegistry.register
@@ -218,6 +219,12 @@ class ScaledDotProductAttn(OperationImpl):
         cum_seqlens_q_sharding = self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_q)
         cum_seqlens_k_sharding = self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_k)
         output_sharding = self.create_stable_sharding(shardings.output, [0, 2])
+        mask_info = align_mask_info_to_qkv_specs(
+            mask_info,
+            query_spec=query_sharding,
+            key_spec=key_sharding,
+            layout="bthd",
+        )
 
         attention_output: Float[Array, "batch seq_len num_q_heads head_dim"] = scaled_dot_product_attention(
             query,
@@ -243,7 +250,7 @@ class ScaledDotProductAttn(OperationImpl):
         )
 
         attention_output_sharded: Float[Array, "batch seq_len num_q_heads head_dim"] = with_sharding_constraint(
-            arr=attention_output, sharding=shardings.output
+            arr=attention_output, sharding=shardings.output, mesh=self.metadata.mesh
         )
 
         result: AttentionOutput = AttentionOutput(

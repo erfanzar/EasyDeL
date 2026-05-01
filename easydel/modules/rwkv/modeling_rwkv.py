@@ -836,12 +836,13 @@ class RwkvModel(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             hidden_states, all_hidden_states, all_self_attentions, idx = carry
-            hidden_states, _state, attentions = block(
-                hidden_states,
-                state=state,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-            )
+            with self._layer_stage_context(idx, layers=self.blocks):
+                hidden_states, _state, attentions = block(
+                    hidden_states,
+                    state=state,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
 
             if self.layers_are_rescaled and self.config.rescale_every > 0 and (idx + 1) % self.config.rescale_every == 0:
                 hidden_states = hidden_states / 2

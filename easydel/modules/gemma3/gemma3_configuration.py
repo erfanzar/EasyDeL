@@ -15,8 +15,6 @@
 
 import typing
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
@@ -248,19 +246,6 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
             rope_parameters["full_attention"] = full_attention_rope_params
         self.rope_parameters = rope_parameters
 
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None
-
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.
 
@@ -374,16 +359,3 @@ class Gemma3Config(EasyDeLBaseConfig):
         self.initializer_range = initializer_range
 
         super().__init__(**kwargs)
-
-    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
-        """Returns partition rules for model sharding.
-
-        Providing explicit partition rules is preferred over automatic sharding resolution,
-        as it gives full control over parameter distribution across the device mesh.
-        Returns ``None`` by default, which triggers automatic sharding via
-        spectrax parameter metadata.
-
-        Returns:
-            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
-        """
-        return None

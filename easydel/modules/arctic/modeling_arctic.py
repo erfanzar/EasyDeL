@@ -887,17 +887,18 @@ class ArcticModel(EasyDeLBaseModule):
             hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            outputs = layer(
-                hidden_states=hidden_states,
-                mask_info=mask_info,
-                position_ids=position_ids,
-                mode=mode,
-                cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
-                cache_metadata=cache_metadata,
-                output_attentions=output_attentions,
-                output_router_logits=output_router_logits,
-                frequencies=self.frequencies,
-            )
+            with self._layer_stage_context(idx, layers=self.layers):
+                outputs = layer(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    frequencies=self.frequencies,
+                )
             hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.layers)
 
             hidden_states = apply_logical_sharding(

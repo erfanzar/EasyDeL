@@ -103,19 +103,20 @@ class TestToEsurgeKwargs:
     def test_minimal_config(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_esurge_kwargs(cfg)
-        assert "max_model_len" in result
-        assert "max_num_seqs" in result
+        assert "runtime" in result
+        assert "cache" in result
+        assert "context" in result
 
     def test_default_values(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_esurge_kwargs(cfg)
-        assert result["max_num_seqs"] == 32
-        assert result["hbm_utilization"] == 0.80
-        assert result["page_size"] == 128
-        assert result["use_aot_forward"] is True
-        assert result["enable_prefix_caching"] is True
-        assert result["compile_runner"] is True
-        assert result["auto_truncate_prompt"] is True
+        assert result["runtime"].max_num_seqs == 32
+        assert result["cache"].hbm_utilization == 0.80
+        assert result["cache"].page_size == 128
+        assert result["runtime"].use_aot_forward is True
+        assert result["cache"].enable_prefix_caching is True
+        assert result["runtime"].compile_runner is True
+        assert result["context"].auto_truncate_prompt is True
 
     def test_custom_esurge_settings(self):
         cfg = {
@@ -128,10 +129,10 @@ class TestToEsurgeKwargs:
             },
         }
         result = to_esurge_kwargs(cfg)
-        assert result["max_num_seqs"] == 64
-        assert result["hbm_utilization"] == 0.9
-        assert result["page_size"] == 64
-        assert result["max_num_batched_tokens"] == 8192
+        assert result["runtime"].max_num_seqs == 64
+        assert result["cache"].hbm_utilization == 0.9
+        assert result["cache"].page_size == 64
+        assert result["runtime"].max_num_batched_tokens == 8192
 
     def test_extra_stops_list(self):
         cfg = {
@@ -139,7 +140,7 @@ class TestToEsurgeKwargs:
             "esurge": {"extra_stops": ["<|stop|>", "<|end|>"]},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["extra_stops"] == ["<|stop|>", "<|end|>"]
+        assert result["parsing"].extra_stops == ["<|stop|>", "<|end|>"]
 
     def test_extra_stops_non_string_coerced(self):
         cfg = {
@@ -147,12 +148,12 @@ class TestToEsurgeKwargs:
             "esurge": {"extra_stops": 42},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["extra_stops"] == ["42"]
+        assert result["parsing"].extra_stops == ["42"]
 
     def test_extra_stops_none(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_esurge_kwargs(cfg)
-        assert result["extra_stops"] is None
+        assert result["parsing"].extra_stops is None
 
     def test_extra_eos_token_ids(self):
         cfg = {
@@ -160,7 +161,7 @@ class TestToEsurgeKwargs:
             "esurge": {"extra_eos_token_ids": [50256, 50257]},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["extra_eos_token_ids"] == [50256, 50257]
+        assert result["parsing"].extra_eos_token_ids == [50256, 50257]
 
     def test_idle_reset_seconds(self):
         cfg = {
@@ -168,7 +169,7 @@ class TestToEsurgeKwargs:
             "esurge": {"idle_reset_seconds": 300},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["idle_reset_seconds"] == 300.0
+        assert result["workers"].idle_reset_seconds == 300.0
 
     def test_worker_startup_timeout(self):
         cfg = {
@@ -176,7 +177,7 @@ class TestToEsurgeKwargs:
             "esurge": {"worker_startup_timeout": 30},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["worker_startup_timeout"] == 30.0
+        assert result["workers"].worker_startup_timeout == 30.0
 
     def test_truncate_mode(self):
         cfg = {
@@ -184,14 +185,14 @@ class TestToEsurgeKwargs:
             "esurge": {"truncate_mode": "middle"},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["truncate_mode"] == "middle"
+        assert result["context"].truncate_mode == "middle"
 
     def test_distributed_defaults(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_esurge_kwargs(cfg)
-        assert result["distributed_mode"] is False
-        assert result["distributed_role"] == "auto"
-        assert result["distributed_control_port"] == 19666
+        assert result["distributed"].distributed_mode is False
+        assert result["distributed"].distributed_role == "auto"
+        assert result["distributed"].distributed_control_port == 19666
 
     def test_distributed_settings(self):
         cfg = {
@@ -203,9 +204,9 @@ class TestToEsurgeKwargs:
             },
         }
         result = to_esurge_kwargs(cfg)
-        assert result["distributed_mode"] is True
-        assert result["distributed_role"] == "leader"
-        assert result["distributed_control_port"] == 20000
+        assert result["distributed"].distributed_mode is True
+        assert result["distributed"].distributed_role == "leader"
+        assert result["distributed"].distributed_control_port == 20000
 
     def test_boolean_flags_false(self):
         cfg = {
@@ -219,11 +220,11 @@ class TestToEsurgeKwargs:
             },
         }
         result = to_esurge_kwargs(cfg)
-        assert result["use_aot_forward"] is False
-        assert result["enable_prefix_caching"] is False
-        assert result["compile_runner"] is False
-        assert result["overlap_execution"] is True
-        assert result["silent_mode"] is True
+        assert result["runtime"].use_aot_forward is False
+        assert result["cache"].enable_prefix_caching is False
+        assert result["runtime"].compile_runner is False
+        assert result["runtime"].overlap_execution is True
+        assert result["parsing"].silent_mode is True
 
     def test_sharding_axis_dims(self):
         cfg = {
@@ -231,7 +232,7 @@ class TestToEsurgeKwargs:
             "esurge": {"sharding_axis_dims": [1, 2, 1, 1, 4, 1]},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["sharding_axis_dims"] == (1, 2, 1, 1, 4, 1)
+        assert "sharding_axis_dims" not in result
 
     def test_sharding_axis_dims_none(self):
         cfg = {
@@ -239,7 +240,7 @@ class TestToEsurgeKwargs:
             "esurge": {"sharding_axis_dims": None},
         }
         result = to_esurge_kwargs(cfg)
-        assert result["sharding_axis_dims"] is None
+        assert "sharding_axis_dims" not in result
 
 
 class TestNormalize:

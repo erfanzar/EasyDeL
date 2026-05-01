@@ -318,15 +318,28 @@ class StepMetrics:
             if metrics.mean_grad_norm is not None:
                 detailed_metrics.update({"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist()})
 
-            # Add per-layer gradient norms
+            # Add per-layer gradient norms. ``grad_norms`` may be a plain
+            # nested dict (legacy path) or a ``spx.State`` (current path);
+            # the latter exposes ``.flatten()`` which returns a flat
+            # ``{"collection/path": leaf}`` mapping ready to format.
             if metrics.grad_norms is not None:
-                detailed_metrics.update(
-                    {
-                        f"grad_norm/{'.'.join([str(s) for s in layer_name])}": getattr_in(grad_norm).tolist()
-                        for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
-                        if getattr_in(grad_norm) is not None
-                    }
-                )
+                if hasattr(metrics.grad_norms, "flatten") and not isinstance(metrics.grad_norms, dict):
+                    flat_grad_norms = metrics.grad_norms.flatten()
+                    detailed_metrics.update(
+                        {
+                            f"grad_norm/{layer_name}": getattr_in(grad_norm).tolist()
+                            for layer_name, grad_norm in flat_grad_norms.items()
+                            if getattr_in(grad_norm) is not None
+                        }
+                    )
+                else:
+                    detailed_metrics.update(
+                        {
+                            f"grad_norm/{'.'.join([str(s) for s in layer_name])}": getattr_in(grad_norm).tolist()
+                            for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
+                            if getattr_in(grad_norm) is not None
+                        }
+                    )
 
         return detailed_metrics
 

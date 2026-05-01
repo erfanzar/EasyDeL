@@ -146,18 +146,23 @@ def build_elarge_model(args: argparse.Namespace) -> ed.eLargeModel:
                 }
             },
             "esurge": {
-                "max_model_len": args.max_model_len,
-                "max_num_seqs": max_num_seqs,
-                "min_input_pad": 8,
-                "hbm_utilization": args.hbm_utilization,
-                "page_size": args.page_size,
-                "enable_prefix_caching": False,
-                "max_num_batched_tokens": args.max_num_batched_tokens,
-                "use_aot_forward": True,
-                "data_parallelism_axis": "fsdp",
-                "runner_verbose": False,
-                "verbose": not bool(args.dont_verbose),
-                "reserve_tokens": args.reserve_tokens,
+                "runtime": {
+                    "max_model_len": args.max_model_len,
+                    "max_num_seqs": max_num_seqs,
+                    "min_input_pad": 8,
+                    "max_num_batched_tokens": args.max_num_batched_tokens,
+                    "use_aot_forward": True,
+                    "runner_verbose": False,
+                },
+                "cache": {
+                    "hbm_utilization": args.hbm_utilization,
+                    "page_size": args.page_size,
+                    "enable_prefix_caching": False,
+                    "data_parallelism_axis": "fsdp",
+                },
+                "context": {
+                    "reserve_tokens": args.reserve_tokens,
+                },
             },
         }
     )
@@ -442,13 +447,19 @@ def main() -> None:
             "max_tokens": args.output_len,
         },
         "esurge": {
-            "max_num_seqs": args.max_num_seqs or args.parallel,
-            "max_model_len": args.max_model_len,
-            "max_num_batched_tokens": args.max_num_batched_tokens,
-            "hbm_utilization": args.hbm_utilization,
-            "page_size": args.page_size,
-            "enable_prefix_caching": False,
-            "reserve_tokens": int(engine.reserve_tokens),
+            "runtime": {
+                "max_num_seqs": args.max_num_seqs or args.parallel,
+                "max_model_len": args.max_model_len,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+            },
+            "cache": {
+                "hbm_utilization": args.hbm_utilization,
+                "page_size": args.page_size,
+                "enable_prefix_caching": False,
+            },
+            "context": {
+                "reserve_tokens": int(engine.reserve_tokens),
+            },
             "axis_dims": tuple(args.axis_dims),
         },
         "result": result,

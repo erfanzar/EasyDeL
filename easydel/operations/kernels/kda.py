@@ -557,14 +557,15 @@ class KernelDeltaAttnOp(OperationImpl):
         """
         seq_len = query.shape[1]
         shardings = None
+        mesh = self.metadata.mesh
 
-        if self.metadata.mesh is not None:
-            with self.metadata.mesh:
+        if mesh is not None:
+            with mesh:
                 mode = self.get_mode(query=query, BTHD=True)
                 shardings = self.metadata.get_shardings(mode, layout="bthd")
-                query = with_sharding_constraint(arr=query, sharding=shardings.query)
-                key = with_sharding_constraint(arr=key, sharding=shardings.key)
-                value = with_sharding_constraint(arr=value, sharding=shardings.value)
+                query = with_sharding_constraint(arr=query, sharding=shardings.query, mesh=mesh)
+                key = with_sharding_constraint(arr=key, sharding=shardings.key, mesh=mesh)
+                value = with_sharding_constraint(arr=value, sharding=shardings.value, mesh=mesh)
 
         runtime_dtype = self.metadata.runtime_dtype
         query = query.astype(runtime_dtype)
@@ -611,9 +612,9 @@ class KernelDeltaAttnOp(OperationImpl):
 
             outputs = outputs.transpose(0, 2, 1, 3)
 
-        if self.metadata.mesh is not None and shardings is not None:
-            with self.metadata.mesh:
-                outputs = with_sharding_constraint(arr=outputs, sharding=shardings.output)
+        if mesh is not None and shardings is not None:
+            with mesh:
+                outputs = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
 
         return KDAOutput(
             attention_outputs=outputs,

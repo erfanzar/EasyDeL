@@ -32,14 +32,14 @@ Features:
     - **Monitoring**: Built-in Prometheus metrics and console monitor (Grafana-ready).
 
 Usage Example:
-    >>> from easydel.inference.esurge import eSurge
+    >>> from easydel.inference.esurge import eSurge, eSurgeContextConfig, eSurgeRuntimeConfig
     >>> from easydel.inference.sampling_params import SamplingParams
     >>>
     >>> # Initialize engine
     >>> engine = eSurge(
     ...     model="model-name",
-    ...     max_model_len=8192,
-    ...     reserve_tokens=800
+    ...     runtime=eSurgeRuntimeConfig.from_dict(max_model_len=8192),
+    ...     context=eSurgeContextConfig.from_dict(reserve_tokens=800),
     ... )
     >>>
     >>> # Stream generation
@@ -73,14 +73,26 @@ from typing import Any
 
 import jax
 from jax import numpy as jnp
-from spectrax.common_types import NOT_GIVEN, _Empty
+from spectrax.common_types import NOT_GIVEN
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
+
+if typing.TYPE_CHECKING:
+    from easydel.modules.auto.auto_modeling import PreTrainedLoading
 from easydel.workers.esurge.pipeline import WorkerManager
 
+from .config import (
+    eSurgeCacheRuntimeConfig,
+    eSurgeContextConfig,
+    eSurgeDistributedConfig,
+    eSurgeParsingConfig,
+    eSurgeRuntimeConfig,
+    eSurgeVisionConfig,
+    eSurgeWorkerConfig,
+)
 from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
 from .logger import logger
 from .mixins import (
@@ -383,7 +395,12 @@ class RequestOutput:
 
 @Registry.register("serve", "esurge")
 class eSurge(
-    EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, EngineIOMixin, EngineLifecycleMixin, EngineUtilsMixin
+    EngineMonitoringMixin,
+    EngineParsingMixin,
+    EngineRequestsMixin,
+    EngineIOMixin,
+    EngineLifecycleMixin,
+    EngineUtilsMixin,
 ):
     """High-level engine interface for text generation with eSurge.
 
@@ -409,8 +426,8 @@ class eSurge(
         >>> # Initialize engine
         >>> engine = eSurge(
         ...     model="model-name",
-        ...     max_model_len=8192,
-        ...     reserve_tokens=800  # Reserve tokens for generation
+        ...     runtime=eSurgeRuntimeConfig.from_dict(max_model_len=8192),
+        ...     context=eSurgeContextConfig.from_dict(reserve_tokens=800),
         ... )
         >>> engine.initiate()
         >>>
@@ -447,266 +464,149 @@ class eSurge(
 
     def __init__(
         self,
+        *,
         model: str | EasyDeLBaseModule,
-        tokenizer: str | PreTrainedTokenizerBase | None = None,
-        dtype: jnp.dtype = jnp.bfloat16,
-        max_model_len: int = 8192,
-        min_input_pad: int = 16,
-        min_token_pad: int | None = None,
-        max_num_seqs: int = 256,
-        max_num_seq_buckets: list[int] | None = None,
-        async_scheduling: bool = True,
-        max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
-        hbm_utilization: float = 0.85,
-        page_size: int = 128,
-        use_aot_forward: bool = True,
-        bind_graphstate_for_aot: bool = False,
-        enable_prefix_caching: bool = True,
-        auto_shard_model: bool = True,
-        sharding_axis_dims: tuple[int, ...] = (1, 1, 1, 1, -1, 1),
-        compile_runner: bool = True,
-        runner_verbose: bool = False,
-        overlap_execution: bool = True,
-        sampler_metrics: bool = False,
-        data_parallelism_axis: str = "dp",
-        esurge_name: str | None = None,
-        reserve_tokens: int | None = None,
-        auto_truncate_prompt: bool = True,
-        auto_cap_new_tokens: bool = True,
-        strict_context: bool = False,
-        truncate_mode: typing.Literal["left", "right", "middle"] = "left",
-        prefer_preserve_prompt: bool = True,
-        decode_truncated_prompt: bool = True,
-        destroy_pages_on_pause: bool = True,
-        detokenizer_max_states: int = DEFAULT_DETOKENIZER_MAX_STATES,
-        tokenizer_endpoint: str | None = None,
-        detokenizer_endpoint: str | None = None,
-        worker_startup_timeout: float | None = None,
-        max_request_outputs: int | None = 1000,
-        idle_reset_seconds: float | None = None,
-        idle_reset_min_interval: float = 60.0,
-        sampling_params_callback: SamplingCallable = None,
-        extra_eos_token_ids: list[int] | None = None,
-        extra_stops: str | list[str] | None = None,
-        ignore_stop_strings_in_reasoning: bool = True,
-        silent_mode: bool = False,
         processor: Any | None = None,
-        resolution_buckets: list[tuple[int, int]] | None = None,
-        vision_cache_capacity_mb: int = 1024,
-        tool_parser: ToolParserName | None = None,
-        reasoning_parser: ReasoningParserName | None = None,
-        long_prefill_token_threshold: int | None = None,
-        distributed_mode: bool = False,
-        distributed_role: typing.Literal["auto", "leader", "worker"] = "auto",
-        distributed_service_name: str | None = None,
-        distributed_world_size: int | None = None,
-        distributed_rank: int | None = None,
-        distributed_control_port: int = 19666,
-        distributed_control_bind_host: str = "0.0.0.0",
-        distributed_advertise_addr: str | None = None,
-        distributed_auth_token: str | None = None,
-        distributed_step_timeout_s: float = 30.0,
-        distributed_connect_timeout_s: float = 15.0,
-        distributed_verify_sampling_digest: bool = True,
-        enable_window_aware_runtime_cap: bool = False,
-        **kwargs,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        loading_kwargs: PreTrainedLoading | typing.Mapping[str, Any] | None = None,
+        runtime: eSurgeRuntimeConfig | typing.Mapping[str, Any] | None = None,
+        cache: eSurgeCacheRuntimeConfig | typing.Mapping[str, Any] | None = None,
+        context: eSurgeContextConfig | typing.Mapping[str, Any] | None = None,
+        workers: eSurgeWorkerConfig | typing.Mapping[str, Any] | None = None,
+        parsing: eSurgeParsingConfig | typing.Mapping[str, Any] | None = None,
+        vision: eSurgeVisionConfig | typing.Mapping[str, Any] | None = None,
+        distributed: eSurgeDistributedConfig | typing.Mapping[str, Any] | None = None,
     ):
         """Initialize the eSurge engine.
 
         Args:
-            model: Model path (HuggingFace hub) or preloaded EasyDeL model instance.
-            tokenizer: Deprecated alias for `processor`. Tokenizer path or instance.
-            dtype: JAX dtype for model computations (default: bfloat16).
-            max_model_len: Maximum sequence length the model can handle.
-            min_input_pad: Minimum padding for input sequences.
-            min_token_pad: Optional minimum token bucket size for compilation. When
-                smaller than `min_input_pad`, this allows decode steps like `tok=1/b1`
-                instead of `tok=1/b16`, at the cost of more compilation variants.
-            max_num_seqs: Maximum number of concurrent sequences.
-            max_num_seq_buckets: Optional explicit request-capacity buckets used for
-                compilation (e.g., [1, 2, 4, 8, 16, 32]). When provided, the runner
-                compiles these bucket sizes and selects the smallest that can fit
-                the current active batch.
-            async_scheduling: Enable async token sampling overlap in the scheduler
-                and let the runner compile the corresponding safe batch shapes.
-            max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
-            hbm_utilization: Target HBM memory utilization (0.0-1.0).
-            page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
-            bind_graphstate_for_aot: Whether AOT model-step compilations should
-                close over graphstate/graphother as compile-time constants.
-                Default: False.
-            enable_prefix_caching: Enable caching of common prefixes for efficiency.
-            auto_shard_model: Automatically shard model across devices.
-            sharding_axis_dims: Base sharding configuration for model parallelism.
-                Default order is ``(dp, fsdp, ep, tp, sp)``.
-            compile_runner: JIT pre-compile the runner for better performance.
-            runner_verbose: Enable verbose logging in runner.
-            esurge_name: Optional custom name for this engine instance.
-            reserve_tokens: Safety margin tokens reserved from max_model_len to prevent
-                OOM or Scheduler errors. Defaults to max_model_len // 10.
-            auto_truncate_prompt: Allow automatic prompt truncation when it exceeds
-                the available context budget.
-            auto_cap_new_tokens: Automatically cap max_new_tokens to fit within
-                the model's context window.
-            strict_context: If True, raise errors on context violations instead of
-                auto-fixing. Use for strict validation.
-            truncate_mode: Strategy for prompt truncation:
-                - "left": Remove tokens from the beginning
-                - "right": Remove tokens from the end
-                - "middle": Remove tokens from the middle
-            prefer_preserve_prompt: When True, prioritize preserving the prompt by
-                capping new tokens first before truncating the prompt.
-            decode_truncated_prompt: Re-decode truncated prompt to update the text
-                representation when truncation occurs.
-            overlap_execution: Enable double-buffered model execution to overlap
-                scheduler work with device execution (experimental).
-            sampler_metrics: Enable the lightweight sampler JIT for recording
-                token log-probabilities on-device.
-            data_parallelism_axis: Mesh axis name used as the data-parallel page
-                axis for KV-cache sharding and slot localization. Defaults to
-                ``"dp"``. Set to ``"ep"`` to run data parallelism over the expert axis.
-            detokenizer_max_states: Maximum number of streaming decode states
-                the detokenizer worker will keep resident (power-of-two recommended).
-            destroy_pages_on_pause: When True, destroying the ragged KV cache upon
-                pause() to free memory, and lazily reinitializing it on resume().
-            tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
-            detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
-            worker_startup_timeout: Seconds to wait for spawned tokenizer and
-                detokenizer workers to bind. If None, uses
-                ``EASURGE_WORKER_STARTUP_TIMEOUT`` when set, otherwise defaults
-                to 120 seconds.
-            max_request_outputs: Maximum number of completed RequestOutput objects
-                to retain in memory for post-hoc access. Set to None for unlimited
-                retention or <=0 to disable retention entirely.
-            idle_reset_seconds: If set, automatically pause/resume the engine after
-                this many seconds of continuous idleness (no running/pending requests).
-                Useful for clearing stale state under long-running workloads.
-            idle_reset_min_interval: Minimum seconds between idle resets to avoid
-                reset loops when traffic is sparse.
-            sampling_params_callback: Optional callable that can inspect/modify
-                the SamplingParams for each submitted request. Receives a cloned
-                SamplingParams instance and request metadata dict containing
-                "request_id", "prompt", and "engine". May return a new instance
-                or mutate the provided one in-place.
-            extra_eos_token_ids: Additional EOS token IDs beyond the tokenizer's default.
-                These will be treated as end-of-sequence tokens for all requests unless
-                overridden in SamplingParams.
-            extra_stops: Additional stop strings applied to every request. These are
-                merged into per-request ``SamplingParams.stop`` at runtime and
-                de-duplicated while preserving existing stop order.
-            ignore_stop_strings_in_reasoning: When True, stop-string matching is
-                applied only to parsed visible content for requests that use a
-                reasoning parser. Stop strings that appear inside the reasoning
-                section will not terminate generation.
-            silent_mode: If True, suppress informational eSurge engine logs.
-            processor: Unified text/multimodal processor. Can be a tokenizer or an
-                HF processor (with an embedded tokenizer). If None, falls back to
-                `tokenizer` and then to loading from `model` when `model` is a string.
-            tool_parser: Name of the tool-call parser to use for automatic function-call
-                extraction (e.g., "hermes", "mistral", "llama3_json"). When set, the
-                engine runs the parser in ``_process_engine_outputs()`` so that
-                ``RequestOutput.tool_calls`` / ``RequestOutput.delta_tool_calls`` are
-                populated directly. If None, tool-call detection is left to the
-                API server layer. See ``ToolParserManager`` for available parsers.
-            reasoning_parser: Name of the reasoning parser to use for extracting
-                chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
-                When set, the engine separates reasoning from content so that
-                ``RequestOutput.reasoning_content`` / ``RequestOutput.delta_reasoning_content``
-                are populated directly. If None, no reasoning extraction is performed.
-                See ``ReasoningParserManager`` for available parsers.
-            distributed_mode: Enable lockstep multi-host serving mode. Rank 0
-                acts as leader and all other ranks are worker executors.
-            distributed_role: Role override for distributed mode. Use ``\"auto\"``
-                (default) to map rank 0 -> leader and others -> worker.
-            distributed_service_name: DNS service name resolved into host
-                membership for fixed world-size serving.
-            distributed_world_size: Expected number of hosts in the service.
-            distributed_rank: Optional rank override. Defaults to JAX process
-                index when distributed mode is enabled.
-            distributed_control_port: ZMQ control-plane port.
-            distributed_control_bind_host: Bind host for worker control server.
-            distributed_advertise_addr: Optional advertised address override.
-            distributed_auth_token: Shared secret used to authenticate
-                control-plane requests.
-            distributed_step_timeout_s: Worker step reply timeout in seconds.
-            distributed_connect_timeout_s: Worker connect/handshake timeout.
-            distributed_verify_sampling_digest: Validate sampled-token digest
-                from workers against leader output each step.
-            enable_window_aware_runtime_cap: Whether to derive the runtime
-                request cap from the model's live KV-window page demand.
-                When False, eSurge falls back to the cache metadata's
-                heuristic request-cap estimate instead.
-            **kwargs: Additional configuration passed to model loading.
+            model: Model id/path to load, or an already loaded EasyDeL model.
+            processor: Unified text/multimodal processor. Can be a tokenizer or
+                HF processor. When omitted for a string model, it is loaded from
+                the model id/path.
+            tokenizer: Deprecated alias/fallback for `processor`.
+            loading_kwargs: Optional pretrained-loader kwargs used only when
+                `model` is a string model id/path.
+            runtime: Runtime and execution config.
+            cache: KV-cache config.
+            context: Context-window handling config.
+            workers: Tokenizer/detokenizer worker config.
+            parsing: Tool/reasoning parser config.
+            vision: Multimodal config.
+            distributed: Distributed serving config.
 
         Raises:
-            ValueError: If tokenizer not provided and cannot be inferred, or if
-                configuration parameters are invalid.
+            ValueError: If processor/tokenizer cannot be inferred, or if
+                configuration is invalid.
         """
         from easydel.infra import EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
         from easydel.modules.auto import AutoEasyDeLModelForCausalLM
+        from easydel.modules.auto.auto_modeling import PreTrainedLoading
 
-        self.silent_mode = silent_mode
-        self._info = logger.info if not self.silent_mode else lambda *args, **kwargs: None
+        loading_data = dict(loading_kwargs or {})
+        configured_model = loading_data.pop("pretrained_model_name_or_path", None)
+        if configured_model is not None and configured_model != model:
+            logger.warning(
+                "`loading_kwargs.pretrained_model_name_or_path` is ignored; use the top-level `model` argument."
+            )
+        if processor is None:
+            processor = loading_data.pop("processor", None)
+        else:
+            loading_data.pop("processor", None)
+        if tokenizer is None:
+            tokenizer = loading_data.pop("tokenizer", None)
+        else:
+            loading_data.pop("tokenizer", None)
+        loading_data["pretrained_model_name_or_path"] = model
+        loading_data["processor"] = processor
+        loading_data["tokenizer"] = tokenizer
+        self.loading_kwargs = PreTrainedLoading.coerce_config(loading_data)
+        self.runtime_config = eSurgeRuntimeConfig.coerce_config(runtime)
+        self.cache_config = eSurgeCacheRuntimeConfig.coerce_config(cache)
+        self.context_config = eSurgeContextConfig.coerce_config(context)
+        self.worker_config = eSurgeWorkerConfig.coerce_config(workers)
+        self.parsing_config = eSurgeParsingConfig.coerce_config(parsing)
+        self.vision_config = eSurgeVisionConfig.coerce_config(vision)
+        self.distributed_config = eSurgeDistributedConfig.coerce_config(distributed)
 
+        # Backward-compatible public aliases.  The sectioned configs above are
+        # the source of truth, but server/eval adapters still read these names.
+        self.silent_mode = bool(self.parsing_config.silent_mode)
+        self.max_model_len = self.runtime_config.max_model_len
+        self.max_num_seqs = self.runtime_config.max_num_seqs
+        self.page_size = self.cache_config.page_size
+        self.enable_window_aware_runtime_cap = self.runtime_config.enable_window_aware_runtime_cap
+        self.distributed_mode = bool(self.distributed_config.distributed_mode)
+        self._overlap_execution = self.runtime_config.overlap_execution
+        self._scheduler_enable_prefix_caching = self.cache_config.enable_prefix_caching
+        self._min_input_pad = self.runtime_config.min_input_pad
+        self._max_num_seqs = self.runtime_config.max_num_seqs
+        self._max_num_batched_tokens = self.runtime_config.max_num_batched_tokens
+        self._hbm_utilization = self.cache_config.hbm_utilization
+        self._page_size = self.cache_config.page_size
+        self._enable_prefix_caching = self.cache_config.enable_prefix_caching
+        self._runner_verbose = self.runtime_config.runner_verbose
+        self._decode_truncated_prompt = self.context_config.decode_truncated_prompt
+        self._destroy_pages_on_pause = self.cache_config.destroy_pages_on_pause
+        self._sampling_params_callback = self.parsing_config.sampling_params_callback
+        self.ignore_stop_strings_in_reasoning = bool(self.parsing_config.ignore_stop_strings_in_reasoning)
+
+        # Locals only for values that get transformed (resolved, normalized, or
+        # mutated). Pure config field reads use ``self.X_config.field`` directly.
+        dtype = self.loading_kwargs.dtype if self.loading_kwargs.dtype is not None else jnp.bfloat16
+
+        self._info = logger.info if not self.parsing_config.silent_mode else lambda *args, **kwargs: None
+
+        reserve_tokens = self.context_config.reserve_tokens
         if reserve_tokens is None:
-            reserve_tokens = max_num_seqs
+            reserve_tokens = self.runtime_config.max_num_seqs
+        self.reserve_tokens = reserve_tokens
 
-        if max_model_len <= reserve_tokens:
-            raise ValueError(f"Configuration error: max_model_len={max_model_len} <= reserve_tokens={reserve_tokens}")
+        if self.runtime_config.max_model_len <= reserve_tokens:
+            raise ValueError(
+                f"Configuration error: max_model_len={self.runtime_config.max_model_len} "
+                f"<= reserve_tokens={reserve_tokens}"
+            )
 
-        self.max_model_len = max_model_len
-        self.max_num_seqs = max_num_seqs
-        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
-        self.page_size = page_size
-        self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
+        self.data_parallelism_axis = _normalize_data_parallelism_axis(self.cache_config.data_parallelism_axis)
         register_attention_data_parallel_axis(self.data_parallelism_axis)
-        self.distributed_mode = bool(distributed_mode)
-        self.distributed_service_name = distributed_service_name
-        self.distributed_control_port = int(distributed_control_port)
-        self.distributed_control_bind_host = str(distributed_control_bind_host)
-        self.distributed_advertise_addr = distributed_advertise_addr
-        self.distributed_step_timeout_s = float(distributed_step_timeout_s)
-        self.distributed_connect_timeout_s = float(distributed_connect_timeout_s)
-        self.distributed_verify_sampling_digest = bool(distributed_verify_sampling_digest)
         self._distributed_controller: DistributedController | None = None
 
-        if self.distributed_mode:
-            if not distributed_auth_token:
+        if self.distributed_config.distributed_mode:
+            if not self.distributed_config.distributed_auth_token:
                 raise ValueError("`distributed_auth_token` must be provided when distributed_mode=True.")
-            if distributed_world_size is None:
+            if self.distributed_config.distributed_world_size is None:
                 raise ValueError("`distributed_world_size` must be provided when distributed_mode=True.")
-            if overlap_execution:
+            if self.runtime_config.overlap_execution:
                 raise ValueError(
                     "`overlap_execution=True` is not supported with distributed_mode=True. "
                     "Use overlap_execution=False for lockstep multi-host serving."
                 )
 
-            world_size = int(distributed_world_size)
+            world_size = self.distributed_config.distributed_world_size
             if world_size <= 0:
-                raise ValueError(f"`distributed_world_size` must be positive, got {distributed_world_size}.")
+                raise ValueError(f"`distributed_world_size` must be positive, got {world_size}.")
 
-            rank = int(distributed_rank) if distributed_rank is not None else int(jax.process_index())
+            rank = (
+                self.distributed_config.distributed_rank
+                if self.distributed_config.distributed_rank is not None
+                else int(jax.process_index())
+            )
             if rank < 0 or rank >= world_size:
                 raise ValueError(
                     f"`distributed_rank` out of range: rank={rank}, world_size={world_size}. "
                     "Ensure JAX distributed init and DNS membership agree."
                 )
 
-            role = resolve_distributed_role(distributed_role, rank)
-
-            self.distributed_role = role
+            self.distributed_role = resolve_distributed_role(self.distributed_config.distributed_role, rank)
             self.distributed_world_size = world_size
             self.distributed_rank = rank
-            self.distributed_auth_token = str(distributed_auth_token)
         else:
             self.distributed_role = "leader"
             self.distributed_world_size = 1
             self.distributed_rank = 0
-            self.distributed_auth_token = ""
 
-        if kwargs.pop("use_combined_forward", None) is not None:
-            logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
         # `processor` is the unified interface for text + multimodal workflows.
         # Backward-compat: if `processor` isn't provided, fall back to `tokenizer`.
         if tokenizer is not None and processor is not None and tokenizer is not processor:
@@ -766,8 +666,8 @@ class eSurge(
             self._multimodal_manager = MultiModalManager(
                 processor=self.processor,
                 model=None if isinstance(model, str) else model,
-                resolution_buckets=resolution_buckets,
-                cache_capacity_mb=vision_cache_capacity_mb,
+                resolution_buckets=self.vision_config.resolution_buckets,
+                cache_capacity_mb=self.vision_config.vision_cache_capacity_mb,
                 enable_cache=True,
             )
 
@@ -781,32 +681,26 @@ class eSurge(
         self._grafana_url: str | None = None
         self._prometheus_process: subprocess.Popen | None = None
         self._prometheus_temp_dir: str | None = None
-        self._esurge_name = esurge_name
         self._scheduler_running = False
-        self.destroy_pages_on_pause = destroy_pages_on_pause
         self._kv_cache_valid = True
         self._paused = False
-        self._sampling_params_callback = sampling_params_callback
-        self.ignore_stop_strings_in_reasoning = bool(ignore_stop_strings_in_reasoning)
 
         # Detokenizer cleanup tracking
         self._failed_detokenizer_resets: set[str] = set()
         self._detokenizer_cleanup_threshold = 100  # Clean up after this many failures
 
-        # Idle reset configuration
-        self._idle_reset_seconds = float(idle_reset_seconds) if idle_reset_seconds else None
-        self._idle_reset_min_interval = float(idle_reset_min_interval)
+        # Idle reset state (config lives on self.worker_config)
         self._idle_reset_last_activity = time.time()
         self._idle_reset_last_reset = 0.0
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
 
-        tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
-        detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
+        tokenizer_endpoint = self.worker_config.tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
+        detokenizer_endpoint = self.worker_config.detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
-        self._worker_manager = WorkerManager(tokenizer_source, startup_timeout=worker_startup_timeout)
+        self._worker_manager = WorkerManager(tokenizer_source, startup_timeout=self.worker_config.worker_startup_timeout)
         self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
-            detokenizer_max_states=detokenizer_max_states,
+            detokenizer_max_states=self.worker_config.detokenizer_max_states,
             tokenizer_endpoint=tokenizer_endpoint,
             detokenizer_endpoint=detokenizer_endpoint,
         )
@@ -821,8 +715,9 @@ class eSurge(
                 if backend == "gpu"
                 else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
             )
-            user_provided_attn = "attn_mechanism" in kwargs
-            requested_attn = kwargs.get("attn_mechanism") if user_provided_attn else None
+            user_config_kwargs = dict(self.loading_kwargs.config_kwargs or {})
+            user_provided_attn = "attn_mechanism" in user_config_kwargs
+            requested_attn = user_config_kwargs.get("attn_mechanism") if user_provided_attn else None
             if requested_attn is None:
                 user_provided_attn = False
 
@@ -858,9 +753,7 @@ class eSurge(
                         f"got attn_mechanism={attn_value!r}."
                     )
 
-            sharding_axis_names = tuple(kwargs.pop("sharding_axis_names", ("pp", "dp", "fsdp", "ep", "tp", "sp")))
-            sharding_axis_dims_resolved = tuple(int(v) for v in sharding_axis_dims)
-            sharding_axis_names_resolved = tuple(str(v) for v in sharding_axis_names)
+            sharding_axis_names_resolved = tuple(self.loading_kwargs.sharding_axis_names)
             if self.data_parallelism_axis not in sharding_axis_names_resolved:
                 logger.warning(
                     "`data_parallelism_axis=%r` not found in `sharding_axis_names=%r`; "
@@ -869,32 +762,24 @@ class eSurge(
                     sharding_axis_names_resolved,
                 )
 
-            config_kwargs = dict(kwargs.pop("config_kwargs", {}) or {})
-            config_partition_axis = config_kwargs.pop("partition_axis", None)
-            kwargs_partition_axis = kwargs.pop("partition_axis", None)
-            resolved_partition_axis = (
-                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis
+            user_config_kwargs.pop("attn_mechanism", None)
+
+            loading = self.loading_kwargs.to_dict()
+            loading["dtype"] = dtype
+            loading["param_dtype"] = dtype
+            loading["precision"] = jax.lax.Precision.DEFAULT
+            loading["sharding_axis_dims"] = tuple(self.loading_kwargs.sharding_axis_dims)
+            loading["sharding_axis_names"] = sharding_axis_names_resolved
+            loading["config_kwargs"] = EasyDeLBaseConfigDict(
+                attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
+                attn_dtype=dtype,
+                kvdtype=dtype,
+                freq_max_position_embeddings=self.runtime_config.max_model_len,
+                mask_max_position_embeddings=self.runtime_config.max_model_len,
+                **user_config_kwargs,
             )
 
-            model = AutoEasyDeLModelForCausalLM.from_pretrained(
-                model,
-                dtype=dtype,
-                param_dtype=dtype,
-                precision=jax.lax.Precision.DEFAULT,
-                auto_shard_model=auto_shard_model,
-                sharding_axis_dims=sharding_axis_dims_resolved,
-                sharding_axis_names=sharding_axis_names_resolved,
-                partition_axis=resolved_partition_axis,
-                config_kwargs=EasyDeLBaseConfigDict(
-                    attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
-                    attn_dtype=dtype,
-                    kvdtype=dtype,
-                    freq_max_position_embeddings=max_model_len,
-                    mask_max_position_embeddings=max_model_len,
-                    **config_kwargs,
-                ),
-                **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
-            )
+            model = AutoEasyDeLModelForCausalLM.from_pretrained(**loading)
             text_config = model.config.get_text_config()
             has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(model, text_config)
 
@@ -949,11 +834,13 @@ class eSurge(
             self._multimodal_manager.model = model
 
         detected_model_type = getattr(getattr(model, "config", None), "model_type", None)
+        tool_parser = self.parsing_config.tool_parser
         if tool_parser is None:
             tool_parser = self._auto_detect_tool_parser(
                 tokenizer=self.tokenizer,
                 model_type=detected_model_type,
             )
+        reasoning_parser = self.parsing_config.reasoning_parser
         if reasoning_parser is None:
             reasoning_parser = self._auto_detect_reasoning_parser_name(
                 tokenizer=self.tokenizer,
@@ -970,7 +857,7 @@ class eSurge(
                 from easydel.inference.tools import ToolParserManager
 
                 self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
-                if not silent_mode:
+                if not self.parsing_config.silent_mode:
                     logger.info("Initialized tool parser: %s", tool_parser)
             except KeyError:
                 logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
@@ -980,20 +867,21 @@ class eSurge(
                 from easydel.inference.reasoning import ReasoningParserManager
 
                 self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
-                if not silent_mode:
+                if not self.parsing_config.silent_mode:
                     logger.info("Initialized reasoning parser: %s", reasoning_parser)
             except KeyError:
                 logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
 
+        max_num_batched_tokens = self.runtime_config.max_num_batched_tokens
         if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
-            max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
+            max_num_batched_tokens = min(max(2048, self.runtime_config.max_num_seqs), self.runtime_config.max_model_len)
             logger.info(
                 f"GPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
                 "Pass an explicit int to override, or pass `None` to disable this auto-default "
                 "(falls back to `max_model_len`)."
             )
         elif max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "tpu":
-            max_num_batched_tokens = min(max(8192, max_num_seqs), max_model_len)
+            max_num_batched_tokens = min(max(8192, self.runtime_config.max_num_seqs), self.runtime_config.max_model_len)
             logger.info(
                 f"TPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
                 "Pass an explicit int to override, or pass `None` to disable this auto-default "
@@ -1012,25 +900,29 @@ class eSurge(
 
         self.runner = eSurgeRunner(
             model=model.esurge_compatible_model,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            max_model_len=max_model_len,
+            hbm_utilization=self.cache_config.hbm_utilization,
+            page_size=self.cache_config.page_size,
+            pipeline_inference=self.runtime_config.pipeline_inference,
+            max_cache_tokens=self.cache_config.max_cache_tokens,
+            cache_capacity_margin=self.cache_config.cache_capacity_margin,
+            kernel_tile_policy=self.runtime_config.kernel_tile_policy,
+            max_model_len=self.runtime_config.max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
-            enable_window_aware_runtime_cap=enable_window_aware_runtime_cap,
-            min_input_pad=min_input_pad,
-            max_num_seqs=max_num_seqs,
-            max_num_seq_buckets=max_num_seq_buckets,
-            async_scheduling=async_scheduling,
-            min_token_pad=min_token_pad,
-            use_aot_forward=use_aot_forward,
-            bind_graphstate_for_aot=bind_graphstate_for_aot,
-            verbose=runner_verbose,
-            enable_overlap_execution=overlap_execution,
-            enable_sampler_metrics=sampler_metrics,
+            enable_window_aware_runtime_cap=self.runtime_config.enable_window_aware_runtime_cap,
+            min_input_pad=self.runtime_config.min_input_pad,
+            max_num_seqs=self.runtime_config.max_num_seqs,
+            max_num_seq_buckets=self.runtime_config.max_num_seq_buckets,
+            async_scheduling=self.runtime_config.async_scheduling,
+            min_token_pad=self.runtime_config.min_token_pad,
+            use_aot_forward=self.runtime_config.use_aot_forward,
+            bind_graphstate_for_aot=self.runtime_config.bind_graphstate_for_aot,
+            verbose=self.runtime_config.runner_verbose,
+            enable_overlap_execution=self.runtime_config.overlap_execution,
+            enable_sampler_metrics=self.runtime_config.sampler_metrics,
+            mpmd_scheduler=self.runtime_config.mpmd_scheduler,
         )
-        self._overlap_execution = overlap_execution
 
-        if compile_runner:
+        if self.runtime_config.compile_runner:
             # Limit compilation to the scheduler's per-step token budget when provided.
             # This avoids compiling long-context token buckets (e.g. 32K/64K) when
             # the scheduler will only ever emit smaller batches (e.g. 512/2048).
@@ -1039,12 +931,11 @@ class eSurge(
         self.scheduler = Scheduler.from_runner(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
-            enable_prefix_caching=enable_prefix_caching,
-            async_scheduling=async_scheduling,
-            long_prefill_token_threshold=long_prefill_token_threshold,
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
+            async_scheduling=self.runtime_config.async_scheduling,
+            long_prefill_token_threshold=self.runtime_config.long_prefill_token_threshold,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
-        self._scheduler_enable_prefix_caching = enable_prefix_caching
 
         # Streaming decode cadence
         self.decode_interval_tokens = DEFAULT_DECODE_INTERVAL_TOKENS
@@ -1054,20 +945,13 @@ class eSurge(
         self._request_counter = 0
         self._active_requests: dict[str, dict] = {}
         self._request_outputs: dict[str, RequestOutput] = {}
-        self._max_request_outputs = None if max_request_outputs is None else int(max_request_outputs)
+        self._max_request_outputs = self.worker_config.max_request_outputs
         self._finished_request_ids: deque[str] = deque()
 
         # Per-request events to support many concurrent streams
         self._request_events: dict[str, threading.Event] = {}
-        self.reserve_tokens = reserve_tokens
-        self.auto_truncate_prompt = auto_truncate_prompt
-        self.auto_cap_new_tokens = auto_cap_new_tokens
-        self.strict_context = strict_context
-        self.truncate_mode = truncate_mode
-        self.prefer_preserve_prompt = prefer_preserve_prompt
-        self.decode_truncated_prompt = decode_truncated_prompt
-        self.extra_eos_token_ids = extra_eos_token_ids or []
-        self.extra_stops = self._normalize_stop_sequences(extra_stops)
+        self.extra_eos_token_ids = self.parsing_config.extra_eos_token_ids or []
+        self.extra_stops = self._normalize_stop_sequences(self.parsing_config.extra_stops)
         # Locks and signals
         self._scheduler_lock = threading.RLock()
         self._request_lock = threading.RLock()
@@ -1129,18 +1013,18 @@ class eSurge(
         self._eos_ids = self.__eos_ids
         self._eos_set = self.__eos_set
 
-        if self.distributed_mode:
+        if self.distributed_config.distributed_mode:
             distributed_config = {
-                "max_model_len": int(self.max_model_len),
-                "max_num_seqs": int(self.max_num_seqs),
-                "page_size": int(self.page_size),
-                "data_parallelism_axis": str(self.data_parallelism_axis),
+                "max_model_len": self.runtime_config.max_model_len,
+                "max_num_seqs": self.runtime_config.max_num_seqs,
+                "page_size": self.cache_config.page_size,
+                "data_parallelism_axis": self.data_parallelism_axis,
                 "max_num_batched_tokens": (
                     int(self.scheduler.max_num_scheduled_tokens)
                     if self.scheduler.max_num_scheduled_tokens is not None
                     else None
                 ),
-                "enable_window_aware_runtime_cap": bool(self.enable_window_aware_runtime_cap),
+                "enable_window_aware_runtime_cap": self.runtime_config.enable_window_aware_runtime_cap,
                 "scheduler_policy": str(
                     self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
                 ),
@@ -1151,14 +1035,14 @@ class eSurge(
                 role=self.distributed_role,
                 rank=self.distributed_rank,
                 world_size=self.distributed_world_size,
-                service_name=self.distributed_service_name,
-                control_port=self.distributed_control_port,
-                control_bind_host=self.distributed_control_bind_host,
-                advertise_addr=self.distributed_advertise_addr,
-                auth_token=self.distributed_auth_token,
-                step_timeout_s=self.distributed_step_timeout_s,
-                connect_timeout_s=self.distributed_connect_timeout_s,
-                verify_sampling_digest=self.distributed_verify_sampling_digest,
+                service_name=self.distributed_config.distributed_service_name,
+                control_port=self.distributed_config.distributed_control_port,
+                control_bind_host=self.distributed_config.distributed_control_bind_host,
+                advertise_addr=self.distributed_config.distributed_advertise_addr,
+                auth_token=self.distributed_config.distributed_auth_token,
+                step_timeout_s=self.distributed_config.distributed_step_timeout_s,
+                connect_timeout_s=self.distributed_config.distributed_connect_timeout_s,
+                verify_sampling_digest=self.distributed_config.distributed_verify_sampling_digest,
                 config_fingerprint=self._distributed_config_fingerprint,
                 execute_step=self._distributed_execute_step,
             )
@@ -1215,7 +1099,7 @@ class eSurge(
             Custom name if provided during initialization, otherwise an
             auto-generated name based on model type and size.
         """
-        return self._esurge_name or self._possible_name
+        return self.runtime_config.esurge_name or self._possible_name
 
     def set_sampling_params_callback(
         self,
@@ -1361,21 +1245,21 @@ class eSurge(
         """
         attrs = [
             f"name={self.esurge_name!r}",
-            f"max_model_len={self.max_model_len}",
-            f"max_num_seqs={self.max_num_seqs}",
-            f"page_size={self.page_size}",
-            f"enable_window_aware_runtime_cap={self.enable_window_aware_runtime_cap}",
+            f"max_model_len={self.runtime_config.max_model_len}",
+            f"max_num_seqs={self.runtime_config.max_num_seqs}",
+            f"page_size={self.cache_config.page_size}",
+            f"enable_window_aware_runtime_cap={self.runtime_config.enable_window_aware_runtime_cap}",
             f"data_parallelism_axis={self.data_parallelism_axis!r}",
             f"reserve_tokens={self.reserve_tokens}",
-            f"auto_truncate_prompt={self.auto_truncate_prompt}",
-            f"auto_cap_new_tokens={self.auto_cap_new_tokens}",
-            f"strict_context={self.strict_context}",
-            f"truncate_mode={self.truncate_mode!r}",
-            f"prefer_preserve_prompt={self.prefer_preserve_prompt}",
-            f"decode_truncated_prompt={self.decode_truncated_prompt}",
+            f"auto_truncate_prompt={self.context_config.auto_truncate_prompt}",
+            f"auto_cap_new_tokens={self.context_config.auto_cap_new_tokens}",
+            f"strict_context={self.context_config.strict_context}",
+            f"truncate_mode={self.context_config.truncate_mode!r}",
+            f"prefer_preserve_prompt={self.context_config.prefer_preserve_prompt}",
+            f"decode_truncated_prompt={self.context_config.decode_truncated_prompt}",
             f"extra_eos_token_ids={self.extra_eos_token_ids}",
             f"extra_stops={self.extra_stops!r}",
-            f"distributed_mode={self.distributed_mode}",
+            f"distributed_mode={self.distributed_config.distributed_mode}",
             f"distributed_role={self.distributed_role!r}",
             f"distributed_rank={self.distributed_rank}",
             f"distributed_world_size={self.distributed_world_size}",

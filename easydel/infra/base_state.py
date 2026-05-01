@@ -79,7 +79,6 @@ import dataclasses
 import datetime as dt
 import json
 import os
-import pickle
 import typing as tp
 import uuid
 from typing import Self
@@ -89,17 +88,18 @@ import optax  # pyright: ignore[reportMissingTypeStubs]
 import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
-from eformer.serialization import AsyncCheckpointManager, Checkpointer
+from jax import device_get
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import PartitionAxis, make_shard_and_gather_fns
+from spectrax.serialization import AsyncCheckpointManager, Checkpointer
 
 from easydel.infra.factory import TaskType
 from easydel.utils.helpers import is_remote_path
-from easydel.utils.traversals import deepcopy_model, flatten_dict, unflatten_dict
+from easydel.utils.traversals import deepcopy_model
 
-from .sharding import replicated_named_sharding
-from .utils import device_put_or_shard_abstract, materialize_meta_leaves, sanitize_partition_spec_for_shape
+from .sharding import MeshLike, replicated_named_sharding, sanitize_partition_specs_for_shape_tree
+from .utils import device_put_or_shard_abstract, materialize_meta_leaves
 
 
 class _PyTreeNode:
@@ -159,13 +159,11 @@ def _field(pytree_node=True, default=dataclasses.MISSING, default_factory=datacl
 
 
 if tp.TYPE_CHECKING:
-    from jax.sharding import Mesh
-
     from easydel.infra.base_config import EasyDeLBaseConfigDict
     from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
     from easydel.layers import QuantizationConfig
 
-    from .base_module import EasyDeLBaseModule, PartitionLike
+    from .base_module import EasyDeLBaseModule
 
 AM = AsyncCheckpointManager
 """Alias for AsyncCheckpointManager for convenient access."""
@@ -260,50 +258,6 @@ def _is_optimizer_template_incompatibility(exc: Exception) -> bool:
     return (isinstance(exc, KeyError) and "Missing array for key" in message) or (
         isinstance(exc, ValueError) and "Array shape mismatch for key" in message
     )
-
-
-def _sanitize_partition_specs_for_shape_tree(
-    partition_specs: tp.Any,
-    shape_tree: tp.Any,
-    mesh: "Mesh",
-) -> tuple[tp.Any, int]:
-    """Sanitize a partition-spec tree against concrete tensor shapes."""
-    adjusted = {"count": 0}
-
-    def _sanitize(spec: tp.Any, shape_obj: tp.Any) -> tp.Any:
-        if not isinstance(spec, PartitionSpec) or not hasattr(shape_obj, "shape"):
-            return spec
-        safe_spec = sanitize_partition_spec_for_shape(
-            spec=spec,
-            shape=tuple(shape_obj.shape),
-            mesh=mesh,
-        )
-        if safe_spec != spec:
-            adjusted["count"] += 1
-        return safe_spec
-
-    try:
-        sanitized = jax.tree_util.tree_map(_sanitize, partition_specs, shape_tree)
-        return sanitized, adjusted["count"]
-    except Exception:
-        # Fallback for structures that don't support aligned tree mapping.
-        flat_specs = flatten_dict(partition_specs)
-        flat_shapes = flatten_dict(shape_tree)
-        adjusted_count = 0
-        for key, spec in flat_specs.items():
-            if not isinstance(spec, PartitionSpec):
-                continue
-            shape_obj = flat_shapes.get(key)
-            shape = tuple(getattr(shape_obj, "shape", ()))
-            if not shape:
-                continue
-            safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
-            if safe_spec != spec:
-                flat_specs[key] = safe_spec
-                adjusted_count += 1
-        if adjusted_count == 0:
-            return partition_specs, adjusted_count
-        return unflatten_dict(flat_specs), adjusted_count
 
 
 class EasyDeLState(_PyTreeNode):
@@ -516,7 +470,7 @@ class EasyDeLState(_PyTreeNode):
                 components. Defaults to None.
             trainable_selector (spx.SelectorSugar | None): Selector describing which
                 collections belong in `graphstate` when `model` is provided. Defaults
-                to the model's `default_trainable_selector`, which is `"parameters"`
+                to the model's `trainable_selector`, which is `"parameters"`
                 for EasyDeL modules.
             tx (optax.GradientTransformation | None): The optimizer transformation
                 to use for training. Required if `init_opt_state` is True. Can be
@@ -605,7 +559,7 @@ class EasyDeLState(_PyTreeNode):
                 graphdef = gdef
                 selector = trainable_selector
                 if selector is None:
-                    selector = getattr(model, "default_trainable_selector", "parameters")
+                    selector = getattr(model, "trainable_selector", "parameters")
                 graphstate, graphother = spx.as_selector(selector).partition_state(model, state)
         else:
             if trainable_selector is not None:
@@ -647,17 +601,14 @@ class EasyDeLState(_PyTreeNode):
         self,
         opt_state: tp.Any,
         *,
-        partition_rules: PartitionLike = None,
-        mesh: "Mesh | None" = None,
+        mesh: MeshLike | None = None,
     ) -> tp.Any:
         """Derive optimizer-state sharding from parameter metadata when possible."""
         mesh = mesh or self.model._get_mesh(None)
 
-        if partition_rules is not None:
-            partition_specs = spx.match_partition_rules(self.model._get_partition_rules(partition_rules), opt_state)
-        elif self.tx is not None and hasattr(optax, "tree_map_params"):
+        if self.tx is not None and hasattr(optax, "tree_map_params"):
             try:
-                param_partition_specs = self.model._parameter_partition_specs(None, mesh=mesh)
+                param_partition_specs = self.model.resolve_sharding_for_tree(self.graphstate)
                 partition_specs = optax.tree_map_params(
                     self.tx,
                     lambda _param, spec: spec,
@@ -666,11 +617,11 @@ class EasyDeLState(_PyTreeNode):
                     transform_non_params=lambda _: PartitionSpec(),
                 )
             except Exception:
-                partition_specs = spx.match_partition_rules(self.model._get_partition_rules(None), opt_state)
+                partition_specs = spx.match_partition_rules(((".*", PartitionSpec()),), opt_state)
         else:
-            partition_specs = spx.match_partition_rules(self.model._get_partition_rules(None), opt_state)
+            partition_specs = spx.match_partition_rules(((".*", PartitionSpec()),), opt_state)
 
-        partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+        partition_specs, adjusted = sanitize_partition_specs_for_shape_tree(
             partition_specs=partition_specs,
             shape_tree=opt_state,
             mesh=mesh,
@@ -688,7 +639,7 @@ class EasyDeLState(_PyTreeNode):
             is_leaf=lambda x: x is None,
         )
 
-    def init_tx(self: Self, tx: optax.GradientTransformation, partition_rules: PartitionLike = None) -> Self:
+    def init_tx(self: Self, tx: optax.GradientTransformation) -> Self:
         """Initialize the optimizer state with automatic sharding support.
 
         Initializes the optimizer state (`opt_state`) for the current `graphstate`
@@ -704,10 +655,6 @@ class EasyDeLState(_PyTreeNode):
             tx (optax.GradientTransformation): The optimizer transformation to
                 initialize. Common choices include `optax.adam`, `optax.adamw`,
                 `optax.sgd`, or composed transformations using `optax.chain`.
-            partition_rules (PartitionLike, optional): Partitioning rules for the
-                optimizer state. These rules determine how optimizer state tensors
-                are distributed across the device mesh. If None, uses the partition
-                rules from the associated model's config. Defaults to None.
 
         Returns:
             Self: A new EasyDeLState instance with:
@@ -723,14 +670,6 @@ class EasyDeLState(_PyTreeNode):
                 >>> # Later, add optimizer for fine-tuning
                 >>> tx = optax.adamw(learning_rate=1e-5, weight_decay=0.01)
                 >>> state = state.init_tx(tx)
-
-            With custom partition rules::
-
-                >>> custom_rules = (
-                ...     (".*kernel.*", PartitionSpec("fsdp", "tp")),
-                ...     (".*", PartitionSpec()),
-                ... )
-                >>> state = state.init_tx(tx, partition_rules=custom_rules)
 
         Note:
             This method requires the model to have a valid mesh configuration.
@@ -763,7 +702,7 @@ class EasyDeLState(_PyTreeNode):
         eval_opt_state = jax.eval_shape(lambda: tx.init(self.graphstate))
 
         # 2. Mirror each param's NamedSharding onto its matching opt-state slot.
-        if partition_rules is None and hasattr(optax, "tree_map_params"):
+        if hasattr(optax, "tree_map_params"):
             out_shardings = optax.tree_map_params(
                 tx,
                 lambda _param, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
@@ -773,24 +712,7 @@ class EasyDeLState(_PyTreeNode):
                 is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
             )
         else:
-            # Legacy: explicit ``partition_rules`` argument goes through the regex
-            # / ``PartitionSpec`` resolver.  Loses per-stage info, but matches
-            # historical behaviour when the caller asks for it explicitly.
-            partition_specs = self._optimizer_partition_specs(
-                eval_opt_state,
-                partition_rules=partition_rules,
-                mesh=mesh,
-            )
-            with mesh:
-                out_shardings = jax.tree_util.tree_map(
-                    lambda spec, shape_obj: (
-                        spx.get_corrected_named_sharding(tuple(shape_obj.shape), spec)
-                        if isinstance(spec, PartitionSpec) and hasattr(shape_obj, "shape")
-                        else None
-                    ),
-                    partition_specs,
-                    eval_opt_state,
-                )
+            out_shardings = eval_opt_state
 
         # 3. Materialise via per-leaf device_put against the resolved
         #    NamedShardings.  Equivalent to what ``make_shard_and_gather_fns``
@@ -813,7 +735,6 @@ class EasyDeLState(_PyTreeNode):
     def shard_optimizer_state(
         self,
         opt_state: tp.Any | None = None,
-        partition_rules: PartitionLike = None,
     ) -> Self:
         """Apply sharding to the optimizer state based on partition rules.
 
@@ -826,11 +747,6 @@ class EasyDeLState(_PyTreeNode):
                 uses the current `self.opt_state`. This allows sharding an external
                 optimizer state while keeping it associated with this state object.
                 Defaults to None.
-            partition_rules (PartitionLike, optional): Partitioning rules that define
-                how each tensor in the optimizer state should be distributed across
-                the device mesh. If None, uses the partition rules from the model's
-                config. Defaults to None.
-
         Returns:
             Self: A new EasyDeLState instance with the sharded `opt_state`.
 
@@ -846,15 +762,6 @@ class EasyDeLState(_PyTreeNode):
                 >>> # Apply sharding
                 >>> state = state.shard_optimizer_state()
 
-            With custom partition rules::
-
-                >>> rules = (
-                ...     (".*mu.*", PartitionSpec("fsdp")),  # First moment
-                ...     (".*nu.*", PartitionSpec("fsdp")),  # Second moment
-                ...     (".*", PartitionSpec()),
-                ... )
-                >>> state = state.shard_optimizer_state(partition_rules=rules)
-
         See Also:
             - :meth:`gather_optimizer_state`: Reverse operation to gather state.
             - :meth:`init_tx`: Initialize optimizer with automatic sharding.
@@ -866,14 +773,13 @@ class EasyDeLState(_PyTreeNode):
         mesh = self.model._get_mesh(None)
         partition_specs = self._optimizer_partition_specs(
             opt_state,
-            partition_rules=partition_rules,
             mesh=mesh,
         )
         shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
         opt_state = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, opt_state)
         return self.replace(opt_state=opt_state)
 
-    def gather_optimizer_state(self: Self, partition_rules: PartitionLike = None) -> Self:
+    def gather_optimizer_state(self: Self) -> Self:
         """Gather the optimizer state from distributed devices to a single device.
 
         Reverses the sharding operation by collecting all shards of the optimizer
@@ -882,11 +788,6 @@ class EasyDeLState(_PyTreeNode):
         distributed to single-device execution.
 
         Args:
-            partition_rules (PartitionLike, optional): Partitioning rules that were
-                used to shard the optimizer state. These rules are needed to generate
-                the appropriate gather functions. If None, uses the partition rules
-                from the model's config. Defaults to None.
-
         Returns:
             Self: A new EasyDeLState instance with the gathered (non-sharded)
             `opt_state`.
@@ -911,7 +812,6 @@ class EasyDeLState(_PyTreeNode):
         mesh = self.model._get_mesh(None)
         partition_specs = self._optimizer_partition_specs(
             self.opt_state,
-            partition_rules=partition_rules,
             mesh=mesh,
         )
         _, gather = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
@@ -958,7 +858,7 @@ class EasyDeLState(_PyTreeNode):
             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
             self.graphother,
         )
-        full_state = tree.merge(other, copy=True)
+        full_state = tree.merge(other, copy=False)
         return spx.bind(self.graphdef, full_state)
 
     def merge_to_state(self: Self, tree) -> Self:
@@ -1024,9 +924,14 @@ class EasyDeLState(_PyTreeNode):
         See Also:
             - :meth:`merge`: Explicit merge with custom parameters.
         """
-        full_state = self.graphstate.merge(self.graphother, copy=True)
+        full_state = self.graphstate.merge(self.graphother, copy=False)
         model = spx.bind(self.graphdef, full_state)
-        model._esurge_cache_scope_key = self.esurge_cache_scope_key
+        # `Module.__setattr__` bumps the graph-structure epoch even on
+        # underscore-prefixed attrs, which fails inside any spx.jit trace
+        # (IllegalMutationError). The scope key is metadata only — bypass
+        # the spectrax setattr path so accessing `state.model` is pure.
+        object.__setattr__(model, "_esurge_cache_scope_key", self.esurge_cache_scope_key)
+        # TODO: Make me Dynamic.
         return model
 
     @property
@@ -1142,97 +1047,47 @@ class EasyDeLState(_PyTreeNode):
 
         if checkpointer is None:
             checkpointer = Checkpointer(
-                base_path=load_directory,
+                base_path=str(load_directory),
                 save_interval=None,
                 step_policies=[],
             )
-        org_path = load_directory
-        optim_path = load_directory if AM.is_tensorstore(load_directory) else load_directory / OPTIMIZER_NAME
-        struct_path = load_directory / OPTIMIZER_STRUCT_NAME
-        tx_struct_path = load_directory / TX_STRUCT_JSON
-        partition_rules = self.model._get_partition_rules(None)
 
-        def new_method(tx_template):
-            """Load using modern TensorStore format."""
-            path = str(AsyncCheckpointManager.safe_loadpath(org_path))
-            tx_template = tx_template if tx_template is not None else self.tx
+        tx_template = tx_template if tx_template is not None else self.tx
 
-            def _load_tensorstore(template):
-                return checkpointer.load_pytree(
-                    mesh=self.model.mesh,
-                    path=path,
-                    partition_rules=partition_rules,
-                    prefix="tx",
-                    load_treedef=True,
-                    discover_latest=True,
-                    discover_raise=False,
-                    template=template,
+        def _load_tensorstore(template):
+            return checkpointer.load_pytree(
+                mesh=self.model.mesh,
+                path=str(load_directory),
+                prefix="tx",
+                load_treedef=True,
+                discover_latest=False,
+                template=template,
+                sharding_rules=self.model.resolve_shardings_regex(),
+            )
+
+        template = None
+        if tx_template is not None:
+            try:
+                template = jax.eval_shape(tx_template.init, self.graphstate)
+            except Exception:
+                logger.warning(
+                    "Failed to build an optimizer template for TensorStore restore; "
+                    "retrying using the saved optimizer structure.",
+                    exc_info=True,
                 )
-
-            template = None
-            if tx_template is not None:
-                try:
-                    template = jax.eval_shape(tx_template.init, self.graphstate)
-                except Exception:
-                    logger.warning(
-                        "Failed to build an optimizer template for TensorStore restore; "
-                        "retrying using the saved optimizer structure.",
-                        exc_info=True,
-                    )
-
-            try:
-                opt_state, metadata = _load_tensorstore(template)
-            except KeyError as exc:
-                if template is not None and "Missing array for key" in str(exc):
-                    logger.error(
-                        "Optimizer checkpoint is incompatible with the current optimizer template.",
-                        exc_info=True,
-                    )
-                raise
-            step = metadata.get("step", 0)
-            return opt_state, step
-
-        if not tx_struct_path.exists() or not struct_path.exists():
-            try:
-                opt_state, step = new_method(tx_template)
-                logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
-                return self.replace(opt_state=opt_state, step=jnp.asarray(step))
-            except Exception as exc:
-                if _is_optimizer_template_incompatibility(exc):
-                    raise
-                logger.exception("Failed to load optimizer state via TensorStore format.")
 
         try:
-            if not AsyncCheckpointManager.is_tensorstore(optim_path):
-                treedef, step = pickle.loads(struct_path.read_bytes())
-                leaves, _ = AsyncCheckpointManager().load(
-                    path=AsyncCheckpointManager.safe_loadpath(optim_path),
-                    mesh=self.model.mesh,
-                    partition_rules=partition_rules,
-                    prefix="tx",
+            opt_state, metadata = _load_tensorstore(template)
+        except KeyError as exc:
+            if template is not None and "Missing array for key" in str(exc):
+                logger.error(
+                    "Optimizer checkpoint is incompatible with the current optimizer template.",
+                    exc_info=True,
                 )
-                recreated = [None] * len(leaves)
-                for i in range(len(leaves)):
-                    try:
-                        recreated[i] = leaves[f"param_idx_{i}"]
-                    except KeyError:
-                        recreated[i] = leaves[f"param_{i}"]
-
-                opt_state = jax.tree_util.tree_unflatten(treedef, recreated)
-            else:
-                opt_state, step = new_method(tx_template)
-
-            logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
-            return self.replace(opt_state=opt_state, step=jnp.asarray(step))
-        except Exception as e:
-            if "Too many leaves for PyTreeDef" in str(e):
-                try:
-                    opt_state, step = new_method(tx_template)
-                    return self.replace(opt_state=opt_state, step=jnp.asarray(step))
-                except Exception:
-                    logger.warning("Fallback optimizer load also failed.", exc_info=True)
-            logger.error(f"Optimizer load failed: {e!s}")
             raise
+        step = metadata.get("step", 0)
+        logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
+        return self.replace(opt_state=opt_state, step=jnp.asarray(step))
 
     def save_optimizer(
         self,
@@ -1315,7 +1170,6 @@ class EasyDeLState(_PyTreeNode):
                 with self.model.mesh:
                     checkpointer.save_pytree(
                         tree=self.opt_state,
-                        mesh=self.model.mesh,
                         dtype=float_dtype,
                         prefix="tx",
                         # Don't pass step here - save_directory is already the checkpoint directory
@@ -1470,7 +1324,6 @@ class EasyDeLState(_PyTreeNode):
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         model_task: TaskType = TaskType.AUTO_BIND,
         auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
         quantization_config: "QuantizationConfig | None" = None,
         apply_quantization: bool = False,
         verbose: bool = True,
@@ -1521,9 +1374,6 @@ class EasyDeLState(_PyTreeNode):
                 Defaults to TaskType.AUTO_BIND (auto-detect from config).
             auto_shard_model (bool): If True, automatically shards the loaded model
                 and optimizer state based on sharding configuration. Defaults to True.
-            partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Explicit
-                partition rules as (regex_pattern, PartitionSpec) tuples. Defaults to
-                None (uses model config rules).
             quantization_config (QuantizationConfig | None): Configuration for model
                 quantization. Defaults to None (no quantization).
             apply_quantization (bool): If True, applies quantization to model linear
@@ -1653,7 +1503,6 @@ class EasyDeLState(_PyTreeNode):
             platform=platform,
             config_kwargs=config_kwargs,
             auto_shard_model=auto_shard_model,
-            partition_rules=partition_rules,
             quantization_config=quantization_config,
             apply_quantization=apply_quantization,
             verbose=verbose,
@@ -1722,21 +1571,16 @@ class EasyDeLState(_PyTreeNode):
 
     def shard_state(
         self,
-        partition_rules: PartitionLike = None,
-        mesh: Mesh = None,
+        mesh: MeshLike | None = None,
     ) -> Self:
-        """Shard the entire state based on partition rules.
+        """Shard the entire state across the device mesh.
 
         Applies sharding to both model parameters and optimizer state according to
-        the specified partition rules and device mesh. This is the primary method
-        for distributing state across multiple devices for data/model parallelism.
+        variable metadata-derived partition specs and the device mesh. This is the
+        primary method for distributing state across multiple devices for data/model
+        parallelism.
 
         Args:
-            partition_rules (PartitionLike, optional): Partitioning rules as a
-                sequence of (regex_pattern, PartitionSpec) tuples. Parameters
-                matching each pattern are sharded according to the corresponding
-                PartitionSpec. If None, uses rules from the model's config.
-                Defaults to None.
             mesh (Mesh, optional): The JAX device mesh to shard across. Defines the
                 topology of devices (e.g., 2x4 grid for 8 devices). If None, uses
                 the model's configured mesh. Defaults to None.
@@ -1749,15 +1593,6 @@ class EasyDeLState(_PyTreeNode):
             Shard with default rules::
 
                 >>> sharded_state = state.shard_state()
-
-            Shard with custom rules::
-
-                >>> rules = (
-                ...     (".*embed.*", PartitionSpec("tp")),
-                ...     (".*kernel.*", PartitionSpec("fsdp", "tp")),
-                ...     (".*", PartitionSpec()),
-                ... )
-                >>> sharded_state = state.shard_state(partition_rules=rules)
 
             Shard with custom mesh::
 
@@ -1789,8 +1624,7 @@ class EasyDeLState(_PyTreeNode):
         #     ``spx.extract_sharding_structure`` (per-stage submesh preserved).
         #   * ``opt_state`` mirrors per-param NamedShardings onto matching
         #     mu/nu slots via ``optax.tree_map_params`` -- same auto path as
-        #     ``init_tx``.  Legacy regex ``partition_rules`` argument still
-        #     hits the old PartitionSpec resolver for callers that opt in.
+        #     ``init_tx``.
         mesh = mesh or self.model._get_mesh(None)
         replicated = replicated_named_sharding(mesh)
 
@@ -1798,46 +1632,20 @@ class EasyDeLState(_PyTreeNode):
         if not isinstance(step, jax.Array):
             step = jnp.asarray(step, dtype=jnp.int32)
 
-        graphstate_specs = self.model._parameter_partition_specs(partition_rules=partition_rules, mesh=mesh)
-        graphstate = self.model._apply_partition_specs_to_state(self.graphstate, graphstate_specs, mesh=mesh)
-
-        graphother = materialize_meta_leaves(self.graphother, seed=42)
-        graphother_shardings = spx.extract_sharding_structure(graphother, mesh=mesh)
-        graphother = jax.tree_util.tree_map(
-            lambda leaf, ns: (
-                jax.device_put(leaf, ns)
-                if isinstance(ns, jax.sharding.NamedSharding) and hasattr(leaf, "shape")
-                else leaf
-            ),
-            graphother,
-            graphother_shardings,
-            is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
-        )
+        graphstate = self.model.apply_sharding_for_tree(self.graphstate)
+        graphother = self.model.apply_sharding_for_tree(self.graphother)
 
         opt_state = self.opt_state
-        if opt_state is not None:
+        if opt_state is not None and self.tx is not None and hasattr(optax, "tree_map_params"):
             param_shardings = spx.extract_sharding_structure(graphstate, mesh=mesh)
-            if partition_rules is None and self.tx is not None and hasattr(optax, "tree_map_params"):
-                opt_shardings = optax.tree_map_params(
-                    self.tx,
-                    lambda _p, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
-                    opt_state,
-                    param_shardings,
-                    transform_non_params=lambda _: replicated,
-                    is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
-                )
-            else:
-                opt_specs = self._optimizer_partition_specs(opt_state, partition_rules=partition_rules, mesh=mesh)
-                with mesh:
-                    opt_shardings = jax.tree_util.tree_map(
-                        lambda spec, leaf: (
-                            spx.get_corrected_named_sharding(tuple(leaf.shape), spec)
-                            if isinstance(spec, PartitionSpec) and hasattr(leaf, "shape")
-                            else None
-                        ),
-                        opt_specs,
-                        opt_state,
-                    )
+            opt_shardings = optax.tree_map_params(
+                self.tx,
+                lambda _p, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
+                opt_state,
+                param_shardings,
+                transform_non_params=lambda _: replicated,
+                is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
+            )
             opt_state = jax.tree_util.tree_map(
                 lambda leaf, ns: (
                     jax.device_put(leaf, ns)
@@ -1892,11 +1700,7 @@ class EasyDeLState(_PyTreeNode):
         self = self.gather_model()
         return self
 
-    def gather_model(
-        self,
-        partition_rules: PartitionLike = None,
-        mesh: Mesh | None = None,
-    ) -> Self:
+    def gather_model(self, mesh: MeshLike | None = None) -> Self:
         """Gather model parameters from distributed devices.
 
         Collects the sharded model parameters (`graphstate` and `graphother`) from
@@ -1904,10 +1708,6 @@ class EasyDeLState(_PyTreeNode):
         typically needed before saving model weights in a portable format.
 
         Args:
-            partition_rules (PartitionLike, optional): Partitioning rules that were
-                used for the original sharding. Needed to generate appropriate gather
-                functions. If None, uses rules from the model's config. Defaults to
-                None.
             mesh (Mesh | None): The JAX device mesh to gather from. If None, uses
                 the model's configured mesh. Defaults to None.
 
@@ -1921,21 +1721,12 @@ class EasyDeLState(_PyTreeNode):
                 >>> gathered_state = state.gather_model()
                 >>> # Now graphstate contains complete (non-sharded) parameters
 
-            With specific rules::
-
-                >>> gathered_state = state.gather_model(
-                ...     partition_rules=custom_rules,
-                ...     mesh=custom_mesh
-                ... )
-
         See Also:
             - :meth:`shard_model`: Reverse operation to shard model.
             - :meth:`gather_state`: Gather entire state including optimizer.
         """
         mesh = mesh or self.model._get_mesh(None)
-        graphstate_specs = self.model._parameter_partition_specs(partition_rules=partition_rules, mesh=mesh)
-        _, graphstate_gather = make_shard_and_gather_fns(partition_specs=graphstate_specs, mesh=mesh)
-        graphstate = jax.tree_util.tree_map(lambda f, o: f(o), graphstate_gather, self.graphstate)
+        graphstate = jax.tree_util.tree_map(lambda o: device_get(o), self.graphstate)
 
         graphother = materialize_meta_leaves(self.graphother, seed=42)
         graphother_specs = self._materialized_tree_partition_specs(graphother)
@@ -1944,17 +1735,14 @@ class EasyDeLState(_PyTreeNode):
         self = self.replace(graphstate=graphstate, graphother=graphother)
         return self
 
-    def shard_model(self: Self, partition_rules: PartitionLike = None, mesh: Mesh | None = None) -> Self:
-        """Shard model parameters based on partition rules.
+    def shard_model(self: Self, mesh: MeshLike | None = None) -> Self:
+        """Shard model parameters across the device mesh.
 
         Distributes the model parameters (`graphstate` and `graphother`) across
-        devices according to the specified partition rules. This enables data and
-        model parallelism for training and inference with large models.
+        devices according to variable metadata-derived partition specs. This enables
+        data and model parallelism for training and inference with large models.
 
         Args:
-            partition_rules (PartitionLike, optional): Partitioning rules as a
-                sequence of (regex_pattern, PartitionSpec) tuples. If None, uses
-                rules from the model's config. Defaults to None.
             mesh (Mesh | None): The JAX device mesh to shard across. If None, uses
                 the model's configured mesh. Defaults to None.
 
@@ -1967,15 +1755,6 @@ class EasyDeLState(_PyTreeNode):
 
                 >>> sharded_state = state.shard_model()
 
-            Shard with custom configuration::
-
-                >>> rules = (
-                ...     (".*attention.*kernel.*", PartitionSpec("tp", None)),
-                ...     (".*mlp.*kernel.*", PartitionSpec(None, "tp")),
-                ...     (".*", PartitionSpec()),
-                ... )
-                >>> sharded_state = state.shard_model(partition_rules=rules)
-
         Note:
             This method only shards model parameters, not optimizer state. Use
             `shard_state` to shard both, or `shard_optimizer_state` for optimizer
@@ -1987,8 +1766,8 @@ class EasyDeLState(_PyTreeNode):
             - :meth:`shard_optimizer_state`: Shard optimizer state.
         """
         mesh = mesh or self.model._get_mesh(None)
-        graphstate_specs = self.model._parameter_partition_specs(partition_rules=partition_rules, mesh=mesh)
-        graphstate = self.model._apply_partition_specs_to_state(self.graphstate, graphstate_specs, mesh=mesh)
+        graphstate = self.model.apply_sharding_for_tree(self.graphstate)
+        graphother = self.model.apply_sharding_for_tree(self.graphother)
 
         graphother = materialize_meta_leaves(self.graphother, seed=42)
         graphother_specs = self._materialized_tree_partition_specs(graphother)
@@ -1999,7 +1778,7 @@ class EasyDeLState(_PyTreeNode):
         return self
 
     @property
-    def mesh(self) -> Mesh:
+    def mesh(self) -> spx.SpxMesh:
         """Get the JAX device mesh from the model.
 
         Returns the device mesh used for sharding operations. The mesh defines
