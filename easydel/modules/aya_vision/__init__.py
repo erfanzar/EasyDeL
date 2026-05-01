@@ -35,7 +35,7 @@ Usage Example:
     import jax
     from easydel import AyaVisionConfig, AyaVisionForConditionalGeneration
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
 
     # Initialize configuration
     config = AyaVisionConfig.from_pretrained("CohereForAI/aya-vision-8b")

@@ -106,28 +106,48 @@ class ReasoningParser:
 
     @cached_property
     def vocab(self) -> dict[str, int]:
-        """Get the tokenizer vocabulary mapping tokens to IDs."""
+        """Get the tokenizer vocabulary mapping tokens to IDs.
+
+        Returns:
+            Dictionary mapping token strings to their integer IDs.
+        """
         return self.model_tokenizer.get_vocab()
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        """Check if reasoning section has ended based on token IDs.
+        """Decide whether the reasoning block is closed in the given token sequence.
+
+        Implementations typically scan ``input_ids`` for the parser-
+        specific end marker (the ``</think>`` token id, the
+        ``<channel|>`` close marker, or whichever boundary the model
+        uses). This is consulted by upstream code (for example the
+        delegating parser) to know whether the engine has crossed the
+        reasoning boundary so visible content emission can resume.
 
         Args:
-            input_ids: Sequence of token IDs to check.
+            input_ids: Token IDs decoded so far.
 
         Returns:
-            True if the reasoning section is complete.
+            ``True`` when the reasoning section has ended in
+            ``input_ids``, ``False`` while it is still open.
         """
         raise NotImplementedError
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        """Extract content token IDs (excluding reasoning tokens).
+        """Strip reasoning-only token IDs from a decoded sequence.
+
+        Used by callers that need the post-reasoning portion of the
+        generation as raw token IDs (for example to feed it into a
+        downstream tokenizer-aware tool parser). Implementations should
+        return the suffix following the reasoning end marker and may
+        return the input unchanged when no reasoning section was
+        detected.
 
         Args:
-            input_ids: Complete sequence of token IDs.
+            input_ids: Full sequence of decoded token IDs.
 
         Returns:
-            Token IDs for content only (reasoning tokens removed).
+            Token IDs corresponding to visible content, with reasoning
+            tokens removed.
         """
         raise NotImplementedError
 
@@ -136,14 +156,25 @@ class ReasoningParser:
         model_output: str,
         request=None,
     ) -> tuple[str | None, str | None]:
-        """Extract reasoning and content from complete output (batch mode).
+        """Split a complete generation into reasoning and visible content.
+
+        Called once per request after generation finishes, this method
+        is responsible for locating the model-specific reasoning markers
+        in ``model_output`` and returning the two halves separately.
+        Returning ``None`` for a half signals that nothing was detected
+        (for example when the model never opened the reasoning block, or
+        when reasoning mode is asymmetric and no visible content was
+        produced).
 
         Args:
-            model_output: Complete text output from model.
-            request: Optional request context.
+            model_output: Complete decoded text from the model.
+            request: Optional request context (for parsers whose grammar
+                depends on request flags such as ``enable_thinking``).
 
         Returns:
-            Tuple of (reasoning_content, content). Either may be None.
+            Tuple ``(reasoning_content, visible_content)`` where each
+            element is the corresponding portion of the text, or
+            ``None`` when the parser found no such portion.
         """
         raise NotImplementedError
 
@@ -157,20 +188,32 @@ class ReasoningParser:
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
-        """Extract reasoning content from streaming model output.
+        """Stream-aware variant of :meth:`extract_reasoning`.
+
+        Invoked once per engine snapshot during a streaming request,
+        with cumulative and incremental views of both the decoded text
+        and the token IDs. Implementations route the new chunk to either
+        ``DeltaMessage.reasoning_content`` (still inside reasoning),
+        ``DeltaMessage.content`` (already past the boundary), or both
+        when the reasoning end marker straddles the chunk. Returning
+        ``None`` is the legitimate way to suppress an event when only
+        a boundary token arrived and there is nothing meaningful to
+        forward yet.
 
         Args:
-            previous_text: Text accumulated before this chunk.
-            current_text: Text including current chunk.
-            delta_text: New text in current chunk.
-            previous_token_ids: Token IDs before current chunk.
-            current_token_ids: Token IDs including current chunk.
-            delta_token_ids: New token IDs in current chunk.
-            request: Optional request context.
+            previous_text: Cumulative text seen before this chunk.
+            current_text: Cumulative text including the new chunk.
+            delta_text: Newly produced text in the current chunk.
+            previous_token_ids: Token IDs prior to the chunk.
+            current_token_ids: Token IDs after the chunk has been added.
+            delta_token_ids: Token IDs corresponding to ``delta_text``.
+            request: Optional request context (for parsers whose grammar
+                varies based on request flags).
 
         Returns:
-            DeltaMessage with reasoning_content and/or content fields set,
-            or None if no update available.
+            A :class:`DeltaMessage` carrying ``reasoning_content`` and/or
+            ``content`` for downstream emission, or ``None`` when there
+            is nothing usable to emit this step.
         """
         raise NotImplementedError
 
@@ -186,13 +229,36 @@ class ReasoningParserManager:
 
     @classmethod
     def get_reasoning_parser(cls, name: str) -> type:
-        """Retrieve a registered reasoning parser by name."""
+        """Retrieve a registered reasoning parser by name.
+
+        Args:
+            name: Name under which a parser was registered.
+
+        Returns:
+            The registered :class:`ReasoningParser` subclass.
+
+        Raises:
+            KeyError: If ``name`` is not present in the registry.
+        """
         if name in cls.reasoning_parsers:
             return cls.reasoning_parsers[name]
         raise KeyError(f"reasoning parser: '{name}' not found in reasoning_parsers")
 
     @classmethod
     def _register_module(cls, module: type, module_name: str | list[str] | None = None, force: bool = True) -> None:
+        """Register one or more aliases for a parser class in the registry.
+
+        Args:
+            module: The :class:`ReasoningParser` subclass to register.
+            module_name: Single name or list of aliases. ``None`` uses the
+                class ``__name__``.
+            force: When ``False``, raise :class:`KeyError` if any alias is
+                already registered.
+
+        Raises:
+            TypeError: If ``module`` is not a :class:`ReasoningParser` subclass.
+            KeyError: If ``force`` is False and an alias is already taken.
+        """
         if not issubclass(module, ReasoningParser):
             raise TypeError(f"module must be subclass of ReasoningParser, but got {type(module)}")
         if module_name is None:
@@ -209,7 +275,22 @@ class ReasoningParserManager:
     def register_module(
         cls, name: str | list[str] | None = None, force: bool = True, module: type | None = None
     ) -> type | Callable:
-        """Register a reasoning parser module. Can be used as a decorator or called directly."""
+        """Register a reasoning parser module. Can be used as a decorator or called directly.
+
+        Args:
+            name: Optional alias or list of aliases for the registered parser.
+                Defaults to the class ``__name__``.
+            force: Overwrite existing registrations when ``True``.
+            module: When provided, register ``module`` immediately and return
+                it. When ``None``, return a decorator.
+
+        Returns:
+            The registered parser class when ``module`` is supplied, otherwise
+            a decorator that performs the registration.
+
+        Raises:
+            TypeError: If ``force`` is not a bool or ``name`` has an unsupported type.
+        """
         if not isinstance(force, bool):
             raise TypeError(f"force must be a boolean, but got {type(force)}")
 
@@ -221,6 +302,7 @@ class ReasoningParserManager:
             return module
 
         def _register(module):
+            """Register ``module`` and return it so the decorator preserves the class."""
             cls._register_module(module=module, module_name=name, force=force)
             return module
 
@@ -228,7 +310,15 @@ class ReasoningParserManager:
 
     @classmethod
     def import_reasoning_parser(cls, plugin_path: str) -> None:
-        """Import and register a reasoning parser from an external Python file."""
+        """Import and register a reasoning parser from an external Python file.
+
+        The file should call :meth:`register_module` (typically via decorator)
+        at import time. Failures are logged at warning level rather than
+        propagated.
+
+        Args:
+            plugin_path: Filesystem path to the Python module to load.
+        """
         module_name = os.path.splitext(os.path.basename(plugin_path))[0]
         try:
             _import_from_path(module_name, plugin_path)
@@ -239,7 +329,18 @@ class ReasoningParserManager:
 
 
 def _import_from_path(module_name: str, file_path: str | os.PathLike):
-    """Import a Python module from a file path dynamically."""
+    """Import a Python module from a file path dynamically.
+
+    Args:
+        module_name: Name to associate with the loaded module in ``sys.modules``.
+        file_path: Filesystem path to the ``.py`` source file.
+
+    Returns:
+        The newly imported module object.
+
+    Raises:
+        ModuleNotFoundError: If the file cannot be located or no spec is created.
+    """
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec is None:
         raise ModuleNotFoundError(f"No module named '{module_name}'")
@@ -251,6 +352,18 @@ def _import_from_path(module_name: str, file_path: str | os.PathLike):
 
 
 def _is_list_of(value: object, typ, *, check: Literal["first", "all"] = "first") -> bool:
+    """Return ``True`` when ``value`` is a list whose elements match ``typ``.
+
+    Args:
+        value: Object to inspect.
+        typ: Type expected for the list elements.
+        check: ``"first"`` checks only the first element (cheap heuristic),
+            ``"all"`` checks every element.
+
+    Returns:
+        ``True`` when ``value`` is a list and the requested elements all
+        match ``typ``; ``False`` otherwise.
+    """
     if not isinstance(value, list):
         return False
     if check == "first":

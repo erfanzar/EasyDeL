@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the GRPO trainer.
+
+Group Relative Policy Optimization (DeepSeek, 2024) replaces the
+critic of PPO with group-relative advantage normalization: rewards
+inside each prompt group are mean-centred and (optionally) standardised
+to provide a low-variance learning signal.  :class:`GRPOConfig`
+holds the temperature, KL penalty, group / generation sizes, the chunk
+sizes for memory efficiency, and the reference-model handling knobs.
+"""
+
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -23,20 +33,99 @@ from ..training_configurations import TrainingArguments
 @Registry.register("trainer-arguments", "grpo")
 @dataclass
 class GRPOConfig(TrainingArguments):
-    """Configuration class for Group Relative Policy Optimization training.
+    """Configuration class for Group Relative Policy Optimization (GRPO) training.
 
-    GRPO is an efficient RLHF algorithm that optimizes policies using group-based
-    relative comparisons of rewards. It provides better training stability compared
-    to standard PPO by normalizing rewards within groups of samples.
+    GRPO (DeepSeekMath, Shao et al. 2024) replaces PPO's value-network
+    baseline with a *group-relative* advantage: for each prompt the
+    policy samples ``num_generations`` completions, scores them with
+    one or more reward functions, and standardises the rewards within
+    the group (mean / std). The standardised rewards become the
+    advantages that drive a clipped-PPO-style policy gradient,
+    optionally regularised by a KL penalty against a reference model.
 
-    This configuration extends TrainingArguments with GRPO-specific parameters
-    for controlling the policy optimization process, reward computation, and
-    generation sampling strategies.
+    This trainer supports several GRPO loss variants exposed via
+    ``loss_type``: the canonical ``"grpo"``, the
+    batch-normalised-policy-gradient ``"bnpo"``, the unbiased
+    ``"dr_grpo"``, the dynamic-clipping ``"dapo"`` (default in EasyDeL),
+    and the constant-importance-sampling ``"cispo"``. Importance
+    sampling can be applied at the token level (``"token"``) or
+    aggregated per sequence (``"sequence"``).
 
-    Key concepts:
-    - Group-based normalization: Rewards are normalized within groups to reduce variance
-    - KL regularization: Prevents the policy from deviating too far from reference
-    - Reference model syncing: Optionally updates reference model during training
+    Construct with dict-literal kwargs, e.g.:
+
+    >>> cfg = GRPOConfig(num_generations=8, beta=0.04, loss_type="dapo",
+    ...                  max_prompt_length=512, max_completion_length=256)
+
+    Attributes:
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"GRPO"``).
+        remove_unused_columns: When ``False``, dataset columns are kept
+            so reward functions can read auxiliary fields.
+        max_prompt_length: Maximum prompt-only token budget. Default
+            ``512``.
+        max_completion_length: Maximum completion token budget. Default
+            ``256``. Must satisfy
+            ``max_prompt_length + max_completion_length <= max_length``.
+        dataset_num_proc: Worker count for ``Dataset.map`` calls.
+        learning_rate: Optimizer learning rate. Default ``1e-6``.
+        beta: KL-regularisation coefficient against the reference
+            model. ``0.0`` disables the KL term entirely.
+        epsilon: Lower (and default upper) clipping bound for
+            importance-sampling weights, mirroring PPO.
+        epsilon_high: Optional asymmetric upper clip; falls back to
+            ``epsilon`` when ``None``.
+        delta: Optional two-sided dynamic clipping bound (DAPO).
+            ``None`` disables dynamic clipping.
+        sync_ref_model: When ``True``, the reference model is
+            periodically refreshed from a moving average of the
+            policy.
+        ref_model_mixup_alpha: Polyak mixing coefficient used when
+            syncing the reference (``new_ref = alpha * ref + (1 - alpha) * policy``).
+        ref_model_sync_steps: Optimizer-step interval between
+            reference syncs.
+        num_iterations: Number of optimizer updates per generated
+            batch (PPO-style multi-epoch updates).
+        loss_type: One of ``"grpo"``, ``"bnpo"``, ``"dr_grpo"``,
+            ``"dapo"``, ``"cispo"``. Default ``"dapo"``.
+        importance_sampling_level: ``"token"`` or ``"sequence"``.
+        reward_weights: Optional weights for combining multiple reward
+            functions. Length must match the reward-function list.
+        scale_rewards: Reward scaling strategy: ``"group"`` (default),
+            ``"batch"``, ``"none"``. ``True``/``False`` are accepted
+            and mapped to ``"group"``/``"none"``.
+        tools: Optional tool registry forwarded to the reward
+            functions.
+        skip_apply_chat_template: When ``True``, the prompt is taken
+            verbatim from the dataset (no chat-template application).
+        num_return_sequences: Number of completions to sample per
+            prompt. Mirrored on ``num_generations`` for TRL parity.
+        num_generations: Alias of ``num_return_sequences`` (kept for
+            TRL compatibility); both fields are kept in sync after
+            ``__post_init__``.
+        temperature: Sampling temperature.
+        top_p, top_k, presence_penalty, frequency_penalty, min_p,
+            repetition_penalty: Standard generation knobs.
+        generation_kwargs: Extra kwargs forwarded to the generation
+            engine.
+        chat_template_kwargs: Extra kwargs for chat-template
+            application during generation.
+        mask_truncated_completions: When ``True``, completions that
+            did not terminate with EOS are dropped from the loss to
+            avoid biasing the gradient toward truncated trajectories.
+        top_entropy_quantile: Keeps only the top fraction (by token
+            entropy) of completion tokens in the loss. ``1.0``
+            disables filtering.
+        ref_logps_chunk_size: Sequence-axis chunk size for the
+            reference-model log-prob forward. ``None`` disables
+            chunking.
+        completion_chunk_size: Sequence-axis chunk size for the
+            policy completion-loss computation. ``None`` disables
+            chunking.
+        max_loss_completion_tokens: Optional cap on the number of
+            completion tokens contributing to the loss.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for
+            :func:`compute_token_logps_and_entropies_chunked` when
+            scoring completions. ``None`` disables chunking.
     """
 
     trainer_prefix: str | None = field(
@@ -224,7 +313,30 @@ class GRPOConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
-        """Post initialization to set dependent parameters."""
+        """Finalize GRPO-specific config invariants.
+
+        Resolves the legacy ``max_sequence_length`` alias, derives
+        ``max_completion_length`` from ``max_length`` /
+        ``max_prompt_length`` when left at the class default, ensures
+        ``max_length == max_prompt_length + max_completion_length``,
+        keeps ``num_generations`` and ``num_return_sequences`` in
+        sync, copies ``temperature`` into ``generation_temperature``
+        when not set, defaults ``epsilon_high`` to ``epsilon``,
+        normalises the various chunk-size aliases (``0`` -> ``None``)
+        and converts ``scale_rewards`` boolean shorthands to their
+        canonical string values. Finally defers to the base
+        :class:`TrainingArguments.__post_init__`.
+
+        Args:
+            max_sequence_length: Legacy alias for ``max_length``.
+            quantization_block: Legacy alias for the quantization group
+                size; forwarded to the base class.
+
+        Raises:
+            ValueError: If ``max_length`` is smaller than
+                ``max_prompt_length`` or
+                ``max_prompt_length + max_completion_length``.
+        """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
 
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default

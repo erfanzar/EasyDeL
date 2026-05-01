@@ -34,7 +34,7 @@ class TestQwen3VL:
         org_config.text_config.intermediate_size = 1024
         org_config.text_config.num_attention_heads = 4
         org_config.text_config.num_key_value_heads = 2
-        org_config.text_config.num_hidden_layers = 2
+        org_config.text_config.num_hidden_layers = small_model_config["num_hidden_layers"]
         org_config.text_config.head_dim = 128
         org_config.text_config.rope_scaling = {
             "rope_type": "default",

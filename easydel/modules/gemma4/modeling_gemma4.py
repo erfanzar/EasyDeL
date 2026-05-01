@@ -114,7 +114,16 @@ from .gemma4_configuration import Gemma4Config, Gemma4TextConfig, Gemma4VisionCo
 
 
 def _has_registered_gemma4_vision_backend(config: Gemma4VisionConfig | None) -> bool:
-    """Return True when the configured Gemma4 vision encoder is registered."""
+    """Return True when the configured Gemma4 vision encoder is registered.
+
+    Args:
+        config (Gemma4VisionConfig | None): Vision config or ``None``.
+
+    Returns:
+        bool: ``True`` if a ``BASE_VISION`` module is registered for
+        ``config.model_type``; ``False`` if ``config`` is ``None`` or no
+        registration exists.
+    """
     if config is None:
         return False
     try:
@@ -125,7 +134,17 @@ def _has_registered_gemma4_vision_backend(config: Gemma4VisionConfig | None) -> 
 
 
 def _gemma4_vision_pixel_values_to_nhwc(pixel_values: Array) -> Array:
-    """Convert image inputs to NHWC, accepting both NCHW and NHWC layouts."""
+    """Convert image inputs to NHWC, accepting both NCHW and NHWC layouts.
+
+    Args:
+        pixel_values (Array): A rank-4 tensor of either NCHW or NHWC layout.
+
+    Returns:
+        Array: NHWC-laid out tensor.
+
+    Raises:
+        ValueError: If ``pixel_values`` is not rank-4.
+    """
     if pixel_values.ndim != 4:
         raise ValueError("Gemma4 vision inputs must be rank-4 tensors.")
 
@@ -228,7 +247,22 @@ class Gemma4RMSNorm(spx.Module):
 
 
 def _gemma4_vision_patchify(pixel_values: Array, patch_size: int) -> tuple[Array, Array]:
-    """Convert raw images into flat patches and 2-D patch position ids."""
+    """Convert raw images into flat patches and 2-D patch position ids.
+
+    Args:
+        pixel_values (Array): NHWC pixel tensor of shape
+            ``(batch, height, width, channels)``.
+        patch_size (int): Side length of each square patch.
+
+    Returns:
+        tuple[Array, Array]: ``(patches, pixel_position_ids)`` of shapes
+        ``(batch, num_patches, patch_size**2 * channels)`` and
+        ``(batch, num_patches, 2)``.
+
+    Raises:
+        ValueError: If the image dimensions are not divisible by
+            ``patch_size``.
+    """
     pixel_values = _gemma4_vision_pixel_values_to_nhwc(pixel_values)
     batch_size, height, width, channels = pixel_values.shape
     if height % patch_size != 0 or width % patch_size != 0:
@@ -264,7 +298,28 @@ def _gemma4_vision_prepare_inputs(
     patch_size: int,
     pixel_position_ids: Array | None = None,
 ) -> tuple[Array, Array, Array]:
-    """Normalize Gemma4 vision inputs to flat patches plus patch positions."""
+    """Normalize Gemma4 vision inputs to flat patches plus patch positions.
+
+    Accepts either rank-4 pixel inputs (which are patchified internally) or
+    rank-3 pre-patchified inputs. When ``pixel_position_ids`` is ``None`` for
+    rank-3 inputs, square positional ids are auto-generated provided the patch
+    count is a perfect square.
+
+    Args:
+        pixel_values (Array): Rank-4 pixel tensor or rank-3 patch tensor.
+        patch_size (int): Patch side length, used only for rank-4 inputs.
+        pixel_position_ids (Array | None, optional): Optional explicit
+            ``(x, y)`` patch ids. Defaults to None.
+
+    Returns:
+        tuple[Array, Array, Array]: ``(patches, pixel_position_ids,
+        padding_positions)``. ``padding_positions`` is True wherever
+        ``pixel_position_ids == -1``.
+
+    Raises:
+        ValueError: If the input rank is unsupported, or if rank-3 inputs lack
+            position ids and do not have a square patch count.
+    """
     if pixel_values.ndim == 4:
         patches, inferred_position_ids = _gemma4_vision_patchify(pixel_values, patch_size)
         if pixel_position_ids is None:
@@ -303,7 +358,20 @@ def _gemma4_vision_prepare_inputs(
 
 
 class Gemma4VisionPatchEmbedder(spx.Module):
-    """Project flat image patches and add learned 2-D position embeddings."""
+    """Project flat image patches and add learned 2-D position embeddings.
+
+    Implements the HF-compatible Gemma4 vision stem: pixel patches are linearly
+    projected to ``hidden_size`` and added to learned 2-D positional embeddings
+    indexed by per-patch ``(x, y)`` ids. Padded patches receive zero positional
+    embeddings.
+
+    Attributes:
+        input_proj (ColumnParallelLinear): Linear projection from flattened
+            patch pixels (``3 * patch_size**2``) to ``hidden_size``.
+        position_embedding_table (ArrayParam): Learned table of shape
+            ``(2, position_embedding_size, hidden_size)`` storing per-axis
+            (x then y) positional embeddings.
+    """
 
     def __init__(
         self,
@@ -314,6 +382,20 @@ class Gemma4VisionPatchEmbedder(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma4 vision patch embedder.
+
+        Args:
+            config (Gemma4VisionConfig): Vision encoder configuration providing
+                ``patch_size``, ``hidden_size``, ``position_embedding_size``,
+                and ``initializer_range``.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for
+                matmul. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         patch_dim = 3 * config.patch_size * config.patch_size
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
@@ -335,7 +417,22 @@ class Gemma4VisionPatchEmbedder(spx.Module):
         )
 
     def _position_embeddings(self, pixel_position_ids: Array, padding_positions: Array) -> Array:
-        """Gather per-axis position embeddings and zero them on padded patches."""
+        """Gather per-axis position embeddings and zero them on padded patches.
+
+        Args:
+            pixel_position_ids (Array): Integer ids of shape
+                ``(batch, num_patches, 2)`` for the ``(x, y)`` patch positions.
+            padding_positions (Array): Boolean mask of shape
+                ``(batch, num_patches)`` indicating padded (True) entries.
+
+        Returns:
+            Array: Positional embeddings of shape
+            ``(batch, num_patches, hidden_size)`` with zeros on padded slots.
+
+        Raises:
+            ValueError: If ``pixel_position_ids`` does not have a trailing
+                dimension of size 2.
+        """
         clamped_positions = jnp.clip(
             pixel_position_ids.astype(jnp.int32),
             min=0,
@@ -352,7 +449,24 @@ class Gemma4VisionPatchEmbedder(spx.Module):
         return jnp.where(padding_positions[..., None], 0.0, position_embeddings)
 
     def forward(self, pixel_values: Array, pixel_position_ids: Array, padding_positions: Array) -> Array:
-        """Embed already patchified pixel inputs using the HF-compatible stem."""
+        """Embed already patchified pixel inputs using the HF-compatible stem.
+
+        The pixel values are first rescaled from ``[0, 1]`` to ``[-1, 1]``,
+        projected through ``input_proj``, and then added to the per-axis 2-D
+        positional embeddings.
+
+        Args:
+            pixel_values (Array): Patchified pixel inputs of shape
+                ``(batch, num_patches, patch_dim)``.
+            pixel_position_ids (Array): Integer ``(x, y)`` ids of shape
+                ``(batch, num_patches, 2)``.
+            padding_positions (Array): Boolean padding mask of shape
+                ``(batch, num_patches)``.
+
+        Returns:
+            Array: Embeddings of shape ``(batch, num_patches, hidden_size)``
+            named ``"vision_embeddings"`` for rematerialization.
+        """
         pixel_values = 2.0 * (pixel_values.astype(jnp.float32) - 0.5)
         hidden_states = self.input_proj(pixel_values.astype(self.input_proj.weight.dtype))
         position_embeddings = self._position_embeddings(pixel_position_ids, padding_positions)
@@ -360,7 +474,14 @@ class Gemma4VisionPatchEmbedder(spx.Module):
 
 
 class Gemma4VisionClippableLinear(spx.Module):
-    """Wrapper that preserves the HF `*.linear.weight` parameter layout."""
+    """Wrapper that preserves the HF ``*.linear.weight`` parameter layout.
+
+    Wraps either a :class:`ColumnParallelLinear` or :class:`RowParallelLinear`
+    inside a ``self.linear`` attribute so that checkpoint parameter paths match
+    Hugging Face's Gemma4 layout (``*.linear.weight``). The "clippable" name
+    derives from the optional weight-clipping behaviour controlled by
+    ``Gemma4VisionConfig.use_clipped_linears``.
+    """
 
     def __init__(
         self,
@@ -375,6 +496,24 @@ class Gemma4VisionClippableLinear(spx.Module):
         precision: jax.lax.PrecisionLike = None,
         rngs: spx.Rngs,
     ):
+        """Initialize the clippable linear wrapper.
+
+        Args:
+            config (Gemma4VisionConfig): Vision config providing
+                ``initializer_range``.
+            in_features (int): Number of input features.
+            out_features (int): Number of output features.
+            parallel_mode (str): Either ``"row"`` for row-parallel or any other
+                value for column-parallel.
+            use_bias (bool): Whether to add a bias term.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
         linear_cls = RowParallelLinear if parallel_mode == "row" else ColumnParallelLinear
         self.linear = linear_cls(
@@ -389,13 +528,45 @@ class Gemma4VisionClippableLinear(spx.Module):
         )
 
     def forward(self, hidden_states: Array) -> Array:
+        """Apply the wrapped linear projection.
+
+        Args:
+            hidden_states (Array): Input tensor of shape ``(..., in_features)``.
+
+        Returns:
+            Array: Output tensor of shape ``(..., out_features)``.
+        """
         return self.linear(hidden_states)
 
 
 class Gemma4VisionRotaryEmbedding(spx.Module):
-    """2-D rotary embedding shared across all Gemma4 vision encoder layers."""
+    """2-D rotary embedding shared across all Gemma4 vision encoder layers.
+
+    Splits the per-head feature dimension in two halves and applies independent
+    NeoX-style RoPE rotations driven by the patch ``x`` and ``y`` coordinates.
+    The remaining channels are passed through unchanged.
+
+    Attributes:
+        head_dim (int): Per-head feature dimension.
+        base (float): RoPE base frequency (typically very small for spatial
+            positions, e.g. 100.0).
+        rotary_dim_per_axis (int): Number of channels rotated per spatial axis
+            (``2 * (head_dim // 4)``).
+        frequencies (Array): Precomputed RoPE frequency tensor.
+    """
 
     def __init__(self, config: Gemma4VisionConfig, dtype: jnp.dtype = jnp.bfloat16):
+        """Initialize the 2-D rotary embedding.
+
+        Args:
+            config (Gemma4VisionConfig): Vision config providing ``head_dim``,
+                ``rope_parameters``, and ``max_position_embeddings``.
+            dtype (jnp.dtype, optional): Data type of the precomputed
+                frequencies. Defaults to jnp.bfloat16.
+
+        Raises:
+            ValueError: If ``head_dim < 4`` (no channels left to rotate).
+        """
         from easydel.layers import get_frequencies
 
         self.head_dim = config.head_dim
@@ -413,6 +584,17 @@ class Gemma4VisionRotaryEmbedding(spx.Module):
             ).astype(dtype)
 
     def _apply_axis(self, query: Array, key: Array, positions: Array) -> tuple[Array, Array]:
+        """Apply NeoX-style RoPE along a single spatial axis.
+
+        Args:
+            query (Array): Query slice for a single axis.
+            key (Array): Key slice for a single axis.
+            positions (Array): Integer positions along the chosen axis.
+
+        Returns:
+            tuple[Array, Array]: Rotated ``(query, key)`` tensors of the same
+            shape as the inputs.
+        """
         from easydel.layers.rotary._compute_fns import apply_basic_rope
 
         return apply_basic_rope(
@@ -426,7 +608,23 @@ class Gemma4VisionRotaryEmbedding(spx.Module):
         )
 
     def forward(self, query: Array, key: Array, pixel_position_ids: Array | None) -> tuple[Array, Array]:
-        """Apply independent RoPE rotations for the x and y patch coordinates."""
+        """Apply independent RoPE rotations for the x and y patch coordinates.
+
+        The first ``2 * (head_dim // (2 * ndim))`` channels per spatial axis are
+        rotated using the corresponding axis position; the remainder of the head
+        is passed through unchanged.
+
+        Args:
+            query (Array): Query tensor of shape
+                ``(batch, seq_len, num_heads, head_dim)``.
+            key (Array): Key tensor of the same shape as ``query``.
+            pixel_position_ids (Array | None): ``(x, y)`` patch ids of shape
+                ``(batch, seq_len, 2)``. When ``None``, both inputs are
+                returned unchanged.
+
+        Returns:
+            tuple[Array, Array]: ``(query, key)`` with RoPE applied per axis.
+        """
         if pixel_position_ids is None:
             return query, key
 
@@ -453,7 +651,14 @@ class Gemma4VisionRotaryEmbedding(spx.Module):
 
 
 class Gemma4VisionAttention(spx.Module):
-    """HF-compatible bidirectional vision attention block for Gemma4."""
+    """HF-compatible bidirectional vision attention block for Gemma4.
+
+    Implements the multi-head bidirectional attention used inside each Gemma4
+    vision encoder layer. Q/K/V are produced by clippable linear projections,
+    Q and K are normalized by RMSNorm, V is normalized scale-free, and 2-D RoPE
+    is applied via :class:`Gemma4VisionRotaryEmbedding` before the attention
+    kernel.
+    """
 
     def __init__(
         self,
@@ -465,6 +670,19 @@ class Gemma4VisionAttention(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the vision attention block.
+
+        Args:
+            config (Gemma4VisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical
+                precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -545,7 +763,25 @@ class Gemma4VisionAttention(spx.Module):
         mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ) -> EncoderLayerOutput:
-        """Apply attention, including 2-D patch rotary embeddings."""
+        """Apply attention, including 2-D patch rotary embeddings.
+
+        Args:
+            hidden_states (Array): Input tensor of shape
+                ``(batch, seq_len, hidden_size)``.
+            rotary_emb (Gemma4VisionRotaryEmbedding): Shared rotary embedding
+                module driven by the patch positions.
+            pixel_position_ids (Array | None, optional): ``(x, y)`` patch ids
+                of shape ``(batch, seq_len, 2)`` for RoPE application. Defaults
+                to None.
+            mask_info (MaskInfo | None, optional): Optional bidirectional
+                attention mask. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention
+                weights. Defaults to False.
+
+        Returns:
+            EncoderLayerOutput: Hidden states after projection and optional
+            attention weights.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -592,7 +828,13 @@ class Gemma4VisionAttention(spx.Module):
 
 
 class Gemma4VisionMLP(spx.Module):
-    """HF-compatible Gemma4 vision MLP using `*.linear.weight` wrappers."""
+    """HF-compatible Gemma4 vision MLP using ``*.linear.weight`` wrappers.
+
+    Gated MLP with the same structure as the text decoder MLP
+    (``down(act(gate(x)) * up(x))``) but built from
+    :class:`Gemma4VisionClippableLinear` so that parameter paths match the
+    Hugging Face checkpoint layout.
+    """
 
     def __init__(
         self,
@@ -603,6 +845,20 @@ class Gemma4VisionMLP(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma4 vision MLP.
+
+        Args:
+            config (Gemma4VisionConfig): Vision encoder configuration providing
+                ``hidden_size``, ``intermediate_size``, and
+                ``hidden_activation``.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         self.act = ACT2FN[config.hidden_activation]
         self.gate_proj = Gemma4VisionClippableLinear(
@@ -640,6 +896,15 @@ class Gemma4VisionMLP(spx.Module):
         )
 
     def forward(self, hidden_states: Array) -> Array:
+        """Apply the gated MLP transformation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape
+                ``(batch, seq_len, hidden_size)``.
+
+        Returns:
+            Array: Output tensor of shape ``(batch, seq_len, hidden_size)``.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -657,7 +922,12 @@ class Gemma4VisionMLP(spx.Module):
 
 
 class Gemma4VisionEncoderLayer(spx.Module):
-    """HF-compatible vision transformer block for Gemma4."""
+    """HF-compatible vision transformer block for Gemma4.
+
+    A single bidirectional encoder block with pre/post-norm structure around
+    both the attention and MLP sub-blocks, matching the Hugging Face Gemma4
+    vision encoder reference layout.
+    """
 
     def __init__(
         self,
@@ -669,6 +939,19 @@ class Gemma4VisionEncoderLayer(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize one Gemma4 vision encoder layer.
+
+        Args:
+            config (Gemma4VisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.input_layernorm = Gemma4RMSNorm(config, param_dtype=param_dtype)
@@ -700,7 +983,30 @@ class Gemma4VisionEncoderLayer(spx.Module):
         attention_mask: Array | None = None,
         output_attentions: bool = False,
     ) -> EncoderLayerOutput:
-        """Run one Gemma4 vision encoder block."""
+        """Run one Gemma4 vision encoder block.
+
+        Applies pre-norm bidirectional attention with both pre- and
+        post-feedforward RMSNorm, residual connections, and an optional zero
+        mask on padded patch positions.
+
+        Args:
+            hidden_states (Array): Input tensor of shape
+                ``(batch, num_patches, hidden_size)``.
+            rotary_emb (Gemma4VisionRotaryEmbedding): Shared RoPE module.
+            pixel_position_ids (Array | None, optional): ``(x, y)`` patch ids
+                of shape ``(batch, num_patches, 2)``. Defaults to None.
+            mask_info (MaskInfo | None, optional): Bidirectional attention
+                mask. Defaults to None.
+            attention_mask (Array | None, optional): Boolean per-token mask of
+                shape ``(batch, num_patches)``; padded tokens are zeroed in
+                the residual path. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention
+                weights. Defaults to False.
+
+        Returns:
+            EncoderLayerOutput: Updated hidden states and optional attention
+            weights.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attention_outputs = self.self_attn(
@@ -730,7 +1036,13 @@ class Gemma4VisionEncoderLayer(spx.Module):
 
 
 class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
-    """Shared rotary embedding plus stacked Gemma4 vision encoder layers."""
+    """Shared rotary embedding plus stacked Gemma4 vision encoder layers.
+
+    Stacks ``num_hidden_layers`` :class:`Gemma4VisionEncoderLayer` blocks under
+    a shared :class:`Gemma4VisionRotaryEmbedding` and runs them sequentially via
+    the layer-stack scan, with support for gradient checkpointing and pipeline
+    staging through :class:`EasyDeLLayerStackMixin`.
+    """
 
     def __init__(
         self,
@@ -741,6 +1053,18 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma4 vision encoder stack.
+
+        Args:
+            config (Gemma4VisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         self.rotary_emb = Gemma4VisionRotaryEmbedding(config=config, dtype=dtype)
         remat_layer_block = auto_remat(
@@ -771,7 +1095,25 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> BaseModelOutput:
-        """Encode patch embeddings with bidirectional attention."""
+        """Encode patch embeddings with bidirectional attention.
+
+        Args:
+            inputs_embeds (Array): Patch embeddings of shape
+                ``(batch, num_patches, hidden_size)`` from the patch embedder.
+            attention_mask (Array | None): Boolean mask of shape
+                ``(batch, num_patches)`` marking valid (True) tokens; used to
+                build a bidirectional attention mask.
+            pixel_position_ids (Array | None, optional): ``(x, y)`` patch ids
+                of shape ``(batch, num_patches, 2)`` for RoPE. Defaults to None.
+            output_attentions (bool, optional): Whether to collect attention
+                weights from each layer. Defaults to False.
+            output_hidden_states (bool, optional): Whether to collect hidden
+                states from each layer. Defaults to False.
+
+        Returns:
+            BaseModelOutput: Final hidden states with optional per-layer
+            hidden states and attention weights.
+        """
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         mask_info = None
@@ -822,9 +1164,26 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
 
 
 class Gemma4VisionPooler(spx.Module):
-    """Spatial pooling and hidden-size scaling for Gemma4 vision tokens."""
+    """Spatial pooling and hidden-size scaling for Gemma4 vision tokens.
+
+    Reduces the encoder output from ``num_patches`` patches to ``output_length``
+    soft tokens by averaging positional groups, zeroes padded entries, then
+    scales the result by ``sqrt(hidden_size)`` to match the language model's
+    embedding scale.
+
+    Attributes:
+        hidden_size (int): Encoder hidden size.
+        root_hidden_size (float): Square root of ``hidden_size`` used as the
+            output scale factor.
+    """
 
     def __init__(self, config: Gemma4VisionConfig):
+        """Initialize the vision pooler.
+
+        Args:
+            config (Gemma4VisionConfig): Vision config providing
+                ``hidden_size``.
+        """
         self.hidden_size = config.hidden_size
         self.root_hidden_size = config.hidden_size**0.5
 
@@ -834,6 +1193,26 @@ class Gemma4VisionPooler(spx.Module):
         pixel_position_ids: Array,
         length: int,
     ) -> tuple[Array, Array]:
+        """Average-pool tokens to ``length`` soft tokens via positional groups.
+
+        Computes per-token weights from the patch positions so that each output
+        soft token is the average of a square ``kernel_size x kernel_size`` block.
+
+        Args:
+            hidden_states (Array): Encoder outputs of shape
+                ``(batch, num_patches, hidden_size)``.
+            pixel_position_ids (Array): ``(x, y)`` patch ids of shape
+                ``(batch, num_patches, 2)``.
+            length (int): Target number of soft tokens.
+
+        Returns:
+            tuple[Array, Array]: ``(pooled_hidden_states, valid_mask)`` of
+            shapes ``(batch, length, hidden_size)`` and ``(batch, length)``.
+
+        Raises:
+            ValueError: If ``length`` does not divide ``num_patches`` into a
+                square kernel.
+        """
         input_seq_len = hidden_states.shape[1]
         kernel_size = int((input_seq_len // length) ** 0.5)
         kernel_size_squared = kernel_size**2
@@ -859,6 +1238,24 @@ class Gemma4VisionPooler(spx.Module):
         padding_positions: Array,
         output_length: int | None = None,
     ) -> tuple[Array, Array]:
+        """Pool encoder outputs into soft tokens and scale by ``sqrt(hidden)``.
+
+        Args:
+            hidden_states (Array): Encoder outputs of shape
+                ``(batch, num_patches, hidden_size)``.
+            pixel_position_ids (Array): ``(x, y)`` patch ids.
+            padding_positions (Array): Boolean padding mask of shape
+                ``(batch, num_patches)``.
+            output_length (int | None, optional): Target number of soft tokens.
+                If None, no spatial pooling is applied. Defaults to None.
+
+        Returns:
+            tuple[Array, Array]: ``(soft_tokens, valid_mask)``.
+
+        Raises:
+            ValueError: If ``output_length`` exceeds the number of input
+                patches.
+        """
         if output_length is None:
             output_length = hidden_states.shape[1]
         if output_length > hidden_states.shape[1]:
@@ -878,7 +1275,13 @@ class Gemma4VisionPooler(spx.Module):
 @register_module(TaskType.BASE_VISION, config=Gemma4VisionConfig, model_type="gemma4_vision")
 @register_module(TaskType.BASE_MODULE, config=Gemma4VisionConfig, model_type="gemma4_vision")
 class Gemma4VisionModel(EasyDeLBaseModule):
-    """HF-compatible Gemma4 vision encoder for multimodal checkpoints."""
+    """HF-compatible Gemma4 vision encoder for multimodal checkpoints.
+
+    Wraps the patch embedder, encoder stack, and pooler into a single
+    end-to-end vision tower that accepts either NCHW/NHWC raw pixels or
+    pre-patchified inputs and returns flattened soft-token embeddings ready
+    for the multimodal embedder.
+    """
 
     config_class = Gemma4VisionConfig
 
@@ -891,6 +1294,18 @@ class Gemma4VisionModel(EasyDeLBaseModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma4 vision tower.
+
+        Args:
+            config (Gemma4VisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to
+                jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -935,7 +1350,32 @@ class Gemma4VisionModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Encode images or flat patches into Gemma4 soft tokens."""
+        """Encode images or flat patches into Gemma4 soft tokens.
+
+        Accepts rank-4 pixel inputs (NCHW or NHWC, auto-detected) or rank-3
+        flat patches. Patches are embedded, encoded by the bidirectional
+        transformer stack, spatially pooled, optionally standardized, and then
+        flattened across the (batch, valid-token) axis.
+
+        Args:
+            pixel_values (Array): Either ``(batch, channels, height, width)``,
+                ``(batch, height, width, channels)``, or
+                ``(batch, num_patches, patch_dim)``.
+            pixel_position_ids (Array | None, optional): Per-patch ``(x, y)``
+                ids. Defaults to None.
+            image_position_ids (Array | None, optional): Alias for
+                ``pixel_position_ids`` accepted for API compatibility.
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return
+                attention weights. Defaults to None (False).
+            output_hidden_states (bool | None, optional): Whether to return
+                per-layer hidden states. Defaults to None (False).
+
+        Returns:
+            BaseModelOutput: Flattened soft-token embeddings as
+            ``last_hidden_state`` plus optional per-layer hidden states and
+            attentions.
+        """
         output_attentions = output_attentions if output_attentions is not None else False
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
         pixel_position_ids = pixel_position_ids if pixel_position_ids is not None else image_position_ids
@@ -964,7 +1404,7 @@ class Gemma4VisionModel(EasyDeLBaseModule):
             padding_positions=padding_positions,
             output_length=output_length,
         )
-        hidden_states = hidden_states[pooler_mask]
+        hidden_states = jnp.where(pooler_mask[..., None], hidden_states, 0).reshape(-1, hidden_states.shape[-1])
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias.value) * self.std_scale.value
         hidden_states = checkpoint_name(hidden_states, "vision_model_output")

@@ -91,25 +91,41 @@ class Trainer(BaseTrainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """
-        Creates a collate/collect function to process batches of data for training or evaluation.
+        """Return the default Grain collator (identity) for the base trainer.
 
-        This function returns a callable that takes a batch (a list of dictionaries) and converts it
-        into a dictionary of JAX arrays. For models of class "ForCausalLMLoss", it also performs
-        truncation (either keeping the end or the start of the sequence) so that each sequence does not
-        exceed the specified maximum length.
+        The base :class:`Trainer` assumes Grain's per-shard pipeline has
+        already produced ready-to-consume batched arrays (typically via
+        upstream :class:`grain.transforms.Batch` or a custom
+        per-trainer collator). This default therefore returns an
+        identity callable: any padding / truncation the model needs
+        must be done by the dataset transforms or by a subclass that
+        overrides this hook.
+
+        Subclasses with non-trivial padding (e.g. DPO, ORPO, GRPO,
+        reward) override this method to return a dedicated
+        ``Grain``-compatible collator.
 
         Args:
-            max_sequence_length (int): The maximum allowed sequence length.
-            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
-                Determines whether to keep the end or the start of the sequence when truncating.
-                Defaults to "keep_end".
+            max_sequence_length: Accepted for API symmetry with
+                :meth:`create_tfds_collect_function`; ignored by the
+                identity collator.
+            truncation_mode: Accepted for API symmetry; ignored by the
+                identity collator.
 
         Returns:
-            tp.Callable: A function that takes a batch (list of dicts) and returns a processed dict of arrays.
+            A callable ``batch -> batch`` that forwards Grain output
+            verbatim.
         """
 
         def collate_fn(batch):
+            """Identity collator used by Grain when no truncation is needed.
+
+            Args:
+                batch: Iterable of per-example dicts produced by Grain.
+
+            Returns:
+                The original batch unchanged.
+            """
             return batch
 
         return collate_fn
@@ -119,25 +135,50 @@ class Trainer(BaseTrainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """
-        Creates a collate/collect function to process batches of data for training or evaluation.
+        """Return a TFDS collator that stacks per-example dicts into batched arrays.
 
-        This function returns a callable that takes a batch (a list of dictionaries) and converts it
-        into a dictionary of JAX arrays. For models of class "ForCausalLMLoss", it also performs
-        truncation (either keeping the end or the start of the sequence) so that each sequence does not
-        exceed the specified maximum length.
+        TFDS yields lists of per-example dicts; the returned closure
+        builds a batched ``dict[str, jax.Array]`` by stacking
+        same-named fields. Two type-specific behaviours are baked in:
+
+        * Fields whose values fail ``jax.numpy.array(...)`` conversion
+          (typically Python objects) are silently dropped, except for
+          the special ``"tools"`` key which is forwarded as a Python
+          list so chat-template tool schemas survive batching.
+        * For causal-LM models (``model.lossfn_type == "ForCausalLM"``)
+          per-example tensors are first sliced to
+          ``max_sequence_length`` along the last axis -- ``keep_end``
+          retains the trailing window (default; preserves the
+          completion suffix) and ``keep_start`` retains the leading
+          window. Non-causal models are stacked unchanged.
 
         Args:
-            max_sequence_length (int): The maximum allowed sequence length.
-            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
-                Determines whether to keep the end or the start of the sequence when truncating.
-                Defaults to "keep_end".
+            max_sequence_length: Maximum number of trailing/leading
+                tokens to retain per causal-LM example.
+            truncation_mode: ``"keep_end"`` (default) or
+                ``"keep_start"`` -- selects which window survives the
+                slice for causal-LM examples.
 
         Returns:
-            tp.Callable: A function that takes a batch (list of dicts) and returns a processed dict of arrays.
+            A callable ``list[dict[str, Any]] -> dict[str, jax.Array]``
+            ready to pass to a TFDS pipeline as the collate step.
         """
 
         def collate_fn(batch):
+            """Stack a list of TFDS-style example dicts into batched arrays.
+
+            For causal-LM models the per-example tensors are first
+            truncated to ``max_sequence_length`` according to
+            ``truncation_mode``.
+
+            Args:
+                batch: List of per-example dicts.
+
+            Returns:
+                dict: Batched arrays keyed by feature name. ``tools`` is
+                kept as a python list; non-array fields that fail
+                ``jax.numpy.array(...)`` conversion are silently dropped.
+            """
             results = {}
             for key in batch[0].keys():
                 if key == "tools":
@@ -516,6 +557,14 @@ class Trainer(BaseTrainer):
         if data_collator is None:
 
             def data_collator(x):
+                """Identity collator used as a fallback when no collator is configured.
+
+                Args:
+                    x: Already-batched input.
+
+                Returns:
+                    The input unchanged.
+                """
                 return x
 
         if self.max_training_steps is None:
@@ -657,6 +706,14 @@ class Trainer(BaseTrainer):
         if data_collator is None:
 
             def data_collator(x):
+                """Identity collator used as a fallback when no collator is configured.
+
+                Args:
+                    x: Already-batched input.
+
+                Returns:
+                    The input unchanged.
+                """
                 return x
 
         global_step = int(jax.device_get(state.step))
@@ -732,15 +789,28 @@ class Trainer(BaseTrainer):
             )
 
     def _execute_eval_step(self, state, batch) -> LossMetrics:
-        """
-        Executes a single evaluation step.
+        """Run one evaluation step end-to-end (preprocess + compiled forward).
+
+        First routes ``batch`` through :meth:`_preprocess_batch_input`
+        in eval mode so any trainer-specific preprocessing (rollouts,
+        teacher scoring, label masking, etc.) is applied. The returned
+        ``informations`` dict carries auxiliary scalars produced by
+        preprocessing that would otherwise be lost (generation
+        timings, reward statistics, etc.) and is merged into
+        ``metrics.other_metrics`` after the compiled step returns. The
+        compiled :func:`evaluation_step` (or trainer-specific override)
+        is then invoked with the cached eval-side static argument
+        tuple and any ``_eval_shared_fn_extra_args`` (such as a teacher
+        or reference state for distillation/preference trainers).
 
         Args:
-            state: The current model state.
-            batch: A processed batch of evaluation data.
+            state: Current model state used for the evaluation forward.
+            batch: Already-collated evaluation batch.
 
         Returns:
-            LossMetrics: The loss metrics computed by the sharded evaluation step function.
+            :class:`LossMetrics` with ``loss``, ``accuracy``, and any
+            auxiliary metrics from the trainer-specific eval step
+            merged with the preprocessing ``informations`` dict.
         """
         batch, informations = self._preprocess_batch_input(
             state=state,

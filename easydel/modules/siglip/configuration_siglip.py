@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for the SigLIP vision-language model family.
+
+This module defines the three configuration objects used by SigLIP:
+
+- :class:`SiglipTextConfig`: hyperparameters for the text encoder
+  transformer.
+- :class:`SiglipVisionConfig`: hyperparameters for the vision encoder
+  (patch embedding, image size, transformer dimensions).
+- :class:`SiglipConfig`: composite configuration carrying both text and
+  vision sub-configs plus the joint logit-scale/bias parameters used
+  for the contrastive loss.
+
+SigLIP differs from CLIP primarily in using a per-pair sigmoid loss
+rather than a softmax over batch negatives.
+"""
 
 import typing
 
@@ -97,6 +112,14 @@ class SiglipTextConfig(EasyDeLBaseConfig):
         projection_size=None,
         **kwargs,
     ):
+        """Initialize SiglipTextConfig.
+
+        See the class docstring for parameter semantics.
+        ``projection_size`` defaults to ``hidden_size`` when ``None``,
+        controlling the dimension of the projected text embedding used in
+        the contrastive loss. ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -163,6 +186,13 @@ class SiglipVisionConfig(EasyDeLBaseConfig):
         attention_dropout=0.0,
         **kwargs,
     ):
+        """Initialize SiglipVisionConfig.
+
+        See the class docstring for parameter semantics. ``image_size``
+        and ``patch_size`` together determine the number of vision
+        patches per image (``(image_size / patch_size) ** 2``).
+        ``**kwargs`` are forwarded to :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
@@ -212,6 +242,19 @@ class SiglipConfig(EasyDeLBaseConfig):
 	"""
 
     def __init__(self, text_config=None, vision_config=None, **kwargs):
+        """Initialize SiglipConfig.
+
+        Args:
+            text_config: Either a dict of options for :class:`SiglipTextConfig`
+                or ``None`` (defaults are used).
+            vision_config: Either a dict of options for
+                :class:`SiglipVisionConfig` or ``None`` (defaults are used).
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+
+        After constructing the sub-configs, the method propagates the
+        EasyDeL "basics" (sharding, dtype, etc.) from the parent into
+        each sub-config and sets ``initializer_factor = 1.0``.
+        """
         super().__init__(**kwargs)
 
         if text_config is None:

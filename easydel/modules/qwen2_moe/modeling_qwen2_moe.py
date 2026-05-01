@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen2-MoE model implementation for EasyDeL.
+
+This module implements the Mixture-of-Experts variant of Qwen2. It
+shares Qwen2's attention/decoder-layer skeleton (RMSNorm, SwiGLU, GQA,
+RoPE) but replaces the dense MLP with a sparse routed MoE block plus
+an optional shared expert that processes all tokens.
+
+Components:
+- :class:`Qwen2MoeAttention` and :class:`Qwen2MoeDecoderLayer` provide
+  per-layer transformer logic.
+- :class:`Qwen2MoeSparseMoeBlock` performs token-to-expert routing and
+  combines routed and shared expert outputs.
+- :class:`Qwen2MoeModel` is the transformer trunk; :class:`Qwen2MoeForCausalLM`
+  wraps it with an LM head and computes the load-balancing auxiliary
+  loss when training.
+"""
 
 import typing
 from functools import partial
@@ -304,7 +320,24 @@ class Qwen2MoeAttention(UnifiedAttention):
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use qkv_bias for query projection (Qwen2Moe-specific)."""
+        """Build the query projection with Qwen2-MoE's optional QKV bias.
+
+        Overrides :meth:`UnifiedAttention._create_q_proj` so the query
+        ``ColumnParallelLinear`` honours ``config.qkv_bias`` (Qwen2-MoE
+        attaches a learned bias to all three projections, unlike the
+        Llama-style default which omits it).
+
+        Args:
+            config: Qwen2-MoE configuration.
+            dtype: Activation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Initializer RNGs.
+
+        Returns:
+            ColumnParallelLinear: Q projection mapping
+            ``hidden_size`` → ``num_attention_heads * head_dim``.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -317,7 +350,15 @@ class Qwen2MoeAttention(UnifiedAttention):
         )
 
     def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use qkv_bias for key projection (Qwen2Moe-specific)."""
+        """Build the key projection with Qwen2-MoE's optional QKV bias.
+
+        Overrides the default to thread ``config.qkv_bias`` through to
+        the ``ColumnParallelLinear``. Output dimension follows the GQA
+        contract ``num_key_value_heads * head_dim``.
+
+        Returns:
+            ColumnParallelLinear: K projection.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
@@ -330,7 +371,14 @@ class Qwen2MoeAttention(UnifiedAttention):
         )
 
     def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use qkv_bias for value projection (Qwen2Moe-specific)."""
+        """Build the value projection with Qwen2-MoE's optional QKV bias.
+
+        Mirrors :meth:`_create_k_proj` for the V projection so all three
+        QKV projections share a consistent bias setting.
+
+        Returns:
+            ColumnParallelLinear: V projection.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
@@ -343,7 +391,17 @@ class Qwen2MoeAttention(UnifiedAttention):
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=False for output projection (Qwen2Moe-specific)."""
+        """Build the output projection without bias.
+
+        Qwen2-MoE keeps the output projection bias-free even when QKV
+        bias is enabled — the convention preserves the residual signal
+        magnitude. Maps ``num_attention_heads * head_dim`` back to
+        ``hidden_size`` via a ``RowParallelLinear`` so the row-sharded
+        output naturally combines along the sequence dimension.
+
+        Returns:
+            RowParallelLinear: O projection.
+        """
         from easydel.layers import RowParallelLinear
 
         return RowParallelLinear(
@@ -358,7 +416,15 @@ class Qwen2MoeAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: Qwen2MoeConfig, dtype: jnp.dtype):
-        """Create Qwen2Moe-specific rotary embedding layer."""
+        """Create the RoPE module for Qwen2-MoE attention.
+
+        Qwen2-MoE applies full (not partial) rotary embeddings, so both
+        ``head_size`` and ``rotary_dim`` are set to ``head_dim`` and the
+        period is controlled solely by ``config.rope_theta``.
+
+        Returns:
+            RoPE module produced by ``config.get_basic_rope``.
+        """
         return config.get_basic_rope(
             head_size=config.hidden_size // config.num_attention_heads,
             rotary_dim=config.hidden_size // config.num_attention_heads,
@@ -367,7 +433,17 @@ class Qwen2MoeAttention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config: Qwen2MoeConfig, rngs: spx.Rngs):
-        """Create attention performer with Qwen2Moe's attention dropout."""
+        """Create the FlexibleAttention performer with Qwen2-MoE settings.
+
+        Wires up ``config.attention_dropout`` and the standard
+        ``head_dim**-0.5`` softmax scale so the shared dispatcher picks
+        the same numerics that the upstream Qwen2-MoE checkpoints were
+        trained with.
+
+        Returns:
+            FlexibleAttentionModule: The attention dispatcher used by
+            this layer.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -815,6 +891,13 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden
+            states, self-attention weights and MoE router logits, and
+            returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1176,5 +1259,10 @@ class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2Mo
         return self.model.get_embedding()
 
     def get_task_head(self):
-        """Returns the sequence classification head."""
+        """Return the per-class scoring head.
+
+        Returns:
+            ColumnParallelLinear: The classification ``score`` layer
+            mapping the pooled hidden state to ``num_labels`` logits.
+        """
         return self.score

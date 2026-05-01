@@ -242,11 +242,27 @@ class BaseEmbeddingModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def get_task_head(self):
-        """Embedding models have no task-specific head."""
+        """Return ``None`` — embedding models have no learned task head.
+
+        Override of :meth:`BaseTaskModule.get_task_head`. Unlike
+        classification or causal-LM wrappers, the embedding wrapper
+        produces its output by pooling + L2-normalising the
+        transformer hidden states; there is no separate trainable
+        head module to surface here.
+
+        Returns:
+            ``None``.
+        """
         return None
 
     def get_lm_head(self):
-        """Embedding models do not have a language modeling head."""
+        """Embedding models do not produce vocabulary logits.
+
+        Raises:
+            NotImplementedError: Always — use
+                :meth:`forward` (or :meth:`encode`) to obtain the
+                pooled embedding instead of an LM head's logits.
+        """
         raise NotImplementedError("Embedding models do not have a language modeling head.")
 
     def encode(

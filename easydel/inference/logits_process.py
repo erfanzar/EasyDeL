@@ -317,6 +317,7 @@ class TopPLogitsWarper(LogitsWarper):
         min_keep = self.min_tokens_to_keep
 
         def _apply(x):
+            """Mask logits below the top-p cumulative-probability cutoff."""
             topk_scores, topk_indices = lax.top_k(x, x.shape[-1])
             mask_scores = jnp.full_like(x, self.filter_value)
             cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
@@ -482,6 +483,11 @@ class MinLengthLogitsProcessor(LogitsProcessor):
     eos_token_id: int
 
     def __post_init__(self):
+        """Validate that ``min_length`` and ``eos_token_id`` are non-negative ints.
+
+        Raises:
+            ValueError: If either field is missing or out of range.
+        """
         if not isinstance(self.min_length, int) or self.min_length < 0:
             raise ValueError(f"`min_length` has to be a positive integer, but is {self.min_length}")
 
@@ -621,6 +627,7 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
         """
 
         def _force_token(generation_idx):
+            """Replace logits with a one-hot force on the mapped token."""
             batch_size = scores.shape[0]
             current_token = self.force_token_array[generation_idx]
 
@@ -806,6 +813,7 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
         """
 
         def _apply(x, ids, presence_penalty):
+            """Subtract the presence penalty from logits of present tokens."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
             one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
@@ -854,6 +862,7 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
         """
 
         def _apply(x, ids, frequency_penalty):
+            """Subtract a count-proportional penalty from each token's logit."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
             one_hot_counts = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
@@ -913,6 +922,7 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
         """
 
         def _apply(x, ids, repetition_penalty):
+            """Apply CTRL-style multiplicative repetition penalty per token."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
             one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
@@ -973,6 +983,7 @@ class MinPLogitsWarper(LogitsWarper):
         min_p = jnp.asarray(self.min_p)
 
         def _apply(x):
+            """Mask logits whose probability is below ``min_p * max_prob``."""
             batch_size, vocab_size = x.shape
             sorted_logits, sorted_indices = lax.top_k(x, k=vocab_size)
             sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)

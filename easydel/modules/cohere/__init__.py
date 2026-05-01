@@ -45,7 +45,7 @@ Usage Example:
     from easydel.modules.cohere import CohereConfig, CohereForCausalLM
     import jax
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
 
     # Configure Cohere Command-R style model
     config = CohereConfig(

@@ -60,7 +60,30 @@ def base_step(
     is_training: bool = True,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """Run the shared base trainer loss path for train or eval."""
+    """Run the shared base trainer loss path for train or eval.
+
+    Args:
+        state (EasyDeLState): Current parameter / optimizer state.
+        batch (collections.abc.Mapping[str, jax.Array]): Input batch.
+        loss_config (LossConfig | None): Optional loss configuration
+            forwarded to ``module.compute_loss``.
+        learning_rate_fn (optax.Schedule): Learning-rate schedule used
+            for metric reporting.
+        partition_spec (PartitionSpec | None): Sharding spec applied to
+            the input batch.
+        gradient_accumulation_steps (int): Number of microbatches
+            whose gradients are accumulated before an update.
+        is_training (bool): When True, compute gradients and apply an
+            optimizer update; otherwise only compute metrics.
+        straight_through_emulator (tp.Callable | None): Optional STE
+            wrapping the parameter tree to emulate quantized forward
+            passes.
+
+    Returns:
+        tuple[EasyDeLState, LossMetrics] | LossMetrics: ``(state,
+        metrics)`` in training mode; just ``metrics`` in evaluation
+        mode.
+    """
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -69,21 +92,36 @@ def base_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
-        """
-        Computes the loss and additional metrics for a given minibatch and tree state.
+        """Compute the base-trainer scalar loss and metrics for one microbatch.
 
-        The inner function merges the current graph state with an updated tree,
-        prepares inputs for a model call, pops the labels from the inputs, and calls
-        the model's compute_loss method.
+        Steps performed inside the closure:
+
+        1. Optionally pass ``tree`` through ``straight_through_emulator``
+           so the forward pass runs under simulated quantisation while
+           the gradient path stays differentiable.
+        2. Rebind ``tree`` against the trainer state's graph definition
+           via ``state.merge`` to recover a live module.
+        3. When evaluating, switch the module to eval mode so dropout
+           and other train-only paths short-circuit.
+        4. Run ``module.prepare_inputs_for_call(**minibatch)`` so the
+           module-specific input filter projects the raw batch onto the
+           callable's signature, then pop ``"labels"`` (None when
+           absent) and feed the rest to ``module.compute_loss``.
+
+        ``compute_loss`` returns ``(outputs, metrics)`` where ``outputs``
+        carries the scalar loss the trainer differentiates against; the
+        metrics object is forwarded verbatim to
+        :func:`update_state_respectfully` for logging.
 
         Args:
-            tree: The current update to the model's graph state.
-            minibatch: A minibatch of input data.
+            tree: Differentiable parameter tree.
+            minibatch: Mapping with the model-specific input fields and
+                an optional ``labels`` entry.
 
         Returns:
-            A tuple containing:
-                - The computed loss (scalar).
-                - Additional metrics (LossMetrics) produced during loss computation.
+            ``(loss, metrics)`` where ``loss`` is the scalar trainable
+            objective and ``metrics`` is the :class:`LossMetrics`
+            instance returned by ``module.compute_loss``.
         """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
@@ -132,7 +170,24 @@ def training_step(
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """Perform one base trainer update step."""
+    """Perform one base trainer update step.
+
+    Convenience wrapper over :func:`base_step` with ``is_training=True``.
+
+    Args:
+        state (EasyDeLState): Current state.
+        batch (collections.abc.Mapping[str, jax.Array]): Input batch.
+        loss_config (LossConfig | None): Optional loss configuration.
+        learning_rate_fn (optax.Schedule): Learning-rate schedule for
+            metric reporting.
+        partition_spec (PartitionSpec | None): Sharding spec.
+        gradient_accumulation_steps (int): Number of accumulation
+            microbatches.
+        straight_through_emulator (tp.Callable | None): Optional STE.
+
+    Returns:
+        tuple[EasyDeLState, LossMetrics]: Updated state and metrics.
+    """
     return base_step(
         state=state,
         batch=batch,
@@ -151,7 +206,20 @@ def evaluation_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
-    """Perform one base trainer evaluation step."""
+    """Perform one base trainer evaluation step.
+
+    Convenience wrapper over :func:`base_step` with ``is_training=False``
+    and a fixed accumulation factor of 1.
+
+    Args:
+        state (EasyDeLState): Current state.
+        batch (collections.abc.Mapping[str, jax.Array]): Input batch.
+        loss_config (LossConfig | None): Optional loss configuration.
+        partition_spec (PartitionSpec | None): Sharding spec.
+
+    Returns:
+        LossMetrics: Metrics for the evaluated batch.
+    """
     return base_step(
         state=state,
         batch=batch,
@@ -163,6 +231,16 @@ def evaluation_step(
 
 
 def _base_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build the cache key for a scheduled base-trainer loss specialization.
+
+    Args:
+        call: Scheduled call descriptor with bound static arguments.
+
+    Returns:
+        tuple[tp.Any, ...]: Hashable identifier for the
+        ``(partition_spec, loss_config, straight_through_emulator)``
+        specialization.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("partition_spec",),
@@ -171,10 +249,30 @@ def _base_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_base_scheduled_loss(call):
+    """Build a scalar loss closure for the base-trainer scheduled-loss adapter.
+
+    Args:
+        call: Scheduled call descriptor providing ``loss_config`` and
+            ``partition_spec``.
+
+    Returns:
+        tp.Callable: A function ``(tree, batch) -> Array`` that runs
+        ``module.compute_loss(...)`` and returns its scalar loss.
+    """
     loss_config = call.get("loss_config")
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree, batch):
+        """Compute the base-trainer scalar loss for the scheduled adapter.
+
+        Args:
+            tree: Current model parameter tree.
+            batch (collections.abc.Mapping[str, jax.Array]): Input
+                minibatch (with optional ``labels`` field).
+
+        Returns:
+            jax.Array: Scalar loss returned by ``module.compute_loss``.
+        """
         module = bind_scheduled_module(call, tree)
         batch = constrain_scheduled_batch(module, batch, partition_spec)
         call_batch = module.prepare_inputs_for_call(**batch)

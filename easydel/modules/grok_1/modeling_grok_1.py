@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of xAI's Grok-1 sparse Mixture-of-Experts decoder.
+
+Grok-1 is a 314B-parameter sparse MoE decoder transformer. Each layer hosts
+``num_experts`` expert FFNs (default 8) with top-k routing
+(``num_experts_per_tok`` = 2), producing roughly 25% activated parameters
+per token. Routing is regularised with an auxiliary load-balancing loss.
+
+Architectural traits:
+    - Sparse MoE FFN with learned gating and auxiliary load-balancing loss.
+    - Grouped-query attention with RoPE positional encoding.
+    - Configurable attention output multiplier and max-attention clipping.
+    - Separate scaling factors for embeddings and output logits.
+    - RMSNorm pre-normalization throughout.
+
+Exports:
+    - :class:`Grok1Model`: Backbone returning hidden states.
+    - :class:`Grok1ForCausalLM`: Decoder LM with optional tied LM head.
+"""
 
 from functools import cached_property
 
@@ -244,17 +262,28 @@ class Grok1Attention(AttentionModule):
 
 
 class Grok1BLockSparseMLP(spx.Module):
-    """Grok-1 Block Sparse MLP module.
+    """Single expert MLP for Grok-1 with the historic ``linear/linear_1/linear_v`` naming.
 
-    This module implements the specific MLP structure used within the sparse Mixture of Experts
-    layer in the Grok-1 model.
+    Implements one expert of the Grok-1 MoE: a gated GeLU MLP of the form
+    ``linear_1( gelu(linear(x)) * linear_v(x) )``. The naming is preserved
+    verbatim from xAI's released checkpoint:
+
+    - ``linear``: ColumnParallel "gate" projection ``hidden -> intermediate``.
+    - ``linear_v``: ColumnParallel "up" projection ``hidden -> intermediate``.
+    - ``linear_1``: RowParallel "down" projection ``intermediate -> hidden``.
+
+    GeLU (exact, not the approximate variant) is applied to the gate stream
+    only. There is **no shared expert** in Grok-1 — every layer's
+    feedforward branch is a pure top-k mixture, so each instance of this
+    class is invoked solely on the tokens routed to it by
+    :class:`Grok1SparseMoeBlock`.
 
     Attributes:
-            config (Grok1Config): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (spx.Rngs): Random number generators.
+        config: Source ``Grok1Config``.
+        dtype: Activation/compute dtype.
+        param_dtype: Parameter storage dtype.
+        precision: ``jax.lax.PrecisionLike`` for the three matmuls.
+        rngs: Random key container used to seed parameter init.
     """
 
     def __init__(
@@ -345,17 +374,37 @@ class Grok1BLockSparseMLP(spx.Module):
 
 
 class Grok1SparseMoeBlock(spx.Module):
-    """Grok-1 Sparse Mixture of Experts (MoE) block.
+    """Top-k sparse MoE block: 8 experts, route 2 per token, softmax over selected.
 
-    This module implements the sparse MoE layer used in Grok-1. It routes tokens
-    to a subset of experts based on learned gating weights.
+    Grok-1's flagship 314B checkpoint uses ``num_experts=8`` and
+    ``num_experts_per_tok=2``: every token's hidden state is scored against
+    a learned ``gate`` projection, the **two** highest-scoring experts are
+    selected via :func:`jax.lax.top_k`, and only those two are softmaxed
+    *over each other* to produce normalised mixing weights. The two routed
+    experts run in parallel and their outputs are linearly combined; all
+    other experts contribute zero to this token. There is no shared
+    expert and no auxiliary load-balancing loss baked into the module —
+    Grok-1 instead emits ``router_logits`` so the trainer can apply its
+    own balancing penalty.
+
+    The implementation walks every expert in a Python ``for`` loop and
+    masks token assignments rather than sorting tokens by expert (the
+    "fused" MoE path used by GLM-MoE). This is intentionally simple and
+    well-suited to small expert counts; the ``checkpoint_name`` calls let
+    the gradient-checkpointer rematerialise expert outputs cheaply when
+    needed. Router logits are promoted to float32 before the top-k and
+    softmax to keep the small relative differences between top-1 and
+    top-2 experts well resolved.
 
     Attributes:
-            config (Grok1Config): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (spx.Rngs): Random number generators.
+        config: Source ``Grok1Config``.
+        dtype: Activation/compute dtype.
+        param_dtype: Parameter storage dtype.
+        precision: ``jax.lax.PrecisionLike`` for the gate / experts.
+        rngs: Random key container.
+        gate: ColumnParallel ``hidden -> num_experts`` router projection
+            (no bias).
+        experts: ``ModuleList`` of ``num_experts`` :class:`Grok1BLockSparseMLP`.
     """
 
     def __init__(

@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Responses store worker process for handling persistent Responses API state via ZMQ."""
+"""Subprocess entry point for the Responses API state store ZMQ worker.
+
+Wraps :class:`FileResponseStore` behind a ZMQ REP socket so multiple
+API server processes can share ``response_id`` and ``conversation_id``
+records. Dispatches one command per request (``get_response``,
+``put_response``, ``delete_response`` and the conversation
+counterparts, plus ``stats`` and ``shutdown``) and serialises the
+backing store's results as plain dicts.
+
+Errors raised inside the store are caught and forwarded as
+``{"status": "error", "message": ...}`` so the client side can re-raise
+them as ``RuntimeError`` without taking the whole worker process down.
+"""
 
 from __future__ import annotations
 

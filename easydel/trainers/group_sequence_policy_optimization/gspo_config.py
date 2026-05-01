@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the GSPO trainer.
+
+Defines :class:`GSPOConfig` as a thin subclass of :class:`GRPOConfig`
+that switches the default ``importance_sampling_level`` to
+``"sequence"`` and clamps the loss type to GSPO-friendly variants.
+"""
 
 from dataclasses import dataclass, field
 
@@ -23,38 +29,46 @@ from ..group_relative_policy_optimization import GRPOConfig
 @Registry.register("trainer-arguments", "gspo")
 @dataclass
 class GSPOConfig(GRPOConfig):
-    """Configuration class for Group Sequence Policy Optimization training.
+    """Configuration class for Group Sequence Policy Optimization (GSPO).
 
-    GSPO is a variant of GRPO that operates at the sequence level rather than
-    token level, providing improved training stability and performance, especially
-    for Mixture-of-Experts (MoE) models. It was developed by Alibaba Qwen team
-    and contributed to the improvements in Qwen3 models.
+    GSPO (Qwen team, arXiv:2507.18071) is a sequence-level variant of
+    GRPO that aggregates the importance-sampling ratio over the full
+    completion before applying the PPO clip, instead of clipping
+    per-token. This change yields markedly more stable optimisation
+    on MoE backbones (where individual token ratios can be highly
+    bimodal across experts) and lets GSPO operate with very tight
+    clipping bounds (``epsilon ~ 3e-4``).
 
-    Key differences from GRPO:
-    - Sequence-level importance ratios instead of token-level
-    - Much smaller clipping bounds (3e-4 to 4e-4 vs 0.2)
-    - No KL regularization by default (beta=0.0)
-    - Better stability for MoE model training
+    Compared with the GRPO defaults inherited from
+    :class:`GRPOConfig`, GSPO flips:
 
-    Reference:
-        Group Sequence Policy Optimization (arXiv:2507.18071)
+    * ``importance_sampling_level = "sequence"`` (vs. ``"token"``).
+    * ``epsilon = 3e-4`` and ``epsilon_high = 4e-4`` (vs. ``0.2``).
+    * ``beta = 0.0`` -- the canonical GSPO recipe drops the
+      reference-KL penalty, relying on the tight ratio clip alone for
+      regularisation.
+    * ``loss_type = "grpo"`` (vs. ``"dapo"`` in :class:`GRPOConfig`).
 
-    Example:
-        >>> config = GSPOConfig(
-        ...     per_device_train_batch_size=4,
-        ...     num_generations=4,
-        ...     max_prompt_length=512,
-        ...     max_completion_length=256,
-        ...     learning_rate=1e-6,
-        ... )
-        >>> trainer = GSPOTrainer(
-        ...     arguments=config,
-        ...     model=model,
-        ...     reward_funcs=reward_model,
-        ...     train_dataset=dataset,
-        ...     processing_class=tokenizer
-        ... )
-        >>> trainer.train()
+    All other fields inherited from :class:`GRPOConfig` are kept as
+    documented there. Construct with dict-literal kwargs:
+
+    >>> cfg = GSPOConfig(num_generations=4, max_prompt_length=512,
+    ...                  max_completion_length=256)
+
+    Attributes:
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"GSPO"``).
+        importance_sampling_level: ``"sequence"`` (default) or
+            ``"token"``. GSPO requires sequence-level aggregation for
+            its tight clipping recipe.
+        epsilon: Lower clipping bound on the sequence-level
+            importance ratio. Default ``3e-4``.
+        epsilon_high: Upper clipping bound. Default ``4e-4``.
+        beta: KL coefficient against the reference model. Default
+            ``0.0`` (no KL penalty).
+        loss_type: GRPO loss variant. Default ``"grpo"``; other
+            entries from the GRPO surface (``"bnpo"``, ``"dr_grpo"``,
+            ``"dapo"``, ``"cispo"``) are accepted.
     """
 
     trainer_prefix: str | None = field(

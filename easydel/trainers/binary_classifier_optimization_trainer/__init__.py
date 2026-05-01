@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Binary Classifier Optimization (BCO) trainer entry point.
+
+BCO learns from unpaired desirable / undesirable completions via a
+binary preference classifier with optional User-Driven Modeling (UDM)
+embedding regularization.  This package exposes :class:`BCOConfig` and
+:class:`BCOTrainer` for end users; algorithm helpers live in :mod:`._fn`.
+"""
 
 from .bco_config import BCOConfig
 from .bco_trainer import BCOTrainer

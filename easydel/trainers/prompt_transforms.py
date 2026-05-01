@@ -179,6 +179,16 @@ class GRPOPreprocessTransform(Transform):
         tools: list | None = None,
         skip_apply_chat_template: bool = False,
     ):
+        """Cache the tokenizer plus prompt-length and special-token configuration.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional max length to enforce on the prompt.
+            tools: Optional default list of tool schemas; can be overridden
+                per example via ``example["tools"]``.
+            skip_apply_chat_template: If ``True``, the tokenizer's chat
+                template is bypassed even for list-of-messages prompts.
+        """
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
         self._tools = tools
@@ -208,6 +218,18 @@ class GRPOPreprocessTransform(Transform):
         example = maybe_convert_to_chatml(example)
 
         def _has_non_empty_prompt(value: tp.Any) -> bool:
+            """Return ``True`` if ``value`` is a non-empty prompt-shaped object.
+
+            Strings are non-empty after ``strip``; lists must have at least
+            one element; anything else (excluding ``None``) is treated as
+            non-empty.
+
+            Args:
+                value: Candidate prompt value.
+
+            Returns:
+                ``True`` for non-empty prompts, ``False`` otherwise.
+            """
             if value is None:
                 return False
             if isinstance(value, str):
@@ -272,6 +294,7 @@ class GRPOPreprocessTransform(Transform):
         return purify_example(result, keep_fields=keep_fields)
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the prompt cap."""
         return f"GRPOPreprocessTransform(max_prompt={self._max_prompt_length})"
 
 
@@ -283,6 +306,7 @@ class PPOPreprocessTransform(GRPOPreprocessTransform):
     """
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the prompt cap."""
         return f"PPOPreprocessTransform(max_prompt={self._max_prompt_length})"
 
 
@@ -329,6 +353,21 @@ class KTOPreprocessTransform(Transform):
         embedding_tokenizer: tp.Any = None,
         tools: list | None = None,
     ):
+        """Cache the tokenizer and configuration for KTO preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional cap on prompt length (left-truncated).
+            max_completion_length: Optional cap on completion length
+                (right-truncated).
+            add_special_tokens: Whether to prepend the BOS token to the
+                prompt and append the EOS token to the completion.
+            label_pad_token_id: Token id used to mask prompt positions in
+                ``completion_labels`` (defaults to ``-100``).
+            embedding_tokenizer: Optional separate tokenizer used for the
+                UDM embedding feed (BCO compatibility).
+            tools: Optional default tool schemas for chat templating.
+        """
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
         self._max_completion_length = max_completion_length
@@ -423,6 +462,7 @@ class KTOPreprocessTransform(Transform):
         return purify_example(result)
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
         return (
             f"KTOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
         )
@@ -477,6 +517,20 @@ class BCOPreprocessTransform(ExpandTransform):
         embedding_tokenizer: tp.Any = None,
         tools: list | None = None,
     ):
+        """Cache the tokenizer and configuration for BCO preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional cap on prompt length (left-truncated).
+            max_completion_length: Optional cap on completion length
+                (right-truncated).
+            add_special_tokens: Whether to prepend BOS and append EOS.
+            label_pad_token_id: Token id used to mask prompt positions in
+                ``completion_labels``.
+            embedding_tokenizer: Optional separate tokenizer for the BCO
+                User-Driven Model (UDM) embedding feed.
+            tools: Optional default tool schemas for chat templating.
+        """
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
         self._max_completion_length = max_completion_length
@@ -640,6 +694,7 @@ class BCOPreprocessTransform(ExpandTransform):
         return purify_example(result)
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
         return (
             f"BCOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
         )
@@ -684,6 +739,18 @@ class DPOPreprocessTransform(Transform):
         tools: list | None = None,
         label_pad_token_id: int = -100,
     ):
+        """Cache the tokenizer and configuration for DPO preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_prompt_length: Optional cap on prompt length (left-truncated).
+            max_completion_length: Optional cap on chosen/rejected length
+                (right-truncated).
+            add_special_tokens: Whether to prepend BOS / append EOS.
+            tools: Optional default tool schemas for chat templating.
+            label_pad_token_id: Token id used to mask prompt positions in
+                ``chosen_labels`` and ``rejected_labels``.
+        """
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
         self._max_completion_length = max_completion_length
@@ -778,6 +845,16 @@ class DPOPreprocessTransform(Transform):
         max_seq_length = (self._max_prompt_length or 0) + (self._max_completion_length or 0)
 
         def _pad_sequence(seq, max_len, pad_value):
+            """Right-pad ``seq`` with ``pad_value`` up to ``max_len``.
+
+            Args:
+                seq: List of token ids.
+                max_len: Target length; ``None`` or ``0`` disables padding.
+                pad_value: Value to append.
+
+            Returns:
+                The (possibly extended) list.
+            """
             if max_len and len(seq) < max_len:
                 return seq + [pad_value] * (max_len - len(seq))
             return seq
@@ -824,6 +901,7 @@ class DPOPreprocessTransform(Transform):
         return purify_example(result)
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
         return (
             f"DPOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
         )
@@ -843,6 +921,7 @@ class ORPOPreprocessTransform(DPOPreprocessTransform):
     """
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length caps."""
         return (
             f"ORPOPreprocessTransform(max_prompt={self._max_prompt_length}, "
             f"max_completion={self._max_completion_length})"
@@ -876,6 +955,14 @@ class RewardPreprocessTransform(Transform):
         max_length: int,
         truncation: bool = True,
     ):
+        """Cache the tokenizer and configuration for reward-model preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_length: Maximum length of the tokenized chosen/rejected
+                sequences (used for both truncation and padding).
+            truncation: Whether to truncate to ``max_length``.
+        """
         self._tokenizer = tokenizer
         self._max_length = max_length
         self._truncation = truncation
@@ -939,6 +1026,7 @@ class RewardPreprocessTransform(Transform):
         return purify_example(result)
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length cap."""
         return f"RewardPreprocessTransform(max_length={self._max_length})"
 
 
@@ -986,6 +1074,22 @@ class SFTPreprocessTransform(Transform):
         truncation: bool = True,
         formatting_func: tp.Callable | None = None,
     ):
+        """Cache the tokenizer and configuration for SFT preprocessing.
+
+        Args:
+            tokenizer: Tokenizer used for chat templating and encoding.
+            max_length: Target sequence length used for truncation and
+                padding.
+            text_field: Dataset field that holds plain text rows.
+            messages_field: Dataset field that holds chat messages.
+            mask_prompt: When ``True``, attempt to build a completion mask
+                that excludes prompt tokens from the loss.
+            add_eos: When ``True``, ensure the EOS token is appended to
+                non-templated text.
+            truncation: Whether to truncate to ``max_length``.
+            formatting_func: Optional callable that turns a raw example
+                into a formatted dict or string before tokenization.
+        """
         self._tokenizer = tokenizer
         self._max_length = max_length
         self._text_field = text_field
@@ -1059,6 +1163,16 @@ class SFTPreprocessTransform(Transform):
 
     @staticmethod
     def _normalize_message_list(messages: tp.Any) -> list[dict[str, tp.Any]] | None:
+        """Normalize an arbitrary message payload to the canonical chat format.
+
+        Args:
+            messages: Raw value as found in the dataset (string, JSON
+                string, list of dicts, ...).
+
+        Returns:
+            A list of role/content dicts, or ``None`` if the payload could
+            not be interpreted as a non-plain-text chat list.
+        """
         return normalize_message_payload(messages, allow_plain_text=False)
 
     def _tokenize_conversational(self, example: dict, messages: list) -> dict:
@@ -1223,6 +1337,7 @@ class SFTPreprocessTransform(Transform):
         return purify_example(result)
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length cap."""
         return f"SFTPreprocessTransform(max_length={self._max_length}, mask_prompt={self._mask_prompt})"
 
 
@@ -1260,6 +1375,16 @@ class EmbeddingPreprocessTransform(Transform):
         positive_field: str = "positive",
         negative_field: str | None = None,
     ):
+        """Cache the tokenizer and dataset-column configuration.
+
+        Args:
+            tokenizer: Tokenizer used to encode each text field.
+            max_length: Sequence length used for both truncation and
+                padding (defaults to 512).
+            query_field: Dataset column carrying anchor/query strings.
+            positive_field: Dataset column carrying positive examples.
+            negative_field: Optional dataset column carrying hard negatives.
+        """
         self._tokenizer = tokenizer
         self._max_length = max_length
         self._query_field = query_field
@@ -1267,6 +1392,15 @@ class EmbeddingPreprocessTransform(Transform):
         self._negative_field = negative_field
 
     def __call__(self, example: Example) -> Example:
+        """Tokenize the configured query/positive (and optional negative) fields.
+
+        Args:
+            example: Source example mapping with the configured text fields.
+
+        Returns:
+            A dict with ``query_*``, ``positive_*`` and (optionally)
+            ``negative_*`` ``input_ids`` / ``attention_mask`` arrays.
+        """
         result: dict[str, tp.Any] = {}
 
         for prefix, field_name in [
@@ -1298,6 +1432,7 @@ class EmbeddingPreprocessTransform(Transform):
         return result
 
     def __repr__(self) -> str:
+        """Return a debug-friendly representation including the length cap and field names."""
         return (
             f"EmbeddingPreprocessTransform(max_length={self._max_length}, "
             f"query={self._query_field}, positive={self._positive_field}, "

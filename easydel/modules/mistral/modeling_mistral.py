@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mistral transformer implementation.
+
+Implements the Mistral decoder family — a LLaMA-like architecture with optional
+sliding-window attention, grouped-query attention, RMSNorm, RoPE, and a SwiGLU
+MLP. Sliding-window vs full-attention is selected per layer through the
+``layer_types`` configuration.
+
+Exports:
+    - ``MistralMLP``: SwiGLU feed-forward block.
+    - ``MistralAttention``: standard / sliding-window attention.
+    - ``MistralDecoderLayer``: a single transformer block.
+    - ``MistralModel``: base transformer trunk.
+    - ``MistralForCausalLM``: causal LM head wrapper.
+    - ``MistralForSequenceClassification``: classification head wrapper.
+"""
+
 import functools
 
 import jax
@@ -52,10 +68,23 @@ logger = get_logger(__name__)
 
 
 class MistralMLP(spx.Module):
-    """Multi-Layer Perceptron module for Mistral models.
+    """Standard SwiGLU FFN for Mistral decoder layers.
 
-    Implements the feedforward network with SiLU activation function
-    for efficient and effective representation learning.
+    Identical in shape to LLaMA's MLP — gate / up / down with SiLU — but
+    instantiated separately so checkpoint state-dict keys match the
+    upstream Mistral weight layout. Uses ``ColumnParallelLinear`` on the
+    expanding (gate / up) projections so the intermediate activation is
+    sharded along the model-parallel axis, and ``RowParallelLinear`` on
+    the contracting ``down_proj`` so the cross-shard reduction happens
+    inside the projection rather than in a separate all-reduce.
+
+    Attributes:
+        gate_proj (ColumnParallelLinear): Gate projection
+            ``hidden_size -> intermediate_size``.
+        up_proj (ColumnParallelLinear): Up projection ``hidden_size -> intermediate_size``.
+        down_proj (RowParallelLinear): Output projection
+            ``intermediate_size -> hidden_size``.
+        act_fn (Callable): Pointwise nonlinearity (SiLU by default).
     """
 
     def __init__(
@@ -144,11 +173,21 @@ class MistralMLP(spx.Module):
 
 
 class MistralAttention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for Mistral models.
+    """Mistral attention: GQA + RoPE + sliding-window causal mask.
 
-    Inherits from UnifiedAttention with Mistral-specific customizations:
-    - Sliding window attention support
-    - Custom RoPE configuration
+    A thin subclass of :class:`UnifiedAttention` that
+
+    * Forwards ``config.sliding_window`` so the underlying attention
+      kernel applies a banded causal mask of width
+      ``min(query_len, sliding_window)`` per layer (set to ``None`` for
+      full causal attention).
+    * Uses ``head_dim = config.head_dim`` (a fixed 128 in the official
+      Mistral checkpoints, independent of ``hidden_size /
+      num_attention_heads``).
+    * Builds the rotary table from ``config.rope_theta`` /
+      ``config.rope_scaling`` via ``config.get_basic_rope``.
+
+    Inherits the standard MHA / GQA implementation from the base class.
     """
 
     def __init__(
@@ -186,15 +225,38 @@ class MistralAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: MistralConfig, dtype: jnp.dtype):
-        """Create Mistral-specific rotary embedding layer."""
+        """Build the rotary embedding for this attention layer.
+
+        Args:
+            config (MistralConfig): Model configuration providing ``rope_theta``
+                and any ``rope_scaling`` settings.
+            dtype (jnp.dtype): Computation dtype for the rotary tables.
+
+        Returns:
+            Rotary module configured with this layer's head dimension.
+        """
         return config.get_basic_rope(dtype, self.head_dim)
 
 
 class MistralDecoderLayer(spx.Module):
-    """Single decoder layer for Mistral models.
+    """One Mistral block: pre-norm sliding-window attention + SwiGLU FFN.
 
-    Combines sliding window attention with feedforward networks,
-    using RMS normalization and residual connections.
+    Pre-norm residual layout::
+
+        x = x + self_attn(input_layernorm(x))
+        x = x + mlp(post_attention_layernorm(x))
+
+    Both norms are :class:`RMSNorm` at ``rms_norm_eps``. The attention
+    sub-layer applies the sliding-window mask configured on
+    :class:`MistralAttention` so the cost of each layer is O(L · window)
+    rather than O(L²) — long-range mixing is recovered by stacking
+    layers.
+
+    Attributes:
+        self_attn (MistralAttention): Sliding-window GQA attention.
+        mlp (MistralMLP): SwiGLU feed-forward.
+        input_layernorm, post_attention_layernorm (RMSNorm): Pre-attention
+            and pre-FFN RMSNorms.
     """
 
     def __init__(
@@ -312,7 +374,7 @@ class MistralDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=MistralConfig, model_type="mistral")
 class MistralModel(EasyDeLBaseModule):
-    """Mistral model implementation.
+    """Mistral base trunk: token embeddings + sliding-window decoder stack + final RMSNorm.
 
     This implements the Mistral language model architecture, utilizing transformer blocks
     with RMSNorm, sliding window attention, and rotary position embeddings.
@@ -567,16 +629,13 @@ class MistralModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MistralConfig, model_type="mistral")
 class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
-    """Mistral model with a language modeling head for causal language modeling tasks.
+    """Causal LM head wrapper around :class:`MistralModel`.
 
-    This model is a transformer-based language model with causal attention masks
-    and sliding window attention applied to perform autoregressive language generation.
-
-    Attributes:
-            config (MistralConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-            param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-            precision: Precision setting for JAX operations.
+    Adds a bias-free LM projection on top of the sliding-window decoder
+    trunk. ``compute_lm_logits`` (inherited) is wrapped under
+    ``nn.remat`` by default for the ~34 GB savings on long-vocab models.
+    Tied embeddings follow ``config.tie_word_embeddings`` (default
+    ``False`` for Mistral checkpoints).
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -717,16 +776,13 @@ class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MistralConfig, model_type="mistral")
 class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralModel, MistralConfig]):
-    """Mistral model for sequence classification tasks.
+    """Sequence classification head on top of :class:`MistralModel`.
 
-    This class extends the base Mistral model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
-
-    Attributes:
-            config (MistralConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision: Precision setting for JAX operations.
+    Pools the trunk's last hidden state at the position of the last
+    non-padded token (``pooling_strategy="last"``) and projects it to
+    ``config.num_labels`` via a bias-free ``score`` linear. Sliding-window
+    attention from the trunk is preserved unchanged — the classifier
+    only reshapes the final output.
     """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION

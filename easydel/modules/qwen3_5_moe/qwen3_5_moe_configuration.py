@@ -24,7 +24,17 @@ from easydel.modules.qwen3_vl_moe.qwen3_vl_moe_configuration import Qwen3VLMoeVi
 
 
 def _hf_supports_mrope_rope_type() -> bool:
-    """Check whether the installed HF rope validator supports ``rope_type='mrope'``."""
+    """Probe whether the installed transformers exposes the ``"mrope"`` validator.
+
+    Mirrors the helper of the same name in ``qwen3_5_configuration``;
+    multimodal RoPE was added to ``modeling_rope_utils`` after the
+    initial Qwen2-VL release, so older transformers installations do
+    not accept ``rope_type="mrope"`` during validation.
+
+    Returns:
+        ``True`` iff ``transformers`` ships an mRoPE validator;
+        ``False`` if the import fails or the entry is missing.
+    """
     try:
         from transformers import modeling_rope_utils
     except Exception:
@@ -35,7 +45,19 @@ def _hf_supports_mrope_rope_type() -> bool:
 
 
 def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
-    """Normalize mRoPE config while remaining compatible with older HF validators."""
+    """Patch a Qwen3.5-MoE ``rope_scaling`` dict for HF cross-version use.
+
+    See :func:`qwen3_5_configuration._normalize_rope_scaling_for_mrope`
+    for the rationale: when mRoPE-specific keys are present but no
+    explicit ``rope_type`` is set, this helper picks ``"mrope"`` on
+    modern transformers and falls back to ``"default"`` on older
+    ones, so config validation succeeds in both cases.
+
+    Returns:
+        A new dict with normalised keys, the original mapping
+        unchanged when no mRoPE keys are present, or ``None`` when
+        the input was ``None``.
+    """
     if not isinstance(rope_scaling, dict):
         return rope_scaling
     normalized = dict(rope_scaling)
@@ -75,6 +97,13 @@ def _patch_hf_qwen3_5_moe_load_balancing_loss() -> None:
         top_k=2,
         attention_mask=None,
     ):
+        """HF-compatible Qwen3.5-MoE load-balancing loss with mask-shape guard.
+
+        Wraps :func:`hf_qwen3_5_moe.load_balancing_loss_func` to recover
+        from an upstream regression where some HF snapshots compute an
+        invalid expert attention-mask shape on small synthetic inputs.
+        On the second ``RuntimeError`` it returns ``0.0`` instead.
+        """
         try:
             return original_fn(
                 gate_logits=gate_logits,
@@ -375,7 +404,16 @@ class Qwen3_5MoeConfig(EasyDeLBaseConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_text_config(self, decoder: bool = True) -> Qwen3_5MoeTextConfig:
-        """Get the text configuration object."""
+        """Return the embedded MoE text-decoder configuration.
+
+        Implements the HuggingFace ``get_text_config`` contract for the
+        composite Qwen3.5-MoE config. The ``decoder`` flag is accepted
+        for protocol compatibility but ignored — the model has no
+        separate text encoder config.
+
+        Returns:
+            Qwen3_5MoeTextConfig: ``self.text_config``.
+        """
         return self.text_config  # pyright: ignore[reportReturnType]
 
 

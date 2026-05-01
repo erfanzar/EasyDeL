@@ -11,6 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Memory-efficient log-probability and entropy utilities for trainers.
+
+This module provides JAX-friendly helpers used across preference and policy
+optimization trainers (DPO, ORPO, CPO, GRPO, GSPO, GFPO, PPO, RLVR, ...) to
+score sequences against a language-model head without materializing the
+``[batch, seq_len, vocab_size]`` logit tensor at once.
+
+The core ideas are:
+
+* **Vocabulary-dimension chunking** -- streaming three-pass log-softmax that
+  only keeps one ``[..., chunk]`` slice of logits live at a time
+  (``compute_token_logps_and_entropies_chunked``).
+* **Sequence-dimension chunking** -- iterating over slices of hidden states,
+  projecting through the LM head one slice at a time, and either
+  accumulating per-sequence sums
+  (``compute_sequence_scores_from_hidden_states``) or writing per-token
+  results back into full-length output arrays
+  (``compute_per_token_logps_and_entropies_from_hidden_states``).
+
+Both levels are wrapped with ``jax.checkpoint`` and driven by
+``jax.lax.fori_loop`` so XLA can rematerialize chunks during backward
+passes, and a model-side ``make_lm_head_fn`` hook is preferred when
+available so ``nn.remat``-wrapped LM heads remain trace-safe.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -161,12 +186,31 @@ def compute_token_logps_and_entropies_chunked(
     tail = vocab_size - num_full_chunks * chunk_size
 
     def _max_step(start: int, size: int, running_max: Array) -> Array:
+        """Update the running per-position logit-max with one vocab chunk.
+
+        Args:
+            start: Vocabulary start index.
+            size: Number of vocab entries in this chunk.
+            running_max: Per-position max accumulated so far.
+
+        Returns:
+            The updated running max.
+        """
         chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
         return jnp.maximum(running_max, jnp.max(chunk, axis=-1))
 
     _max_step = jax.checkpoint(_max_step, prevent_cse=False, static_argnums=(1,))
 
     def max_body(i: int, running_max: Array) -> Array:
+        """``fori_loop`` body that calls ``_max_step`` for full-sized vocab chunks.
+
+        Args:
+            i: Chunk index in ``[0, num_full_chunks)``.
+            running_max: Current running max.
+
+        Returns:
+            The updated running max.
+        """
         return _max_step(i * chunk_size, chunk_size, running_max)
 
     logit_max = jnp.full(logits.shape[:-1], -jnp.inf, dtype=jnp.float32)
@@ -176,12 +220,31 @@ def compute_token_logps_and_entropies_chunked(
         logit_max = _max_step(num_full_chunks * chunk_size, tail, logit_max)
 
     def _sum_step(start: int, size: int, running_sum: Array) -> Array:
+        """Update the running ``sum_v exp(logits[v] - max)`` with one vocab chunk.
+
+        Args:
+            start: Vocabulary start index.
+            size: Number of vocab entries in this chunk.
+            running_sum: Running exp-sum accumulated so far.
+
+        Returns:
+            The updated running exp-sum.
+        """
         chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
         return running_sum + jnp.sum(jnp.exp(chunk - logit_max[..., None]), axis=-1)
 
     _sum_step = jax.checkpoint(_sum_step, prevent_cse=False, static_argnums=(1,))
 
     def sum_body(i: int, running_sum: Array) -> Array:
+        """``fori_loop`` body that calls ``_sum_step`` for full-sized vocab chunks.
+
+        Args:
+            i: Chunk index in ``[0, num_full_chunks)``.
+            running_sum: Current running exp-sum.
+
+        Returns:
+            The updated running exp-sum.
+        """
         return _sum_step(i * chunk_size, chunk_size, running_sum)
 
     exp_sum = jnp.zeros_like(logit_max)
@@ -198,6 +261,16 @@ def compute_token_logps_and_entropies_chunked(
         return token_log_probs, None
 
     def _entropy_step(start: int, size: int, expected_logits: Array) -> Array:
+        """Update the running ``E_p[logit]`` with one vocab chunk.
+
+        Args:
+            start: Vocabulary start index.
+            size: Number of vocab entries in this chunk.
+            expected_logits: Running expected-logit accumulated so far.
+
+        Returns:
+            The updated running expected logit.
+        """
         chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
         probs = jnp.exp(chunk - log_z[..., None])
         return expected_logits + jnp.sum(probs * chunk, axis=-1)
@@ -205,6 +278,15 @@ def compute_token_logps_and_entropies_chunked(
     _entropy_step = jax.checkpoint(_entropy_step, prevent_cse=False, static_argnums=(1,))
 
     def entropy_body(i: int, expected_logits: Array) -> Array:
+        """``fori_loop`` body that calls ``_entropy_step`` for full-sized vocab chunks.
+
+        Args:
+            i: Chunk index in ``[0, num_full_chunks)``.
+            expected_logits: Current running expected logit.
+
+        Returns:
+            The updated running expected logit.
+        """
         return _entropy_step(i * chunk_size, chunk_size, expected_logits)
 
     expected_logits = jnp.zeros_like(log_z)
@@ -274,6 +356,9 @@ def compute_sequence_scores_from_hidden_states(
         vocab_chunk_size: Vocabulary chunk size forwarded to
             :func:`compute_token_logps_and_entropies_chunked` for the inner
             vocabulary-dimension chunking.
+        return_correct_counts: If ``True``, additionally accumulate a
+            per-sequence count of masked tokens whose argmax prediction
+            matches the label.  Returned as a fourth array.
 
     Returns:
         A 3-tuple or 4-tuple of float32 arrays, each of shape ``[batch]``:
@@ -308,6 +393,15 @@ def compute_sequence_scores_from_hidden_states(
     _has_prepare = hasattr(projection_model, "prepare_lm_head_inputs")
 
     def _project_chunk(chunk_hidden_states: Array) -> Array:
+        """Project a sequence-axis hidden-state chunk through the LM head.
+
+        Args:
+            chunk_hidden_states: ``[batch, chunk_seq, hidden_dim]``
+                slice of the hidden-state tensor.
+
+        Returns:
+            The corresponding ``[batch, chunk_seq, vocab_size]`` logits.
+        """
         if _has_prepare:
             chunk_hidden_states = projection_model.prepare_lm_head_inputs(chunk_hidden_states)
         return _lm_head_fn(chunk_hidden_states)
@@ -319,6 +413,19 @@ def compute_sequence_scores_from_hidden_states(
         chunk_labels: Array,
         chunk_loss_mask: Array,
     ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
+        """Compute per-sequence per-chunk logp/logit/count contributions.
+
+        Args:
+            chunk_hidden_states: Hidden-state slice for the current
+                sequence chunk.
+            chunk_labels: Label slice with the same sequence range.
+            chunk_loss_mask: Boolean loss mask slice.
+
+        Returns:
+            A 3- or 4-tuple of ``[batch]`` accumulators (the 4th
+            element being correct-prediction counts when
+            ``return_correct_counts`` is set).
+        """
         chunk_logits = _project_chunk(chunk_hidden_states)
         chunk_logps, _ = compute_token_logps_and_entropies_chunked(
             chunk_logits,
@@ -365,6 +472,17 @@ def compute_sequence_scores_from_hidden_states(
         size: int,
         current: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array],
     ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
+        """Add the contributions of one sequence-chunk into the running totals.
+
+        Args:
+            start: Sequence start index for this chunk.
+            size: Number of tokens in this chunk.
+            current: Running per-sequence accumulator tuple.
+
+        Returns:
+            The updated accumulator tuple (preserving the
+            3-tuple/4-tuple shape).
+        """
         chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, size, axis=1)
         chunk_labels = lax.dynamic_slice_in_dim(labels, start, size, axis=1)
         chunk_loss_mask = lax.dynamic_slice_in_dim(loss_mask, start, size, axis=1)
@@ -392,6 +510,15 @@ def compute_sequence_scores_from_hidden_states(
         i: int,
         current: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array],
     ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
+        """``fori_loop`` body that processes the ``i``-th full sequence chunk.
+
+        Args:
+            i: Chunk index in ``[0, num_full_chunks)``.
+            current: Current accumulator tuple.
+
+        Returns:
+            The updated accumulator tuple.
+        """
         return _accumulate_chunk(i * token_chunk_size, token_chunk_size, current)
 
     if num_full_chunks > 0:
@@ -480,6 +607,15 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
     _has_prepare = hasattr(projection_model, "prepare_lm_head_inputs")
 
     def _project_chunk(chunk_hidden_states: Array) -> Array:
+        """Project a sequence-axis hidden-state chunk through the LM head.
+
+        Args:
+            chunk_hidden_states: ``[batch, chunk_seq, hidden_dim]``
+                slice of the hidden-state tensor.
+
+        Returns:
+            The corresponding ``[batch, chunk_seq, vocab_size]`` logits.
+        """
         if _has_prepare:
             chunk_hidden_states = projection_model.prepare_lm_head_inputs(chunk_hidden_states)
         return _lm_head_fn(chunk_hidden_states)
@@ -487,6 +623,17 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
     _project_chunk = jax.checkpoint(_project_chunk, prevent_cse=False)
 
     def _chunk_contributions(chunk_hidden_states: Array, chunk_targets: Array) -> tuple[Array, Array | None]:
+        """Compute per-token log-probabilities (and optional entropies) for one chunk.
+
+        Args:
+            chunk_hidden_states: Hidden-state slice for this chunk.
+            chunk_targets: Target ids matching the chunk's sequence
+                range.
+
+        Returns:
+            ``(chunk_logps, chunk_entropies)`` matching the requested
+            ``return_entropy`` setting.
+        """
         chunk_logits = _project_chunk(chunk_hidden_states)
         return compute_token_logps_and_entropies_chunked(
             chunk_logits,
@@ -507,6 +654,17 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
         size: int,
         current: tuple[Array, Array],
     ) -> tuple[Array, Array]:
+        """Write one chunk's per-token logps (and entropies) into the output arrays.
+
+        Args:
+            start: Sequence start index.
+            size: Number of tokens in this chunk.
+            current: Running ``(token_logps, entropies)`` arrays.
+
+        Returns:
+            Updated ``(token_logps, entropies)`` with the chunk filled
+            in.
+        """
         chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, size, axis=1)
         chunk_targets = lax.dynamic_slice_in_dim(targets, start, size, axis=1)
         chunk_logps, chunk_entropies = _chunk_contributions(chunk_hidden_states, chunk_targets)
@@ -517,6 +675,15 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
         return next_logps, next_entropies
 
     def _full_body(i: int, current: tuple[Array, Array]) -> tuple[Array, Array]:
+        """``fori_loop`` body that processes the ``i``-th full sequence chunk.
+
+        Args:
+            i: Chunk index in ``[0, num_full_chunks)``.
+            current: Current ``(token_logps, entropies)`` accumulator.
+
+        Returns:
+            Updated accumulator tuple.
+        """
         return _accumulate_chunk(i * token_chunk_size, token_chunk_size, current)
 
     carry = (token_logps, entropies)

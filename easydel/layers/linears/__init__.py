@@ -56,7 +56,6 @@ Example:
     ...     RowParallelLinear,
     ... )
     >>> import spectrax as spx
-from spectrax import nn
     >>>
     >>> # Create a two-layer MLP with tensor parallelism
     >>> up_proj = ColumnParallelLinear(768, 3072, rngs=spx.Rngs(0))

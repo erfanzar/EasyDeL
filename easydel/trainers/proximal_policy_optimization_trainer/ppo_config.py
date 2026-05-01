@@ -36,13 +36,102 @@ from ..training_configurations import TrainingArguments
 @Registry.register("trainer-arguments", "ppo")
 @dataclass
 class PPOConfig(TrainingArguments):
-    """Configuration class for Proximal Policy Optimization (PPO) training.
+    """Hyperparameters for RLHF-style Proximal Policy Optimization.
 
-    This config is intended for RLHF-style PPO on language models where:
-    - Prompts are provided by the dataset (left-padded)
-    - Completions are generated online
-    - A reward function/model scores (prompt, completion)
-    - A value head is trained as a baseline, and PPO clipping stabilizes updates
+    PPO optimises a stochastic policy ``pi_theta`` against advantages
+    estimated from a learned value function ``V_phi`` while constraining
+    each update to a *proximal* region of the rollout policy
+    ``pi_old``. The clipped surrogate objective minimised here is
+
+    ``L_pi = E_t[ min( r_t * A_t, clip(r_t, 1 - cliprange, 1 + cliprange) * A_t ) ]``
+
+    where ``r_t = exp(logp_theta(a_t|s_t) - logp_old(a_t|s_t))`` is the
+    importance ratio. The total loss adds a clipped value-function
+    regression ``vf_coef * L_v`` (see ``cliprange_value``) and an
+    optional entropy bonus controlled by ``entropy_coef``. Per-token
+    rewards combine an external reward (typically a reward model
+    scoring the *whole* completion) with a token-wise KL penalty
+    ``-kl_coef * KL(pi_theta || pi_ref)`` against a frozen reference
+    policy; advantages are computed via Generalised Advantage Estimation
+    with discount ``gamma`` and trace-decay ``lam``. Rollouts are
+    generated outside the gradient computation with the sampling
+    parameters below and replayed for ``num_ppo_epochs`` minibatch
+    epochs.
+
+    Attributes:
+        trainer_prefix: Prefix used when naming logs / checkpoints / W&B
+            runs. Default: ``"PPO"``.
+        remove_unused_columns: Whether the base trainer should drop
+            columns from the dataset that are not consumed by PPO.
+            Default ``False`` to preserve any side-channel metadata.
+        max_prompt_length: Maximum prompt length in tokens; prompts are
+            left-padded so generation always sees a right-aligned prefix.
+        max_completion_length: Maximum number of new tokens generated
+            per rollout sample; right-padded.
+        dataset_num_proc: Number of worker processes used by the
+            preprocessing transform. ``None`` runs sequentially.
+        learning_rate: Optimiser step size for the joint
+            policy + value-head update.
+        num_ppo_epochs: Minibatch epochs reused per rollout batch.
+            Currently best-effort -- keep at ``1`` for parity with the
+            v1 reference implementation.
+        kl_coef: Coefficient on the per-token KL penalty added to the
+            score-only reward, i.e. ``r_kl_t = -kl_coef * KL_t``.
+        kl_estimator: Choice of KL estimator: ``"k1"`` uses the
+            unbiased single-sample estimator
+            ``logp - logp_ref``; ``"k3"`` uses the variance-reduced
+            estimator ``exp(logp_ref - logp) - 1 - (logp_ref - logp)``.
+        cliprange: PPO policy-ratio clip parameter ``epsilon`` used in
+            the clipped surrogate.
+        vf_coef: Scalar weight on the value-function loss in the joint
+            objective.
+        cliprange_value: Symmetric clip range for the value function
+            update, applied as
+            ``V_clipped = V_old + clip(V_phi - V_old, -range, +range)``.
+        gamma: Reward discount factor used by GAE.
+        lam: GAE trace-decay parameter.
+        whiten_rewards: If ``True``, normalise per-token rewards to
+            zero-mean / unit-variance before running GAE.
+        whiten_advantages: If ``True``, normalise the GAE advantages
+            after computation. Strongly recommended.
+        entropy_coef: Optional entropy-regularisation weight; ``None`` or
+            non-positive disables the bonus, otherwise the loss adds
+            ``-entropy_coef * H[pi_theta]``.
+        missing_eos_penalty: Optional penalty subtracted from the score
+            of completions that fail to emit an EOS token before the
+            length cap.
+        tools: Tool/function-calling schemas forwarded to the chat
+            template during prompt assembly.
+        reward_weights: Per-reward-function weights used when several
+            reward callables are combined into a scalar score; length
+            must match the number of reward functions.
+        skip_apply_chat_template: When ``True`` the dataset is treated
+            as already chat-templated and only tokenisation is applied.
+        num_return_sequences: Number of completions sampled per prompt
+            during rollout.
+        num_generations: Alias for ``num_return_sequences`` kept for
+            cross-trainer parity; the two are reconciled in
+            ``__post_init__``.
+        temperature: Rollout sampling temperature.
+        top_p: Nucleus-sampling cumulative-probability cutoff.
+        top_k: Optional top-k sampling cutoff (``None`` disables top-k).
+        presence_penalty: Per-token presence penalty applied during
+            sampling.
+        frequency_penalty: Per-token frequency penalty applied during
+            sampling.
+        min_p: Optional minimum-probability filter (HF "top-p-min").
+        repetition_penalty: Multiplicative repetition penalty applied
+            to already-generated tokens.
+        generation_kwargs: Extra keyword arguments forwarded verbatim to
+            the underlying generation config.
+        chat_template_kwargs: Extra keyword arguments forwarded to chat
+            template rendering during prompt assembly.
+        mask_truncated_completions: When ``True``, completions that hit
+            ``max_completion_length`` without emitting EOS are masked
+            out of the loss.
+        logprob_vocab_chunk_size: Optional vocabulary chunking for the
+            log-probability / entropy reductions used by the loss; set
+            to ``None`` (or non-positive) to disable chunking.
     """
 
     trainer_prefix: str | None = field(
@@ -196,6 +285,28 @@ class PPOConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Validate and reconcile PPO-specific length and sampling parameters.
+
+        - Forwards a deprecated ``max_sequence_length`` to the base class.
+        - Reconciles ``max_length`` with ``max_prompt_length`` /
+          ``max_completion_length``.
+        - Mirrors ``num_return_sequences`` and ``num_generations``.
+        - Synchronizes ``generation_temperature`` with the rollout
+          ``temperature`` when not explicitly set.
+        - Clamps ``entropy_coef`` to ``None`` when non-positive.
+        - Normalizes ``logprob_vocab_chunk_size`` to ``None`` when not
+          positive.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias for
+                ``max_length``; forwarded to the base class.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the base class.
+
+        Raises:
+            ValueError: If ``max_length`` is smaller than
+                ``max_prompt_length``.
+        """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
 
         if self.max_length is not None:

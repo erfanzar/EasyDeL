@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Loss and step implementations for the Nash-MD trainer.
+
+Implements the Nash mirror-descent objective: a regularised
+expected-reward gradient against a mixture between the current policy
+and a reference, with optional KL clipping and missing-EOS reward
+penalty.  The scheduled-VJP variant supports MPMD pipeline parallelism.
+"""
 
 from __future__ import annotations
 
@@ -84,20 +91,47 @@ def nash_md_step(
     is_train: bool,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """Execute Nash-MD training or evaluation step.
+    """Run one Nash-MD training or evaluation step.
+
+    Consumes a batch that the trainer has already augmented with:
+
+    * ``ref_token_logps`` -- per-token reference logps for the
+      completion tokens (frozen).
+    * ``probabilities`` -- the preference oracle's win probability of
+      the policy completion against the mixture-sampled completion.
+
+    The mirror-descent objective is
+
+    ``L = beta * KL(policy || reference)
+          - (probabilities - 0.5) * policy_token_logps``
+
+    summed over completion tokens and masked by ``completion_mask``.
+    The KL term is computed in token-space using the policy and
+    reference per-token logps; the second term scales the policy
+    log-likelihood by the centred oracle preference, pushing the
+    policy toward completions the oracle preferred.
 
     Args:
-        state: Current model state.
-        batch: Input batch with prompts, completions, and rewards.
-        beta: Temperature parameter for KL penalty.
-        loss_config: Optional loss configuration.
-        learning_rate_fn: Function mapping step to learning rate.
-        partition_spec: Sharding specification.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
-        is_train: Whether this is a training step.
+        state: Policy ``EasyDeLState`` being differentiated.
+        batch: Nash-MD minibatch with prompt/completion ids and
+            masks, ``ref_token_logps``, and ``probabilities``.
+        beta: KL coefficient against the reference.
+        logprob_vocab_chunk_size: Vocab-axis chunk size used by the
+            policy logp computation.
+        loss_config: ``LossConfig`` controlling NaN handling.
+        learning_rate_fn: Schedule mapping step to learning rate.
+        partition_spec: Sharding spec applied to the input batch.
+        gradient_accumulation_steps: Gradient-accumulation factor.
+        is_train: When ``False`` skips gradient computation and
+            returns only ``LossMetrics``.
+        straight_through_emulator: Optional STE callable applied to
+            the graphstate before the forward (QAT path).
 
     Returns:
-        Updated state and metrics (if training) or just metrics (if eval).
+        ``(new_state, metrics)`` when ``is_train`` is ``True``;
+        otherwise ``LossMetrics`` alone. ``metrics.other_metrics``
+        records the score, KL, mean oracle probability, and mean
+        policy log-prob for diagnostics.
     """
 
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -109,6 +143,22 @@ def nash_md_step(
     beta = jnp.asarray(beta, dtype=jnp.float32)
 
     def loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
+        """Compute the Nash-MD loss for one minibatch.
+
+        Computes per-token policy log-probabilities, evaluates the
+        ``beta * KL - (oracle_prob - 0.5) * policy_logp`` mirror-descent
+        objective against the precomputed reference per-token logps,
+        and records score / KL / probability / mean policy-logp as
+        diagnostics.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            minibatch: Dict carrying prompt and completion ids/masks,
+                ``ref_token_logps``, and the oracle ``probabilities``.
+
+        Returns:
+            ``(loss, metrics)`` ready for ``minibatch_call``.
+        """
         if is_train and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
@@ -178,6 +228,15 @@ def nash_md_step(
 
 
 def _nash_md_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the Nash-MD scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering ``beta``, the logprob vocab chunk size, the
+        partition spec, and the quantization emulator identity.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("beta", "logprob_vocab_chunk_size", "partition_spec"),
@@ -186,11 +245,30 @@ def _nash_md_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_nash_md_scheduled_loss(call):
+    """Build a SpectraX-scheduled Nash-MD scalar-loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` carrying loss config.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready for
+        :func:`spx.sxvalue_and_grad`.
+    """
     beta = jnp.asarray(call.get("beta"), dtype=jnp.float32)
     logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the scalar Nash-MD loss inside the SpectraX scheduled VJP.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            batch: Minibatch dict with prompt / completion ids, masks,
+                ``ref_token_logps`` and ``probabilities``.
+
+        Returns:
+            The scalar Nash-MD loss.
+        """
         module = bind_scheduled_module(call, tree)
         batch = constrain_scheduled_batch(module, batch, partition_spec)
         completion_mask = batch["completion_mask"]

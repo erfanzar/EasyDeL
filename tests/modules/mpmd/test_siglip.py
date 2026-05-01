@@ -31,7 +31,7 @@ class TestSigLIP:
         return ed.SiglipVisionConfig(
             hidden_size=512,
             intermediate_size=1024,
-            num_hidden_layers=2,
+            num_hidden_layers=small_model_config["num_hidden_layers"],
             num_attention_heads=4,
             image_size=384,
             patch_size=14,
@@ -44,7 +44,7 @@ class TestSigLIP:
             vocab_size=small_model_config["vocab_size"],
             hidden_size=512,
             intermediate_size=1024,
-            num_hidden_layers=2,
+            num_hidden_layers=small_model_config["num_hidden_layers"],
             num_attention_heads=4,
             max_position_embeddings=128,  # Must be >= sequence_length (128)
         )

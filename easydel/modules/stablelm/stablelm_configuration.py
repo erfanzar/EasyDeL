@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the StableLM model family.
+
+Defines :class:`StableLmConfig`, the EasyDeL configuration object for
+Stability AI's StableLM dense decoder-only architecture. Distinguishing
+features include LayerNorm normalization, partial RoPE on a subset of
+head dimensions (``partial_rotary_factor``), optional QK LayerNorm, and
+configurable attention/MLP biases.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

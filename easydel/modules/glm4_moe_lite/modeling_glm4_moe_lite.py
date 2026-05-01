@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of GLM-4-MoE-Lite.
+
+GLM-4-MoE-Lite is a lightweight MoE variant of GLM-4 that combines
+Multi-head Latent Attention (MLA) with a hybrid dense/grouped-MoE FFN
+schedule. MLA replaces the full Q/K/V projection set with a low-rank
+compression of the KV cache, drastically reducing memory while preserving
+representational capacity.
+
+Architectural traits:
+    - Multi-head Latent Attention with separate compressed KV cache views.
+    - Grouped top-k MoE routing with shared (always-on) experts.
+    - First ``first_k_dense_replace`` layers use a dense MLP; remaining
+      layers use the MoE block.
+    - Pre-norm RMSNorm decoder layers with partial RoPE.
+
+Exports:
+    - :class:`Glm4MoeLiteModel`: Backbone returning hidden states.
+    - :class:`Glm4MoeLiteForCausalLM`: Decoder LM with optional tied LM head.
+"""
+
 import functools
 import typing
 from functools import partial
@@ -231,11 +251,23 @@ class Glm4MoeLiteMLPStack(spx.Module):
 
 
 class Glm4MoeLiteTopKRouter(spx.Module):
-    """Top-K expert router for GLM-4-MoE-Lite with grouped expert selection.
+    """fp32 router projection feeding the grouped top-k selector in :class:`Glm4MoeLiteMoE`.
 
-    Implements routing using a learned weight matrix and e-score correction bias
-    for improved load balancing. Computes router logits via matrix multiplication
-    in float32 precision for numerical stability.
+    Owns only the *projection* parameters — the actual grouped top-k logic
+    lives in :meth:`Glm4MoeLiteMoE._select_experts_static`. The two stored
+    parameters are:
+
+    - ``weight``: ``(hidden_size, n_routed_experts)`` learned matrix used to
+      produce the per-expert pre-bias logits.
+    - ``e_score_correction_bias``: ``(n_routed_experts,)`` learnable
+      load-balancing bias that is added to the sigmoid scores at
+      *selection* time only — never to the convex combination weights, so
+      the bias can drive load balancing without distorting expert
+      contributions.
+
+    The matmul is forced into float32 (regardless of activation dtype)
+    because the relative gaps between selected and rejected experts can
+    fall below bfloat16's resolution near initialisation.
     """
 
     def __init__(
@@ -270,12 +302,25 @@ class Glm4MoeLiteTopKRouter(spx.Module):
 
 
 class Glm4MoeLiteMoE(BaseMoeModule):
-    """Mixture-of-Experts feed-forward module for GLM-4-MoE-Lite.
+    """Sparse FFN with grouped sigmoid-top-k routing plus an always-on shared expert.
 
-    Combines the Top-K router, expert MLP stack, and shared experts into
-    a unified MoE layer. Routes tokens to selected experts using grouped
-    routing with sigmoid scoring and e-score correction, then combines
-    outputs with shared expert outputs.
+    Identical routing protocol to :class:`Glm4MoeMoE` (DeepSeek-style
+    grouped top-k with bias-corrected sigmoid scoring; see that class's
+    docstring for the full algorithm) but configured for the *Lite*
+    parameter regime: smaller ``n_routed_experts``, smaller
+    ``moe_intermediate_size``, and a single layer-uniform routing schedule
+    with no first-K-dense replacement at this level (the dense/sparse mix
+    is decided one level up at the decoder layer).
+
+    The convex combination is
+
+        ``out = shared(h) + sum_i w_i * routed_i(h)``
+
+    with ``shared`` widened by ``n_shared_experts`` (so the shared branch
+    matches the aggregate capacity of the selected routed branch). When
+    ``n_shared_experts == 0`` the shared expert is omitted entirely. The
+    ``moe_call`` parent dispatch sorts tokens by expert and runs all
+    routed-expert kernels through ``grouped_matmul``.
     """
 
     def __init__(
@@ -397,12 +442,32 @@ class Glm4MoeLiteMoE(BaseMoeModule):
 
 
 class Glm4MoeLiteAttention(UnifiedAttention):
-    """Multi-head Latent Attention (MLA) for GLM-4-MoE-Lite.
+    """DeepSeek-style Multi-head Latent Attention with split-RoPE heads and YaRN mscale.
 
-    Implements attention with low-rank KV/Q compression using LoRA-style
-    projections. Queries are compressed via q_a_proj/q_b_proj and KV pairs
-    via kv_a_proj/kv_b_proj, with separate nope and rope head dimensions.
-    Supports YaRN-based mscale softmax scaling for extended context.
+    Same MLA layout used in DeepSeek-V2/V3 and the GlmMoeDsaAttention sibling
+    class, minus the dynamic-sparse indexer:
+
+    - **Query LoRA** ``hidden -> q_lora_rank -> num_heads * q_head_dim`` when
+      ``q_lora_rank`` is set (skipped, i.e., a single dense ``q_proj``, when
+      it is ``None``/0).
+    - **KV compression** ``hidden -> kv_lora_rank (+ qk_rope_head_dim) ->
+      num_kv_heads * (qk_nope + v_head_dim)`` storing only the
+      ``kv_lora_rank``-dimensional latent in the KV cache rather than the
+      full keys and values.
+    - **Split-RoPE heads**: ``q_head_dim = qk_nope_head_dim + qk_rope_head_dim``
+      with RoPE applied only to the trailing ``qk_rope_head_dim`` slice; the
+      ``qk_nope_head_dim`` slice carries content-only matching. Values use
+      a separate ``v_head_dim`` because they need no rotated component.
+    - **YaRN mscale** at ``softmax_scale`` time: when long-context RoPE
+      scaling is configured, the softmax temperature is multiplied by the
+      :func:`yarn_get_mscale` factor so the effective attention temperature
+      matches the rescaled RoPE frequencies — this avoids the classic
+      attention sharpening that otherwise plagues NTK-style RoPE scaling
+      at very long contexts.
+
+    The ``projection_mapping`` class variable rewrites the ``UnifiedAttention``
+    factory's logical names into the HF-DeepSeek attribute names so released
+    checkpoints load directly.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {

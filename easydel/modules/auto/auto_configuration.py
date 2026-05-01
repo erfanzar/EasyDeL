@@ -11,6 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Auto-discovery utilities for EasyDeL configurations and shard/gather plans.
+
+This module exposes:
+
+- :func:`get_modules_by_type` — resolve ``(config_cls, module_cls)`` from a
+  registered ``model_type`` and :class:`TaskType`.
+- :func:`infer_task_from_hf_config` — read a HuggingFace ``config.json`` (local
+  or hub) and map ``architectures[0]`` to a :class:`TaskType`.
+- :func:`normalize_task` — normalize loose strings/aliases to :class:`TaskType`.
+- :class:`AutoEasyDeLConfig` — load the correct ``EasyDeLBaseConfig`` subclass
+  for a HuggingFace identifier or local path.
+- :class:`AutoShardAndGatherFunctions` — build per-leaf shard/gather closures
+  from a config, a lazy-initialized module, or raw params + mesh; used to move
+  HF/PyTorch tensors onto the JAX device mesh and back.
+"""
+
 import json
 import typing as tp
 from collections.abc import Callable, Mapping, Sequence
@@ -41,10 +57,24 @@ def get_modules_by_type(
     model_type: str,
     task_type: TaskType,
 ) -> tuple[type[EasyDeLBaseConfig], type[EasyDeLBaseModule] | tp.Any]:
-    """
-    The get_modules_by_type function is a helper function that returns the following:
-        1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
-        2. The EasyDeL Model class for the model type specified (e.g., LlamaForCausalLM, FalconForCausalLM)
+    """Resolve a registered ``(config, module)`` pair for ``(model_type, task)``.
+
+    Looks the registration up in :data:`easydel.infra.factory.registry`, the
+    same registry populated by :func:`register_config` and
+    :func:`register_module` decorators on each model file.
+
+    Args:
+        model_type (str): HuggingFace-style ``model_type`` string (e.g.
+            ``"llama"``, ``"deepseek_v3"``).
+        task_type (TaskType): Task slot to fetch (``CAUSAL_LM``,
+            ``SEQUENCE_CLASSIFICATION``, …).
+
+    Returns:
+        tuple: ``(config_cls, module_cls)`` — for example,
+        ``(LlamaConfig, LlamaForCausalLM)``.
+
+    Raises:
+        KeyError: If no registration exists for the requested pair.
     """
     registred_module = registry.get_module_registration(
         task_type=task_type,
@@ -54,15 +84,20 @@ def get_modules_by_type(
 
 
 def is_flatten(pytree: dict):
-    """The is_flatten function checks if the pytree is flattened.
-        If it is, then the first key in the dictionary will be a tuple of (mpl, mpl_id).
-        Otherwise, it will be an integer representing mpl_id.
+    """Detect whether ``pytree`` is in the flattened-keys form used here.
+
+    The shard/gather code paths above represent pytrees in two equivalent
+    layouts: nested dicts (``{"layers": {"0": {"q_proj": ...}}}``) and
+    flattened dicts whose keys are tuples of path components
+    (``{("layers", "0", "q_proj"): ...}``). The check inspects the first key
+    only — both flatten / unflatten in this module guarantee homogeneous keys.
 
     Args:
-        pytree: dict: Pass the pytree to the function
+        pytree (dict): Either a nested or flattened pytree dict.
 
     Returns:
-        True if the pytree is a flattened tree, and false otherwise
+        bool: ``True`` if the first key is a ``tuple`` (flattened form),
+        ``False`` otherwise.
     """
     mpl = next(iter(pytree.keys()))
     return True if isinstance(mpl, tuple) else False
@@ -255,6 +290,25 @@ class AutoEasyDeLConfig:
 
     @staticmethod
     def bind_model_task(model_task: TaskType, architectures: list[str] | str):
+        """Resolve ``TaskType.AUTO_BIND`` to the concrete task of an EasyDeL class.
+
+        When ``model_task`` is :attr:`TaskType.AUTO_BIND`, looks up the named
+        architecture in the top-level ``easydel`` namespace and returns its
+        ``_model_task``. Otherwise returns ``model_task`` unchanged.
+
+        Args:
+            model_task (TaskType): Requested task. ``AUTO_BIND`` triggers lookup;
+                any other value is returned as-is.
+            architectures (list[str] | str): HF architecture name(s) from the
+                model config. A list must contain exactly one entry.
+
+        Returns:
+            TaskType: The resolved task type.
+
+        Raises:
+            AssertionError: If ``architectures`` is a list of length != 1, or
+                if the architecture name cannot be resolved on ``easydel``.
+        """
         if model_task == TaskType.AUTO_BIND:
             if isinstance(architectures, list):
                 assert len(architectures) == 1, "AutoBind is not supported for multi architecture loading!"
@@ -280,23 +334,50 @@ class AutoEasyDeLConfig:
         from_torch: bool = False,
         **kwargs,
     ) -> EasyDeLBaseConfig:
-        """The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
-        model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
-        the class corresponding to your model, with all weights loaded from disk.
+        """Load and finalize an :class:`EasyDeLBaseConfig` for a HF identifier or local path.
+
+        Pipeline:
+
+        1. Read the upstream HF ``config.json`` (via ``EasyDeLBaseConfig`` or
+           ``transformers.AutoConfig``, depending on ``from_torch``).
+        2. Cross-check against the ``trust_remote_code`` HF config in case the
+           dynamic ``model_type`` differs from the static one.
+        3. Resolve ``model_task`` (``AUTO_BIND`` infers it from
+           ``architectures[0]``; otherwise the value is honoured as-is).
+        4. Look up the registered EasyDeL config class via
+           :func:`get_modules_by_type` and reload through it so
+           model-specific defaults run.
+        5. Apply ``add_basic_configurations`` to attach the mesh / sharding
+           layout, then splat ``**kwargs`` as attribute overrides.
 
         Args:
-            cls: Create an instance of the class that called this function.
-            pretrained_model_name_or_path: str: Identify the model in the huggingface model hub.
-            sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded
-                model_tasking arrays in easydel.
-            backend: tp.Optional[EasyDeLBackends] : backend to use for model.
-                        model_task (TaskType): Task type of model load and find.
-            from_torch: should config be loaded from torch models or not.
-            **kwargs: Pass additional arguments to the model and config classes.
-        generation process
+            pretrained_model_name_or_path (str): HF Hub repo id or local
+                directory containing a ``config.json``.
+            sharding_axis_dims (Sequence[int], optional): Mesh shape across
+                ``(pp, dp, fsdp, ep, tp, sp)``. Defaults to
+                ``(1, 1, -1, 1, 1, 1)``.
+            sharding_dcn_axis_dims (Sequence[int] | None, optional): Optional
+                outer DCN mesh shape. Defaults to ``None``.
+            sharding_axis_names (Sequence[str], optional): Axis names paired
+                with ``sharding_axis_dims``.
+            partition_axis (PartitionAxis | None, optional): Per-tensor
+                sharding policy; default :class:`PartitionAxis` is used when
+                ``None``.
+            backend (EasyDeLBackends | None, optional): Custom-kernel backend
+                hint forwarded to the config.
+            platform (EasyDeLPlatforms | None, optional): Target platform
+                hint forwarded to the config.
+            model_task (TaskType, optional): Task slot to register against.
+                ``AUTO_BIND`` triggers architecture-based inference. Defaults
+                to ``TaskType.AUTO_BIND``.
+            from_torch (bool, optional): Bypass the EasyDeL config registry and
+                read with ``transformers.AutoConfig`` directly. Defaults to
+                ``False``.
+            **kwargs: Additional attributes copied onto the resulting config
+                via ``setattr`` (overrides any value set above).
 
         Returns:
-            A Model Config
+            EasyDeLBaseConfig: The fully resolved, mesh-aware model config.
         """
         if partition_axis is None:
             partition_axis = PartitionAxis()
@@ -382,20 +463,27 @@ def _shard_gather_fns_from_named_shardings(
 
 
 class AutoShardAndGatherFunctions:
-    """
-    A class to automatically generate shard and gather functions for a given model configuration.
+    """Factory of per-leaf shard / gather closures for an EasyDeL model.
 
-    This class provides two methods to generate shard and gather functions:
+    Used during checkpoint loading to move HF / PyTorch tensors onto the JAX
+    device mesh (``shard_fns``) and during checkpoint saving / extraction to
+    pull them back to the host (``gather_fns``). The closures are organised in
+    a pytree mirroring the model's parameter pytree, optionally flattened to a
+    ``{(path,): fn}`` dict via :func:`is_flatten`.
 
-    - `from_config`: Generates functions based on a provided `EasyDeLBaseConfig` object.
-    - `from_pretrained`: Generates functions based on a pretrained model name or path.
+    Three entry points cover the common loading flows:
 
-    Attributes:
-        None
+    * :meth:`from_config` — given an :class:`EasyDeLBaseConfig`, performs a
+      full ``module.lazy_init`` to derive shapes/shardings (slow on large
+      models but the most common path).
+    * :meth:`from_model` — cheap path when a ``lazy_init`` already happened;
+      reads the live ``NamedSharding`` from each Variable, preserving
+      pipeline-stage submeshes (MPMD-safe).
+    * :meth:`from_params` — derive from raw params + a mesh, replicating
+      every leaf with a default ``PartitionSpec()``.
 
-    Methods:
-        from_config: Generates shard and gather functions based on a provided `EasyDeLBaseConfig` object.
-        from_pretrained: Generates functions based on a pretrained model name or path.
+    See also :func:`_shard_gather_fns_from_named_shardings` for the MPMD-aware
+    builder used internally.
     """
 
     @classmethod

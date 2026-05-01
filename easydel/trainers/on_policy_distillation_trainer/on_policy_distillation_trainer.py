@@ -90,6 +90,27 @@ class OnPolicyDistillationTrainer(Trainer):
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
     ):
+        """Initialize the on-policy distillation trainer.
+
+        Args:
+            arguments (OnPolicyDistillationConfig): Training configuration.
+            processing_class (ProcessingClassType): Tokenizer or processor
+                used for both prompt encoding and generation.
+            student_model (EasyDeLBaseModule | EasyDeLState | None): The
+                student model to be trained. Plain modules are converted to
+                a state via ``model.to_state(...)``.
+            teacher_model (EasyDeLBaseModule | EasyDeLState | None): The
+                frozen teacher model. Plain modules are converted to a
+                state.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Prompt-only training dataset.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation dataset(s).
+
+        Raises:
+            TypeError: If ``arguments`` is not an
+                :class:`OnPolicyDistillationConfig`.
+        """
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
             tokenizer = processing_class.tokenizer
@@ -123,7 +144,22 @@ class OnPolicyDistillationTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
-        """Get preprocessing transform for prompt-only datasets."""
+        """Build the lazy prompt-only preprocessing transform for the training source.
+
+        On-policy distillation trains on the *student's own generations*,
+        so the dataset only needs to provide prompts. The transform
+        reuses the GRPO-style :class:`GRPOPreprocessTransform`, which
+        applies the chat template (when ``skip_apply_chat_template`` is
+        False), tokenises the prompt, and left-pads / truncates it to
+        ``arguments.max_prompt_length``. It is intentionally lazy so the
+        per-sample work happens inside the data loader instead of an
+        eager ``Dataset.map``.
+
+        Returns:
+            A configured :class:`GRPOPreprocessTransform`, or ``None``
+            when :meth:`_is_pretokenized` reports that the source already
+            emits ``input_ids`` and the transform would be a no-op.
+        """
         if self._is_pretokenized():
             return None
         return GRPOPreprocessTransform(
@@ -133,7 +169,18 @@ class OnPolicyDistillationTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check whether the source already yields token IDs."""
+        """Check whether the bound training source already exposes tokenised prompts.
+
+        Peeks at the first row of the first shard and reports whether
+        the column ``"input_ids"`` is present. This is the signal the
+        trainer uses to skip :class:`GRPOPreprocessTransform` and feed
+        rows directly to the prompt collator.
+
+        Returns:
+            ``True`` when the first sample of the first shard contains
+            ``"input_ids"``; ``False`` if the source is unset, the shard
+            is empty, or the field is absent.
+        """
         if self._train_source is None:
             return False
         try:
@@ -147,7 +194,27 @@ class OnPolicyDistillationTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create Grain data collator for prompt-only batches."""
+        """Construct the Grain collator that left-pads prompt-only batches.
+
+        On-policy distillation only batches *prompts* prior to
+        generation; completions are produced inside
+        :meth:`_preprocess_batch_input`. The collator therefore left-
+        pads tokenised prompts to ``arguments.max_prompt_length`` using
+        the resolved ``self.padding_value`` so that generation receives a
+        contiguous, right-aligned prefix.
+
+        Args:
+            max_sequence_length: Accepted for interface compatibility
+                with :class:`Trainer`; the prompt budget is taken from
+                the config.
+            truncation_mode: Accepted for interface compatibility with
+                :class:`Trainer`; unused -- the GRPO collator left-pads
+                rather than truncating.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorGrain` bound to the
+            configured prompt length and pad token.
+        """
         from ..utils import GRPODataCollatorGrain
 
         return GRPODataCollatorGrain(
@@ -160,7 +227,23 @@ class OnPolicyDistillationTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create TFDS data collator for prompt-only batches."""
+        """Construct the TFDS collator that left-pads prompt-only batches.
+
+        TFDS analogue of :meth:`create_grain_collect_function`. The
+        returned collator pads tokenised prompts to
+        ``arguments.max_prompt_length`` with ``self.padding_value`` and
+        does not produce any completion tensors -- those are generated
+        on-the-fly during :meth:`_preprocess_batch_input`.
+
+        Args:
+            max_sequence_length: Accepted for interface compatibility
+                with :class:`Trainer`; ignored.
+            truncation_mode: Accepted for interface compatibility with
+                :class:`Trainer`; ignored.
+
+        Returns:
+            A freshly built :class:`GRPODataCollatorTFDS`.
+        """
         from ..utils import GRPODataCollatorTFDS
 
         return GRPODataCollatorTFDS(
@@ -169,10 +252,38 @@ class OnPolicyDistillationTrainer(Trainer):
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile the training and evaluation step functions.
+        """Compile the training/eval distillation steps with teacher-state plumbing.
+
+        The on-policy distillation step takes the *student* state (which
+        is differentiated/optimised), the prepared batch, and the
+        *teacher* state (frozen, no gradient) as positional inputs. The
+        method:
+
+        * Resolves the optional straight-through emulator from the
+          configured quantisation knobs so the student forward can be
+          traced under simulated quantisation while keeping the gradient
+          path differentiable.
+        * Caches static argument tuples for both train and eval; the
+          eval tuple sets ``is_training=False`` and clears the
+          straight-through emulator.
+        * JITs :func:`on_policy_distillation_step` twice -- once with
+          state donation and full ``(state, metrics)`` outputs for
+          training, once without donation and metrics-only output for
+          evaluation. The student state is donated, the batch and
+          metrics ride on a replicated sharding, and the teacher state
+          flows through with its own resident sharding so the teacher
+          forward never gets re-sharded.
+        * Computes the per-token FLOP overhead added by the teacher
+          forward (with both loss and backward semantics enabled by
+          ``flops_per_token``) and stashes it under
+          ``self._extra_forward_flops_per_token`` /
+          ``self._extra_backward_flops_per_token`` for downstream
+          throughput accounting.
 
         Returns:
-            TrainerConfigureFunctionOutput with compiled step functions.
+            A :class:`TrainerConfigureFunctionOutput` carrying the two
+            compiled step functions, the active mesh, and the streaming
+            checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
@@ -253,6 +364,21 @@ class OnPolicyDistillationTrainer(Trainer):
         This is the core on-policy step: prompts are extracted from the batch,
         completions are generated (outside gradient computation), and the full
         sequences are assembled for the distillation step function.
+
+        Args:
+            state (EasyDeLState): Current student state, used as the generator
+                state when ``generate_with_teacher`` is False.
+            batch (dict[str, tp.Any]): Raw input batch with at minimum
+                ``input_ids`` and ``attention_mask`` for prompts.
+            is_train (bool): Whether this preprocessing is for training
+                (currently unused -- behavior is identical for eval).
+
+        Returns:
+            tuple[dict[str, tp.Any], dict[str, float | int | str]]: A pair of
+            (prepared_batch, auxiliary_metrics). ``prepared_batch`` contains
+            ``input_ids``, ``attention_mask``, and ``completion_mask`` for the
+            full prompt+completion sequence; auxiliary metrics include
+            generation/preprocessing wallclock and mean completion length.
         """
         batch = self._purify_batch(batch)
 
@@ -341,8 +467,18 @@ class OnPolicyDistillationTrainer(Trainer):
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Extra positional args appended to the training step call.
+
+        Returns:
+            tuple[tp.Any]: Single-element tuple containing the teacher state.
+        """
         return (self.teacher_state,)
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Extra positional args appended to the evaluation step call.
+
+        Returns:
+            tuple[tp.Any]: Single-element tuple containing the teacher state.
+        """
         return (self.teacher_state,)

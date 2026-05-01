@@ -11,15 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FalconMamba models (EasyDeL / JAX).
+"""Spectrax implementation of FalconMamba — pure-Mamba decoder-only LLM.
 
-Implements:
-    - `FalconMambaModel`: base decoder-only backbone.
-    - `FalconMambaForCausalLM`: causal LM head on top of the backbone.
+FalconMamba replaces attention entirely with Mamba selective state-space
+mixers (SSMs). Each layer is a single SSM mixer + residual; there is no
+attention, no RoPE, and no KV cache. Decoding uses EasyDeL's
+:class:`RecurrentCache` to thread the SSM hidden state across steps.
 
-The implementation mirrors the HuggingFace reference (PyTorch) but uses
-EasyDeL's spectrax modules, sharding-aware linear layers, and the unified
-`RecurrentCache` interface for decoding.
+Helpers:
+
+- :func:`rms_forward` — stateless RMS normalization helper used inside the
+  mixer.
+
+Building blocks:
+
+- :class:`Conv1D` — depthwise causal convolution used at the front of the
+  Mamba mixer.
+- :class:`FalconMambaMixer` — full Mamba mixer (in-proj, conv, dt/B/C
+  projections, SSM scan, gated norm, out-proj).
+- :class:`FalconMambaBlock` — single decoder layer (RMSNorm + mixer +
+  residual).
+
+Output dataclasses :class:`FalconMambaOutput` and
+:class:`FalconMambaCausalLMOutput` extend the base output to carry the
+recurrent cache through the call chain.
+
+Public model classes (registered with the factory):
+
+- :class:`FalconMambaModel` — base recurrent decoder.
+- :class:`FalconMambaForCausalLM` — causal LM head.
 
 HuggingFace reference:
     https://github.com/huggingface/transformers/blob/main/src/transformers/models/falcon_mamba/modeling_falcon_mamba.py

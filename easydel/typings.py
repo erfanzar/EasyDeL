@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Typed configuration helpers for EasyDeL.
+
+This module provides the small machinery EasyDeL uses to write configuration
+classes whose schema is expressed once as a ``TypedDict`` (so that
+``Unpack[Spec]`` annotations on ``**kwargs`` work cleanly) while still getting
+runtime conveniences such as defaults, validation, ``from_dict`` /
+``to_dict`` round-tripping, and immutable updates via ``replace``.
+
+Two patterns are supported:
+
+* :func:`typed_config` (preferred) — decorate a ``TypedDict`` and the same
+  class gains ``from_dict``, ``coerce_config``, ``to_dict``, ``replace``
+  helpers that return a per-spec :class:`ConfigDict` (a ``dict`` subclass with
+  attribute access). The class itself remains a ``TypedDict`` to type
+  checkers, so ``Unpack[MyConfig]`` keeps working.
+* :func:`typed_config_dataclass` (legacy) — synthesizes a regular dataclass
+  derived from :class:`ConfigDataclass` from a ``TypedDict`` spec.
+
+Public exports: :class:`ConfigDataclass`, :class:`ConfigDict`,
+:func:`typed_config`, :func:`typed_config_dataclass`.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -54,27 +76,80 @@ class ConfigDict(dict):
     __spec__: tp.ClassVar[type | None] = None
 
     def __getattr__(self, name: str) -> tp.Any:
+        """Return ``self[name]`` for attribute-style access.
+
+        Args:
+            name: Field name to look up.
+
+        Returns:
+            The value stored at ``name``.
+
+        Raises:
+            AttributeError: If ``name`` is not a key of the dict.
+        """
         try:
             return self[name]
         except KeyError as e:
             raise AttributeError(name) from e
 
     def __setattr__(self, name: str, value: tp.Any) -> None:
+        """Set ``self[name] = value`` via attribute-style assignment.
+
+        Args:
+            name: Field name to assign.
+            value: Value to store under ``name``.
+        """
         self[name] = value
 
     def __delattr__(self, name: str) -> None:
+        """Remove ``self[name]`` via ``del instance.name``.
+
+        Args:
+            name: Field name to delete.
+
+        Raises:
+            AttributeError: If ``name`` is not present.
+        """
         try:
             del self[name]
         except KeyError as e:
             raise AttributeError(name) from e
 
     def to_dict(self) -> dict[str, tp.Any]:
+        """Return a plain ``dict`` deeply unwrapping nested ``ConfigDict`` values.
+
+        Nested :class:`ConfigDict`/:class:`ConfigDataclass`/dataclass values are
+        converted to plain Python containers so that the result is safe for
+        JSON-style serialization.
+
+        Returns:
+            A new ``dict`` with the same fields as ``self`` and all values
+            converted to plain Python types.
+        """
         return {k: _config_to_plain(v) for k, v in self.items()}
 
     def as_dict(self) -> dict[str, tp.Any]:
+        """Alias for :meth:`to_dict`.
+
+        Returns:
+            A plain ``dict`` representation of the config.
+        """
         return self.to_dict()
 
     def replace(self, **updates: tp.Any) -> "ConfigDict":
+        """Return a new instance with the given fields replaced.
+
+        When the originating spec is known the call is routed through
+        ``spec.from_dict`` so that defaults, coercion and ``post_init`` run on
+        the merged result. Otherwise a shallow copy with ``updates`` applied is
+        returned.
+
+        Args:
+            **updates: Field names and values to override on the new instance.
+
+        Returns:
+            A new ``ConfigDict`` instance with the requested updates applied.
+        """
         spec = type(self).__spec__
         if spec is not None and hasattr(spec, "from_dict"):
             return spec.from_dict(self, **updates)
@@ -141,6 +216,15 @@ def typed_config(
     """
 
     def wrap(spec: type) -> type:
+        """Bind the runtime helpers to ``spec`` and return it.
+
+        Args:
+            spec: The ``TypedDict`` class being decorated.
+
+        Returns:
+            ``spec`` itself, mutated to gain ``from_dict``, ``coerce_config``
+            and the runtime per-spec instance class.
+        """
         defaults_ = dict(defaults or {})
         ns = dict(namespace or {})
 
@@ -185,6 +269,25 @@ def typed_config(
 
         @classmethod
         def from_dict(cls, data=None, **overrides):
+            """Build a per-spec :class:`ConfigDict` instance.
+
+            Existing instance values are returned (or merged with overrides).
+            Mappings are validated against ``required``/``optional`` keys,
+            populated with defaults, coerced via :func:`_coerce_value`, and
+            then handed to ``post_init`` (if any).
+
+            Args:
+                cls: The decorated TypedDict spec.
+                data: Optional mapping or existing instance.
+                **overrides: Field overrides taking precedence over ``data``.
+
+            Returns:
+                A populated ``ConfigDict`` instance for this spec.
+
+            Raises:
+                TypeError: For non-mapping ``data``, unknown fields or missing
+                    required fields.
+            """
             if isinstance(data, instance_cls):
                 if not overrides:
                     return data
@@ -244,6 +347,15 @@ def typed_config(
 
 
 def _strip_required(annotation: tp.Any) -> tp.Any:
+    """Unwrap ``Required[T]``/``NotRequired[T]`` to ``T``.
+
+    Args:
+        annotation: A possibly-wrapped TypedDict field annotation.
+
+    Returns:
+        The inner annotation, or ``annotation`` unchanged when it is not a
+        ``Required``/``NotRequired`` wrapper.
+    """
     origin = tp.get_origin(annotation)
     if origin in (tp.Required, tp.NotRequired):
         return tp.get_args(annotation)[0]
@@ -251,6 +363,17 @@ def _strip_required(annotation: tp.Any) -> tp.Any:
 
 
 def _copy_default(value: tp.Any) -> tp.Any:
+    """Shallow-copy a default value if it is a mutable container.
+
+    Mutable defaults (``dict``/``list``/``set``) are copied so that distinct
+    instances don't accidentally share state. Anything else is returned as-is.
+
+    Args:
+        value: The default value as recorded for a config field.
+
+    Returns:
+        ``value`` itself, or a shallow copy when it is a mutable container.
+    """
     if isinstance(value, dict):
         return dict(value)
     if isinstance(value, list):
@@ -261,6 +384,20 @@ def _copy_default(value: tp.Any) -> tp.Any:
 
 
 def _coerce_value(annotation: tp.Any, value: tp.Any) -> tp.Any:
+    """Coerce ``value`` to match ``annotation`` when possible.
+
+    Handles ``Union``/``Optional`` annotations, nested ``TypedDict`` config
+    classes, ``ConfigDataclass`` subclasses and the standard parametric
+    container types (``tuple``, ``list``, ``dict``). Falls back to returning
+    ``value`` unchanged when no specific coercion rule applies.
+
+    Args:
+        annotation: The field's resolved type annotation, or ``None``.
+        value: The raw value to coerce.
+
+    Returns:
+        A coerced value, or ``value`` unchanged when no rule matches.
+    """
     if annotation is None or value is None:
         return value
 
@@ -286,6 +423,19 @@ _COERCE_FAIL = object()
 
 
 def _try_coerce(annotation: tp.Any, value: tp.Any) -> tp.Any:
+    """Attempt to coerce ``value`` for a non-``Union`` annotation.
+
+    Returns the sentinel ``_COERCE_FAIL`` when the annotation describes a
+    container/config target but the value can't be promoted. Callers use this
+    sentinel to decide whether to fall through to other ``Union`` variants.
+
+    Args:
+        annotation: A non-Union type annotation.
+        value: Raw value to attempt to coerce.
+
+    Returns:
+        The coerced value, or ``_COERCE_FAIL`` when no coercion applies.
+    """
     origin = tp.get_origin(annotation)
     args = tp.get_args(annotation)
 
@@ -319,7 +469,15 @@ def _try_coerce(annotation: tp.Any, value: tp.Any) -> tp.Any:
 
 
 def _config_target(annotation: tp.Any) -> type | None:
-    """Return the config class to coerce a Mapping into, or None if N/A."""
+    """Return the config class to coerce a Mapping into, or None if N/A.
+
+    Args:
+        annotation: Any field type annotation.
+
+    Returns:
+        The associated ``typed_config`` spec or ``ConfigDataclass`` subclass
+        when ``annotation`` refers to one, else ``None``.
+    """
     if isinstance(annotation, type):
         if hasattr(annotation, "__typed_config_instance_cls__"):
             return annotation
@@ -329,6 +487,19 @@ def _config_target(annotation: tp.Any) -> type | None:
 
 
 def _config_to_plain(value: tp.Any) -> tp.Any:
+    """Recursively convert config-aware containers to plain Python objects.
+
+    ``ConfigDict``/``ConfigDataclass``/dataclass values are unwrapped via their
+    own ``to_dict`` (or via ``dataclasses.fields``). Standard containers
+    (``tuple``/``list``/``dict``) are walked element-wise. All other values
+    pass through unchanged.
+
+    Args:
+        value: Any value, possibly nested.
+
+    Returns:
+        A structurally-equivalent value built from plain Python containers.
+    """
     if isinstance(value, ConfigDict):
         return value.to_dict()
     if isinstance(value, ConfigDataclass):
@@ -360,6 +531,15 @@ class ConfigDataclass:
     """
 
     def to_dict(self) -> dict[str, tp.Any]:
+        """Return a plain dict of init-fields with nested configs unwrapped.
+
+        Returns:
+            A new ``dict`` keyed by init-field name, with values converted to
+            plain Python types via :func:`_config_to_plain`.
+
+        Raises:
+            TypeError: If ``self`` is not a dataclass instance.
+        """
         if not dataclasses.is_dataclass(self):
             raise TypeError(f"{type(self).__name__} must be a dataclass to use to_dict().")
         return {
@@ -367,15 +547,47 @@ class ConfigDataclass:
         }
 
     def as_dict(self) -> dict[str, tp.Any]:
+        """Alias for :meth:`to_dict`.
+
+        Returns:
+            A plain ``dict`` representation of the dataclass.
+        """
         return self.to_dict()
 
     @classmethod
     def coerce_config(cls: type[T], value: Mapping[str, tp.Any] | None = None) -> T:
-        """Coerce ``value`` (None / Mapping / instance) into a ``cls`` instance."""
+        """Coerce ``value`` (None / Mapping / instance) into a ``cls`` instance.
+
+        Args:
+            value: ``None`` (build with defaults), a mapping (route through
+                :meth:`from_dict`), or an existing instance of ``cls``.
+
+        Returns:
+            A ``cls`` instance equivalent to ``value``.
+        """
         return cls.from_dict(value)
 
     @classmethod
     def from_dict(cls: type[T], data: Mapping[str, tp.Any] | None = None, **overrides: tp.Any) -> T:
+        """Build a ``cls`` instance from a mapping plus keyword overrides.
+
+        Already-constructed ``cls`` values are returned unchanged. Unknown
+        fields raise ``TypeError``. Field values are run through
+        :func:`_coerce_value` using the resolved type hints.
+
+        Args:
+            data: Mapping of field values, or an existing ``cls`` instance, or
+                ``None`` to build solely from ``overrides`` and defaults.
+            **overrides: Per-field values that take precedence over ``data``.
+
+        Returns:
+            A new instance of ``cls`` populated from ``data`` and ``overrides``.
+
+        Raises:
+            TypeError: If ``data`` is neither ``None``, a mapping, nor an
+                instance of ``cls``, or if any of the supplied keys is not a
+                declared field of ``cls``.
+        """
         if isinstance(data, cls):
             return data
         if data is None:
@@ -401,6 +613,14 @@ class ConfigDataclass:
         return cls(**kwargs)
 
     def replace(self: T, **updates: tp.Any) -> T:
+        """Return a copy of ``self`` with the given fields replaced.
+
+        Args:
+            **updates: Field names mapped to their new values.
+
+        Returns:
+            A new instance with ``updates`` applied via ``dataclasses.replace``.
+        """
         return dataclasses.replace(self, **updates)
 
 
@@ -411,7 +631,25 @@ def typed_config_dataclass(
     post_init: PostInit | None = None,
     namespace: Mapping[str, tp.Any] | None = None,
 ) -> type[ConfigDataclass]:
-    """Build a runtime dataclass from a ``TypedDict`` spec (legacy)."""
+    """Build a runtime dataclass from a ``TypedDict`` spec (legacy).
+
+    The resulting class is a subclass of :class:`ConfigDataclass` whose fields
+    mirror the ``TypedDict`` annotations. Fields wrapped in ``Required[]`` are
+    required at construction time; ``NotRequired[]`` and ``total=False`` fields
+    receive a ``None`` default unless overridden in ``defaults``.
+
+    Args:
+        spec: The ``TypedDict`` whose annotations describe the schema.
+        defaults: Per-field default values. Mutable defaults are converted to
+            ``default_factory`` to avoid shared state across instances.
+        post_init: Optional ``(instance) -> None`` validator/normalizer wired
+            up as ``__post_init__`` on the produced dataclass.
+        namespace: Extra attributes to attach to the produced class.
+
+    Returns:
+        A new dataclass type that subclasses :class:`ConfigDataclass` and has
+        the same name and module as ``spec``.
+    """
 
     defaults = dict(defaults or {})
     try:
@@ -439,6 +677,7 @@ def typed_config_dataclass(
     if post_init is not None:
 
         def __post_init__(self):
+            """Forward to the user-supplied ``post_init`` validator."""
             post_init(self)
 
         class_namespace["__post_init__"] = __post_init__
@@ -453,6 +692,16 @@ def typed_config_dataclass(
 
 
 def _unwrap_typeddict_requiredness(annotation: tp.Any) -> tuple[bool, tp.Any]:
+    """Split a TypedDict annotation into ``(required, inner_annotation)``.
+
+    Args:
+        annotation: The raw TypedDict field annotation.
+
+    Returns:
+        A pair ``(required, inner)`` where ``required`` is whether the field
+        is required (``Required[...]`` or absence of ``NotRequired[...]``) and
+        ``inner`` is the unwrapped annotation.
+    """
     origin = tp.get_origin(annotation)
     args = tp.get_args(annotation)
     if origin is tp.Required:
@@ -463,6 +712,18 @@ def _unwrap_typeddict_requiredness(annotation: tp.Any) -> tuple[bool, tp.Any]:
 
 
 def _default_field(value: tp.Any) -> dataclasses.Field:
+    """Build a ``dataclasses.field`` for the given default value.
+
+    Mutable defaults are wrapped in a ``default_factory`` returning a shallow
+    copy to keep instances independent.
+
+    Args:
+        value: The default value.
+
+    Returns:
+        A ``dataclasses.Field`` configured with either ``default`` or
+        ``default_factory`` as appropriate.
+    """
     if isinstance(value, (dict, list, set)):
         return dataclasses.field(default_factory=lambda value=value: value.copy())
     return dataclasses.field(default=value)

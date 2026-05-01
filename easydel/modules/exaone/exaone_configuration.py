@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the EXAONE family of decoder-only LLMs.
+
+Defines :class:`ExaoneConfig` for LG AI Research's EXAONE models — a
+GPT-style decoder with RoPE, optional GQA (``num_key_value_heads``), gated
+SiLU/SwiGLU MLPs, and RMSNorm. The HF config exposes ``num_layers`` while
+EasyDeL's :attr:`attribute_map` aliases it to the standard
+``num_hidden_layers``.
+"""
 
 from typing import ClassVar
 

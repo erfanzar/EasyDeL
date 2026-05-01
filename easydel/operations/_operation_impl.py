@@ -88,8 +88,15 @@ BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 
 @auto_pytree
 class OperationOutput:
-    """
-    This dataclass encapsulates the results computation
+    """Base pytree-compatible container for operation results.
+
+    Concrete operation outputs (such as ``AttentionOutput``) inherit from this
+    class. The ``@auto_pytree`` decoration ensures subclasses can be used inside
+    JAX transformations (``jit``, ``vmap``, ``scan``) without manual flatten/
+    unflatten registration.
+
+    Subclasses define operation-specific fields (e.g. attention weights, cache
+    views) on top of this empty base.
     """
 
 
@@ -173,8 +180,15 @@ class OperationImpl(BaseOperation):
         Assumes generation mode if the query sequence length dimension is 1.
 
         Args:
-            query: The query tensor.
-            BTHD: Boolean indicating tensor layout (True for B, T, H, D; False for B, H, T, D).
+            query: The query tensor with either ``(B, T, H, D)`` or
+                ``(B, H, T, D)`` layout depending on ``BTHD``.
+            BTHD: If True, treat the second dimension as sequence length
+                (``B, T, H, D`` layout). If False, treat the third dimension as
+                sequence length (``B, H, T, D`` layout). Defaults to True.
+
+        Returns:
+            ``common_types.MODE_DECODE`` when the query length is 1 (single-step
+            generation) and ``common_types.MODE_TRAIN`` otherwise.
         """
         in_generation = query.shape[1] == 1 if BTHD else query.shape[2] == 1
         return common_types.MODE_DECODE if in_generation else common_types.MODE_TRAIN

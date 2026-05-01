@@ -189,12 +189,36 @@ def _parse_action(item: Any) -> tuple[str, Any | None]:
 
 
 def _require_mapping(value: Any, *, ctx: str) -> dict[str, Any]:
+    """Assert that ``value`` is a dict and return it.
+
+    Args:
+        value: Value to validate.
+        ctx: Description used in the error message.
+
+    Returns:
+        The validated dictionary.
+
+    Raises:
+        SystemExit: If ``value`` is not a mapping.
+    """
     if not isinstance(value, dict):
         raise SystemExit(f"{ctx} must be a mapping/dict, got {type(value).__name__}.")
     return value
 
 
 def _require_str(value: Any, *, ctx: str) -> str:
+    """Assert that ``value`` is a non-empty string and return it.
+
+    Args:
+        value: Value to validate.
+        ctx: Description used in the error message.
+
+    Returns:
+        The validated string.
+
+    Raises:
+        SystemExit: If ``value`` is not a non-empty string.
+    """
     if not isinstance(value, str) or not value.strip():
         raise SystemExit(f"{ctx} must be a non-empty string.")
     return value

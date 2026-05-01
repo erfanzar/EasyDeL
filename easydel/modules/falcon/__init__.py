@@ -42,7 +42,7 @@ Usage Example:
     from easydel.modules.falcon import FalconConfig, FalconForCausalLM
     import jax
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
 
     # Configure Falcon with parallel attention and MQA
     config = FalconConfig(

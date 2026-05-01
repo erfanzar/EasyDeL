@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""RWKV model implementation for EasyDeL.
+
+This module implements the RWKV (Receptance-Weighted Key-Value)
+recurrent-attention architecture. RWKV combines transformer-style
+parallel training with linear-time recurrent inference by replacing
+softmax attention with a per-channel time-mix block parameterized by
+learnable exponential decay rates.
+
+Components:
+- Time-mix block (RWKV self-attention surrogate) with state carrying
+  the per-channel running-key statistics.
+- Channel-mix block (RWKV feedforward surrogate) using receptance/value
+  gating.
+- :class:`RwkvModel` is the trunk; :class:`RwkvForCausalLM` adds an LM
+  head for next-token prediction.
+
+The implementation supports both parallel-mode (training, used here)
+and recurrent-mode inference using cached layer state.
+"""
 
 import math
 import typing as tp
@@ -381,11 +400,13 @@ class RwkvSelfAttention(spx.Module):
         (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), xs)
         c_x = jnp.swapaxes(c_x, 0, 1)
 
-        attn_prod = apply_logical_sharding(
-            receptance_state * c_x,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        attn_prod = receptance_state * c_x
+        if self.config.use_sharding_constraint:
+            attn_prod = apply_logical_sharding(
+                attn_prod,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
         out = checkpoint_name(self.output(attn_prod), "attn_output")
         next_state = (hidden[:, -1, :], aa, bb, pp)
         return out, next_state
@@ -514,11 +535,12 @@ class RwkvFeedForward(spx.Module):
         r = checkpoint_name(jax.nn.sigmoid(self.receptance(xr)), "mlp_gate")
         k = checkpoint_name(jnp.square(jax.nn.relu(self.key(xk))), "mlp_up")
         output = checkpoint_name(r * self.value(k), "mlp_output")
-        output = apply_logical_sharding(
-            output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        if self.config.use_sharding_constraint:
+            output = apply_logical_sharding(
+                output,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
         return output, hidden[:, -1, :]
 
 
@@ -653,11 +675,12 @@ class SingleStandRwkvBlock(spx.Module):
 
         feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
         hidden = checkpoint_name(hidden + feed_forward, "layer_output")
-        hidden = apply_logical_sharding(
-            hidden,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        if self.config.use_sharding_constraint:
+            hidden = apply_logical_sharding(
+                hidden,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
 
         if uses_global_state:
             state[0] = state[0].at[:, :, self.layer_id].set(ffd_state)
@@ -835,6 +858,12 @@ class RwkvModel(EasyDeLBaseModule):
         all_self_attentions = ()
 
         def _layer_loop(block, carry):
+            """Apply a single RWKV block inside the layer-stack scan.
+
+            Body of ``self.blocks.scan``; runs ``block`` on the current
+            hidden states, optionally accumulates per-layer hidden states
+            / time-mix attention weights, and returns the updated carry.
+            """
             hidden_states, all_hidden_states, all_self_attentions, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 hidden_states, _state, attentions = block(
@@ -877,11 +906,29 @@ class RwkvModel(EasyDeLBaseModule):
         )
 
     def get_embedding(self):
-        """Returns the embedding layer of the module."""
+        """Return the input token embedding (post token-shift).
+
+        RWKV embeds tokens through ``self.embeddings`` and then applies
+        the time-mixing token-shift inside each block; this accessor
+        returns the underlying :class:`Embed` table so checkpoint
+        loaders and weight-tying utilities can reach it directly.
+
+        Returns:
+            spx.Module: The token :class:`Embed` module.
+        """
         return self.embeddings
 
     def get_decoder(self):
-        """Returns the decoder part of the model."""
+        """Return ``self`` — the RWKV trunk *is* the decoder.
+
+        RWKV is a recurrent linear-time model with no separate
+        encoder/decoder split; ``forward`` consumes the embedded
+        sequence and threads the time-mixing state through each block
+        directly.
+
+        Returns:
+            spx.Module: ``self``.
+        """
         return self
 
 
@@ -957,6 +1004,14 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
 
         def _keep_fp32(array: Array, key: tuple):
+            """State-dict callback that keeps ``time_decay``/``time_first`` arrays in fp32.
+
+            RWKV's per-channel decay rates are stored as exponents and
+            are sensitive to precision; this callback prevents them from
+            being downcast when the rest of the parameter tree is
+            promoted to a lower-precision dtype during HuggingFace ->
+            EasyDeL state-dict conversion.
+            """
             if key and key[-1] in {"time_decay", "time_first"}:
                 return array.astype(jnp.float32)
             return array
@@ -1107,13 +1162,31 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         )
 
     def get_lm_head(self):
-        """Returns the language modeling head."""
+        """Return the linear LM head used for next-token prediction.
+
+        RWKV stores the LM head as ``self.head`` (rather than the more
+        common ``self.lm_head``) to follow the upstream naming, and
+        does not tie weights with the input embedding by default.
+
+        Returns:
+            ColumnParallelLinear: The vocabulary projection head.
+        """
         return self.head
 
     def get_embedding(self):
-        """Returns the embedding layer of the module."""
+        """Return the wrapped RWKV embedding table.
+
+        Returns:
+            spx.Module: ``self.rwkv.get_embedding()`` — the same
+            :class:`Embed` exposed by :class:`RwkvModel`.
+        """
         return self.rwkv.get_embedding()
 
     def get_decoder(self):
-        """Returns the decoder part of the model."""
+        """Return the wrapped recurrent RWKV decoder.
+
+        Returns:
+            spx.Module: The :class:`RwkvModel` trunk that owns the
+            time-mixing state machinery.
+        """
         return self.rwkv

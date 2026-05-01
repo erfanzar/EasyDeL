@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Loss and step implementations for the CPO trainer.
+
+Hosts the concatenated forward (chosen / rejected sequences in one
+batch), the loss-type dispatch (sigmoid / hinge / IPO / SimPO), the
+combined CPO loss with auxiliary supervised log-likelihood, and the
+scheduled-VJP loss adapter used under MPMD pipelining.
+"""
 
 from __future__ import annotations
 
@@ -214,19 +221,54 @@ def cpo_loss(
     simpo_gamma: float,
     alpha: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compute CPO losses and rewards for chosen/rejected pairs.
+    """Compute the CPO/SimPO/AlphaPO contrastive loss and per-example rewards.
+
+    Reference-free preference loss: rather than penalising
+    ``logp_policy - logp_reference`` like DPO, CPO penalises the
+    log-ratio between chosen and rejected completions directly,
+    optionally shaped by an AlphaPO probability transform or a SimPO
+    margin.
+
+    The path is:
+
+    1. **Reward construction.** When ``alpha == 0`` the rewards are the
+       summed log-probs themselves (``chosen_rewards = policy_chosen_logps``).
+       When ``alpha != 0`` (AlphaPO), ``rewards = (1 - p**(-alpha)) / alpha``
+       where ``p = exp(logp)``; ``logits`` is the chosen-minus-rejected
+       differential of those rewards.
+    2. **Loss shape.** Selected by ``loss_type``:
+       - ``"sigmoid"`` -- ``-(1 - eps) * logsigmoid(beta * logits)
+         - eps * logsigmoid(-beta * logits)`` with ``eps = label_smoothing``.
+       - ``"simpo"`` -- same shape as sigmoid but on
+         ``logits - simpo_gamma/beta`` (target margin ``simpo_gamma``).
+       - ``"hinge"`` -- ``relu(1 - beta * logits)``.
+       - ``"ipo"`` -- squared error ``(logits - 1/(2*beta))**2``.
+    3. **Reward rescaling.** The returned ``chosen_rewards`` /
+       ``rejected_rewards`` are always multiplied by ``beta`` so that
+       downstream metrics have a consistent unit regardless of the
+       ``alpha`` branch.
 
     Args:
-        policy_chosen_logps: Policy log probs for chosen completions.
-        policy_rejected_logps: Policy log probs for rejected completions.
-        beta: Temperature parameter.
-        label_smoothing: Label smoothing factor.
-        loss_type: Loss variant (sigmoid, hinge, ipo, simpo).
-        simpo_gamma: Margin for SimPO loss.
-        alpha: AlphaPO reward shaping parameter.
+        policy_chosen_logps: ``[batch]`` summed completion logps for
+            chosen completions (length-normalized when running SimPO).
+        policy_rejected_logps: Same for rejected completions.
+        beta: CPO inverse-temperature on the reward differential.
+        label_smoothing: cDPO-style smoothing factor; only consulted
+            by the sigmoid and SimPO branches.
+        loss_type: One of ``"sigmoid"``, ``"hinge"``, ``"ipo"``,
+            ``"simpo"`` (``"alphapo"`` is rewritten upstream).
+        simpo_gamma: Target margin used by the SimPO branch.
+        alpha: AlphaPO reward shaping coefficient. ``0.0`` keeps the
+            rewards equal to the raw logps.
 
     Returns:
-        Tuple of (losses, chosen_rewards, rejected_rewards).
+        ``(losses, chosen_rewards, rejected_rewards)`` where
+        ``losses`` is ``[batch]`` per-example loss and the reward
+        arrays are ``beta``-scaled per-example diagnostics.
+
+    Raises:
+        ValueError: If ``loss_type`` is not one of the supported
+            variants.
     """
 
     if alpha != 0.0:
@@ -267,14 +309,20 @@ def _policy_nll_loss(
     chosen_logps_raw: jax.Array,
     chosen_lengths: jax.Array,
 ) -> jax.Array:
-    """Compute negative log-likelihood loss for policy regularization.
+    """Compute the supervised behaviour-cloning NLL term used by CPO.
+
+    CPO mixes a contrastive preference loss with a token-averaged
+    negative log-likelihood on the chosen completion (weighted by
+    ``cpo_alpha``). This helper returns ``-sum(logp) / total_tokens``
+    so the regulariser is independent of batch composition.
 
     Args:
-        chosen_logps_raw: Raw log probabilities for chosen completions.
-        chosen_lengths: Token counts for normalization.
+        chosen_logps_raw: Per-token (already masked) log-probs of the
+            chosen completion summed per example, ``[batch]``.
+        chosen_lengths: Per-example loss-mask token count, ``[batch]``.
 
     Returns:
-        Scalar NLL loss.
+        Scalar token-averaged NLL.
     """
     total_tokens = jnp.maximum(jnp.sum(chosen_lengths), 1)
     total_logprob = jnp.sum(chosen_logps_raw)
@@ -297,25 +345,48 @@ def training_step(
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """Execute CPO training step with gradient computation.
+    """Run one CPO training step (forward, loss, backward, optimizer update).
+
+    Combines two losses on each minibatch:
+
+    1. The CPO/SimPO/AlphaPO contrastive loss between chosen and
+       rejected completions (see :func:`compute_cpo_loss`).
+    2. An auxiliary supervised NLL on the chosen completion, scaled by
+       ``cpo_alpha`` (see :func:`_policy_nll_loss`). Set
+       ``cpo_alpha == 0.0`` to recover the pure contrastive
+       (AlphaPO/SimPO) objective.
+
+    Unlike DPO this step does *not* run a reference model: the
+    contrastive term consumes only policy logps. The
+    ``concatenated_forward_fn`` is expected to return per-example
+    summed logps for both halves of the chosen/rejected concatenation
+    plus raw / length tensors for the supervised regulariser.
 
     Args:
-        state: Current model state.
-        batch: Training batch with chosen/rejected pairs.
-        learning_rate_fn: Function mapping step to learning rate.
-        concatenated_forward_fn: Forward function.
-        beta: Temperature parameter.
-        label_smoothing: Label smoothing factor.
-        loss_type: Loss variant to use.
-        cpo_alpha: Weight for behavior cloning regularization.
-        simpo_gamma: Margin for SimPO.
-        alpha: AlphaPO reward shaping parameter.
-        loss_config: Optional loss configuration.
-        partition_spec: Sharding specification.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
+        state: Policy ``EasyDeLState`` being differentiated.
+        batch: CPO minibatch with paired chosen/rejected sequences.
+        learning_rate_fn: Schedule mapping step to learning rate.
+        concatenated_forward_fn: Captured forward closure that returns
+            ``{"chosen_logps", "rejected_logps", "chosen_logps_raw",
+            "chosen_lengths", ...}``.
+        beta: CPO inverse-temperature.
+        label_smoothing: cDPO-style smoothing for the contrastive loss.
+        loss_type: One of ``"sigmoid"``, ``"hinge"``, ``"ipo"``,
+            ``"simpo"``.
+        cpo_alpha: Weight on the supervised NLL term.
+        simpo_gamma: Target reward margin for the SimPO branch.
+        alpha: AlphaPO reward shaping coefficient.
+        loss_config: ``LossConfig`` controlling NaN handling.
+        partition_spec: Batch sharding spec under the model's mesh.
+        gradient_accumulation_steps: Gradient-accumulation factor; the
+            batch must be evenly divisible.
+        straight_through_emulator: Optional STE callable applied to
+            the graphstate before the forward pass (QAT path).
 
     Returns:
-        Updated state and loss metrics.
+        ``(new_state, metrics)`` where ``metrics`` is a ``LossMetrics``
+        with the mean total loss and the per-example
+        ``chosen_rewards`` / ``rejected_rewards`` arrays for logging.
     """
 
     _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
@@ -326,6 +397,21 @@ def training_step(
     batch = with_sharding_constraint(batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: spx.State, call_batch: dict[str, jax.Array]):
+        """Compute the CPO loss and diagnostic metrics for one minibatch.
+
+        Runs the concatenated forward, evaluates the chosen
+        ``loss_type``-specific contrastive loss, adds the auxiliary
+        chosen-NLL term scaled by ``cpo_alpha``, and folds in any
+        router/aux-loss reported by the model.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            call_batch: Minibatch of preference triples.
+
+        Returns:
+            ``(loss, metrics)`` with reward margin/accuracy and chosen
+            / rejected logit means recorded in ``metrics.other_metrics``.
+        """
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         policy_model = state.merge(tree=tree)
@@ -395,6 +481,16 @@ def training_step(
 
 
 def _cpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the CPO scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering all CPO knobs that influence compilation
+        (loss type, beta, smoothing, simpo gamma, alpha, partition spec,
+        forward fn identity, and the quantization emulator identity).
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=(
@@ -411,6 +507,16 @@ def _cpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_cpo_scheduled_loss(call):
+    """Build a SpectraX-scheduled CPO loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` exposing the trainer's
+            current configuration.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready to feed to
+        :func:`spx.sxvalue_and_grad`.
+    """
     concatenated_forward_fn = call.get("concatenated_forward_fn")
     beta = call.get("beta")
     label_smoothing = call.get("label_smoothing")
@@ -421,6 +527,16 @@ def _make_cpo_scheduled_loss(call):
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the scalar CPO loss inside the SpectraX scheduled VJP.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            batch: Minibatch of preference triples.
+
+        Returns:
+            The combined CPO + chosen-NLL scalar loss (with optional
+            aux-loss term added).
+        """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
         model_outputs = concatenated_forward_fn(module, call_batch)
@@ -469,22 +585,32 @@ def evaluation_step(
     alpha: float,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
-    """Execute CPO evaluation step without gradients.
+    """Run one CPO evaluation step (forward only, no parameter update).
+
+    Computes the same combined contrastive + supervised loss as
+    :func:`training_step` and the same reward / accuracy diagnostics,
+    but without minibatch gradient accumulation or optimizer
+    interaction. ``partition_spec`` is accepted for API symmetry and
+    discarded; eval batches are run as-is on the model's mesh.
 
     Args:
-        state: Current model state.
-        batch: Evaluation batch.
-        concatenated_forward_fn: Forward function.
-        beta: Temperature parameter.
-        label_smoothing: Label smoothing factor.
-        loss_type: Loss variant to use.
-        cpo_alpha: Weight for behavior cloning regularization.
-        simpo_gamma: Margin for SimPO.
-        alpha: AlphaPO reward shaping parameter.
-        partition_spec: Sharding specification.
+        state: Policy state to evaluate.
+        batch: CPO eval minibatch.
+        concatenated_forward_fn: Forward closure with tokenization
+            knobs baked in.
+        beta: CPO inverse-temperature.
+        label_smoothing: cDPO smoothing factor.
+        loss_type: Variant key (``"sigmoid"``, ``"hinge"``, ``"ipo"``,
+            ``"simpo"``).
+        cpo_alpha: Weight on the supervised NLL.
+        simpo_gamma: SimPO target margin.
+        alpha: AlphaPO reward shaping coefficient.
+        partition_spec: Unused at eval time (accepted for symmetry).
 
     Returns:
-        Loss metrics.
+        ``LossMetrics`` with mean loss, per-example chosen/rejected
+        rewards, and the standard CPO diagnostics (policy NLL, reward
+        margin, reward accuracy, mean logits).
     """
     del partition_spec
 

@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mistral3 / Pixtral tokenizer wrapper.
+
+Wraps ``mistral_common.tokens.tokenizers.mistral.MistralTokenizer`` in a
+HuggingFace-style API so the rest of EasyDeL can use it interchangeably with
+``transformers`` tokenizers (``encode``, ``decode``, ``__call__``, batch
+helpers, and ``apply_chat_template``).
+
+Exports:
+    - ``Mistral3Tokenizer``: the HF-shaped wrapper class.
+"""
+
 from typing import Any
 
 import numpy as np
@@ -40,6 +51,15 @@ class Mistral3Tokenizer:
     """
 
     def __init__(self, mistral_tokenizer: MistralTokenizer):  # type: ignore[no-untyped-def]
+        """Wrap a ``MistralTokenizer`` with a HuggingFace-style API.
+
+        Args:
+            mistral_tokenizer (MistralTokenizer): An already-loaded
+                ``mistral_common`` tokenizer.
+
+        Raises:
+            ImportError: If ``mistral-common`` is not installed.
+        """
         if MistralTokenizer is None:
             raise ImportError("mistral-common is not installed. Please install it with `pip install mistral-common`.")
         self.mistral_tokenizer = mistral_tokenizer

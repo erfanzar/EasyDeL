@@ -89,12 +89,22 @@ class AuthWorkerManager:
 
     @property
     def auth_endpoint(self) -> str | None:
-        """Get the auth worker endpoint."""
+        """Return the ZMQ endpoint of the running auth worker.
+
+        Returns:
+            str | None: The bound endpoint URI once :meth:`start` succeeds;
+            ``None`` before start or after :meth:`shutdown`.
+        """
         return self._auth_endpoint
 
     @property
     def auth_client(self) -> AuthWorkerClient | None:
-        """Get the auth worker client."""
+        """Return the connected auth client.
+
+        Returns:
+            AuthWorkerClient | None: The client returned by :meth:`start`;
+            ``None`` before start or after :meth:`shutdown`.
+        """
         return self._auth_client
 
     def start(self, *, auth_endpoint: str | None = None) -> AuthWorkerClient:

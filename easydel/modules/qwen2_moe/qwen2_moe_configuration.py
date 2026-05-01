@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Qwen2-MoE model family.
+
+Defines :class:`Qwen2MoeConfig`, the EasyDeL configuration object for
+Alibaba's Qwen2 Mixture-of-Experts variant. Extends :class:`Qwen2Config`
+hyperparameters with MoE-specific knobs such as ``num_experts``,
+``num_experts_per_tok``, ``moe_intermediate_size``, ``shared_expert_intermediate_size``,
+and the routing/auxiliary-loss coefficients used for load balancing.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

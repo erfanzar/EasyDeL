@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Unified attention cache.
+
+Re-exports the configuration, per-layer view and multi-layer container
+that back EasyDeL's unified-attention path. The unified cache adapts a
+single layout to several attention variants (dense, sliding window,
+chunked local) so model code can stay backend-agnostic.
+"""
+
 from .cache import UnifiedAttentionCache, UnifiedAttentionCacheConfig, UnifiedAttentionCacheView
 
 __all__ = (

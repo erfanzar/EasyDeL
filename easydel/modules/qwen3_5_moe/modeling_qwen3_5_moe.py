@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.5-MoE text and multimodal model wrappers."""
+"""Qwen3.5-MoE text and multimodal model wrappers.
+
+Qwen3.5-MoE is the Mixture-of-Experts variant of Qwen3.5. It reuses
+Qwen3-Next's hybrid attention/linear-attention decoder with a sparse
+routed MoE FFN, and pairs it with the Qwen3-VL-MoE vision tower for
+multimodal inputs.
+
+This module exposes the task-specific wrappers for that stack:
+
+- :class:`Qwen3_5MoeForCausalLM` — text-only causal LM, registered under
+  the ``qwen3_5_moe`` model type. Reuses :class:`Qwen3NextModel`
+  with MoE FFN blocks and the Pallas-fused decode kernel.
+- :class:`Qwen3_5MoeVLForConditionalGeneration` — vision-language MoE
+  wrapper combining the Qwen3-VL-MoE vision tower with the Qwen3-Next
+  MoE language backbone and merging visual embeddings at placeholder
+  positions before invoking the LM head.
+
+Multimodal mRoPE construction reuses
+:func:`easydel.modules.qwen3_5.modeling_qwen3_5._get_rope_index_from_mm_token_types`
+and the position-id flattening helper from the Qwen3.5 module.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -383,29 +403,64 @@ class Qwen3_5MoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5MoeMode
         self.vocab_size = config.text_config.vocab_size
 
     def get_input_embeddings(self):
-        """Get the input embedding layer."""
+        """Return the shared text token embedding layer.
+
+        Delegates to the wrapped multimodal :class:`Qwen3VLModel`, which
+        owns the ``Embed`` table used to project ``input_ids`` to
+        ``hidden_size`` before visual fusion.
+
+        Returns:
+            spx.Module: The text token embedding module.
+        """
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        """Set the input embedding layer."""
+        """Replace the shared text token embedding layer.
+
+        Args:
+            value: Replacement embedding module accepting ``input_ids`` of
+                shape ``(batch, seq_len)`` and producing hidden states of
+                shape ``(batch, seq_len, hidden_size)``.
+        """
         self.model.set_input_embeddings(value)
 
     def set_decoder(self, decoder):
-        """Set the language model decoder."""
+        """Replace the underlying Qwen3-Next MoE decoder stack.
+
+        Args:
+            decoder: Replacement language-model module compatible with
+                :class:`Qwen3NextModel` (MoE-aware in this configuration).
+        """
         self.model.set_decoder(decoder)
 
     def get_decoder(self):
-        """Get the language model decoder."""
+        """Return the wrapped Qwen3-Next MoE decoder stack.
+
+        Returns:
+            spx.Module: The text decoder; same instance as
+            ``self.model.language_model``.
+        """
         return self.model.get_decoder()
 
     @property
     def visual(self):
-        """Property to access the vision transformer for backward compatibility."""
+        """Backward-compatible alias for the Qwen3-VL vision tower.
+
+        Returns:
+            spx.Module: The Qwen3-VL vision transformer used to encode
+            images and videos before merging into the text sequence.
+        """
         return self.model.visual
 
     @property
     def language_model(self):
-        """Property to access the language model for backward compatibility."""
+        """Backward-compatible alias for the Qwen3-Next MoE language trunk.
+
+        Returns:
+            spx.Module: The MoE-flavored Qwen3-Next decoder; emits
+            per-layer router losses that are aggregated into
+            ``aux_loss`` by the surrounding causal-LM wrapper.
+        """
         return self.model.language_model
 
     def get_video_features(
@@ -414,7 +469,23 @@ class Qwen3_5MoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5MoeMode
         video_grid_thw: jax.Array | None = None,
         video_max_grid_size: int | None = None,
     ) -> tuple[tuple[jax.Array, ...], list[jax.Array]]:
-        """Encode videos into continuous embeddings."""
+        """Encode video tensors into per-grid visual embeddings.
+
+        Args:
+            pixel_values_videos: Packed pixel values of shape
+                ``(num_video_patches, ...)`` produced by the Qwen3-VL
+                processor.
+            video_grid_thw: Per-video ``(T, H, W)`` grid dimensions used
+                to slice the packed encoder output back into per-video
+                groups.
+            video_max_grid_size: Optional shared grid-size cap for static
+                shape compilation.
+
+        Returns:
+            A tuple ``(per_video_embeddings, split_sizes)`` where the
+            first element is a tuple of ``(num_tokens_i, hidden_size)``
+            arrays (one per video) ready for placeholder substitution.
+        """
         return self.model.get_video_features(pixel_values_videos, video_grid_thw, video_max_grid_size)
 
     def get_image_features(
@@ -423,11 +494,42 @@ class Qwen3_5MoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5MoeMode
         image_grid_thw: jax.Array | None = None,
         image_max_grid_size: int | None = None,
     ) -> tuple[tuple[jax.Array, ...], list[jax.Array]]:
-        """Encode images into continuous embeddings."""
+        """Encode image tensors into per-image visual embeddings.
+
+        Args:
+            pixel_values: Packed pixel values of shape
+                ``(num_image_patches, ...)``.
+            image_grid_thw: Per-image ``(T, H, W)`` grid dimensions
+                (``T == 1``) used to locate placeholder positions.
+            image_max_grid_size: Optional shared grid-size cap.
+
+        Returns:
+            A tuple ``(per_image_embeddings, split_sizes)`` matching the
+            convention of :meth:`get_video_features`.
+        """
         return self.model.get_image_features(pixel_values, image_grid_thw, image_max_grid_size)
 
     def compute_embedding(self, input_ids, *args, **kwargs):
-        """Compute embeddings with multimodal fusion."""
+        """Compute the merged text + multimodal input embeddings.
+
+        Embeds ``input_ids`` with the text token table and then splices
+        in vision-tower hidden states at every position whose token id
+        equals the configured image / video placeholder. The merge is
+        done with the cumsum-based scatter from
+        :class:`MultiModalMergeFeature` so the result remains
+        differentiable and JIT-compatible.
+
+        Args:
+            input_ids: Input token ids of shape ``(batch, seq_len)``.
+            *args: Forwarded positional arguments accepted by
+                ``Qwen3VLModel.compute_embedding`` (typically image and
+                video pixel/grid tensors).
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            Merged input embeddings of shape
+            ``(batch, seq_len, hidden_size)``.
+        """
         return self.model.compute_embedding(input_ids, *args, **kwargs)
 
 

@@ -121,6 +121,8 @@ class OlmoConfig(EasyDeLBaseConfig):
             num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
             num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
             num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to `num_attention_heads`.
+            head_dim (int, optional): Per-head attention dimension; defaults to
+                ``hidden_size // num_attention_heads`` when ``None``.
             hidden_act (str, optional): Activation function. Defaults to "silu".
             max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
             initializer_range (float, optional): Initializer range. Defaults to 0.02.
@@ -139,6 +141,8 @@ class OlmoConfig(EasyDeLBaseConfig):
             use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
             scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+            layer_types (list[str] | None, optional): Per-layer attention type;
+                defaults to ``"full_attention"`` for every layer when ``None``.
             **kwargs: Additional keyword arguments.
         """
         self.vocab_size = vocab_size

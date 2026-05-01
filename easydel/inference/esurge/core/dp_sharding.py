@@ -24,7 +24,15 @@ from __future__ import annotations
 
 
 def usable_pages_count(num_pages: int) -> int:
-    """Return the number of allocatable pages (excluding null page 0)."""
+    """Return the number of allocatable pages (excluding null page 0).
+
+    Args:
+        num_pages (int): Total page count of the KV-cache tensor (including
+            page id 0, which is reserved as the null/padding sentinel).
+
+    Returns:
+        int: ``max(0, num_pages - 1)``.
+    """
     return max(0, int(num_pages) - 1)
 
 
@@ -33,6 +41,15 @@ def pages_per_dp_shard(num_pages: int, data_parallel_size: int | None) -> int | 
 
     The check is on ``num_pages % dp_size == 0`` (matching the JAX sharding
     requirement on the full page tensor).
+
+    Args:
+        num_pages (int): Total page count of the KV-cache tensor.
+        data_parallel_size (int | None): DP axis size; ``None`` and ``<= 1``
+            are treated as "not sharded" and return ``None``.
+
+    Returns:
+        int | None: ``num_pages // dp_size`` if the cache is evenly
+        partitionable; ``None`` otherwise (including the unsharded case).
     """
     dp_size = max(1, int(data_parallel_size or 1))
     if dp_size <= 1:
@@ -45,7 +62,18 @@ def pages_per_dp_shard(num_pages: int, data_parallel_size: int | None) -> int | 
 
 
 def dp_shard_for_page_id(page_id: int, pages_per_shard: int, dp_size: int) -> int | None:
-    """Map a non-null page ID to a DP shard index."""
+    """Map a non-null page ID to a DP shard index.
+
+    Args:
+        page_id (int): Global page id (must be ``>= 1``; id 0 is the null page).
+        pages_per_shard (int): Pages owned by each DP shard, as returned by
+            :func:`pages_per_dp_shard`.
+        dp_size (int): DP axis size.
+
+    Returns:
+        int | None: Shard index in ``[0, dp_size)``, or ``None`` if the inputs
+        are invalid (non-positive page id or shard counts).
+    """
     pid = int(page_id)
     if pid <= 0 or pages_per_shard <= 0 or dp_size <= 0:
         return None
@@ -56,6 +84,14 @@ def dp_shard_page_bounds(shard_index: int, pages_per_shard: int) -> tuple[int, i
     """Return inclusive-exclusive page-ID bounds for a DP shard.
 
     Shard 0 contains the null page (id 0), so its *usable* range starts at 1.
+
+    Args:
+        shard_index (int): DP shard index.
+        pages_per_shard (int): Pages owned by each DP shard.
+
+    Returns:
+        tuple[int, int]: ``(lo, hi)`` page-id range; ``lo`` is inclusive and
+        ``hi`` is exclusive.
     """
     shard = max(0, int(shard_index))
     lo = shard * int(pages_per_shard)

@@ -12,6 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of Google's Gemma2 decoder-only language model.
+
+Gemma2 builds on Gemma with a hybrid attention pattern, additional normalization,
+and logit soft-capping for improved training stability. This module exposes the
+core building blocks (RMSNorm, hybrid sliding/full attention, gated MLP, decoder
+layer with pre/post-norm) and the full models for inference, causal language
+modeling, and sequence classification.
+
+Architectural traits:
+    - Hybrid attention: alternates between sliding-window attention on odd layers
+      (default window 4096) and full attention on even layers.
+    - Pre- and post-normalization (RMSNorm with ``1 + weight`` scaling) around
+      both the attention and feedforward sub-blocks.
+    - Custom query pre-attention scalar (default 224) replaces the standard
+      ``head_dim ** -0.5`` softmax scale; optional attention-logit soft-capping.
+    - Final logit soft-capping ``cap * tanh(logits / cap)`` (default cap 30.0).
+    - Embedding scaling by ``sqrt(hidden_size)`` and RoPE positional encoding.
+
+Exports:
+    - :class:`Gemma2Model`: Backbone returning hidden states.
+    - :class:`Gemma2ForCausalLM`: Decoder LM with soft-capped output logits.
+    - :class:`Gemma2ForSequenceClassification`: Pooled classifier over the last token.
+"""
 
 from functools import partial
 
@@ -53,20 +76,30 @@ logger = get_logger(__name__)
 
 
 class Gemma2RMSNorm(spx.Module):
-    """Root Mean Square Layer Normalization for Gemma2 models.
+    """Gemma2's RMSNorm with the ``(1 + weight)`` scaling and fp32 variance reduction.
 
-    This normalization technique normalizes the inputs by the root mean square,
-    providing stability during training while being computationally efficient.
+    Identical formulation to Gemma's RMSNorm (zero-init weight applied as
+    ``1 + weight`` so the layer is the identity at step 0; variance is computed
+    in float32 even when activations are bfloat16 to avoid precision loss in
+    the inverse-square-root). Gemma2 uses two of these per block — one before
+    attention and one before the MLP — plus optional post-attention and
+    post-FFN copies depending on the layer-norm placement schema.
+
+    Attributes:
+        config: Source ``Gemma2Config``; reads ``hidden_size`` and ``rms_norm_eps``.
+        epsilon: Floor under the inverse-RMS to keep the gradient well-defined.
+        dtype: Cast-back dtype for the normalised activations.
+        weight: Bound :class:`ArrayParam` of shape ``(hidden_size,)`` initialised
+            to ones (consumed as ``1 + weight``).
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(self, config: Gemma2Config, dtype: jnp.dtype = jnp.float32):
-        """Initialize Gemma2 RMS normalization layer.
+        """Allocate the per-feature scale and capture epsilon from ``config``.
 
-        Args:
-            config (Gemma2Config): Model configuration containing hidden_size and rms_norm_eps.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+        ``dtype`` controls the cast-back of the normalised tensor only — the
+        variance reduction itself is forced to float32 inside :meth:`forward`.
         """
         self.config = config
         self.epsilon = self.config.rms_norm_eps
@@ -81,13 +114,20 @@ class Gemma2RMSNorm(spx.Module):
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply RMS normalization with learnable scale.
+        """Compute ``(1 + weight) * x / sqrt(mean(x**2, axis=-1) + eps)``.
+
+        The mean of squared activations is taken in float32 over the trailing
+        hidden dimension, the inverse RMS scale is then applied to the
+        original tensor, and finally the learnable scale ``(1 + weight)``
+        modulates the output. The cast back to ``self.dtype`` happens at the
+        very end so the multiplication runs at full precision.
 
         Args:
-            hidden_states: Input tensor to normalize.
+            hidden_states: Tensor of shape ``[batch, seq_len, hidden_dim]``.
 
         Returns:
-            Normalized and scaled hidden states.
+            Tensor of the same shape, with each ``hidden_dim`` slice having
+            unit RMS prior to the learned ``(1 + weight)`` rescaling.
         """
         variance = hidden_states.astype(jnp.float32)
         variance = jnp.power(variance, 2)
@@ -98,18 +138,34 @@ class Gemma2RMSNorm(spx.Module):
 
 
 class Gemma2Attention(UnifiedAttention):
-    """Multi-head attention layer for Gemma2 with sliding window and softcapping support.
+    """Gemma2 attention with alternating sliding-window / full layers and custom softmax scale.
 
-    Extends UnifiedAttention with Gemma2-specific features:
-    - Layer-specific attention type: alternates between sliding window (odd layers)
-      and full attention (even layers) based on config.layer_types
-    - Custom query pre-attention scaling via query_pre_attn_scalar
-    - Optional attention logit softcapping
+    Gemma2 alternates two attention regimes layer-by-layer, controlled by
+    ``config.layer_types[layer_idx]``: a sliding-window mode that bounds each
+    query's receptive field to ``config.sliding_window`` past tokens (typically
+    set on odd layers in the published checkpoints) and a full-causal mode
+    elsewhere. The window is forwarded into :class:`UnifiedAttention` so the
+    underlying ejkernel kernel masks tokens beyond the window in addition to
+    the causal mask.
+
+    Two further departures from vanilla MHA are introduced here:
+
+    1. The softmax scale is **not** the usual ``1 / sqrt(head_dim)``. Gemma2
+       uses ``1 / sqrt(query_pre_attn_scalar)`` (see
+       :meth:`_create_attention_performer`), which decouples the temperature
+       from the head dimension and stabilises training under the wider hidden
+       dimensions used in the larger Gemma2 sizes.
+    2. Softmax is forced to float32 via ``attention_softmax_in_fp32`` whenever
+       the activation dtype is not already float32 — Gemma2's logit
+       distribution can be sharp enough that bfloat16 softmax loses precision.
 
     Attributes:
-        config (Gemma2Config): Model configuration.
-        head_dim (int): Dimensionality of each attention head.
-        attention_softmax_in_fp32 (bool): Whether to compute softmax in float32.
+        config: Source ``Gemma2Config``.
+        head_dim: Per-head dimensionality.
+        attention_softmax_in_fp32: ``True`` whenever the activation dtype is
+            not float32.
+        is_cross_attention: Reserved flag for cross-attention layers (always
+            ``False`` in the public Gemma2 checkpoints).
     """
 
     def __init__(
@@ -124,18 +180,14 @@ class Gemma2Attention(UnifiedAttention):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Gemma2 attention with sliding window configuration.
+        """Resolve the per-layer attention regime and forward to :class:`UnifiedAttention`.
 
-        Args:
-            config (Gemma2Config): Model configuration with attention parameters.
-            layer_idx (int): Index of this layer in the model, determines attention type.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (str | jax.lax.Precision | None, optional): Numerical precision for
-                matrix operations. Defaults to None.
-            causal (bool, optional): Whether to use causal attention masking. Defaults to True.
-            is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
-            rngs (spx.Rngs): Random number generator state.
+        Reads ``config.layer_types[layer_idx]``: if it equals
+        ``"sliding_attention"`` the constructor passes
+        ``sliding_window=config.sliding_window`` down to the unified attention
+        backend; otherwise ``sliding_window=None`` (full causal). Sets
+        ``attention_softmax_in_fp32`` based on ``dtype`` and stores
+        ``is_cross_attention`` for later cross-attention specialisation.
         """
         # Set layer-specific attributes before super().__init__
         self.is_cross_attention = is_cross_attention
@@ -160,11 +212,25 @@ class Gemma2Attention(UnifiedAttention):
         self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
 
     def _create_rotary(self, config: Gemma2Config, dtype: jnp.dtype):
-        """Create Gemma2-specific rotary embedding layer."""
+        """Build Gemma2's full-head-dim rotary embedding helper.
+
+        Gemma2 applies RoPE across the full head dimension
+        (``rotary_dim == head_dim``). The fourth positional argument
+        (``True``) toggles the legacy half-rotation interleaving that matches
+        Google's reference implementation. The returned helper precomputes
+        cos/sin tables for use inside the attention kernel.
+        """
         return config.get_basic_rope(dtype, self.head_dim, self.head_dim, True)
 
     def _create_attention_performer(self, config: Gemma2Config, rngs: spx.Rngs):
-        """Create attention performer with Gemma2's custom softmax scale."""
+        """Build the flexible attention performer with Gemma2's custom temperature.
+
+        Replaces the default ``1/sqrt(head_dim)`` softmax scale with
+        ``1/sqrt(config.query_pre_attn_scalar)``. This is the key knob that
+        lets Gemma2's larger sizes share head dimensions with smaller variants
+        without rebalancing the attention temperature. ``dropout_prob`` is
+        wired through from ``config.attention_dropout``.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -173,26 +239,33 @@ class Gemma2Attention(UnifiedAttention):
         )
 
     def _merge_heads(self, hidden_states):
-        """
-        Merges the attention heads into a single hidden state tensor.
+        """Collapse the per-head axis back into the contiguous hidden dimension.
+
+        Folds the trailing ``(num_heads, head_dim)`` axes of an attention
+        output back into a single ``hidden_dim = num_heads * head_dim`` axis,
+        ready for the output projection.
 
         Args:
-            hidden_states (Array): The hidden states with separate head dimensions.
+            hidden_states: Array of shape ``[batch, seq_len, num_heads, head_dim]``.
 
         Returns:
-            Array: The hidden states with merged head dimensions.
+            Array of shape ``[batch, seq_len, num_heads * head_dim]``.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
 
     def _split_heads(self, hidden_states, num_heads):
-        """Split hidden states into separate attention heads.
+        """Reshape a flat hidden tensor into ``[..., num_heads, head_dim]``.
+
+        Inverse of :meth:`_merge_heads`. Used after the Q/K/V linear
+        projections to expose the per-head axis to the attention kernel.
 
         Args:
-            hidden_states (Array): The hidden states to split.
-            num_heads (int): Number of attention heads.
+            hidden_states: Array of shape ``[batch, seq_len, num_heads * head_dim]``.
+            num_heads: Number of heads to split into. The per-head dimension
+                ``head_dim`` is read from ``self.head_dim``.
 
         Returns:
-            Array: The hidden states with separate head dimensions.
+            Array of shape ``[batch, seq_len, num_heads, head_dim]``.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
 

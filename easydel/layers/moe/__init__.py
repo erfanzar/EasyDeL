@@ -100,7 +100,6 @@ Example Usage
     ...     MoeLoadBalancingStrategy,
     ... )
     >>> import spectrax as spx
-from spectrax import nn
     >>>
     >>> # Configure MoE execution
     >>> config.moe_method = MoEMethods.FUSED_MOE

@@ -52,6 +52,17 @@ from ..training_utils import (
 
 
 def _stop_gradient_tree(tree):
+    """Apply ``jax.lax.stop_gradient`` to every JAX array leaf in a pytree.
+
+    Non-array leaves are returned unchanged.
+
+    Args:
+        tree: An arbitrary pytree, typically a parameter / state container.
+
+    Returns:
+        A pytree with the same structure where each :class:`jax.Array` leaf
+        has been wrapped in :func:`jax.lax.stop_gradient`.
+    """
     return jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
 
 
@@ -108,6 +119,18 @@ def on_policy_distillation_step(
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
     def loss_fn(tree, minibatch):
+        """Compute the on-policy distillation loss for a minibatch.
+
+        Args:
+            tree: The student parameter tree (subject to gradient).
+            minibatch (collections.abc.Mapping[str, jax.Array]): Minibatch
+                with ``input_ids``, ``attention_mask`` and the
+                ``completion_mask`` selecting generated tokens.
+
+        Returns:
+            tuple[jax.Array, LossMetrics]: Scalar total loss and a
+            :class:`LossMetrics` instance with per-component diagnostics.
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = student_state.merge(tree)
@@ -141,6 +164,16 @@ def on_policy_distillation_step(
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         def _teacher_fwd(kw, t_graphstate):
+            """Run the teacher forward pass under a hard rematerialization barrier.
+
+            Args:
+                kw: Dynamic keyword arguments (input_ids, attention_mask, ...).
+                t_graphstate: Stop-gradient teacher graph state.
+
+            Returns:
+                dict: ``{"h": last_hidden_state}`` when chunked KL is enabled,
+                otherwise ``{"l": logits}`` -- both detached from gradients.
+            """
             teacher_module = teacher_state.merge(t_graphstate)
             out = teacher_module(**kw, **_teacher_static_kw)
             results = {}

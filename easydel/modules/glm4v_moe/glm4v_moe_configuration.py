@@ -448,10 +448,24 @@ class Glm4vMoeConfig(EasyDeLBaseConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_text_config(self, decoder: bool = True) -> Glm4vMoeTextConfig:
+        """Return the text decoder configuration.
+
+        Args:
+            decoder (bool, optional): Unused; kept for API compatibility with
+                upstream Hugging Face configs. Defaults to True.
+
+        Returns:
+            Glm4vMoeTextConfig: The text sub-config.
+        """
         del decoder
         return self.text_config  # pyright: ignore[reportReturnType]
 
     def get_vision_config(self) -> Glm4vMoeVisionConfig:
+        """Return the vision encoder configuration.
+
+        Returns:
+            Glm4vMoeVisionConfig: The vision sub-config.
+        """
         return self.vision_config  # type: ignore
 
 

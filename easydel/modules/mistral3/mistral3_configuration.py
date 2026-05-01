@@ -21,11 +21,29 @@ from easydel.infra.factory import register_config, registry
 
 @register_config("mistral3")
 class Mistral3Config(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Composite configuration for Mistral-3 / Pixtral vision-language models.
 
-    Args:
+    Mistral-3 pairs a Pixtral vision tower (aspect-ratio aware ViT, see
+    ``vision_config``) with the Mistral-Nemo / Mistral-Small text decoder
+    (``text_config``). Image patches are concatenated by the projector via
+    a ``spatial_merge_size``-by-``spatial_merge_size`` spatial-to-channel
+    fold (default 2 collapses each ``2x2`` patch group into a single
+    token), which is what allows the model to process *non-square* images
+    without padding to a fixed grid. ``image_token_index`` is the
+    placeholder text token whose positions are overwritten with projected
+    vision tokens at call time. ``layer_types`` controls per-layer
+    attention dispatch on the text side and is propagated automatically
+    to the wrapped text decoder when the value is left ``None``.
+
+    Composition flags:
+        * ``sub_configs`` declares the two embedded configs so the EasyDeL
+          factory knows how to recursively serialize/deserialize them.
+        * ``is_composition = True`` opts this config out of the standard
+          field flattening.
+        * ``attribute_map`` aliases the HuggingFace name
+          ``image_token_id`` to the internal ``image_token_index``.
+
+    Attributes:
         vision_config (`Union[AutoConfig, dict]`,  *optional*, defaults to `PixtralVisionConfig`):
             The config object or dictionary of the vision backbone.
         text_config (`Union[AutoConfig, dict]`, *optional*, defaults to `MistralConfig`):
@@ -61,6 +79,30 @@ class Mistral3Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize the Mistral3 vision-language configuration.
+
+        Args:
+            vision_config (dict | EasyDeLBaseConfig | None, optional): Vision encoder
+                configuration. Accepts a dict, an ``EasyDeLBaseConfig`` instance, or
+                ``None`` for a Pixtral default. Defaults to None.
+            text_config (dict | EasyDeLBaseConfig | None, optional): Text decoder
+                configuration. Accepts a dict, an ``EasyDeLBaseConfig`` instance, or
+                ``None`` for a Mistral default. Defaults to None.
+            image_token_index (int, optional): Token id used as a placeholder for image
+                features. Defaults to 10.
+            projector_hidden_act (str, optional): Activation used by the multimodal
+                projector. Defaults to "gelu".
+            vision_feature_layer (int | list[int], optional): Index (or indices) of the
+                vision encoder hidden layer(s) to extract features from. Defaults to -1.
+            multimodal_projector_bias (bool, optional): Whether the projector uses
+                bias. Defaults to False.
+            spatial_merge_size (int, optional): Downsampling factor of the spatial
+                merge step (e.g. 2 collapses each 2x2 patch group). Defaults to 2.
+            layer_types (list[str] | None, optional): Per-layer attention type. If
+                ``None``, defaults to ``"full_attention"`` for every text decoder
+                layer. Defaults to None.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         super().__init__(**kwargs)
         self.image_token_index = image_token_index
         self.projector_hidden_act = projector_hidden_act

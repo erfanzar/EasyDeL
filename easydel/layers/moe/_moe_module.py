@@ -180,7 +180,94 @@ class BaseMoeModule(spx.Module, ABC):
 
     @property
     def mesh(self):
+        """Resolve the active stage-local mesh for this MoE module.
+
+        Returns:
+            The :class:`StageMesh` (or compatible mesh) currently active for
+            the surrounding pipeline stage. When no MPMD pipeline is in scope
+            this is equivalent to the module's stored ``self._mesh``.
+        """
         return resolve_stage_mesh(self._mesh)
+
+    def _build_active_expert_mesh(
+        self,
+        *,
+        axis_types: tuple[jax.sharding.AxisType, ...],
+        arr: jax.Array | None = None,
+    ) -> spx.SpxMesh:
+        """Collapse the 5D model mesh into the 3D ``(dp, expert, tp)`` MoE mesh.
+
+        The model-level mesh has axes ``(dp, fsdp, ep, tp, sp)``; grouped-matmul
+        / shard-map kernels for MoE want a single ``expert`` axis whose size
+        equals ``ep * (fsdp if fsdp_is_ep_bound else 1) * (sp if sp_is_ep_bound
+        else 1)``. This method walks the runtime sharding resolver, assigns
+        each physical axis to one of the three groups (``dp``, ``ep``, ``tp``),
+        flattens the device array accordingly, and returns a fresh
+        :class:`spx.SpxMesh` with the requested ``axis_types``. When the active
+        stage has no resolvable mesh (e.g. fully replicated single-host), the
+        pre-computed ``self.auto_expert_mesh`` is returned as a fallback.
+
+        Args:
+            axis_types: Three :class:`jax.sharding.AxisType` values, one per
+                axis of the resulting expert mesh ``(dp, expert, tp)``. Use
+                ``Auto`` for the auto-resharding path and ``Manual`` for the
+                shard-map path.
+            arr: Optional sample array used by :func:`resolve_stage_mesh` to
+                determine the active MPMD stage when none has been entered
+                explicitly.
+
+        Returns:
+            A new :class:`spx.SpxMesh` of shape ``(dp_size, ep_size, tp_size)``
+            ready to be used as a target for sharding constraints inside MoE
+            kernels, or ``self.auto_expert_mesh`` when no stage-local mesh is
+            available.
+        """
+        mesh = resolve_stage_mesh(self._mesh, arr=arr)
+        if mesh is None:
+            return self.auto_expert_mesh
+
+        runtime_sharding_resolver = self.runtime_sharding_resolver
+        dpname = resolve_eformer_axis(DP, runtime_sharding_resolver)
+        fsdpname = resolve_eformer_axis(FSDP, runtime_sharding_resolver)
+        epname = resolve_eformer_axis(EP, runtime_sharding_resolver)
+        tpname = resolve_eformer_axis(TP, runtime_sharding_resolver)
+        spname = resolve_eformer_axis(SP, runtime_sharding_resolver)
+
+        axis_sizes = mesh.shape
+        assigned_axes: dict[str, str] = {}
+        size_by_group = {"dp": 1, "ep": 1, "tp": 1}
+
+        def assign_axis(axis_name: str | None, group: str) -> None:
+            if axis_name is None or axis_name in assigned_axes:
+                return
+            assigned_axes[axis_name] = group
+            size_by_group[group] *= axis_sizes.get(axis_name, 1)
+
+        assign_axis(tpname, "tp")
+        assign_axis(epname, "ep")
+        assign_axis(dpname, "dp")
+        assign_axis(fsdpname, "ep" if self.config.fsdp_is_ep_bound else "dp")
+        assign_axis(spname, "ep" if self.config.sp_is_ep_bound else "dp")
+
+        devices = mesh.devices.flatten()
+        return spx.SpxMesh(
+            jax_mesh=jax.sharding.Mesh(
+                devices.reshape(size_by_group["dp"], size_by_group["ep"], size_by_group["tp"]),
+                axis_names=(dpname, epname, tpname),
+                axis_types=axis_types,
+            ),
+            mpmd_axis=None,
+        )
+
+    def _active_auto_expert_mesh(self, arr: jax.Array | None = None) -> spx.SpxMesh:
+        return self._build_active_expert_mesh(
+            axis_types=(
+                jax.sharding.AxisType.Auto,
+                jax.sharding.AxisType.Auto,
+                jax.sharding.AxisType.Auto,
+            ),
+            arr=arr,
+        )
 
     def get_moe_spec(
         self,
@@ -978,7 +1065,7 @@ class BaseMoeModule(spx.Module, ABC):
             gate_logits = hooks.before_topk(gate_logits)
 
         # Use expert_mesh (3D: dp, ep, tp) for cleaner sharding
-        expert_mesh = self.auto_expert_mesh
+        expert_mesh = self._active_auto_expert_mesh(hidden_state)
         runtime_sharding_resolver = self.runtime_sharding_resolver
 
         # Resolve axis names from the runtime sharding resolver rather than the mesh directly.
@@ -1252,7 +1339,8 @@ class BaseMoeModule(spx.Module, ABC):
         # # @erfanzar NOTE: spx.with_sharding_constraint (NOT jax.lax.*) so the
         # constraint is MPMD-aware and the spec lands on the resolved
         # stage-local submesh.
-        output = spx.with_sharding_constraint(output, original_output_ps, mesh=self.mesh)
+        if self.config.use_sharding_constraint:
+            output = spx.with_sharding_constraint(output, original_output_ps, mesh=self.mesh)
 
         return output, prein_gate_logits
 
@@ -1318,7 +1406,7 @@ class BaseMoeModule(spx.Module, ABC):
             - logits: Router logits for auxiliary loss computation. Shape: [B*S, E].
         """
         self._configure_hooks_for_routing_strategy()
-        with self.auto_expert_mesh:
+        with self._active_auto_expert_mesh(hidden_state):
             match self.module_moe_method:
                 case MoEMethods.STANDARD_MOE:
                     logger.warn_once(

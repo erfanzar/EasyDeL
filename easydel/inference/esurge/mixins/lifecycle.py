@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Lifecycle mixin for the eSurge engine.
+
+Handles process-level lifecycle for :class:`eSurge`:
+
+- ``initiate`` / ``terminate`` / ``pause`` / ``resume``
+- AOT compilation orchestration of the scheduler/runner
+- Signal handling and graceful shutdown
+- Idle-reset monitor thread that drains caches after periods of inactivity
+- Profiling start/stop wrappers
+
+Exposes :class:`EngineLifecycleMixin`, mixed into :class:`eSurge`.
+"""
+
 from __future__ import annotations
 
 import os
@@ -56,11 +69,27 @@ class EngineLifecycleMixin:
 
     @staticmethod
     def _is_nonrecoverable_scheduler_error(exc: BaseException) -> bool:
-        """Classify scheduler errors that should abort immediately.
+        """Decide whether a scheduler exception should bypass the retry budget.
 
-        Some failures indicate a hard state invariant violation (for example
-        DP-local page-table mismatch) and retrying the same loop iteration
-        only causes follow-up errors from stale intermediate state.
+        Most exceptions are absorbed up to ``MAX_CONSECUTIVE_SCHEDULER_ERRORS``
+        retries, since a transient failure (rate-limited HBM allocator, a
+        flaky tokenizer worker, etc.) often clears on the next iteration.
+        Some failures, however, leave the engine in an inconsistent state
+        that the next iteration will only worsen — for instance a DP-local
+        page-table invariant violation indicates the scheduler and runner
+        disagree on which DP shard owns a request, and retrying drives
+        further pages onto the wrong shard. Those flavours are matched here
+        and force an immediate abort via
+        :meth:`_abort_scheduler_due_to_error`.
+
+        Args:
+            exc: Exception raised by the scheduler loop body.
+
+        Returns:
+            ``True`` for failures that should *not* be retried (currently:
+            ``ValueError`` whose message contains
+            ``"Non-DP-local page IDs detected"`` or ``"Distributed step
+            synchronization failure"``); ``False`` otherwise.
         """
         msg = str(exc)
         return isinstance(exc, ValueError) and (
@@ -69,12 +98,48 @@ class EngineLifecycleMixin:
 
     @staticmethod
     def _model_overrides_esurge_graphdef(model: EasyDeLBaseModule) -> bool:
-        """Return whether the model delegates eSurge graph construction."""
+        """Whether the model class supplies its own ``esurge_graphdef`` override.
+
+        Some wrapper models (e.g. embedding-augmented LMs) cannot be
+        rebuilt by eSurge's default ``_esurge_graphdef_from_graphdef``
+        because their construction depends on runtime state that no longer
+        exists at hot-swap time. They opt out by exposing a class-level
+        ``esurge_graphdef`` attribute / property; weight-update logic
+        consults this flag to decide whether to delegate eSurge graph
+        construction to the underlying compatible model instead.
+
+        Args:
+            model: Loaded EasyDeL module to inspect.
+
+        Returns:
+            ``True`` iff the model's *class* (not the instance) has an
+            ``esurge_graphdef`` entry in its dict — checking the class is
+            important because most concrete models inherit a default that
+            should not register as an override.
+        """
         return type(model).__dict__.get("esurge_graphdef") is not None
 
     @classmethod
     def _split_graph_components_for_weight_update(cls, model: EasyDeLBaseModule):
-        """Split graph components from the module that actually backs eSurge."""
+        """Run :meth:`split_module` on the right model for an eSurge hot-swap.
+
+        Engines that wrap their model in a non-eSurge-compatible class need
+        their ``esurge_compatible_model`` (the inner LM that actually carries
+        the executable graph) split, not the wrapper. This helper resolves
+        the correct module, calls ``split_module()`` on it, and returns the
+        full split tuple along with the resolved module so callers don't
+        have to repeat the wrapper-detection logic.
+
+        Args:
+            model: Wrapped or bare module supplied to :meth:`update_model_weights`.
+
+        Returns:
+            Tuple ``(split_model, graphdef, graphstate, graphother)`` where
+            ``split_model`` is either ``model.esurge_compatible_model``
+            (when the wrapper opts out via :meth:`_model_overrides_esurge_graphdef`)
+            or ``model`` itself, and the remaining three are the components
+            produced by :meth:`split_module` on that module.
+        """
         split_model = model
         if cls._model_overrides_esurge_graphdef(model):
             try:
@@ -86,13 +151,37 @@ class EngineLifecycleMixin:
 
     @staticmethod
     def _can_prefetch_scheduler_output(scheduler: Scheduler, current: SchedulerOutput) -> bool:
-        """Return whether the next schedule can be computed before current output lands.
+        """Decide whether ``schedule()`` can run while ``current`` is still in flight.
 
-        Prefetch is only safe for pure prefill batches whose requests cannot
-        terminate based on the current step's sampled token. Once a request has
-        reached prompt length, or the async scheduler has already inserted output
-        placeholders for it, the scheduler must wait for `update_from_output()`
-        to run before computing the next batch.
+        The overlap path may compute the next batch ahead of time only when
+        no decision in that batch depends on the sampled token of the
+        current one. Two situations forbid prefetch and force the
+        dispatcher to wait for ``update_from_output()`` first:
+
+        * The async scheduler has already inserted output placeholders
+          (``num_output_placeholders > 0``) — running ``schedule()`` again
+          before those placeholders are filled would either double-budget
+          the request or generate stale page-table updates.
+        * The request has reached prompt-length parity
+          (``num_computed_tokens >= num_tokens``) — its next decision (e.g.
+          whether to terminate on EOS) depends on the as-yet-unobserved
+          sampled token, so re-entering the scheduler would speculatively
+          extend a request that may finish.
+
+        Returns ``False`` defensively whenever exception handling kicks in
+        (e.g. if the scheduler maps are mutated mid-iteration), trading
+        some throughput for correctness.
+
+        Args:
+            scheduler: Live :class:`Scheduler` instance whose
+                ``requests`` map is queried per request id.
+            current: The :class:`SchedulerOutput` representing the
+                in-flight step.
+
+        Returns:
+            ``True`` iff every request in ``current`` is in the safe
+            "pure prefill, no termination decision yet" state, so the
+            next batch can be assembled now.
         """
         try:
             for rid in current.num_scheduled_tokens:
@@ -211,11 +300,27 @@ class EngineLifecycleMixin:
                 pass  # Not main thread or signal not available
 
     def _update_scheduler_heartbeat(self) -> None:
-        """Update the scheduler heartbeat timestamp."""
+        """Stamp the scheduler-loop progress watermark with the current monotonic time.
+
+        Called twice per iteration of the scheduler loop (once after
+        ``schedule()`` lands, once after ``update_from_output()`` lands)
+        so :meth:`_check_scheduler_heartbeat` can distinguish a hung loop
+        from one that is busy on a long step.
+        """
         self._scheduler_heartbeat = time.monotonic()
 
     def _check_scheduler_heartbeat(self) -> None:
-        """Warn if the scheduler hasn't produced a heartbeat recently."""
+        """Emit a WARNING when the scheduler heartbeat is staler than the threshold.
+
+        Polled from :meth:`_raise_if_scheduler_failed` (which is invoked
+        on every poll of :meth:`generate` / :meth:`stream`). Compares the
+        last heartbeat against
+        :data:`_SCHEDULER_HEARTBEAT_WARN_S`; when stale, logs at WARNING
+        with the age and rate-limits subsequent warnings to one per
+        :data:`_SCHEDULER_HEARTBEAT_WARN_INTERVAL_S` so a hang doesn't
+        flood the logs. No-op when the scheduler isn't running or no
+        heartbeat has been recorded yet.
+        """
         if not getattr(self, "_scheduler_running", False):
             return
         heartbeat = getattr(self, "_scheduler_heartbeat", None)
@@ -260,17 +365,41 @@ class EngineLifecycleMixin:
             self._request_outputs.pop(old_id, None)
 
     def initiate(self) -> None:
-        """Start the background scheduler thread.
+        """Start (or wake) the background scheduler so requests can flow.
 
-        Initiates a daemon thread that continuously runs the scheduler loop,
-        processing requests from the queue and updating outputs. This must
-        be called before using generate() or stream() methods.
+        Two flavours of behaviour, gated by ``distributed_mode``:
 
-        The scheduler thread will:
-        1. Schedule requests from the waiting queue
-        2. Execute model forward passes
-        3. Update request outputs with generated tokens
-        4. Signal waiting threads when updates are available
+        * **Worker rank** in distributed mode — boots the control server
+          via :meth:`DistributedController.start`, ensures KV pages are
+          allocated, and returns; no scheduler thread is spawned because
+          the leader will dispatch each step over RPC.
+        * **Leader rank or single-host** — re-allocates KV pages if they
+          were previously destroyed, clears any prior crash state,
+          installs SIGTERM diagnostics, and spawns the daemon scheduler
+          thread that runs the main control loop.
+
+        The scheduler-loop body itself comes in two shapes depending on
+        ``runtime_config.overlap_execution``:
+
+        1. **Synchronous path** — call ``schedule()``, run the model
+           via :meth:`eSurgeRunner.execute_model`, and apply the result
+           with ``update_from_output()`` on the same thread.
+        2. **Overlap path** — dispatch the model asynchronously via
+           :meth:`eSurgeRunner.execute_model_async`, use
+           :meth:`_can_prefetch_scheduler_output` to decide whether to
+           compute the next batch while the device is still busy, and
+           drain the prior step via :meth:`_drain_runner_future`.
+
+        Both paths are wrapped in a retry budget
+        (:data:`MAX_CONSECUTIVE_SCHEDULER_ERRORS`) and routed through
+        :meth:`_is_nonrecoverable_scheduler_error` so invariant violations
+        terminate immediately instead of looping. The
+        :meth:`_update_scheduler_heartbeat` call after each iteration
+        keeps :meth:`_check_scheduler_heartbeat` in :meth:`_raise_if_scheduler_failed`
+        able to detect hangs.
+
+        State on exit: ``_scheduler_running=True``, idle monitor armed,
+        ``_paused=False``. No-op if the loop is already running.
         """
         with self._scheduler_lock:
             distributed_controller = getattr(self, "_distributed_controller", None)
@@ -486,11 +615,29 @@ class EngineLifecycleMixin:
             self._paused = False
 
     def terminate(self) -> None:
-        """Stop the background scheduler thread.
+        """Tear down the scheduler loop and release subordinate resources.
 
-        Gracefully shuts down the scheduler loop and waits for the thread
-        to terminate. Should be called when the engine is no longer needed
-        to free resources.
+        Engine-stop path. Steps:
+
+        1. Stop the idle-reset watchdog so it cannot fire mid-shutdown.
+        2. Set ``_scheduler_running = False`` and ``join`` the scheduler
+           thread with a five-second timeout (logs a WARNING if it
+           refuses to stop). Workers in distributed mode are also asked
+           to shut down their control servers here.
+        3. If a profiler trace is active, stop it via
+           :meth:`stop_profiling` (best-effort; failures are demoted to
+           DEBUG).
+        4. Forward to :meth:`eSurgeRunner.shutdown` so resident PP-stage
+           worker threads inside the :class:`ModelStepExecutor` are
+           joined.
+        5. Clear runner buffers via :meth:`_reset_runner_state_if_idle`
+           when the engine is genuinely idle, so a subsequent
+           :meth:`initiate` starts from a clean slate.
+
+        State on exit: the scheduler thread is gone, the runner has no
+        in-flight state, and no background timers are active. Idempotent
+        — calling it on an already-terminated engine logs an info line
+        and returns.
         """
         self._stop_idle_monitor()
         with self._scheduler_lock:
@@ -525,14 +672,21 @@ class EngineLifecycleMixin:
             self._reset_runner_state_if_idle("terminate")
 
     def pause(self) -> None:
-        """Pause the background scheduler without clearing queued state.
+        """Stop the scheduler loop while preserving request bookkeeping.
 
-        Temporarily stops the scheduler thread while preserving request state.
-        Use resume() to restart processing. Optionally destroys KV cache to
-        free memory if destroy_pages_on_pause is enabled.
+        Suspended state is intentionally non-destructive for requests:
+        the waiting and running queues survive, and active streaming
+        clients merely stop receiving updates until :meth:`resume`.
+        Internally this terminates the scheduler thread (so any
+        in-flight model step is drained), drains the resident PP worker
+        pool, and — when ``cache_config.destroy_pages_on_pause`` is set
+        — frees the KV pages to reclaim HBM (skipped if requests are
+        still active to avoid corrupting their state). Finally,
+        :meth:`_reset_runner_state_if_idle` clears the runner's
+        sequence buffer if the engine is genuinely idle.
 
-        Note:
-            Does not abort pending requests - they will resume when resume() is called.
+        Sets ``_paused=True``. Idempotent — pausing an already-paused
+        engine logs an info line and returns.
         """
         if not self._scheduler_running:
             self._info("Scheduler loop already paused or not running")
@@ -557,14 +711,14 @@ class EngineLifecycleMixin:
         self._reset_runner_state_if_idle("pause")
 
     def resume(self) -> None:
-        """Resume the scheduler if it was paused.
+        """Reopen the engine for inference after a :meth:`pause`.
 
-        Restarts the background scheduler thread after a pause(). If KV cache
-        was destroyed during pause, it will be reinitialized before processing
-        resumes.
-
-        Note:
-            Safe to call even if the scheduler is already running - will no-op.
+        Drains any leftover PP-worker state, reinitializes the KV cache
+        when ``destroy_pages_on_pause`` had freed it, and delegates to
+        :meth:`initiate` to spin a fresh scheduler thread. Requests that
+        were waiting before the pause are immediately considered for
+        scheduling on the next iteration. Idempotent for already-running
+        engines.
         """
         if self._scheduler_running:
             self._info("Scheduler loop already running")
@@ -788,11 +942,24 @@ class EngineLifecycleMixin:
             self._profiling_python_level = None
 
     def _drain_runner_future(self, future, scheduler_output: SchedulerOutput) -> None:
-        """Wait for an async runner execution and process results.
+        """Block on an in-flight async step and apply its outputs to the scheduler.
+
+        Used by the overlap scheduler-loop path after dispatching a step
+        via :meth:`eSurgeRunner.execute_model_async`. Waits for the host
+        copies of sampled tokens to land, runs the scheduler's
+        ``update_from_output`` on the resulting :class:`ModelRunnerOutput`,
+        forwards engine-side outputs (sampled tokens, finished requests)
+        to :meth:`_process_engine_outputs` for client delivery, and
+        decrements the profiler step counter when an active trace is
+        running.
 
         Args:
-            future: The async execution future to wait on.
-            scheduler_output: The scheduler output that triggered the execution.
+            future: Async handle returned by
+                :meth:`eSurgeRunner.execute_model_async` (an
+                ``_AsyncExecutionHandle`` or ``concurrent.futures.Future``).
+            scheduler_output: The :class:`SchedulerOutput` that produced
+                ``future``; needed by ``update_from_output`` to map
+                sampled tokens back to the right requests.
         """
         model_output = self.runner.wait_for_execution(future)
         with self._scheduler_lock:
@@ -802,10 +969,14 @@ class EngineLifecycleMixin:
         self._handle_profiling_step()
 
     def _handle_profiling_step(self) -> None:
-        """Handle profiling step counter and auto-stop when complete.
+        """Tick down the profiler step budget and auto-stop the trace at zero.
 
-        Decrements the profiling step counter and stops profiling when
-        the configured number of batches has been traced.
+        Called from both scheduler-loop paths (sync and overlap) after
+        each scheduler iteration completes. When a profiler trace is not
+        active, returns immediately. Otherwise decrements
+        ``_profiling_steps_remaining`` and, if it reaches zero, finalizes
+        the trace via :meth:`stop_profiling` so users get a self-bounded
+        profile without having to remember to stop it manually.
         """
         if not self._profiling_active:
             return

@@ -22,11 +22,29 @@ from easydel.infra.factory import register_config
 
 @register_config("mamba")
 class MambaConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for the original Mamba selective state-space model (Mamba-1).
 
-    Args:
+    Mamba replaces self-attention with a selective state-space recurrence
+
+    .. math::
+        h_t = \\bar{A}_t \\, h_{t-1} + \\bar{B}_t \\, x_t, \\qquad y_t = C_t \\, h_t + D \\, x_t
+
+    where :math:`\\bar{A}, \\bar{B}` are obtained by zero-order-hold discretization of
+    a continuous SSM with input-dependent step size :math:`\\Delta_t = \\text{softplus}
+    (\\text{Linear}_{\\Delta}(x_t))`. ``B`` and ``C`` are projected from the input as
+    well, which is what makes the SSM *selective* — it can let information through or
+    drop it based on the token. A short causal depthwise 1-D convolution of width
+    ``conv_kernel`` is applied before the SSM to give the model a learnable local
+    receptive field; its rolling window is what is carried in ``conv_state`` during
+    streaming decode.
+
+    State carried per token across batch/seq:
+        * ``conv_state``: rolling window of length ``conv_kernel`` over the
+          ``intermediate_size`` channel axis.
+        * ``ssm_state``: per-channel hidden state of shape
+          ``(intermediate_size, state_size)`` accumulating the recurrence.
+
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 50280):
             Vocabulary size of the Mamba model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.
@@ -116,6 +134,55 @@ class MambaConfig(EasyDeLBaseConfig):
         use_mambapy: bool = False,
         **kwargs,
     ):
+        """Initialize the Mamba configuration.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 50280.
+            hidden_size (int, optional): Hidden dimension. Defaults to 768.
+            state_size (int, optional): SSM state dimension. Defaults to 16.
+            num_hidden_layers (int, optional): Number of Mamba blocks. Defaults to 32.
+            layer_norm_epsilon (float, optional): Epsilon for normalization layers.
+                Defaults to 1e-5.
+            pad_token_id (int, optional): Padding token id. Defaults to 0.
+            bos_token_id (int, optional): Beginning-of-sequence token id. Defaults to 0.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 0.
+            expand (int, optional): Intermediate-size expansion factor. Defaults to 2.
+            conv_kernel (int, optional): 1D convolution kernel size. Defaults to 4.
+            use_bias (bool, optional): Whether linear layers use bias. Defaults to False.
+            use_conv_bias (bool, optional): Whether the conv layer uses bias.
+                Defaults to True.
+            hidden_act (str, optional): Activation function for the gated path.
+                Defaults to "silu".
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.1.
+            residual_in_fp32 (bool, optional): Whether to compute the residual
+                connection in float32. Defaults to True.
+            time_step_rank (str | int, optional): Rank of the time-step projection.
+                Use ``"auto"`` to use ``ceil(hidden_size / 16)``. Defaults to "auto".
+            time_step_scale (float, optional): Scale applied to the time-step
+                projection. Defaults to 1.0.
+            time_step_min (float, optional): Minimum bias value for the time step.
+                Defaults to 0.001.
+            time_step_max (float, optional): Maximum bias value for the time step.
+                Defaults to 0.1.
+            time_step_init_scheme (str, optional): Initialization scheme for the
+                time-step bias (``"random"`` or ``"uniform"``). Defaults to "random".
+            time_step_floor (float, optional): Floor applied to the time-step bias.
+                Defaults to 1e-4.
+            rescale_prenorm_residual (bool, optional): Whether to rescale the pre-norm
+                residual. Defaults to False.
+            use_cache (bool, optional): Whether to enable recurrent state caching.
+                Defaults to True.
+            use_associative_scan (bool, optional): Whether to use the associative-scan
+                implementation when supported. Defaults to True.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to True.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient
+                checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            use_mambapy (bool, optional): Whether to use the ``mambapy`` Python
+                reference path. Defaults to False.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.state_size = state_size
@@ -147,17 +214,25 @@ class MambaConfig(EasyDeLBaseConfig):
 
     @property
     def layer_types(self) -> list[str]:
-        """Return a uniform recurrent layer type list for pure Mamba models.
+        """Layer-type schedule consumed by ``EasyDeLBaseModule`` for cache routing.
+
+        Pure Mamba models advertise the recurrent ``"mamba"`` layer type for every
+        block, which tells the cache machinery to allocate :class:`RecurrentCache`
+        slots (rolling conv window + SSM state) instead of KV pages.
 
         Returns:
-            List of ``"mamba"`` strings with length ``num_hidden_layers``.
+            list[str]: ``["mamba"] * num_hidden_layers``.
         """
         return ["mamba"] * self.num_hidden_layers
 
     def get_mask_details(self):
-        """Recurrent Mamba layers do not use attention-mask descriptors.
+        """Mamba blocks consume no attention mask metadata.
+
+        The selective scan is fully causal by construction (left-to-right
+        recurrence); padding is handled by zeroing the channel inputs in
+        :meth:`MambaMixer.forward`, not by an attention mask.
 
         Returns:
-            Always ``None``, since Mamba layers have no attention masks.
+            None: Always — there is no mask schema to advertise.
         """
         return None

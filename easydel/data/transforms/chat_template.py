@@ -28,15 +28,23 @@ from .base import Example, Transform
 
 
 def is_conversational(example: dict) -> bool:
-    """Check if an example is in conversational format.
+    """Heuristic check that distinguishes chat-format rows from plain-text rows.
 
-    Detects if the example contains messages/conversations with role/content structure.
+    Looks for any of the recognised chat columns
+    (``"prompt"``, ``"chosen"``, ``"rejected"``, ``"completion"``,
+    ``"messages"``, ``"conversations"``) and accepts the row as
+    conversational when at least one of those columns holds a
+    non-empty list whose first element is a dict with a ``"role"``
+    or ``"from"`` key. The check is intentionally cheap (constant
+    time per row) so it can be applied per-row by
+    :class:`MaybeApplyChatTemplate`.
 
     Args:
-        example: Example dictionary to check.
+        example: Row dict to inspect.
 
     Returns:
-        True if example appears to be conversational format.
+        bool: ``True`` if the row's shape matches a chat-style
+        schema, ``False`` for plain-text and other schemas.
     """
     supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "conversations"]
 
@@ -56,13 +64,22 @@ def is_conversational(example: dict) -> bool:
 
 
 def convert_to_chatml(messages: list[dict]) -> list[dict]:
-    """Convert from/value format to role/content (ChatML) format.
+    """Re-key from/value-style messages into ChatML's role/content shape.
+
+    Many open-source datasets follow the ShareGPT convention
+    (``{"from": ..., "value": ...}``) instead of the OpenAI/ChatML
+    convention (``{"role": ..., "content": ...}``). This helper
+    rewrites the keys without touching message order or values.
+    Messages already in role/content shape are passed through
+    unchanged so the function is safe to call defensively.
 
     Args:
-        messages: List of messages, possibly in from/value format.
+        messages: Sequence of message dicts; entries may be in either
+            shape and are converted independently.
 
     Returns:
-        Messages in role/content format.
+        list[dict]: New list of messages in ``role``/``content``
+        shape; the originals are not mutated.
     """
     result = []
     for msg in messages:
@@ -80,12 +97,22 @@ def convert_to_chatml(messages: list[dict]) -> list[dict]:
 
 
 class ChatTemplateTransform(Transform):
-    """Apply chat template to convert messages to formatted text.
+    """Render conversational rows to model-ready text using the tokenizer's chat template.
 
-    This is the primary transform for converting conversational data:
-        {"messages": [{"role": "user", "content": "Hello!"}, ...]}
-    to:
-        {"text": "<formatted conversation>"}
+    Reads the configured messages field
+    (``messages_field``, with fallbacks to ``"conversations"`` /
+    ``"conversation"``), optionally re-keys ShareGPT-style
+    ``from``/``value`` entries to ChatML ``role``/``content``, and
+    invokes ``tokenizer.apply_chat_template(messages, tokenize=False, ...)``
+    to produce a single rendered string. The result is written to
+    ``output_field`` (default ``"text"``); when the template raises,
+    a minimal ``"role: content"`` fallback string is produced so
+    downstream tokenization can still proceed (with a warning).
+
+    Use this transform once chat data has already been normalised to
+    role/content shape. For mixed-format datasets, wrap with
+    :class:`MaybeApplyChatTemplate`. For ShareGPT/OpenAI variant
+    inputs, prepend :class:`ConvertToChatML`.
 
     Example:
         >>> from transformers import AutoTokenizer
@@ -110,17 +137,35 @@ class ChatTemplateTransform(Transform):
         drop_messages: bool = True,
         **template_kwargs,
     ):
-        """Initialize ChatTemplateTransform.
+        """Capture template settings without invoking the tokenizer.
 
         Args:
-            tokenizer: HuggingFace tokenizer with chat template.
-            messages_field: Field containing the messages list. Also checks
-                "conversations" and "conversation" as fallbacks.
-            output_field: Field to store the formatted text.
-            tools: Optional tools/functions for function calling templates.
-            convert_from_value_format: Auto-convert from/value to role/content format.
-            drop_messages: Remove the original messages field after conversion.
-            **template_kwargs: Additional kwargs passed to apply_chat_template.
+            tokenizer: HuggingFace ``PreTrainedTokenizerBase`` (or
+                compatible) exposing ``apply_chat_template``. The
+                tokenizer must define a chat template — the transform
+                falls back to a simple formatter when it raises but
+                logs a warning.
+            messages_field: Primary row key holding the message list.
+                ``"conversations"`` and ``"conversation"`` are tried
+                as fallbacks before giving up.
+            output_field: Row key under which the rendered string is
+                stored. Defaults to ``"text"`` so downstream
+                tokenization picks it up without configuration.
+            tools: Optional tools/functions list forwarded as
+                ``tools=`` to ``apply_chat_template`` (for tokenizers
+                that support function-calling templates). ``None``
+                disables tool rendering.
+            convert_from_value_format: When ``True``, ShareGPT-style
+                ``from``/``value`` messages are re-keyed via
+                :func:`convert_to_chatml` before rendering; when
+                ``False``, messages are passed through verbatim.
+            drop_messages: When ``True``, removes the original source
+                field after rendering so downstream stages do not see
+                two copies of the conversation.
+            **template_kwargs: Extra keyword arguments forwarded
+                verbatim to ``apply_chat_template`` —
+                ``add_generation_prompt``, ``continue_final_message``,
+                custom template flags, etc.
         """
         self._tokenizer = tokenizer
         self._messages_field = messages_field
@@ -131,17 +176,23 @@ class ChatTemplateTransform(Transform):
         self._template_kwargs = template_kwargs
 
     def __call__(self, example: Example) -> Example:
-        """Apply chat template to convert messages to formatted text.
+        """Render the example's messages through the tokenizer's chat template.
 
-        Looks for messages in the configured field (with fallbacks to
-        "conversations" and "conversation"), applies the tokenizer's chat
-        template, and stores the result in the output field.
+        Walks the source field fallbacks (``messages_field`` then
+        ``"conversations"`` then ``"conversation"``) and stops at the
+        first one present. Optionally normalises ShareGPT-style
+        messages, then invokes ``apply_chat_template``. On failure,
+        falls back to :meth:`_simple_format` and emits a warning.
 
         Args:
-            example: Input example with a messages field.
+            example: Row dict containing the message list under one
+                of the recognised keys.
 
         Returns:
-            Example with formatted text in the output field.
+            dict: A copy of ``example`` with the rendered string in
+            ``output_field`` and the original messages key removed
+            when ``drop_messages`` is ``True``. Rows with no
+            recognised messages key are returned unchanged.
         """
         result = example.copy()
 
@@ -186,7 +237,17 @@ class ChatTemplateTransform(Transform):
         return result
 
     def _simple_format(self, messages: list[dict]) -> str:
-        """Simple fallback formatting if chat template fails."""
+        """Render messages with a minimal ``role: content`` formatter.
+
+        Used as a fallback when the tokenizer's chat template raises.
+
+        Args:
+            messages: List of role/content message dicts (from/value also
+                supported).
+
+        Returns:
+            Newline-joined string of ``"<role>: <content>"`` lines.
+        """
         parts = []
         for msg in messages:
             role = msg.get("role", msg.get("from", "unknown"))
@@ -195,13 +256,23 @@ class ChatTemplateTransform(Transform):
         return "\n".join(parts)
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"ChatTemplateTransform(messages_field=..., output_field=...)"``.
+        """
         return f"ChatTemplateTransform(messages_field={self._messages_field!r}, output_field={self._output_field!r})"
 
 
 class MaybeApplyChatTemplate(Transform):
-    """Conditionally apply chat template only if example is conversational.
+    """Per-row guard that applies a chat template only when the row looks conversational.
 
-    This is useful when processing datasets that may have mixed formats.
+    Useful when a single dataset is heterogeneous — e.g. an SFT mix
+    that combines plain ``text`` rows with chat ``messages`` rows.
+    The transform tests :func:`is_conversational` on each row and
+    forwards plain rows untouched, applying the wrapped
+    :class:`ChatTemplateTransform` only when the row matches the
+    chat shape.
 
     Example:
         >>> transform = MaybeApplyChatTemplate(tokenizer)
@@ -212,29 +283,39 @@ class MaybeApplyChatTemplate(Transform):
     """
 
     def __init__(self, tokenizer: tp.Any, **chat_template_kwargs):
-        """Initialize MaybeApplyChatTemplate.
+        """Build the wrapped :class:`ChatTemplateTransform` once at construction time.
 
         Args:
-            tokenizer: HuggingFace tokenizer with chat template.
-            **chat_template_kwargs: Arguments passed to ChatTemplateTransform.
+            tokenizer: HuggingFace tokenizer with a chat template;
+                forwarded to :class:`ChatTemplateTransform`.
+            **chat_template_kwargs: Forwarded verbatim to the
+                wrapped transform — same vocabulary as
+                :class:`ChatTemplateTransform.__init__`.
         """
         self._tokenizer = tokenizer
         self._chat_transform = ChatTemplateTransform(tokenizer, **chat_template_kwargs)
 
     def __call__(self, example: Example) -> Example:
-        """Apply chat template only if the example is in conversational format.
+        """Run the chat template only for chat-shaped rows; pass plain rows through.
 
         Args:
-            example: Input example to conditionally transform.
+            example: Row dict; may be plain text or chat shape.
 
         Returns:
-            Transformed example if conversational, original example otherwise.
+            dict: The result of the wrapped chat-template transform
+            for chat-shaped rows, or the original ``example``
+            object (no copy) for non-chat rows.
         """
         if is_conversational(example):
             return self._chat_transform(example)
         return example
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"MaybeApplyChatTemplate()"``.
+        """
         return "MaybeApplyChatTemplate()"
 
 
@@ -270,13 +351,20 @@ class ConvertInputOutputToChatML(Transform):
         user_role: str = "user",
         assistant_role: str = "assistant",
     ):
-        """Initialize ConvertInputOutputToChatML.
+        """Capture the schema field names and role labels used during conversion.
 
         Args:
-            input_field: Field containing the conversations (also checks "conversations").
-            output_field: Field to store the converted messages.
-            user_role: Role name for user turns (default: "user").
-            assistant_role: Role name for assistant turns (default: "assistant").
+            input_field: Primary row key holding the input/output
+                conversation turns. Falls back to ``"conversation"``
+                and ``"conversations"`` when the primary key is absent.
+            output_field: Row key under which the produced messages
+                list is stored. Defaults to ``"messages"`` to align
+                with ChatML conventions.
+            user_role: Role tag emitted for ``input`` text. Defaults
+                to ``"user"`` to match ChatML; some templates may
+                expect alternates such as ``"human"``.
+            assistant_role: Role tag emitted for ``output`` text.
+                Defaults to ``"assistant"``.
         """
         self._input_field = input_field
         self._output_field = output_field
@@ -284,13 +372,24 @@ class ConvertInputOutputToChatML(Transform):
         self._assistant_role = assistant_role
 
     def __call__(self, example: Example) -> Example:
-        """Convert input/output conversation pairs to ChatML messages format.
+        """Expand each ``{input, output}`` turn into a ``user`` + ``assistant`` message pair.
+
+        Walks the configured input field (with fallbacks) and
+        translates every turn into one or two ChatML messages
+        (``user`` from ``input``, ``assistant`` from ``output``);
+        turns missing one side produce only the present side. The
+        original input field is removed when it differs from
+        ``output_field``.
 
         Args:
-            example: Input example with input/output conversation turns.
+            example: Row dict expected to carry an
+                ``input``/``output`` turn list under one of the
+                recognised keys.
 
         Returns:
-            Example with messages in ChatML role/content format.
+            dict: Copy of ``example`` with the rendered messages list
+            in ``output_field``. Rows with no recognised conversation
+            field are returned unchanged.
         """
         result = example.copy()
 
@@ -322,6 +421,11 @@ class ConvertInputOutputToChatML(Transform):
         return result
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"ConvertInputOutputToChatML('input_field' -> 'output_field')"``.
+        """
         return f"ConvertInputOutputToChatML({self._input_field!r} -> {self._output_field!r})"
 
 
@@ -378,15 +482,24 @@ class ConvertToChatML(Transform):
         role_mapping: dict[str, str] | None = None,
         use_default_mapping: bool = True,
     ):
-        """Initialize ConvertToChatML.
+        """Capture the schema field names and assemble the role-normalisation table.
 
         Args:
-            input_field: Field containing the conversations (also checks "messages").
-            output_field: Field to store the converted messages.
-            role_mapping: Custom mapping to normalize role names. If use_default_mapping
-                is True, these are merged with defaults (custom takes precedence).
-            use_default_mapping: Whether to use default role mapping (human->user, etc).
-                Set to False to only use custom role_mapping.
+            input_field: Primary row key holding the conversation
+                list; ``"conversations"`` and ``"messages"`` are
+                tried as fallbacks during ``__call__``.
+            output_field: Row key under which the converted ChatML
+                messages are stored. Defaults to ``"messages"``.
+            role_mapping: Per-call role rename map (e.g.
+                ``{"human": "user", "gpt": "assistant"}``). When
+                ``use_default_mapping`` is ``True`` the map is merged
+                on top of :data:`DEFAULT_ROLE_MAPPING` with custom
+                entries taking precedence; otherwise only the custom
+                map is consulted.
+            use_default_mapping: When ``True`` (default), include the
+                shipped :data:`DEFAULT_ROLE_MAPPING` entries
+                (``human -> user``, ``gpt -> assistant`` etc.) so
+                common ShareGPT corpora work out-of-the-box.
         """
         self._input_field = input_field
         self._output_field = output_field
@@ -400,16 +513,25 @@ class ConvertToChatML(Transform):
             self._role_mapping = role_mapping or {}
 
     def __call__(self, example: Example) -> Example:
-        """Convert from/value format messages to standard ChatML format.
+        """Re-key every message to ``role``/``content`` and normalise role names.
 
-        Normalizes role names using the configured role mapping and converts
-        "from"/"value" keys to "role"/"content" keys.
+        For each message in the source list, picks the role from
+        ``"from"`` or ``"role"`` (defaulting to ``"user"`` if neither
+        is present), runs it through the role rename map, and
+        copies the body from ``"value"`` or ``"content"``
+        (defaulting to ``""``). The original input field is removed
+        when it differs from ``output_field`` so downstream stages
+        do not see two copies of the conversation.
 
         Args:
-            example: Input example with conversations in from/value format.
+            example: Row dict expected to carry messages under one
+                of ``input_field``, ``"conversations"``, or
+                ``"messages"``.
 
         Returns:
-            Example with messages in standard role/content ChatML format.
+            dict: Copy of ``example`` with the converted messages
+            list under ``output_field``. Rows with no recognised
+            conversation field are returned unchanged.
         """
         result = example.copy()
 
@@ -460,4 +582,9 @@ class ConvertToChatML(Transform):
         return result
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"ConvertToChatML('input_field' -> 'output_field')"``.
+        """
         return f"ConvertToChatML({self._input_field!r} -> {self._output_field!r})"

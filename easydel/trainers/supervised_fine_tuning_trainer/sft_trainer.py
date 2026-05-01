@@ -92,6 +92,36 @@ class SFTTrainer(Trainer):
         formatting_func: tp.Callable | None = None,
         data_collator: DataCollatorForCompletionOnlyLM | None = None,
     ):
+        """Initialize the supervised fine-tuning trainer.
+
+        Args:
+            arguments (SFTConfig): SFT configuration; must be an
+                :class:`SFTConfig`.
+            processing_class (ProcessingClassType): Tokenizer / processor.
+                If ``pad_token`` is unset and ``eos_token`` exists,
+                pad is set to eos in place.
+            model (EasyDeLBaseModule | EasyDeLState | None): Model to be
+                fine-tuned. Plain modules are converted to a state via
+                ``model.to_state(...)``.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation
+                dataset(s).
+            formatting_func (tp.Callable | None): Optional callable
+                converting a dataset row into a single string. When
+                omitted and ``arguments.dataset_text_field`` is also
+                ``None``, an automatic formatter is inferred from the
+                dataset (when possible).
+            data_collator (DataCollatorForCompletionOnlyLM | None):
+                Optional completion-only data collator. Allowed only
+                when ``arguments.packing`` is True.
+
+        Raises:
+            TypeError: If ``arguments`` is not an :class:`SFTConfig`.
+            ValueError: If ``data_collator`` is supplied while
+                ``arguments.packing`` is False.
+        """
         if not isinstance(arguments, SFTConfig):
             raise TypeError("passed argument must be a `SFTConfig`.")
 
@@ -160,7 +190,20 @@ class SFTTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Detect whether the bound training source already exposes tokenised text.
+
+        Peeks at the first row of the first shard and reports whether
+        the column ``"input_ids"`` is present. The presence of that
+        field is the signal the trainer uses to skip
+        :class:`SFTPreprocessTransform` (chat-template rendering and
+        tokenisation) and feed rows directly to the data collator. The
+        method is defensive against unset sources, empty shard lists,
+        and shards yielding no rows.
+
+        Returns:
+            ``True`` when the first sample of the first shard contains
+            ``"input_ids"``; ``False`` otherwise.
+        """
         if self._train_source is None:
             return False
         try:
@@ -170,11 +213,27 @@ class SFTTrainer(Trainer):
             return False
 
     def _apply_preprocess_transforms(self) -> None:
-        """Apply preprocessing transforms including optional packing.
+        """Run the base preprocessor and optionally wrap the source in a packer.
 
-        Extends base implementation to add packing support when `packing=True`
-        in the SFT config. Packing combines multiple sequences into fixed-length
-        blocks for more efficient training.
+        After the standard tokenisation transform attached by the base
+        :class:`Trainer` runs, this override consults
+        ``arguments.packing`` and ``arguments.eval_packing`` and, when
+        either is enabled, wraps the corresponding shard source in a
+        :class:`PackedShardedSource`. The packer fills fixed-length
+        blocks of ``arguments.max_length`` tokens with multiple
+        sequences separated by EOS, exposing per-sequence
+        ``segment_ids`` so attention can be restricted to within-document
+        boundaries.
+
+        Strategy mapping mirrors the public ``packing_strategy`` field:
+        ``"bfd"`` (the SFT default) maps to the underlying
+        ``"first_fit"`` packer; ``"wrapped"`` maps to ``"greedy"``. When
+        the tokenizer has no ``eos_token_id`` the pad token is used as a
+        fallback delimiter and a warning is logged.
+
+        Side effects:
+            Replaces ``self._train_source`` (and, when configured,
+            ``self._eval_source``) with packed views in place.
         """
         # First apply standard tokenization transform
         super()._apply_preprocess_transforms()
@@ -230,6 +289,26 @@ class SFTTrainer(Trainer):
         batch: dict[str, tp.Any],
         is_train: bool,
     ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
+        """Normalize completion masks and ``labels`` after the base preprocessor.
+
+        Renames any ``assistant_masks`` field to ``completion_mask``,
+        intersects ``completion_mask`` with ``attention_mask`` and, when
+        ``labels`` is missing, derives it from ``input_ids`` masked to
+        ``-100`` outside the completion / attention regions. When only
+        ``labels`` is provided, ``completion_mask`` is recovered as
+        ``labels != -100``.
+
+        Args:
+            state (EasyDeLState): Current model state (forwarded to the
+                base preprocessor).
+            batch (dict[str, tp.Any]): Raw input batch, possibly already
+                post-processed by the base preprocessor.
+            is_train (bool): Whether this preprocessing is for training.
+
+        Returns:
+            tuple[dict[str, tp.Any], dict[str, float | int | str]]:
+            ``(processed_batch, auxiliary_metrics)``.
+        """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 
         if "assistant_masks" in batch:

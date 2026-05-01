@@ -11,6 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Spectrax implementation of DeepSeek-V3.
+
+DeepSeek-V3 keeps DeepSeek-V2's Multi-head Latent Attention (low-rank Q/KV
+projections, split nope/rope head dims) and pushes the MoE further: 256
+routed experts plus a single shared expert, top-8 routing with the
+auxiliary-free top-k method (``topk_method="noaux_tc"``) and sigmoid
+scoring, optional multi-token prediction, and YaRN-style RoPE for extended
+context.
+
+Building blocks:
+
+- :class:`DeepseekV3MLP` — dense SwiGLU FFN used by the dense layers
+  (typically the first ``first_k_dense_replace`` layers).
+- :class:`DeepseekV3MLPMoE` — expert-parallel SwiGLU FFN.
+- :class:`MoEGate` — sigmoid/softmax router with optional group routing,
+  ``topk_method="noaux_tc"`` (no auxiliary, learned bias), and sequence-level
+  auxiliary loss.
+- :class:`DeepseekV3MoE` — router + routed/shared experts wired together.
+- :class:`DeepseekV3Attention` — Multi-head Latent Attention (MLA) module.
+- :class:`DeepseekV3DecoderLayer` — single decoder layer (dense or MoE).
+
+Public model classes (registered with the factory):
+
+- :class:`DeepseekV3Model` — base decoder.
+- :class:`DeepseekV3ForCausalLM` — causal LM head + auxiliary load-balancing
+  loss.
+"""
 
 import functools
 import typing
@@ -64,10 +91,14 @@ from .deepseek_configuration import DeepseekV3Config
 
 
 class DeepseekV3MLP(spx.Module):
-    """Multi-Layer Perceptron module for DeepSeek V3 dense layers.
+    """SwiGLU feed-forward used by DeepSeek-V3 dense layers and shared experts.
 
-    Implements the feedforward network with SwiGLU activation function
-    for enhanced representation learning in dense (non-MoE) layers.
+    Computes ``down_proj(silu(gate_proj(x)) * up_proj(x))``. Used in two
+    places: as the FFN of the first ``config.first_k_dense_replace`` layers
+    (which run as dense transformer blocks), and as the *shared expert*
+    branch inside :class:`DeepseekV3MoE` when
+    ``config.n_shared_experts`` is set (the shared-expert intermediate width
+    is ``config.moe_intermediate_size * n_shared_experts``).
     """
 
     def __init__(
@@ -144,10 +175,24 @@ class DeepseekV3MLP(spx.Module):
 
 
 class MoEGate(spx.Module):
-    """Router module that scores tokens and selects experts for DeepSeek V3 MoE.
+    """DeepSeek-V3 router: sigmoid scoring + grouped ``noaux_tc`` top-k selection.
 
-    Implements token-to-expert routing with sigmoid scoring and noaux_tc
-    top-k selection for mixture-of-experts layers in DeepSeek V3.
+    DeepSeek-V3 replaces the standard softmax router with a *biased sigmoid*
+    routing scheme:
+
+    1. ``hidden -> n_routed_experts`` linear (no bias) produces per-expert
+       scores; a learnable ``e_score_correction_bias`` is added to balance
+       experts without an auxiliary loss.
+    2. Experts are grouped into ``n_group`` groups; only the top
+       ``topk_group`` groups (ranked by the sum of their best two members)
+       are eligible for selection on each token.
+    3. Within the eligible groups, the router picks ``num_experts_per_tok``
+       experts (8 by default in V3) and re-normalises their sigmoid scores
+       to sum to 1 (scaled by ``routed_scaling_factor``).
+
+    The selection function ``noaux_tc`` keeps the routing differentiable in
+    the value path while load balance is handled purely through the
+    correction bias — hence the name "no auxiliary loss" balancing.
     """
 
     def __init__(
@@ -260,10 +305,16 @@ class MoEGate(spx.Module):
 
 
 class DeepseekV3MLPMoE(spx.Module):
-    """Mixture-of-experts feed-forward module for DeepSeek V3 MoE layers.
+    """Expert-parallel SwiGLU FFN used inside DeepSeek-V3 MoE layers.
 
-    Implements the expert network with SwiGLU activation function for
-    mixture-of-experts routing in DeepSeek V3 architecture.
+    Each call evaluates ``w_down(silu(w_gate(x)) * w_up(x))`` independently
+    per expert via ``ColumnParallelMoELinear`` / ``RowParallelMoELinear``,
+    so the expert dimension is sharded across the EP/TP mesh axes. Tokens
+    have already been grouped by :class:`DeepseekV3MoE` into per-expert
+    ragged segments (``group_sizes`` + sorted-expert indices); this module
+    never sees the raw ``(batch, seq)`` layout. The intermediate width is
+    ``config.moe_intermediate_size`` (smaller than ``intermediate_size`` so
+    each expert is cheaper than a dense layer).
     """
 
     reform_param: typing.ClassVar = {
@@ -385,10 +436,22 @@ class DeepseekV3MLPMoE(spx.Module):
 
 
 class DeepseekV3MoE(BaseMoeModule):
-    """Mixture-of-experts module combining gating and expert networks for DeepSeek V3.
+    """DeepSeek-V3 MoE layer: ``noaux_tc`` routing + routed experts + shared expert.
 
-    Implements the complete MoE layer with token routing through gating network
-    and expert processing with optional shared experts for enhanced performance.
+    Composes the routing and expert paths into one block:
+
+    * **Router** (:class:`MoEGate`) emits ``num_experts_per_tok`` expert ids
+      per token and matching gating weights, using DeepSeek-V3's
+      sigmoid-scored ``noaux_tc`` group-top-k strategy.
+    * **Routed experts** (:class:`DeepseekV3MLPMoE`) run the SwiGLU FFN per
+      expert, scattered through ``BaseMoeModule.moe_call`` with
+      ``MoeLoadBalancingStrategy.NO_AUX_LOSS``.
+    * **Shared expert** (:class:`DeepseekV3MLP`, optional) processes every
+      token unconditionally with intermediate width
+      ``moe_intermediate_size * n_shared_experts``; its output is summed
+      onto the routed-expert output before exit. This is the
+      "shared + routed" trick that lets DeepSeek keep per-token compute
+      stable even at low expert activation rates.
     """
 
     def __init__(
@@ -481,10 +544,33 @@ class DeepseekV3MoE(BaseMoeModule):
 
 
 class DeepseekV3Attention(UnifiedAttention):
-    """Multi-head Latent Attention (MLA) layer for DeepSeek V3 models.
+    """Multi-head Latent Attention (MLA) for DeepSeek-V3.
 
-    Implements MLA with low-rank key-value compression for efficient memory usage
-    and improved inference performance. Inherits from UnifiedAttention base class.
+    MLA splits each query/key into two parts — a "no-position" (NoPE) part of
+    width ``qk_nope_head_dim`` and a "position" (RoPE) part of width
+    ``qk_rope_head_dim`` — and projects keys/values through a low-rank latent
+    of width ``kv_lora_rank``. The KV cache then stores the *latent* vectors
+    (size ``kv_lora_rank + qk_rope_head_dim`` per token) instead of full
+    per-head keys/values, shrinking the cache to a small fraction of GQA's
+    footprint.
+
+    Concretely:
+
+    * **Query path.** When ``config.q_lora_rank`` is set, queries are routed
+      through a LoRA-style bottleneck:
+      ``hidden -> q_a_proj (rank=q_lora_rank) -> q_a_layernorm ->
+      q_b_proj``; otherwise a single ``q_proj`` produces the full
+      ``num_heads * (qk_nope_head_dim + qk_rope_head_dim)`` projection.
+    * **KV path.** ``kv_a_proj_with_mqa`` produces both the latent
+      (``kv_lora_rank``) and the shared RoPE-K (``qk_rope_head_dim``) in one
+      matmul; the latent is RMSNorm'd by ``kv_a_layernorm`` and then
+      ``kv_b_proj`` expands it to per-head NoPE-K and value channels of
+      total width ``num_heads * (qk_nope_head_dim + v_head_dim)``.
+    * **Softmax scale.** Uses ``q_head_dim ** -0.5``; when YARN scaling is
+      configured (``rope_scaling.mscale_all_dim``) the scale is multiplied
+      by ``mscale ** 2`` for stable extrapolation.
+    * **Output.** Heads are merged at the value head dim ``v_head_dim`` and
+      projected back to ``hidden_size`` by a row-parallel ``o_proj``.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -709,10 +795,24 @@ class DeepseekV3Attention(UnifiedAttention):
 
 
 class DeepseekV3DecoderLayer(spx.Module):
-    """Single decoder layer for DeepSeek V3 models.
+    """One DeepSeek-V3 decoder layer (sequential pre-norm MLA + FFN/MoE).
 
-    Combines Multi-head Latent Attention (MLA) and feedforward networks
-    (dense or MoE) with RMS normalization and residual connections.
+    Standard pre-norm transformer block:
+
+        ``x = x + mla(input_ln(x))``
+        ``x = x + ffn(post_attn_ln(x))``
+
+    The FFN swap-out is layer-aware:
+
+    * Layers ``0..first_k_dense_replace - 1`` use a dense
+      :class:`DeepseekV3MLP` with intermediate width ``intermediate_size``.
+    * Remaining layers use :class:`DeepseekV3MoE` (sigmoid-routed experts +
+      optional shared expert) with intermediate width
+      ``moe_intermediate_size`` per expert.
+
+    This layout — dense early layers, MoE for the bulk — keeps representation
+    quality at the bottom of the stack while reaping MoE's compute savings
+    deeper in the model.
     """
 
     def __init__(
@@ -874,10 +974,18 @@ class DeepseekV3DecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, DeepseekV3Config, model_type="deepseek_v3")
 class DeepseekV3Model(EasyDeLBaseModule):
-    """DeepSeek V3 base model implementation.
+    """DeepSeek-V3 backbone (registered as ``BASE_MODULE``).
 
-    This implements the DeepSeek V3 language model architecture with Multi-head Latent
-    Attention (MLA), mixture-of-experts (MoE) layers, and RMS normalization.
+    Stack: token embedding -> ``num_hidden_layers`` :class:`DeepseekV3DecoderLayer`
+    blocks (the first ``first_k_dense_replace`` are dense, the rest run MoE)
+    -> final RMSNorm. Attention uses MLA with low-rank KV compression
+    (``kv_lora_rank``, ``qk_nope/rope_head_dim``, ``v_head_dim``) and YARN
+    RoPE scaling for long context. Decoder layers wrap with :func:`auto_remat`
+    so per-layer activation checkpointing follows
+    ``config.gradient_checkpointing``. Forward returns
+    :class:`MoeModelOutput` carrying the final hidden state, optional
+    all-layer hidden states / attentions, optional router logits (one per
+    MoE layer; ``None`` for the dense prefix), and the updated KV cache.
 
     Attributes:
         config (DeepseekV3Config): Configuration for the model.
@@ -1131,10 +1239,15 @@ class DeepseekV3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, DeepseekV3Config, model_type="deepseek_v3")
 class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config]):
-    """DeepSeek V3 model with a language modeling head for causal language modeling tasks.
+    """DeepSeek-V3 backbone + ``vocab_size`` LM head for autoregressive generation.
 
-    This model extends the base DeepSeek V3 model by adding a linear language modeling head
-    for autoregressive text generation with MoE routing and auxiliary loss support.
+    Wraps :class:`DeepseekV3Model` with an unbiased linear ``lm_head``. Goes
+    through ``forward_moe`` so per-MoE-layer router logits are surfaced;
+    however DeepSeek-V3's ``noaux_tc`` routing means the auxiliary
+    load-balancing loss is *not* added to the objective (load balance is
+    maintained purely through the learnable
+    ``e_score_correction_bias``). Routing weights still flow into the
+    output for diagnostics and downstream MoE-aware tooling.
 
     Attributes:
         config (DeepseekV3Config): Configuration for the model.

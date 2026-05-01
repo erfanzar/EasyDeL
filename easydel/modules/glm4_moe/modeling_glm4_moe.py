@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of THUDM's GLM-4-MoE language model.
+
+GLM-4-MoE is a decoder-only transformer with a hybrid dense/sparse layout:
+the first ``first_k_dense_replace`` layers use a standard dense MLP and the
+rest use a grouped mixture-of-experts block with a small number of always-on
+shared experts plus sparsely routed experts.
+
+Architectural traits:
+    - Grouped-query attention with optional bias and Q/K normalization.
+    - Partial rotary embeddings (``partial_rotary_factor``).
+    - Pre-norm RMSNorm decoder layers.
+    - Hybrid dense + grouped MoE FFN: per-token top-k routing inside
+      ``topk_group`` selected groups out of ``n_group``, plus shared experts.
+    - Optional load-balancing auxiliary loss via ``routed_scaling_factor``.
+
+Exports:
+    - :class:`Glm4MoeModel`: Backbone returning hidden states.
+    - :class:`Glm4MoeForCausalLM`: Decoder LM with optional tied LM head.
+    - :class:`Glm4MoeForSequenceClassification`: Pooled classifier head.
+"""
+
 import typing
 from functools import partial
 
@@ -259,11 +280,36 @@ class Glm4MoeMLPStack(spx.Module):
 
 
 class Glm4MoeTopKRouter(spx.Module):
-    """Top-K expert router for GLM-4-MoE with grouped expert selection.
+    """Two-stage grouped top-k router with bias-corrected sigmoid scoring.
 
-    Implements a two-stage routing strategy: first selects top groups based on
-    aggregated scores, then selects top-k experts within those groups. Uses
-    sigmoid scoring with e-score correction bias for improved load balancing.
+    GLM-4-MoE adopts the DeepSeek-style "grouped top-k" routing rather than
+    flat top-k over all experts. The ``n_routed_experts`` are partitioned into
+    ``n_group`` contiguous groups of equal size; routing then proceeds in two
+    nested top-k passes:
+
+    1. **Group selection**. For each token, score every group by the sum of
+       its top-2 expert scores (within that group), then pick the
+       ``topk_group`` highest-scoring groups. All experts outside the selected
+       groups are masked to zero.
+    2. **Expert selection**. From the surviving (non-masked) experts, take a
+       flat top-k of size ``num_experts_per_tok`` to obtain the final
+       routing decision.
+
+    Two further details matter at training time. The router emits **raw
+    sigmoid** probabilities (not softmax) so that the per-expert "load" is a
+    well-defined fraction in ``[0, 1]`` independent of the other experts. A
+    learned ``e_score_correction_bias`` of shape ``(n_routed_experts,)`` is
+    *added to scores only for selection*; the value used for the convex
+    combination of expert outputs is the un-biased sigmoid. This decouples
+    routing from output magnitude so the bias can drive load balancing
+    without distorting expert outputs. Finally, the selected weights are
+    optionally re-normalised (``norm_topk_prob``) and scaled by
+    ``routed_scaling_factor`` before consumption.
+
+    The router projection itself is a single fp32 matmul against
+    ``self.weight`` of shape ``(n_routed_experts, hidden_size)`` — kept in
+    fp32 regardless of the activation dtype because tiny gating logit
+    differences can otherwise be lost in bf16.
     """
 
     def __init__(
@@ -365,11 +411,31 @@ class Glm4MoeTopKRouter(spx.Module):
 
 
 class Glm4MoeMoE(BaseMoeModule):
-    """Mixture-of-Experts feed-forward module for GLM-4-MoE.
+    """GLM-4-MoE sparse feedforward block: routed experts + always-on shared expert.
 
-    Combines the Top-K router, expert MLP stack, and shared experts into
-    a unified MoE layer. Routes tokens to selected experts and combines
-    outputs with shared expert outputs for enhanced model capacity.
+    Composes three pieces:
+
+    - :class:`Glm4MoeTopKRouter` to compute per-token gate logits.
+    - :class:`Glm4MoeMLPStack` holding the ``n_routed_experts`` parameter
+      stacks, executed via the fused ``moe_call`` dispatch in
+      :class:`BaseMoeModule` (which sorts tokens by assigned expert and
+      processes each contiguous expert group with ``grouped_matmul``).
+    - :class:`Glm4MoeMLP` shared expert that *every* token always passes
+      through; its output is added unconditionally to the routed-expert
+      mixture. The shared expert's intermediate size is widened by
+      ``n_shared_experts`` to give it capacity comparable to the routed
+      experts being combined.
+
+    Token output is therefore ``shared(h) + sum_i w_i * routed_i(h)`` where
+    ``i`` ranges over the ``num_experts_per_tok`` selected experts and
+    ``w_i`` come from the (optionally re-normalised, ``routed_scaling_factor``
+    -scaled) sigmoid scores returned by the grouped top-k router.
+
+    Auxiliary load-balancing and router-z losses are wired into the parent
+    ``BaseMoeModule`` via ``router_aux_loss_coef`` / ``router_z_loss_coef``
+    if the config provides them; the actual loss tensors come back as a
+    side-output of :meth:`forward` (the ``router_logits`` returned to the
+    caller) and are aggregated by the trainer.
     """
 
     def __init__(
@@ -508,10 +574,15 @@ class Glm4MoeMoE(BaseMoeModule):
 
 
 class Glm4MoeAttention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for GLM-4-MoE models.
+    """Causal GQA attention with RoPE and optional QK-norm for GLM-4-MoE.
 
-    Extends UnifiedAttention with optional QK normalization support
-    for improved training stability in mixture-of-experts architectures.
+    Thin specialisation of :class:`UnifiedAttention` whose only deviation
+    from a stock causal attention is the ``use_qk_norm`` toggle: when
+    ``config.use_qk_norm`` is true, query and key heads pass through a
+    per-head RMSNorm before RoPE is applied, which empirically stabilises
+    the gradient through the routing layers above. The dispatch backend,
+    head splits, and RoPE are inherited verbatim from the unified base
+    class.
     """
 
     def __init__(
@@ -547,12 +618,25 @@ class Glm4MoeAttention(UnifiedAttention):
 
 
 class Glm4MoeDecoderLayer(spx.Module):
-    """Single decoder layer for GLM-4-MoE models.
+    """Hybrid dense/MoE decoder block selected by ``layer_idx``.
 
-    Combines multi-head attention and either dense MLP or MoE feedforward
-    networks with RMS normalization and residual connections. Uses dense
-    MLP for early layers (layer_idx < first_k_dense_replace) and MoE for
-    deeper layers to balance efficiency and capacity.
+    Implements one transformer block with the standard pre-norm shape
+    ``x + attn(norm(x))`` followed by ``x + ff(norm(x))``, where the
+    feedforward branch is one of two flavours depending on this layer's
+    position in the stack:
+
+    - **Dense MLP** (:class:`Glm4MoeMLP`) when
+      ``layer_idx < config.first_k_dense_replace``. The first
+      ``first_k_dense_replace`` layers stay dense to preserve the strong
+      low-frequency feature mixing those early layers do; making them
+      sparse would starve every expert of training signal.
+    - **MoE block** (:class:`Glm4MoeMoE`) for all later layers. These are
+      where the parameter count is concentrated and where sparse routing
+      meaningfully reduces compute per token.
+
+    Both flavours expose the same ``(out, router_logits)`` return contract
+    (the dense path returns ``router_logits=None``) so the surrounding
+    decoder loop can collect auxiliary losses uniformly.
     """
 
     def __init__(

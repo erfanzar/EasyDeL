@@ -12,6 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the Arctic model.
+
+Snowflake Arctic is a hybrid dense / Mixture-of-Experts decoder. Default
+configuration: 8 local experts per MoE layer, top-1 routing, MoE inserted
+every second decoder layer. Uses RMSNorm, RoPE (theta=1e6), grouped-query
+attention, optional sliding-window attention, and an optional parallel
+attention/MLP residual path on MoE layers.
+
+Exports:
+
+- :class:`ArcticAttention` — sliding-window-aware GQA attention.
+- :class:`ArcticMLP` — dense SwiGLU FFN.
+- :class:`ArcticMLPMoE` — expert-parallel SwiGLU FFN used inside MoE layers.
+- :class:`ArcticMoeBlock` — top-k router + expert dispatch (or dense MLP for
+  non-MoE layers).
+- :class:`ArcticDecoderLayer` — one decoder layer with optional parallel
+  attention/MLP residual.
+- :class:`ArcticModel` — ``BASE_MODULE`` registration.
+- :class:`ArcticForCausalLM` — ``CAUSAL_LM`` registration with auxiliary
+  load-balancing loss.
+- :class:`ArcticForSequenceClassification` — ``SEQUENCE_CLASSIFICATION``
+  registration.
+"""
 
 import typing
 from functools import partial
@@ -61,10 +84,16 @@ from .arctic_configuration import ArcticConfig
 
 
 class ArcticAttention(UnifiedAttention):
-    """Multi-head attention layer with sliding window support for Arctic models.
+    """Grouped-query causal attention block for Snowflake Arctic.
 
-    Implements grouped-query attention with RoPE embeddings and sliding window
-    attention for efficient processing of long sequences in the Arctic architecture.
+    Implements per-head ``q/k/v`` projections (``num_attention_heads`` queries,
+    ``num_key_value_heads`` keys/values for GQA) followed by RoPE rotation with
+    base ``config.rope_theta`` (default ``1e6``) and a softmax-scaled dot-product
+    attention. When ``config.sliding_window`` is set, the underlying
+    ``UnifiedAttention`` masks all tokens outside the local window so each layer
+    runs as windowed self-attention; otherwise it behaves as full causal
+    attention. Output is projected back to ``hidden_size`` via a
+    row-parallel ``o_proj`` for tensor-parallel compatibility.
     """
 
     def __init__(
@@ -228,10 +257,16 @@ class ArcticAttention(UnifiedAttention):
 
 
 class ArcticMLPMoE(spx.Module):
-    """Mixture-of-Experts MLP block for Arctic models.
+    """Expert-parallel SwiGLU FFN used inside Arctic MoE layers.
 
-    Implements the feedforward network with SwiGLU activation function
-    using expert-parallel linear layers for efficient MoE computation.
+    Each call computes ``w2(silu(w1(x)) * w3(x))`` independently per expert,
+    using ``ColumnParallelMoELinear`` / ``RowParallelMoELinear`` so the expert
+    dimension is sharded across devices. Tokens have already been grouped by
+    ``ArcticMoeBlock`` into per-expert ragged segments (``group_sizes``,
+    ``sorted_experts``); this module never sees the raw ``[batch, seq]`` layout.
+    The class-level :pyattr:`reform_param` map describes how the upstream HF
+    weight (a single fused ``gate_up_proj`` and ``down_proj``) is split into
+    ``w1`` / ``w3`` / ``w2`` on load and reassembled on save.
     """
 
     reform_param: typing.ClassVar = {
@@ -353,10 +388,15 @@ class ArcticMLPMoE(spx.Module):
 
 
 class ArcticMLP(spx.Module):
-    """Multi-Layer Perceptron module for Arctic models.
+    """Dense SwiGLU feed-forward block for Arctic.
 
-    Implements the feedforward network with SwiGLU activation function
-    for enhanced representation learning in the Arctic architecture.
+    Computes ``w2(silu(w1(x)) * w3(x))`` (the standard SwiGLU formulation:
+    ``w1`` is the gate projection, ``w3`` is the up projection, ``w2`` is the
+    down projection). Used both for the non-MoE layers selected by
+    ``moe_layer_frequency`` and, when ``parallel_attn_mlp_res=True``, for the
+    parallel residual MLP that runs alongside the MoE block. When
+    ``is_residual_mlp`` is set, the intermediate width collapses to
+    ``hidden_size`` instead of ``intermediate_size``.
     """
 
     def __init__(
@@ -429,10 +469,24 @@ class ArcticMLP(spx.Module):
 
 
 class ArcticMoeBlock(BaseMoeModule):
-    """Mixture-of-Experts block for Arctic models.
+    """Conditional MoE / dense-FFN block for Arctic decoder layers.
 
-    Routes tokens to different experts based on a learned gating mechanism,
-    alternating between MoE and standard MLP layers based on moe_layer_frequency.
+    Arctic interleaves dense and sparse layers: a layer ``layer_idx`` is treated
+    as MoE iff ``(layer_idx + 1) % config.moe_layer_frequency == 0``. On MoE
+    layers this block runs the standard top-k routed expert path:
+
+    1. ``self.gate`` (a ``ColumnParallelLinear`` with ``num_local_experts``
+       outputs) produces per-token expert logits.
+    2. :class:`BaseMoeModule.moe_call` performs top-``num_experts_per_tok``
+       (default 1) selection with the ``STANDARD`` load-balancing strategy and
+       dispatches tokens to :class:`ArcticMLPMoE`.
+    3. Outputs are scattered back to the original token order; router logits
+       are returned to the caller for the auxiliary load-balancing loss
+       (``router_aux_loss_coef``).
+
+    On non-MoE layers the block degenerates to a single :class:`ArcticMLP` and
+    returns ``None`` for ``router_logits``. This dual behaviour keeps the
+    decoder's forward signature uniform across the dense/sparse layer mix.
     """
 
     def __init__(
@@ -538,11 +592,25 @@ class ArcticMoeBlock(BaseMoeModule):
 
 
 class ArcticDecoderLayer(spx.Module):
-    """Single decoder layer for Arctic models.
+    """One Arctic decoder layer with optional parallel attention/MLP residuals.
 
-    Combines multi-head attention with MoE/MLP feedforward networks,
-    RMS normalization, and residual connections. Supports optional
-    parallel attention-MLP residual connections for MoE layers.
+    Pre-normalised attention + (MoE | dense MLP) block. The forward path runs
+    in one of two modes depending on ``config.parallel_attn_mlp_res`` and
+    whether the layer is selected as MoE:
+
+    * **Sequential (default).** ``x = x + attn(input_ln(x))`` then
+      ``x = x + moe_or_mlp(post_attn_ln(x))``.
+    * **Parallel residual (Arctic's hallmark, only on MoE layers when
+      ``parallel_attn_mlp_res=True``).** A second normaliser
+      (``residual_layernorm``) and a residual ``ArcticMLP`` (with
+      ``is_residual_mlp=True``, intermediate width = ``hidden_size``) run in
+      parallel to the MoE block, both reading the post-attention residual
+      stream. The three contributions — attention, residual MLP, MoE — are
+      summed before the layer output.
+
+    Attention is the GQA / sliding-window block from
+    :class:`ArcticAttention`; MoE / MLP routing is delegated to
+    :class:`ArcticMoeBlock`.
     """
 
     def __init__(
@@ -711,17 +779,26 @@ class ArcticDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=ArcticConfig, model_type="arctic")
 class ArcticModel(EasyDeLBaseModule):
-    """Arctic model implementation.
+    """Snowflake Arctic backbone (registered as ``BASE_MODULE``).
 
-    This implements the Arctic language model architecture with Mixture-of-Experts,
-    utilizing transformer blocks with RMSNorm, rotary position embeddings,
-    sliding window attention, and sparse MoE layers.
+    Stack: token embedding -> ``num_hidden_layers`` :class:`ArcticDecoderLayer`
+    blocks -> final RMSNorm. Every ``moe_layer_frequency`` layers carry the
+    sparse MoE FFN; the rest are dense SwiGLU. Attention uses RoPE
+    (``rope_theta`` defaults to 1e6), grouped-query (``num_key_value_heads``),
+    and optional sliding-window attention (``sliding_window``). Decoder layers
+    are wrapped with :func:`auto_remat` so per-layer activation checkpointing
+    follows ``config.gradient_checkpointing``. The forward pass returns a
+    :class:`MoeModelOutput` carrying the final hidden state, optional all-layer
+    hidden states / attention weights, optional router logits (one per MoE
+    layer; ``None`` for dense layers), and the updated KV cache.
 
     Attributes:
-        config (ArcticConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        config (ArcticConfig): Architectural hyperparameters (depth, heads,
+            MoE topology, sliding window, RoPE).
+        dtype (jnp.dtype): Activation dtype for matmuls.
+        param_dtype (jnp.dtype): Storage dtype of parameters.
+        precision: JAX matmul precision (``HIGH``, ``DEFAULT``, …) forwarded to
+            every linear in the stack.
     """
 
     def __init__(
@@ -971,16 +1048,21 @@ class ArcticModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=ArcticConfig, model_type="arctic")
 class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type: ignore
-    """Arctic model with a language modeling head for causal language modeling tasks.
+    """Arctic backbone + ``vocab_size`` LM head for autoregressive generation.
 
-    This model is a sparse Mixture-of-Experts transformer with causal attention masks
-    applied to perform autoregressive language generation.
+    Wraps :class:`ArcticModel` and adds an unbiased linear head producing token
+    logits. Inherits the standard generation utilities (``prepare_inputs``,
+    KV-cache handling) from :class:`BaseCausalLMModule`. Because Arctic is a
+    sparse MoE model, the forward pass goes through ``forward_moe`` and the
+    auxiliary load-balancing loss (computed in :meth:`_compute_aux_loss` from
+    the per-MoE-layer router logits, weighted by
+    ``config.router_aux_loss_coef``) is folded into the main objective.
 
     Attributes:
-        config (ArcticConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        config (ArcticConfig): Architectural hyperparameters.
+        dtype (jnp.dtype): Activation dtype (default ``bfloat16``).
+        param_dtype (jnp.dtype): Parameter storage dtype (default ``bfloat16``).
+        precision: JAX matmul precision policy.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -1097,16 +1179,21 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type:
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ArcticConfig, model_type="arctic")
 class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticModel, ArcticConfig]):  # type: ignore
-    """Arctic model for sequence classification tasks.
+    """Arctic backbone + linear ``score`` head for sequence-level classification.
 
-    This class extends the base Arctic model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Pools the last non-pad token's hidden state from :class:`ArcticModel`
+    (using ``config.pad_token_id`` to find the final non-pad position) and
+    feeds it through an unbiased ``score`` linear with ``num_labels`` outputs.
+    The MoE auxiliary load-balancing loss is still threaded through
+    :meth:`compute_router_aux_loss` so classification fine-tunes preserve
+    expert balance.
 
     Attributes:
-        config (ArcticConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        config (ArcticConfig): Architectural hyperparameters; ``num_labels``
+            and ``pad_token_id`` are required at this task level.
+        dtype (jnp.dtype): Activation dtype.
+        param_dtype (jnp.dtype): Parameter storage dtype.
+        precision: JAX matmul precision policy.
     """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION

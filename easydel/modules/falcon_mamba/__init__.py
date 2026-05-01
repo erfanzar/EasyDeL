@@ -56,7 +56,7 @@ Example Usage:
     from easydel import FalconMambaConfig, FalconMambaForCausalLM
     import jax.numpy as jnp
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
 
     # Create configuration
     config = FalconMambaConfig(

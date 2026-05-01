@@ -12,6 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Llama4 multimodal model implementation.
+
+This module implements Meta's Llama4 (a.k.a. Llama 3.3) family of models, which
+extends the LLaMA decoder architecture with:
+
+- A sparse Mixture-of-Experts (MoE) feedforward path interleaved with dense MLP
+  blocks (controlled by ``moe_layers`` / ``interleave_moe_layer_step``).
+- Per-layer RoPE control (some layers skip RoPE) and chunked attention with
+  attention-temperature tuning for very long contexts.
+- Optional QK normalization in attention.
+- A ViT-style vision encoder with pixel-shuffle downsampling and a multi-modal
+  projector that maps vision features into the text embedding space.
+
+Exports:
+    - ``Llama4TextExperts``, ``Llama4TextMLP``, ``Llama4TextMoe``: MoE / FFN blocks.
+    - ``Llama4TextAttention``, ``Llama4TextDecoderLayer``: text decoder primitives.
+    - ``Llama4TextModel``, ``Llama4ForCausalLM``, ``Llama4ForSequenceClassification``:
+      text-only model variants.
+    - ``Llama4VisionAttention``, ``Llama4VisionEncoder``, ``Llama4VisionEncoderLayer``,
+      ``Llama4VisionMLP``, ``Llama4VisionMLP2``, ``Llama4VisionPixelShuffleMLP``,
+      ``Llama4UnfoldConvolution``, ``Llama4VisionModel``: vision tower components.
+    - ``Llama4MultiModalProjector``, ``Llama4ForConditionalGeneration``: multimodal
+      projection and full vision-language model.
+    - ``Llama4CausalLMOutputWithPast``: structured output for autoregressive runs.
+"""
 
 import math
 import typing as tp
@@ -111,7 +136,23 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
 
 @ejit(static_argnums=(0, 1, 2, 3))  # pyright: ignore[reportUntypedFunctionDecorator]
 def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
-    """Compute rotary frequencies for the vision transformer grid."""
+    """Compute complex rotary frequencies for the vision transformer grid.
+
+    Builds 2D rotary embeddings over an ``idx`` x ``idx`` patch grid (plus a
+    sentinel position used by the class token), interleaving x- and y-axis
+    frequencies and returning them in complex form ready to be multiplied with
+    queries/keys.
+
+    Args:
+        idx (int): Patch grid side length (i.e. ``image_size // patch_size``).
+        hidden_size (int): Vision encoder hidden dimension.
+        num_attention_heads (int): Number of vision attention heads.
+        rope_theta (float): RoPE base frequency.
+
+    Returns:
+        jnp.ndarray: Complex frequencies of shape ``(idx**2 + 1, 1, head_dim)``,
+        with the trailing position zeroed out to act as a class-token sentinel.
+    """
     img_idx = jnp.arange(idx**2, dtype="i4").reshape(idx**2, 1)
     img_idx = jnp.concatenate([img_idx, img_idx[:1]], axis=0)
     img_idx = img_idx.at[-1, -1].set(-2)
@@ -134,7 +175,20 @@ def _create_chunked_attention_mask(  # pyright: ignore[reportUnusedFunction]
     start: int,
     end: int,
 ):
-    """Create a chunked causal attention mask for sliding window attention."""
+    """Create a chunked causal attention mask for sliding-window attention.
+
+    Builds a boolean mask over positions ``[start, end)`` such that token ``i``
+    can attend to token ``j`` only if they fall in the same chunk
+    (``i // chunk == j // chunk``) and ``j <= i``.
+
+    Args:
+        attention_chunk_size (int): Length of one attention chunk.
+        start (int): Inclusive start position.
+        end (int): Exclusive end position.
+
+    Returns:
+        jnp.ndarray: Boolean mask of shape ``(end - start, end - start)``.
+    """
     blcok_position = jnp.abs(
         (jnp.arange(start, end)[None, :] // attention_chunk_size)
         - jnp.arange(start, end)[:, None] // attention_chunk_size
@@ -144,10 +198,31 @@ def _create_chunked_attention_mask(  # pyright: ignore[reportUnusedFunction]
 
 
 class Llama4TextExperts(spx.Module):
-    """Mixture of Experts module for Llama4 text models.
+    """Batched SwiGLU expert bank for Llama-4's MoE FFN.
 
-    Implements a sparse mixture of experts with top-k routing,
-    enabling efficient scaling and specialization of model capacity.
+    Llama-4 FFN experts are stacked along an extra leading axis of size
+    ``num_local_experts`` and executed in a single grouped GEMM via
+    :class:`ColumnParallelMoELinear` / :class:`RowParallelMoELinear` rather
+    than looped in Python. Each expert is a SwiGLU MLP::
+
+        y = down( silu(gate(x)) * up(x) )
+
+    The HuggingFace checkpoint stores the gate and up projections fused
+    along the last dim — the ``reform_param`` map below splits and rejoins
+    them so EasyDeL state-dicts round-trip cleanly. ``ColumnParallelMoELinear``
+    handles both the ``num_experts`` axis and the tensor-parallel hidden
+    axis, so this single module can be partitioned across both expert
+    parallelism (EP) and tensor parallelism (TP).
+
+    Attributes:
+        gate_proj, up_proj (ColumnParallelMoELinear): Per-expert gate and
+            value projections, ``hidden_size -> intermediate_size``.
+        down_proj (RowParallelMoELinear): Per-expert output projection,
+            ``intermediate_size -> hidden_size``.
+        act_fn (Callable): Per-expert non-linearity (typically SiLU).
+        num_experts (int): Number of routed experts (``num_local_experts``).
+        intermediate_size, hidden_size, expert_dim (int): Mirrors
+            corresponding fields on ``Llama4Config``.
     """
 
     reform_param: tp.ClassVar = {
@@ -255,10 +330,15 @@ class Llama4TextExperts(spx.Module):
 
 
 class Llama4TextL2Norm(spx.Module):
-    """L2 normalization layer for Llama4 text models.
+    """Parameter-free L2 normalization (RMSNorm without affine scale).
 
-    Normalizes inputs using L2 norm with learned scaling parameters,
-    providing stable gradients during training.
+    Used by :class:`Llama4TextAttention` as the optional Q/K normalization.
+    Computes ``x / sqrt(mean(x ** 2) + eps)`` along the last axis, with the
+    rescale done in fp32 for numerical stability and the result cast back
+    to the input dtype. Unlike :class:`RMSNorm` there is no learnable
+    weight — that is intentional: Q/K-norm is purely about taming pre-softmax
+    activation scale, and Llama-4 found a learnable scale was redundant
+    with the per-head temperature tuning.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -272,6 +352,14 @@ class Llama4TextL2Norm(spx.Module):
         self.eps = eps
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Compute L2 normalization along the last axis.
+
+        Args:
+            x (jnp.ndarray): Input array of shape ``(..., hidden_dim)``.
+
+        Returns:
+            jnp.ndarray: Normalized array of the same shape as ``x``.
+        """
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     @jax.named_scope("easydel-L2norm")
@@ -288,10 +376,19 @@ class Llama4TextL2Norm(spx.Module):
 
 
 class Llama4TextMLP(spx.Module):
-    """Multi-Layer Perceptron for Llama4 text models.
+    """Dense SwiGLU FFN used as the *shared* expert path inside the Llama-4 MoE.
 
-    Implements feedforward network with SwiGLU activation function
-    for improved representation learning.
+    Identical in structure to LLaMA's standard MLP (gate / up / down with
+    SiLU), but instantiated separately because Llama-4's MoE block routes
+    every token through this dense expert in addition to the top-k routed
+    experts (see :class:`Llama4TextMoe`). The shared expert captures
+    "always-useful" features and stabilizes early-training routing.
+
+    Attributes:
+        gate_proj (ColumnParallelLinear): ``hidden_size -> intermediate_size``.
+        up_proj (ColumnParallelLinear): ``hidden_size -> intermediate_size``.
+        down_proj (RowParallelLinear): ``intermediate_size -> hidden_size``.
+        activation_fn (Callable): SiLU (default) or anything in ``ACT2FN``.
     """
 
     def __init__(
@@ -371,10 +468,33 @@ class Llama4TextMLP(spx.Module):
 
 
 class Llama4TextMoe(BaseMoeModule):
-    """Mixture of Experts layer for Llama4 text models.
+    """Sparse Mixture-of-Experts FFN for Llama-4 text decoder layers.
 
-    Routes inputs to specialized expert networks based on learned routing,
-    allowing for conditional computation and increased model capacity.
+    Llama-4 differs from Mixtral / DeepSeek-V3 in two important ways that
+    are wired up by the ``moe_hooks`` overrides at the bottom of ``__init__``:
+
+    1. **Sigmoid + top-k routing (no softmax)**. Router logits are turned
+       into per-expert weights by ``sigmoid(logit)``, then everything outside
+       the top-``num_experts_per_tok`` is masked to zero. There is *no*
+       sum-to-one renormalization — sigmoid routing intentionally lets a
+       token's total expert mass vary.
+    2. **Input scaling, not output scaling**. The router weights are folded
+       into the *input* of each expert (``expert(input * weight)``) instead
+       of multiplied with the expert's output. The output-combination
+       weights are therefore set to all-ones so that
+       :func:`BaseMoeModule.unpermute` does not double-scale.
+
+    A single dense :class:`Llama4TextMLP` (the "shared expert") is also run
+    on every token and added on top of the routed-expert sum. Compute cost
+    per token is ``shared_expert + num_experts_per_tok routed experts``.
+
+    Attributes:
+        router (ColumnParallelLinear): Single-layer linear projecting
+            ``hidden_size -> num_local_experts`` for routing logits.
+        experts (Llama4TextExperts): Batched SwiGLU expert bank.
+        shared_expert (Llama4TextMLP): Always-on dense expert.
+        top_k (int): Equal to ``num_experts_per_tok``.
+        num_experts (int): Equal to ``num_local_experts`` (routed only).
     """
 
     def __init__(
@@ -541,10 +661,35 @@ class Llama4TextMoe(BaseMoeModule):
 
 
 class Llama4TextAttention(UnifiedAttention):
-    """Attention module for the Llama4 text decoder with optional sliding windows.
+    """Llama-4 text attention with per-layer NoPE and runtime temperature tuning.
 
-    Implements multi-head attention with optional rotary position embeddings,
-    QK normalization, and temperature tuning for improved attention patterns.
+    Two architectural twists over standard LLaMA attention:
+
+    * **Per-layer RoPE schedule (NoPE)**. Layers where
+      ``(layer_idx + 1) % 4 == 0`` skip RoPE entirely (``use_rope = False``)
+      and rely solely on positional information leaked through earlier
+      layers — Llama-4's "NoPE" trick that improves length extrapolation.
+      QK-norm (``Llama4TextL2Norm``) is also disabled on those NoPE layers
+      since there is no rotary subspace to renormalize.
+    * **Attention-temperature tuning**. When ``attn_temperature_tuning`` is
+      enabled, an extra per-token *log-position*-dependent scaling factor
+      is multiplied into the queries before the softmax, sharpening
+      attention to local context for short sequences and broadening it for
+      long ones. The schedule depends on ``attn_scale`` and ``floor_scale``.
+
+    Inherits the standard MHA / GQA implementation from
+    :class:`UnifiedAttention`; ``causal=False`` here because the causality
+    is enforced through the supplied :class:`MaskInfo`, allowing chunked
+    bidirectional attention on Llama-4's vision-text fusion path to share
+    the same module.
+
+    Attributes:
+        use_rope (bool): Per-layer flag controlling the NoPE schedule.
+        attn_scale, floor_scale (float): Coefficients of the
+            log-position-based temperature schedule.
+        attn_temperature_tuning (bool): Master switch for the schedule.
+        qk_norm (Llama4TextL2Norm | None): Q/K L2-norm on RoPE layers; ``None``
+            on NoPE layers and when ``use_qk_norm`` is off.
     """
 
     def __init__(
@@ -585,6 +730,15 @@ class Llama4TextAttention(UnifiedAttention):
         self._cached_position_ids: Int[Array, "batch seq_len"] | None = None
 
     def _create_attention_performer(self, config: Llama4TextConfig, rngs: spx.Rngs):
+        """Build the attention computation backend.
+
+        Args:
+            config (Llama4TextConfig): Text decoder configuration.
+            rngs (spx.Rngs): Random number generator state.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention performer.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -593,6 +747,18 @@ class Llama4TextAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: Llama4TextConfig, dtype: jnp.dtype):
+        """Build the rotary embedding for this layer, or skip RoPE entirely.
+
+        Some Llama4 layers intentionally use no rotary embedding; this method returns
+        ``None`` for those layers and falls back to the parent rotary otherwise.
+
+        Args:
+            config (Llama4TextConfig): Text decoder configuration.
+            dtype (jnp.dtype): Computation dtype for the rotary tables.
+
+        Returns:
+            Rotary module or ``None`` when this layer skips RoPE.
+        """
         # RoPE is handled via custom complex rotary frequencies when enabled.
         return None if not self.use_rope else super()._create_rotary(config, dtype)
 
@@ -603,6 +769,24 @@ class Llama4TextAttention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"],
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch seq_len num_kv_heads head_dim"]]:
+        """Apply rotary position embeddings to queries and keys.
+
+        Skips rotation entirely on no-RoPE layers and uses the complex-valued path
+        when precomputed ``frequencies`` are supplied.
+
+        Args:
+            query_states (Array): Query tensor of shape
+                ``(batch, seq_len, num_heads, head_dim)``.
+            key_states (Array): Key tensor of shape
+                ``(batch, seq_len, num_kv_heads, head_dim)``.
+            position_ids (Array): Position indices of shape ``(batch, seq_len)``.
+            frequencies (Array | None, optional): Precomputed complex rotary
+                frequencies of shape ``(seq_len, head_dim)``. Defaults to None.
+
+        Returns:
+            tuple[Array, Array]: Rotated query and key tensors with shapes matching
+            their inputs.
+        """
         if not self.use_rope:
             return query_states, key_states
         if frequencies is not None:
@@ -619,6 +803,21 @@ class Llama4TextAttention(UnifiedAttention):
         Float[Array, "batch seq_len num_kv_heads head_dim"],
         Float[Array, "batch seq_len num_kv_heads head_dim"],
     ]:
+        """Apply QK normalization and attention temperature tuning.
+
+        On layers configured with ``use_qk_norm``, applies L2 normalization to
+        queries and keys. On no-RoPE layers, optionally rescales queries by a
+        position-dependent temperature controlled by ``attn_scale`` / ``floor_scale``.
+
+        Args:
+            query_states (Array): Query tensor.
+            key_states (Array): Key tensor.
+            value_states (Array): Value tensor.
+
+        Returns:
+            tuple[Array, Array, Array]: Possibly normalized/rescaled
+            ``(query, key, value)`` tensors.
+        """
         if self.qk_norm is not None:
             query_states = self.qk_norm(query_states)
             key_states = self.qk_norm(key_states)
@@ -634,10 +833,36 @@ class Llama4TextAttention(UnifiedAttention):
 
 
 class Llama4TextDecoderLayer(spx.Module):
-    """Single Llama4 text decoder block combining attention and MLP.
+    """One Llama-4 text decoder block (pre-norm attention + dense-or-MoE FFN).
 
-    Combines multi-head attention and feedforward networks (dense or MoE)
-    with RMS normalization and residual connections.
+    Two layer-index-driven branches are decided in ``__init__``:
+
+    * The attention block alternates between RoPE+chunked-attention layers
+      (``(layer_idx + 1) % 4 != 0``) and NoPE+full-attention layers
+      (``(layer_idx + 1) % 4 == 0``); the chunked behaviour is what allows
+      the long-context Llama-4 variants to run efficiently with limited
+      memory by chunking the attention into local windows on RoPE layers.
+    * The FFN is a dense :class:`Llama4TextMLP` on layers *not* listed in
+      ``config.moe_layers`` and a sparse :class:`Llama4TextMoe` otherwise.
+      In the 128E (Llama-4 Maverick) checkpoint, dense and sparse FFN
+      layers interleave; in the 16E (Llama-4 Scout) variant every block is
+      MoE except for early dense ones.
+
+    Pre-norm residual layout::
+
+        x = x + self_attn(input_layernorm(x))
+        x = x + feed_forward(post_attention_layernorm(x))   # router_logits returned for MoE
+
+    Attributes:
+        self_attn (Llama4TextAttention): Per-layer attention with RoPE/NoPE
+            and chunked windowing decided by ``layer_idx``.
+        feed_forward (Llama4TextMLP | Llama4TextMoe): Dense MLP or sparse MoE.
+        input_layernorm, post_attention_layernorm (Llama4TextRMSNorm): Pre-
+            attention and pre-FFN RMSNorms.
+        is_moe_layer (bool): Whether this block uses the MoE FFN.
+        use_chunked_attention (int): 1 if attention runs chunked (RoPE
+            layers), 0 otherwise; consumed downstream by mask construction.
+        layer_idx (int): Layer index used for cache slot selection.
     """
 
     def __init__(
@@ -773,16 +998,23 @@ class Llama4TextDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Llama4TextConfig, model_type="llama4_text")
 class Llama4TextModel(EasyDeLBaseModule):
-    """Decoder-only Llama4 text model built from embeddings and decoder blocks.
+    """Llama-4 text trunk: token embeddings + heterogenous decoder stack + final RMSNorm.
 
-    Implements the Llama4 text language model architecture, utilizing transformer blocks
-    with RMSNorm, rotary position embeddings, and optional Mixture of Experts layers.
+    Each block in :class:`Llama4TextDecoderLayer` is heterogenous along
+    two axes: attention is RoPE-with-chunked-mask vs. NoPE-with-full-mask
+    based on layer index, and the FFN is dense (:class:`Llama4TextMLP`)
+    vs. sparse (:class:`Llama4TextMoe`) based on whether the layer index
+    appears in ``config.moe_layers``. The trunk itself is therefore the
+    *only* level that does not need to know about either dispatch — it
+    just runs the layers via :meth:`nn.ModuleList.scan` with the cache
+    threaded through, and lets each block decide what to do.
 
     Attributes:
-        config (Llama4TextConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        embed_tokens (Embed): Token embedding ``(vocab_size, hidden_size)``.
+        layers (nn.ModuleList[Llama4TextDecoderLayer]): Heterogenous block
+            stack assigned to pipeline stages via :func:`spx.assign_stage`
+            and rematerialized per ``gradient_checkpointing``.
+        norm (Llama4TextRMSNorm): Final RMSNorm at ``rms_norm_eps``.
     """
 
     def __init__(
@@ -1101,10 +1333,22 @@ class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4Tex
 
 
 class Llama4MultiModalProjector(spx.Module):
-    """Multi-modal projector for Llama4 vision-language models.
+    """Linear projection from vision-encoder output space to the text decoder's hidden space.
 
-    Projects vision features into the text embedding space using MLP layers,
-    enabling cross-modal understanding and generation.
+    Llama-4 vision tokens (after :class:`Llama4VisionPixelShuffleMLP` has
+    pixel-shuffled the patch grid down) live in
+    ``vision_config.vision_output_dim``-dimensional space; the text decoder
+    expects ``text_config.hidden_size``-dimensional embeddings. This module
+    is the *only* learned tensor on that bridge — a single bias-free linear,
+    initialized small (``stddev = 0.01``) so that vision tokens enter the
+    decoder near zero magnitude and do not destabilize the language model
+    on the first training step. The text decoder treats the projected
+    tokens identically to text tokens; positional information for the
+    vision tokens comes from the surrounding text positions, not from the
+    vision encoder's own RoPE.
+
+    Attributes:
+        linear_1 (RowParallelLinear): The vision-to-text projection.
     """
 
     def __init__(
@@ -1155,7 +1399,22 @@ class Llama4MultiModalProjector(spx.Module):
 
 
 def pixel_shuffle(input_tensor, shuffle_ratio):
-    """Rearrange flattened vision tokens to a denser spatial grid."""
+    """Rearrange flattened vision tokens to a denser spatial grid.
+
+    Splits each spatial position's channels across a smaller spatial grid scaled
+    by ``shuffle_ratio``, trading channel count for fewer tokens. The number of
+    output tokens is ``num_patches * shuffle_ratio**2``.
+
+    Args:
+        input_tensor (jnp.ndarray): Flattened patch features of shape
+            ``(batch, num_patches, channels)`` where ``num_patches`` is a perfect
+            square.
+        shuffle_ratio (float): Spatial downsampling ratio (typically 0.5).
+
+    Returns:
+        jnp.ndarray: Shuffled features of shape
+        ``(batch, new_num_patches, channels / shuffle_ratio**2)``.
+    """
     batch_size, num_patches, channels = input_tensor.shape
     patch_size = int(math.sqrt(num_patches))
 
@@ -1182,10 +1441,30 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
 
 
 class Llama4VisionPixelShuffleMLP(spx.Module):
-    """Pixel shuffle MLP for Llama4 vision models.
+    """Sub-pixel-shuffle downsampler followed by a SwiGLU MLP.
 
-    Performs spatial downsampling of vision features through pixel shuffling
-    and MLP transformations for efficient processing.
+    Llama-4's vision encoder emits a square grid of
+    ``(patch_size, patch_size)`` tokens at the encoder's hidden dim. To
+    drop the token count fed to the text decoder by ``1 / pixel_shuffle_ratio**2``
+    *without throwing information away*, this module reshuffles the
+    spatial dimensions of each feature into the channel dimension via
+    :func:`pixel_shuffle` (the inverse of PyTorch's ``pixel_shuffle``):
+    the output is a ``shuffle_ratio``× smaller spatial grid with channels
+    inflated by the inverse-square. A subsequent :class:`Llama4VisionMLP2`
+    rescales those inflated channels back to ``projector_output_dim`` so
+    they fit the next stage's expectations.
+
+    This is the standard "sub-pixel/space-to-depth" trade-off used in
+    vision transformers to balance resolution vs. token count.
+
+    Attributes:
+        pixel_shuffle_ratio (float): Spatial scaling factor (e.g. 0.5 keeps
+            1 token per 4 input tokens).
+        inner_dim (int): Channel count after shuffle, ``projector_input_dim
+            / pixel_shuffle_ratio**2``.
+        output_dim (int): Channel count after the trailing MLP.
+        mlp (Llama4VisionMLP2): SwiGLU MLP that maps ``inner_dim ->
+            output_dim``.
     """
 
     def __init__(
@@ -1239,7 +1518,21 @@ class Llama4VisionPixelShuffleMLP(spx.Module):
 
 
 def reshape_for_broadcast(frequencies: jax.Array, query: jax.Array) -> jax.Array:
-    """Reshape rotary frequencies so they broadcast over the complex query tensor."""
+    """Reshape rotary frequencies so they broadcast over the complex query tensor.
+
+    Inserts singleton dimensions everywhere except along the sequence (axis 1)
+    and feature (last axis) dimensions, so that ``frequencies`` lines up with a
+    ``(batch, seq, ..., head_dim)`` query.
+
+    Args:
+        frequencies (jax.Array): Complex rotary frequencies of shape
+            ``(seq, head_dim)``.
+        query (jax.Array): Reference complex query tensor whose shape determines
+            the broadcast layout.
+
+    Returns:
+        jax.Array: Frequencies broadcastable to ``query.shape``.
+    """
     ndim = query.ndim
     return jnp.reshape(
         frequencies,
@@ -1252,7 +1545,22 @@ def vision_apply_rotary_emb(
     key: jax.Array,
     frequencies: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Apply rotary position embeddings to complex-valued vision queries and keys."""
+    """Apply rotary position embeddings to vision queries and keys.
+
+    Treats consecutive feature pairs as the real and imaginary parts of a complex
+    number, multiplies by precomputed complex ``frequencies``, and returns the
+    rotated query and key tensors in their original real layout.
+
+    Args:
+        query (jax.Array): Query tensor with even-sized last dimension.
+        key (jax.Array): Key tensor with the same last dimension as ``query``.
+        frequencies (jax.Array): Complex rotary frequencies, broadcastable to the
+            query/key complex layout.
+
+    Returns:
+        tuple[jax.Array, jax.Array]: Rotated query and key with shapes/dtypes
+        matching their inputs.
+    """
     query_dtype = query.dtype
     key_dtype = key.dtype
     query_reshaped = query.astype(jnp.float32).reshape((*query.shape[:-1], -1, 2))
@@ -1273,10 +1581,26 @@ def vision_apply_rotary_emb(
 
 
 class Llama4VisionAttention(AttentionModule):
-    """Attention module for the Llama4 vision transformer.
+    """Bidirectional MHA with 2-D RoPE for the Llama-4 vision tower.
 
-    Implements multi-head self-attention with rotary position embeddings
-    for encoding visual features from image patches.
+    Vision-encoder analog of :class:`Llama4TextAttention` but adapted for
+    a ViT-style image tower:
+
+    * **Bidirectional** (``causal=False``): vision tokens see each other
+      symmetrically — there is no causal mask in image space.
+    * **2-D RoPE**: the rotary frequencies are computed from a
+      ``(grid_h, grid_w)`` patch grid by ``_vision_freqs`` and applied
+      to Q/K via :func:`vision_apply_rotary_emb`. Even feature pairs
+      encode the row coordinate, odd pairs the column coordinate, so the
+      attention is intrinsically aware of 2-D spatial structure.
+    * **MHA, not GQA** (``num_key_value_groups = 1``): vision encoders
+      are typically narrow enough that GQA is unnecessary.
+    * Biased linears (vision tower convention) and ``attention_dropout``
+      drawn from the vision config.
+
+    Attributes:
+        embed_dim, num_heads, head_dim (int): Standard MHA shape parameters.
+        attention_dropout (float): Dropout on attention probabilities.
     """
 
     def __init__(
@@ -1389,10 +1713,23 @@ class Llama4VisionAttention(AttentionModule):
 
 
 class Llama4VisionMLP2(spx.Module):
-    """Two-layer MLP module for Llama4 vision models.
+    """Post-shuffle MLP that maps inflated channels back into ``projector_output_dim``.
 
-    Implements a simple two-layer feedforward network with GELU activation
-    for vision feature transformation.
+    Used inside :class:`Llama4VisionPixelShuffleMLP` after the
+    spatial-to-channel fold has multiplied the channel count by
+    ``1 / pixel_shuffle_ratio**2``. This module compresses those inflated
+    channels back to ``projector_output_dim`` through ``fc1 -> GELU ->
+    fc2 -> GELU`` (note the activation on *both* sides — this is a "block"
+    activation, not a single MLP). All linears are bias-free and
+    initialized small (``stddev = 0.01``) to keep the bridge near
+    identity at initialization.
+
+    Attributes:
+        fc1, fc2 (ColumnParallelLinear): The two linear projections; their
+            input/output widths come from ``config.intermediate_size``,
+            ``config.projector_input_dim`` and ``config.projector_output_dim``.
+        activation_fn (Callable): GELU.
+        hidden_size, intermediate_size: Mirror config.
     """
 
     def __init__(
@@ -1448,10 +1785,18 @@ class Llama4VisionMLP2(spx.Module):
 
 
 class Llama4VisionMLP(spx.Module):
-    """MLP module for Llama4 vision transformer.
+    """Vision-encoder MLP block — the FFN inside :class:`Llama4VisionEncoderLayer`.
 
-    Standard feedforward network with GELU activation for vision
-    feature transformation within transformer blocks.
+    A standard ViT-style feed-forward block: ``fc1 -> GELU -> fc2`` with
+    bias on both linears (vision encoders typically keep biases unlike
+    the text decoder). Width expansion is ``hidden_size -> intermediate_size
+    -> hidden_size``. Initialized small (``stddev = 0.01``) to keep the
+    pre-trained CLIP-style weights well-conditioned at fine-tuning time.
+
+    Attributes:
+        fc1 (ColumnParallelLinear): Expansion projection.
+        fc2 (ColumnParallelLinear): Contraction projection.
+        activation_fn (Callable): GELU.
     """
 
     def __init__(
@@ -1509,10 +1854,23 @@ class Llama4VisionMLP(spx.Module):
 
 
 class Llama4VisionEncoderLayer(spx.Module):
-    """Single encoder layer for Llama4 vision models.
+    """One ViT block: pre-norm bidirectional attention + GELU MLP.
 
-    Combines self-attention and feedforward networks with layer normalization
-    and residual connections for vision feature encoding.
+    Vision-tower analog of :class:`Llama4TextDecoderLayer` but
+    bidirectional (``causal=False`` on the attention) and with biased
+    LayerNorm at ``epsilon = 1e-5``, biased linears, and 2-D RoPE
+    frequencies precomputed by ``_vision_freqs`` and threaded in from the
+    parent encoder. Pre-norm residual layout::
+
+        x = x + self_attn(input_layernorm(x))
+        x = x + mlp(post_attention_layernorm(x))
+
+    Attributes:
+        self_attn (Llama4VisionAttention): Bidirectional MHA with 2-D RoPE.
+        mlp (Llama4VisionMLP): GELU FFN.
+        input_layernorm, post_attention_layernorm (LayerNorm): Biased
+            LayerNorms (epsilon = 1e-5).
+        layer_idx (int): Index of this block within the vision encoder.
     """
 
     def __init__(
@@ -1623,10 +1981,20 @@ class Llama4VisionEncoderLayer(spx.Module):
 
 
 class Llama4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
-    """Vision encoder stack for Llama4 models.
+    """Stack of :class:`Llama4VisionEncoderLayer` blocks executed via scan.
 
-    Stacks multiple vision encoder layers to progressively encode
-    visual features for downstream processing.
+    Holds ``config.num_hidden_layers`` ViT blocks in an ``nn.ModuleList``
+    that is consumed by :meth:`EasyDeLLayerStackMixin._layer_stage_context`
+    so the layers can be assigned to pipeline stages and rematerialized
+    according to ``config.gradient_checkpointing``. The 2-D RoPE
+    frequencies (``frequencies`` argument on forward) are computed *once*
+    in :class:`Llama4VisionModel` from the input image's patch grid and
+    threaded through every block — the encoder itself does not own the
+    rotary table.
+
+    Attributes:
+        layers (nn.ModuleList[Llama4VisionEncoderLayer]): The stacked ViT
+            blocks (each rematerialized via :func:`auto_remat`).
     """
 
     def __init__(
@@ -1740,10 +2108,26 @@ class Llama4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
 
 
 class Llama4UnfoldConvolution(spx.Module):
-    """Unfold convolution module for Llama4 vision models.
+    """Patchify stem implemented as ``unfold`` + linear (im2col-style ViT embedding).
 
-    Implements patch extraction with optional convolution,
-    converting images into sequences of patch embeddings.
+    Llama-4 ViTs do not use a strided convolution for the patch
+    embedding; instead they unfold non-overlapping ``(patch_size,
+    patch_size)`` windows from the input image into per-patch vectors of
+    length ``num_channels * patch_h * patch_w`` (via
+    :func:`jax.lax.conv_general_dilated_patches` with ``"VALID"`` padding
+    and stride ``= patch_size``) and then apply a single bias-free linear
+    map to ``hidden_size``. This is mathematically equivalent to a strided
+    conv but factors cleanly into ``(reshape, linear)`` which is friendlier
+    for tensor-parallel sharding of the embedding dimension.
+
+    Attributes:
+        kernel_size (tuple[int, int]): Patch height and width.
+        stride (tuple[int, int]): Equal to ``kernel_size`` for non-overlapping
+            patches.
+        num_channels (int): Input image channel count.
+        hidden_size (int): Output embedding dimension.
+        linear (ColumnParallelLinear): Per-patch projection
+            ``num_channels * patch_h * patch_w -> hidden_size``.
     """
 
     def __init__(
@@ -1818,16 +2202,36 @@ class Llama4UnfoldConvolution(spx.Module):
 @register_module(TaskType.BASE_VISION, config=Llama4VisionConfig, model_type="llama4_vision")
 @register_module(TaskType.BASE_MODULE, config=Llama4VisionConfig, model_type="llama4_vision")
 class Llama4VisionModel(EasyDeLBaseModule):
-    """Vision transformer for Llama4 including patchify stem, transformer blocks, and final norm.
+    """Llama-4 ViT vision tower: patchify + class token + ViT encoder + projector.
 
-    Implements the vision encoder for Llama4 vision-language models, processing
-    images into feature representations suitable for cross-modal fusion.
+    Pipeline at call time:
+
+    1. :class:`Llama4UnfoldConvolution` patchifies the image into a
+       sequence of ``(image_size / patch_size)**2`` token embeddings.
+    2. A learnable ``class_embedding`` is appended to the sequence (so
+       there are ``num_patches + 1`` tokens), and a learnable
+       ``positional_embedding_vlm`` is added to all tokens.
+    3. ``layernorm_pre`` (LayerNorm) applied; the encoder
+       (:class:`Llama4VisionEncoder`) processes the tokens with 2-D
+       RoPE-augmented bidirectional attention.
+    4. ``layernorm_post`` applied, the trailing class token is dropped
+       (Llama-4 uses CLS only as a pooling target during pre-training,
+       not for downstream language modelling), and
+       :class:`Llama4VisionPixelShuffleMLP` reduces the spatial token
+       count via sub-pixel shuffle so the language model gets a manageable
+       sequence length.
 
     Attributes:
-        config (Llama4VisionConfig): Configuration for the vision model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        patch_embedding (Llama4UnfoldConvolution): Im2col-style patchifier.
+        class_embedding (ArrayParam): Learnable CLS token.
+        positional_embedding_vlm (ArrayParam): Learnable absolute positional
+            table covering ``num_patches + 1`` tokens.
+        layernorm_pre, layernorm_post (LayerNorm): Pre- and post-encoder
+            LayerNorms.
+        model (Llama4VisionEncoder): The ViT encoder stack.
+        vision_adapter (Llama4VisionPixelShuffleMLP): Sub-pixel-shuffle
+            spatial downsampler + MLP into ``projector_output_dim``.
+        vision_idx (int): Patch grid edge length, ``image_size // patch_size``.
     """
 
     def __init__(
@@ -2025,26 +2429,35 @@ class Llama4VisionModel(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Llama4Config, model_type="llama4")
 class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM, Llama4Config]):  # type: ignore
-    """Llama4 Vision model for conditional text generation based on image inputs.
+    """End-to-end Llama-4 Vision-Language model: ViT + projector + Llama-4 text decoder.
 
-    Combines a vision tower and a language model with a multi-modal projector.
+    Pipeline at call time:
 
-    Note: Llama4 has a unique architecture where the language_model is already
-    a complete Llama4ForCausalLM (with its own lm_head), unlike other VLMs where
-    the base model doesn't include the lm_head.
+    1. ``vision_model`` (a :class:`Llama4VisionModel`, an aspect-ratio-aware
+       ViT with pixel-shuffle downsampling) ingests pixel tiles and produces
+       a sequence of vision tokens at ``vision_config.vision_output_dim``.
+    2. ``multi_modal_projector`` (:class:`Llama4MultiModalProjector`) maps
+       those tokens into the text decoder's ``hidden_size`` space.
+    3. The projected vision tokens are spliced into the text token sequence
+       at the positions marked by the special image token id, producing a
+       merged ``inputs_embeds`` for the language model.
+    4. ``language_model`` is a *complete* :class:`Llama4ForCausalLM` —
+       contrary to most VLMs in EasyDeL where the base trunk lacks an LM
+       head — so the LM head and embedding tying live inside the language
+       model and not at this level.
+
+    Class attributes flag IMAGE_TEXT_TO_TEXT capability and indicate that
+    Llama-4 supports interleaved video frames (``_supports_video = True``)
+    while using standard RoPE rather than M-RoPE (``_uses_mrope = False``).
 
     Attributes:
-        config (Llama4Config): Configuration object.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (spx.Rngs): Random number generators.
-
-    Class Attributes:
-        _task_type: IMAGE_TEXT_TO_TEXT task type
-        _model_type: "llama4" model identifier
-        _supports_video: True (Llama4 supports video input)
-        _uses_mrope: False (uses standard RoPE)
+        vision_model (Llama4VisionModel): The visual tower; named
+            ``vision_model`` to match the upstream HF checkpoint layout
+            (declared via ``_vision_tower_name``).
+        multi_modal_projector (Llama4MultiModalProjector): Vision-to-text
+            projection (declared via ``_projector_name``).
+        language_model (Llama4ForCausalLM): Full causal LM with its own LM
+            head (declared via ``_language_model_name``).
     """
 
     # Class attributes for VLM capabilities

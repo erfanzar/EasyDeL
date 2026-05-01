@@ -37,10 +37,13 @@ class DetokenizerResult:
     """Result from a detokenization operation.
 
     Attributes:
-        accumulated_text: The full decoded text accumulated so far.
+        accumulated_text: The full decoded text accumulated so far for the
+            request.
         delta_text: The newly decoded text since the last decode call.
         last_decoded_index: Index of the last token that was decoded.
         finished: Whether this is the final decode for the request.
+        detoktook: Wall-clock time spent inside the worker on this decode
+            step (seconds), used by the engine for telemetry.
     """
 
     accumulated_text: str
@@ -51,15 +54,26 @@ class DetokenizerResult:
 
 
 class _BaseWorkerClient:
-    """Base class for ZeroMQ worker clients.
+    """Shared REQ-socket plumbing for tokenizer and detokenizer ZMQ clients.
 
-    Provides common functionality for thread-safe communication with worker processes.
+    Connects a single ``zmq.REQ`` socket to the worker endpoint and
+    serializes all sends/receives behind a lock. Subclasses
+    (:class:`TokenizerWorkerClient`, :class:`DetokenizerWorkerClient`)
+    layer command-specific helpers on top of :meth:`_request` and inherit
+    :meth:`close` for orderly socket teardown.
 
-    Args:
-        endpoint: The ZeroMQ endpoint to connect to.
+    Instances are safe to share across worker threads because every
+    request acquires :attr:`_lock` for the full ``send_pyobj`` /
+    ``recv_pyobj`` round-trip; concurrent traffic to the same client
+    simply queues on the lock.
     """
 
     def __init__(self, endpoint: str):
+        """Connect a REQ socket to ``endpoint`` under a thread lock.
+
+        Args:
+            endpoint: ZMQ endpoint URI of the worker process.
+        """
         self._context = zmq.Context.instance()
         self._socket = self._context.socket(zmq.REQ)
         self._socket.connect(endpoint)
@@ -84,16 +98,24 @@ class _BaseWorkerClient:
 
 
 class TokenizerWorkerClient(_BaseWorkerClient):
-    """Client for communicating with a tokenizer worker process.
+    """ZMQ client for the bundled HuggingFace ``AutoTokenizer`` worker.
 
-    Args:
-        endpoint: The ZeroMQ endpoint of the tokenizer worker.
-
-    Raises:
-        ValueError: If endpoint is not provided.
+    Wraps the tokenizer worker spawned by :class:`WorkerManager` so the
+    eSurge engine can delegate ``str -> token_ids`` conversion to a
+    sibling process (avoiding GIL contention with the JAX hot path).
+    Provides :meth:`tokenize` (one prompt per call), plus :meth:`drain`
+    and :meth:`shutdown` for lifecycle control.
     """
 
     def __init__(self, endpoint: str):
+        """Initialize the tokenizer client.
+
+        Args:
+            endpoint: ZMQ endpoint URI of the tokenizer worker.
+
+        Raises:
+            ValueError: When ``endpoint`` is empty.
+        """
         if not endpoint:
             raise ValueError("Tokenizer worker endpoint must be provided.")
         super().__init__(endpoint)
@@ -131,16 +153,27 @@ class TokenizerWorkerClient(_BaseWorkerClient):
 
 
 class DetokenizerWorkerClient(_BaseWorkerClient):
-    """Client for communicating with a detokenizer worker process.
+    """ZMQ client for the bundled incremental detokenizer worker.
 
-    Args:
-        endpoint: The ZeroMQ endpoint of the detokenizer worker.
-
-    Raises:
-        ValueError: If endpoint is not provided.
+    Talks to the detokenizer worker spawned by :class:`WorkerManager`
+    which runs :class:`FastIncrementalDecoder` on top of the same
+    HuggingFace tokenizer used for prompt encoding. The worker keeps a
+    per-request decoder state (handling buffered partial UTF-8 sequences
+    and SentencePiece prompt context) so this client only needs to send
+    the latest token slice per call. Returns :class:`DetokenizerResult`
+    instances that include both the cumulative ``accumulated_text`` and
+    the streaming ``delta_text``.
     """
 
     def __init__(self, endpoint: str):
+        """Initialize the detokenizer client.
+
+        Args:
+            endpoint: ZMQ endpoint URI of the detokenizer worker.
+
+        Raises:
+            ValueError: When ``endpoint`` is empty.
+        """
         if not endpoint:
             raise ValueError("Detokenizer worker endpoint must be provided.")
         super().__init__(endpoint)

@@ -1927,6 +1927,25 @@ class DPODataCollatorWithPaddingGrain:
     prepadded: bool = True
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Collate a Grain-style features dict into a padded DPO batch.
+
+        Pads ``prompt_*``, ``chosen_*`` and ``rejected_*`` ``_input_ids``,
+        ``_attention_mask``, ``_labels`` and ``_pixel_values`` to the
+        configured prompt/completion lengths, leaves ``*_logps`` arrays
+        untouched, and optionally drops non-numeric fields when
+        ``output_arrays_only`` is set.
+
+        Args:
+            features: Mapping of column name to per-example values produced
+                by the Grain data pipeline.
+
+        Returns:
+            A new dict with the padded JAX arrays.
+
+        Raises:
+            ValueError: If padding is enabled but ``pad_token_id`` is
+                ``None``, or an unexpected key is encountered.
+        """
         camax_length = self.max_completion_length + self.max_prompt_length
         padded_batch = {}
         for k in features.keys():
@@ -2492,6 +2511,17 @@ def conversations_formatting_function(
     """
 
     def format_dataset(examples):
+        """Apply the tokenizer's chat template to each example or batch.
+
+        Args:
+            examples: Mapping of column name to per-example values; the
+                conversation column is read by ``messages_field``.
+
+        Returns:
+            A list of formatted strings (when the column is batched as a
+            list of conversation lists) or a single formatted string for
+            the unbatched case.
+        """
         if isinstance(examples[messages_field][0], list):
             output_texts = []
             for i in range(len(examples[messages_field])):
@@ -2532,6 +2562,16 @@ def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type
     """
 
     def format_dataset(examples):
+        """Convert ``prompt``/``completion`` pairs into chat-templated strings.
+
+        Args:
+            examples: Mapping with at minimum ``prompt`` and ``completion``
+                fields; either scalar or batched (list of strings).
+
+        Returns:
+            A list of formatted strings for batched inputs or a single
+            formatted string otherwise.
+        """
         if isinstance(examples["prompt"], list):
             output_texts = []
             for i in range(len(examples["prompt"])):
@@ -2770,6 +2810,19 @@ class EmbeddingDataCollatorTFDS:
     has_negatives: bool = False
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        """Stack per-example query/positive (and optionally negative) tensors.
+
+        Args:
+            features: List of pre-tokenized example dicts.  Each example is
+                expected to contain ``query_input_ids``,
+                ``query_attention_mask``, ``positive_input_ids``,
+                ``positive_attention_mask`` and -- when
+                ``self.has_negatives`` -- the corresponding ``negative_*``
+                fields.
+
+        Returns:
+            A dict mapping each present field to a stacked JAX array.
+        """
         keys = [
             "query_input_ids",
             "query_attention_mask",
@@ -2798,6 +2851,19 @@ class EmbeddingDataCollatorGrain:
     has_negatives: bool = False
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        """Stack per-example query/positive (and optionally negative) tensors.
+
+        Args:
+            features: List of pre-tokenized example dicts.  Each example is
+                expected to contain ``query_input_ids``,
+                ``query_attention_mask``, ``positive_input_ids``,
+                ``positive_attention_mask`` and -- when
+                ``self.has_negatives`` -- the corresponding ``negative_*``
+                fields.
+
+        Returns:
+            A dict mapping each present field to a stacked JAX array.
+        """
         keys = [
             "query_input_ids",
             "query_attention_mask",

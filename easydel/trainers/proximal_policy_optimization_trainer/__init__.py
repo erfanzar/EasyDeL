@@ -14,11 +14,22 @@
 
 """Proximal Policy Optimization (PPO) trainer module for EasyDeL.
 
-This module implements PPO-style RLHF training for autoregressive language models.
+PPO is an actor-critic policy gradient method that constrains the policy
+update to a proximal region of the rollout policy. The objective is the
+clipped surrogate
 
-The module includes:
-- PPOConfig: Configuration for PPO training parameters
-- PPOTrainer: Trainer implementing PPO rollouts + clipped policy/value updates
+    L_pi = E_t[ min( r_t * A_t, clip(r_t, 1 - eps, 1 + eps) * A_t ) ]
+
+with a value-function regression term ``L_v`` and an optional entropy bonus.
+For RLHF the actor is a causal language model with a value-head adapter,
+advantages are estimated via GAE on per-token rewards (typically a reward
+model score plus a KL penalty against a reference policy), and rollouts are
+generated outside the gradient computation.
+
+The module exposes:
+    - :class:`PPOConfig`: Hyperparameter container for PPO training.
+    - :class:`PPOTrainer`: Trainer orchestrating rollouts and clipped
+      policy/value updates.
 """
 
 from .ppo_config import PPOConfig

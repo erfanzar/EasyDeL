@@ -51,6 +51,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ``--split``), output location (``--out``), optional streaming from HF
     (``--streaming``), row caps for dry runs (``--max-rows``), and Hub
     push options (``--push-to-hub``, ``--repo-id``, ``--private``).
+
+    Args:
+        argv: Optional list of CLI arguments. Uses ``sys.argv`` when ``None``.
+
+    Returns:
+        ``argparse.Namespace`` populated from the parsed arguments.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -90,14 +96,20 @@ def main(argv: list[str] | None = None) -> None:
     """Run the full normalization pipeline.
 
     Steps:
-    1. Stream or load rows from the source HF dataset.
-    2. Apply ``normalize_openai_tool_dataset_example`` to each row,
-       decoding stringified JSON fields into native objects.
-    3. Write the result as ``{split}.jsonl`` and ``{split}.parquet``
-       under ``--out``.
-    4. Emit a ``metadata.json`` summary alongside the data files.
-    5. If ``--push-to-hub`` is set, upload the dataset and metadata
-       to the Hub repository specified by ``--repo-id``.
+        1. Stream or load rows from the source HF dataset.
+        2. Apply ``normalize_openai_tool_dataset_example`` to each row,
+           decoding stringified JSON fields into native objects.
+        3. Write the result as ``{split}.jsonl`` and ``{split}.parquet``
+           under ``--out``.
+        4. Emit a ``metadata.json`` summary alongside the data files.
+        5. If ``--push-to-hub`` is set, upload the dataset and metadata
+           to the Hub repository specified by ``--repo-id``.
+
+    Args:
+        argv: Optional list of CLI arguments. Uses ``sys.argv`` when ``None``.
+
+    Raises:
+        SystemExit: If ``--push-to-hub`` is provided without ``--repo-id``.
     """
     args = parse_args(argv)
     out_dir = Path(args.out).expanduser().resolve()

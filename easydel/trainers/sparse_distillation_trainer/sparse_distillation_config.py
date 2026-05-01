@@ -120,6 +120,24 @@ class SparseDistillationConfig(DistillationConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Validate top-k and prompt/completion length budgets.
+
+        - Enforces ``top_k_teacher >= 1``.
+        - Reconciles ``max_length`` with ``max_prompt_length`` /
+          ``max_completion_length`` (deriving the completion budget when
+          omitted, validating the sum otherwise).
+        - Renormalizes ``max_length`` as the sum of the two parts.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias for
+                ``max_length``; forwarded to the base class.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the base class.
+
+        Raises:
+            ValueError: If ``top_k_teacher`` is below 1, or if length
+                budgets are inconsistent.
+        """
         if self.top_k_teacher < 1:
             raise ValueError(f"`top_k_teacher` must be >= 1, got {self.top_k_teacher}.")
 

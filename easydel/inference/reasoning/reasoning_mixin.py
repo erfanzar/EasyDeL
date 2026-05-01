@@ -37,7 +37,20 @@ class ReasoningMixin:
         reasoning_parser_name: str,
         enable_reasoning: bool,
     ) -> dict[str, ReasoningParser]:
-        """Initialize reasoning parsers for all registered models."""
+        """Initialize reasoning parsers for all registered models.
+
+        Args:
+            model_processors: Mapping of model name to its tokenizer/processor.
+            reasoning_parser_name: Name of the parser registered with
+                :class:`ReasoningParserManager`.
+            enable_reasoning: When ``False``, returns an empty mapping
+                without instantiating parsers.
+
+        Returns:
+            Dictionary mapping model name to a configured
+            :class:`ReasoningParser`. Models for which initialization fails
+            are silently dropped (with a warning logged).
+        """
         reasoning_parsers = {}
         if not enable_reasoning:
             return reasoning_parsers
@@ -63,8 +76,14 @@ class ReasoningMixin:
     ) -> tuple[str | None, str | None]:
         """Extract reasoning from a complete response.
 
+        Args:
+            response_text: Full assistant response text.
+            model_name: Model identifier used to look up the registered parser.
+
         Returns:
-            Tuple of (reasoning_content, content_without_reasoning).
+            Tuple of (reasoning_content, content_without_reasoning). Either
+            element may be ``None`` (or the original text when no parser is
+            available for ``model_name``).
         """
         if not hasattr(self, "reasoning_parsers") or model_name not in self.reasoning_parsers:
             return None, response_text
@@ -83,7 +102,22 @@ class ReasoningMixin:
         delta_token_ids: list[int] | None = None,
         request=None,
     ) -> DeltaMessage | None:
-        """Extract reasoning from streaming response chunks."""
+        """Extract reasoning from streaming response chunks.
+
+        Args:
+            model_name: Model identifier used to look up the registered parser.
+            previous_text: Cumulative text emitted prior to this delta.
+            current_text: Cumulative text including the new delta.
+            delta_text: Newly produced text in this chunk.
+            previous_token_ids: Token IDs prior to this delta.
+            current_token_ids: Token IDs including the new delta.
+            delta_token_ids: Token IDs corresponding to the new text.
+            request: Optional request context forwarded to the parser.
+
+        Returns:
+            A :class:`DeltaMessage` carrying ``reasoning_content`` and/or
+            ``content`` fields, or ``None`` when there is nothing to emit.
+        """
         if not hasattr(self, "reasoning_parsers") or model_name not in self.reasoning_parsers:
             return None
 

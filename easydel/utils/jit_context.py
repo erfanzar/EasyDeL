@@ -94,6 +94,12 @@ if _JIT_CONTEXT_STATE is None:
 
 
 def _get_state_value() -> ContextPayload | None:
+    """Read the current ``ContextVar`` payload.
+
+    Returns:
+        The stored ``NamedTuple`` payload, or ``None`` when no context is
+        currently active.
+    """
     value = _context_var.get()
     return None if value is None else tp.cast(ContextPayload, value)
 
@@ -108,6 +114,9 @@ def jit_context(context: ContextPayload | None) -> Iterator[ContextPayload | Non
 
     Yields:
         The context that was set for convenience.
+
+    Raises:
+        TypeError: If ``context`` is not ``None`` and not a tuple/NamedTuple.
     """
 
     if context is not None and not isinstance(context, tuple):
@@ -160,6 +169,12 @@ def peek_jit_context(default: ContextPayload | None = None) -> ContextPayload | 
 
     This helper is useful inside utilities that can operate without forcing an
     active context.
+
+    Args:
+        default: Value to return when no context is active.
+
+    Returns:
+        The current context payload, or ``default`` when none is set.
     """
 
     context = _get_state_value()
@@ -169,7 +184,9 @@ def peek_jit_context(default: ContextPayload | None = None) -> ContextPayload | 
 def clear_jit_context() -> None:
     """Clear any active context without leaving a ``with`` block.
 
-    This is mostly intended for testing helpers.
+    Bumps ``_context_generation`` so an enclosing :func:`jit_context` block
+    detects the explicit clear and skips its own restore on exit. Mostly
+    intended for testing helpers.
     """
 
     global _context_generation
@@ -180,7 +197,11 @@ def clear_jit_context() -> None:
 
 
 def is_jit_context_available() -> bool:
-    """Check whether a context payload is currently set."""
+    """Check whether a context payload is currently set.
+
+    Returns:
+        ``True`` if a context is active, otherwise ``False``.
+    """
 
     return _get_state_value() is not None
 

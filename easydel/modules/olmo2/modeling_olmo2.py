@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OLMo2 (Open Language Model 2) implementation.
+
+Implements AI2's OLMo2 decoder family. Compared to OLMo v1, the key
+architectural distinction is QK normalization (RMSNorm applied to query and
+key projections inside attention) for improved training stability. The rest
+follows a standard LLaMA-like layout: SwiGLU MLPs, RMSNorm, RoPE, and
+optional grouped-query attention.
+
+Exports:
+    - ``Olmo2MLP``: SwiGLU feed-forward block.
+    - ``Olmo2Attention``: standard attention with QK normalization.
+    - ``Olmo2DecoderLayer``: a single transformer block.
+    - ``Olmo2Model``: base transformer trunk.
+    - ``Olmo2ForCausalLM``: causal LM head wrapper.
+    - ``Olmo2ForSequenceClassification``: classification head wrapper.
+"""
 
 import functools
 

@@ -38,7 +38,7 @@ class TestQwen3VLMoE:
         org_config.text_config.intermediate_size = 1024
         org_config.text_config.num_attention_heads = 4
         org_config.text_config.num_key_value_heads = 2
-        org_config.text_config.num_hidden_layers = 2
+        org_config.text_config.num_hidden_layers = small_model_config["num_hidden_layers"]
         org_config.text_config.head_dim = 128
         org_config.text_config.moe_intermediate_size = 128
         org_config.text_config.num_experts = small_model_config.get("num_experts", 8)
@@ -91,7 +91,9 @@ class TestQwen3VLMoE:
         }
 
     @pytest.mark.parametrize("mpmd_schedule_kind", LOSS_SCHEDULE_KINDS, indirect=True)
-    def test_vision_language(self, qwen3_vl_moe_config, small_model_config, vlm_config, hf_qwen3_vl_moe_class, mpmd_schedule_kind):
+    def test_vision_language(
+        self, qwen3_vl_moe_config, small_model_config, vlm_config, hf_qwen3_vl_moe_class, mpmd_schedule_kind
+    ):
         """Test Qwen3VLMoEForConditionalGeneration with vision inputs."""
         local_cfg = small_model_config.copy()
         local_cfg["max_position_embeddings"] = 2048

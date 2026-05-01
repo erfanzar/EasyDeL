@@ -203,6 +203,17 @@ class StepMetrics:
 
     @staticmethod
     def _coerce_summary_scalar(metric_value: tp.Any) -> float | None:
+        """Coerce an arbitrary metric value into a Python ``float`` scalar.
+
+        Args:
+            metric_value: Any object emitted as a metric (jnp/np scalar,
+                Python number, or non-numeric).  ``None`` and booleans are
+                treated as non-summable.
+
+        Returns:
+            A finite ``float`` value when the input is a 0-d numeric scalar,
+            otherwise ``None``.
+        """
         if metric_value is None or isinstance(metric_value, bool):
             return None
         try:
@@ -224,6 +235,21 @@ class StepMetrics:
         metric_name: str,
         mode: tp.Literal["eval", "train"] | None = None,
     ) -> tp.Literal["ignore", "mean", "sum"]:
+        """Decide how a metric should be reduced when summarizing.
+
+        Most metrics use a "mean" reduction across steps, but a few are
+        either skipped (e.g. last-step counters that should not be averaged)
+        or summed (e.g. MLPerf totals).
+
+        Args:
+            metric_name: The full metric name as logged.
+            mode: Either ``"train"`` or ``"eval"`` to disambiguate between
+                modes that share suffixes; ``None`` skips the
+                mode-specific overrides.
+
+        Returns:
+            One of ``"ignore"``, ``"mean"``, ``"sum"``.
+        """
         if mode is not None and metric_name.startswith(f"{mode}/"):
             bare_metric_name = metric_name.removeprefix(f"{mode}/")
             if bare_metric_name in {
@@ -252,6 +278,22 @@ class StepMetrics:
         metric_value: tp.Any,
         mode: tp.Literal["eval", "train"] | None = None,
     ) -> None:
+        """Accumulate a metric value into running sum / count dictionaries.
+
+        Skips metrics flagged as ``"ignore"`` and silently drops values that
+        cannot be coerced to ``float``.  Used by trainers to compute
+        per-epoch summaries from per-step metrics.
+
+        Args:
+            summary_metric_sums: Mutable mapping of metric name to running
+                sum; updated in-place.
+            summary_metric_counts: Mutable mapping of metric name to running
+                count; updated in-place.
+            metric_name: The metric name to accumulate under.
+            metric_value: The latest scalar value for this metric (any type).
+            mode: Optional ``"train"``/``"eval"`` mode used by the reduction
+                lookup; defaults to ``None``.
+        """
         if self._get_summary_metric_reduction(metric_name, mode=mode) == "ignore":
             return
         scalar_value = self._coerce_summary_scalar(metric_value)
@@ -267,6 +309,26 @@ class StepMetrics:
         summary_metric_counts: dict[str, int],
         mode: tp.Literal["eval", "train"] | None = None,
     ) -> dict[str, tp.Any]:
+        """Reduce accumulated per-step metrics into a final summary mapping.
+
+        Combines ``last_metrics`` (carrying point-in-time values like
+        ``train_step``) with mean/sum reductions over the accumulated
+        running totals.  For ``mode="eval"``, also derives MLPerf throughput
+        and TFLOPS plus convenience aliases like ``eval/loss`` and
+        ``eval/perplexity``.
+
+        Args:
+            last_metrics: The most recent metrics dict (used as a base).
+            summary_metric_sums: Running sum dict from
+                :meth:`accumulate_summary_metric`.
+            summary_metric_counts: Running count dict from
+                :meth:`accumulate_summary_metric`.
+            mode: Optional ``"train"``/``"eval"`` mode for reduction
+                selection and post-processing.
+
+        Returns:
+            A new dict with reduced summary metrics.
+        """
         summary_metrics = dict(last_metrics)
         for metric_name, metric_total in summary_metric_sums.items():
             reduction = self._get_summary_metric_reduction(metric_name, mode=mode)
@@ -523,15 +585,27 @@ class NullProgressBar(BaseProgressBar):
     """
 
     def update(self, n: int = 1) -> None:
+        """No-op update; satisfies the :class:`BaseProgressBar` contract.
+
+        Args:
+            n: Ignored.
+        """
         pass
 
     def set_postfix(self, **kwargs) -> None:
+        """No-op postfix setter.
+
+        Args:
+            **kwargs: Ignored metric values.
+        """
         pass
 
     def reset(self) -> None:
+        """No-op reset."""
         pass
 
     def close(self) -> None:
+        """No-op close."""
         pass
 
 
@@ -553,9 +627,22 @@ class TqdmProgressBar(BaseProgressBar):
         self.pbar = pbar
 
     def update(self, n: int = 1) -> None:
+        """Advance the underlying tqdm bar.
+
+        Args:
+            n: Number of steps to advance.
+        """
         self.pbar.update(n)
 
     def set_postfix(self, **kwargs) -> None:
+        """Set tqdm's postfix, rounding floats for compact display.
+
+        ``learning_rate`` is preserved at full precision; all other floats
+        are rounded to three decimal places.
+
+        Args:
+            **kwargs: Metric key/value pairs.
+        """
         for k in list(kwargs.keys()):
             val = kwargs.get(k)
             if isinstance(val, float) and k != "learning_rate":
@@ -563,10 +650,12 @@ class TqdmProgressBar(BaseProgressBar):
         self.pbar.set_postfix(**kwargs)
 
     def reset(self) -> None:
+        """Reset tqdm step counter and start timestamp."""
         self.pbar.n = 0
         self.pbar.start_t = self.pbar._time()
 
     def close(self) -> None:
+        """Close the underlying tqdm bar."""
         self.pbar.close()
 
 
@@ -588,9 +677,24 @@ class JSONProgressBar(BaseProgressBar):
         """
         self.desc = desc
 
-    def update(self, n: int = 1) -> None: ...
+    def update(self, n: int = 1) -> None:
+        """No-op; JSON output is emitted from :meth:`set_postfix` only.
+
+        Args:
+            n: Ignored.
+        """
+        ...
 
     def set_postfix(self, **kwargs) -> None:
+        """Log the postfix metrics as a single JSON-style log record.
+
+        Single-element JAX/NumPy arrays are unboxed to scalars, and floats
+        (other than ``learning_rate``) are rounded to three decimal places
+        for compact log lines.
+
+        Args:
+            **kwargs: Metric key/value pairs to log.
+        """
         for k in list(kwargs.keys()):
             val = kwargs.get(k)
             if hasattr(val, "size") and val.size == 1:
@@ -599,9 +703,13 @@ class JSONProgressBar(BaseProgressBar):
                 kwargs[k] = round(val, 3)
         logger.info(kwargs)
 
-    def reset(self) -> None: ...
+    def reset(self) -> None:
+        """No-op."""
+        ...
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """No-op."""
+        ...
 
 
 class RichProgressBar(BaseProgressBar):
@@ -628,17 +736,33 @@ class RichProgressBar(BaseProgressBar):
         self._postfix = {}
 
     def update(self, n: int = 1) -> None:
+        """Advance the Rich task by ``n`` steps.
+
+        Args:
+            n: Number of steps to advance.
+        """
         self.progress.update(self.task_id, advance=n)
 
     def set_postfix(self, **kwargs) -> None:
+        """Merge new metrics into the Rich task's metrics field.
+
+        Args:
+            **kwargs: Metric key/value pairs accumulated and forwarded to
+                the Rich progress display.
+        """
         self._postfix.update(kwargs)
         self.progress.update(self.task_id, metrics=self._postfix)
 
     def reset(self) -> None:
+        """Reset the Rich task and clear accumulated metrics."""
         self.progress.reset(self.task_id)
         self._postfix = {}
 
     def close(self) -> None:
+        """Remove the Rich task from the progress display.
+
+        Silently ignores ``KeyError`` if the task is already gone.
+        """
         try:
             self.progress.remove_task(self.task_id)
         except KeyError:
@@ -647,10 +771,30 @@ class RichProgressBar(BaseProgressBar):
 
 @auto_pytree
 class MetricsHistogram:
-    """Compute and store histogram data for model weights or activations.
+    """JIT-compatible histogram of a JAX array's values.
 
-    This class provides a PyTree-compatible way to compute histograms and statistics
-    for JAX arrays, optimized for use within JIT-compiled functions.
+    Computed via :meth:`from_array`, which in a single ``jit`` traces
+    a 64-bin histogram plus the running min / max / sum / sum_squares
+    sufficient to recover mean, variance, and stddev later via the
+    ``mean`` / ``variance`` / ``std`` properties. The pytree layout
+    is auto-registered so instances can flow through ``jax.tree_util``
+    and be returned from compiled training steps verbatim.
+
+    Used by :func:`compute_weight_stats` to log per-parameter weight
+    distributions during training without breaking out of XLA.
+
+    Attributes:
+        bin_counts: ``[64]`` int counts of values falling into each
+            bucket.
+        bin_edges: ``[65]`` float bucket edges (left-closed,
+            right-open except for the rightmost bucket which absorbs
+            the maximum value).
+        size: Total number of input elements (post flattening).
+        min: Scalar minimum of the input array.
+        max: Scalar maximum.
+        sum: Scalar sum (cached for cheap mean).
+        sum_squares: Scalar sum of squares (cached for cheap variance
+            via ``E[x^2] - E[x]^2``).
     """
 
     bin_counts: jax.Array

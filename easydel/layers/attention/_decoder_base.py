@@ -53,7 +53,6 @@ Example:
 
         >>> from easydel.layers.attention import BaseDecoderLayer
         >>> import spectrax as spx
-from spectrax import nn
         >>>
         >>> class MyDecoderLayer(spx.Module):
         ...     def __init__(self, config, rngs):
@@ -183,25 +182,57 @@ class BaseDecoderLayer:
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         checkpoint_names: tuple[str, str] = ("norm", "residual"),
     ) -> tuple[Float[Array, "batch seq_len hidden_dim"], AttentionLayerOutput]:
-        """Apply attention with pre-norm residual connection.
+        """Run the pre-LN attention sub-block: ``h = h + attn(norm(h))``.
 
-        Pattern: `hidden = hidden + attention(norm(hidden))`
+        Implements the canonical pre-norm residual pattern (Wang et al.,
+        Llama, Mistral) — the residual stream stays in its native dtype
+        while normalization happens before the attention call. Both the
+        normalised tensor and the post-residual tensor are wrapped with
+        :func:`jax.ad_checkpoint.checkpoint_name` so that gradient
+        rematerialisation policies can decide which intermediate to keep.
 
         Args:
-            hidden_states: Input tensor
-            attention_module: Attention module to apply
-            norm_module: Normalization module (e.g., RMSNorm, LayerNorm)
-            mask_info: Mask information for attention
-            position_ids: Position indices
-            mode: Runtime mode
-            cache_view: Optional cache view
-            cache_metadata: Optional cache metadata
-            output_attentions: Whether to return attention weights
-            frequencies: Optional RoPE frequencies
-            checkpoint_names: Names for checkpointing (norm_name, residual_name)
+            hidden_states: Residual-stream tensor of shape
+                ``[batch, seq_len, hidden_dim]``. Cast preserved in the
+                residual; only ``norm_module``'s output flows into attention.
+            attention_module: Callable that consumes the normalised
+                hidden states plus the masking / position / cache stack
+                and returns an :class:`AttentionLayerOutput`. Typically a
+                :class:`UnifiedAttention` or :class:`FlexibleAttentionModule`.
+            norm_module: Pre-attention normalization layer (RMSNorm /
+                LayerNorm). Called on ``hidden_states`` *before* attention.
+            mask_info: ejkernel :class:`MaskInfo` describing the attention
+                mask (causal, sliding-window, document-packing, etc.) or
+                ``None`` for full visibility.
+            position_ids: Per-token absolute positions, shape
+                ``[batch, seq_len]``. Forwarded to attention for RoPE / ALiBi
+                lookup.
+            mode: SpecTrax runtime mode marker (training vs. various
+                inference flavors); used by attention to pick the right
+                kernel and cache code-path.
+            cache_view: Optional KV-cache view (transformer / ragged-pages /
+                unified). Mutated in-place by attention when running in an
+                inference mode.
+            cache_metadata: Companion metadata (page tables, cumulative
+                lengths) for paged caches; ignored in training.
+            output_attentions: When ``True`` instructs the attention module
+                to also return materialized softmax weights — expensive but
+                required for interpretability paths.
+            frequencies: Pre-computed RoPE cos/sin cache of shape
+                ``[seq_len, head_dim]`` (or whatever the attention module
+                expects). ``None`` when the model uses ALiBi or no
+                positional bias.
+            checkpoint_names: ``(norm_name, residual_name)`` labels passed
+                to :func:`checkpoint_name`; the SpecTrax remat policy keys
+                off these names.
 
         Returns:
-            Tuple of (updated_hidden_states, attention_outputs)
+            ``(updated_hidden_states, attn_outputs)`` where
+            ``updated_hidden_states`` has shape
+            ``[batch, seq_len, hidden_dim]`` and is the post-residual
+            tensor, and ``attn_outputs`` is the
+            :class:`AttentionLayerOutput` from the attention call (carrying
+            the optionally-returned weights and the updated cache view).
         """
         norm_name: str
         residual_name: str
@@ -239,20 +270,33 @@ class BaseDecoderLayer:
         scan_chunk_size: int = 1024,
         checkpoint_names: tuple[str, str] = ("norm", "residual"),
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply MLP with pre-norm residual connection.
+        """Run the pre-LN MLP sub-block: ``h = h + mlp(norm(h))``.
 
-        Pattern: `hidden = hidden + mlp(norm(hidden))`
+        Mirrors :meth:`pre_norm_residual_attn` for the feed-forward branch
+        of a transformer block. Optionally chunks the MLP along the
+        sequence axis via :func:`block_wise_ffn` to bound peak activation
+        memory on long contexts — useful when the FFN intermediate
+        (typically 4× ``hidden_dim`` for dense, 8×+ for SwiGLU) is the
+        memory hot-spot during training.
 
         Args:
-            hidden_states: Input tensor
-            mlp_module: MLP module to apply
-            norm_module: Normalization module (e.g., RMSNorm, LayerNorm)
-            use_scan: Whether to use block-wise scan for memory efficiency
-            scan_chunk_size: Chunk size for scan (if use_scan=True)
-            checkpoint_names: Names for checkpointing (norm_name, residual_name)
+            hidden_states: Residual-stream tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
+            mlp_module: Callable feed-forward block (dense, SwiGLU, MoE,
+                etc.). Receives the normalised tensor and returns the
+                same shape.
+            norm_module: Pre-MLP normalization layer (typically RMSNorm).
+            use_scan: When ``True`` apply ``mlp_module`` block-wise via
+                :func:`block_wise_ffn` to reduce peak memory; otherwise
+                call it once on the full sequence.
+            scan_chunk_size: Sequence-axis chunk size used when
+                ``use_scan=True``. Defaults to 1024.
+            checkpoint_names: ``(norm_name, residual_name)`` labels passed
+                to :func:`checkpoint_name` for remat policy targeting.
 
         Returns:
-            Updated hidden states
+            Updated hidden-states tensor of shape
+            ``[batch, seq_len, hidden_dim]`` after the residual add.
         """
         norm_name: str
         residual_name: str
@@ -280,14 +324,25 @@ class BaseDecoderLayer:
     def apply_output_sharding(
         hidden_states: Float[Array, "batch seq_len hidden_dim"], partition_manager
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Apply sharding to decoder layer output.
+        """Constrain the residual stream to the model's hidden-state sharding.
+
+        Wraps :func:`spectrax.apply_logical_sharding` with the canonical
+        ``HiddenStateSharding`` axis spec so that every decoder layer exits
+        with the same partitioning regardless of internal sharding choices
+        made by attention/MLP. This is crucial after MoE blocks (which may
+        produce expert-sharded outputs) and after tensor-parallel attention
+        where the residual axis temporarily diverges from the configured
+        layout.
 
         Args:
-            hidden_states: Output tensor
-            partition_manager: Partition manager for sharding
+            hidden_states: Decoder-layer output tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
+            partition_manager: SpecTrax partition manager carrying the
+                model-level mesh and axis-name resolution.
 
         Returns:
-            Sharded hidden states
+            ``hidden_states`` with a sharding constraint matching
+            :data:`common_types.HiddenStateSharding`.
         """
         return apply_logical_sharding(
             hidden_states,
@@ -313,31 +368,46 @@ class BaseDecoderLayer:
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
     ) -> DecoderLayerOutput:
-        """Complete standard decoder layer forward pass.
+        """Drive a full pre-LN transformer decoder block end-to-end.
 
-        Combines attention and MLP with pre-norm residuals:
-        1. `hidden = hidden + attention(norm(hidden))`
-        2. `hidden = hidden + mlp(norm(hidden))`
+        Three logical steps:
+
+        1. ``h = h + attention(input_norm(h))`` via :meth:`pre_norm_residual_attn`,
+           checkpoint labels ``("attn_norm", "attn_residual")``.
+        2. ``h = h + mlp(post_attn_norm(h))`` via :meth:`pre_norm_residual_mlp`,
+           checkpoint labels ``("mlp_norm", "mlp_residual")``; optionally
+           sequence-chunked when ``use_scan_mlp=True``.
+        3. :meth:`apply_output_sharding` to re-pin the residual stream to
+           the model's hidden-state partitioning before the next layer.
+
+        Returns the same triple of (hidden, attention weights, cache view)
+        any caller needs to feed into the next decoder layer.
 
         Args:
-            hidden_states: Input tensor
-            attention_module: Attention module
-            mlp_module: MLP module
-            input_norm: Pre-attention normalization
-            post_attn_norm: Pre-MLP normalization
-            mask_info: Mask information
-            position_ids: Position indices
-            mode: Runtime mode
-            partition_manager: Partition manager for sharding
-            cache_view: Optional cache view
-            cache_metadata: Optional cache metadata
-            output_attentions: Whether to return attention weights
-            frequencies: Optional RoPE frequencies
-            use_scan_mlp: Whether to use block-wise scan for MLP
-            scan_mlp_chunk_size: Chunk size for scan
+            hidden_states: Residual-stream tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
+            attention_module: Attention sub-block callable.
+            mlp_module: Feed-forward sub-block callable.
+            input_norm: Pre-attention normalization layer.
+            post_attn_norm: Pre-MLP normalization layer.
+            mask_info: ejkernel mask descriptor (causal, sliding-window, …)
+                or ``None``.
+            position_ids: ``[batch, seq_len]`` absolute positions.
+            mode: SpecTrax runtime mode (training / generate / prefill / …).
+            partition_manager: Partition manager whose ``HiddenStateSharding``
+                spec is enforced on the output.
+            cache_view: Optional KV cache view for inference; updated in
+                place by attention.
+            cache_metadata: Cache metadata companion (page tables, etc.).
+            output_attentions: Whether to materialise softmax weights.
+            frequencies: Optional RoPE cos/sin cache.
+            use_scan_mlp: Sequence-chunk the MLP for memory savings.
+            scan_mlp_chunk_size: Chunk width when ``use_scan_mlp=True``.
 
         Returns:
-            DecoderLayerOutput with hidden states and optional attention weights
+            :class:`DecoderLayerOutput` carrying the post-block hidden
+            states (sharded), the optional attention weights, and the
+            updated cache view from the attention call.
         """
         # Attention with pre-norm residual
         hidden_states_after_attn: Float[Array, "batch_size seq_len hidden_dim"]

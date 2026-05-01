@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the Cohere Command R2 (Cohere2) decoder-only LLM.
+
+Defines :class:`Cohere2Config` — the next-generation Cohere decoder. Compared
+to :class:`CohereConfig` it adds an interleaved sliding/full attention
+pattern (``sliding_window``, ``sliding_window_pattern``) for cheaper
+long-context inference, and an optional ``rope_scaling`` config to extend
+the effective context window.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

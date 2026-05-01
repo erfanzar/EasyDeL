@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Seed-OSS model family.
+
+Defines :class:`SeedOssConfig`, the EasyDeL configuration object for
+ByteDance's Seed-OSS dense decoder-only architecture (RMSNorm, GQA,
+SwiGLU MLP, RoPE with optional scaling, optional sliding-window
+attention via per-layer ``layer_types``).
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -76,6 +84,16 @@ class SeedOssConfig(EasyDeLBaseConfig):
         mlp_bias: bool = False,
         **kwargs,
     ):
+        """Initialize SeedOssConfig.
+
+        See the class docstring for parameter semantics. Defaults are
+        chosen to match the public Seed-OSS checkpoints; in particular
+        ``num_key_value_heads`` defaults to ``num_attention_heads``,
+        ``head_dim`` defaults to ``hidden_size // num_attention_heads``,
+        and ``max_window_layers`` defaults to ``num_hidden_layers`` when
+        not provided. ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
 
@@ -141,7 +159,23 @@ class SeedOssConfig(EasyDeLBaseConfig):
         )
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
-        """Return per-layer attention mask settings."""
+        """Materialise per-layer attention-mask metadata.
+
+        Walks ``layer_types`` (one entry per decoder layer) and
+        produces a mapping ``layer_idx -> AttnMaskDetail`` where the
+        mask type is derived from the HuggingFace string descriptor
+        and the sliding-window size is shared across all sliding
+        layers via :attr:`sliding_window`.
+
+        The returned mapping is consumed by EasyDeL's attention
+        dispatcher to pick the right kernel per layer (full vs.
+        sliding-window causal).
+
+        Returns:
+            dict[int, AttnMaskDetail]: One entry per layer present in
+            ``layer_types``; an empty dict when ``layer_types`` is
+            ``None``.
+        """
         mapping: dict[int, AttnMaskDetail] = {}
         for layer_idx, layer_type in enumerate(self.layer_types or ()):
             mapping[layer_idx] = AttnMaskDetail(

@@ -12,6 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the Falcon decoder-only LLM family.
+
+Falcon (TII) is built around a few cost-saving choices: multi-query
+attention (one shared KV head), parallel attention/MLP (sum the two paths
+into the residual), and either RoPE or ALiBi for positional encoding. The
+``new_decoder_architecture`` flag selects the dual-LayerNorm variant used
+by the larger Falcon checkpoints.
+
+Helpers:
+
+- :func:`built_bloom_alibi` — build BLOOM-style ALiBi slopes for the given
+  number of heads.
+- :func:`dropout_add` — apply dropout then add the residual.
+
+Building blocks:
+
+- :class:`FalconAttention` — :class:`UnifiedAttention` subclass with MQA, RoPE
+  / ALiBi switching, and the parallel-attention plumbing.
+- :class:`FalconMlp` — feed-forward block (gated or plain depending on
+  config).
+- :class:`FalconBlock` — single decoder layer; supports parallel and
+  dual-LayerNorm layouts.
+
+Public model classes (registered with the factory):
+
+- :class:`FalconModel` — base decoder.
+- :class:`FalconForCausalLM` — causal LM head.
+"""
 
 import functools
 import math
@@ -106,10 +134,20 @@ def dropout_add(
 
 
 class FalconAttention(UnifiedAttention):
-    """Multi-head attention layer for Falcon models.
+    """Causal attention with fused QKV, MQA/GQA, and ALiBi/RoPE for Falcon.
 
-    Implements the attention mechanism with support for ALiBi positional encodings
-    and multi-query attention, built on top of the unified attention backend.
+    Falcon stores the Q, K, V projections fused into a single
+    ``query_key_value`` linear (matching the HF Falcon checkpoint layout)
+    and routes the output through a ``dense`` projection. KV head count is
+    config-driven:
+
+    * ``config.multi_query=True`` selects MQA (``num_kv_heads = 1``).
+    * ``new_decoder_architecture`` enables GQA via ``config.num_kv_heads``.
+
+    Position handling is also config-driven: when ``config.alibi`` is set,
+    the attention type is ``"alibi"`` (additive linear-attention bias and
+    no RoPE); otherwise standard RoPE rotation is applied to Q/K. Per-layer
+    bias on every linear is gated by ``config.bias``.
     """
 
     projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
@@ -220,10 +258,13 @@ class FalconAttention(UnifiedAttention):
 
 
 class FalconMlp(spx.Module):
-    """Multi-Layer Perceptron module for Falcon models.
+    """Two-layer GELU feed-forward block for Falcon decoder layers.
 
-    Implements the feedforward network with GELU activation function
-    for enhanced representation learning in Falcon architecture.
+    Computes ``dense_4h_to_h(gelu(dense_h_to_4h(x)))`` — the original
+    transformer-style MLP without gating. The intermediate width is
+    ``config.ff_factor * hidden_size`` (default ``ff_factor=4``). Activation
+    is ``gelu`` with ``approximate=False`` to match the upstream
+    HF Falcon implementation. Per-linear bias is gated by ``config.bias``.
     """
 
     def __init__(
@@ -299,11 +340,25 @@ class FalconMlp(spx.Module):
 
 
 class FalconBlock(spx.Module):
-    """Single decoder layer for Falcon models.
+    """One Falcon decoder layer (sequential or parallel residual mode).
 
-    Combines multi-head attention and feedforward networks with
-    LayerNorm normalization and residual connections. Supports both
-    parallel and sequential attention/MLP computation modes.
+    Falcon has two block layouts depending on ``config.parallel_attn`` and
+    the legacy / ``new_decoder_architecture`` flag:
+
+    * **Parallel attention/MLP residual** (``parallel_attn=True``,
+      classic Falcon-7B layout).  A single ``input_layernorm`` feeds both
+      the attention and MLP paths and the two outputs are summed back into
+      the residual stream:
+      ``y = x + attn(input_ln(x)) + mlp(input_ln(x))``. Cheaper to run on
+      accelerators because the two computations are independent.
+    * **Sequential pre-norm** (``parallel_attn=False`` /
+      ``new_decoder_architecture=True``). Uses two layer norms
+      (``ln_attn``, ``ln_mlp``) and the standard pre-norm pattern:
+      ``x = x + attn(ln_attn(x))`` then ``x = x + mlp(ln_mlp(x))``.
+
+    Attention is :class:`FalconAttention` (fused QKV + ALiBi/RoPE), MLP is
+    :class:`FalconMlp` (GELU). Residual additions are protected by an
+    optional dropout (:func:`dropout_add`).
     """
 
     def __init__(
@@ -489,11 +544,15 @@ class FalconBlock(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=FalconConfig, model_type="falcon")
 class FalconModel(EasyDeLBaseModule):
-    """Falcon model implementation.
+    """Falcon backbone (registered as ``BASE_MODULE``).
 
-    This implements the Falcon language model architecture, utilizing transformer blocks
-    with LayerNorm, optional ALiBi or rotary position embeddings, and support for
-    parallel or sequential attention/MLP computation.
+    Stack: ``word_embeddings`` -> ``num_hidden_layers`` :class:`FalconBlock`
+    blocks -> final ``LayerNorm`` (``ln_f``). Attention follows the
+    fused-QKV layout from :class:`FalconAttention` (MQA / GQA / MHA based
+    on config) and uses either ALiBi or RoPE for positional encoding.
+    Decoder layers can run in parallel-residual or sequential pre-norm
+    mode (``config.parallel_attn`` / ``new_decoder_architecture``).
+    Returns :class:`BaseModelOutput`.
 
     Attributes:
         config (FalconConfig): Configuration for the model.
@@ -713,10 +772,12 @@ class FalconModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=FalconConfig, model_type="falcon")
 class FalconForCausalLM(BaseCausalLMModule[FalconModel, FalconConfig]):
-    """Falcon model with a language modeling head for causal language modeling tasks.
+    """Falcon backbone + ``vocab_size`` LM head for autoregressive generation.
 
-    This model is a transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation.
+    Wraps :class:`FalconModel` with an unbiased linear LM head producing
+    token logits. Supports ALiBi-positioned and RoPE-positioned variants
+    interchangeably through the underlying attention; KV head count
+    (MQA / GQA / MHA) is honoured at inference for KV-cache layout.
 
     Attributes:
         config (FalconConfig): Configuration for the model.

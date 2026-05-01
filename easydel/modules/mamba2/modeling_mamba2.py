@@ -39,13 +39,28 @@ from .mamba2_configuration import Mamba2Config as Mamba2Config
 
 
 def init_to_value(x, dtype):
-    """Return a parameter initializer that fills tensors with a fixed value."""
+    """Return a parameter initializer that fills tensors with a fixed value.
+
+    Args:
+        x (jnp.ndarray): Constant array used as the initializer's output.
+        dtype (jnp.dtype): Data type that the initializer casts ``x`` to.
+
+    Returns:
+        Callable[..., jnp.ndarray]: An initializer that ignores its arguments and
+        always returns ``x.astype(dtype)``.
+    """
     return lambda *_: x.astype(dtype)
 
 
 @auto_pytree
 class Mamba2Output(BaseModelOutput):
-    """Output type for the base Mamba2 model including cache state."""
+    """Output container for :class:`Mamba2Model`.
+
+    Carries ``last_hidden_state`` of shape ``(batch, seq_len, hidden_size)``
+    after the final RMSNorm and the per-layer recurrent state under
+    ``cache_params`` (named ``cache_params`` rather than ``past_key_values``
+    because there is no KV cache — every layer is recurrent).
+    """
 
     last_hidden_state: Array = None
     cache_params: RecurrentCache | None = None
@@ -54,7 +69,13 @@ class Mamba2Output(BaseModelOutput):
 
 @auto_pytree
 class Mamba2CausalLMOutput(BaseModelOutput):
-    """Causal language modeling output with logits and cached state."""
+    """Output container for :class:`Mamba2ForCausalLM`.
+
+    Adds vocab logits ``(batch, seq_len, vocab_size)`` on top of
+    :class:`Mamba2Output`. ``cache_params`` MUST be threaded through the
+    generation loop — without it the SSD recurrence restarts from zero state
+    on every step.
+    """
 
     logits: Array = None
     cache_params: RecurrentCache | None = None
@@ -62,8 +83,19 @@ class Mamba2CausalLMOutput(BaseModelOutput):
 
 
 def pad_tensor_by_size(input_tensor: jnp.ndarray, pad_size: int):
-    """
-    Padding x tensor with `pad_size` on the seq_len dim (dim=1)
+    """Pad a tensor along the sequence-length dimension.
+
+    Adds ``pad_size`` zero-valued positions at the end of axis 1 of either a 3-D
+    ``(batch, seq, dim)`` or 4-D ``(batch, seq, dim_a, dim_b)`` tensor.
+
+    Args:
+        input_tensor (jnp.ndarray): 3-D or 4-D tensor whose axis 1 is the sequence
+            dimension.
+        pad_size (int): Number of trailing positions to pad (zeros).
+
+    Returns:
+        jnp.ndarray: Padded tensor with shape matching the input except along
+        axis 1 which grows by ``pad_size``.
     """
     if input_tensor.ndim == 4:
         pad_width = [(0, 0), (0, pad_size), (0, 0), (0, 0)]
@@ -74,9 +106,20 @@ def pad_tensor_by_size(input_tensor: jnp.ndarray, pad_size: int):
 
 
 def reshape_into_chunks(input_tensor, pad_size, chunk_size):
-    """
-    Padding input_tensor with `pad_size` on the seq_len dim (dim=1) and
-    simultaneously splitting it into chunk sequences.
+    """Pad and reshape a sequence into uniform chunks.
+
+    First pads along the sequence axis (axis 1) using :func:`pad_tensor_by_size`,
+    then splits the padded sequence into ``chunk_size``-sized chunks.
+
+    Args:
+        input_tensor (jnp.ndarray): Tensor of shape ``(batch, seq, ...)``.
+        pad_size (int): Number of trailing positions to pad (chosen so that
+            ``(seq + pad_size)`` is a multiple of ``chunk_size``).
+        chunk_size (int): Length of each chunk after splitting.
+
+    Returns:
+        jnp.ndarray: Tensor with the sequence axis split into a
+        ``(num_chunks, chunk_size)`` pair, preserving trailing dimensions.
     """
     input_tensor = pad_tensor_by_size(input_tensor, pad_size)
 
@@ -93,8 +136,19 @@ def reshape_into_chunks(input_tensor, pad_size, chunk_size):
 
 
 def segment_sum(input_tensor):
-    """
-    More stable segment sum calculation. Uses cumulative sums and masking instead of direct subtractions.
+    """Compute a numerically stable cumulative segment sum.
+
+    Builds a strictly-lower-triangular mask, accumulates contributions, and then
+    fills the upper triangle with ``-inf`` so the result can be used directly
+    as a log-domain mask (e.g. for SSM cumulative decays).
+
+    Args:
+        input_tensor (jnp.ndarray): Tensor whose last dimension equals
+            ``chunk_size``; segment sums are computed along that axis.
+
+    Returns:
+        jnp.ndarray: Tensor of shape ``(*input_tensor.shape, chunk_size)`` with
+        cumulative sums in the lower triangle and ``-inf`` elsewhere.
     """
     chunk_size = input_tensor.shape[-1]
     input_tensor = jnp.expand_dims(input_tensor, axis=-1)
@@ -117,9 +171,28 @@ _T = tp.TypeVar("_T")
 def create_tuple_parser(
     n: int,
 ) -> Callable[[_T | Sequence[_T]], tuple[_T, ...]]:
-    """Ensure a scalar or sequence is expanded into a tuple of length ``n``."""
+    """Ensure a scalar or sequence is expanded into a tuple of length ``n``.
+
+    Args:
+        n (int): Required tuple length.
+
+    Returns:
+        Callable[[_T | Sequence[_T]], tuple[_T, ...]]: A parser that returns
+        ``(x,) * n`` for scalars and validates length for sequences.
+    """
 
     def parse(x: _T | Sequence[_T]) -> tuple[_T, ...]:
+        """Coerce ``x`` to a length-``n`` tuple.
+
+        Args:
+            x (_T | Sequence[_T]): Scalar value or already-correct-length sequence.
+
+        Returns:
+            tuple[_T, ...]: The corresponding length-``n`` tuple.
+
+        Raises:
+            ValueError: If ``x`` is a sequence whose length is not ``n``.
+        """
         if isinstance(x, Sequence):
             if len(x) == n:
                 return tuple(x)
@@ -132,7 +205,16 @@ def create_tuple_parser(
 
 
 class Conv1D(spx.Module):
-    """Lightweight 1D convolution wrapper used by the Mamba2 mixer."""
+    """Causal depthwise 1-D convolution shared by the Mamba2 mixer.
+
+    Operates on the channel-major layout ``(batch, conv_dim, seq_len)`` with
+    ``feature_group_count = conv_dim`` so the kernel is depthwise. The mixer
+    feeds the *concatenation* of the SSM channel stream and the per-token
+    ``B``/``C`` parameters through this conv (``conv_dim = intermediate_size +
+    2 * n_groups * state_size``), giving each of those streams a short local
+    receptive field of width ``kernel_size`` before they enter the
+    selective-scan kernel.
+    """
 
     def __init__(
         self,
@@ -228,7 +310,18 @@ class Conv1D(spx.Module):
 
 
 class MambaRMSNormGated(spx.Module):
-    """RMSNorm variant that optionally gates inputs before normalization."""
+    """RMSNorm with an optional SiLU gate folded in before normalization.
+
+    Mamba-2's mixer uses gating *after* the SSM (rather than alongside it as
+    in Mamba-1), but to keep the multiply numerically stable the gate is
+    applied in fp32 *before* RMS normalization::
+
+        y = w * RMSNorm(silu(gate) * x)
+
+    When ``gate`` is ``None`` this collapses to a plain RMSNorm. Always casts
+    to fp32 internally and casts back to the input dtype on the way out so
+    bf16 trunks do not lose precision in the rescale.
+    """
 
     def __init__(
         self,
@@ -278,29 +371,45 @@ class MambaRMSNormGated(spx.Module):
 
 
 class Mamba2Mixer(spx.Module):
-    """Core selective state space mixer for Mamba2 blocks.
+    """State-space-dual ("SSD") mixer — Mamba-2's per-layer attention substitute.
 
-    Implements the improved selective state space model (SSM) from Mamba2,
-    featuring enhanced hardware efficiency through chunked computations and
-    multi-head structure. This mixer processes sequences with input-dependent
-    state transitions, enabling content-aware modeling with linear complexity.
+    Pipeline for ``(batch, seq_len, hidden_size)`` input:
 
-    The Mamba2 architecture introduces several improvements over the original:
-    - Multi-head SSM structure for better parallelization
-    - Grouped convolutions for efficiency
-    - Improved numerical stability through chunked state updates
+    1. ``in_proj`` produces a single fused tensor that is split into:
+       a (residual) MLP path of width ``2 * d_mlp``, the gate ``g`` of width
+       ``intermediate_size``, the conv input of width ``conv_dim =
+       intermediate_size + 2 * n_groups * state_size``, and a per-head step
+       tensor of width ``num_heads`` (``Δ`` raw).
+    2. The conv input is run through a causal depthwise ``conv1d`` (and a
+       cached rolling buffer during decode, exactly as in Mamba-1) and split
+       into the channel stream ``x`` plus the per-token ``B``/``C``
+       projections shared across ``n_groups`` head-groups.
+    3. ``Δ = clip(softplus(Δ_raw + dt_bias), time_step_limit)`` produces the
+       positive per-head step. The recurrence used by :class:`SSM2Op` is the
+       *scalar-decay* SSD form
+
+       .. math::
+           a_t = \\exp(-\\Delta_t \\, \\text{softplus}(A)), \\;
+           h_t = a_t h_{t-1} + B_t x_t, \\; y_t = C_t h_t + D x_t
+
+       implemented as a chunked block-matmul of size ``chunk_size`` for
+       throughput on TPU/GPU.
+    4. The output is gated and normalized by :class:`MambaRMSNormGated`,
+       then projected back to ``hidden_size`` by ``out_proj``.
 
     Attributes:
-        config (Mamba2Config): Model configuration.
-        layer_idx (int): Index of this layer in the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Numerical precision for operations.
-        num_heads (int): Number of SSM heads.
-        hidden_size (int): Dimensionality of hidden states.
-        ssm_state_size (int): Size of the SSM state.
-        conv_kernel_size (int): Size of the convolution kernel.
-        intermediate_size (int): Expanded intermediate dimension.
+        in_proj, out_proj, conv1d: Fused input projection, output projection,
+            and depthwise conv described above.
+        A_log (ArrayParam): Log-parametrization of the per-head decay scalar
+            ``A``; ``-softplus(A_log)`` is always negative, ensuring stability.
+        D (ArrayParam): Per-head skip term added directly to the SSM output.
+        dt_bias (ArrayParam): Initial per-head bias on ``Δ`` chosen so that
+            ``E[Δ]`` matches a uniform draw on ``[time_step_min, time_step_max]``.
+        norm (MambaRMSNormGated): Gated RMSNorm applied to the SSM output.
+        ssm_op (SSM2Op): Fused SSD kernel running the chunked recurrence.
+        n_groups, num_heads, head_dim, ssm_state_size, conv_kernel_size,
+            intermediate_size, chunk_size, time_step_limit, time_step_min,
+            time_step_max: Mirror the corresponding config fields.
     """
 
     def __init__(
@@ -444,22 +553,39 @@ class Mamba2Mixer(spx.Module):
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
     ):
-        """Apply selective state space transformation.
+        """Run the SSD mixer over a chunk of tokens.
+
+        At ``seq_len == 1`` with a populated cache the mixer takes the
+        single-step decode path: it shifts the new token into the cached
+        ``conv_state`` rolling buffer, evaluates the conv as a single dot
+        product, and lets :class:`SSM2Op` advance the recurrent state by one
+        step using ``cache_params.recurrent_state``. For longer sequences it
+        runs the full causal conv (left-padded by ``conv_kernel - 1``) and
+        the chunked SSD scan, then snapshots the trailing ``conv_kernel``
+        columns into the cache.
+
+        Padding handling: when the supplied ``attention_mask`` matches the
+        input shape and is non-trivial, the gate, conv input, and ``Δ``
+        streams are all multiplied by it so masked tokens contribute zero to
+        the SSM state and conv buffer.
 
         Args:
-            input_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
-            cache_params (RecurrentCacheView | None, optional): Cache for efficient generation.
-                Contains conv_state [batch, conv_dim, conv_kernel] and recurrent_state
-                [batch, num_heads, head_dim, state_size]. Defaults to None.
-            cache_position (Array | None, optional): Position indices for cache updates.
-                Not used in current implementation. Defaults to None.
-            attention_mask (Array | None, optional): Mask tensor of shape [batch, seq_len]
-                where 1 indicates valid tokens and 0 indicates padding. Defaults to None.
+            input_states: ``(batch, seq_len, hidden_size)`` block input.
+            cache_params: Per-layer cache view (rolling ``conv_state`` plus
+                ``recurrent_state`` of shape ``(batch, num_heads, head_dim,
+                state_size)``). ``None`` skips state threading.
+            cache_position: Accepted for signature parity with attention
+                layers; the SSD scan does not need explicit positions.
+            attention_mask: Optional ``(batch, seq_len)`` 0/1 padding mask.
 
         Returns:
-            tuple: A tuple containing:
-                - contextualized_states (Array): Output tensor of shape [batch, seq_len, hidden_size].
-                - cache_view (RecurrentCacheView | None): Updated cache state for next iteration.
+            tuple: ``(contextualized_states, cache_view)`` with output shape
+            ``(batch, seq_len, hidden_size)`` and an updated cache view (or
+            ``None`` if no cache was supplied).
+
+        Raises:
+            ValueError: If ``num_heads`` is not divisible by ``n_groups`` or
+                ``intermediate_size != num_heads * head_dim``.
         """
         dtype = input_states.dtype
 
@@ -586,20 +712,21 @@ class Mamba2Mixer(spx.Module):
 
 
 class Mamba2Block(spx.Module):
-    """Single Mamba2 layer combining normalization, SSM mixer, and residual connections.
+    """Pre-norm wrapper around a :class:`Mamba2Mixer`.
 
-    Implements a complete Mamba2 block with pre-normalization architecture,
-    applying RMS normalization followed by the selective state space mixer
-    and a residual connection. Each block maintains separate convolution
-    and SSM states for efficient autoregressive generation.
+    A Mamba-2 layer is just ``residual + mixer(RMSNorm(x))``; there is no
+    separate FFN — the gated channel projection inside the mixer plays the
+    feed-forward role. With ``residual_in_fp32`` enabled the residual stream
+    is upcast to fp32 to bound numerical drift across many recurrent steps,
+    which matters more for SSMs than for transformers because each layer's
+    output flows through a long sequential recurrence rather than a fresh
+    softmax.
 
     Attributes:
-        config (Mamba2Config): Model configuration.
-        layer_idx (int): Index of this layer in the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Numerical precision for operations.
-        residual_in_fp32 (bool): Whether to compute residuals in float32.
+        norm (RMSNorm): Pre-mixer RMSNorm at ``layer_norm_epsilon``.
+        mixer (Mamba2Mixer): The SSD mixer, optionally rematerialized via
+            :func:`auto_remat` per the config's checkpointing policy.
+        residual_in_fp32 (bool): Cast the residual to fp32 before adding.
     """
 
     def __init__(
@@ -692,23 +819,19 @@ class Mamba2Block(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Mamba2Config, model_type="mamba2")
 class Mamba2Model(EasyDeLBaseModule):
-    """Mamba2 selective state space model implementation.
+    """Mamba-2 base trunk: embeddings + stack of :class:`Mamba2Block` + final RMSNorm.
 
-    Implements the Mamba2 architecture, an improved state space model that
-    achieves linear-time sequence modeling through selective state spaces
-    with multi-head structure. Mamba2 introduces hardware-efficient chunked
-    computations and improved parallelization compared to the original Mamba.
-
-    The model processes input tokens through:
-    1. Token embedding layer
-    2. Stack of Mamba2 blocks with SSM mixers
-    3. Final RMS normalization
+    No positional embedding and no attention — sequence ordering is encoded
+    entirely by the SSD recurrence. Each block contributes a per-layer
+    :class:`RecurrentCacheView` to the trunk's :class:`RecurrentCache` so
+    that streaming decode runs in O(1) time per token by stepping the
+    rolling conv buffer and the per-head SSM state.
 
     Attributes:
-        config (Mamba2Config): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        embeddings (Embed): Token embedding ``(vocab_size, hidden_size)``.
+        layers (nn.ModuleList[Mamba2Block]): ``num_hidden_layers`` SSD blocks
+            assigned to pipeline stages via :func:`spx.assign_stage`.
+        norm_f (RMSNorm): Final RMS normalization applied to trunk output.
     """
 
     def __init__(
@@ -881,18 +1004,19 @@ class Mamba2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Mamba2Config, model_type="mamba2")
 class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type: ignore
-    """Mamba2 model with a language modeling head for causal language modeling tasks.
+    """Causal LM head wrapper around :class:`Mamba2Model`.
 
-    This model combines the Mamba2 selective state space backbone with a
-    linear language modeling head to perform autoregressive text generation
-    with linear-time complexity. The improved multi-head SSM structure
-    enables better hardware utilization compared to the original Mamba.
+    Stacks an LM projection on the SSD trunk. Decoding cost per token is
+    independent of generated length once the cache is primed because the
+    SSD recurrence advances in O(num_heads * head_dim * state_size) per
+    step rather than the O(seq_len) of a transformer attending to a
+    growing KV cache. The :class:`RecurrentCache` returned alongside the
+    logits MUST be threaded back into the next call.
 
     Attributes:
-        config (Mamba2Config): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-        precision: Precision setting for JAX operations.
+        backbone (Mamba2Model): SSM trunk; named ``"backbone"`` (not
+            ``"model"``) to match upstream Mamba checkpoint layouts.
+        lm_head: Vocab projection produced by :class:`BaseCausalLMModule`.
     """
 
     _task_type = TaskType.CAUSAL_LM

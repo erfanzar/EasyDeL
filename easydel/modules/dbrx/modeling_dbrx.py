@@ -12,6 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the DBRX (Databricks) Mixture-of-Experts decoder.
+
+DBRX is a fine-grained MoE transformer with 16 experts per layer and top-4
+routing in its largest configuration. The reference architecture also uses
+multi-query attention (single KV head), QKV clipping, and standard RoPE.
+
+Building blocks:
+
+- :class:`DbrxAttention` — fused-QKV multi-query attention with optional QKV
+  clipping.
+- :class:`DbrxNormAttentionNorm` — pre/post norm wrapper around the attention
+  module.
+- :class:`DbrxExpertGLU` / :class:`DbrxExperts` — fused per-expert SwiGLU FFN
+  bank.
+- :class:`DbrxRouter` — softmax router with optional jitter and uniform-
+  assignment debug knob.
+- :class:`DbrxFFN` — router + experts wired together.
+- :class:`DbrxBlock` — single decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`DbrxModel` — base decoder.
+- :class:`DbrxForCausalLM` — causal LM head + auxiliary load-balancing loss.
+- :class:`DbrxForSequenceClassification` — pooled classifier head.
+
+Also defines :func:`_patch_hf_dbrx_aux_loss_return_type`, applied at import
+time, to repair an HF helper that occasionally returns a Python ``0``.
+"""
 
 from functools import cached_property
 from typing import ClassVar
@@ -44,6 +72,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
+from easydel.infra.sharding import is_mpmd_mesh
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, ParallelLinear, RowParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
@@ -84,6 +113,18 @@ def _patch_hf_dbrx_aux_loss_return_type() -> None:
 
 
 _patch_hf_dbrx_aux_loss_return_type()
+
+
+def _config_uses_mpmd(config) -> bool:
+    mesh = getattr(config, "_hidden_mesh", None) or getattr(config, "mesh", None)
+    if is_mpmd_mesh(mesh) or int(getattr(mesh, "shape", {}).get("pp", 1)) > 1:
+        return True
+    axis_names = tuple(getattr(config, "sharding_axis_names", ()))
+    axis_dims = tuple(getattr(config, "sharding_axis_dims", ()))
+    if "pp" not in axis_names:
+        return False
+    pp_index = axis_names.index("pp")
+    return pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
 
 
 class DbrxAttention(UnifiedAttention):
@@ -845,19 +886,21 @@ class DbrxFFN(spx.Module):
                 - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
                 - Raw router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
-        x = apply_logical_sharding(
-            x,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        if not _config_uses_mpmd(self.config):
+            x = apply_logical_sharding(
+                x,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
         router_logits, top_weights, top_experts = self.router(x)
         router_logits = checkpoint_name(router_logits, name="moe_router_logits")
         out = checkpoint_name(self.experts(x, top_weights, top_experts), name="moe_expert_output")
-        out = apply_logical_sharding(
-            out,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        if not _config_uses_mpmd(self.config):
+            out = apply_logical_sharding(
+                out,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
         return out, router_logits
 
 
@@ -981,11 +1024,18 @@ class DbrxBlock(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=DbrxConfig, model_type="dbrx")
 class DbrxModel(EasyDeLBaseModule):
-    """The base DBRX model transformer.
+    """Databricks DBRX backbone (registered as ``BASE_MODULE``).
 
-    This class represents the core transformer architecture of the DBRX model,
-    consisting of an embedding layer, multiple DbrxBlock layers (with sparse MoE),
-    and a final layer normalization.
+    Stack: token embedding -> ``n_layers`` :class:`DbrxBlock` blocks (each
+    a norm-attention-norm + MoE FFN) -> final ``LayerNorm``. Attention
+    uses MQA/GQA with ``kv_n_heads`` (default 1, multi-query), fused QKV,
+    optional symmetric QKV clipping (``attn_config.clip_qkv``), and RoPE
+    (``rope_theta``). Every layer's FFN is the fine-grained DBRX MoE:
+    ``ffn_config.moe_num_experts`` (16 by default) routed via
+    :class:`DbrxRouter` with top-``moe_top_k`` selection (4 by default),
+    optional jitter, and Lp-normalised expert weights. Auxiliary
+    load-balancing loss is gated by ``router_aux_loss_coef``. Returns
+    :class:`MoeModelOutput`.
 
     The DBRX architecture features:
     - Fused QKV attention with optional clipping
@@ -1190,11 +1240,12 @@ class DbrxModel(EasyDeLBaseModule):
                 )
             hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.blocks)
 
-            hidden_states = apply_logical_sharding(
-                hidden_states,
-                dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.runtime_sharding_resolver,
-            )
+            if not _config_uses_mpmd(self.config):
+                hidden_states = apply_logical_sharding(
+                    hidden_states,
+                    dynamic_axes=common_types.HiddenStateSharding,
+                    partition_manager=self.config.runtime_sharding_resolver,
+                )
 
             if output_attentions:
                 all_attentions += (outputs.attention_weight,)
@@ -1250,10 +1301,14 @@ class DbrxModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=DbrxConfig, model_type="dbrx")
 class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignore
-    """DBRX model with a language modeling head for causal language modeling tasks.
+    """DBRX backbone + ``vocab_size`` LM head for autoregressive generation.
 
-    This model is a sparse MoE transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation.
+    Wraps :class:`DbrxModel` with an unbiased linear ``lm_head``. Goes
+    through the MoE-aware ``forward_moe`` path so per-layer router logits
+    flow into the output and the auxiliary load-balancing loss
+    (weighted by ``config.router_aux_loss_coef``) is folded into the main
+    objective. Tied embeddings are *not* supported by DBRX
+    (the config raises if ``tie_word_embeddings=True``).
 
     Attributes:
         config (DbrxConfig): Configuration for the model.
@@ -1383,10 +1438,13 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignor
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")
 class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, DbrxConfig]):  # type: ignore
-    """DBRX model for sequence classification tasks.
+    """DBRX backbone + linear ``score`` head for sequence-level classification.
 
-    This class extends the base DBRX model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Pools the last non-pad token's hidden state from :class:`DbrxModel` and
+    feeds it through an unbiased ``score`` head with ``num_labels``
+    outputs. ``config.pad_token_id`` is required for batched inputs;
+    auxiliary router load-balancing loss is still threaded through during
+    fine-tuning to keep the experts balanced.
 
     Attributes:
         config (DbrxConfig): Configuration for the model.

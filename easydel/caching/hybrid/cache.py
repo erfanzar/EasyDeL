@@ -223,19 +223,47 @@ class HybridCacheConfig(BaseCacheConfig):
         )
 
     def is_full_attention(self, layer_idx: int) -> bool:
-        """Check if a layer uses full attention."""
+        """Check if a layer uses full attention.
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``FULL_ATTENTION``.
+        """
         return self.layer_types[layer_idx] == FULL_ATTENTION
 
     def is_linear_attention(self, layer_idx: int) -> bool:
-        """Check if a layer uses linear attention (GatedDeltaNet)."""
+        """Check if a layer uses linear attention (GatedDeltaNet).
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``LINEAR_ATTENTION``.
+        """
         return self.layer_types[layer_idx] == LINEAR_ATTENTION
 
     def is_kda_attention(self, layer_idx: int) -> bool:
-        """Check if a layer uses KDA linear attention (Kimi Linear)."""
+        """Check if a layer uses KDA linear attention (Kimi Linear).
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``KDA_LINEAR_ATTENTION``.
+        """
         return self.layer_types[layer_idx] == KDA_LINEAR_ATTENTION
 
     def is_parallel_hybrid(self, layer_idx: int) -> bool:
-        """Check if a layer uses parallel hybrid (attention + SSM in parallel)."""
+        """Check if a layer uses parallel hybrid (attention + SSM in parallel).
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``PARALLEL_HYBRID``.
+        """
         return self.layer_types[layer_idx] == PARALLEL_HYBRID
 
 
@@ -781,6 +809,11 @@ class HybridCacheView(BaseCacheView):
             raise ValueError(f"Unknown layer_type: {self.layer_type}")
 
     def __repr__(self) -> str:
+        """Return a layer-type-aware ``repr`` highlighting the populated state.
+
+        Returns:
+            A string describing the relevant cache tensors for this layer.
+        """
         if self.layer_type == FULL_ATTENTION:
             return (
                 f"{self.__class__.__name__}(layer_type={self.layer_type}, "
@@ -845,6 +878,13 @@ class ParallelHybridCacheView(BaseCacheView):
     layer_index: int | None = field(pytree_node=False, default=None)
 
     def __post_init__(self):
+        """Mirror recurrent fields onto ``self`` so ``replace`` keeps both views in sync.
+
+        When the inner ``recurrent`` view is set the parallel view exposes its
+        conv/recurrent state directly; this hook copies those handles onto
+        ``self`` and rewrites ``self.recurrent`` if the user passed overrides
+        via field defaults.
+        """
         if self.recurrent is None:
             return
 
@@ -884,14 +924,29 @@ class ParallelHybridCacheView(BaseCacheView):
 
     @property
     def is_ragged(self) -> bool:
-        """Whether the attention component uses paged (ragged/unified) cache."""
+        """Whether the attention component uses paged (ragged/unified) cache.
+
+        Returns:
+            ``True`` when ``self.transformer`` is a ragged/unified cache view.
+        """
         from easydel.caching.ragged_page.cache import RaggedPagesCacheView as _RPC
         from easydel.caching.unified_attention.cache import UnifiedAttentionCacheView as _UAC
 
         return isinstance(self.transformer, (_RPC, _UAC))
 
     def _require_transformer_attr(self, name: str):
-        """Access an attribute on the inner transformer cache view, raising if unavailable."""
+        """Access an attribute on the inner transformer cache view.
+
+        Args:
+            name: Attribute name to look up on ``self.transformer``.
+
+        Returns:
+            The attribute value; ``None`` for ragged caches that legitimately
+            don't expose the attribute (e.g. dense ``key`` on a paged cache).
+
+        Raises:
+            AttributeError: If the inner view is dense and lacks ``name``.
+        """
         if self.transformer is None:
             return None
         val = getattr(self.transformer, name, None)
@@ -903,36 +958,50 @@ class ParallelHybridCacheView(BaseCacheView):
 
     @property
     def key(self):
+        """Inner attention view's ``key`` tensor (or ``None`` for paged views)."""
         return self._require_transformer_attr("key")
 
     @property
     def value(self):
+        """Inner attention view's ``value`` tensor (or ``None`` for paged views)."""
         return self._require_transformer_attr("value")
 
     @property
     def indexes(self):
+        """Inner attention view's ``indexes`` tensor."""
         return self._require_transformer_attr("indexes")
 
     @property
     def starts(self):
+        """Inner attention view's ``starts`` tensor."""
         return self._require_transformer_attr("starts")
 
     @property
     def masking_details(self):
+        """Inner attention view's masking details, or ``None`` if unavailable."""
         return getattr(self.transformer, "masking_details", None)
 
     @property
     def metadata(self):
+        """Inner attention view's static metadata, or ``None`` if unavailable."""
         return getattr(self.transformer, "metadata", None)
 
     @property
     def kv_pages(self):
-        """Access kv_pages for ragged page cache views."""
+        """Access ``kv_pages`` for ragged page cache views.
+
+        Returns:
+            The inner view's ``kv_pages`` tensor, or ``None`` if not a paged view.
+        """
         return getattr(self.transformer, "kv_pages", None)
 
     @kv_pages.setter
     def kv_pages(self, value):
-        """Forward kv_pages write to the inner transformer cache view."""
+        """Forward ``kv_pages`` write to the inner transformer cache view.
+
+        Args:
+            value: Replacement tensor to install on the inner view.
+        """
         if self.transformer is not None:
             self.transformer.kv_pages = value
 
@@ -1435,6 +1504,11 @@ class HybridCache(BaseCache):
         return self.replace(views=new_views)
 
     def __repr__(self):
+        """Return a multi-line ``repr`` listing each layer view.
+
+        Returns:
+            A string with one line per layer view.
+        """
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
 
     __str__ = __repr__

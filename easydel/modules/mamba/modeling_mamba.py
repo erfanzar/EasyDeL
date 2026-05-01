@@ -44,13 +44,31 @@ from .mamba_configuration import MambaConfig as MambaConfig
 
 
 def init_to_value(x, dtype):
-    """Return initializer that fills parameters with a broadcasted constant."""
+    """Build an initializer that fills parameters with a broadcasted constant.
+
+    Args:
+        x (Any): Constant scalar (or array) that the initializer should produce.
+        dtype: Unused by the inner closure; the dtype passed to the resulting
+            initializer at call time wins.
+
+    Returns:
+        Callable[[jax.Array, tuple, jnp.dtype], jax.Array]: An initializer with
+        the standard ``(key, shape, dtype)`` signature returning ``x`` broadcast
+        to ``shape``.
+    """
     return lambda _, shape, dtype: jnp.broadcast_to(jnp.asarray(x, dtype=dtype), shape)
 
 
 @auto_pytree
 class MambaOutput(BaseModelOutput):
-    """Output container for the base Mamba model with cached state."""
+    """Output container for :class:`MambaModel`.
+
+    Mirrors :class:`BaseModelOutput` but swaps the transformer KV cache for a
+    :class:`RecurrentCache` carrying the per-layer SSM state and rolling conv
+    window. ``last_hidden_state`` is the model trunk output after final RMSNorm
+    of shape ``(batch, seq_len, hidden_size)``; ``hidden_states`` is the
+    optional per-layer trace.
+    """
 
     last_hidden_state: Array = None
     cache: RecurrentCache | None = None
@@ -59,7 +77,13 @@ class MambaOutput(BaseModelOutput):
 
 @auto_pytree
 class MambaCausalLMOutput(BaseModelOutput):
-    """Causal LM output including logits and cache for Mamba decoding."""
+    """Output container for :class:`MambaForCausalLM`.
+
+    Adds the LM-head logits ``(batch, seq_len, vocab_size)`` on top of
+    :class:`MambaOutput`. The ``cache`` field must be threaded back into the
+    next call during streaming generation — without it the SSM recurrence
+    restarts from zero state.
+    """
 
     logits: Array = None
     cache: RecurrentCache | None = None
@@ -73,9 +97,28 @@ _T = tp.TypeVar("_T")
 def create_tuple_parser(
     n: int,
 ) -> Callable[[_T | Sequence[_T]], tuple[_T, ...]]:
-    """Normalize a scalar or sequence into a tuple of length ``n``."""
+    """Normalize a scalar or sequence into a tuple of length ``n``.
+
+    Args:
+        n (int): Required tuple length.
+
+    Returns:
+        Callable[[_T | Sequence[_T]], tuple[_T, ...]]: A parser that returns
+        ``(x,) * n`` for scalars and validates length for sequences.
+    """
 
     def parse(x: _T | Sequence[_T]) -> tuple[_T, ...]:
+        """Coerce ``x`` to a length-``n`` tuple.
+
+        Args:
+            x (_T | Sequence[_T]): Scalar value or sequence already of length ``n``.
+
+        Returns:
+            tuple[_T, ...]: The corresponding length-``n`` tuple.
+
+        Raises:
+            ValueError: If ``x`` is a sequence whose length is not ``n``.
+        """
         if isinstance(x, Sequence):
             if len(x) == n:
                 return tuple(x)
@@ -88,20 +131,47 @@ def create_tuple_parser(
 
 
 class Lambda(spx.Module):
-    """Convenience wrapper to insert callables into module pipelines."""
+    """Convenience wrapper to insert callables into module pipelines.
+
+    Wraps a Python callable as an ``spx.Module`` so it can participate in the
+    Spectrax module tree (e.g. inside ``nn.ModuleList``).
+
+    Attributes:
+        fn (Callable): The callable invoked by ``forward``.
+    """
 
     fn: tp.Callable
 
     def forward(self, x, **kwargs):
+        """Invoke the wrapped callable.
+
+        Args:
+            x: Primary positional argument forwarded to ``fn``.
+            **kwargs: Additional keyword arguments forwarded to ``fn``.
+
+        Returns:
+            The return value of ``fn(x, **kwargs)``.
+        """
         return self.fn(x, **kwargs)
 
 
 class MambaConv1D(spx.Module):
-    """Minimal 1D convolution layer for Mamba mixer implementation.
+    """Causal depthwise 1-D convolution feeding the Mamba selective scan.
 
-    Implements a depthwise separable 1D convolution used in the Mamba
-    selective state space model for local context aggregation before
-    the SSM layer.
+    Mamba prepends a small ``conv_kernel``-wide depthwise convolution
+    (``feature_group_count = features``) on the channel-major layout
+    ``(batch, features, seq_len)`` so that each token mixes a short local
+    window before being fed into the otherwise *pointwise* recurrence. The
+    convolution is left-padded with ``(conv_kernel - 1)`` zeros so it stays
+    causal during prefill, and during decode the same effect is reproduced
+    incrementally via the cached ``conv_state`` rolling buffer.
+
+    Attributes:
+        weight (ArrayParam): Kernel of shape ``(kernel_size, 1, features)``;
+            transposed and broadcast over the depthwise group at apply-time.
+        bias (ArrayParam): Optional per-channel bias of shape ``(features,)``.
+        features (int): Number of channels (== ``intermediate_size`` in the mixer).
+        kernel_size (int): Convolution kernel width / size of the rolling cache.
     """
 
     def __init__(
@@ -198,19 +268,43 @@ class MambaConv1D(spx.Module):
 
 
 class MambaMixer(spx.Module):
-    """Core selective state space mixer for Mamba blocks.
+    """Selective state-space mixer ("S6") block — Mamba's attention replacement.
 
-    Implements the selective state space model (SSM) with input-dependent
-    dynamics that enables content-aware sequence modeling. This is the
-    key component that differentiates Mamba from traditional SSMs by
-    making the state transitions depend on the input sequence.
+    Pipeline applied to ``(batch, seq_len, hidden_size)`` input :math:`x`:
+
+    1. ``in_proj`` lifts ``hidden_size -> 2 * intermediate_size`` and splits
+       into a *content* stream ``h`` and a *gate* stream ``g`` (the SiLU gate
+       multiplied at the end).
+    2. ``conv1d`` runs a causal depthwise convolution of width
+       ``conv_kernel`` over ``h`` and applies the ``hidden_act`` activation.
+       During decode the same window comes from the cached ``conv_state``.
+    3. ``x_proj`` produces the *input-dependent* SSM parameters per token::
+
+           [Δ_raw,  B,  C] = x_proj(h)               # rank/state-size split
+           Δ = softplus(dt_proj(Δ_raw))              # positive step size
+           Ā, B̄ = ZOH(A = -exp(A_log), Δ, B)         # discretization
+
+       making the recurrence selective: ``A``, ``B``, ``C``, ``Δ`` are
+       functions of ``x`` instead of fixed.
+    4. The recurrence ``s_t = Ā_t s_{t-1} + B̄_t h_t``, ``y_t = C_t s_t + D h_t``
+       is evaluated by :class:`SSM1Op` (parallel scan during prefill, single
+       step during decode) which also returns the final ``ssm_state`` of shape
+       ``(batch, intermediate_size, state_size)``.
+    5. Result is gated by ``SiLU(g)`` and projected back with ``out_proj``
+       down to ``hidden_size``.
 
     Attributes:
-        config (MambaConfig): Model configuration.
-        layer_idx (int): Index of this layer in the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Numerical precision for operations.
+        in_proj, x_proj, dt_proj, out_proj: Linear projections.
+        conv1d (MambaConv1D): Causal depthwise convolution feeding the SSM.
+        A_log (ArrayParam): Log-parametrization of the negative diagonal SSM
+            matrix; the actual ``A = -exp(A_log)`` is always negative-definite,
+            guaranteeing stability of the recurrence.
+        D (ArrayParam): Per-channel skip term added directly to the SSM output.
+        ssm_state_size (int): SSM hidden dimension ``N`` per channel.
+        intermediate_size (int): Channel dimension after ``in_proj``.
+        conv_kernel_size (int): Width of the cached rolling conv window.
+        time_step_rank (int): Rank of the low-rank ``Δ`` parameterization.
+        ssm_op (SSM1Op): Fused kernel that runs the (selective) scan.
     """
 
     def __init__(
@@ -356,25 +450,40 @@ class MambaMixer(spx.Module):
         position_ids: Array | None = None,
         attention_mask: Array | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
-        """Apply selective state space transformation.
+        """Run the gated selective-scan over a chunk of tokens.
 
-        Processes input through the SSM with input-dependent B, C, and delta
-        parameters, enabling content-aware sequence modeling with efficient
-        linear-time complexity.
+        Two execution paths share the same recurrence but differ in how
+        the conv window is materialized:
+
+        * **Prefill / training** (``seq_len > 1`` or no cache): the full
+          ``conv1d`` is applied with left-padding of ``conv_kernel - 1`` and
+          the trailing ``conv_kernel`` columns are saved into the cache for
+          later decode steps. ``SSM1Op`` runs as a parallel associative scan
+          across the whole sequence.
+        * **Decode** (``seq_len == 1`` with cache): the cached ``conv_state``
+          rolling buffer is updated with the new token, the convolution
+          collapses to a single dot product, and ``SSM1Op`` performs one
+          recurrent step per channel using the cached ``ssm_state``.
+
+        Padding is handled in-stream by zeroing the channel inputs at masked
+        positions (no attention mask needed by the recurrence itself).
 
         Args:
-            input_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
-            cache (RecurrentCacheView | None, optional): Cache containing previous
-                convolution and SSM states for incremental decoding. Defaults to None.
-            position_ids (Array | None, optional): Position indices for tokens.
-                Defaults to None.
-            attention_mask (Array | None, optional): Mask to avoid processing
-                padding tokens. Defaults to None.
+            input_states: ``(batch, seq_len, hidden_size)`` block input.
+            cache: Per-layer recurrent cache view. ``None`` skips state
+                threading entirely (training-only).
+            position_ids: Unused by the recurrence; accepted for signature
+                compatibility with attention layers.
+            attention_mask: ``(batch, seq_len)`` boolean/0-1 mask. When
+                provided, the gated channel stream is multiplied by the mask
+                so padding tokens contribute neither to the conv window nor
+                to the SSM state.
 
         Returns:
-            tuple[Array, RecurrentCacheView | None]: Tuple containing:
-                - Contextualized hidden states of shape (batch, seq_len, hidden_dim)
-                - Updated cache view for subsequent decoding steps
+            tuple: ``(contextualized_states, cache_view)`` where
+            ``contextualized_states`` has shape ``(batch, seq_len, hidden_size)``
+            and ``cache_view`` carries the updated ``conv_state`` and
+            ``ssm_state`` (or ``None`` if no cache was supplied).
         """
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -471,18 +580,20 @@ class MambaMixer(spx.Module):
 
 
 class MambaBlock(spx.Module):
-    """Single Mamba layer combining normalization, SSM mixer, and residual connections.
+    """Pre-norm wrapper around a :class:`MambaMixer`.
 
-    Implements a complete Mamba block with pre-normalization architecture,
-    applying RMS normalization followed by the selective state space mixer
-    and a residual connection.
+    A Mamba layer is just ``residual + mixer(RMSNorm(x))`` — there is no
+    second feed-forward, the mixer's gated MLP-on-channels already plays
+    that role. When ``config.residual_in_fp32`` is set, the residual stream
+    is upcast to fp32 to bound numerical drift across many recurrent steps
+    (Mamba accumulates information through the SSM rather than re-attending,
+    so error in the residual compounds layer-to-layer).
 
     Attributes:
-        config (MambaConfig): Model configuration.
-        layer_idx (int): Index of this layer in the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Numerical precision for operations.
+        norm (RMSNorm): Pre-mixer RMS normalization at ``layer_norm_epsilon``.
+        mixer (MambaMixer): The selective-scan block, optionally rematerialized
+            via :func:`auto_remat` according to the config's checkpointing policy.
+        residual_in_fp32 (bool): Whether the residual is kept in float32.
     """
 
     def __init__(
@@ -539,23 +650,21 @@ class MambaBlock(spx.Module):
         position_ids: Array | None = None,
         attention_mask: Array | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
-        """Forward pass through the Mamba block.
-
-        Applies pre-normalization architecture: x + mixer(norm(x))
+        """Apply the pre-norm Mamba block ``x = x + mixer(RMSNorm(x))``.
 
         Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
-            cache (RecurrentCacheView | None, optional): Cache for incremental decoding.
-                Defaults to None.
-            position_ids (Array | None, optional): Position indices for tokens.
-                Defaults to None.
-            attention_mask (Array | None, optional): Mask to avoid processing
-                padding tokens. Defaults to None.
+            hidden_states: ``(batch, seq_len, hidden_size)`` block input.
+            cache: Per-layer recurrent state (``conv_state`` + ``ssm_state``)
+                threaded through during streaming decode; ``None`` for the
+                training/non-cached path.
+            position_ids: Forwarded to the mixer for signature parity; unused
+                by the SSM recurrence itself.
+            attention_mask: ``(batch, seq_len)`` mask used inside the mixer to
+                zero out padding tokens before they enter the conv/SSM state.
 
         Returns:
-            tuple[Array, RecurrentCacheView | None]: Tuple containing:
-                - Output hidden states of shape (batch, seq_len, hidden_dim)
-                - Updated cache view for subsequent decoding steps
+            tuple: ``(hidden_states, cache_view)``. The output keeps the input
+            shape; ``cache_view`` is the mixer's updated cache view (or ``None``).
         """
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
@@ -578,18 +687,19 @@ class MambaBlock(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=MambaConfig, model_type="mamba")
 class MambaModel(EasyDeLBaseModule):
-    """Mamba selective state space model implementation.
+    """Mamba (S6) base trunk: token embedding + stack of :class:`MambaBlock` + final RMSNorm.
 
-    Implements the Mamba architecture, a novel state space model that
-    achieves linear-time sequence modeling through selective state spaces.
-    Unlike transformers, Mamba uses content-aware state transitions that
-    enable efficient processing of long sequences.
+    There is no positional embedding and no attention — sequence ordering is
+    encoded entirely by the causal SSM recurrence. Each block contributes a
+    :class:`RecurrentCacheView` to the trunk's :class:`RecurrentCache` so that
+    autoregressive decode runs in O(1) time per token by stepping the cached
+    SSM/conv state instead of replaying the prefix.
 
     Attributes:
-        config (MambaConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision: Precision setting for JAX operations.
+        embeddings (Embed): Token embedding ``(vocab_size, hidden_size)``.
+        layers (nn.ModuleList[MambaBlock]): ``num_hidden_layers`` mixer blocks,
+            assigned to pipeline stages via :func:`spx.assign_stage`.
+        norm_f (RMSNorm): Final RMSNorm applied to the trunk output.
     """
 
     def __init__(
@@ -654,32 +764,41 @@ class MambaModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaOutput:
-        """Forward pass through the Mamba base model.
+        """Embed tokens and run them through every Mamba layer, threading the cache.
 
-        Processes input tokens through embedding, all Mamba blocks with SSM,
-        and final normalization.
+        The trunk is executed via :meth:`nn.ModuleList.scan` with
+        ``trace=True`` so the layer body is JIT-traced once and replayed for
+        each block, keeping compile time independent of ``num_hidden_layers``.
+        At each step the per-layer :class:`RecurrentCacheView` is read from
+        ``cache.views[idx]`` and the updated view is written back in-place;
+        passing ``cache=None`` causes a fresh empty cache to be allocated, which
+        is what training and one-shot prefill rely on.
 
         Args:
-            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
-                Must be provided if inputs_embeds is None. Defaults to None.
-            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
-                (batch, seq_len, hidden_size). Defaults to None.
-            cache (RecurrentCache | None, optional): Cache with previous SSM and
-                convolution states for incremental decoding. Defaults to None.
-            position_ids (Array | None, optional): Position indices for tokens, shape
-                (batch, seq_len). Defaults to None.
-            attention_mask (Array | None, optional): Boolean mask to avoid processing
-                padding tokens, shape (batch, seq_len). Defaults to None.
-            output_hidden_states (bool | None, optional): Whether to return hidden
-                states from all layers. Defaults to None.
-            **kwargs: Additional keyword arguments (unused).
+            input_ids: ``(batch, seq_len)`` int32 token ids. Mutually exclusive
+                with ``inputs_embeds``.
+            inputs_embeds: Pre-embedded ``(batch, seq_len, hidden_size)`` input
+                used when token embeddings come from elsewhere.
+            cache: Recurrent cache with one slot per layer; updated in place
+                and returned on the output.
+            position_ids: Forwarded to layers for signature compatibility but
+                ignored by the recurrence. Reconstructed from the
+                ``MaskInfo``'s ``q_position_ids`` when not provided.
+            attention_mask: ``(batch, seq_len)`` 0/1 padding mask. Used by the
+                mixer to gate out padding contributions to the SSM state.
+            output_hidden_states: When true, return the per-layer trace
+                including the post-final-norm output. Defaults to
+                ``config.output_hidden_states``.
+            **kwargs: Ignored (retained for cross-model call-site parity).
 
         Returns:
-            MambaOutput: Contains last_hidden_state, optional all hidden_states,
-                and updated cache.
+            MambaOutput: ``last_hidden_state`` of shape ``(batch, seq_len,
+            hidden_size)``, the (possibly mutated) ``cache``, and an optional
+            tuple of per-layer hidden states.
 
         Raises:
-            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            ValueError: If exactly one of ``input_ids`` and ``inputs_embeds``
+                is not provided.
         """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -778,17 +897,20 @@ class MambaModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
 class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ignore
-    """Mamba model with a language modeling head for causal language modeling tasks.
+    """Causal language model wrapper around :class:`MambaModel`.
 
-    This model combines the Mamba selective state space backbone with a
-    linear language modeling head to perform autoregressive text generation
-    with linear-time complexity.
+    Adds an LM head on top of the SSM trunk. Because every layer is recurrent,
+    autoregressive sampling is O(1) per token in sequence length once the cache
+    is primed (cf. transformers, which still need to attend to a growing KV
+    cache). The :class:`RecurrentCache` returned alongside the logits MUST be
+    threaded into the next call — there is no recoverable state otherwise.
 
     Attributes:
-        config (MambaConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-        precision: Precision setting for JAX operations.
+        backbone (MambaModel): The SSM trunk; stored under the name
+            ``"backbone"`` (not ``"model"``) to match the upstream Mamba
+            checkpoint layout.
+        lm_head: Tied or independent vocab projection produced by
+            :class:`BaseCausalLMModule`.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -835,31 +957,27 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaCausalLMOutput:
-        """Forward pass for causal language modeling.
-
-        Processes input through the Mamba backbone and optionally applies
-        the language modeling head to produce next-token logits.
+        """Run the SSM trunk and (optionally) project to vocab logits.
 
         Args:
-            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
-                Must be provided if inputs_embeds is None. Defaults to None.
-            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
-                (batch, seq_len, hidden_size). Defaults to None.
-            cache (RecurrentCache | None, optional): Cache with previous SSM and
-                convolution states for incremental decoding. Defaults to None.
-            position_ids (Array | None, optional): Position indices for tokens.
-                Defaults to None.
-            apply_lm_head (bool, optional): Whether to apply the language modeling head.
-                Defaults to True.
-            attention_mask (Array | None, optional): Boolean mask to avoid processing
-                padding tokens. Defaults to None.
-            output_hidden_states (bool | None, optional): Whether to return hidden
-                states from all layers. Defaults to None.
-            **kwargs: Additional keyword arguments.
+            input_ids: ``(batch, seq_len)`` int32 token ids. Mutually exclusive
+                with ``inputs_embeds``.
+            inputs_embeds: Pre-embedded ``(batch, seq_len, hidden_size)`` inputs.
+            cache: Recurrent cache (per-layer ``conv_state`` + ``ssm_state``)
+                threaded across decoding steps.
+            position_ids: Accepted for signature parity; unused by the SSM.
+            apply_lm_head: When ``False`` the LM projection is skipped and
+                ``logits`` is left ``None`` — useful for distillation, value
+                heads, or trace-only calls.
+            attention_mask: ``(batch, seq_len)`` padding mask forwarded to the
+                trunk.
+            output_hidden_states: Optional per-layer hidden state trace.
+            **kwargs: Ignored (consumed for cross-model call-site parity).
 
         Returns:
-            MambaCausalLMOutput: Contains logits (if apply_lm_head), last_hidden_state,
-                optional all hidden_states, and updated cache.
+            MambaCausalLMOutput: ``logits`` of shape ``(batch, seq_len, vocab)``
+            when ``apply_lm_head`` is true, the trunk's ``last_hidden_state``,
+            the updated ``cache``, and the optional per-layer hidden states.
         """
         mamba_outputs = self.backbone(
             input_ids=input_ids,
@@ -887,18 +1005,22 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
         model_kwargs: dict[str, tp.Any],
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Update model inputs for the next generation step.
+        """Forward the updated recurrent cache into the next generation step.
 
-        Extracts the updated cache from model outputs and adds it to the
-        model kwargs for the next forward pass during autoregressive generation.
+        Unlike transformers, Mamba's ``cache`` is the only carrier of
+        sequence context across decoding steps — token ids do *not* need to be
+        re-prefilled. This hook simply lifts ``outputs.cache`` into
+        ``model_kwargs`` so the generation loop's next ``forward`` keeps
+        evolving the same SSM/conv state.
 
         Args:
-            outputs (MambaOutput): Model outputs from the current generation step.
-            model_kwargs (dict[str, tp.Any]): Current model keyword arguments.
-            **kwargs: Additional keyword arguments (unused).
+            outputs: The :class:`MambaCausalLMOutput`/``MambaOutput`` returned
+                by the previous step.
+            model_kwargs: Mutable kwargs dict for the next call.
+            **kwargs: Ignored.
 
         Returns:
-            dict[str, tp.Any]: Updated model kwargs with the new cache state.
+            dict: ``model_kwargs`` with ``"cache"`` set to the latest state.
         """
         model_kwargs["cache"] = outputs.get("cache", None)
         return model_kwargs
@@ -911,22 +1033,29 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ig
         starts: int | None = None,
         **kwargs,
     ):
-        """Prepare model inputs for text generation.
+        """Allocate the per-layer recurrent cache for a new generation run.
 
-        Initializes or retrieves the recurrent cache and prepares all
-        necessary inputs for the generation loop.
+        Builds a :class:`RecurrentCache` shaped for this model's
+        ``intermediate_size``, ``state_size`` and ``conv_kernel`` if one was
+        not supplied, then defers to :meth:`prepare_inputs_for_call` to wire
+        up ``attention_mask`` / ``position_ids`` defaults. Unlike transformer
+        models, ``max_length`` does not affect cache allocation: the cache
+        size is constant per batch element regardless of generated length.
 
         Args:
-            input_ids: Input token IDs to start generation from.
-            max_length (int): Maximum sequence length for generation.
-            pad_token_id (int): Token ID used for padding.
-            starts (int | None, optional): Starting position for generation.
-                Defaults to None.
-            **kwargs: Additional keyword arguments including cache, attention_mask,
-                and position_ids.
+            input_ids: Prompt tokens; only the batch dimension is read here.
+            max_length: Generation budget; accepted for API parity but not
+                used for cache shaping.
+            pad_token_id: Padding id used to construct the default attention
+                mask in the parent helper.
+            starts: Optional starting offset, forwarded to
+                :meth:`prepare_inputs_for_call`.
+            **kwargs: May carry an existing ``cache``, ``attention_mask`` or
+                ``position_ids`` to override the defaults.
 
         Returns:
-            dict: Prepared inputs including cache, attention_mask, and position_ids.
+            dict: Kwargs dict consumable by :meth:`forward`, containing the
+            (possibly fresh) ``cache``, ``attention_mask`` and ``position_ids``.
         """
         from spectrax import PartitionAxis
 

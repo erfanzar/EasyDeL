@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Xerxes model family.
+
+Defines :class:`XerxesConfig`, the EasyDeL configuration object for the
+Xerxes experimental decoder-only language model. Captures hidden
+size, depth, head counts, RoPE/attention settings, and Xerxes-specific
+hyperparameters used by the modeling code.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -108,6 +115,15 @@ class XerxesConfig(EasyDeLBaseConfig):
         scan_layers: bool = False,
         **kwargs,
     ):
+        """Initialize XerxesConfig.
+
+        See the class docstring for parameter semantics. ``xe_moe``,
+        ``num_local_experts`` and ``num_experts_per_tok`` enable the MoE
+        FFN; ``xe_kvnorm`` / ``xe_mlpnorm`` toggle Xerxes-specific
+        normalization placements; ``window_pattern`` and
+        ``sliding_window`` enable optional sliding-window attention.
+        ``**kwargs`` are forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.vocab_size = vocab_size

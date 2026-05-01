@@ -11,13 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-How to use
+"""CLI script to download large non-PyTorch HF artifacts to a local directory.
 
-Download large non-PyTorch artifacts from one or more Hugging Face repos into a local directory
-(including a gcsfuse mount).
+Useful for staging large non-PyTorch weight artifacts (e.g. ``.gguf``,
+custom binaries) from one or more HuggingFace repos into a local
+directory or a gcsfuse mount before further processing.
 
-Example:
+Exports a ``main`` entry point and a ``LargeWeightsArgs`` dataclass that
+encodes the CLI flags. Repos may be selected via ``--repo-id``,
+``--repos-file``, or HF collection URLs; selected files are filtered by
+size threshold, include globs, and exclude globs.
+
+Example invocation:
 
   python scripts/download_hf_large_weights_to_gcs.py \\
     --repo-id org/repo \\
@@ -26,10 +31,12 @@ Example:
     --token $HF_TOKEN
 
 Notes:
-- By default, PyTorch weights (.bin/.safetensors/.pt) are excluded.
-- This script is size-based, so it is not a good fit for directory-style weights like Zarr
-  (many small chunk files). For Zarr/whole-repo downloads, use:
-  `python scripts/download_hf_repo_chunked_to_gcs.py ...`
+    - By default, PyTorch weights (``.bin``/``.safetensors``/``.pt``) are
+      excluded.
+    - This script is size-based, so it is not a good fit for
+      directory-style weights like Zarr (many small chunk files). For
+      Zarr/whole-repo downloads, use
+      ``python scripts/download_hf_repo_chunked_to_gcs.py ...``.
 """
 
 from __future__ import annotations
@@ -74,11 +81,19 @@ PYTORCH_WEIGHT_GLOBS = (
 
 @dataclass(frozen=True)
 class RepoFile:
-    """Metadata for a single file in a HuggingFace repository.
+    """Lightweight ``(name, size)`` record describing one file in a HF repo.
+
+    Returned in lists from :func:`HfApi.list_repo_files`-derived
+    helpers and consumed by the include/exclude/size filters in
+    :func:`main`. Frozen so instances can be hashed for dedupe in
+    set membership checks.
 
     Attributes:
-        name: Relative filename within the repository.
-        size: File size in bytes, or ``None`` if unknown.
+        name (str): Path of the file relative to the repo root
+            (e.g. ``"model.safetensors"`` or ``"weights/part-0.gguf"``).
+        size (int | None): File size in bytes, or ``None`` when the
+            HF API did not report a size for this entry. Compared
+            against ``min_size_mb * 1024 * 1024`` during filtering.
     """
 
     name: str
@@ -87,10 +102,52 @@ class RepoFile:
 
 @dataclass
 class LargeWeightsArgs:
-    """Command-line arguments for downloading large HF weight files.
+    """CLI argument schema for the large-weight downloader.
 
-    Controls repository selection (individual repos, files, or HF collections),
-    file filtering (size threshold, glob patterns), and download behavior.
+    Lets the caller specify a list of source repositories (directly,
+    via a file, or by expanding HF collection URLs), a destination
+    output root, file filters (size threshold + include/exclude
+    globs), and runtime safety flags. Parsed by
+    :class:`eformer.aparser.DataClassArgumentParser`.
+
+    Attributes:
+        out_root (str): Local output root directory (often a
+            GCSFuse mount). One subdirectory per repo is created
+            beneath it.
+        repo_id (str): Repeatable list-style flag — each occurrence
+            adds one HF repo id to download.
+        repos_file (str | None): Optional path to a text file with
+            one repo id per line.
+        collection (str): Repeatable list-style flag accepting
+            either an ``owner/slug`` or a Hub collection URL;
+            members are expanded into individual repo ids.
+        revision (str | None): Repo revision/branch/tag to
+            download from. ``None`` uses the default revision.
+        token (str | None): HF token; falls back to the standard
+            HF auth chain.
+        cache_dir (str | None): Override for the HF cache. Useful
+            when redirecting cache I/O off the boot disk.
+        min_size_mb (int): Lower size bound (MiB) — files smaller
+            than this are skipped unless they match an
+            ``--include`` glob.
+        include (str): Repeatable include-glob list. When set,
+            only files matching at least one include glob are
+            downloaded (size threshold still applies).
+        exclude (str): Repeatable exclude-glob list applied on top
+            of includes.
+        include_pytorch (bool): When ``False`` (default), PyTorch
+            weight extensions (``.bin``, ``.safetensors``, ``.pt``,
+            …) are excluded; ``True`` allows them.
+        match_repo (str): Repeatable substring filter on repo ids;
+            only repos containing one of these substrings are
+            processed.
+        dry_run (bool): Print the plan without performing any
+            downloads.
+        continue_on_error (bool): Keep going through remaining
+            repos when a single repo's downloads fail.
+        enable_hf_transfer (bool): Toggle the
+            ``HF_HUB_ENABLE_HF_TRANSFER`` accelerator (requires
+            ``hf_transfer`` to be installed).
     """
 
     out_root: str = field(metadata={"help": "Output root directory (e.g. /mnt/gcs/weights)."})
@@ -218,6 +275,15 @@ def _fetch_collection_repo_ids(owner: str, slug: str, *, timeout_s: int = 30) ->
 
 
 def _matches_any_glob(name: str, globs: tuple[str, ...]) -> bool:
+    """Return True when ``name`` matches at least one glob in ``globs``.
+
+    Args:
+        name: Filename to test.
+        globs: Tuple of fnmatch patterns.
+
+    Returns:
+        True if any pattern matches ``name``.
+    """
     return any(fnmatch.fnmatch(name, pattern) for pattern in globs)
 
 
@@ -229,6 +295,21 @@ def _should_keep_file(
     include_globs: tuple[str, ...],
     exclude_globs: tuple[str, ...],
 ) -> bool:
+    """Decide whether to download a single repo file.
+
+    Args:
+        filename: Repo-relative filename.
+        size: File size in bytes, or ``None`` if unknown.
+        min_size_bytes: Minimum file size required when no include glob
+            matches.
+        include_globs: Optional tuple of include patterns; when set, the
+            filename must match at least one.
+        exclude_globs: Tuple of exclude patterns; the filename must not
+            match any.
+
+    Returns:
+        True when the file should be downloaded.
+    """
     if include_globs and not _matches_any_glob(filename, include_globs):
         return False
     if exclude_globs and _matches_any_glob(filename, exclude_globs):
@@ -240,6 +321,16 @@ def _should_keep_file(
 
 
 def _repo_out_dir(out_root: Path, repo_id: str) -> Path:
+    """Compute the destination directory for a repository.
+
+    Args:
+        out_root: Configured output root.
+        repo_id: HuggingFace repo id (``owner/name`` or single segment).
+
+    Returns:
+        ``out_root/owner/name`` when ``repo_id`` contains a slash,
+        otherwise ``out_root/repo_id``.
+    """
     if "/" in repo_id:
         owner, name = repo_id.split("/", 1)
         return out_root / owner / name

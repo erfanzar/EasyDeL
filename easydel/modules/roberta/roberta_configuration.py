@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the RoBERTa model family.
+
+Defines :class:`RobertaConfig`, the EasyDeL configuration object for
+Facebook AI's RoBERTa encoder-only architecture (LayerNorm,
+absolute/learned position embeddings, GELU activation, classifier head
+hyperparameters).
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -94,6 +101,12 @@ class RobertaConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize RobertaConfig.
+
+        See the class docstring for parameter semantics. ``**kwargs`` are
+        forwarded to :class:`EasyDeLBaseConfig` for the standard EasyDeL
+        configuration plumbing (sharding, dtype, etc.).
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers

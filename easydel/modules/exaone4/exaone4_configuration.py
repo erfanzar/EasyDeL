@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the EXAONE 4.0 decoder-only LLM.
+
+Defines :class:`Exaone4Config` for LG AI Research's EXAONE 4.0. Compared to
+EXAONE 3.0 (see :mod:`easydel.modules.exaone`), 4.0 introduces an
+interleaved sliding/full attention pattern controlled by
+``sliding_window`` and ``sliding_window_pattern`` (every Nth layer is full
+attention; the rest use a fixed-size sliding window). Other knobs follow
+the standard decoder shape (RoPE, GQA, RMSNorm, gated MLP).
+"""
 
 import typing
 
@@ -106,7 +115,52 @@ class Exaone4Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize Exaone4Config."""
+        """Initialize the EXAONE 4.0 configuration.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``102400``.
+            hidden_size (int, optional): Hidden dimension. Defaults to ``4096``.
+            intermediate_size (int, optional): Feed-forward intermediate width.
+                Defaults to ``16384``.
+            num_hidden_layers (int, optional): Number of decoder layers.
+                Defaults to ``32``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``32``.
+            num_key_value_heads (int | None, optional): Key/value heads for GQA.
+                ``None`` falls back to ``num_attention_heads``. Defaults to ``None``.
+            hidden_act (str, optional): MLP activation. Defaults to ``"silu"``.
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``2048``.
+            initializer_range (float, optional): Truncated-normal weight init
+                stddev. Defaults to ``0.02``.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-5``.
+            use_cache (bool, optional): Return KV caches during forward.
+                Defaults to ``True``.
+            pad_token_id (int, optional): Padding token id. Defaults to ``1``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``0``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``2``.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to ``False``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            rope_scaling (dict | None, optional): RoPE scaling spec
+                (``{"type": "linear" | "dynamic", "factor": float}``). ``"default"``
+                / ``None`` ``type`` collapses to ``None``.
+            attention_dropout (float, optional): Attention probability dropout.
+                Defaults to ``0.0``.
+            sliding_window (int | None, optional): Sliding window size. ``None``
+                disables sliding-window layers. Defaults to ``4096``.
+            sliding_window_pattern (int, optional): Insert one full-attention
+                layer every ``sliding_window_pattern``-th position; the rest use
+                sliding attention. Defaults to ``4``.
+            layer_types (list[str] | None, optional): Explicit per-layer attention
+                types (``"sliding_attention"`` or ``"full_attention"``). Overrides
+                the pattern when provided.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+
+        Raises:
+            ValueError: If ``rope_scaling`` is malformed or ``layer_types`` is
+                inconsistent with ``num_hidden_layers``.
+        """
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -158,7 +212,18 @@ class Exaone4Config(EasyDeLBaseConfig):
         )
 
     def _rope_scaling_validation(self):
-        """Validate rope_scaling configuration."""
+        """Validate and normalize ``self.rope_scaling`` in place.
+
+        Accepts ``None`` or a dict with ``type`` / ``rope_type`` plus a
+        ``factor`` (>= 1.0). ``"default"`` types are collapsed to ``None``.
+        Sets ``self.rope_scaling`` to a normalized
+        ``{"type": ..., "factor": ...}`` dict.
+
+        Raises:
+            ValueError: If ``rope_scaling`` is not a dict, the ``type`` is not
+                one of ``{"linear", "dynamic"}``, or ``factor`` is not a float
+                ``>= 1.0``.
+        """
         if self.rope_scaling is None:
             return
 
@@ -189,7 +254,12 @@ class Exaone4Config(EasyDeLBaseConfig):
         self.rope_scaling = {"type": rope_scaling_type, "factor": rope_scaling_factor}
 
     def _validate_layer_types(self):
-        """Validate layer_types list."""
+        """Validate ``self.layer_types`` matches the model depth and known kinds.
+
+        Raises:
+            ValueError: If ``len(layer_types) != num_hidden_layers`` or any
+                entry is not in ``{"sliding_attention", "full_attention"}``.
+        """
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError(
                 f"`layer_types` must have length equal to `num_hidden_layers` ({self.num_hidden_layers}), "

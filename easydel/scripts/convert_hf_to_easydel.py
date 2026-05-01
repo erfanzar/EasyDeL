@@ -11,10 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-How to use
+"""CLI script to convert a HuggingFace checkpoint to an EasyDeL checkpoint.
 
-Convert a Hugging Face checkpoint to an EasyDeL checkpoint (recommended: sequential, no push yet):
+Exports a single ``main`` entry point plus the ``ConvertArgs`` dataclass
+that encodes all CLI flags. Two conversion strategies are supported:
+
+- ``sequential``: Streams shards through ``huggingface_to_easydel_sequential``
+  and writes a TensorStore checkpoint without ever loading the full
+  parameter tree.
+- ``from_pretrained``: Uses ``AutoEasyDeLModel*.from_pretrained`` and
+  ``model.save_pretrained``.
+
+Example invocation:
 
   python scripts/convert_hf_to_easydel.py \\
     --source lmsys/gpt-oss-120b-bf16 \\
@@ -27,21 +35,20 @@ Convert a Hugging Face checkpoint to an EasyDeL checkpoint (recommended: sequent
     --enable-hf-transfer \\
     --token $HF_TOKEN
 
-Push later by re-running with `--push-to-hub` (or omitting `--no-push-to-hub`).
+Push later by re-running with ``--push-to-hub`` (or omitting
+``--no-push-to-hub``).
 
-Sharding
+Sharding:
+    ``--sharding-axis-dims`` and ``--sharding-axis-names`` define the 6D
+    mesh as ``pp,dp,fsdp,ep,tp,sp``. Use ``-1`` to auto-infer an axis
+    from available devices. Example for a single host with auto FSDP:
+    ``--sharding-axis-dims 1,1,-1,1,1,1``.
 
-`--sharding-axis-dims` and `--sharding-axis-names` define the 6D mesh as:
-  pp,dp,fsdp,ep,tp,sp
-
-Use -1 in axis dims to auto-infer that axis from available devices.
-Example (single host; auto-choose FSDP):
-  --sharding-axis-dims 1,1,-1,1,1,1
-
-Disk usage tips
-
-- Prefer `--torch-streaming-cache temp` to avoid filling the HF cache with full shards.
-- If you do use HF cache, redirect it with `--cache-dir` (or set HF_HOME/HF_HUB_CACHE).
+Disk usage tips:
+    - Prefer ``--torch-streaming-cache temp`` to avoid filling the HF
+      cache with full shards.
+    - If you do use the HF cache, redirect it with ``--cache-dir`` (or
+      set ``HF_HOME``/``HF_HUB_CACHE``).
 """
 
 from __future__ import annotations
@@ -60,6 +67,20 @@ except ModuleNotFoundError:  # pragma: no cover
     import logging
 
     def get_logger(name: str):
+        """Stdlib :func:`logging.getLogger` fallback when ``eformer.loggings`` is unavailable.
+
+        ``eformer`` is the preferred logger source because it
+        ships richer formatting; this fallback keeps the script
+        usable in stripped-down environments (smoke tests,
+        ad-hoc deployments) where the optional dependency is
+        missing.
+
+        Args:
+            name: Logger namespace, typically the module name.
+
+        Returns:
+            logging.Logger: Standard library logger for ``name``.
+        """
         return logging.getLogger(name)
 
 
@@ -92,6 +113,18 @@ IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
 
 
 def _infer_task_from_hf_config(config) -> TaskType:
+    """Infer the EasyDeL task type from a HuggingFace config object.
+
+    Inspects ``config.architectures``, ``config.model_type`` and
+    ``config.is_encoder_decoder`` to choose the most specific
+    ``AutoEasyDeLModel*`` task.
+
+    Args:
+        config: Loaded HuggingFace ``PretrainedConfig`` instance.
+
+    Returns:
+        ``TaskType`` literal that matches the config's architecture.
+    """
     architectures = [str(a) for a in (getattr(config, "architectures", None) or [])]
     joined = " ".join(architectures).lower()
     model_type = str(getattr(config, "model_type", "") or "").lower()
@@ -204,10 +237,67 @@ TorchStreamingCache = Literal["hf_cache", "temp"]
 
 @dataclass
 class ConvertArgs:
-    """Command-line arguments for HuggingFace-to-EasyDeL model conversion.
+    """Argument schema for the HuggingFace-to-EasyDeL conversion CLI.
 
-    Configures source/destination, model task, conversion strategy (sequential
-    vs. from_pretrained), sharding mesh, dtype, and HuggingFace Hub options.
+    Parsed by :class:`eformer.aparser.DataClassArgumentParser`; every
+    field's ``metadata["help"]`` is what shows up in ``--help``. The
+    fields cluster into source/destination control, conversion
+    strategy, shard streaming behaviour, dtype, mesh layout, and
+    Hub-side options.
+
+    Attributes:
+        source (str): HuggingFace Hub repo id (e.g.
+            ``"meta-llama/Llama-3.1-8B"``) or local path to a
+            checkpoint directory. Required.
+        out (str): Output directory written by the converter. May
+            point at a GCSFuse-mounted bucket. Required.
+        repo_id (str | None): Optional Hub repo id under which to
+            publish the converted checkpoint when
+            :attr:`push_to_hub` is on.
+        push_to_hub (bool): When ``True`` and :attr:`repo_id` is
+            set, uploads the converted folder to the Hub at the
+            end of the run.
+        task (TaskType): Selects which ``AutoEasyDeLModel*`` class
+            handles the conversion. ``"auto"`` (default) consults
+            :func:`_infer_task_from_hf_config`.
+        convert_mode (ConvertMode): ``"sequential"`` streams shards
+            without ever materialising the full param tree;
+            ``"from_pretrained"`` performs a normal load then
+            ``save_pretrained``.
+        torch_streaming_cache (TorchStreamingCache): For sequential
+            mode, ``"hf_cache"`` keeps shards in the regular HF
+            cache; ``"temp"`` downloads one shard at a time to a
+            temp directory and deletes it after consumption.
+        torch_streaming_tmp_dir (str | None): Parent directory for
+            the temp shard cache; only used when
+            ``torch_streaming_cache == "temp"``.
+        tensorstore_chunk_bytes (int): Soft cap on TensorStore
+            chunk size in bytes. Defaults to 2 GiB.
+        dtype (str): Compute dtype string passed to
+            :func:`_parse_dtype` (``bf16``/``fp16``/``fp32``).
+        param_dtype (str): Parameter dtype string passed to
+            :func:`_parse_dtype`.
+        sharding_axis_dims (str): Comma-separated 6-tuple
+            ``pp,dp,fsdp,ep,tp,sp`` parsed by
+            :func:`_parse_int_list`. Use ``-1`` to auto-infer
+            from device count.
+        sharding_axis_names (str): Comma-separated 6-tuple of
+            axis names (default ``"pp,dp,fsdp,ep,tp,sp"``).
+        auto_shard_model (bool): Toggle automatic sharding (only
+            consumed by ``from_pretrained`` mode).
+        cache_dir (str | None): HF cache directory override; useful
+            when redirecting the cache to a GCSFuse mount.
+        revision (str | None): HF revision/branch/tag/commit to load
+            from. ``None`` uses the default revision.
+        token (str | None): HF token; falls back to ``HF_TOKEN`` env
+            or ``huggingface-cli login`` credentials.
+        local_files_only (bool): Disable Hub downloads entirely.
+        force_download (bool): Force re-download even when files
+            are already cached.
+        trust_remote_code (bool): Allow loading custom code from
+            the source repo (required for some architectures).
+        enable_hf_transfer (bool): Set ``HF_HUB_ENABLE_HF_TRANSFER``
+            and import ``hf_transfer`` for accelerated downloads.
     """
 
     source: str = field(metadata={"help": "HF repo id (e.g. meta-llama/Llama-3.1-8B) or local path"})
@@ -386,6 +476,17 @@ def main(argv: list[str] | None = None) -> None:
         from easydel.infra.base_module import EasyDeLBaseModule
 
         class Base(EasyDeLBaseModule):
+            """Inline subclass that pins ``_model_task`` to the task chosen at runtime.
+
+            ``EasyDeLBaseModule.huggingface_to_easydel_sequential``
+            dispatches on the class-level ``_model_task`` to pick
+            the right Auto-class internally; we don't need a real
+            module instance here, just a class with the right
+            ``_model_task`` attribute, so we synthesise one on the
+            fly. Keeps the script short while giving the sequential
+            converter what it needs.
+            """
+
             _model_task = model_cls.model_task
 
         Base.huggingface_to_easydel_sequential(

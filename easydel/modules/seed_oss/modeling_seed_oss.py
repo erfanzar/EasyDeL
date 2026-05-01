@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Seed-OSS model implementation for EasyDeL.
+
+This module implements ByteDance's Seed-OSS dense decoder-only
+language model. Architectural traits closely follow the modern
+GQA-RoPE-SwiGLU template:
+
+- RMSNorm normalization with pre-norm placement.
+- SwiGLU MLP (``gate``/``up``/``down`` projections).
+- Grouped-query attention with full RoPE.
+- Optional sliding-window attention configured per layer through
+  ``layer_types``.
+
+Exposes :class:`SeedOssModel` (transformer trunk) and the task wrapper
+:class:`SeedOssForCausalLM`.
+"""
+
 from __future__ import annotations
 
 from functools import partial
@@ -536,6 +552,12 @@ class SeedOssModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(layer, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``layer`` on the current
+            hidden states, optionally accumulates per-layer hidden states
+            / attention weights, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

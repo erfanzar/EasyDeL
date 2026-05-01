@@ -32,7 +32,7 @@ class TestGLM4Moe:
             vocab_size=151552,
             hidden_size=128,
             intermediate_size=256,
-            num_hidden_layers=2,
+            num_hidden_layers=small_model_config["num_hidden_layers"],
             num_attention_heads=8,
             partial_rotary_factor=0.5,
             num_key_value_heads=4,

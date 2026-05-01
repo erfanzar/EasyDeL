@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Re-exports of typed config dataclass helpers.
+
+Thin shim that surfaces ``ConfigDataclass`` and ``typed_config_dataclass``
+from :mod:`easydel.typings` under the ``easydel.infra`` namespace so that
+downstream modules can build typed configuration containers without importing
+the deeper typing helpers directly.
+
+Exports:
+    ConfigDataclass: Generic typed config dataclass base.
+    typed_config_dataclass: Decorator that turns a class into a typed config
+        dataclass with automatic field validation and ``TypedDict`` mirrors.
+"""
+
 from easydel.typings import ConfigDataclass, typed_config_dataclass
 
 __all__ = ("ConfigDataclass", "typed_config_dataclass")

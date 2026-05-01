@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Group Sequence Policy Optimization (GSPO) trainer.
+
+Thin subclass of :class:`GRPOTrainer` that enforces a
+:class:`GSPOConfig` argument and otherwise delegates the entire
+generation/scoring/loss pipeline to GRPO.  The defaults baked into
+:class:`GSPOConfig` flip the importance ratio to sequence level.
+"""
 
 from __future__ import annotations
 

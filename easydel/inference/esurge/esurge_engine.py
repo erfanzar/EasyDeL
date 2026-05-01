@@ -442,7 +442,17 @@ class eSurge(
         tokenizer: PreTrainedTokenizerBase | None,
         model_type: str | None,
     ) -> ToolParserName | None:
-        """Infer the tool parser from tokenizer/template hints and model type."""
+        """Infer the tool parser from tokenizer/template hints and model type.
+
+        Args:
+            tokenizer (PreTrainedTokenizerBase | None): Tokenizer whose chat
+                template and special tokens may indicate a tool-call format.
+            model_type (str | None): Model architecture identifier used as a
+                fallback hint (e.g. ``"llama"``, ``"qwen2"``).
+
+        Returns:
+            The detected :class:`ToolParserName` or ``None`` if nothing matched.
+        """
 
         from easydel.inference.tools.auto_detect import detect_tool_parser
 
@@ -455,7 +465,19 @@ class eSurge(
         tokenizer: PreTrainedTokenizerBase | None,
         model_type: str | None,
     ) -> ReasoningParserName | None:
-        """Infer the reasoning parser from tokenizer/template hints and model type."""
+        """Infer the reasoning parser from tokenizer/template hints and model type.
+
+        Args:
+            tokenizer (PreTrainedTokenizerBase | None): Tokenizer whose chat
+                template and special tokens may signal a reasoning format
+                (``<think>`` tags, etc.).
+            model_type (str | None): Model architecture identifier used as a
+                fallback hint.
+
+        Returns:
+            The detected :class:`ReasoningParserName` or ``None`` if nothing
+            matched.
+        """
 
         from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
 
@@ -479,25 +501,172 @@ class eSurge(
     ):
         """Initialize the eSurge engine.
 
+        The engine accepts seven sectioned configs (each a ``TypedDict``-backed
+        ``ConfigDict`` from :mod:`easydel.inference.esurge.config`). Each config
+        argument may be passed as the typed object, a plain mapping with the
+        same field names, or ``None`` (in which case all defaults are used).
+
         Args:
-            model: Model id/path to load, or an already loaded EasyDeL model.
-            processor: Unified text/multimodal processor. Can be a tokenizer or
-                HF processor. When omitted for a string model, it is loaded from
-                the model id/path.
-            tokenizer: Deprecated alias/fallback for `processor`.
-            loading_kwargs: Optional pretrained-loader kwargs used only when
-                `model` is a string model id/path.
-            runtime: Runtime and execution config.
-            cache: KV-cache config.
-            context: Context-window handling config.
-            workers: Tokenizer/detokenizer worker config.
-            parsing: Tool/reasoning parser config.
-            vision: Multimodal config.
-            distributed: Distributed serving config.
+            model (str | EasyDeLBaseModule): Model id/path to load, or an
+                already-loaded EasyDeL module.
+            processor (Any | None): Unified text/multimodal processor. May be a
+                tokenizer or an HF processor. When omitted for a string ``model``,
+                it is auto-loaded from the same id/path.
+            tokenizer (str | PreTrainedTokenizerBase | None): Deprecated alias /
+                fallback for ``processor``. Used only if ``processor`` cannot
+                supply a tokenizer.
+            loading_kwargs (PreTrainedLoading | Mapping[str, Any] | None):
+                Optional pretrained-loader kwargs forwarded to
+                ``AutoEasyDeLModelForCausalLM.from_pretrained`` when ``model`` is
+                a string id/path.
+            runtime (eSurgeRuntimeConfig | Mapping[str, Any] | None): Runtime
+                and execution config. Fields (see :class:`eSurgeRuntimeConfig`):
+
+                - ``esurge_name`` (str | None): Optional human-readable engine name.
+                - ``pipeline_inference`` (Literal["auto", "on", "off"]): Whether
+                  to enable pipeline-parallel inference. ``"auto"`` decides from
+                  the mesh.
+                - ``kernel_tile_policy`` (KernelTilePolicy): GDN/Pallas kernel
+                  tile policy.
+                - ``max_model_len`` (int): Maximum sequence length (prompt + new).
+                - ``min_input_pad`` (int): Minimum padded input length per step.
+                - ``min_token_pad`` (int | None): Minimum padded total token count.
+                - ``max_num_seqs`` (int): Maximum number of concurrent sequences.
+                - ``max_num_seq_buckets`` (list[int] | tuple[int, ...] | None):
+                  Optional bucket sizes for batch padding.
+                - ``async_scheduling`` (bool): Enable async scheduler thread.
+                - ``max_num_batched_tokens`` (int | None | _Empty): Per-step
+                  token budget. ``NOT_GIVEN`` triggers backend-specific defaults.
+                - ``use_aot_forward`` (bool): Compile the forward pass ahead-of-time.
+                - ``bind_graphstate_for_aot`` (bool): Bind graph state into the
+                  AOT-compiled callable.
+                - ``compile_runner`` (bool): Pre-compile runner buckets at startup.
+                - ``runner_verbose`` (bool): Verbose runner logging.
+                - ``overlap_execution`` (bool): Overlap host/device work across
+                  steps. Mutually exclusive with ``distributed_mode=True``.
+                - ``sampler_metrics`` (bool): Emit per-step sampler metrics.
+                - ``long_prefill_token_threshold`` (int | None): Threshold for
+                  splitting long prefills.
+                - ``enable_window_aware_runtime_cap`` (bool): Cap total tokens by
+                  attention sliding window.
+                - ``mpmd_scheduler`` (MpMdSchedulers | None): Optional MPMD scheduler.
+
+                Consumed via ``Unpack[eSurgeRuntimeConfig]`` in
+                :meth:`eSurgeRuntimeConfig.from_dict`.
+            cache (eSurgeCacheRuntimeConfig | Mapping[str, Any] | None):
+                KV-cache config. Fields (see :class:`eSurgeCacheRuntimeConfig`):
+
+                - ``hbm_utilization`` (float): Fraction of HBM allocated to the
+                  KV cache, in ``(0, 1]``.
+                - ``page_size`` (int): KV-cache page size in tokens.
+                - ``enable_prefix_caching`` (bool): Enable prefix-caching reuse.
+                - ``max_cache_tokens`` (int | None): Optional hard cap on total
+                  cached tokens.
+                - ``cache_capacity_margin`` (float): Safety margin in ``(0, 1]``.
+                - ``data_parallelism_axis`` (str): Mesh axis used for KV-page DP.
+                - ``destroy_pages_on_pause`` (bool): Free pages on engine pause.
+
+                Consumed via ``Unpack[eSurgeCacheRuntimeConfig]``.
+            context (eSurgeContextConfig | Mapping[str, Any] | None):
+                Context-window handling config. Fields
+                (see :class:`eSurgeContextConfig`):
+
+                - ``reserve_tokens`` (int | None): Tokens reserved for generation;
+                  defaults to ``max_num_seqs`` when ``None``.
+                - ``auto_truncate_prompt`` (bool): Truncate prompts that exceed
+                  the limit.
+                - ``auto_cap_new_tokens`` (bool): Cap ``max_new_tokens`` to fit
+                  the remaining context window.
+                - ``strict_context`` (bool): Raise instead of truncating when
+                  context overflows.
+                - ``truncate_mode`` (Literal["left", "right", "middle"]): Strategy
+                  for prompt truncation.
+                - ``prefer_preserve_prompt`` (bool): Prefer cutting generation
+                  budget over the prompt.
+                - ``decode_truncated_prompt`` (bool): Re-decode truncated prompt
+                  text for accurate echoing.
+
+                Consumed via ``Unpack[eSurgeContextConfig]``.
+            workers (eSurgeWorkerConfig | Mapping[str, Any] | None):
+                Tokenizer/detokenizer worker config. Fields
+                (see :class:`eSurgeWorkerConfig`):
+
+                - ``detokenizer_max_states`` (int): Max concurrent detokenizer
+                  streaming states.
+                - ``tokenizer_endpoint`` (str | None): Out-of-process tokenizer
+                  endpoint URL.
+                - ``detokenizer_endpoint`` (str | None): Out-of-process
+                  detokenizer endpoint URL.
+                - ``worker_startup_timeout`` (float | None): Startup timeout, secs.
+                - ``max_request_outputs`` (int | None): Cap of retained finished
+                  outputs.
+                - ``idle_reset_seconds`` (float | None): Auto-reset cache after
+                  N idle seconds; ``None`` disables.
+                - ``idle_reset_min_interval`` (float): Minimum spacing (secs)
+                  between idle resets.
+
+                Consumed via ``Unpack[eSurgeWorkerConfig]``.
+            parsing (eSurgeParsingConfig | Mapping[str, Any] | None):
+                Tool/reasoning/sampling parser config. Fields
+                (see :class:`eSurgeParsingConfig`):
+
+                - ``sampling_params_callback`` (Callable | None): Optional hook
+                  to mutate ``SamplingParams`` per request.
+                - ``extra_eos_token_ids`` (list[int] | None): Extra EOS ids
+                  appended to the tokenizer's defaults.
+                - ``extra_stops`` (str | list[str] | None): Extra stop strings.
+                - ``ignore_stop_strings_in_reasoning`` (bool): Suppress stop
+                  strings inside reasoning blocks.
+                - ``silent_mode`` (bool): Silence info-level logging.
+                - ``tool_parser`` (Any | None): Tool parser name; ``None``
+                  triggers auto-detection.
+                - ``reasoning_parser`` (Any | None): Reasoning parser name;
+                  ``None`` triggers auto-detection.
+
+                Consumed via ``Unpack[eSurgeParsingConfig]``.
+            vision (eSurgeVisionConfig | Mapping[str, Any] | None):
+                Multimodal/vision config. Fields
+                (see :class:`eSurgeVisionConfig`):
+
+                - ``resolution_buckets`` (list[tuple[int, int]] | None): Discrete
+                  vision resolutions for caching/precompilation.
+                - ``vision_cache_capacity_mb`` (int): Vision encoder cache size.
+
+                Consumed via ``Unpack[eSurgeVisionConfig]``.
+            distributed (eSurgeDistributedConfig | Mapping[str, Any] | None):
+                Distributed serving config. Fields
+                (see :class:`eSurgeDistributedConfig`):
+
+                - ``distributed_mode`` (bool): Enable multi-host control plane.
+                - ``distributed_role`` (Literal["auto", "leader", "worker"]):
+                  Role for this process; ``"auto"`` resolves from rank.
+                - ``distributed_service_name`` (str | None): DNS / discovery
+                  service name.
+                - ``distributed_world_size`` (int | None): Total ranks; required
+                  when ``distributed_mode=True``.
+                - ``distributed_rank`` (int | None): Rank for this process;
+                  defaults to ``jax.process_index()`` when ``None``.
+                - ``distributed_control_port`` (int): Control-plane TCP port.
+                - ``distributed_control_bind_host`` (str): Control-plane bind host.
+                - ``distributed_advertise_addr`` (str | None): External address
+                  advertised to peers.
+                - ``distributed_auth_token`` (str | None): Shared auth token;
+                  required when ``distributed_mode=True``.
+                - ``distributed_step_timeout_s`` (float): Per-step RPC timeout.
+                - ``distributed_connect_timeout_s`` (float): Initial connect
+                  timeout.
+                - ``distributed_verify_sampling_digest`` (bool): Verify per-step
+                  sampling digests across ranks.
+
+                Consumed via ``Unpack[eSurgeDistributedConfig]``.
 
         Raises:
-            ValueError: If processor/tokenizer cannot be inferred, or if
-                configuration is invalid.
+            ValueError: If processor/tokenizer cannot be inferred, if a
+                ``runtime``/``cache``/``distributed`` field violates an invariant
+                (positive numbers, valid mode strings), if ``max_model_len <=
+                reserve_tokens``, or if ``distributed_mode=True`` but
+                ``distributed_auth_token`` / ``distributed_world_size`` are
+                missing or ``overlap_execution=True`` is also set.
         """
         from easydel.infra import EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
@@ -1122,17 +1291,36 @@ class eSurge(
         eSurge's KV-page parallelism uses the dedicated ``ATTN_DP`` semantic
         axis registered during engine setup. Rewriting the model's standard
         data-parallel axis here can alias DP with EP and break MoE shard maps.
+
+        Args:
+            model (EasyDeLBaseModule): Loaded model whose partition axes are
+                intentionally left untouched. Argument is dropped after the
+                no-op to keep the call site uniform with subclass overrides.
         """
         del model
 
     def _distributed_execute_step(self, scheduler_output):
-        """Execute a single scheduler step on worker ranks via control-plane RPC."""
+        """Execute a single scheduler step on worker ranks via control-plane RPC.
+
+        Args:
+            scheduler_output: Scheduler step payload to forward to
+                :meth:`runner.execute_model`. Held under the engine's scheduler
+                lock for the duration of the call.
+
+        Returns:
+            The runner's per-step model output (sampled tokens, etc.).
+        """
 
         with self._scheduler_lock:
             return self.runner.execute_model(scheduler_output)
 
     def _instantiate_reasoning_parser_for_metadata(self):
-        """Build a short-lived reasoning parser instance for token metadata lookups."""
+        """Build a short-lived reasoning parser instance for token metadata lookups.
+
+        Returns:
+            A reasoning-parser instance, or ``None`` if no parser class is
+            registered, the tokenizer is missing, or instantiation raises.
+        """
         if self._reasoning_parser_class is None or self.tokenizer is None:
             return None
         try:
@@ -1141,12 +1329,28 @@ class eSurge(
             return None
 
     def _resolve_reasoning_boundary_token(self, attr_name: str) -> str | None:
-        """Resolve a reasoning boundary token from parser metadata when available."""
+        """Resolve a reasoning boundary token from parser metadata when available.
+
+        Args:
+            attr_name (str): Attribute name on the parser to read (e.g.
+                ``"start_token"`` or ``"end_token"``).
+
+        Returns:
+            The token string if present and non-empty, otherwise ``None``.
+        """
         parser = self._instantiate_reasoning_parser_for_metadata()
         return self._find_str_attr(parser, attr_name)
 
     def _find_str_attr(self, parser, attr_name: str) -> str | None:
-        """Search parser, its delegate, and the parser class for a non-empty string attribute."""
+        """Search parser, its delegate, and the parser class for a non-empty string attribute.
+
+        Args:
+            parser: Reasoning-parser instance to inspect first. May be ``None``.
+            attr_name (str): Attribute name to look up on each candidate.
+
+        Returns:
+            The first non-empty string found, or ``None``.
+        """
         candidates = (parser, getattr(parser, "_delegate", None), self._reasoning_parser_class)
         for candidate in candidates:
             token = getattr(candidate, attr_name, None)
@@ -1155,7 +1359,18 @@ class eSurge(
         return None
 
     def _resolve_reasoning_boundary_token_id(self, attr_name: str, token_attr_name: str) -> int | None:
-        """Resolve a reasoning boundary token ID from parser metadata or tokenizer vocab."""
+        """Resolve a reasoning boundary token ID from parser metadata or tokenizer vocab.
+
+        Args:
+            attr_name (str): Attribute name holding a token id on the parser
+                (e.g. ``"_start_token_id"``).
+            token_attr_name (str): Attribute name holding the corresponding
+                string token (e.g. ``"start_token"``); used as a fallback to
+                look up the id via the tokenizer's vocabulary.
+
+        Returns:
+            The token id as ``int``, or ``None`` if it cannot be resolved.
+        """
         parser = self._instantiate_reasoning_parser_for_metadata()
         candidates = (parser, getattr(parser, "_delegate", None))
         for candidate in candidates:

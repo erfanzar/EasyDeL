@@ -47,7 +47,7 @@ class TestMistral3:
         vision_config = ed.PixtralVisionConfig(
             hidden_size=128,
             intermediate_size=256,
-            num_hidden_layers=2,
+            num_hidden_layers=small_model_config["num_hidden_layers"],
             num_attention_heads=4,
             image_size=224,
             patch_size=14,

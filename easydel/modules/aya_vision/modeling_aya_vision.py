@@ -11,6 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Spectrax implementation of the Aya Vision multimodal model.
+
+Aya Vision pairs a SigLIP vision tower with a text decoder (Cohere2 by
+default) through a small multi-modal projector. The projector applies
+pixel-shuffle downsampling, layer normalization, and a gated SiLU
+projection, then splices the resulting tokens into the text embedding
+stream at positions equal to ``config.image_token_index``.
+
+Exports:
+
+- :class:`AyaVisionCausalLMOutputWithPast` — output dataclass with optional
+  ``image_hidden_states``.
+- :class:`AyaVisionMultiModalProjector` — pixel-shuffle + GLU projector.
+- :class:`AyaVisionModel` — base ``BASE_VISION``-registered VLM (no LM head).
+- :class:`AyaVisionForConditionalGeneration` — ``IMAGE_TEXT_TO_TEXT``
+  registration with the LM head used for autoregressive generation.
+"""
 
 import jax
 import jax.numpy as jnp

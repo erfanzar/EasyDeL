@@ -61,6 +61,12 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             self._delegate = IdentityReasoningParser(tokenizer)
 
     def _sync_delegate_state(self) -> None:
+        """Mirror compatibility flags from this wrapper onto the delegate.
+
+        ``assume_reasoning`` may be toggled on the wrapper by callers that
+        want to force prompt-gated reasoning; this helper keeps the
+        delegate observable to such overrides.
+        """
         # Keep compatibility with manual overrides on wrapper instances.
         self._delegate.assume_reasoning = self.assume_reasoning
 

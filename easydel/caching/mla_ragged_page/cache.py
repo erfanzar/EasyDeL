@@ -396,6 +396,11 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         return self.flattened_kv_pages()
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing layer index and KV page shape.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         return (
             f"{self.__class__.__name__}(layer_index={self.layer_index}, "
             f"kv_shape={getattr(self.kv_pages, 'shape', None)})"

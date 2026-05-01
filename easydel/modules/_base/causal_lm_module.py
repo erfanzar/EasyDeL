@@ -74,6 +74,7 @@ from easydel.caching import (
     TransformerMetadata,
 )
 from easydel.infra.modeling_outputs import CausalLMOutput, MoeCausalLMOutput
+from easydel.infra.sharding import is_mpmd_mesh
 from easydel.infra.utils import auto_remat as auto_remat
 from easydel.layers import ColumnParallelLinear
 
@@ -590,7 +591,32 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         return lm_head(hidden_states, w=w)
 
     def prepare_lm_head_inputs(self, hidden_states: Array) -> Array:
-        """Apply the shared pre-LM-head hidden-state transform."""
+        """Apply the shared pre-LM-head hidden-state transform.
+
+        Resolves the configured ``HiddenStateSharding`` partitioning so the
+        hidden states arrive at the LM head with the correct sharding for
+        tensor-parallel vocab projection. Subclasses may override to insert
+        additional pre-projection ops (e.g., final norm) before the head.
+
+        Args:
+            hidden_states: Hidden states with shape
+                ``(batch_size, sequence_length, hidden_size)``.
+
+        Returns:
+            Array: ``hidden_states`` with logical sharding applied; same shape
+            as the input.
+        """
+        mesh = getattr(self.config, "_hidden_mesh", None)
+        if mesh is None:
+            mesh = getattr(self.config, "mesh", None)
+        axis_names = tuple(getattr(self.config, "sharding_axis_names", ()))
+        axis_dims = tuple(getattr(self.config, "sharding_axis_dims", ()))
+        config_has_pp = False
+        if "pp" in axis_names:
+            pp_index = axis_names.index("pp")
+            config_has_pp = pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
+        if is_mpmd_mesh(mesh) or int(getattr(mesh, "shape", {}).get("pp", 1)) > 1 or config_has_pp:
+            return hidden_states
         return apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -598,7 +624,21 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def compute_lm_logits(self, hidden_states: Array) -> Array:
-        """Project hidden states to logits using the shared LM-head path."""
+        """Project hidden states to logits using the shared LM-head path.
+
+        Thin override that delegates to
+        :meth:`BaseTaskModule.compute_lm_logits`, which handles optional
+        token-chunked projection (``config.lmhead_chunksize``) and applies
+        :meth:`apply_logit_cap` when configured.
+
+        Args:
+            hidden_states: Hidden states with shape
+                ``(batch_size, sequence_length, hidden_size)``.
+
+        Returns:
+            Array: Logits with shape
+            ``(batch_size, sequence_length, vocab_size)``.
+        """
 
         return super().compute_lm_logits(hidden_states)
 

@@ -26,7 +26,6 @@ Available Components:
 Example:
     >>> from easydel.layers.embeddings import Embed
     >>> import spectrax as spx
-from spectrax import nn
     >>> import jax.numpy as jnp
     >>>
     >>> # Create embedding layer with 32K vocabulary and 512-dim embeddings

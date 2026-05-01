@@ -269,6 +269,13 @@ class Gemma4ToolParser(ToolParser):
     tool_call_end_token = TOOL_CALL_END
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize streaming state and compile the tool-call regex.
+
+        Args:
+            tokenizer: HuggingFace tokenizer used to resolve the
+                ``<|tool_call>`` / ``<tool_call|>`` token IDs and decode
+                streaming tokens.
+        """
         super().__init__(tokenizer)
 
         self.current_tool_name_sent: bool = False
@@ -293,6 +300,20 @@ class Gemma4ToolParser(ToolParser):
         self.buffered_delta_text = ""
 
     def _buffer_delta_text(self, delta_text: str) -> str:
+        """Withhold partial tool-call markers that may span multiple deltas.
+
+        If the trailing characters of ``delta_text`` form a prefix of either
+        the start or end marker, those characters are buffered until enough
+        text arrives to disambiguate them.
+
+        Args:
+            delta_text: New text delta from the engine.
+
+        Returns:
+            The portion of the buffered text that is safe to emit. Buffered
+            characters are stored in ``self.buffered_delta_text`` for the
+            next call.
+        """
         combined = self.buffered_delta_text + delta_text
 
         if combined.endswith(TOOL_CALL_START) or combined.endswith(TOOL_CALL_END):
@@ -309,6 +330,17 @@ class Gemma4ToolParser(ToolParser):
         return combined
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        """Disable special-token stripping when tools are enabled.
+
+        Gemma4's tool-call markers are special tokens; the request must
+        keep them visible so the parser can find them.
+
+        Args:
+            request: Chat completion request to adjust.
+
+        Returns:
+            The same request, possibly with ``skip_special_tokens=False``.
+        """
         request = super().adjust_request(request)
         if request.tools and request.tool_choice != "none":
             request.skip_special_tokens = False
@@ -319,6 +351,16 @@ class Gemma4ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """Extract Gemma4 tool calls from a complete model response.
+
+        Args:
+            model_output: Full text produced by the model.
+            request: Original chat completion request.
+
+        Returns:
+            An :class:`ExtractedToolCallInformation` describing whether tools
+            were called, the parsed tool calls, and any leading content text.
+        """
         if TOOL_CALL_START not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -362,6 +404,22 @@ class Gemma4ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Stream Gemma4 tool-call deltas from incremental engine output.
+
+        Args:
+            previous_text: Cumulative output up to the previous step.
+            current_text: Cumulative output including this step.
+            delta_text: Newly produced text since ``previous_text``.
+            previous_token_ids: Token IDs corresponding to ``previous_text``.
+            current_token_ids: Token IDs corresponding to ``current_text``.
+            delta_token_ids: Token IDs corresponding to ``delta_text``.
+            request: Original chat completion request.
+
+        Returns:
+            A :class:`DeltaMessage` describing the next chunk of visible
+            content or tool-call deltas, or ``None`` when nothing should be
+            emitted in this step.
+        """
         delta_text = self._buffer_delta_text(delta_text)
 
         if TOOL_CALL_START not in current_text:
@@ -379,6 +437,21 @@ class Gemma4ToolParser(ToolParser):
         current_text: str,
         delta_text: str,
     ) -> DeltaMessage | None:
+        """Drive the streaming state machine for Gemma4 tool calls.
+
+        Counts open/close markers between ``previous_text`` and
+        ``current_text`` to decide whether the current step opens a new
+        call, continues a call's body, or closes a call.
+
+        Args:
+            previous_text: Cumulative output up to the previous step.
+            current_text: Cumulative output including the current step.
+            delta_text: Newly produced text in this step.
+
+        Returns:
+            The :class:`DeltaMessage` to forward to the client, or ``None``
+            when no client-visible event should be emitted.
+        """
         start_count = current_text.count(TOOL_CALL_START)
         end_count = current_text.count(TOOL_CALL_END)
         prev_start_count = previous_text.count(TOOL_CALL_START)
@@ -414,6 +487,17 @@ class Gemma4ToolParser(ToolParser):
         return None
 
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
+        """Return the function name and partial argument body of the active call.
+
+        Args:
+            current_text: Cumulative output text that may contain the
+                in-progress tool call.
+
+        Returns:
+            Tuple ``(func_name, args_part)`` where ``func_name`` is ``None``
+            when no usable call is detected, and ``args_part`` is the body
+            of the partial argument block (without enclosing braces).
+        """
         last_start = current_text.rfind(TOOL_CALL_START)
         if last_start == -1:
             return None, ""
@@ -438,6 +522,16 @@ class Gemma4ToolParser(ToolParser):
         return func_name, args_part
 
     def _handle_tool_call_middle(self, current_text: str) -> DeltaMessage | None:
+        """Emit the streaming delta for an in-progress tool call body.
+
+        Args:
+            current_text: Cumulative output containing the open tool call.
+
+        Returns:
+            A :class:`DeltaMessage` carrying either the function name (on
+            first sight) or an argument-string diff, or ``None`` when no
+            update is appropriate yet.
+        """
         func_name, args_part = self._extract_partial_call(current_text)
         if func_name is None:
             return None
@@ -462,6 +556,16 @@ class Gemma4ToolParser(ToolParser):
         return None
 
     def _handle_tool_call_end(self, current_text: str) -> DeltaMessage | None:
+        """Emit the trailing argument diff when a tool call closes.
+
+        Args:
+            current_text: Cumulative output containing the now-closed call.
+
+        Returns:
+            A :class:`DeltaMessage` with the final argument diff, or ``None``
+            when no diff needs to be sent (e.g. arguments already streamed
+            in full).
+        """
         if self.current_tool_id < 0 or self.current_tool_id >= len(self.prev_tool_call_arr):
             return None
 

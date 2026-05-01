@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for Falcon decoder-only LLMs.
+
+Defines :class:`FalconConfig` for TII's Falcon family. Distinguishing knobs:
+
+- ``alibi`` — switch between ALiBi (linear position biases) and RoPE.
+- ``multi_query`` — use multi-query attention (one shared KV head).
+- ``parallel_attn`` — compute attention and MLP in parallel rather than
+  sequentially.
+- ``new_decoder_architecture`` + ``num_ln_in_parallel_attn`` — opt into the
+  refined decoder layout used by larger Falcon checkpoints (separate ``ln_attn``
+  / ``ln_mlp`` for parallel paths).
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -132,6 +144,50 @@ class FalconConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize a :class:`FalconConfig`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``65024``.
+            hidden_size (int, optional): Hidden dimension. Defaults to ``4544``.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to ``32``.
+            num_attention_heads (int, optional): Attention heads per layer. Defaults to ``71``.
+            num_ln_in_parallel_attn (int | None, optional): Number of LayerNorms in the
+                parallel-attention path (``2`` enables the dual ``ln_attn``/``ln_mlp``
+                layout). Defaults to ``None``.
+            layer_norm_epsilon (float, optional): LayerNorm epsilon. Defaults to ``1e-5``.
+            initializer_range (float, optional): Truncated-normal init stddev.
+                Defaults to ``0.02``.
+            use_cache (bool, optional): Return KV caches during forward. Defaults to ``True``.
+            hidden_dropout (float, optional): Residual dropout probability. Defaults to ``0.0``.
+            attention_dropout (float, optional): Attention probability dropout. Defaults to ``0.0``.
+            num_kv_heads (int | None, optional): Number of KV heads. ``None`` defaults to
+                ``num_attention_heads`` (effectively MHA when ``multi_query=False``).
+            alibi (bool, optional): Use ALiBi instead of RoPE. Defaults to ``False``.
+            new_decoder_architecture (bool, optional): Enable the refined decoder layout
+                used by larger Falcon checkpoints. Defaults to ``False``.
+            multi_query (bool, optional): Use multi-query attention (single shared KV head
+                across all query heads). Defaults to ``True``.
+            parallel_attn (bool, optional): Compute attention and MLP in parallel rather
+                than sequentially. Defaults to ``True``.
+            bias (bool, optional): Whether linear layers use bias. Defaults to ``False``.
+            max_position_embeddings (int, optional): Maximum sequence length. Defaults to ``2048``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            rope_scaling (dict | None, optional): RoPE scaling spec. Defaults to ``None``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``11``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``11``.
+            ffn_hidden_size (int | None, optional): FFN intermediate width. ``None`` ->
+                ``4 * hidden_size``.
+            ff_factor (int | None, optional): FFN width multiplier (``ffn_hidden_size /
+                hidden_size``). Computed from ``ffn_hidden_size`` when ``None``.
+            activation (str, optional): MLP activation function. Defaults to ``"gelu"``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing
+                policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            layer_types (list[str] | None, optional): Per-layer attention types. ``None``
+                fills with ``"full_attention"`` for every layer.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`. Recognizes the legacy
+                ``n_embed`` alias for ``hidden_size``.
+        """
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
@@ -174,9 +230,19 @@ class FalconConfig(EasyDeLBaseConfig):
 
     @property
     def rotary(self):
+        """Whether the model uses RoPE (True) or ALiBi (False) positional encoding.
+
+        Returns:
+            bool: ``True`` when ``self.alibi`` is ``False``.
+        """
         return not self.alibi
 
     @property
     def num_key_value_heads(self):
-        """Alias for num_kv_heads to match UnifiedAttention expectations."""
+        """Alias for ``num_kv_heads`` exposed under the standard GQA name.
+
+        Returns:
+            int: Same value as :attr:`num_kv_heads`. UnifiedAttention reads
+            ``num_key_value_heads``; Falcon stores it as ``num_kv_heads``.
+        """
         return self.num_kv_heads

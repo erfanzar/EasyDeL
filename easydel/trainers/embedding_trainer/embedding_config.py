@@ -31,43 +31,50 @@ class EmbeddingConfig(TrainingArguments):
     Supports multiple contrastive learning objectives for training
     dense text embedding models:
 
-    - **InfoNCE** (default): In-batch negatives with temperature-scaled
-      cross-entropy. The standard approach used by E5, GTE, BGE.
-    - **Triplet**: Margin-based triplet loss with (anchor, positive, negative).
-    - **MNRL** (Multiple Negatives Ranking Loss): Variant of InfoNCE
-      optimized for retrieval, equivalent to InfoNCE with cosine similarity.
+    - **InfoNCE** (default): in-batch negatives with temperature-scaled
+      cross-entropy. The standard objective used by E5, GTE, BGE.
+    - **Triplet**: margin-based triplet loss on
+      ``(anchor, positive, negative)`` triples.
+    - **MNRL** (Multiple Negatives Ranking Loss): variant of InfoNCE
+      tailored to retrieval, equivalent to InfoNCE with cosine
+      similarity.
 
-    The trainer expects datasets with at minimum ``query`` and ``positive``
-    columns. For triplet loss or hard-negative training, a ``negative``
-    column can also be provided.
+    The trainer expects datasets with at minimum ``query`` /
+    ``positive`` columns; for triplet or hard-negative training a
+    ``negative`` column may also be supplied. Optionally, when
+    ``matryoshka_dims`` is set, the contrastive loss is evaluated at
+    each requested embedding dimension and averaged
+    (Matryoshka Representation Learning).
 
-    Args:
-        loss_type: Contrastive loss function to use.
-        temperature: Temperature scaling for InfoNCE/MNRL similarity logits.
-            Lower values make the distribution sharper. Standard range: 0.01-0.1.
-        margin: Margin for triplet loss. Ignored for InfoNCE/MNRL.
-        query_field: Dataset column name containing query/anchor texts.
-        positive_field: Dataset column name containing positive texts.
-        negative_field: Dataset column name containing hard negative texts.
-            If ``None``, only in-batch negatives are used (InfoNCE/MNRL).
-        max_length: Maximum sequence length for tokenization.
-        matryoshka_dims: Optional list of embedding dimensions for
-            Matryoshka Representation Learning (MRL). When set, the loss
-            is computed at each dimension and averaged. Example: ``[64, 128, 256, 768]``.
-        normalize_embeddings: Whether to L2-normalize embeddings before
-            computing similarity. Should match the model's setting.
-        pooling_strategy: Pooling strategy override. If ``None``, uses
-            the model's default.
-        dataset_num_proc: Number of processes for dataset preprocessing.
+    Construct with dict-literal kwargs:
 
-    Example:
-        >>> config = EmbeddingConfig(
-        ...     loss_type="infonce",
-        ...     temperature=0.05,
-        ...     max_length=512,
-        ...     total_batch_size=128,
-        ...     learning_rate=2e-5,
-        ... )
+    >>> cfg = EmbeddingConfig(loss_type="infonce", temperature=0.05,
+    ...                       max_length=512, total_batch_size=128)
+
+    Attributes:
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"Embedding"``).
+        loss_type: Contrastive objective. One of ``"infonce"``,
+            ``"triplet"``, ``"mnrl"``. Default ``"infonce"``.
+        temperature: Logit-scale temperature applied before the
+            softmax in InfoNCE/MNRL. Lower values produce sharper
+            distributions. Typical range ``0.01-0.1``.
+        margin: Triplet loss margin. Ignored for InfoNCE/MNRL.
+        query_field: Dataset column carrying anchor/query strings.
+        positive_field: Dataset column carrying positive strings.
+        negative_field: Optional dataset column carrying hard
+            negatives. ``None`` falls back to in-batch negatives only.
+        max_length: Maximum tokenized sequence length.
+        matryoshka_dims: Optional list of embedding sub-dimensions for
+            MRL. The loss is computed at each dimension and averaged.
+        normalize_embeddings: When ``True``, L2-normalises embeddings
+            before computing similarity (must match the model's
+            inference-time setting).
+        pooling_strategy: Override for the model's pooling strategy
+            (``"last"``, ``"mean"``, ``"first"``, ``"weighted_mean"``,
+            ``"max"``). ``None`` keeps the model default.
+        dataset_num_proc: Worker count for ``Dataset.map`` during
+            preprocessing.
     """
 
     trainer_prefix: str | None = field(

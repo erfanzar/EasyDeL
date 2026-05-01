@@ -29,16 +29,33 @@ from .states import CachedRequestState
 
 @dataclass
 class AsyncWindowResult:
-    """Host-copy payload for one runner window.
+    """One scheduler-window's worth of in-flight sampled-token state.
+
+    Built by :meth:`eSurgeRunner._execute_model_impl` whenever the runner
+    needs to defer host materialization (overlap path or async scheduling).
+    The ``sampled_token_ids`` and optional ``token_logprobs`` arrays have
+    already had ``jax.copy_to_host_async`` called on them so the device
+    transfer is in flight; the receiving thread realizes them with
+    :func:`numpy.asarray` once the lifecycle loop reaches the
+    finalize step.
 
     Attributes:
-        req_ids: Active request ids for this window, in scheduler output order.
-        row_positions: Indices into ``sampled_token_ids`` / ``token_logprobs`` that
-            correspond to each request id.
-        sampled_token_ids: Sampled token tensor with host-copy already initiated.
-        valid_mask: Whether each request should materialize a sampled token.
-        token_logprobs: Optional per-request sampler metric payload with host-copy
-            already initiated.
+        req_ids: Request ids active in this window, ordered to match the
+            row layout the runner used during execution. Aligns with
+            ``row_positions`` element-wise.
+        row_positions: Per-entry index into ``sampled_token_ids`` /
+            ``token_logprobs`` for the corresponding ``req_ids[i]``. Values
+            may be sparse (when a window contained dropped rows) so callers
+            should index by these positions rather than enumerate.
+        sampled_token_ids: Device array of sampled token ids with shape
+            ``[num_reqs]``. Host-copy is already initiated; ``np.asarray``
+            on the consumer side blocks until the transfer completes.
+        valid_mask: Per-request flag — ``False`` rows correspond to slots
+            whose sampled token must be discarded (partial prefill, padding).
+            Same length as ``req_ids``.
+        token_logprobs: Optional companion array of token logprobs (shape
+            ``[num_reqs]``) for sampler-metrics callers, with host-copy
+            already initiated. ``None`` when sampler metrics are disabled.
     """
 
     req_ids: list[str]
@@ -50,7 +67,26 @@ class AsyncWindowResult:
 
 @dataclass
 class AsyncPreResults:
-    """Stores previous iteration's sampled-token payloads for async scheduling."""
+    """Carry-across snapshot from the previous async-scheduling iteration.
+
+    Created at the end of step ``N`` (when the runner could not yet write
+    the sampled tokens back into the sequence buffer because the host copy
+    was still in flight) and consumed at the start of step ``N+1`` by
+    :meth:`eSurgeRunner._modify_prev_results`, which finalizes the sampled
+    tokens, writes them into the buffer, and replaces the placeholders that
+    :meth:`_update_placeholder` injected on step ``N``.
+
+    Attributes:
+        windows (list[AsyncWindowResult]): Per-window host-copy payloads
+            captured from the previous step. Each contains the deferred
+            sampled-token tensor plus metadata needed to map rows back to
+            requests.
+        request_seq_lens (list[tuple[int, int, CachedRequestState, int]]):
+            Per-request rendezvous tuples
+            ``(out_index, seq_row_idx, request_state, seq_len)`` so the
+            finalizer can update the buffer at the correct row and append
+            the freshly-decoded token to the request's output stream.
+    """
 
     windows: list[AsyncWindowResult]
     request_seq_lens: list[tuple[int, int, CachedRequestState, int]]

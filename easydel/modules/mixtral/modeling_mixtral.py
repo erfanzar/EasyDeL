@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mixtral Mixture-of-Experts transformer implementation.
+
+Implements Mistral AI's Mixtral architecture: a decoder-only transformer where
+the standard MLP is replaced by a sparse Mixture-of-Experts block. A per-token
+top-k router selects ``num_experts_per_tok`` experts out of ``num_local_experts``
+SwiGLU experts; an auxiliary load-balancing loss is exposed via
+``output_router_logits``. Attention layers use grouped-query attention and a
+configurable sliding-window mask.
+
+Exports:
+    - ``MixtralAttention``: standard / sliding-window attention.
+    - ``MixtralMoEMlp``, ``MixtralSparseMoeBlock``: per-expert MLP and routing block.
+    - ``MixtralDecoderLayer``: one transformer block.
+    - ``MixtralModel``: base transformer trunk.
+    - ``MixtralForCausalLM``: causal LM head wrapper with auxiliary MoE loss.
+    - ``MixtralForSequenceClassification``: classification head wrapper.
+"""
 
 import typing
 
@@ -60,11 +77,24 @@ from .mixtral_configuration import MixtralConfig as MixtralConfig
 
 
 class MixtralAttention(UnifiedAttention):
-    """Mixtral Attention module with sliding window support.
+    """Mixtral attention: GQA + sliding-window + RoPE.
 
-    Inherits from UnifiedAttention with Mixtral-specific customizations:
-    - Sliding window attention support
-    - Custom RoPE configuration
+    Mixtral inherits the default ``"standard"`` attention implementation
+    from :class:`UnifiedAttention` and only adds three twists relative to
+    LLaMA-style attention:
+
+    - **Sliding-window causal mask**: tokens can only attend to the most
+      recent ``config.sliding_window`` keys, dropping attention cost from
+      O(L²) to O(L·W) per layer. Long-range mixing comes from stacking
+      layers (each token sees a window of size ``W`` per layer, so after
+      ``L`` layers the receptive field is ``L·W``).
+    - **Grouped-query attention** with ``num_key_value_heads = 8`` (a
+      quarter of ``num_attention_heads`` in 8x7B), shrinking KV cache
+      memory by 4×.
+    - **High RoPE base** (``rope_theta = 1e6``) for long-context
+      extrapolation up to ~130k tokens.
+
+    Inherited capabilities:
     """
 
     def __init__(
@@ -100,15 +130,39 @@ class MixtralAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: MixtralConfig, dtype: jnp.dtype):
-        """Create Mixtral-specific rotary embedding layer."""
+        """Build the rotary embedding for this attention layer.
+
+        Args:
+            config (MixtralConfig): Model configuration providing ``rope_theta`` and
+                any optional ``rope_scaling`` settings.
+            dtype (jnp.dtype): Computation dtype for the rotary tables.
+
+        Returns:
+            Rotary module configured with this layer's head dimension.
+        """
         return config.get_basic_rope(dtype, self.head_dim)
 
 
 class MixtralMoEMlp(spx.Module):
-    """Mixture of Experts MLP module for Mixtral models.
+    """Batched SwiGLU expert bank used inside :class:`MixtralSparseMoeBlock`.
 
-    Implements the feedforward network used by each expert in the Sparse MoE block.
-    Uses SwiGLU activation with gated projections (w1, w3) and a down projection (w2).
+    Mixtral keeps the original LLaMA SwiGLU shape (w1 = gate, w3 = up,
+    w2 = down) but stacks ``num_local_experts`` copies along an extra
+    leading axis so all experts can be evaluated as a single grouped GEMM
+    via :class:`ColumnParallelMoELinear` / :class:`RowParallelMoELinear`.
+    Per token / per assigned expert the forward computes
+    ``y = w2(silu(w1(x)) * w3(x))``. Tokens arrive already permuted into
+    expert-major layout (the parent block does the permutation), and
+    ``group_sizes`` tells the GEMM how many tokens go to each slice.
+    Tensor parallelism shards the hidden axis; expert parallelism shards
+    the leading expert axis (the parent toggles between EP and TP via
+    ``use_expert_tensor_mode``).
+
+    Attributes:
+        w1 (ColumnParallelMoELinear): Gate projection ``hidden -> intermediate``.
+        w3 (ColumnParallelMoELinear): Up projection ``hidden -> intermediate``.
+        w2 (RowParallelMoELinear): Down projection ``intermediate -> hidden``.
+        act_fn (Callable): Per-expert activation (typically SiLU).
     """
 
     reform_param: typing.ClassVar = {
@@ -216,10 +270,34 @@ class MixtralMoEMlp(spx.Module):
 
 
 class MixtralSparseMoeBlock(BaseMoeModule):
-    """Sparse Mixture of Experts block for Mixtral models.
+    """Top-k softmax-routed sparse-MoE FFN at the heart of Mixtral.
 
-    Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
-    Uses top-k routing with load balancing to distribute tokens across experts efficiently.
+    Routing protocol (per token ``x``):
+
+    1. ``logits = router(x)`` produces a vector of length ``num_local_experts``.
+    2. Add Uniform(``-router_jitter_noise``, ``+router_jitter_noise``) noise
+       during training (only) — this is the canonical Mixtral exploration
+       trick that prevents premature expert collapse.
+    3. ``probs = softmax(logits)``; pick the top-``num_experts_per_tok``
+       experts and renormalize their weights to sum to one.
+    4. Permute tokens into expert-major layout, run :class:`MixtralMoEMlp`
+       in a single grouped GEMM, then unpermute and combine with the
+       weighted sum :math:`\\sum_e w_e \\, \\text{expert}_e(x)`.
+
+    Auxiliary load-balancing loss (Switch Transformer-style)
+    :math:`\\mathcal{L}_{aux} = N_e \\sum_i f_i p_i` is exposed via
+    ``router_logits`` so that :class:`BaseCausalLMModule` can fold it into
+    the final training loss with coefficient ``router_aux_loss_coef``.
+    Note: unlike DeepSeek-V3 / Llama-4, Mixtral has *no* shared expert —
+    every token is processed by exactly ``num_experts_per_tok`` routed
+    experts and that's it.
+
+    Attributes:
+        gate (ColumnParallelLinear): Single-layer router producing
+            ``hidden_size -> num_local_experts`` logits.
+        experts (MixtralMoEMlp): Batched SwiGLU expert bank.
+        jitter_noise (float): ``router_jitter_noise``; controls training
+            exploration noise.
     """
 
     def __init__(
@@ -303,10 +381,25 @@ class MixtralSparseMoeBlock(BaseMoeModule):
 
 
 class MixtralDecoderLayer(spx.Module):
-    """Single decoder layer for Mixtral models.
+    """One Mixtral block: pre-norm sliding-window attention + sparse-MoE FFN.
 
-    Combines multi-head attention with sliding window and Sparse MoE feedforward
-    networks, using RMS normalization and residual connections.
+    Layout (input ``x``)::
+
+        x = x + self_attn(input_layernorm(x))
+        x = x + block_sparse_moe(post_attention_layernorm(x))   # also returns router_logits
+
+    Both norms are :class:`RMSNorm` at ``rms_norm_eps``. The FFN sub-layer
+    is a :class:`MixtralSparseMoeBlock` that returns both the combined
+    expert output and the per-token router logits — the parent
+    :class:`MixtralModel` collects those logits across layers so the
+    auxiliary load-balancing loss can be computed once at the LM-head
+    level (see ``output_router_logits`` on the model forward).
+
+    Attributes:
+        self_attn (MixtralAttention): Sliding-window GQA attention.
+        block_sparse_moe (MixtralSparseMoeBlock): Top-k MoE FFN.
+        input_layernorm, post_attention_layernorm (RMSNorm): Pre-attention
+            and pre-FFN RMSNorms.
     """
 
     # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion

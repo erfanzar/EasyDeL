@@ -27,20 +27,55 @@ from ..group_relative_policy_optimization.grpo_config import GRPOConfig
 @Registry.register("trainer-arguments", "xpo")
 @dataclass
 class XPOConfig(GRPOConfig):
-    """Configuration for the XPO (Exploratory Preference Optimization) trainer.
+    """Hyperparameters for Exploratory Preference Optimization (XPO).
 
-    Extends GRPOConfig with hyperparameters required by the XPO objective,
-    which combines DPO-style preference learning with exploratory sampling.
-    The configuration controls the loss variant, KL penalty scaling, and
-    the exploratory weighting parameter alpha.
+    XPO is an online preference-learning algorithm that pairs a
+    DPO-style preference loss with an explicit *exploration* bonus.
+    For each prompt the trainer samples *two* completions from the
+    current policy and one completion from a frozen reference policy
+    (the latter acts as a stand-in for an oracle answer). A reward
+    function then ranks the two policy completions, and the
+    higher-ranked completion is used as ``chosen`` while the other is
+    used as ``rejected``. The loss is
+
+    ``L = L_DPO(beta; chosen, rejected, ref)
+          - alpha * mean(log pi_theta(ref_completion | prompt))``
+
+    where ``L_DPO`` is the standard ``"sigmoid"`` Bradley-Terry log-
+    sigmoid surrogate (or the IPO squared-loss when
+    ``loss_type="ipo"``), ``beta`` controls the KL penalty toward the
+    reference policy, and the second term -- the XPO-specific
+    exploration bonus -- pushes the policy to keep probability mass on
+    the *reference* completion. This balances exploitation (preference
+    signal) against exploration (don't collapse onto a narrow mode).
+    Both ``beta`` and ``alpha`` accept either a scalar (constant
+    schedule) or a sequence (epoch-wise schedule whose tail value is
+    reused once the schedule is exhausted).
+
+    Inherits all generation / sampling / dataset knobs from
+    :class:`GRPOConfig`; XPO fixes ``num_return_sequences`` to 1
+    because the additional reference-policy sample is generated
+    separately inside the trainer rather than via group sampling.
 
     Attributes:
-        loss_type: Choice of DPO loss function ("sigmoid" or "ipo").
-        beta: Scaling factor for the KL penalty. Can be a float or sequence for epoch-wise scheduling.
-        alpha: Weight of exploratory term encouraging probability mass on reference completions.
-            Supports epoch-wise scheduling via sequence.
-        missing_eos_penalty: Optional penalty subtracted from reward when completion lacks EOS token.
-        num_return_sequences: Number of completions to sample per prompt (XPO uses 1).
+        trainer_prefix: Prefix used when naming logs / checkpoints /
+            W&B runs. Default: ``"XPO"``.
+        loss_type: Selects the DPO surrogate. ``"sigmoid"`` (default)
+            uses the Bradley-Terry log-sigmoid loss; ``"ipo"`` uses the
+            squared-margin Identity Preference Optimization variant.
+        beta: KL-penalty weight against the reference policy. Pass a
+            scalar for a constant schedule or a sequence for an
+            epoch-wise schedule (final value is reused when the
+            schedule is exhausted).
+        alpha: Exploration-bonus weight on
+            ``-mean(log pi_theta(ref_completion | prompt))``. Default
+            is the single-element list ``[1e-5]``, which the
+            ``__post_init__`` collapses to the scalar ``1e-5``.
+            Sequence form enables epoch-wise scheduling.
+        missing_eos_penalty: Optional penalty subtracted from the
+            reward of completions that do not emit an EOS token before
+            the length cap; encourages well-formed sequences. ``None``
+            disables the penalty.
     """
 
     trainer_prefix: str | None = field(
@@ -82,6 +117,18 @@ class XPOConfig(GRPOConfig):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Normalize XPO scheduling parameters and forward to the base class.
+
+        - Forwards a deprecated ``max_sequence_length`` to the base class.
+        - Collapses single-element ``alpha`` / ``beta`` sequences to
+          scalars to keep the JIT specialization stable.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias for
+                ``max_length``; forwarded to the GRPO base class.
+            quantization_block (int | None): Optional quantization
+                block size forwarded to the base class.
+        """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if isinstance(self.alpha, collections.abc.Sequence) and len(self.alpha) == 1:
             self.alpha = self.alpha[0]

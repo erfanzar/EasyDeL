@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Contrastive Preference Optimization (CPO) trainer.
 
+CPO is a reference-free preference-learning method that combines a
+max-margin preference objective with an auxiliary supervised
+log-likelihood loss on the chosen response.  It supports several loss
+variants (sigmoid, hinge, IPO, SimPO, AlphaPO) selected through
+:class:`CPOConfig`.
+"""
 
 from __future__ import annotations
 
@@ -48,18 +55,30 @@ logger = get_logger(__name__)
 
 @Registry.register("trainer", "cpo")
 class CPOTrainer(Trainer):
-    """Contrastive Preference Optimization (CPO) trainer.
+    """Trainer for Contrastive Preference Optimization (CPO).
 
-    Implements CPO training which aligns language models using preference pairs.
-    Supports multiple loss variants including sigmoid, hinge, IPO, SimPO, and AlphaPO.
+    Implements the *reference-free* preference objective from Xu
+    et al. 2024: instead of regularising against a frozen reference
+    model (DPO style), CPO mixes a max-margin contrastive loss
+    between chosen and rejected completions with an auxiliary
+    supervised log-likelihood on the chosen completion (weighted by
+    ``cpo_alpha``). Supports the canonical sigmoid form, hinge,
+    IPO, SimPO (Meng et al. 2024), and AlphaPO probability-power
+    shaping; ``cpo_alpha == 0`` recovers the pure contrastive
+    objective.
 
-    Args:
-        arguments: CPO-specific training configuration.
-        model: Policy model to train.
-        processing_class: Tokenizer or processor.
-        train_dataset: Training dataset with prompt, chosen, and rejected fields.
-        eval_dataset: Optional evaluation dataset.
-        data_collator: Optional custom data collator.
+    See :func:`compute_cpo_loss` for the loss family and
+    :func:`training_step` for the per-step pipeline.
+
+    Attributes:
+        arguments: :class:`CPOConfig` controlling losses, lengths,
+            and the inherited ``TrainingArguments`` surface.
+        processing_class: Tokenizer/processor used for prompt and
+            completion encoding.
+        is_encoder_decoder: Cached architecture flag (auto-detected
+            when ``arguments.is_encoder_decoder is None``).
+        truncation_mode: Cached truncation policy from
+            ``arguments.truncation_mode``.
     """
 
     arguments: CPOConfig
@@ -73,6 +92,28 @@ class CPOTrainer(Trainer):
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         data_collator: DataCollatorForPreferenceTFDS | DataCollatorForPreferenceGrain | None = None,
     ):
+        """Initialize the CPO trainer.
+
+        Resolves the policy state, sets up encoder-decoder/padding
+        bookkeeping, and forwards the rest of the construction to
+        :class:`Trainer`.
+
+        Args:
+            arguments: CPO-specific training configuration.
+            model: Policy module or state.
+            processing_class: Tokenizer/processor used to encode
+                preference pairs.
+            train_dataset: Dataset of ``(prompt, chosen, rejected)``
+                triples.
+            eval_dataset: Optional evaluation dataset (single or dict).
+            data_collator: Optional custom collator; otherwise a
+                preference-pair collator is built automatically.
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`CPOConfig`.
+            ValueError: If ``processing_class`` or ``model`` is missing,
+                or if no padding token can be determined.
+        """
         if not isinstance(arguments, CPOConfig):
             raise TypeError(f"`arguments` must be a `CPOConfig`, received {type(arguments)}.")
         if processing_class is None:
@@ -170,10 +211,21 @@ class CPOTrainer(Trainer):
             return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure JIT-compiled training and evaluation functions.
+        """Build the JIT-compiled CPO training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, partials
+        the chosen/rejected concatenated forward with all
+        tokenisation knobs (encoder-decoder branch, padding values,
+        truncation, vocab chunking), compiles it through
+        :func:`compile_trainer_auxiliary` for stand-alone reference
+        scoring, and finally compiles :func:`training_step` and
+        :func:`evaluation_step` with the right input/output
+        shardings and the active MPMD pipeline schedule.
 
         Returns:
-            Configuration containing compiled step functions and mesh.
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
@@ -308,10 +360,12 @@ class CPOTrainer(Trainer):
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[()]:
+        """CPO does not require any extra positional args at training time."""
         return ()
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[()]:
+        """CPO does not require any extra positional args at evaluation time."""
         return ()
 
     def on_step_end(

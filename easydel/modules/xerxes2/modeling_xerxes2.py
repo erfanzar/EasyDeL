@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Xerxes2 model implementation for EasyDeL.
+
+This module implements the second-generation Xerxes experimental
+decoder-only language model. Architecturally it inherits the modern
+GQA + RMSNorm + SwiGLU template and adds a structured
+:class:`RopeConfig`-driven rotary position embedding pipeline for
+fine-grained control over context-length extension.
+
+Exposes :class:`Xerxes2Model` (transformer trunk) and the task wrapper
+:class:`Xerxes2ForCausalLM`.
+"""
 
 import functools
 from typing import ClassVar
@@ -942,6 +953,13 @@ class Xerxes2Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states, attention weights and
+            router logits, and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, ar, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

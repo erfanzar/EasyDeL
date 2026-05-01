@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OLMo3 (Open Language Model 3) implementation.
+
+Implements AI2's OLMo3 decoder family. Compared to OLMo2, OLMo3 adds per-layer
+sliding-window attention (commonly used for 3 out of every 4 layers, with full
+attention every 4th layer) while keeping QK normalization for stability and a
+LLaMA-like SwiGLU + RMSNorm + RoPE backbone.
+
+Exports:
+    - ``Olmo3MLP``: SwiGLU feed-forward block.
+    - ``Olmo3Attention``: per-layer sliding/full attention with QK normalization.
+    - ``Olmo3DecoderLayer``: a single transformer block.
+    - ``Olmo3Model``: base transformer trunk.
+    - ``Olmo3ForCausalLM``: causal LM head wrapper.
+    - ``Olmo3ForSequenceClassification``: classification head wrapper.
+"""
 
 import functools
 

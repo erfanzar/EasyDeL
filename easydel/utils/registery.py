@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Thread-safe class registry used by EasyDeL plugins.
+
+This module exposes :class:`Registry`, a process-global, category-based
+registry that EasyDeL uses for trainer/model/optimizer/scheduler/serve
+plug-ins. Implementations register themselves by category and name,
+optionally with metadata, and consumers look them up via :meth:`Registry.get`
+or :meth:`Registry.get_or_raise`.
+
+The registry is safe under concurrent access (an internal ``RLock`` guards
+every mutation) and supports both decorator-style and direct registration.
+"""
+
 import threading
 import typing as tp
 from collections.abc import Callable, Sequence
@@ -31,8 +43,31 @@ class RegistryError(Exception):
 
 
 class Registry:
-    """
-    Thread-safe registry for managing implementations across different categories.
+    """Process-global, category-keyed registry of pluggable EasyDeL implementations.
+
+    EasyDeL pulls trainers, model classes, optimizers, schedulers and serving
+    backends from this registry rather than referencing them directly, which
+    is what allows users to swap implementations by name (e.g. via a config
+    field). Each implementation lives under a ``(category, impl_name)`` pair
+    and may carry a free-form ``metadata`` dict for documentation/discovery.
+
+    State is held entirely in class-level attributes and protected by an
+    ``RLock`` so that concurrent registration from multiple imports does not
+    corrupt the table. Lookups (``get`` / ``get_or_raise``) take the same
+    lock for visibility but do not block each other in practice (lookups are
+    O(1)).
+
+    Class Attributes:
+        _registry: Two-level dict ``{category: {impl_name: cls}}`` that holds
+            every registered implementation. Mutated via :meth:`do_register`
+            and :meth:`unregister`.
+        _lock: Reentrant lock guarding all reads and writes to
+            ``_registry``/``_metadata`` — reentrant so that decorator stacks
+            calling each other's classmethods do not deadlock.
+        _metadata: Parallel dict of the same shape as ``_registry`` that maps
+            each registration to an arbitrary metadata dict supplied by the
+            caller of :meth:`register`/:meth:`do_register`. Empty when no
+            metadata was provided.
 
     Example:
         >>> # Direct registration
@@ -75,16 +110,37 @@ class Registry:
             >>>     pass
 
         Args:
-            category: Category to register under
-            impl_names: Name(s) to register as. If None, uses the class name
-            metadata: Optional metadata to associate with the registration
-            overwrite: Whether to allow overwriting existing registrations
+            category: Bucket under which the class is recorded — typically
+                one of ``"trainer"``, ``"model"``, ``"optimizer"``,
+                ``"scheduler"``, ``"serve"`` or any custom string. The same
+                category is later passed to :meth:`get`/:meth:`get_or_raise`.
+            impl_names: One or more lookup keys for the registered class. A
+                bare string registers a single alias; a sequence registers
+                the same class under several aliases. ``None`` defaults to
+                ``cls.__name__`` so a no-argument decorator still works.
+            metadata: Optional free-form ``dict`` retrievable later via
+                :meth:`get_metadata` — useful for short docstrings,
+                category tags, or discovery hints. Stored as-is (not deep
+                copied).
+            overwrite: When ``True`` the registration silently replaces a
+                pre-existing entry (a debug/warning is still logged); when
+                ``False`` (default) a duplicate raises :class:`RegistryError`.
 
         Returns:
-            Decorator function that registers the class
+            Callable[[type[_T]], type[_T]]: Decorator that records the
+            decorated class in the registry and returns it unmodified, so
+            normal ``class`` semantics are preserved.
         """
 
         def decorator(_cls: type[_T]) -> type[_T]:
+            """Register ``_cls`` under ``impl_names`` and return it unchanged.
+
+            Args:
+                _cls: The class being decorated.
+
+            Returns:
+                ``_cls`` unchanged, after recording it in the registry.
+            """
             names = impl_names if impl_names is not None else _cls.__name__
             return cls.do_register(category, names, _cls, metadata, overwrite)
 
@@ -103,18 +159,30 @@ class Registry:
         Register an implementation under one or more names in a category.
 
         Args:
-            category: Category to register under
-            impl_names: Name(s) to register the implementation as
-            impl_cls: Implementation class to register
-            metadata: Optional metadata to associate with the registration
-            overwrite: Whether to allow overwriting existing registrations
+            category: Bucket under which to install the entry; same set of
+                values accepted by :meth:`register`.
+            impl_names: A single string or a non-empty sequence of strings;
+                each becomes an independent alias mapping to ``impl_cls``.
+                Empty strings are rejected with ``ValueError``.
+            impl_cls: Concrete implementation class — for trainers, models,
+                optimizers, schedulers, etc. Stored verbatim and returned
+                from :meth:`get` later.
+            metadata: Optional metadata dict associated with every alias in
+                ``impl_names``. The same dict reference is shared across
+                aliases.
+            overwrite: When ``True``, replace any existing registration for
+                the same alias; when ``False`` (default), raise
+                :class:`RegistryError`.
 
         Returns:
-            The registered implementation class
+            type[_T]: ``impl_cls`` itself, returned unchanged so this method
+            can be chained from a decorator.
 
         Raises:
-            RegistryError: If registration already exists and overwrite=False
-            ValueError: If invalid arguments provided
+            RegistryError: If a target alias already exists and
+                ``overwrite`` is ``False``.
+            ValueError: If ``category``, ``impl_cls``, or any name in
+                ``impl_names`` is empty/None or has the wrong type.
         """
         if not category:
             raise ValueError("Category cannot be empty")
@@ -165,13 +233,16 @@ class Registry:
         Decorator for registering implementations.
 
         Args:
-            category: Category to register under
-            impl_names: Name(s) to register the implementation as
-            metadata: Optional metadata to associate with the registration
-            overwrite: Whether to allow overwriting existing registrations
+            category: Registry bucket (``"trainer"``, ``"model"``, …).
+            impl_names: One alias or a sequence of aliases under which the
+                decorated class will be installed.
+            metadata: Optional metadata dict stored alongside the entry and
+                surfaced via :meth:`get_metadata`.
+            overwrite: When ``True``, allow replacing an existing alias.
 
         Returns:
-            Decorator function
+            Callable[[type[_T]], type[_T]]: Decorator that installs the
+            class and returns it unchanged.
 
         Example:
             >>> @Registry.register_as("model", "gpt2")
@@ -180,6 +251,14 @@ class Registry:
         """
 
         def decorator(impl_cls: type[_T]) -> type[_T]:
+            """Register ``impl_cls`` under ``impl_names`` and return it.
+
+            Args:
+                impl_cls: The class being decorated.
+
+            Returns:
+                ``impl_cls`` unchanged.
+            """
             return cls.do_register(category, impl_names, impl_cls, metadata, overwrite)
 
         return decorator
@@ -195,15 +274,23 @@ class Registry:
         Unregister an implementation.
 
         Args:
-            category: Category to unregister from
-            impl_name: Name of implementation to unregister
-            raise_if_missing: Whether to raise error if not found
+            category: Registry bucket the alias lives under.
+            impl_name: Alias to remove. Removing the last alias from a
+                category also drops the category itself, so subsequent
+                :meth:`list_categories` calls will not include it.
+            raise_if_missing: When ``True`` (default), an unknown
+                ``category`` or ``impl_name`` raises
+                :class:`RegistryError`; when ``False`` the method silently
+                returns ``None``.
 
         Returns:
-            The unregistered implementation class, or None if not found
+            type | None: The class that was previously registered (so the
+            caller can re-register or inspect it), or ``None`` if no entry
+            existed and ``raise_if_missing`` is ``False``.
 
         Raises:
-            RegistryError: If implementation not found and raise_if_missing=True
+            RegistryError: If the category/alias is missing and
+                ``raise_if_missing`` is ``True``.
         """
         with cls._lock:
             if category not in cls._registry:
@@ -237,12 +324,15 @@ class Registry:
         Get a registered implementation.
 
         Args:
-            category: Category to get from
-            impl_name: Name of implementation to get
-            default: Default value if not found
+            category: Registry bucket to search.
+            impl_name: Alias the caller registered the class under.
+            default: Sentinel returned when the lookup fails. Defaults to
+                ``None`` so callers can use a ``is None`` check; pass a
+                placeholder class to keep typed downstream code happy.
 
         Returns:
-            The implementation class, or default if not found
+            type[_T] | None: The registered class, or ``default`` when no
+            entry matches. Lookups are O(1).
         """
         with cls._lock:
             return cls._registry.get(category, {}).get(impl_name, default)
@@ -253,14 +343,22 @@ class Registry:
         Get a registered implementation or raise error.
 
         Args:
-            category: Category to get from
-            impl_name: Name of implementation to get
+            category: Registry bucket to search.
+            impl_name: Alias to look up.
+            wakeup: When ``True`` (default), the method first imports
+                ``easydel.inference``/``infra``/``kernels``/``layers``/
+                ``modules``/``trainers`` so that any decorator-based
+                registrations sitting behind a lazy module get a chance to
+                execute. Set to ``False`` for tight inner loops where the
+                module is known to already be imported.
 
         Returns:
-            The implementation class
+            type: The registered implementation class.
 
         Raises:
-            RegistryError: If implementation not found
+            RegistryError: If no entry matches; the message lists the
+                currently registered aliases for the category to help the
+                caller spot typos.
         """
         if wakeup:
             try:
@@ -277,7 +375,15 @@ class Registry:
 
     @classmethod
     def exists(cls, category: _CategoryType, impl_name: str) -> bool:
-        """Check if an implementation exists."""
+        """Check if an implementation exists.
+
+        Args:
+            category: Category to look in.
+            impl_name: Implementation name.
+
+        Returns:
+            ``True`` if ``impl_name`` is registered in ``category``.
+        """
         with cls._lock:
             return impl_name in cls._registry.get(category, {})
 
@@ -287,25 +393,56 @@ class Registry:
         category: _CategoryType,
         impl_name: str,
     ) -> dict[str, tp.Any] | None:
-        """Get metadata for a registered implementation."""
+        """Get metadata for a registered implementation.
+
+        Args:
+            category: Category to look in.
+            impl_name: Implementation name.
+
+        Returns:
+            The metadata dict registered alongside the implementation, or
+            ``None`` when no entry exists.
+        """
         with cls._lock:
             return cls._metadata.get(category, {}).get(impl_name)
 
     @classmethod
     def list_categories(cls) -> list[_CategoryType]:
-        """List all registered categories."""
+        """List all registered categories.
+
+        Returns:
+            A snapshot list of category names currently present in the registry.
+        """
         with cls._lock:
             return list(cls._registry.keys())
 
     @classmethod
     def list_implementations(cls, category: _CategoryType) -> list[str]:
-        """List all implementations in a category."""
+        """List all implementations in a category.
+
+        Args:
+            category: Category whose entries should be listed.
+
+        Returns:
+            A snapshot list of implementation names in ``category``; empty list
+            when the category does not exist.
+        """
         with cls._lock:
             return list(cls._registry.get(category, {}).keys())
 
     @classmethod
     def get_category_registry(cls, category: _CategoryType, wakeup: bool = True) -> dict[str, type]:
-        """Get all implementations in a category."""
+        """Get all implementations in a category.
+
+        Args:
+            category: Category to retrieve.
+            wakeup: When ``True``, eagerly imports core EasyDeL packages so
+                lazy decorator registrations get a chance to run first.
+
+        Returns:
+            A shallow copy of the ``{name: implementation}`` mapping for the
+            category, or an empty dict when ``category`` is unknown.
+        """
         if wakeup:
             try:
                 from easydel import inference, infra, kernels, layers, modules, trainers  # noqa  # pyright: ignore[reportUnusedImport]
@@ -316,11 +453,19 @@ class Registry:
 
     @classmethod
     def clear(cls, category: _CategoryType | None = None) -> None:
-        """
-        Clear registry.
+        """Drop registry entries for one category, or for all of them.
+
+        Intended primarily for test fixtures and interactive sessions where
+        you want a clean slate between experiments. Production code should
+        rarely need this — registrations are normally permanent for the
+        lifetime of the process.
 
         Args:
-            category: Specific category to clear, or None to clear all
+            category: When ``None`` (default), every category is wiped along
+                with its metadata. When a string, only that bucket is
+                removed; missing categories are silently ignored so that
+                idempotent teardown doesn't have to guard against absent
+                state.
         """
         with cls._lock:
             if category is None:
@@ -344,23 +489,30 @@ class Registry:
         Create an instance of a registered implementation.
 
         Args:
-            category: Category to get from
-            impl_name: Name of implementation to instantiate
-            *args: Positional arguments for constructor
-            **kwargs: Keyword arguments for constructor
+            category: Registry bucket to search.
+            impl_name: Alias of the implementation to instantiate.
+            *args: Forwarded verbatim to the implementation's constructor.
+            **kwargs: Forwarded verbatim to the implementation's constructor.
 
         Returns:
-            Instance of the implementation
+            Any: A freshly constructed instance of the registered class.
 
         Raises:
-            RegistryError: If implementation not found
+            RegistryError: If the alias is not found (propagated from
+                :meth:`get_or_raise`).
         """
         impl_cls = cls.get_or_raise(category, impl_name)
         return impl_cls(*args, **kwargs)
 
     @classmethod
     def info(cls) -> dict[str, tp.Any]:
-        """Get information about the registry state."""
+        """Get information about the registry state.
+
+        Returns:
+            A nested dict summarizing the number of categories, total entries
+            across all categories, and a per-category list of implementation
+            names.
+        """
         with cls._lock:
             return {
                 "categories": len(cls._registry),

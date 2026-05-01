@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of OpenAI's GPT-2 decoder-only language model.
+
+GPT-2 is the canonical pre-norm decoder transformer with absolute learned
+positional embeddings, multi-head self-attention, and a GeLU-activated MLP.
+This module provides the building blocks and the full GPT-2 backbone /
+LM-head models for inference and training.
+
+Architectural traits:
+    - Absolute learned positional embeddings limited to ``n_positions``.
+    - Pre-norm transformer: LayerNorm placed before attention and MLP.
+    - Standard multi-head attention (no GQA / sliding window).
+    - GeLU (``gelu_new``) MLP, optional embedding tying.
+
+Exports:
+    - :class:`GPT2Model`: Backbone returning hidden states.
+    - :class:`GPT2LMHeadModel`: Decoder LM with optional tied LM head.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -49,22 +66,30 @@ from .gpt2_configuration import GPT2Config as GPT2Config
 
 
 class Conv1D(spx.Module):
-    """Custom 1D Convolution layer used in GPT-2.
+    """OpenAI's "Conv1D" linear layer with the historical ``[out, in]`` weight layout.
 
-    This layer implements a 1D convolution operation often used as a substitute
-    for linear layers in transformer models, particularly in earlier GPT architectures.
-    It performs a matrix multiplication after transposing the kernel.
+    Despite its name this is *not* a convolution — it is the dense linear
+    transformation OpenAI's original GPT-2 codebase mislabeled as
+    ``Conv1D``. The defining property is the kernel shape: ``(out_features,
+    in_features)`` with the bias added on the *input* side. EasyDeL keeps
+    this exact layout so HuggingFace GPT-2 checkpoints load without
+    transposition. Internally :meth:`forward` transposes the kernel back to
+    the ``(in, out)`` orientation expected by ``lax.dot_general``.
 
     Attributes:
-            in_features (int): Dimensionality of the input features.
-            out_features (int): Dimensionality of the output features.
-            use_bias (bool): Whether to include a bias term. Defaults to True.
-            dtype (jnp.dtype): Data type for computations. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            dot_general (tp.Optional[callable]): Custom dot_general function.
-                Defaults to None (uses jax.lax.dot_general).
-            rngs (spx.Rngs): Random number generators.
+        weight: Bound :class:`ArrayParam` of shape ``(out_features,
+            in_features)`` initialised from ``Normal(0, 0.02)``.
+        bias: Bound :class:`ArrayParam` of shape ``(in_features,)`` initialised
+            to zeros, or ``None`` when ``use_bias=False``. Note the bias
+            shape matches *in_features* — that is GPT-2's convention; it is
+            broadcast over all positions of the input dim before the matmul.
+        use_bias: Whether the bias term is allocated and applied.
+        dtype: Compute dtype the inputs are cast to.
+        param_dtype: Storage dtype for the weight/bias parameters.
+        precision: ``jax.lax.PrecisionLike`` forwarded to ``dot_general``.
+        dot_general: Optional override for the matmul (used by quantisation
+            shims); falls back to ``jax.lax.dot_general`` when ``None``.
+        sharding_axis: Optional axis name driving tensor parallelism.
     """
 
     def __init__(
@@ -107,13 +132,18 @@ class Conv1D(spx.Module):
         self.sharding_axis = sharding_axis
 
     def forward(self, inputs):
-        """Forward pass of the Conv1D layer.
+        """Apply the dense projection ``inputs @ weight.T + bias``.
+
+        The stored kernel is in OpenAI's ``[out, in]`` layout, so it is
+        transposed to ``[in, out]`` before the contracted matmul over the
+        last input axis. Bias addition uses the dtype of the activations.
 
         Args:
-            inputs (Array): Input tensor.
+            inputs: Tensor of shape ``[..., in_features]``.
 
         Returns:
-            Array: Output tensor after applying the 1D convolution.
+            Tensor of shape ``[..., out_features]`` (with the bias broadcast
+            across all leading axes when present).
         """
         inputs = jnp.asarray(inputs, self.dtype)
         bias = self.bias.value
@@ -135,19 +165,35 @@ class Conv1D(spx.Module):
 
 
 class GPT2Attention(UnifiedAttention):
-    """GPT-2 Attention module.
+    """Multi-head self/cross-attention with GPT-2's fused ``c_attn`` projection.
 
-    This module implements the standard multi-head self-attention mechanism used in GPT-2.
-    It supports both self-attention and cross-attention.
+    GPT-2 fuses the three Q/K/V projections into a *single* :class:`Conv1D`
+    of width ``3 * embed_dim`` named ``c_attn`` (see :meth:`define_network`),
+    avoiding the launch overhead of three separate matmuls. The output is
+    then split along the trailing axis at attention time. When this layer
+    is configured for cross-attention (``is_cross_attention=True``) the
+    layout changes: ``c_attn`` becomes a ``2 * embed_dim`` projection over
+    the encoder states (K, V only) and a separate ``q_attn`` of width
+    ``embed_dim`` projects the decoder hidden states for the queries.
+    Output goes through a Row-sharded ``c_proj`` and a residual dropout
+    (``resid_pdrop``) before returning to the residual stream.
+
+    Position information is supplied externally — GPT-2 uses *learned*
+    absolute positional embeddings added at the model embedding step, not
+    rotary embeddings — so :class:`UnifiedAttention`'s rotary path is not
+    invoked here. Attention type is fixed to ``"standard"`` (full softmax,
+    optionally causal) and there is no GQA / sliding window.
 
     Attributes:
-            config (GPT2Config): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            causal (bool): Whether the attention is causal.
-            is_cross_attention (bool): Whether the attention is cross-attention.
-            rngs (spx.Rngs): Random number generators.
+        config: Source ``GPT2Config``.
+        dtype: Activation dtype.
+        param_dtype: Parameter dtype.
+        precision: ``jax.lax.PrecisionLike`` for matmuls.
+        causal: Whether the lower-triangular causal mask is applied.
+        is_cross_attention: Whether this block does encoder-decoder
+            cross-attention (``c_attn`` projects K/V only and ``q_attn``
+            handles the queries) instead of self-attention.
+        rngs: Random key container used for dropout / init.
     """
 
     def __init__(
@@ -344,18 +390,25 @@ class GPT2Attention(UnifiedAttention):
 
 
 class GPT2MLP(spx.Module):
-    """GPT-2 MLP module.
+    """Two-layer FFN ``c_fc → activation → c_proj`` with residual dropout.
 
-    This module implements the feed-forward network (MLP) used in the GPT-2 model.
-    It consists of two Conv1D layers with a GELU activation in between.
+    GPT-2's classic non-gated MLP: an up-projection ``c_fc`` to
+    ``intermediate_size`` (Column-sharded), an activation read from
+    ``config.activation_function`` (typically ``"gelu_new"`` — the
+    approximate GeLU), and a down-projection ``c_proj`` back to
+    ``hidden_size`` (Row-sharded). Both projections are :class:`Conv1D`
+    instances to preserve OpenAI's ``[out, in]`` weight orientation, and
+    the residual stream is regularised by an output dropout at
+    ``config.resid_pdrop`` before the addition.
 
     Attributes:
-            config (GPT2Config): Configuration object for the model.
-            intermediate_size (int): Dimensionality of the intermediate layer.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (spx.Rngs): Random number generators.
+        config: Source ``GPT2Config``.
+        precision: ``jax.lax.PrecisionLike`` for the two matmuls.
+        dtype: Activation dtype.
+        c_fc: ``Conv1D(hidden, intermediate)`` up-projection (column-sharded).
+        c_proj: ``Conv1D(intermediate, hidden)`` down-projection (row-sharded).
+        act: Activation function looked up from ``ACT2FN``.
+        dropout: Output dropout applied prior to the residual add.
     """
 
     def __init__(

@@ -49,19 +49,31 @@ def _yarn_find_correction_dim(
     base: float = 10000,
     max_position_embeddings: int = 2048,
 ) -> float | Array:
-    """
-    Calculates the correction dimension for YaRN scaling.
+    """Solve for the rotation-plane index whose wavelength matches ``num_rotations``.
 
-    Internal helper function for YaRN.
+    YaRN's piecewise scaling regions are parameterised by *number of full
+    rotations* completed within the original training window
+    (``beta_fast`` / ``beta_slow`` are stated in those units). For a given
+    rotation budget ``num_rotations`` and base period ``base``, this helper
+    inverts the standard RoPE wavelength formula
+    ``λ_i = 2π * base ** (2i/dim)`` for ``i`` such that the corresponding
+    plane completes exactly ``num_rotations`` cycles in
+    ``max_position_embeddings`` tokens — i.e. it solves
+    ``max_position_embeddings / λ_i = num_rotations`` for the (continuous,
+    fractional) ``i``.
 
     Args:
-        num_rotations (int): Number of rotations.
-        dim (int): The dimension of the embeddings.
-        base (float, optional): The base value for positional encoding. Defaults to 10000.
-        max_position_embeddings (int, optional): The maximum sequence length. Defaults to 2048.
+        num_rotations: Target number of full rotations across the original
+            training window.
+        dim: Total rotary feature dimension.
+        base: RoPE base period (typically 10000 for unscaled).
+        max_position_embeddings: Original (pre-extension) training context
+            length.
 
     Returns:
-        float: The calculated correction dimension.
+        Continuous (possibly fractional) rotation-plane index ``i`` that
+        :func:`_yarn_find_correction_range` will floor/ceil to integer
+        boundaries.
     """
     return (
         dim
@@ -145,16 +157,22 @@ def _yarn_linear_ramp_mask(  # pyright: ignore[reportUnusedFunction]
 
 @jax.named_scope("easydel-rotary-yarn-get-mscale")
 def _yarn_get_mscale(scale: float = 1) -> float | Array:  # pyright: ignore[reportUnusedFunction]
-    """
-    Calculates the mscale factor for YaRN context extension method.
+    """Compute YaRN's logits-magnitude rescale ``1 + 0.1 * log(scale)``.
 
-    Internal helper function for YaRN.
+    YaRN proposes that, after extending the context length by ``scale``,
+    the *magnitudes* of attention logits should be amplified by a small
+    factor that grows logarithmically with the extension. This compensates
+    for the softer attention distributions that result from interpolating
+    the high-frequency rotation planes. The published constant ``0.1`` is
+    used; ``scale <= 1`` is a no-op.
 
     Args:
-        scale (float, optional): The scaling factor. Defaults to 1.
+        scale: Context-length multiplier (e.g. ``8.0`` to extend an 8K
+            model to 64K). Values ``<= 1`` short-circuit to ``1.0``.
 
     Returns:
-        float: The calculated mscale value. Returns 1.0 if scale <= 1.
+        Scalar magnitude multiplier applied to cos/sin in
+        :func:`compute_yarn_frequencies`.
     """
     if scale <= 1:
         return 1.0
@@ -244,17 +262,26 @@ def _apply_rotary_emb(  # pyright: ignore[reportUnusedFunction]
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    """
-    Calculates the mscale factor, potentially used by Deepseek-YaRN or similar methods.
+    """DeepSeek-YaRN magnitude rescale: ``1 + 0.1 * mscale * log(scale)``.
 
-    Allows specifying an additional `mscale` parameter compared to `_yarn_get_mscale`.
+    DeepSeek's variant of YaRN parametrises the logits magnitude rescale
+    with an extra coefficient ``mscale`` that defaults to ``1.0`` for the
+    full-dim path and to a different DeepSeek-specific constant for the
+    rotated half. The actual factor used at attention time is the *ratio*
+    of two calls — see :func:`compute_deepseek_frequencies` for the
+    ``yarn_get_mscale(s, mscale) / yarn_get_mscale(s, mscale_all_dim)``
+    pattern.
 
     Args:
-        scale (float, optional): The scaling factor. Defaults to 1.
-        mscale (float, optional): An additional scaling parameter. Defaults to 1.
+        scale: Context-length extension factor; ``<= 1`` returns ``1.0``.
+        mscale: DeepSeek's additional per-call coefficient — typically
+            ``config.mscale`` for the rotated half and ``config.mscale_all_dim``
+            for the unrotated half.
 
     Returns:
-        float: The calculated mscale value. Returns 1.0 if scale <= 1.
+        Scalar magnitude multiplier (a Python float — the function uses
+        ``math.log`` rather than ``jnp.log`` because it is invoked at
+        cache-build time on Python floats from the config).
     """
     if scale <= 1:
         return 1.0

@@ -12,7 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dynamic planning utilities for eSurge pipeline-parallel inference."""
+"""Topology and KV-cache planning utilities for eSurge pipeline-parallel inference.
+
+Owns :class:`PipelineInferencePlan`, the frozen snapshot every PP-aware
+component reads to learn (a) whether PP is active for the current model/mesh,
+(b) which transformer layer lives on which stage rank, (c) which subset of
+those layers carry KV state, and (d) how many KV pages the cache pool may
+hold given the user's budget knobs.
+
+The plan is built at engine startup by :func:`build_pipeline_inference_plan`
+from the model's mesh and layer metadata, and is then forwarded to
+:class:`ExecutionManager`, :class:`ModelStepExecutor`, and
+:class:`PipelineStageRuntime`. The plan is intentionally immutable so
+downstream code can rely on ``layer_to_stage`` / ``stage_to_layers``
+remaining stable for the lifetime of the engine.
+"""
 
 from __future__ import annotations
 
@@ -46,7 +60,53 @@ logger = get_logger("eSurge-PipelinePlan")
 
 @dataclasses.dataclass(frozen=True)
 class PipelineInferencePlan:
-    """Topology and cache-capacity plan for true PP eSurge inference."""
+    """Frozen topology + KV-cache plan for one eSurge engine instance.
+
+    Built once by :func:`build_pipeline_inference_plan` and treated as
+    read-only thereafter. Disabled plans (``enabled=False``) still carry the
+    normalized ``mode`` and ``kernel_tile_policy`` so SPMD callers can
+    consult them uniformly.
+
+    Attributes:
+        enabled: ``True`` iff PP inference is active for this engine. False
+            when the model's mesh is SPMD or the user explicitly set
+            ``pipeline_inference="off"``. Most other fields are empty /
+            trivial when this is False.
+        mode: Resolved literal — ``"auto"`` / ``"on"`` / ``"off"`` — kept
+            for telemetry and post-hoc validation.
+        mpmd_dim: Number of pipeline stages (i.e. ``mpmd_mesh.mpmd_dim``).
+            ``1`` on disabled plans.
+        final_stage: Rank of the stage that produces the final hidden
+            states / logits. Equal to ``layer_to_stage[num_layers - 1]``;
+            consulted by :class:`ModelStepExecutor` to place the LM-head
+            executable.
+        stage_meshes: Tuple of submesh objects, one per rank, in rank order.
+            Empty tuple when ``enabled=False``.
+        layer_to_stage: ``layer_idx -> stage_rank`` for *every* transformer
+            layer (cache-bearing or not). Filled by the model's
+            ``_layer_physical_stage_assignment`` when present; otherwise a
+            round-robin fallback is used.
+        stage_to_layers: Reverse mapping; ``stage_rank ->
+            tuple[layer_idx, ...]`` listing all layers on that stage. Empty
+            tuples are kept for stages that received no layers.
+        cache_layer_to_stage: Subset of ``layer_to_stage`` restricted to
+            layer indices whose cache view is one of the recognized KV /
+            recurrent cache classes (see
+            :func:`_cache_bearing_layer_indices`).
+        stage_to_cache_layers: Reverse of ``cache_layer_to_stage``. Used by
+            ``max_stage_cache_layers`` to size per-stage cache allocations.
+        max_cache_tokens: Optional absolute upper bound on total cached
+            tokens across all pages, forwarded from
+            :data:`eSurgeCacheRuntimeConfig.max_cache_tokens`. ``None`` lets
+            HBM utilization decide.
+        cache_capacity_margin: Multiplicative shrink factor in ``(0, 1]``
+            applied to the page count by :func:`cap_metadata_pages` to leave
+            headroom for non-KV allocations.
+        kernel_tile_policy: Normalized Pallas/GDN tile-selection policy
+            ultimately passed to
+            :func:`set_gdn_kernel_tile_policy` so the inference kernels
+            agree on tiling with the plan.
+    """
 
     enabled: bool
     mode: PipelineInferenceMode
@@ -63,16 +123,37 @@ class PipelineInferencePlan:
 
     @property
     def is_enabled(self) -> bool:
+        """Boolean wrapper of :attr:`enabled` for cleaner call-site reads.
+
+        Equivalent to ``bool(plan.enabled)``; provided so callers can write
+        ``if plan.is_enabled:`` without having to remember the field name.
+        """
         return bool(self.enabled)
 
     @property
     def max_stage_cache_layers(self) -> int:
+        """Maximum cache-layer count across all stages.
+
+        Used by KV-cache allocation (e.g. ``cap_metadata_pages``) to size
+        per-stage page tables: every stage gets enough pages for the *worst*
+        stage's number of cache-bearing layers. Returns ``0`` when no stage
+        owns any cache-bearing layer (typical of disabled plans).
+        """
         if not self.stage_to_cache_layers:
             return 0
         return max((len(v) for v in self.stage_to_cache_layers.values()), default=0)
 
 
 def _cache_bearing_layer_indices(model: tp.Any) -> set[int]:
+    """Return the indices of layers whose cache view stores KV state.
+
+    Args:
+        model (Any): EasyDeL model exposing ``get_operations_cache_view``.
+
+    Returns:
+        set[int]: Layer indices whose mapped cache view is one of the
+        recognized KV-cache view classes.
+    """
     cache_views = {
         KDACacheView,
         LightningCacheView,
@@ -96,7 +177,33 @@ def build_pipeline_inference_plan(
     cache_capacity_margin: float = 0.92,
     kernel_tile_policy: KernelTilePolicy | None = "auto",
 ) -> PipelineInferencePlan:
-    """Build a dynamic PP inference plan from the model mesh and layer metadata."""
+    """Build a dynamic PP inference plan from the model mesh and layer metadata.
+
+    Inspects the model's mesh to decide whether PP is enabled, walks layer
+    indices to assign each to a stage (via the model's
+    ``_layer_physical_stage_assignment`` if available, else round-robin),
+    and locates cache-bearing layers.
+
+    Args:
+        model (Any): Loaded EasyDeL model.
+        mpmd_scheduler (Any): Reserved for future scheduler-aware planning;
+            unused today (currently dropped).
+        pipeline_inference (PipelineInferenceMode | None): Requested mode.
+            ``"auto"`` enables PP when the mesh is an MPMD mesh.
+        max_cache_tokens (int | None): Optional global cap on cached tokens.
+        cache_capacity_margin (float): Safety margin in ``(0, 1]``.
+        kernel_tile_policy (KernelTilePolicy | None): Pallas/GDN tile policy.
+
+    Returns:
+        PipelineInferencePlan: A plan with ``is_enabled`` reflecting whether
+        PP is active. Disabled plans still carry the normalized mode and
+        cache caps for downstream consumers.
+
+    Raises:
+        ValueError: If ``pipeline_inference='on'`` but the mesh isn't MPMD,
+            ``max_cache_tokens`` is non-positive, or
+            ``cache_capacity_margin`` is outside ``(0, 1]``.
+    """
 
     mode = normalize_pipeline_inference_mode(pipeline_inference)
     tile_policy = normalize_kernel_tile_policy(kernel_tile_policy)
@@ -178,7 +285,18 @@ def build_pipeline_inference_plan(
 
 
 def cap_metadata_pages(metadata: tp.Any, plan: PipelineInferencePlan | None) -> tp.Any:
-    """Apply user/runtime cache token caps to cache metadata in-place."""
+    """Apply user/runtime cache token caps to cache metadata in-place.
+
+    Args:
+        metadata (Any): Cache-metadata object exposing ``num_pages`` and
+            ``page_size`` (and optionally ``_mixed_layer_configs``).
+        plan (PipelineInferencePlan | None): Plan whose
+            ``max_cache_tokens`` and ``cache_capacity_margin`` drive the cap.
+            A ``None`` or disabled plan is a no-op.
+
+    Returns:
+        Any: The same ``metadata`` object (mutated in place).
+    """
 
     if plan is None or not plan.is_enabled or not hasattr(metadata, "num_pages") or not hasattr(metadata, "page_size"):
         return metadata
@@ -193,7 +311,13 @@ def cap_metadata_pages(metadata: tp.Any, plan: PipelineInferencePlan | None) -> 
 
 
 def set_metadata_num_pages(metadata: tp.Any, num_pages: int) -> None:
-    """Update ``num_pages`` on representative and mixed per-layer metadata."""
+    """Update ``num_pages`` on representative and mixed per-layer metadata.
+
+    Args:
+        metadata (Any): Metadata object whose ``num_pages`` (and any nested
+            ``_mixed_layer_configs[*].num_pages``) are overwritten.
+        num_pages (int): New page count (lower-bounded to 1).
+    """
 
     if not hasattr(metadata, "num_pages"):
         return
@@ -206,6 +330,15 @@ def set_metadata_num_pages(metadata: tp.Any, num_pages: int) -> None:
 
 
 def metadata_num_pages(metadata: tp.Any) -> int | None:
+    """Read ``num_pages`` off a cache-metadata object if present.
+
+    Args:
+        metadata (Any): Cache metadata object.
+
+    Returns:
+        int | None: ``num_pages`` cast to ``int``, or ``None`` if the
+        attribute is absent.
+    """
     if not hasattr(metadata, "num_pages"):
         return None
     return int(metadata.num_pages)

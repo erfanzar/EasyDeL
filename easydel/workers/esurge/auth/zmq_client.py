@@ -12,7 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ZeroMQ client for communicating with auth worker process."""
+"""ZeroMQ REQ-socket client for the eSurge auth worker subprocess.
+
+Provides :class:`AuthWorkerClient` plus thin client-side mirrors of the
+worker's domain exceptions (:class:`PermissionDenied`,
+:class:`RateLimitExceeded`, :class:`QuotaExceeded`). The client is
+designed to be created once per FastAPI worker and shared across
+request handlers; every method serialises send/recv behind a per-client
+lock so concurrent calls remain wire-safe.
+
+Most methods deserialize the worker's response into an
+:class:`ApiKeyMetadata` (or list thereof) using
+:meth:`AuthWorkerClient._deserialize_metadata`, which deliberately
+omits the ``hashed_key`` field because the worker does not transmit
+secret-derived material over the socket.
+"""
 
 from __future__ import annotations
 
@@ -25,34 +39,65 @@ from .auth_models import ApiKeyMetadata, ApiKeyPermissions, ApiKeyRole, ApiKeySt
 
 
 class PermissionDenied(Exception):
-    """Raised when permission check fails."""
+    """Client-side mirror of the auth worker's ``PermissionDenied``.
+
+    Re-raised by :meth:`AuthWorkerClient._request` whenever the worker
+    returns ``status == "error"`` with ``exception_type == "PermissionDenied"``,
+    so callers can distinguish authorisation failures from rate-limit
+    and quota errors using a normal ``except`` clause without touching
+    the worker's internal exception classes.
+    """
 
     pass
 
 
 class RateLimitExceeded(Exception):
-    """Raised when rate limit is exceeded."""
+    """Client-side mirror of the auth worker's ``RateLimitExceeded``.
+
+    Re-raised by :meth:`AuthWorkerClient._request` when the worker
+    reports a rate-limit breach. The message string mirrors the
+    server-side message and identifies the window
+    (e.g. ``"... 60 requests/minute"``).
+    """
 
     pass
 
 
 class QuotaExceeded(Exception):
-    """Raised when quota limit is exceeded."""
+    """Client-side mirror of the auth worker's ``QuotaExceeded``.
+
+    Re-raised by :meth:`AuthWorkerClient._request` when the worker
+    detects that a lifetime or monthly quota would be breached. Use this
+    to surface 429/402-style errors back to API callers.
+    """
 
     pass
 
 
 class AuthWorkerClient:
-    """Client for communicating with auth worker process via ZMQ.
+    """Thread-safe ZeroMQ REQ client for the eSurge auth worker.
 
-    Args:
-            endpoint: The ZeroMQ endpoint of the auth worker.
+    Wraps a single REQ socket plus a ``threading.Lock`` so multiple FastAPI
+    request handlers can share one client instance without interleaving
+    sends and receives. Each public method maps 1:1 to a command consumed
+    by ``worker_main.py`` and re-raises the worker's domain exceptions
+    (:class:`PermissionDenied`, :class:`RateLimitExceeded`,
+    :class:`QuotaExceeded`) on the calling thread.
 
-    Raises:
-            ValueError: If endpoint is not provided.
+    Returned :class:`ApiKeyMetadata` objects are reconstructed from the
+    wire payload by :meth:`_deserialize_metadata`; the raw ``hashed_key``
+    field is *not* sent over the socket and is left empty client-side.
     """
 
     def __init__(self, endpoint: str):
+        """Connect a REQ socket to the auth worker at ``endpoint``.
+
+        Args:
+            endpoint: ZeroMQ endpoint URI. Must be non-empty.
+
+        Raises:
+            ValueError: If ``endpoint`` is the empty string or ``None``.
+        """
         if not endpoint:
             raise ValueError("Auth worker endpoint must be provided.")
         self._context = zmq.Context.instance()
@@ -396,16 +441,32 @@ class AuthWorkerClient:
             self.close()
 
     def close(self):
-        """Close the ZeroMQ socket."""
+        """Close the ZeroMQ socket without sending a shutdown command."""
         self._socket.close(0)
 
     @property
     def enabled(self) -> bool:
-        """Check if auth worker is enabled (always True for worker client)."""
+        """Whether the client is active.
+
+        Returns:
+            bool: Always ``True`` for this worker client; provided for
+            interface compatibility with no-op stubs used when auth is
+            disabled.
+        """
         return True
 
     def _deserialize_metadata(self, data: dict[str, tp.Any]) -> ApiKeyMetadata:
-        """Deserialize metadata dict to ApiKeyMetadata object."""
+        """Rebuild an :class:`ApiKeyMetadata` from a wire-format dict.
+
+        Args:
+            data: The mapping returned by ``worker_main.py`` for any
+                command that yields a key record. Sensitive fields like
+                ``hashed_key`` are not sent over the wire.
+
+        Returns:
+            ApiKeyMetadata: A reconstructed dataclass with nested rate
+            limit / quota / permissions sub-dataclasses populated.
+        """
         return ApiKeyMetadata(
             key_id=data["key_id"],
             key_prefix=data["key_prefix"],

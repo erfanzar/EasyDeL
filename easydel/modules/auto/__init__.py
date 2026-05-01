@@ -35,7 +35,7 @@ Usage Examples:
     # Load model for causal LM
     from easydel.modules.auto import AutoEasyDeLModelForCausalLM
     import spectrax as spx
-from spectrax import nn
+    from spectrax import nn
     import jax
 
     model = AutoEasyDeLModelForCausalLM.from_pretrained(

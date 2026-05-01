@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Phi-MoE model family.
+
+Defines :class:`PhiMoeConfig`, the EasyDeL configuration object for
+Microsoft's Phi-MoE Mixture-of-Experts variant. Inherits Phi-3's
+architectural choices and adds router-related hyperparameters such
+as ``num_local_experts``, ``num_experts_per_tok``, ``router_jitter_noise``,
+and ``output_router_logits``.
+
+Also includes a small monkey-patch helper that backfills HF's modern
+rotary mscale attributes onto older Phi-MoE checkpoints when they are
+missing, keeping conversion paths compatible.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -20,7 +32,24 @@ from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
 def _patch_hf_phimoe_rotary_mscale() -> None:
-    """HF compatibility: initialize missing Phimoe rotary mscale attributes."""
+    """Monkey-patch HF's PhimoeRotaryEmbedding to expose modern mscale fields.
+
+    Older releases of ``transformers.models.phimoe`` do not populate
+    the ``short_mscale`` / ``long_mscale`` attributes on
+    ``PhimoeRotaryEmbedding`` instances even though those attributes
+    are referenced from EasyDeL's HF-compat code paths and from newer
+    versions of the upstream rotary code. This helper performs an
+    idempotent runtime patch:
+
+    - If the upstream module is missing or the rotary class is absent,
+      it is a no-op (we silently return so EasyDeL stays usable
+      without ``transformers`` installed).
+    - Otherwise it wraps ``__init__`` with a small adapter that calls
+      the original initializer and then backfills both attributes
+      from ``config.rope_parameters`` when they have not been set.
+    - A sentinel ``_easydel_phimoe_mscale_patch`` is attached to the
+      patched ``__init__`` so the patch only runs once per process.
+    """
     try:
         from transformers.models.phimoe import modeling_phimoe as hf_phimoe
     except Exception:
@@ -35,6 +64,14 @@ def _patch_hf_phimoe_rotary_mscale() -> None:
         return
 
     def _patched_init(self, config, device=None):
+        """Backfill ``short_mscale`` / ``long_mscale`` on HF Phi-MoE rotary modules.
+
+        Wraps the upstream rotary embedding ``__init__`` to populate the
+        modern ``short_mscale`` and ``long_mscale`` attributes from
+        ``config.rope_parameters`` when the original implementation did
+        not set them. This keeps EasyDeL's HF compatibility paths working
+        against older Phi-MoE checkpoints.
+        """
         original_init(self, config, device=device)
         rope_parameters = getattr(config, "rope_parameters", {}) or {}
         if not hasattr(self, "short_mscale"):

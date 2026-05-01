@@ -245,51 +245,61 @@ DEFAULT_ATTENTION_MECHANISM = "auto"
 
 
 class FlexibleAttentionModule(spx.Module):
-    """Unified interface for various attention mechanisms.
+    """Backend-agnostic attention dispatcher (training + paged-cache decode).
 
-    Central hub for managing different attention implementations,
-    automatically selecting and executing the optimal mechanism
-    based on hardware, configuration, and runtime requirements.
+    The role of this class is *routing*, not attention math: every actual
+    attention kernel — vanilla dot-product, FlashAttention 2, SplashAttention,
+    RingAttention, ragged-page paged attention, MLA paged attention,
+    UnifiedAttention (Triton), etc. — is implemented by an
+    :class:`Operation` registered in :class:`OperationRegistry`. This module
+    holds two such operations (``impl`` for prefill / training and
+    ``impl_decode`` for the optional decode-only kernel), validates that
+    the supplied ``cache_view`` matches the chosen backend, and forwards
+    QKV plus the full bag of optional knobs (mask, RoPE-applied bias,
+    sliding-window, soft-caps, dropout, …) to the right kernel.
 
-    Supports optimized implementations like FlashAttention, SplashAttention,
-    RingAttention, and standard dot-product attention. Provides automatic
-    hardware detection and optimization selection.
+    QKV layout and shape conventions (used throughout the operation registry):
+
+    * ``query_states``: ``[batch, seq_q, num_q_heads, head_dim]``
+    * ``key_states``:   ``[batch, seq_k, num_kv_heads, head_dim]``
+    * ``value_states``: ``[batch, seq_v, num_kv_heads, head_dim_v]``
+
+    GQA / MQA are honoured by the kernels, not by this layer. RoPE is
+    applied *before* the call (the ``frequencies`` plumbing lives one level
+    up in :class:`UnifiedAttention`); ALiBi is supplied via the ``bias``
+    argument. Causal vs. bidirectional and sliding-window are controlled
+    by the ``causal`` and ``sliding_window`` keyword arguments respectively
+    — they are passed through to the kernel rather than realised as a mask.
+
+    Multi-host / TPU specialization: the constructor short-circuits the
+    ``"auto"`` mechanism via :func:`get_optimal_config`, and the forward
+    pass contains a fallback that re-routes variable-length VANILLA
+    attention through :class:`ScaledDotProductAttn` when running on a
+    multi-host TPU mesh — a workaround for VANILLA's inability to honour
+    ``cum_seqlens_*`` under TPU's MPMD scheduling.
 
     Attributes:
-        config: Model configuration with attention parameters.
-        dtype: Data type for computations.
-        param_dtype: Data type for parameters.
-        precision: Precision setting for operations.
-        attention_mechanism: Selected attention mechanism.
-        mesh: JAX mesh for distributed computation.
-        implementation: Concrete attention implementation.
-
-    Key Features:
-
-    * **Attention Mechanism Selection:** Supports a wide range of attention mechanisms,
-      allowing users to choose the most suitable option based on performance and hardware constraints.
-    * **Sharding and Partitioning:** Integrates with JAX's sharding capabilities, enabling efficient
-      distribution of computations and data across multiple devices.
-    * **Block-wise Computation:** Implements block-wise attention computations for optimized memory
-      usage and speed, particularly beneficial for large models.
-    * **Performance Optimization:** Includes support for highly optimized implementations like
-      FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
-    * **Flexibility and Customization:** Offers fine-grained control over attention parameters,
-      sharding specifications, and block sizes, providing flexibility for different use cases.
-    * **Testing and Evaluation:** Includes a `run_attention_benchmarks` method to systematically evaluate
-      different attention mechanisms and help users identify the best-performing option.
-
-
-    The AttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
-    computations. It provides a user-friendly way to select and execute different attention mechanisms,
-    leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
-    like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
-    makes it adaptable to a variety of model architectures and hardware configurations.
-    Attributes:
-      impl (AttentionBackend): The chosen attention implementation backend instance.
-      deterministic (bool): Flag indicating whether dropout should be applied (False) or not (True).
-                            Currently hardcoded to True.
-      metadata (OperationMetadata): Metadata derived from the configuration, used by the backend.
+        config (EasyDeLBaseConfig): Owning model config; consulted for
+            attention dtypes, mesh, and (per-layer-overridable) mechanism.
+        metadata (OperationMetadata): Frozen metadata pytree built once by
+            :meth:`OperationMetadata.from_config`; backends key their
+            kernel selection / autotuning off this object.
+        softmax_scale (float): Scale applied to the QK^T product before
+            softmax. Conventionally ``1 / sqrt(head_dim)`` but may differ
+            for muP / DeepSeek MLA (``softmax_scale * mscale``).
+        dropout_prob (float): Attention-weight dropout probability. The
+            forward pass currently always disables dropout (sets it to
+            ``0.0`` and ``deterministic=True``) — present for parity with
+            the kernel signature.
+        impl (Operation): Prefill / training attention backend instance,
+            chosen from :class:`AttentionMechanisms`.
+        impl_decode (Operation | None): Optional separate backend for the
+            decode-only path (e.g. ``REGRESSIVE_DECODE``); ``None`` when
+            the same kernel handles both phases.
+        deterministic (bool): Hardcoded ``True`` — dropout is disabled.
+        _requires_cache (bool | None): Override for the operation's
+            class-level cache requirement; consulted by the
+            :class:`OperationExecutor` and :attr:`requires_cache`.
     """
 
     def __init__(
@@ -608,12 +618,23 @@ class FlexibleAttentionModule(spx.Module):
 
     @property
     def operation(self):
-        """Get the primary (prefill) operation instance."""
+        """Return the prefill / training attention backend instance.
+
+        This is what :meth:`forward` calls in every mode except
+        ``MODE_DECODE``, and even in decode it is used as the fallback
+        when ``impl_decode`` is ``None``.
+        """
         return self.impl
 
     @property
     def decode_operation(self):
-        """Get the decode operation instance (if different from prefill)."""
+        """Return the decode-only attention backend, if one is configured.
+
+        Returns:
+            The :class:`Operation` instance bound to
+            ``base_config.decode_attn_mechanism`` at construction time,
+            or ``None`` when prefill and decode share the same backend.
+        """
         return self.impl_decode
 
     @property
@@ -627,12 +648,23 @@ class FlexibleAttentionModule(spx.Module):
 
     @property
     def requires_cache(self) -> bool:
-        """Whether this attention module requires cache."""
+        """Whether the active backend(s) consume a KV cache view.
+
+        Combines the cache requirements of the prefill and (optional)
+        decode backends with the user-supplied
+        ``requires_cache`` override. Used by surrounding modules to skip
+        cache allocation for encoder-only paths (vision encoders, etc.).
+        """
         return self.operation_executor.requires_cache
 
     @property
     def has_separate_decode(self) -> bool:
-        """Whether decode uses a different operation than prefill."""
+        """Return ``True`` iff prefill and decode use different backends.
+
+        Driven by ``base_config.decode_attn_mechanism`` at construction
+        time; e.g. a model can run SplashAttention for prefill and
+        ``REGRESSIVE_DECODE`` for token-by-token generation.
+        """
         return self.operation_executor.has_separate_decode
 
 

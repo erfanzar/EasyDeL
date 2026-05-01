@@ -12,7 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lifecycle manager for the Responses store ZeroMQ worker."""
+"""Lifecycle manager for the Responses store ZeroMQ worker.
+
+Spawns and supervises the subprocess that exposes
+:class:`FileResponseStore` over a ZMQ REQ/REP socket. Used by API server
+deployments that run multiple worker processes and need a single source
+of truth for OpenAI Responses API state (``previous_response_id``,
+``conversation``) shared across them.
+
+Mirrors the structure of :class:`AuthWorkerManager`: a single
+``start()`` either connects to an externally-supplied endpoint or spawns
+``worker_main.py`` and polls the IPC socket file until the worker
+binds, and ``shutdown()`` cleanly terminates the subprocess and removes
+the ``ipc://`` socket file.
+"""
 
 from __future__ import annotations
 
@@ -78,10 +91,22 @@ class ResponseStoreWorkerManager:
 
     @property
     def endpoint(self) -> str | None:
+        """Return the ZMQ endpoint of the running worker.
+
+        Returns:
+            str | None: The endpoint URI (e.g. ``"ipc:///tmp/...sock"``)
+            once :meth:`start` has succeeded; ``None`` otherwise.
+        """
         return self._endpoint
 
     @property
     def client(self) -> ResponseStoreWorkerClient | None:
+        """Return the connected client, if any.
+
+        Returns:
+            ResponseStoreWorkerClient | None: The client returned by
+            :meth:`start`; ``None`` before start or after shutdown.
+        """
         return self._client
 
     def start(self, *, endpoint: str | None = None) -> ResponseStoreWorkerClient:
@@ -143,6 +168,15 @@ class ResponseStoreWorkerManager:
         self._owned = False
 
     def _spawn_worker(self, endpoint: str) -> subprocess.Popen:
+        """Spawn a fresh ``worker_main.py`` subprocess.
+
+        Args:
+            endpoint: ZMQ endpoint the worker should bind to.
+
+        Returns:
+            subprocess.Popen: Handle to the spawned process. The caller is
+            responsible for waiting on bind via :meth:`_wait_for_endpoint`.
+        """
         worker_main_path = Path(__file__).with_name("worker_main.py")
         cmd = [
             sys.executable,
@@ -169,6 +203,21 @@ class ResponseStoreWorkerManager:
         return subprocess.Popen(cmd, env=env)
 
     def _wait_for_endpoint(self, endpoint: str, process: subprocess.Popen | None) -> None:
+        """Block until the worker binds to ``endpoint`` or the timeout fires.
+
+        For ``ipc://`` endpoints the manager polls for the existence of the
+        socket file. The worker process is also monitored so an early exit
+        produces a meaningful error rather than a timeout.
+
+        Args:
+            endpoint: ZMQ endpoint to monitor.
+            process: The spawned worker process; ``None`` skips the
+                process-aliveness check.
+
+        Raises:
+            RuntimeError: If the worker exits before binding.
+            TimeoutError: If the worker has not bound by the deadline.
+        """
         deadline = time.time() + self._startup_timeout
         path = None
         if endpoint.startswith("ipc://"):
@@ -185,11 +234,25 @@ class ResponseStoreWorkerManager:
         raise TimeoutError(f"Timed out waiting for response store worker to bind to {endpoint}")
 
     def _make_ipc_endpoint(self, prefix: str) -> str:
+        """Build a unique ``ipc://`` endpoint path inside ``_ipc_dir``.
+
+        Args:
+            prefix: Tag used in the socket filename for easy identification.
+
+        Returns:
+            str: A new ``ipc://`` endpoint URI guaranteed to be unique
+            within the IPC directory.
+        """
         os.makedirs(self._ipc_dir, exist_ok=True)
         file_path = os.path.join(self._ipc_dir, f"easydel_{prefix}_{uuid.uuid4().hex}.sock")
         return f"ipc://{file_path}"
 
     def _terminate_process(self) -> None:
+        """Terminate the worker subprocess if it is still alive.
+
+        First sends ``SIGTERM`` and waits up to 5 seconds; falls back to
+        ``SIGKILL`` if the process refuses to exit.
+        """
         if not self._process:
             return
         if self._process.poll() is None:
@@ -203,6 +266,12 @@ class ResponseStoreWorkerManager:
         self._process = None
 
     def _cleanup_ipc_file(self, endpoint: str | None) -> None:
+        """Remove the IPC socket file backing an ``ipc://`` endpoint.
+
+        Args:
+            endpoint: The endpoint URI to clean up. No-op for non-``ipc://``
+                endpoints or when ``None``. Missing files are tolerated.
+        """
         if not endpoint or not endpoint.startswith("ipc://"):
             return
         path = endpoint[len("ipc://") :]

@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Phi-3 model implementation for EasyDeL.
+
+This module implements Microsoft's Phi-3 family of small/medium-scale
+decoder-only language models. Notable architectural traits:
+
+- Fused ``qkv_proj`` and ``gate_up_proj`` linear layers for the attention
+  and MLP blocks (split internally during the forward pass).
+- RMSNorm normalization throughout (replacing Phi's LayerNorm).
+- Full rotary position embeddings (RoPE), optionally extended via
+  long-rope scaling for extended context windows.
+- Optional sliding-window attention with per-layer mask configuration.
+- Bias-free linear layers in attention/MLP.
+
+Exposes :class:`Phi3Model` (transformer trunk) and the task-specific
+wrappers :class:`Phi3ForCausalLM` and :class:`Phi3ForSequenceClassification`.
+"""
 
 import functools
 from typing import ClassVar
@@ -700,6 +716,13 @@ class Phi3Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

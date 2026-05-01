@@ -75,6 +75,12 @@ class Qwen3VLMoeVisionConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize Qwen3VLMoeVisionConfig.
+
+        See the class docstring for parameter semantics; ``**kwargs`` are
+        forwarded to :class:`EasyDeLBaseConfig` for the standard EasyDeL
+        configuration plumbing (sharding, dtype, etc.).
+        """
         super().__init__(**kwargs)
         self.depth = depth
         self.hidden_size = hidden_size
@@ -170,6 +176,15 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize Qwen3VLMoeTextConfig.
+
+        See the class docstring for parameter semantics. ``layer_types``
+        controls per-layer attention type and is auto-derived from
+        ``sliding_window`` and ``max_window_layers`` when ``None``.
+        ``mlp_only_layers`` selects which layers should use a dense MLP
+        instead of the routed MoE block. ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -212,7 +227,18 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
             ]
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
-        """Get attention mask details for sliding window attention."""
+        """Build the per-layer sliding-window mask metadata.
+
+        In Qwen3-VL-MoE the sliding-window window is applied to the
+        *trailing* decoder layers (``layer_idx >= max_window_layers``)
+        rather than the leading ones, so the mapping returned here
+        targets that range. Earlier layers retain the default full
+        causal mask.
+
+        Returns:
+            dict[int, AttnMaskDetail]: Per-layer sliding-window mask
+            metadata; empty when sliding-window attention is disabled.
+        """
         mapping = {}
         if self.sliding_window is not None and self.use_sliding_window:
             for layer_idx in range(self.num_hidden_layers):
@@ -259,6 +285,15 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize Qwen3VLMoeConfig.
+
+        Accepts ``vision_config`` and ``text_config`` either as dicts (in
+        which case they are constructed via the registered sub-config
+        classes) or as already-built configuration objects. Token IDs
+        identify the placeholder positions where image/video features are
+        merged into the text token sequence. ``**kwargs`` are forwarded
+        to :class:`EasyDeLBaseConfig`.
+        """
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:

@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Qwen2 model family.
+
+Defines :class:`Qwen2Config`, the EasyDeL configuration object for
+Alibaba's Qwen2 dense decoder-only architecture (RMSNorm, SwiGLU MLP,
+GQA attention, RoPE with optional scaling, optional sliding-window
+attention, and tie/untie word embedding support).
+"""
+
 from collections.abc import Mapping
 
 from easydel.infra.base_module import EasyDeLBaseConfig

@@ -38,7 +38,24 @@ if TYPE_CHECKING:
 
 @functools.lru_cache(maxsize=32)
 def _solve_lloyd_max_cached(bits: int, dim: int):
-    """Cached Lloyd-Max solver — codebooks depend only on (bits, dim)."""
+    """Memoized Lloyd-Max codebook solver keyed by ``(bits, dim)``.
+
+    The Lloyd-Max algorithm produces optimal scalar-quantization centroids
+    for a given source distribution and bit budget. For TurboQuant we apply
+    Lloyd-Max to the rotated KV coordinates, whose distribution is
+    fully determined by ``(bits, head_dim)`` — so the same codebook is
+    reused for every layer with the same head dim, and ``functools.lru_cache``
+    avoids the (relatively expensive) iterative solve on every layer init.
+
+    Args:
+        bits: Bit budget for the codebook (``2**bits`` centroids).
+        dim: Head dimension — controls the variance of the rotated
+            distribution that Lloyd-Max optimizes against.
+
+    Returns:
+        The :class:`ejkernel.quantization.turboquant.codebook.LloydMaxResult`
+        with ``.centroids`` of length ``2**bits``.
+    """
     from ejkernel.quantization.turboquant.codebook import solve_lloyd_max
 
     return solve_lloyd_max(bits=bits, dim=dim)
@@ -74,27 +91,58 @@ class TurboQuantConfig:
     seed: int = 42
 
     def __post_init__(self):
+        """Validate the bit budget after dataclass initialization.
+
+        Raises:
+            ValueError: If ``bits`` is outside the supported ``[2, 8]`` range.
+        """
         if self.bits < 2 or self.bits > 8:
             raise ValueError(f"bits must be in [2, 8], got {self.bits}")
 
     @property
     def key_codebook_bits(self) -> int:
-        """Bits used for key codebook indices (bits - 1 for QJL sign)."""
+        """Bit budget for the *key* Lloyd-Max codebook.
+
+        TurboQuant spends one of the ``bits`` per key coordinate on the
+        QJL sign (used to recover an unbiased estimator for ``q · k``);
+        the remaining ``bits - 1`` bits index the Lloyd-Max codebook for
+        the rotated key coordinates.
+
+        Returns:
+            ``self.bits - 1`` — the index width into ``key_codebook``.
+        """
         return self.bits - 1
 
     @property
     def value_codebook_bits(self) -> int:
-        """Bits used for value codebook indices (all bits, no QJL)."""
+        """Bit budget for the *value* Lloyd-Max codebook.
+
+        Values do not require the QJL sign trick (they participate in
+        attention only as the right operand of the softmax×V matmul, so
+        sign-preservation isn't needed for unbiasedness), and the full
+        ``self.bits`` indexes the Lloyd-Max codebook for rotated values.
+
+        Returns:
+            ``self.bits`` — the index width into ``value_codebook``.
+        """
         return self.bits
 
     @property
     def key_codebook_size(self) -> int:
-        """Number of Lloyd-Max centroids for keys."""
+        """Number of Lloyd-Max centroids in the *key* codebook.
+
+        Returns:
+            ``2 ** key_codebook_bits``.
+        """
         return 1 << self.key_codebook_bits
 
     @property
     def value_codebook_size(self) -> int:
-        """Number of Lloyd-Max centroids for values."""
+        """Number of Lloyd-Max centroids in the *value* codebook.
+
+        Returns:
+            ``2 ** value_codebook_bits``.
+        """
         return 1 << self.value_codebook_bits
 
 
@@ -123,11 +171,25 @@ class TurboQuantConstants:
     bits: int
 
     def replicate(self, mesh: "MeshLike") -> "TurboQuantConstants":
-        """Return a copy with all arrays replicated across the mesh.
+        """Broadcast every constant array across ``mesh`` (fully replicated).
 
-        Shard-map kernels pass these constants with ``PartitionSpec()``
-        (fully replicated).  If the arrays sit on a single device the
-        shard-map will fail, so this helper broadcasts them first.
+        The TurboQuant shard-map kernels declare these constants with
+        ``PartitionSpec()`` (i.e. fully replicated on every device). When
+        the constants are originally produced on a single device — which is
+        the common case during model load — the shard-map dispatcher will
+        refuse them because their physical placement does not match the
+        declared partitioning. This helper performs the necessary
+        ``jax.device_put`` against the mesh's replicated NamedSharding for
+        each of the four arrays (key/value codebooks, rotation, projection)
+        while leaving the integer fields untouched.
+
+        Args:
+            mesh: Target mesh — typically the same one the attention
+                kernels run under.
+
+        Returns:
+            A new :class:`TurboQuantConstants` whose array fields all live
+            on every device in ``mesh``.
         """
         from easydel.infra.sharding import replicated_named_sharding
 
@@ -148,17 +210,39 @@ class TurboQuantConstants:
         layer_index: int = 0,
         mesh: "MeshLike | None" = None,
     ) -> TurboQuantConstants:
-        """Generate all precomputed constants from config.
+        """Materialize a full :class:`TurboQuantConstants` set for one layer.
+
+        Steps performed:
+
+        1. Resolve ``qjl_dim`` (defaults to ``head_dim`` when the config
+           leaves it as ``None``).
+        2. Solve Lloyd-Max for keys (bits = ``config.key_codebook_bits``)
+           and values (bits = ``config.value_codebook_bits``) via the
+           shared :func:`_solve_lloyd_max_cached` — codebooks are layer
+           independent so the solve runs at most once per ``(bits, head_dim)``.
+        3. Build the orthogonal random rotation ``Pi`` and the QJL random
+           projection ``S`` from per-layer seeds derived as
+           ``seed + layer_index * 1000`` and ``seed + layer_index * 1000 + 500``
+           respectively, ensuring each layer gets independent matrices when
+           ``layer_index`` varies.
+        4. Optionally replicate the resulting arrays across ``mesh`` so the
+           constants can be passed straight into the shard-map kernels.
 
         Args:
-            config: TurboQuant configuration.
-            head_dim: Attention head dimension.
-            layer_index: Layer index for seed derivation (0 = shared).
-            mesh: If provided, replicate all arrays across this mesh so
-                they are compatible with shard-map ``PartitionSpec()`` specs.
+            config: TurboQuant configuration (bit budget, qjl_dim, base seed).
+            head_dim: Attention head dimension; sets the rotation matrix
+                size and the source distribution variance fed to Lloyd-Max.
+            layer_index: Index of the transformer layer the constants are
+                being generated for. Pass ``0`` to share matrices across
+                layers, or distinct indices to give each layer its own
+                rotation/projection.
+            mesh: Optional target mesh; when provided, every array field
+                is broadcast via :meth:`replicate` so the shard-map
+                kernels' ``PartitionSpec()`` declarations are satisfied.
 
         Returns:
-            TurboQuantConstants with all arrays populated.
+            A frozen :class:`TurboQuantConstants` with all four array
+            fields populated and ready for cache initialization.
         """
         from ejkernel.quantization.turboquant.matrices import (
             generate_projection_matrix,

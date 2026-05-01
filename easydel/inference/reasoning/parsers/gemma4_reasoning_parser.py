@@ -62,6 +62,12 @@ class Gemma4ReasoningParser(ReasoningParser):
     )
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize parser state and compile the channel-detection regex.
+
+        Args:
+            tokenizer: HuggingFace tokenizer whose vocabulary supplies the
+                channel start/end token IDs.
+        """
         super().__init__(tokenizer)
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
@@ -73,31 +79,51 @@ class Gemma4ReasoningParser(ReasoningParser):
 
     @cached_property
     def start_token_id(self) -> int:
+        """Token ID corresponding to the channel-open marker (``<|channel>``)."""
         return self.vocab[CHANNEL_START]
 
     @cached_property
     def end_token_id(self) -> int:
+        """Token ID corresponding to the channel-close marker (``<channel|>``)."""
         return self.vocab[CHANNEL_END]
 
     @cached_property
     def _tool_call_token_id(self) -> int | None:
+        """Token ID for ``<|tool_call>`` if present in the vocabulary, else ``None``."""
         return self.vocab.get("<|tool_call>")
 
     @cached_property
     def _new_turn_token_id(self) -> int | None:
+        """Token ID for ``<|turn>`` if present in the vocabulary, else ``None``."""
         return self.vocab.get("<|turn>")
 
     @cached_property
     def _tool_response_token_id(self) -> int | None:
+        """Token ID for ``<|tool_response>`` if present in the vocabulary, else ``None``."""
         return self.vocab.get("<|tool_response>")
 
     def adjust_request(self, request) -> object:
-        """Disable special-token stripping to preserve channel markers."""
+        """Disable special-token stripping to preserve channel markers.
+
+        Args:
+            request: The mutable inference request whose
+                ``skip_special_tokens`` flag is forced to ``False``.
+
+        Returns:
+            The same ``request`` after mutation, for fluent chaining.
+        """
         request.skip_special_tokens = False
         return request
 
     def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
-        """Track the channel opened by the prompt, if generation starts inside one."""
+        """Track the channel opened by the prompt, if generation starts inside one.
+
+        Args:
+            prompt_text: Raw prompt text used to identify the most recently
+                opened channel before generation begins.
+            prompt_token_ids: Tokenized prompt (unused; kept for interface
+                compatibility).
+        """
         del prompt_token_ids
         self._prompt_channel = None
         for match in self._channel_pattern.finditer(prompt_text or ""):
@@ -131,6 +157,17 @@ class Gemma4ReasoningParser(ReasoningParser):
         return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """Return the input IDs unchanged.
+
+        Gemma4 splits at the text level rather than via dedicated content
+        tokens, so all token IDs are forwarded as content.
+
+        Args:
+            input_ids: Full sequence of generated token IDs.
+
+        Returns:
+            A list copy of ``input_ids``.
+        """
         return list(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
@@ -214,7 +251,18 @@ class Gemma4ReasoningParser(ReasoningParser):
         *,
         initial_channel: str | None = None,
     ) -> tuple[str | None, str | None]:
-        """Split text into reasoning and content by channel markers."""
+        """Split text into reasoning and content by channel markers.
+
+        Args:
+            text: The full text to scan for ``<|channel>`` / ``<channel|>``
+                markers.
+            initial_channel: Optional channel name considered active at
+                position 0 (used when the prompt opened a channel).
+
+        Returns:
+            Tuple ``(reasoning, content)`` where each element is the joined
+            text in matching channels, or ``None`` when empty.
+        """
         cursor = 0
         current_channel: str | None = initial_channel
         reasoning_parts: list[str] = []
@@ -240,14 +288,32 @@ class Gemma4ReasoningParser(ReasoningParser):
 
 
 def _strip_thought_label(text: str) -> str:
-    """Remove the ``thought\\n`` role label from the beginning of text."""
+    """Remove the ``thought\\n`` role label from the beginning of text.
+
+    Args:
+        text: Reasoning text that may begin with the structural role label.
+
+    Returns:
+        ``text`` with the leading prefix stripped if present, otherwise
+        unchanged.
+    """
     if text.startswith(_THOUGHT_PREFIX):
         return text[len(_THOUGHT_PREFIX) :]
     return text
 
 
 def _suffix(previous: str | None, current: str | None) -> str | None:
-    """Compute the incremental text delta between two cumulative strings."""
+    """Compute the incremental text delta between two cumulative strings.
+
+    Args:
+        previous: Cumulative text from the previous snapshot.
+        current: Cumulative text from the current snapshot.
+
+    Returns:
+        The newly appended portion when ``current`` extends ``previous``,
+        ``current`` itself when prefix matching fails, or ``None`` when
+        nothing was produced.
+    """
     previous = previous or ""
     current = current or ""
     if not current:

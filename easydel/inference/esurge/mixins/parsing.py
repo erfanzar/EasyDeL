@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Parsing mixin for the eSurge engine.
+
+Drives the per-request decoder pipeline that turns raw token outputs into
+final user-visible text:
+
+- Tool-call extraction and merging via the configured tool parser.
+- Reasoning-block separation (e.g. ``<think>...</think>``) via the
+  configured reasoning parser.
+- Streaming delta computation that respects reasoning/tool boundaries.
+- Stop-string handling and EOS bookkeeping.
+
+Exposes :class:`EngineParsingMixin`, mixed into :class:`eSurge`.
+"""
+
 from __future__ import annotations
 
 import time
@@ -41,7 +55,22 @@ class EngineParsingMixin:
 
     @staticmethod
     def _find_first_stop_string(text: str, stop_sequences: list[str]) -> tuple[int, str] | None:
-        """Return the earliest stop-string match in text, if any."""
+        """Locate the earliest stop sequence in ``text`` (longest wins on tie).
+
+        Iterates over ``stop_sequences`` and finds each one's first
+        occurrence in ``text`` via ``str.find``. Returns the match with the
+        smallest index; ties are broken in favour of the *longest* stop
+        sequence so that a more specific marker like ``"</tool_call>"``
+        wins over a generic ``">"``.
+
+        Args:
+            text: Currently-accumulated detokenized output to search.
+            stop_sequences: List of strings; empty entries are skipped.
+
+        Returns:
+            ``(index, matched_string)`` for the earliest/longest match, or
+            ``None`` when no stop sequence appears in ``text``.
+        """
         best_index: int | None = None
         best_stop: str | None = None
         for stop_seq in stop_sequences:
@@ -64,13 +93,39 @@ class EngineParsingMixin:
         accumulated_text: str,
         fallback_delta: str,
     ) -> tuple[str, str, bool, str | None]:
-        """Apply stop-string trimming policy to decoded text.
+        """Trim ``accumulated_text`` at the first stop string per sampling-params policy.
+
+        Each request's :class:`SamplingParams` may carry a ``stop`` list and
+        an ``include_stop_str_in_output`` flag. This helper consults both
+        and either:
+
+        * leaves ``accumulated_text`` untouched when no stop sequence
+          matches, or
+        * cuts the text at the start of the first match (default), or
+        * cuts after the match when ``include_stop_str_in_output=True``.
+
+        It then computes a "visible delta" against the previous visible
+        text recorded in ``rd["decoder_visible_text"]`` so the streaming
+        client never sees retracted (post-stop) tokens. ``fallback_delta``
+        is used only when the visible text equals the accumulated text
+        (no trimming happened) — otherwise it would replay text that was
+        just cut off.
+
+        Args:
+            rd: Per-request bookkeeping dict; ``decoder_visible_text`` is
+                read here to compute the delta but updated by the caller.
+            accumulated_text: Full detokenized text seen so far for this
+                sample.
+            fallback_delta: Delta to surface when no trimming occurred (i.e.
+                the standard streaming delta from the detokenizer).
 
         Returns:
-            visible_text: Text allowed to be exposed to downstream parsers/clients.
-            visible_delta: Delta computed against prior visible text.
-            stop_triggered: Whether a stop string was matched in accumulated_text.
-            stop_reason: The matched stop string when stop_triggered is True.
+            ``(visible_text, visible_delta, stop_triggered, stop_reason)``
+            where ``visible_text`` is what downstream parsers/clients may
+            see, ``visible_delta`` is its delta against the prior visible
+            text, ``stop_triggered`` is ``True`` when a stop sequence
+            matched, and ``stop_reason`` is the matched string (or
+            ``None``).
         """
         sampling_params = rd.get("sampling_params")
         previous_visible_text = rd.get("decoder_visible_text", "") or ""
@@ -96,7 +151,26 @@ class EngineParsingMixin:
 
     @staticmethod
     def _stop_strings_ignore_reasoning(rd: dict) -> bool:
-        """Return whether stop strings should only match parsed visible content."""
+        """Whether stop-string matching is suppressed inside reasoning blocks.
+
+        When both (a) the request opted into
+        ``ignore_stop_strings_in_reasoning`` on its sampling params and
+        (b) a reasoning parser is wired up via the request's
+        ``DelegatingParser``, stop strings should match only against the
+        *visible content* the reasoning parser has emitted, not the raw
+        accumulated text — so a stop sequence that happens to occur inside
+        an open chain-of-thought block does not prematurely terminate the
+        request.
+
+        Args:
+            rd: Per-request bookkeeping dict (carries
+                ``sampling_params`` and ``delegating_parser``).
+
+        Returns:
+            ``True`` iff the request is configured to defer stop-string
+            matching until after the reasoning parser has classified text,
+            and a reasoning parser is actually present.
+        """
         sampling_params = rd.get("sampling_params")
         if sampling_params is None:
             return False
@@ -114,7 +188,39 @@ class EngineParsingMixin:
         token_ids: list[int],
         finished: bool,
     ) -> tuple[dict, str, str, bool, str | None]:
-        """Parse decoded text and apply stop-string policy in the correct domain."""
+        """Run reasoning/tool parsers and stop-string trimming in the right order.
+
+        Two operating regimes:
+
+        * **Stop in raw domain** (default) — apply :meth:`_apply_stop_string_policy`
+          to the accumulated text *before* feeding it to
+          :meth:`_run_output_parsers`, so the reasoning/tool parsers only see
+          text up to the stop boundary. Stop strings can match anywhere,
+          including inside reasoning blocks.
+        * **Stop in parsed domain** (when
+          :meth:`_stop_strings_ignore_reasoning` is True) — run the
+          parsers first, then apply the stop policy to the parser's
+          ``accumulated_content`` so reasoning blocks shield their text from
+          stop-string matching.
+
+        In either branch, ``rd["decoder_visible_text"]`` is updated to the
+        new visible text so subsequent calls compute correct deltas.
+
+        Args:
+            rd: Per-request bookkeeping dict.
+            accumulated_text: Full detokenized text so far for this sample.
+            delta_text: Newly-decoded text since the previous call.
+            token_ids: Token-id sequence aligned with ``accumulated_text``;
+                forwarded into the parser for token-level decisions.
+            finished: ``True`` iff the request has finished (engine-side
+                EOS / length / abort). Forces the parser into final mode.
+
+        Returns:
+            ``(parsed, visible_text, visible_delta, stop_hit, stop_reason)``
+            — the parser-output dict (with content/reasoning/tool fields),
+            the post-policy visible text and delta, a stop-hit flag, and
+            the matched stop string (or ``None``).
+        """
         if self._stop_strings_ignore_reasoning(rd):
             parsed = self._run_output_parsers(
                 rd=rd,
@@ -156,11 +262,37 @@ class EngineParsingMixin:
         token_ids: list[int],
         finished: bool,
     ) -> dict:
-        """Run reasoning and tool parsers on decoded text via DelegatingParser.
+        """Drive the per-request :class:`DelegatingParser` for one decode step.
+
+        The :class:`DelegatingParser` instance held in ``rd`` chains a
+        reasoning parser and a tool-call parser; this method picks the
+        right entry point — ``process_delta`` for streaming updates,
+        ``process_final`` for terminal ones — and threads the previous
+        ``parser_previous_text`` / ``parser_previous_token_ids`` so the
+        parser can compute cumulative state correctly. After invocation
+        those previous-* slots are advanced in ``rd``.
+
+        When no parser is configured for the request (``rd["delegating_parser"]
+        is None``), returns a pass-through dict where ``content`` carries
+        the verbatim text and ``reasoning`` / ``tool_calls`` are empty.
+
+        Args:
+            rd: Per-request bookkeeping dict; reads ``delegating_parser``,
+                ``parser_previous_text``, ``parser_previous_token_ids`` and
+                writes the latter two on exit.
+            accumulated_text: Full detokenized text so far.
+            delta_text: New text since the previous call.
+            token_ids: Token-id sequence aligned with ``accumulated_text``.
+            finished: When ``True``, switches the parser into final mode
+                (it may flush partial reasoning blocks or close open tool
+                calls).
 
         Returns:
-            Dict with keys: delta_reasoning, delta_content, accumulated_reasoning,
-            accumulated_content, tool_calls, delta_tool_calls.
+            Plain ``dict`` with keys ``delta_reasoning``,
+            ``delta_content``, ``accumulated_reasoning``,
+            ``accumulated_content``, ``tool_calls``, and
+            ``delta_tool_calls`` (any may be ``None`` when not applicable
+            to the current step).
         """
         dp = rd.get("delegating_parser")
         if dp is None:
@@ -188,10 +320,27 @@ class EngineParsingMixin:
 
     @staticmethod
     def _resolve_public_finish_reason(outputs) -> str | None:
-        """Collapse per-sample completion reasons into a single public reason.
+        """Reduce per-sample finish reasons into the parent's single OpenAI reason.
 
-        Priority: abort > length > tool_calls > stop.
-        tool_calls beats stop because the client needs to know to execute tools.
+        For ``n>1`` parallel sampling, each sample carries its own
+        ``finish_reason``. The parent ``RequestOutput`` exposes one string
+        to the client; this helper picks the most informative one using the
+        priority order ``"abort" > "length" > "tool_calls" > "stop"``.
+
+        ``"tool_calls"`` outranks ``"stop"`` because the client needs to
+        know to execute tools (and re-prompt the model with their results)
+        even if other samples in the same request happened to finish on a
+        natural stop. ``"abort"`` and ``"length"`` are explicit failure
+        modes and override anything else.
+
+        Args:
+            outputs: Iterable of ``CompletionOutput`` objects (one per
+                sample) carrying a ``finish_reason`` field.
+
+        Returns:
+            Highest-priority finish reason found, the first sample's
+            reason if none of the priority labels matched, or ``None``
+            when ``outputs`` is empty.
         """
         finish_reason = outputs[0].finish_reason if outputs else None
         if any(output.finish_reason == "abort" for output in outputs):
@@ -210,7 +359,28 @@ class EngineParsingMixin:
         *,
         metrics_collector,
     ) -> None:
-        """Finalize a request when the scheduler reports completion without token output."""
+        """Close out a request that the scheduler ended without a final token.
+
+        The normal finish path runs through :meth:`_finalize_request` when
+        an :class:`EngineCoreOutput` carries ``finished=True``. Some
+        scheduler-side terminations (preemption that didn't recover, hard
+        aborts, fatal cache errors) skip that final output and instead
+        list the request id in
+        ``SchedulerOutput.finished_req_ids``/``finished_requests``. For
+        those, the parser mixin still needs to update the per-sample
+        ``CompletionOutput`` (defaulting ``finish_reason`` to
+        ``"abort"`` with a WARNING when no upstream reason was set),
+        bump processing time, mark the parent ``RequestOutput`` finished,
+        notify the metrics collector, and drop the entry from
+        ``_active_requests``. Streaming clients waiting on the
+        per-request event are woken so they can observe the terminal
+        state.
+
+        Args:
+            request_id: Sample-level id reported by the scheduler.
+            metrics_collector: Optional metrics collector;
+                ``complete_request`` is invoked when the parent finishes.
+        """
 
         rd = self._active_requests.get(request_id)
         if rd is None:
@@ -345,10 +515,36 @@ class EngineParsingMixin:
         raw_delta: str,
         visible_delta: str = "",
     ) -> tuple[bool, bool]:
-        """Apply parsed results to CompletionOutput and RequestOutput.
+        """Write parser output back into ``CompletionOutput`` / ``RequestOutput``.
+
+        Updates the per-sample :class:`CompletionOutput` (``comp``) for any
+        ``sample_index``; only the *first* sample (index 0) is mirrored
+        onto the parent :class:`RequestOutput` (``ro``) because that's the
+        view streaming clients see. The first-sample branch also computes
+        an ``effective_delta`` against ``ro.accumulated_text`` to guarantee
+        clients always observe a strictly-growing visible text — useful
+        when stop-string trimming or reasoning-block retraction would
+        otherwise produce a non-monotonic delta.
+
+        Args:
+            comp: Per-sample completion output to update.
+            ro: Parent request output (only mutated when ``sample_index == 0``).
+            sample_index: Position of this sample within ``ro.outputs``.
+            parsed: Output dict from :meth:`_run_output_parsers` /
+                :meth:`_parse_with_stop_string_policy`.
+            raw_accumulated: Pre-parser detokenized text so far (also
+                surfaced on ``comp.raw_text`` / ``ro.raw_accumulated_text``).
+            raw_delta: Newly-decoded raw text for this step.
+            visible_delta: Stop-policy-trimmed delta from
+                :meth:`_apply_stop_string_policy`; used as a fallback when
+                the parser emits no delta but the visible text changed.
 
         Returns:
-            (text_changed, structured_changed) for event signaling decisions.
+            ``(text_changed, structured_changed)``: the first flag is
+            ``True`` when the visible text moved (so streamers should be
+            woken), the second when reasoning or tool-call structure
+            changed (used to bump update sequencing without forcing a
+            text refresh).
         """
         text_changed = False
         structured_changed = False
@@ -386,7 +582,26 @@ class EngineParsingMixin:
 
     @staticmethod
     def _update_metrics(rd: dict, ro, now: float, num_generated: int) -> None:
-        """Update TTFT, tokens/sec, and timing metrics."""
+        """Recompute the per-request streaming metrics shown on ``RequestOutput``.
+
+        Recomputed every time the parser advances (so streaming clients can
+        poll ``tokens_per_second`` mid-flight). The token count is treated
+        idempotently: ``rd["reported_generated_count"]`` records the last
+        observed total so out-of-order or duplicate updates don't double-
+        count, and a regression (lower count than reported) silently resets
+        the watermark.
+
+        Args:
+            rd: Per-request bookkeeping dict; reads ``start_time`` and
+                ``reported_generated_count``, mutates the latter.
+            ro: Parent :class:`RequestOutput` whose ``processing_time`` /
+                ``time_spent_generating`` / ``num_generated_tokens`` /
+                ``tokens_per_second`` fields are refreshed.
+            now: Wall-clock seconds (``time.monotonic`` or ``time.time``)
+                used for the elapsed computation.
+            num_generated: Cumulative count of generated tokens reported
+                for this step.
+        """
         elapsed = now - rd["start_time"]
         ro.processing_time = elapsed
         ro.time_spent_generating = elapsed
@@ -418,10 +633,39 @@ class EngineParsingMixin:
         metrics_collector,
         now: float,
     ) -> tuple[bool, bool]:
-        """Handle request completion: final decode, finish_reason, cleanup.
+        """Run the terminal-step pipeline for a finishing request/sample.
+
+        Called when the engine output indicates this sample has finished
+        (either naturally or because ``force_finished`` was raised by a
+        stop-string match upstream). Sets ``comp.finish_reason``, marks
+        the parent ``ro.finished`` if all samples are done, runs a *final*
+        decode pass through :meth:`_decode_and_parse` (which flushes any
+        held-back partial reasoning blocks / tool calls), updates the
+        completion outputs, recomputes final metrics, and reports
+        completion to the metrics collector.
+
+        Args:
+            request_id: Sample-level request id (parent or child for n>1).
+            rd: Per-request bookkeeping dict.
+            ro: Parent :class:`RequestOutput`.
+            comp: Per-sample completion output being finalized.
+            sample_index: Position within ``ro.outputs``.
+            parent_request_id: Id used for metrics-collector accounting.
+            engine_output: Engine-side ``EngineCoreOutput`` carrying the
+                raw ``finish_reason``.
+            force_finished: ``True`` when the parser detected a stop
+                string that the engine has not yet acted on; promotes the
+                finish reason to ``"stop"``.
+            stop_string_finishes: Out-parameter dict; populated with
+                ``request_id -> matched_stop`` so the engine can record
+                which stop string ended each request.
+            metrics_collector: Optional metrics collector;
+                ``complete_request`` is called when ``ro.finished``.
+            now: Wall-clock timestamp used for elapsed-time computations.
 
         Returns:
-            (text_changed, structured_changed) for event signaling.
+            ``(text_changed, structured_changed)`` flags for the streaming
+            event-signal logic, mirroring :meth:`_update_outputs`.
         """
         text_changed = False
         structured_changed = False

@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Generalized Knowledge Distillation (GKD) trainer entry point.
+
+GKD interpolates between forward and reverse KL via a tunable
+generalised Jensen-Shannon divergence, mixes online student rollouts
+with the offline teacher signal, and is the on-policy variant of
+classical knowledge distillation introduced by Agarwal et al. (2024).
+"""
 
 from .gkd_config import GKDConfig
 from .gkd_trainer import GKDTrainer

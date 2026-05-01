@@ -61,15 +61,30 @@ from ._utils import (
 
 @jax.named_scope("easydel-rotary-compute-basic-inv-frequencies")
 def compute_basic_inv_frequencies(base: int, rotary_dim: int):
-    """
-    Computes the inverse frequencies for standard RoPE.
+    """Compute the unscaled RoPE inverse-frequency vector ``θ_i = 1 / base^(2i/d)``.
+
+    This is the geometric progression at the heart of the original RoPE
+    formulation (Su et al. 2021): given a head dimension ``rotary_dim`` and a
+    base period ``base`` (typically 10 000 for vanilla RoPE, 500 000 for
+    Llama-3, 1 000 000 for some long-context models), the frequencies span
+    a geometric series with the high-frequency rotation handled by index 0
+    and the slowest rotation by index ``rotary_dim/2 - 1``.
+
+    Used directly by the unscaled RoPE path and as the *unscaled baseline*
+    by Llama-3, dynamic-NTK and some YaRN variants.
 
     Args:
-        base (int): The base value for the geometric progression of frequencies.
-        rotary_dim (int): The dimension of the rotary embeddings.
+        base: Frequency-progression base (the ``θ`` in the paper). Larger
+            values flatten the spectrum and extend the effective context
+            length without re-training; defaults vary by model family.
+        rotary_dim: Total rotary feature dimension. Must be even since each
+            pair of features rotates together; the returned vector has
+            ``rotary_dim // 2`` entries (one per rotation plane).
 
     Returns:
-        jnp.ndarray: An array of inverse frequencies of shape (rotary_dim // 2,).
+        Float32 array of shape ``(rotary_dim // 2,)`` containing ``1/θ_i``,
+        ready to be outer-product'd with positions to form the rotation
+        angles.
     """
     return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype="f4") / rotary_dim))
 
@@ -84,22 +99,46 @@ def compute_yarn_inv_frequencies(
     scaling_factor: float,
     extrapolation_factor: float,
 ) -> jnp.ndarray:
-    """
-    Computes the inverse frequencies for YaRN scaled RoPE.
+    """Compute YaRN-adjusted inverse frequencies (interpolated + extrapolated mix).
 
-    Combines interpolation and extrapolation frequencies based on correction ranges.
+    YaRN (Peng et al., 2023) decomposes RoPE rotations into "fast" and
+    "slow" frequency bands defined by how many full rotations a given
+    inverse-frequency completes within the original training window. The
+    method then blends two regimes:
+
+    * **Interpolation** — divide the raw inverse frequencies by
+      ``scaling_factor`` (Position-Interpolation, Chen et al. 2023) so all
+      rotations slow down proportionally.
+    * **Extrapolation** — keep the raw inverse frequencies untouched
+      (matches the trained behaviour on the high-frequency dimensions).
+
+    The blend is gated by a smooth linear ramp built from
+    ``_yarn_find_correction_range(beta_fast, beta_slow, ...)`` and weighted
+    by ``extrapolation_factor`` so the user can tune how aggressively the
+    high-frequency dims are extrapolated. The result is the inverse
+    frequencies; positions and the magnitude scale ``mscale`` are applied
+    by :func:`compute_yarn_frequencies`.
 
     Args:
-        base (float): The base value for positional encoding.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        beta_fast (float): YaRN parameter for faster rotating dimensions.
-        beta_slow (float): YaRN parameter for slower rotating dimensions.
-        max_position_embeddings (int): Original maximum sequence length before scaling.
-        scaling_factor (float): The factor by which the context length is scaled.
-        extrapolation_factor (float): YaRN parameter controlling extrapolation strength.
+        base: Base ``θ`` for the unscaled spectrum (typically 10 000 or
+            larger).
+        rotary_dim: Total rotary feature dimension; the returned vector has
+            ``rotary_dim // 2`` entries.
+        beta_fast: Number of full rotations across the original context
+            beyond which the dimension is treated as "fast" — those dims
+            extrapolate (no scaling). Typical YaRN value is 32.
+        beta_slow: Number of full rotations within which the dimension is
+            "slow" — those dims interpolate (full scaling). Typical 1.
+        max_position_embeddings: Original (pre-extension) training context
+            length; sets the wavelength reference for the ramp.
+        scaling_factor: Target context-length multiplier; divides the
+            interpolation branch.
+        extrapolation_factor: Scalar in ``[0, 1]`` weighting how much the
+            extrapolation regime contributes; ``1.0`` is full YaRN.
 
     Returns:
-        jnp.ndarray: An array of YaRN-adjusted inverse frequencies of shape (rotary_dim // 2,).
+        Float32 array of shape ``(rotary_dim // 2,)`` containing the blended
+        ``1/θ_i`` ready for use in the cos/sin cache build.
     """
     pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
     inv_freq_extrapolation = 1.0 / pos_freqs
@@ -127,21 +166,38 @@ def compute_llama3_inv_frequencies(
     orig_max_position,
     scaling_factor,
 ):
-    """
-    Computes the inverse frequencies for Llama3-style scaled RoPE.
+    """Compute Llama-3 piecewise frequency scaling (the official 8B/70B method).
 
-    Adjusts frequencies based on wavelength thresholds and a smoothing factor.
+    Llama-3's RoPE extension is a wavelength-piecewise scheme: each rotation
+    plane has a wavelength ``λ_i = 2π / θ_i``, and its inverse frequency is
+    rescaled by one of three rules depending on where ``λ_i`` falls:
+
+    * ``λ_i < orig_max_position / high_freq_factor`` (very short
+      wavelength, "high-frequency band") — left untouched. These planes
+      complete many rotations within the original context and don't need
+      adjustment.
+    * ``λ_i > orig_max_position / low_freq_factor`` (very long wavelength,
+      "low-frequency band") — divided by ``scaling_factor``, full
+      Position-Interpolation.
+    * In between — a linear interpolation between the two regimes,
+      controlled by a smoothing factor that goes from 0 at the
+      high-frequency boundary to 1 at the low-frequency boundary.
 
     Args:
-        base (float): The base value for positional encoding.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        low_freq_factor (float): Factor for adjusting low-frequency components.
-        high_freq_factor (float): Factor for adjusting high-frequency components.
-        orig_max_position (int): Original maximum sequence length before scaling.
-        scaling_factor (float): The overall scaling factor applied.
+        base: RoPE base period for the unscaled spectrum.
+        rotary_dim: Total rotary feature dimension.
+        low_freq_factor: Wavelength-cutoff at which the low-frequency
+            boundary sits (``λ = orig_max_position / low_freq_factor``).
+            Llama-3 uses ``1``.
+        high_freq_factor: Same idea for the high-frequency boundary; Llama-3
+            uses ``4`` (wavelengths shorter than ``orig/4`` are unscaled).
+        orig_max_position: Original training context (Llama-3 uses 8 192).
+        scaling_factor: Target context-length multiplier (Llama-3 uses
+            ``8`` to extend 8K to 64K).
 
     Returns:
-        jnp.ndarray: An array of Llama3-adjusted inverse frequencies of shape (rotary_dim // 2,).
+        Float32 array of shape ``(rotary_dim // 2,)`` of the wavelength-
+        piecewise-rescaled inverse frequencies.
     """
     inv_freqs = compute_basic_inv_frequencies(base, rotary_dim)
     low_freq_wavelen = orig_max_position / low_freq_factor

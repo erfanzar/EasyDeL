@@ -214,6 +214,41 @@ def create_base_config(
     return config
 
 
+def _iter_nested_model_configs(config: Any):
+    """Yield nested model configs used by multimodal wrapper configs."""
+    seen: set[int] = set()
+    for sub_cfg_name in ("text_config", "vision_config", "language_config", "audio_config"):
+        sub_cfg = getattr(config, sub_cfg_name, None)
+        if sub_cfg is None or id(sub_cfg) in seen:
+            continue
+        seen.add(id(sub_cfg))
+        yield sub_cfg
+
+
+def _propagate_test_runtime_config(config: Any, small_model_config: dict) -> None:
+    """Propagate test mesh/runtime settings into nested model configs."""
+    for sub_cfg in _iter_nested_model_configs(config):
+        for key in (
+            "sharding_axis_dims",
+            "sharding_axis_names",
+            "sharding_dcn_axis_dims",
+            "pipeline_stage_regions",
+            "pipeline_stage_layout",
+            "pipeline_virtual_stages",
+            "scan_layers",
+        ):
+            if hasattr(config, key):
+                setattr(sub_cfg, key, getattr(config, key))
+            elif key in small_model_config:
+                setattr(sub_cfg, key, small_model_config[key])
+        if hasattr(sub_cfg, "_hidden_mesh"):
+            sub_cfg._hidden_mesh = None
+        if hasattr(sub_cfg, "_hidden_explicit_mesh"):
+            sub_cfg._hidden_explicit_mesh = None
+        if hasattr(sub_cfg, "_hidden_manual_mesh"):
+            sub_cfg._hidden_manual_mesh = None
+
+
 def setup_config(
     config: Any,
     small_model_config: dict,
@@ -232,6 +267,7 @@ def setup_config(
     for key in ("pipeline_stage_regions", "pipeline_stage_layout", "pipeline_virtual_stages"):
         if key in small_model_config:
             setattr(config, key, small_model_config[key])
+    _propagate_test_runtime_config(config, small_model_config)
 
     # Set head_dim if not already set
     if not hasattr(config, "head_dim") or config.head_dim is None:

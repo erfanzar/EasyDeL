@@ -206,14 +206,30 @@ class GiddConfig(EasyDeLBaseConfig):
 
     @staticmethod
     def get_weight_decay_exclusions():
+        """Return the parameter-name patterns excluded from weight decay.
+
+        Returns:
+            tuple: Empty tuple (no exclusions for GIDD).
+        """
         return tuple()
 
     @staticmethod
     def rng_keys():
+        """Return the RNG stream key required by GIDD modules.
+
+        Returns:
+            str: The single RNG key name ``"parameters"``.
+        """
         return "parameters"
 
     @property
     def granted_freq_max_position_embedding(self) -> int:
+        """Return the maximum position used to precompute RoPE frequencies.
+
+        Returns:
+            int: ``freq_max_position_embeddings`` if set, otherwise
+            ``max_position_embeddings``.
+        """
         return getattr(
             self,
             "freq_max_position_embeddings",
@@ -222,6 +238,12 @@ class GiddConfig(EasyDeLBaseConfig):
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
+        """Return the maximum position used to construct attention masks.
+
+        Returns:
+            int: ``mask_max_position_embeddings`` if set, otherwise
+            ``max_position_embeddings``.
+        """
         return getattr(
             self,
             "mask_max_position_embeddings",

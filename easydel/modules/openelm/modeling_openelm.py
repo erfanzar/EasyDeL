@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OpenELM (Open Efficient Language Model) implementation.
+
+Implements Apple's OpenELM decoder family. The defining trait is *layer-wise
+scaling*: per-layer ``num_query_heads`` / ``num_kv_heads`` and per-layer FFN
+multipliers, all derived from ``qkv_multipliers`` / ``ffn_multipliers`` in the
+config. Uses fused QKV projections, optional QK normalization, RoPE,
+RMSNorm, and a SwiGLU-style FFN.
+
+Exports:
+    - ``OpenELMMultiHeadCausalAttention``: per-layer-shaped causal attention.
+    - ``OpenELMFeedForwardNetwork``: per-layer-shaped FFN.
+    - ``OpenELMDecoderLayer``: one transformer block.
+    - ``OpenELMModel``: base transformer trunk.
+    - ``OpenELMForCausalLM``: causal LM head wrapper.
+"""
 
 import importlib
 import types
@@ -91,11 +106,35 @@ def _openelm_decoder_layer_block(config: OpenELMConfig) -> type["OpenELMDecoderL
 
 
 class OpenELMMultiHeadCausalAttention(UnifiedAttention):
-    """Multi-head causal attention layer for OpenELM models.
+    """Per-layer-scaled GQA attention block — OpenELM's defining architectural feature.
 
-    Implements attention with per-layer head configuration, supporting variable
-    numbers of query and key-value heads across different layers. Uses fused
-    QKV projections and optional QK normalization for improved training stability.
+    Unlike LLaMA-style transformers where every layer has the same head
+    counts, OpenELM allocates a *different* ``num_query_heads`` and
+    ``num_kv_heads`` to each layer (read here from
+    ``config.num_query_heads[layer_idx]`` /
+    ``config.num_kv_heads[layer_idx]`` produced by the config's layer-wise
+    scaling formula). This module temporarily mutates ``config.num_attention_heads``
+    and ``config.num_key_value_heads`` so that the parent
+    :class:`UnifiedAttention` initializer sees the layer-local values when
+    sizing the QKV / output projections, then restores the originals so
+    other layers can pick their own counts. The QKV projection is
+    *fused* into a single ``ColumnParallelLinear`` of width
+    ``(num_q_heads + num_k_heads + num_v_heads) * head_dim`` and split
+    along the head axis afterwards. Optional Q/K-norm
+    (``normalize_qk_projections``) and rotary position embeddings are
+    handled identically to LLaMA.
+
+    The ``projection_mapping`` ClassVar overrides the base mapping so the
+    fused QKV layer is exposed under the upstream OpenELM names
+    (``qkv_proj`` / ``out_proj``) for state-dict compatibility.
+
+    Attributes:
+        layer_idx (int): Index used to look up per-layer head counts.
+        num_q_heads (int): Number of query heads on this layer.
+        num_k_heads, num_v_heads (int): Number of K/V heads (GQA).
+        head_dim (int): Per-head dimension (constant across layers).
+        transformer_dim (int): Equal to ``config.model_dim`` — kept under
+            this name to mirror the upstream codebase.
     """
 
     projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
@@ -368,23 +407,34 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
 
 
 class OpenELMFeedForwardNetwork(spx.Module):
-    """OpenELM Feed-Forward Network (FFN) module.
+    """Per-layer-scaled FFN supporting both vanilla MLP and SwiGLU.
 
-    This module implements the FFN layer used in the OpenELM model.
-    It supports both standard MLP and Gated Linear Unit (GLU) variants.
+    OpenELM picks each layer's intermediate dimension as
+    ``make_divisible(ffn_multipliers[layer_idx] * model_dim, ffn_dim_divisor)``,
+    so the FFN width grows monotonically through depth (per Apple's
+    "layer-wise scaling" recipe). Two FFN flavours are supported and chosen
+    by ``config.ffn_with_glu``:
+
+    * **GLU** (default): ``proj_1`` produces ``2 * intermediate_dim`` wide
+      output that is split halfway into a gate and value stream; the
+      activation is applied only to the gate, the streams are multiplied,
+      and ``proj_2`` projects back to ``model_dim``. With
+      ``activation_fn_name="swish"`` this collapses to the standard
+      SwiGLU.
+    * **Plain MLP**: ``proj_1 -> activation -> proj_2`` of width
+      ``intermediate_dim``.
+
+    Both variants use ``ColumnParallelLinear`` on the expanding side and
+    ``RowParallelLinear`` on the contracting side for tensor-parallel
+    sharding of the intermediate activation.
 
     Attributes:
-        config (OpenELMConfig): Configuration object for the model.
-        layer_idx (int): The index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (spx.Rngs): Random number generators.
-        ffn_with_glu (bool): Whether the FFN uses a Gated Linear Unit.
-        proj_1 (ParallelLinear): First linear projection layer (or gate projection in GLU).
-        proj_2 (ParallelLinear): Second linear projection layer (down projection).
-        gate_proj (ColumnParallelLinear, optional): Gate projection layer used only if `ffn_with_glu` is True.
-        activation_fn (callable): The activation function.
+        proj_1 (ColumnParallelLinear): Expanding projection. Width is
+            ``2 * intermediate_dim`` for GLU or ``intermediate_dim`` for plain.
+        proj_2 (RowParallelLinear): Contracting projection back to ``model_dim``.
+        ffn_with_glu (bool): Mirrors ``config.ffn_with_glu``.
+        act (Callable): Activation looked up via ``ACT2FN[activation_fn_name]``.
+        layer_idx (int): Layer index used for the per-layer width lookup.
     """
 
     def __init__(
@@ -503,23 +553,22 @@ class OpenELMFeedForwardNetwork(spx.Module):
 
 
 class OpenELMDecoderLayer(spx.Module):
-    """OpenELM Transformer Decoder Layer.
+    """One OpenELM block: pre-norm per-layer-scaled attention + per-layer-scaled FFN.
 
-    This module represents a single decoder layer in the OpenELM model,
-    combining self-attention and FFN sub-layers with residual connections
-    and layer normalization applied before each sub-layer.
+    Both sub-layers use the same pre-norm residual recipe as LLaMA but
+    every shape (head counts, FFN width) is *layer-specific* — see
+    :class:`OpenELMMultiHeadCausalAttention` and
+    :class:`OpenELMFeedForwardNetwork` for details. This makes the block
+    fairly conventional structurally; the novelty lives entirely in the
+    sizing schedules computed in :class:`OpenELMConfig`.
 
     Attributes:
-        config (OpenELMConfig): Configuration object for the model.
-        layer_idx (int): The index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (spx.Rngs): Random number generators.
-        attn (OpenELMMultiHeadCausalAttention): The self-attention module.
-        ffn (OpenELMFeedForwardNetwork): The feed-forward network (FFN) module.
-        attn_norm (RMSNorm): Layer normalization before the attention layer.
-        ffn_norm (RMSNorm): Layer normalization before the FFN layer.
+        attn (OpenELMMultiHeadCausalAttention): Per-layer GQA attention.
+        ffn (OpenELMFeedForwardNetwork): Per-layer-scaled (Sw)GLU FFN.
+        attn_norm (RMSNorm): Pre-attention RMSNorm.
+        ffn_norm (RMSNorm): Pre-FFN RMSNorm.
+        layer_idx (int): Layer index used by both sub-layers for schedule
+            lookup.
     """
 
     def __init__(
@@ -652,11 +701,13 @@ class OpenELMDecoderLayer(spx.Module):
 
 @register_module(TaskType.BASE_MODULE, config=OpenELMConfig, model_type="openelm")
 class OpenELMModel(EasyDeLBaseModule):
-    """The base OpenELM model transformer.
+    """OpenELM base trunk: token embeddings + layer-wise-scaled decoder stack + final RMSNorm.
 
-    This class represents the core transformer architecture of the OpenELM model,
-    consisting of an embedding layer, multiple OpenELMDecoderLayer layers,
-    and a final RMS normalization layer.
+    Each decoder layer in this trunk is *individually* sized — see
+    :class:`OpenELMConfig` for the multipliers that materialize per-layer
+    head counts and FFN widths. The attention layer-stage assignment uses
+    :func:`spx.assign_stage` so the heterogeneous per-layer shapes can
+    still be partitioned across pipeline stages cleanly.
 
     Attributes:
         config (OpenELMConfig): Configuration object for the model.

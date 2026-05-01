@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen3-VL multimodal model implementation for EasyDeL.
+
+This module implements Alibaba's Qwen3-VL family: a Qwen3 language
+backbone paired with a vision tower derived from the Qwen2-VL design.
+The vision encoder uses windowed/full attention over patch tokens and
+2-D rotary position embeddings; the language model uses 3-D rotary
+position embeddings (mRoPE) so that interleaved image/video and text
+tokens can share a single RoPE schedule.
+
+Exposes the vision tower, the language trunk
+:class:`Qwen3VLModel`, and the multimodal wrapper
+:class:`Qwen3VLForConditionalGeneration`, which merges projected visual
+features into placeholder positions in the input token sequence and
+forwards through the LM head.
+"""
+
 import math
 from functools import cached_property, partial
 
@@ -78,7 +94,29 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
 
 @auto_pytree
 class Qwen3VLModelOutputWithPast(ModelOutput):
-    """Base-model output for Qwen3-VL with optional mRoPE deltas."""
+    """Base-model output for Qwen3-VL with optional mRoPE position deltas.
+
+    Mirrors the standard ``BaseModelOutputWithPast`` but additionally
+    threads through the precomputed mRoPE position offsets used by the
+    multimodal RoPE branch. Holding the deltas here keeps the language
+    model agnostic to whether the inputs were pure text or contained
+    vision/video placeholders — downstream wrappers reuse the same
+    deltas when extending generation.
+
+    Attributes:
+        last_hidden_state: Final-layer hidden states of shape
+            ``(batch, seq_len, hidden_size)``.
+        past_key_values: Updated KV cache for autoregressive decoding,
+            in the format expected by :class:`TransformerCache`.
+        hidden_states: Per-layer hidden states when
+            ``output_hidden_states`` is requested.
+        attentions: Per-layer attention weights when ``output_attentions``
+            is requested.
+        rope_deltas: Per-batch integer offsets that align the 1-D text
+            RoPE indices with the 3-D visual mRoPE positions; required
+            for correct continuation of multimodal sequences during
+            decode.
+    """
 
     last_hidden_state: Array = None
     past_key_values: list[Array] | None = None
@@ -286,7 +324,29 @@ def merge_multimodal_embeddings(
     multimodal_embeddings: jax.Array,
     placeholder_token_id: int | list[int],
 ) -> jax.Array:
-    """Overwrite inputs_embeds wherever input_ids matches placeholder tokens."""
+    """Splice vision embeddings into a text embedding sequence.
+
+    Replaces every position in ``inputs_embeds`` whose corresponding
+    ``input_ids`` entry equals an image/video placeholder with the next
+    vector from ``multimodal_embeddings``, scanned left-to-right. The
+    cumsum-gather core lives in :func:`_merge_multimodal_embeddings`
+    and is JIT-compatible.
+
+    Args:
+        input_ids: Token ids of shape ``(batch, seq_len)``.
+        inputs_embeds: Text embeddings of shape
+            ``(batch, seq_len, hidden_size)`` produced by the text token
+            embedding.
+        multimodal_embeddings: Concatenated visual tokens of shape
+            ``(num_visual_tokens, hidden_size)`` produced by the vision
+            tower + projector.
+        placeholder_token_id: Single id (or list of ids) marking visual
+            slots in ``input_ids`` (e.g. ``image_token_id``,
+            ``video_token_id``).
+
+    Returns:
+        Merged embedding tensor with the same shape as ``inputs_embeds``.
+    """
     if isinstance(placeholder_token_id, list):
         placeholder_token_id = jnp.array(placeholder_token_id)
         is_multimodal = jnp.isin(input_ids, placeholder_token_id)
@@ -296,14 +356,44 @@ def merge_multimodal_embeddings(
 
 
 def rotate_half(x: Array) -> Array:
-    """Rotate half the hidden dims of the input for RoPE."""
+    """Rotate the second half of the trailing dim by negation.
+
+    RoPE building block: given ``x = [a, b]`` along the last axis with
+    equal halves, returns ``[-b, a]``. Combining this with
+    ``cos``/``sin`` element-wise products implements the standard RoPE
+    rotation per pair of channels.
+
+    Args:
+        x: Tensor with an even-sized trailing dimension.
+
+    Returns:
+        Tensor of identical shape with halves swapped and the new lower
+        half negated.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    """Apply rotary positional embeddings to vision features."""
+    """Apply 2-D RoPE to vision query/key tensors.
+
+    Promotes ``q``/``k``/``cos``/``sin`` to float32 before the
+    trigonometric mix to avoid bf16 round-off, applies the canonical
+    ``x * cos + rotate_half(x) * sin`` rotation, and casts the results
+    back to the input dtypes. ``cos``/``sin`` are expanded with a
+    heads-axis dimension before broadcasting.
+
+    Args:
+        q: Query tensor with rotated trailing dim.
+        k: Key tensor with rotated trailing dim.
+        cos: Cosine table broadcastable to ``q``/``k``.
+        sin: Sine table with the same shape as ``cos``.
+
+    Returns:
+        Tuple ``(q_rot, k_rot)`` with rotation applied; shapes/dtypes
+        match the inputs.
+    """
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.astype("f4"), k.astype("f4")
@@ -1038,6 +1128,11 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         deepstack_feature_lists = []
 
         def _layer_loop(block, carry):
+            """Apply a single vision-encoder block inside the layer-stack scan.
+
+            Body of ``self.blocks.scan``; runs ``block`` on the current
+            visual hidden states and returns the updated carry tuple.
+            """
             hidden_states, layer_num = carry
             with self._layer_stage_context(layer_num, layers=self.blocks):
                 hidden_states = block(
@@ -1575,6 +1670,14 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single language-model decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            mixes in deepstack visual embeddings at the configured layer
+            indices, accumulates per-layer hidden states / attention
+            weights when requested, and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
@@ -1633,7 +1736,35 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         visual_pos_masks: Array,
         visual_embeds: Array,
     ) -> Array:
-        """Add visual embeddings to hidden states at visual positions."""
+        """Inject DeepStack visual residuals at marked positions.
+
+        Qwen3-VL's DeepStack feature periodically additively re-injects
+        intermediate vision-tower features into the language stream at
+        positions occupied by image/video tokens. This helper performs
+        the injection at one such layer:
+
+        1. Flatten the per-layer ``hidden_states`` and the boolean
+           ``visual_pos_masks``.
+        2. Use a cumulative-sum gather to assign each True position a
+           contiguous index into ``visual_embeds`` (the dense
+           layer-specific deepstack table).
+        3. Add the gathered residual to the flattened hidden states only
+           at masked positions via ``jnp.where``.
+        4. Restore the original ``(batch, seq_len, hidden_size)`` shape.
+
+        Args:
+            hidden_states: Language hidden states of shape
+                ``(batch, seq_len, hidden_size)``.
+            visual_pos_masks: Boolean mask of shape ``(batch, seq_len)``
+                marking visual placeholder positions.
+            visual_embeds: Compacted residual embeddings of shape
+                ``(num_visual_tokens, hidden_size)`` to add at masked
+                positions.
+
+        Returns:
+            Updated hidden states of shape
+            ``(batch, seq_len, hidden_size)``.
+        """
         visual_embeds = visual_embeds.astype(hidden_states.dtype)
         batch_size, seq_len, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, hidden_dim)
@@ -2119,22 +2250,24 @@ class Qwen3VLModel(EasyDeLBaseModule):
             special_video_mask = input_ids == self.config.video_token_id
 
         n_image_tokens = special_image_mask.sum()
-        special_image_mask_expanded = jnp.broadcast_to(special_image_mask[..., None], inputs_embeds.shape)
         if image_features is not None:
-            image_feature_size = image_features.size
-            masked_size = inputs_embeds[special_image_mask_expanded].size
-            if masked_size != image_feature_size:
+            try:
+                image_token_count = int(n_image_tokens)
+            except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
+                image_token_count = None
+            if image_token_count is not None and image_token_count * inputs_embeds.shape[-1] != image_features.size:
                 raise ValueError(
                     f"Image features and image tokens do not match: "
                     f"tokens: {n_image_tokens}, features {image_features.shape[0]}"
                 )
 
         n_video_tokens = special_video_mask.sum()
-        special_video_mask_expanded = jnp.broadcast_to(special_video_mask[..., None], inputs_embeds.shape)
         if video_features is not None:
-            video_feature_size = video_features.size
-            masked_size = inputs_embeds[special_video_mask_expanded].size
-            if masked_size != video_feature_size:
+            try:
+                video_token_count = int(n_video_tokens)
+            except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
+                video_token_count = None
+            if video_token_count is not None and video_token_count * inputs_embeds.shape[-1] != video_features.size:
                 raise ValueError(
                     f"Video features and video tokens do not match: "
                     f"tokens: {n_video_tokens}, features {video_features.shape[0]}"
@@ -2445,12 +2578,28 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
 
     @property
     def visual(self):
-        """Property to access the vision transformer for backward compatibility."""
+        """Backward-compatible alias for the Qwen3-VL vision tower.
+
+        Mirrors the HuggingFace attribute layout (``model.visual``) so
+        external code that walks the parameter tree by name continues
+        to find the vision transformer at the expected location.
+
+        Returns:
+            spx.Module: The
+            :class:`Qwen3VisionTransformerPretrainedModel` owned by the
+            wrapped :class:`Qwen3VLModel`.
+        """
         return self.model.visual
 
     @property
     def language_model(self):
-        """Property to access the language model for backward compatibility."""
+        """Backward-compatible alias for the text decoder.
+
+        Returns:
+            spx.Module: The Qwen3 language-model trunk owned by
+            :class:`Qwen3VLModel`. The LM head, in contrast, lives on
+            this outer wrapper rather than on the inner model.
+        """
         return self.model.language_model
 
     def get_video_features(

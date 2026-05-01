@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen3 model implementation for EasyDeL.
+
+This module implements Alibaba's Qwen3 dense decoder-only language
+model. Architectural traits:
+
+- RMSNorm normalization with pre-norm placement.
+- SwiGLU MLP.
+- Grouped-query attention with per-head RMSNorm on the query and key
+  projections (``q_norm``/``k_norm``), improving stability for the
+  larger Qwen3 models.
+- RoPE with optional scaling for extended context windows.
+- Per-layer attention type configuration (full vs. sliding-window),
+  controlled via ``layer_types``.
+
+Exposes :class:`Qwen3Model` (transformer trunk) and the task wrappers
+:class:`Qwen3ForCausalLM`, :class:`Qwen3ForSequenceClassification`, and
+the embedding-only :class:`Qwen3ForEmbedding`.
+"""
 
 from functools import partial
 
@@ -512,6 +530,13 @@ class Qwen3Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

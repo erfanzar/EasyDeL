@@ -291,7 +291,16 @@ class AuthStorage:
                 return {}
 
     def _serialize_key_metadata(self, metadata: ApiKeyMetadata) -> dict[str, tp.Any]:
-        """Serialize ApiKeyMetadata to JSON-compatible dict."""
+        """Serialize :class:`ApiKeyMetadata` to a JSON-compatible dict.
+
+        Args:
+            metadata: The metadata record to flatten.
+
+        Returns:
+            dict[str, tp.Any]: A nested mapping containing the key
+            identification, lifecycle, usage counters, rate limits, quota,
+            permissions, tags and arbitrary user metadata.
+        """
         return {
             "key_id": metadata.key_id,
             "key_prefix": metadata.key_prefix,
@@ -339,7 +348,14 @@ class AuthStorage:
         }
 
     def _deserialize_key_metadata(self, data: dict[str, tp.Any]) -> ApiKeyMetadata:
-        """Deserialize JSON dict to ApiKeyMetadata."""
+        """Inverse of :meth:`_serialize_key_metadata`.
+
+        Args:
+            data: A previously-serialized record from ``keys.json``.
+
+        Returns:
+            ApiKeyMetadata: The reconstructed dataclass instance.
+        """
         return ApiKeyMetadata(
             key_id=data["key_id"],
             key_prefix=data["key_prefix"],
@@ -367,7 +383,14 @@ class AuthStorage:
         )
 
     def _serialize_audit_log(self, log: AuditLogEntry) -> dict[str, tp.Any]:
-        """Serialize AuditLogEntry to JSON-compatible dict."""
+        """Serialize :class:`AuditLogEntry` to a JSON-compatible dict.
+
+        Args:
+            log: The audit-log entry.
+
+        Returns:
+            dict[str, tp.Any]: Mapping with all entry fields.
+        """
         return {
             "timestamp": log.timestamp,
             "key_id": log.key_id,
@@ -379,7 +402,14 @@ class AuthStorage:
         }
 
     def _deserialize_audit_log(self, data: dict[str, tp.Any]) -> AuditLogEntry:
-        """Deserialize JSON dict to AuditLogEntry."""
+        """Inverse of :meth:`_serialize_audit_log`.
+
+        Args:
+            data: Audit-log dict previously written to disk.
+
+        Returns:
+            AuditLogEntry: The reconstructed entry.
+        """
         return AuditLogEntry(
             timestamp=data["timestamp"],
             key_id=data.get("key_id"),
@@ -391,21 +421,31 @@ class AuthStorage:
         )
 
     def mark_dirty(self) -> None:
-        """Mark data as needing save."""
+        """Mark the in-memory state as needing a flush to disk.
+
+        Subsequent calls to :meth:`should_auto_save` will return ``True``
+        once the auto-save interval has elapsed.
+        """
         self._dirty = True
 
     def should_auto_save(self) -> bool:
-        """Check if auto-save should be triggered.
+        """Whether the periodic auto-save loop should write now.
 
         Returns:
-                True if auto_save is enabled and interval has elapsed
+            bool: ``True`` when ``auto_save`` is enabled, the state is
+            dirty, and at least ``save_interval`` seconds have passed since
+            the last successful save.
         """
         if not self.auto_save:
             return False
         return self._dirty and (time.time() - self._last_save) >= self.save_interval
 
     def clear_all(self) -> None:
-        """Clear all stored data (for testing/reset)."""
+        """Delete every stored auth file under the storage directory.
+
+        Intended for tests and explicit factory resets. The lock is held for
+        the duration of the operation.
+        """
         with self._lock:
             for file_path in [self.keys_file, self.audit_logs_file, self.stats_file]:
                 if file_path.exists():

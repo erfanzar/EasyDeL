@@ -121,7 +121,7 @@ def test_easydel_module_call_emits_sxstage_region_markers() -> None:
     config = LlamaConfig(
         hidden_size=8,
         intermediate_size=16,
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         num_attention_heads=2,
         num_key_value_heads=2,
         vocab_size=32,
@@ -135,13 +135,13 @@ def test_easydel_module_call_emits_sxstage_region_markers() -> None:
     assert {spec.name for spec in specs} == {"llama"}
 
 
-def test_scheduled_sxjit_rejects_stage_regions_loudly() -> None:
+def test_scheduled_sxjit_accepts_stage_regions() -> None:
     devices = np.asarray(jax.devices()[:1], dtype=object).reshape(1)
     mesh = MpMdMesh(Mesh(devices, axis_names=("pp",)), "pp")
     config = LlamaConfig(
         hidden_size=8,
         intermediate_size=16,
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         num_attention_heads=2,
         num_key_value_heads=2,
         vocab_size=32,
@@ -153,5 +153,5 @@ def test_scheduled_sxjit_rejects_stage_regions_loudly() -> None:
     def scheduled(x):
         return module(x).sum()
 
-    with pytest.raises(NotImplementedError, match="sxstage_region markers were found"):
-        scheduled(jnp.ones((2,), dtype=jnp.float32))
+    out = scheduled(jnp.ones((2,), dtype=jnp.float32))
+    assert np.allclose(np.asarray(out), np.asarray(4.0, dtype=np.float32))

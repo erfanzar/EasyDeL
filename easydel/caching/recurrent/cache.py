@@ -433,6 +433,11 @@ class RecurrentCacheView(BaseCacheView):
         )
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing conv/recurrent state shapes.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         conv_shape = self.conv_state.shape if self.conv_state is not None else None
         rec_shape = self.recurrent_state.shape if self.recurrent_state is not None else None
         return (
@@ -694,16 +699,28 @@ class RecurrentCache(BaseCache):
         return self.replace(views=new_views)
 
     def __repr__(self) -> str:
+        """Return a multi-line ``repr`` listing each layer view.
+
+        Returns:
+            A string with one ``repr`` per layer.
+        """
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
 
     __str__ = __repr__
 
 
 class RecurrentMetadata(BaseRunTimeMetadata):
-    """Runtime metadata for recurrent cache operations.
+    """Runtime-side companion to ``RecurrentCacheView`` for SSM/linear models.
 
-    Placeholder for future recurrent-model-specific runtime metadata.
-    May include sequence positions, segment boundaries, etc.
+    Recurrent caches don't currently need extra runtime metadata beyond the
+    state tensors themselves: position bookkeeping is implicit (each
+    ``concatenate_to_cache`` call advances the rolling conv buffer and SSM
+    state), and there is no padded KV table to mask. This class is therefore
+    intentionally empty and exists only so the unified
+    :class:`OperationsMetadata` wrapper has a typed slot to populate via
+    :meth:`OperationsMetadata.for_recurrent`. New fields can be added here
+    later (segment boundaries, layer-skip flags, …) without touching
+    :class:`HybridCache` or eSurge.
     """
 
     ...
@@ -711,16 +728,42 @@ class RecurrentMetadata(BaseRunTimeMetadata):
 
 # Convenience aliases for backward compatibility
 @auto_pytree
-class LinearCache(RecurrentCache): ...
+class LinearCache(RecurrentCache):
+    """Backward-compatibility alias for :class:`RecurrentCache`.
+
+    Older EasyDeL releases shipped a separate ``LinearCache`` for linear
+    attention variants (RWKV, RetNet, GatedDeltaNet) before they were
+    unified with the SSM cache implementation. The class is preserved as
+    a thin subclass so existing user code that imports ``LinearCache`` —
+    and pickled checkpoints that name the class — keep working without a
+    rename.
+    """
 
 
 @auto_pytree
-class LinearCacheConfig(RecurrentCacheConfig): ...
+class LinearCacheConfig(RecurrentCacheConfig):
+    """Backward-compatibility alias for :class:`RecurrentCacheConfig`.
+
+    Mirrors :class:`LinearCache`. New code should construct
+    :class:`RecurrentCacheConfig` directly; this subclass is kept so that
+    serialized configs still resolve.
+    """
 
 
 @auto_pytree
-class LinearCacheView(RecurrentCacheView): ...
+class LinearCacheView(RecurrentCacheView):
+    """Backward-compatibility alias for :class:`RecurrentCacheView`.
+
+    Mirrors :class:`LinearCache`; preserved purely for import-path
+    stability after the linear-attention/SSM cache unification.
+    """
 
 
 @auto_pytree
-class LinearMetadata(RecurrentMetadata): ...
+class LinearMetadata(RecurrentMetadata):
+    """Backward-compatibility alias for :class:`RecurrentMetadata`.
+
+    Same role as the other ``Linear*`` aliases — it lets older runner
+    code that referenced ``LinearMetadata`` keep importing the symbol
+    after the recurrent/linear cache merger.
+    """

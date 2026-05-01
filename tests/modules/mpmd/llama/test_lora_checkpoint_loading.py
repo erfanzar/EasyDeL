@@ -27,7 +27,7 @@ def _make_model(*, tie_word_embeddings: bool) -> LlamaForCausalLM:
     cfg = LlamaConfig(
         hidden_size=32,
         intermediate_size=64,
-        num_hidden_layers=1,
+        num_hidden_layers=4,
         num_attention_heads=2,
         num_key_value_heads=2,
         vocab_size=64,

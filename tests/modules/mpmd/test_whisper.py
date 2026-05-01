@@ -31,8 +31,8 @@ class TestWhisper:
         return ed.WhisperConfig(
             vocab_size=small_model_config["vocab_size"],
             d_model=small_model_config["hidden_size"],
-            encoder_layers=2,
-            decoder_layers=2,
+            encoder_layers=small_model_config["num_hidden_layers"],
+            decoder_layers=small_model_config["num_hidden_layers"],
             encoder_attention_heads=4,
             decoder_attention_heads=4,
             encoder_ffn_dim=small_model_config["intermediate_size"],

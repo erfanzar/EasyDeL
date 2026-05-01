@@ -337,6 +337,14 @@ def add_start_docstrings(*docstr):
     """
 
     def docstring_decorator(fn):
+        """Concatenate the captured docstring snippets onto ``fn.__doc__``.
+
+        Args:
+            fn: The function whose docstring will be augmented.
+
+        Returns:
+            Callable: The same function with its ``__doc__`` updated in-place.
+        """
         fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
         return fn
 
@@ -588,6 +596,24 @@ def apply_sparsity_to_params(
     sparsify_module: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo",
     verbose: bool = True,
 ) -> dict[str, tp.Any] | tp.Any:
+    """Convert dense weight matrices in *params* into a JAX sparse format.
+
+    Walks the parameter pytree and rewrites every 2D/3D ``weight`` leaf into
+    the requested ``jax.experimental.sparse`` container.
+
+    Args:
+        params: Parameter pytree (flat or nested dict).
+        sparsify_module: Sparse format name (``"bcoo"``, ``"bcsr"``, ``"coo"``
+            or ``"csr"``).
+        verbose: Whether to render a tqdm progress bar.
+
+    Returns:
+        dict | Any: A pytree mirroring *params*' nesting with sparsified
+        weights.
+
+    Raises:
+        ValueError: If ``sparsify_module`` is not recognized.
+    """
     flatten = is_flatten(params)
     if not flatten:
         params = flatten_dict(params)
@@ -603,6 +629,15 @@ def apply_sparsity_to_params(
         raise ValueError(f"unknown type of sparser {sparsify_module}")
 
     def _path_to_str(path):
+        """Render a JAX pytree key path as a dotted string.
+
+        Args:
+            path: Iterable of pytree key objects (``DictKey``,
+                ``GetAttrKey``, ``SequenceKey``, etc.).
+
+        Returns:
+            str: A dotted joining of human-readable key names.
+        """
         path_keys = []
         for key in path:
             if hasattr(key, "key"):
@@ -616,6 +651,16 @@ def apply_sparsity_to_params(
         return ".".join(path_keys)
 
     def filter_params(path, array):
+        """Sparsify only ``weight`` leaves with rank in ``{2, 3}``.
+
+        Args:
+            path: Pytree key path identifying *array*.
+            array: A parameter leaf.
+
+        Returns:
+            Any: The sparsified array, or the original leaf when not
+            eligible.
+        """
         layer_name = _path_to_str(path)
         if layer_name.endswith("weight") and 4 > array.ndim > 1:
             array = sparser.fromdense(array)
@@ -629,6 +674,15 @@ def apply_sparsity_to_params(
     ) as pbar:
 
         def _with_progress(path, array):
+            """Sparsify one leaf and advance the surrounding progress bar.
+
+            Args:
+                path: Pytree key path for the leaf.
+                array: The leaf value.
+
+            Returns:
+                Any: The (possibly sparsified) array.
+            """
             pbar.set_postfix_str(_path_to_str(path))
             result = filter_params(path, array)
             pbar.update(1)
@@ -694,7 +748,9 @@ def auto_remat(  # pyright: ignore[reportOverlappingOverload]
     prevent_cse: bool = True,
     save_names: list[str] | None = None,
     exclude_names: list[str] | None = None,
-) -> type[M]: ...
+) -> type[M]:
+    """Single-module overload: see :func:`auto_remat` for full documentation."""
+    ...
 
 
 @tp.overload
@@ -707,7 +763,9 @@ def auto_remat(
     prevent_cse: bool = True,
     save_names: list[str] | None = None,
     exclude_names: list[str] | None = None,
-) -> tuple[type[M], type[M]]: ...
+) -> tuple[type[M], type[M]]:
+    """Two-module overload: see :func:`auto_remat` for full documentation."""
+    ...
 
 
 @tp.overload
@@ -717,7 +775,9 @@ def auto_remat(
     prevent_cse: bool = True,
     save_names: list[str] | None = None,
     exclude_names: list[str] | None = None,
-) -> tuple[type[M], ...]: ...
+) -> tuple[type[M], ...]:
+    """Variadic overload: see :func:`auto_remat` for full documentation."""
+    ...
 
 
 def auto_remat(
@@ -1125,6 +1185,14 @@ def count_flop_jaxpr(jaxpr) -> int:
     flops = 0
 
     def visit_jaxpr(jaxpr):
+        """Walk a jaxpr and accumulate FLOP estimates into the outer scope.
+
+        Args:
+            jaxpr: The jaxpr to traverse.
+
+        Returns:
+            None. ``flops`` from the enclosing scope is updated in-place.
+        """
         nonlocal flops
         for eqn in jaxpr.eqns:
             primitive_name = eqn.primitive.name
@@ -1157,16 +1225,34 @@ class TraceResult:
     """
 
     def __init__(self, executable):
+        """Wrap an XLA executable and prepare lazy cost-analysis caching.
+
+        Args:
+            executable: The compiled XLA executable.
+
+        Returns:
+            None.
+        """
         self._executable = executable
         self._cached_cost = None
 
     @property
     @lru_cache(maxsize=1)  # noqa
     def cost_analysis(self):
+        """Return the executable's cost-analysis dict (cached on first access).
+
+        Returns:
+            dict: XLA cost-analysis output (FLOPs, bytes accessed, etc.).
+        """
         return self._executable.cost_analysis()
 
     @property
     def flops(self):
+        """Return the ``flops`` entry from the cached cost analysis.
+
+        Returns:
+            int | float: FLOP count reported by XLA.
+        """
         return self.cost_analysis["flops"]
 
 
@@ -1188,10 +1274,23 @@ class FunctionTracer:
     """
 
     def __init__(self):
+        """Initialize an empty tracer with no captured executables.
+
+        Returns:
+            None.
+        """
         self.new_executables: list[TraceResult] = []
         self._before: set = set()
 
     def __getitem__(self, idx):
+        """Return the *idx*-th captured :class:`TraceResult`.
+
+        Args:
+            idx: Sequence index into ``self.new_executables``.
+
+        Returns:
+            TraceResult: The captured trace at that index.
+        """
         return self.new_executables[idx]
 
 
@@ -1221,12 +1320,23 @@ class CompilationTracker:
     """
 
     def __init__(self):
+        """Initialize the tracker in a not-yet-traced state.
+
+        Returns:
+            None.
+        """
         self.first_time = True
         self.cached_flops = 0
         self.functions = None
 
     @property
     def online_flops(self):
+        """Sum FLOPs across the currently tracked executables.
+
+        Returns:
+            int | float: Aggregate FLOP count, or ``0`` if nothing has been
+            traced yet or cost analysis fails for every executable.
+        """
         if self.functions is None:
             return 0
         cached_flops = 0
@@ -1239,6 +1349,17 @@ class CompilationTracker:
 
     @contextmanager
     def trace_compilation(self):
+        """Capture executables compiled inside the ``with`` block.
+
+        On the first invocation, records the set of live executables before
+        and after the block, accumulates ``cost_analysis()`` FLOPs into
+        ``cached_flops``, and stores the new executables on ``functions``.
+        Subsequent invocations are no-ops.
+
+        Yields:
+            None: Use inside ``with tracker.trace_compilation():`` to record
+            compilation that happens during the body.
+        """
         if self.first_time:
             before = set(jax.extend.backend.get_backend().live_executables())
             yield
@@ -1258,6 +1379,24 @@ class CompilationTracker:
 
 
 class ActivationType(StrEnum):
+    """Enumeration of activation functions recognized by FLOP estimators.
+
+    Attributes:
+        GELU: Standard Gaussian Error Linear Unit.
+        RELU: Rectified Linear Unit.
+        SILU: Sigmoid Linear Unit (a.k.a. Swish).
+        SWISH: Synonym for ``SILU``.
+        GELU_NEW: GELU approximation using tanh (HF "new" variant).
+        GELU_PYTORCH_TANH: PyTorch tanh-based GELU.
+        TANH: Hyperbolic tangent.
+        SIGMOID: Logistic sigmoid.
+        LEAKY_RELU: ReLU with non-zero negative slope.
+        GLU: Gated Linear Unit.
+        ELU: Exponential Linear Unit.
+        SOFTMAX: Softmax (classification head activation).
+        QUICK_GELU: Inexpensive GELU approximation ``x * sigmoid(1.702 * x)``.
+    """
+
     GELU = "gelu"
     RELU = "relu"
     SILU = "silu"
@@ -1296,6 +1435,15 @@ def flop_activation(activation_type: ActivationType, dim: int) -> float:
 
 
 class AttnMaskType(StrEnum):
+    """Coarse attention-mask categories used by the eSurge scheduler.
+
+    Attributes:
+        FULL: Full causal/non-causal attention.
+        SLIDING: Sliding-window attention.
+        CHUNK: Chunked / blockwise attention.
+        LINEAR: Linear-attention layer (treated as full for cache grouping).
+    """
+
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
@@ -1315,6 +1463,17 @@ class AttnMaskType(StrEnum):
             "parallel_hybrid",
         ],
     ):
+        """Map a HuggingFace ``layer_types`` string to an :class:`AttnMaskType`.
+
+        Args:
+            hf_type: HF layer-type identifier.
+
+        Returns:
+            AttnMaskType: The corresponding eSurge mask category.
+
+        Raises:
+            ValueError: If *hf_type* is not recognized.
+        """
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
         elif hf_type in ("full_attention", "linear_attention", "kda_linear_attention", "hybrid", "parallel_hybrid"):
@@ -1444,6 +1603,14 @@ class FlopCalcConfig:
 
 
 def flop_layernorm(hidden_dim: int) -> float:
+    """Estimate FLOPs for a single LayerNorm/RMSNorm over ``hidden_dim``.
+
+    Args:
+        hidden_dim: Hidden dimension being normalized.
+
+    Returns:
+        float: FLOP estimate (~8 * hidden_dim).
+    """
     return 8 * hidden_dim
 
 
@@ -1454,6 +1621,20 @@ def flop_attention(
     head_dim: int | None,
     seq_len: int,
 ) -> float:
+    """Estimate per-token FLOPs for a multi-head self-attention block.
+
+    Args:
+        hidden_dim: Model hidden size.
+        num_heads: Number of query heads.
+        num_kv_heads: Number of key/value heads (for GQA/MQA).
+        head_dim: Per-head dim, or ``None`` to derive ``hidden_dim //
+            num_heads``.
+        seq_len: Effective sequence length.
+
+    Returns:
+        float: FLOP estimate including QKV projection, attention scores,
+        masking, weighted sum, and output projection.
+    """
     if head_dim is None:
         head_dim = hidden_dim // num_heads
     qkv_proj = 2 * hidden_dim * (num_heads * head_dim + 2 * num_kv_heads * head_dim)
@@ -1472,6 +1653,17 @@ def flop_cross_attention(
     enc_seq_len: int,
     dec_seq_len: int,
 ) -> float:
+    """Estimate FLOPs for an encoder-decoder cross-attention block.
+
+    Args:
+        hidden_dim: Model hidden size.
+        num_heads: Number of attention heads.
+        enc_seq_len: Encoder sequence length (keys/values).
+        dec_seq_len: Decoder sequence length (queries).
+
+    Returns:
+        float: Total cross-attention FLOP estimate.
+    """
     head_dim = hidden_dim // num_heads
     proj = 2 * hidden_dim * hidden_dim
     scores = 2 * head_dim * enc_seq_len * dec_seq_len * num_heads
@@ -1486,6 +1678,17 @@ def flop_mlp(
     hidden_dim: int,
     intermediate_dim: int,
 ) -> float:
+    """Estimate FLOPs for an MLP / MoE FFN block.
+
+    Args:
+        cfg: Model FLOP configuration (provides activation, MoE topology).
+        hidden_dim: Hidden dimension.
+        intermediate_dim: FFN intermediate dimension.
+
+    Returns:
+        float: FLOPs including up/down/gate projections, activation, and
+        router cost when MoE is active.
+    """
     factor = 3 if cfg.glu else 2
     base = factor * hidden_dim * intermediate_dim
     total_ffn = base * (cfg.num_experts_per_tok + cfg.num_shared_experts)
@@ -1499,14 +1702,40 @@ def flop_mlp(
 
 
 def flop_lm_head(hidden_dim: int, vocab_size: int) -> float:
+    """Estimate FLOPs for the LM head projection.
+
+    Args:
+        hidden_dim: Hidden dimension.
+        vocab_size: Vocabulary size.
+
+    Returns:
+        float: ``2 * hidden_dim * vocab_size + 5 * vocab_size``.
+    """
     return 2 * hidden_dim * vocab_size + 5 * vocab_size
 
 
 def flop_cls_head(hidden_dim: int, num_labels: int) -> float:
+    """Estimate FLOPs for a classification head.
+
+    Args:
+        hidden_dim: Hidden dimension.
+        num_labels: Number of output classes.
+
+    Returns:
+        float: ``2 * hidden_dim * num_labels + 5 * num_labels``.
+    """
     return 2 * hidden_dim * num_labels + 5 * num_labels
 
 
 def flop_loss(num_classes: int) -> float:
+    """Estimate FLOPs for the cross-entropy loss over ``num_classes``.
+
+    Args:
+        num_classes: Number of output classes.
+
+    Returns:
+        float: ``3 * num_classes + 2``.
+    """
     return 3 * num_classes + 2
 
 
@@ -1517,6 +1746,18 @@ def flop_transformer_body(
     intermediate_dim: int,
     cfg: FlopCalcConfig,
 ) -> float:
+    """Estimate FLOPs for the transformer trunk (attention + MLP + norms).
+
+    Args:
+        layers: Number of transformer blocks.
+        seq_len: Sequence length.
+        hidden_dim: Hidden dimension.
+        intermediate_dim: FFN intermediate dimension.
+        cfg: Full FLOP-calc configuration.
+
+    Returns:
+        float: Total FLOPs across all layers.
+    """
     ln = 2 * flop_layernorm(hidden_dim)
     att = flop_attention(
         hidden_dim,
@@ -1530,6 +1771,15 @@ def flop_transformer_body(
 
 
 def flop_seq2seq(cfg: FlopCalcConfig) -> float:
+    """Estimate FLOPs for an encoder-decoder seq2seq pass.
+
+    Args:
+        cfg: Full FLOP-calc configuration.
+
+    Returns:
+        float: Encoder + decoder FLOPs (decoder includes self-attention,
+        cross-attention, MLP, and norms).
+    """
     enc = flop_transformer_body(
         cfg.enc_num_layers,
         cfg.enc_seq_len,
@@ -1557,6 +1807,14 @@ def flop_seq2seq(cfg: FlopCalcConfig) -> float:
 
 
 def flop_vision_tower(cfg: FlopCalcConfig) -> float:
+    """Estimate FLOPs for the vision tower trunk.
+
+    Args:
+        cfg: Full FLOP-calc configuration (uses ``vision_*`` fields).
+
+    Returns:
+        float: FLOPs for the vision encoder.
+    """
     return flop_transformer_body(
         cfg.vision_num_layers,
         cfg.vision_seq_len,
@@ -1567,6 +1825,20 @@ def flop_vision_tower(cfg: FlopCalcConfig) -> float:
 
 
 def flops_per_token(cfg: FlopCalcConfig) -> float:
+    """Estimate task-specific FLOPs per token for the configured model.
+
+    Dispatches by ``cfg.task`` to compute the appropriate trunk + head + loss
+    cost (causal LM, classification, seq2seq, vision-language, etc.).
+
+    Args:
+        cfg: Full FLOP-calc configuration.
+
+    Returns:
+        float: Estimated FLOPs per token for one forward pass.
+
+    Raises:
+        NotImplementedError: If ``cfg.task`` is not recognized.
+    """
     body_cost = 0
     head_cost = 0
     loss_cost = 0
@@ -1652,6 +1924,16 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
 
 @contextmanager
 def trace_functions():
+    """Context manager that captures XLA executables compiled during the body.
+
+    Records the set of live executables before entering the ``with`` block
+    and, on exit, populates the yielded :class:`FunctionTracer` with a
+    :class:`TraceResult` for each new executable.
+
+    Yields:
+        FunctionTracer: A tracer that exposes ``new_executables`` and
+        therefore ``flops`` after the block exits.
+    """
     tracer = FunctionTracer()
     tracer._before = set(jax.extend.backend.get_backend().live_executables())
 
@@ -1672,6 +1954,15 @@ class ModuleCaches(spx.Buffer):
     """
 
     def __init__(self, value, **kwargs):
+        """Initialize a cache buffer holding *value*.
+
+        Args:
+            value: Initial cached value (any pytree).
+            **kwargs: Forwarded to :class:`spx.Buffer`.
+
+        Returns:
+            None.
+        """
         super().__init__(value, kind="cache", **kwargs)
 
 
@@ -1685,6 +1976,13 @@ class OverWriteWithGradient(spx.Parameter):
 
 
 class hashable_dict(dict):
+    """Dict subclass that participates in static-hash JIT cache keys.
+
+    Provides a deterministic ``__hash__`` (delegated to :func:`hash_fn`) so
+    instances can be passed through ``jax.jit`` ``static_argnums`` /
+    ``static_argnames`` and used as keys in static-config caches.
+    """
+
     __hash__ = hash_fn
 
 
@@ -1727,6 +2025,25 @@ class ArrayParam(spx.Parameter):
         axis_names: tuple[object | None, ...] | None = None,
         **kwargs,
     ):
+        """Construct a serializable, lazily-initializable parameter.
+
+        Args:
+            value: Concrete parameter value (or an abstract shape stand-in).
+            shape: Optional shape override (defaults to ``value.shape``).
+            dtype: Optional dtype override (defaults to ``value.dtype``).
+            init_method: Name of the JAX initializer (``"normal"``,
+                ``"zeros"``, ``"ones"``, etc.).
+            init_kwargs: Optional :class:`hashable_dict` of kwargs forwarded
+                to the initializer.
+            sharding: Optional explicit sharding metadata; either a
+                :class:`spx.Sharding` or a tuple of mesh axis names.
+            axis_names: Optional explicit per-dim axis names (an alternative
+                way to express ``sharding``).
+            **kwargs: Forwarded to :class:`spx.Parameter`.
+
+        Returns:
+            None.
+        """
         if init_kwargs is None:
             init_kwargs = hashable_dict()
         elif not isinstance(init_kwargs, hashable_dict):

@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of EleutherAI's GPT-NeoX decoder-only language model.
+
+GPT-NeoX is a scalable autoregressive transformer family (up to 20B+ params),
+with a fused QKV projection, partial rotary positional embeddings, and an
+optional parallel-residual layout that runs attention and MLP in parallel.
+
+Architectural traits:
+    - Fused ``query_key_value`` projection per attention block.
+    - Partial RoPE controlled by ``rotary_pct`` (default 25%).
+    - Optional parallel residual: ``x + attn(x) + mlp(x)`` instead of the
+      standard sequential pre-norm composition.
+    - LayerNorm pre-attention and pre-MLP.
+
+Exports:
+    - :class:`GPTNeoXModel`: Backbone returning hidden states.
+    - :class:`GPTNeoXForCausalLM`: Decoder LM with optional tied LM head.
+"""
 
 import functools
 from typing import ClassVar

@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the CPO trainer.
+
+Contrastive Preference Optimization (CPO) is a reference-free
+preference-learning method that combines a max-margin preference loss
+with an auxiliary supervised log-likelihood term on the chosen
+response, scaled by ``cpo_alpha``.  This module defines the
+:class:`CPOConfig` dataclass holding the algorithm knobs.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -30,18 +39,71 @@ LOSS_TYPES = tp.Literal["sigmoid", "hinge", "ipo", "simpo", "alphapo"]
 class CPOConfig(TrainingArguments):
     """Configuration class for Contrastive Preference Optimization (CPO) training.
 
-    This dataclass extends :class:`TrainingArguments` with the knobs required to reproduce
-    the behaviour of the TRL CPO trainer while keeping the EasyDeL runtime defaults.
+    CPO (Xu et al. 2024) is a *reference-free* preference-learning
+    objective: it combines a max-margin contrastive loss between
+    chosen and rejected completions with an auxiliary supervised
+    log-likelihood term on the chosen completion, weighted by
+    ``cpo_alpha``. Because no reference model is required, CPO sidesteps
+    the reference forward and the associated KL drift accounting that
+    DPO uses, at the cost of a stronger anchoring on the supervised
+    objective.
 
-    Key parameters:
-        beta: Temperature controlling how far the updated policy may drift.
-        loss_type: Choice of CPO loss formulation (sigmoid, hinge, ipo, simpo, alphapo).
-        cpo_alpha: Weight for the behaviour cloning regulariser.
-        simpo_gamma: Margin used by SimPO when ``loss_type == "simpo"``.
-        alpha: AlphaPO reward shaping parameter (alpha == 0 disables the transform).
-        label_pad_token_id: Token id ignored by the NLL term.
-        padding_value: Explicit padding token id for collators (defaults to tokenizer pad).
-        max_length / max_prompt_length / max_completion_length: Sequence length controls.
+    The ``loss_type`` field selects between several variants:
+
+    * ``"sigmoid"`` -- the canonical contrastive logistic surrogate.
+    * ``"hinge"`` -- max-margin hinge form.
+    * ``"ipo"`` -- IPO-style squared-error contrastive surrogate.
+    * ``"simpo"`` -- SimPO (Meng et al. 2024); length-normalized
+      log-probs with explicit margin ``simpo_gamma``.
+    * ``"alphapo"`` -- AlphaPO syntactic sugar that resolves to
+      ``simpo`` with ``cpo_alpha = 0.0`` after ``__post_init__``,
+      using the AlphaPO probability-power transform when
+      ``alpha != 0``.
+
+    Construct using dict-literal kwargs, e.g.:
+
+    >>> cfg = CPOConfig(beta=0.1, loss_type="simpo", simpo_gamma=0.5)
+
+    Attributes:
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"CPO"``).
+        beta: Inverse-temperature on the policy-vs-reference log-ratio.
+            Larger values keep the policy closer to the reference (or,
+            in the reference-free case, to the supervised target).
+        label_smoothing: Optional cDPO-style smoothing applied to the
+            contrastive loss. Default ``0.0``.
+        loss_type: One of ``"sigmoid"``, ``"hinge"``, ``"ipo"``,
+            ``"simpo"``, ``"alphapo"``. Default ``"sigmoid"``.
+        disable_dropout: When ``True``, dropout is disabled on the
+            policy for deterministic logp computation.
+        cpo_alpha: Weight on the behaviour-cloning (supervised) term
+            added to the contrastive loss. ``0.0`` recovers the pure
+            contrastive objective (AlphaPO/SimPO variants).
+        simpo_gamma: Target reward margin used by SimPO. Only consulted
+            when ``loss_type == "simpo"``. Default ``0.5``.
+        alpha: AlphaPO reward shaping parameter. ``0.0`` uses log-prob
+            rewards; non-zero applies ``(1 - p**(-alpha)) / alpha``
+            to the token probabilities.
+        label_pad_token_id: Token id used to mask prompt tokens in the
+            supervised NLL term (default ``-100``).
+        padding_value: Explicit padding token id for completions.
+            Falls back to the tokenizer pad token when ``None``.
+        truncation_mode: ``"keep_end"`` or ``"keep_start"`` truncation
+            policy.
+        max_length: Maximum combined ``prompt + completion`` sequence
+            length. Default ``1024``.
+        max_prompt_length: Maximum prompt-only token budget. Default
+            ``512``.
+        max_completion_length: Maximum completion token budget;
+            defaults to ``max_length - max_prompt_length`` when not
+            explicitly set.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for
+            :func:`compute_token_logps_and_entropies_chunked`. ``None``
+            disables chunking.
+        is_encoder_decoder: Override automatic encoder-decoder
+            detection.
+        dataset_num_proc: Worker count for ``Dataset.map`` calls
+            during preprocessing.
     """
 
     trainer_prefix: str | None = field(
@@ -148,6 +210,20 @@ class CPOConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Finalize CPO-specific config invariants.
+
+        Resolves the legacy ``max_sequence_length`` alias, derives
+        ``max_completion_length`` from
+        ``max_length - max_prompt_length`` when omitted, applies the
+        ``"alphapo"`` syntactic-sugar (which becomes SimPO with
+        ``cpo_alpha=0.0``), normalizes ``logprob_vocab_chunk_size``,
+        and finally defers to the base ``__post_init__``.
+
+        Args:
+            max_sequence_length: Legacy alias for ``max_length``.
+            quantization_block: Legacy alias for the quantization group
+                size; forwarded to the base class.
+        """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:

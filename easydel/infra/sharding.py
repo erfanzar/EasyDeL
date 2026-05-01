@@ -86,6 +86,19 @@ _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
 
 
 def _coerce_partition_axis(value: AxisPolicy | PartitionAxis | dict[str, tp.Any] | None) -> PartitionAxis:
+    """Coerce *value* into a :class:`PartitionAxis` instance.
+
+    Args:
+        value: An :class:`AxisPolicy`, :class:`PartitionAxis`, mapping of
+            field overrides, or ``None`` for defaults.
+
+    Returns:
+        PartitionAxis: A defensively copied or freshly constructed
+        partition-axis object.
+
+    Raises:
+        TypeError: If *value* is none of the accepted input types.
+    """
     if isinstance(value, AxisPolicy):
         return value.to_partition_axis()
     if value is None:
@@ -105,6 +118,22 @@ def coerce_axis_policy(value: AxisPolicy | PartitionAxis | dict[str, tp.Any] | N
 
 
 def _normalize_axis_entry(value: tp.Any) -> AxisEntry:
+    """Coerce a single axis entry into the canonical ``AxisEntry`` form.
+
+    Accepts strings, sequences of strings, ``None``, the sentinel ``EMPTY``,
+    or the empty marker ``"_"``. Sequences are flattened one level so nested
+    tuples collapse into a single tuple of mesh axis names.
+
+    Args:
+        value: Raw axis specification.
+
+    Returns:
+        AxisEntry: ``None`` for empty inputs, a single string for one axis,
+        or a tuple of strings for compound axes.
+
+    Raises:
+        TypeError: If *value* is neither ``None``, a string, nor a sequence.
+    """
     if value in (None, EMPTY, "_"):
         return None
     if isinstance(value, list | tuple):
@@ -128,10 +157,28 @@ def _normalize_axis_entry(value: tp.Any) -> AxisEntry:
 
 
 def _normalize_axes(axes: tp.Iterable[tp.Any]) -> AxisEntries:
+    """Normalize an iterable of axis entries into a tuple of canonical entries.
+
+    Args:
+        axes: Iterable of raw axis specifications.
+
+    Returns:
+        AxisEntries: Tuple of normalized :func:`_normalize_axis_entry` results.
+    """
     return tuple(_normalize_axis_entry(axis) for axis in axes)
 
 
 def _normalize_logical_axis_rules(overrides: LogicalAxisRules | None) -> tuple[tuple[str, str | None], ...]:
+    """Coerce logical axis-rule overrides into a sorted tuple of pairs.
+
+    Args:
+        overrides: Either a mapping or iterable of
+            ``(logical_name, mesh_axis)`` pairs (mesh_axis may be ``None``).
+
+    Returns:
+        tuple: Tuple of ``(str, str | None)`` pairs with both keys and values
+        coerced to strings (or ``None``).
+    """
     if overrides is None:
         return ()
     items = overrides.items() if isinstance(overrides, Mapping) else overrides
@@ -142,6 +189,16 @@ def _normalize_logical_axis_rules(overrides: LogicalAxisRules | None) -> tuple[t
 
 
 def _simple_rule_value(value: tp.Any) -> str | None | object:
+    """Reduce an axis entry to a simple-rule value, or mark it unsupported.
+
+    Args:
+        value: Raw axis entry.
+
+    Returns:
+        str | None | object: ``None`` for empty entries, a single string for
+        one mesh axis, or :data:`_UNSUPPORTED_SIMPLE_RULE` for compound
+        (multi-axis) entries which cannot be expressed as a simple rule.
+    """
     normalized = _normalize_axis_entry(value)
     if normalized is None:
         return None
@@ -311,10 +368,28 @@ def mesh_axis_size(mesh: OptionalMesh | tp.Any, axis_name: tp.Any) -> int:
 
 
 def _mesh_axis_size(mesh: MeshLike, axis_name: str) -> int:
+    """Internal alias for :func:`mesh_axis_size`.
+
+    Args:
+        mesh: A JAX/SpectraX mesh-like object.
+        axis_name: Axis name to look up.
+
+    Returns:
+        int: The mesh size along ``axis_name``, or ``1`` if missing.
+    """
     return mesh_axis_size(mesh, axis_name)
 
 
 def _mesh_partition_product(mesh: MeshLike, axis_spec: AxisEntry) -> int:
+    """Internal alias for :func:`mesh_partition_product`.
+
+    Args:
+        mesh: A JAX/SpectraX mesh-like object.
+        axis_spec: Single axis name, tuple of axis names, or ``None``.
+
+    Returns:
+        int: Total shard multiplicity implied by ``axis_spec``.
+    """
     return mesh_partition_product(mesh, axis_spec)
 
 
@@ -336,6 +411,16 @@ def coerce_partition_spec(spec: tp.Any) -> PartitionSpec | None:
 
 
 def _resolve_named_sharding_mesh(mesh: MeshLike) -> tuple[Mesh, MpMdMesh | None]:
+    """Split a SpectraX mesh wrapper into ``(jax_mesh, optional_mpmd_mesh)``.
+
+    Args:
+        mesh: A ``jax.sharding.Mesh``, :class:`spx.SpxMesh`, or
+            :class:`MpMdMesh`.
+
+    Returns:
+        tuple: ``(base JAX mesh, mpmd mesh or None)``. For non-SpectraX
+        meshes ``(mesh, None)`` is returned.
+    """
     if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, spx.SpxMesh):
         return mesh.jax_mesh, mesh.mpmd_mesh
     if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
@@ -347,6 +432,19 @@ def _stage_local_mesh(
     mesh: MeshLike,
     metadata: dict[str, tp.Any] | None,
 ) -> Mesh:
+    """Return the stage-local submesh implied by parameter metadata.
+
+    For MPMD meshes, parameters that record a ``stage_assignment`` should
+    only live on the submesh owning that stage. Non-MPMD meshes (or
+    parameters without a stage assignment) get the full mesh.
+
+    Args:
+        mesh: The full mesh (possibly an MPMD wrapper).
+        metadata: Parameter metadata that may carry a ``stage_assignment``.
+
+    Returns:
+        Mesh: The owning JAX mesh (full mesh or stage submesh).
+    """
     assignment = metadata_stage_assignment(metadata)
     if assignment is None:
         if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, spx.SpxMesh):
@@ -374,6 +472,14 @@ def is_mpmd_mesh(mesh: OptionalMesh) -> bool:
 
 
 def _is_mpmd_mesh(mesh: OptionalMesh) -> bool:
+    """Internal alias for :func:`is_mpmd_mesh`.
+
+    Args:
+        mesh: A mesh-like object or ``None``.
+
+    Returns:
+        bool: ``True`` if *mesh* is a SpectraX MPMD wrapper.
+    """
     return is_mpmd_mesh(mesh)
 
 
@@ -428,6 +534,17 @@ def sanitize_sharding_axes_for_shape(
 
 
 def _flatten_mapping(tree: tp.Any, prefix: tuple[tp.Any, ...] = ()) -> dict[tuple[tp.Any, ...], tp.Any]:
+    """Flatten a nested-dict pytree into a path-keyed dict.
+
+    Args:
+        tree: A nested mapping or leaf value.
+        prefix: Internal accumulator of the current path; callers should
+            leave the default.
+
+    Returns:
+        dict: Mapping from path tuples (one element per nesting level) to
+        leaf values.
+    """
     if not isinstance(tree, dict):
         return {prefix: tree}
     flat: dict[tuple[tp.Any, ...], tp.Any] = {}
@@ -437,6 +554,14 @@ def _flatten_mapping(tree: tp.Any, prefix: tuple[tp.Any, ...] = ()) -> dict[tupl
 
 
 def _unflatten_mapping(flat: Mapping[tuple[tp.Any, ...], tp.Any]) -> dict[tp.Any, tp.Any]:
+    """Inverse of :func:`_flatten_mapping`: rebuild a nested dict from path keys.
+
+    Args:
+        flat: Mapping from path tuples to leaf values.
+
+    Returns:
+        dict: A nested-dict reconstruction.
+    """
     root: dict[tp.Any, tp.Any] = {}
     for path, value in flat.items():
         cursor = root
@@ -456,6 +581,16 @@ def sanitize_partition_specs_for_shape_tree(
     adjusted = {"count": 0}
 
     def _sanitize(spec: tp.Any, shape_obj: tp.Any) -> tp.Any:
+        """Sanitize a single ``(PartitionSpec, shape)`` pair.
+
+        Args:
+            spec: Candidate :class:`PartitionSpec` (other types pass through).
+            shape_obj: Object exposing a ``.shape`` attribute.
+
+        Returns:
+            The safe partition spec, increasing ``adjusted["count"]`` from the
+            enclosing scope when changes are made.
+        """
         if not isinstance(spec, PartitionSpec) or not hasattr(shape_obj, "shape"):
             return spec
         safe_spec = sanitize_partition_spec_for_shape(
@@ -549,10 +684,28 @@ class TensorLayout:
     mode: str | int = MODE_TRAIN
 
     def __post_init__(self) -> None:
+        """Normalize ``axes`` after dataclass construction.
+
+        Returns:
+            None.
+        """
         object.__setattr__(self, "axes", _normalize_axes(self.axes))
 
     @classmethod
     def from_any(cls, value: tp.Any) -> TensorLayout | None:
+        """Best-effort coercion from a variety of layout-like inputs.
+
+        Accepts ``TensorLayout``, mappings with ``axes``/``mode`` keys,
+        named-tuple-like layouts, plain sequences (treated as ``axes``), or
+        objects that simply expose ``axes`` and ``mode`` attributes.
+
+        Args:
+            value: Candidate layout description.
+
+        Returns:
+            TensorLayout | None: A :class:`TensorLayout` instance, or
+            ``None`` if *value* could not be interpreted.
+        """
         if value is None:
             return None
         if isinstance(value, cls):
@@ -573,9 +726,19 @@ class TensorLayout:
         return None
 
     def to_dict(self) -> dict[str, tp.Any]:
+        """Return a serializable dict view of this layout.
+
+        Returns:
+            dict: Keys ``axes`` and ``mode`` mirroring the dataclass fields.
+        """
         return {"axes": self.axes, "mode": self.mode}
 
     def as_spectrax_sharding(self) -> spx.Sharding:
+        """Convert this layout to a native :class:`spx.Sharding`.
+
+        Returns:
+            spx.Sharding: Sharding metadata with the same axis names.
+        """
         return spx.Sharding(axis_names=self.axes)
 
 
@@ -610,6 +773,18 @@ def metadata_for_layout(
 
 
 def _sharding_axis_names_from_metadata(metadata: Mapping[str, tp.Any]) -> tp.Any | None:
+    """Extract per-dimension axis names from a metadata mapping.
+
+    Looks for a SpectraX ``sharding`` entry first (dict or
+    :class:`spx.Sharding`) and falls back to a raw ``axis_names`` field.
+
+    Args:
+        metadata: Variable metadata dict.
+
+    Returns:
+        Any | None: Tuple of axis names per dimension, or ``None`` when none
+        are recorded.
+    """
     sharding = metadata.get("sharding")
     if isinstance(sharding, dict):
         sharding = spx.Sharding(
@@ -622,6 +797,15 @@ def _sharding_axis_names_from_metadata(metadata: Mapping[str, tp.Any]) -> tp.Any
 
 
 def _metadata_has_compound_axis_names(metadata: Mapping[str, tp.Any]) -> bool:
+    """Return whether *metadata* declares any compound (multi-axis) sharding.
+
+    Args:
+        metadata: Variable metadata dict.
+
+    Returns:
+        bool: ``True`` if any per-dimension entry is a list or tuple of mesh
+        axis names (i.e. the dim is sharded across multiple mesh axes).
+    """
     axis_names = _sharding_axis_names_from_metadata(metadata)
     if axis_names is None:
         return False
@@ -633,32 +817,118 @@ def _metadata_has_compound_axis_names(metadata: Mapping[str, tp.Any]) -> bool:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class AxisPolicy:
-    """Immutable semantic-axis configuration for EasyDeL."""
+    """Immutable wrapper around a :class:`PartitionAxis` that exposes EasyDeL's logical axis vocabulary.
+
+    EasyDeL describes parameter and activation sharding using *logical* axis
+    names (``batch``, ``hidden``, ``head``, ``query_sequence``, ...) instead of
+    the concrete mesh axis names (``dp``, ``fsdp``, ``tp``, ``sp``, ``ep``,
+    ``pp``). The mapping between logical names and mesh names lives on the
+    underlying :class:`spectrax.PartitionAxis` and depends on the resolution
+    *mode* (e.g. ``"train"`` vs ``"decode"``, where during single-token decode
+    several sequence-bound axes collapse to replicated).
+
+    ``AxisPolicy`` packages that ``PartitionAxis`` together with three
+    facilities used throughout the rest of the codebase:
+
+    1. **Coercion** — :meth:`from_partition_axis`, :meth:`from_dict`, and
+       :meth:`from_any` accept the various inputs (existing
+       :class:`AxisPolicy`, raw :class:`PartitionAxis`, dict of overrides,
+       ``None``) and return a normalized policy; this is the single entry
+       point for accepting user-provided axis configuration.
+    2. **Resolution** — :meth:`resolve_axis` and :meth:`resolve_spec` dispatch
+       a sequence of logical names plus a mode to the wrapped partition axis
+       and return mesh-axis entries / a :class:`PartitionSpec`. Compound
+       entries such as ``("fsdp", "sp")`` are preserved.
+    3. **Logical axis rules** — :meth:`logical_axis_rule_pairs` produces the
+       ``(logical_name, mesh_axis_or_None)`` rule list consumed by
+       ``spectrax.logical_axis_rules`` for the simple (single-axis) cases.
+       Compound placements are intentionally excluded since spectrax's rule
+       system only supports one mesh axis per logical name; those flow
+       through :class:`TensorLayout` + :class:`RuntimeShardingResolver`
+       instead.
+
+    Attributes:
+        partition_axis (PartitionAxis): The wrapped logical-to-mesh-axis
+            mapping. Coerced in ``__post_init__`` so dict-style or ``None``
+            inputs work transparently.
+    """
 
     partition_axis: PartitionAxis = dataclasses.field(default_factory=PartitionAxis, repr=False)
 
     def __post_init__(self) -> None:
+        """Coerce the held ``partition_axis`` to a :class:`PartitionAxis`.
+
+        Returns:
+            None.
+        """
         object.__setattr__(self, "partition_axis", _coerce_partition_axis(self.partition_axis))
 
     def __getattr__(self, name: str) -> tp.Any:
+        """Forward attribute lookups to the underlying ``PartitionAxis``.
+
+        Args:
+            name: Attribute name.
+
+        Returns:
+            Any: The matching attribute on ``self.partition_axis``.
+
+        Raises:
+            AttributeError: If the underlying partition axis has no such
+                attribute.
+        """
         return getattr(self.partition_axis, name)
 
     @classmethod
     def from_partition_axis(cls, value: PartitionAxis | dict[str, tp.Any] | None) -> AxisPolicy:
+        """Build an ``AxisPolicy`` from a partition-axis-like value.
+
+        Args:
+            value: A :class:`PartitionAxis`, dict of overrides, or ``None``.
+
+        Returns:
+            AxisPolicy: A new policy wrapping the coerced partition axis.
+        """
         return cls(partition_axis=_coerce_partition_axis(value))
 
     @classmethod
     def from_dict(cls, value: dict[str, tp.Any]) -> AxisPolicy:
+        """Build an ``AxisPolicy`` from a dict of partition-axis overrides.
+
+        Args:
+            value: Dict of :class:`PartitionAxis` field overrides.
+
+        Returns:
+            AxisPolicy: A new policy.
+        """
         return cls.from_partition_axis(value)
 
     @classmethod
     def from_any(cls, value: AxisPolicy | PartitionAxis | dict[str, tp.Any] | None) -> AxisPolicy:
+        """Coerce any supported input into an :class:`AxisPolicy`.
+
+        Args:
+            value: An ``AxisPolicy``, ``PartitionAxis``, dict, or ``None``.
+
+        Returns:
+            AxisPolicy: A normalized policy.
+        """
         return coerce_axis_policy(value)
 
     def to_partition_axis(self) -> PartitionAxis:
+        """Return a deep copy of the underlying ``PartitionAxis``.
+
+        Returns:
+            PartitionAxis: An independently mutable copy.
+        """
         return copy.deepcopy(self.partition_axis)
 
     def to_dict(self) -> dict[str, tp.Any]:
+        """Serialize the underlying partition axis to a dict.
+
+        Returns:
+            dict: Mapping from each ``PartitionAxis`` field name to a
+            deep-copied value.
+        """
         return {
             field.name: copy.deepcopy(getattr(self.partition_axis, field.name))
             for field in dataclasses.fields(self.partition_axis)
@@ -669,6 +939,16 @@ class AxisPolicy:
         axes: tp.Sequence[str | None],
         mode: str,
     ) -> list[tp.Any]:
+        """Delegate axis resolution to the held ``PartitionAxis``.
+
+        Args:
+            axes: Sequence of logical axis names (``None`` for replicated).
+            mode: Resolution mode (e.g. ``"train"`` or ``"infer"``).
+
+        Returns:
+            list: Resolved axis entries from
+            :meth:`PartitionAxis.resolve_axis`.
+        """
         return self.partition_axis.resolve_axis(axes=axes, mode=mode)
 
     def resolve_spec(
@@ -676,6 +956,15 @@ class AxisPolicy:
         axes: tp.Sequence[str | None],
         mode: str,
     ) -> PartitionSpec:
+        """Resolve a logical-axis sequence into a :class:`PartitionSpec`.
+
+        Args:
+            axes: Sequence of logical axis names.
+            mode: Resolution mode.
+
+        Returns:
+            PartitionSpec: The resolved partition spec.
+        """
         return self.partition_axis.resolve_spec(axes=axes, mode=mode)
 
     def logical_axis_rule_pairs(
@@ -707,16 +996,68 @@ class AxisPolicy:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class RuntimeShardingResolver:
-    """Lower semantic sharding declarations to concrete JAX shardings."""
+    """Stateless resolver that lowers semantic sharding declarations to concrete JAX shardings.
+
+    A ``RuntimeShardingResolver`` pairs an :class:`AxisPolicy` (the logical
+    axis vocabulary) with an optional active mesh, and exposes the helpers
+    that EasyDeL modules and trainers use to translate between *layout*
+    descriptions (``TensorLayout``, :class:`spx.Sharding`, plain tuples of
+    logical names, raw :class:`PartitionSpec`, parameter metadata dicts) and
+    the underlying JAX :class:`NamedSharding` / :class:`PartitionSpec` types
+    that ``jax.jit`` and ``jax.lax.with_sharding_constraint`` consume.
+
+    Notable behaviours:
+
+    - Resolution is mode-aware. ``mode`` may be ``MODE_TRAIN``, ``MODE_DECODE``,
+      ``NOT_GIVEN`` (defer to the layout's own mode), or an ``int`` shape
+      index — in the integer case a dimension equal to ``1`` selects
+      ``MODE_DECODE`` so single-token decode automatically collapses sequence
+      axes.
+    - Resolved specs are *sanitized* against a concrete shape: any axis whose
+      mesh size does not divide the matching tensor dimension is dropped via
+      :func:`sanitize_partition_spec_for_shape`, so callers can keep one
+      logical layout per parameter and let runtime tensor shapes decide
+      which axes are actually shardable.
+    - Stage-local meshes are honored. When parameter metadata records a
+      ``stage_assignment``, the named-sharding helpers route through the
+      stage-local submesh instead of the global one, keeping pipeline
+      parallel weights bound to their owning stage.
+
+    The class is a frozen dataclass so multiple resolver instances bound to
+    different meshes can co-exist (use :meth:`with_mesh` to swap meshes
+    without replacing the policy).
+
+    Attributes:
+        axis_policy (AxisPolicy): The :class:`AxisPolicy` providing logical
+            axis names and the underlying :class:`PartitionAxis`.
+        mesh (OptionalMesh): Active mesh used as the default when individual
+            method calls don't supply ``mesh=...``. ``None`` lets calls fall
+            back to the ambient JAX context (or raise when a mesh is
+            required).
+    """
 
     axis_policy: AxisPolicy
     mesh: OptionalMesh = None
 
     def with_mesh(self, mesh: OptionalMesh) -> RuntimeShardingResolver:
+        """Return a copy of this resolver bound to a different mesh.
+
+        Args:
+            mesh: New mesh to use, or ``None`` for context-driven resolution.
+
+        Returns:
+            RuntimeShardingResolver: A frozen copy with ``mesh`` replaced.
+        """
         return RuntimeShardingResolver(axis_policy=self.axis_policy, mesh=mesh)
 
     @property
     def paxis(self) -> PartitionAxis:
+        """Return a deep copy of the underlying :class:`PartitionAxis`.
+
+        Returns:
+            PartitionAxis: An independently mutable copy of the policy's
+            partition axis.
+        """
         return self.axis_policy.to_partition_axis()
 
     def _resolve_mode(
@@ -726,6 +1067,22 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         layout_mode: str | int = MODE_TRAIN,
     ) -> str:
+        """Resolve a dynamic mode token into ``MODE_TRAIN`` or ``MODE_DECODE``.
+
+        Integer modes are treated as a shape dimension index: when that
+        dimension equals ``1`` the call is in decode mode.
+
+        Args:
+            mode: ``MODE_TRAIN``, ``MODE_DECODE``, an int, or ``NOT_GIVEN``.
+            shape: Concrete tensor shape (required when ``mode`` is an int).
+            layout_mode: Fallback mode used when ``mode`` is ``NOT_GIVEN``.
+
+        Returns:
+            str: ``MODE_TRAIN`` or ``MODE_DECODE``.
+
+        Raises:
+            ValueError: If ``mode`` is an int and ``shape`` was not provided.
+        """
         selected_mode = layout_mode if mode is NOT_GIVEN else mode
         if isinstance(selected_mode, int):
             if shape is NOT_GIVEN:
@@ -740,6 +1097,17 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         overrides: LogicalAxisRules | None = None,
     ) -> tuple[tuple[str, str | None], ...]:
+        """Materialize logical-axis rule pairs for the resolved mode.
+
+        Args:
+            mode: Resolution mode (``MODE_TRAIN``, ``MODE_DECODE``, an int
+                shape index, or ``NOT_GIVEN``).
+            shape: Concrete shape required when ``mode`` is an int.
+            overrides: Optional extra logical-to-mesh axis rules.
+
+        Returns:
+            tuple: Tuple of ``(logical_name, mesh_axis_or_None)`` pairs.
+        """
         resolved_mode = self._resolve_mode(mode=mode, shape=shape, layout_mode=MODE_TRAIN)
         return self.axis_policy.logical_axis_rule_pairs(mode=resolved_mode, overrides=overrides)
 
@@ -763,6 +1131,16 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> PartitionSpec:
+        """Drop sharding axes that don't divide *shape* on the active mesh.
+
+        Args:
+            spec: Partition spec to sanitize.
+            shape: Concrete tensor shape (skipped when ``NOT_GIVEN``).
+            mesh: Mesh override (defaults to ``self.mesh``).
+
+        Returns:
+            PartitionSpec: The (possibly relaxed) safe partition spec.
+        """
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None or shape is NOT_GIVEN:
             return spec
@@ -770,6 +1148,16 @@ class RuntimeShardingResolver:
         return sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=base_mesh)
 
     def _resolve_axis_name_entry(self, axis: tp.Any, mode: str) -> AxisEntry:
+        """Translate a logical axis (or compound axis tuple) to mesh axes.
+
+        Args:
+            axis: Logical axis name, tuple of names, or ``None``.
+            mode: Resolution mode (``MODE_TRAIN`` / ``MODE_DECODE``).
+
+        Returns:
+            AxisEntry: ``None`` (replicated), a single mesh axis name, or a
+            tuple of mesh axis names when the logical entry is compound.
+        """
         normalized = _normalize_axis_entry(axis)
         if normalized is None:
             return None
@@ -777,6 +1165,15 @@ class RuntimeShardingResolver:
         logical_rules = dict(self.logical_axis_rule_pairs(mode=mode))
 
         def _resolve_one(name: str) -> str | None:
+            """Look up a logical axis name in the resolved rule dict.
+
+            Args:
+                name: Logical axis name.
+
+            Returns:
+                str | None: The mapped mesh axis name, or ``None`` to
+                replicate (matching SpectraX's default for unknown rules).
+            """
             resolved = logical_rules.get(name, None)
             if resolved is not None or name in logical_rules:
                 return resolved
@@ -790,6 +1187,15 @@ class RuntimeShardingResolver:
         return _resolve_one(normalized)
 
     def _partition_spec_for_axis_names(self, axes: tp.Iterable[tp.Any], mode: str) -> PartitionSpec:
+        """Build a :class:`PartitionSpec` from logical axis names.
+
+        Args:
+            axes: Iterable of logical axis names (one per tensor dim).
+            mode: Resolution mode.
+
+        Returns:
+            PartitionSpec: The composed partition spec.
+        """
         return PartitionSpec(*(self._resolve_axis_name_entry(axis, mode) for axis in axes))
 
     def partition_spec_for_layout(
@@ -800,6 +1206,17 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> PartitionSpec:
+        """Alias of :meth:`resolve_layout` returning a sanitized spec.
+
+        Args:
+            layout: Layout-like object accepted by :meth:`resolve_layout`.
+            mode: Resolution mode.
+            shape: Concrete tensor shape used for safety checks.
+            mesh: Mesh override (defaults to ``self.mesh``).
+
+        Returns:
+            PartitionSpec: The resolved partition spec.
+        """
         return self.resolve_layout(layout=layout, mode=mode, shape=shape, mesh=mesh)
 
     def resolve_layout(
@@ -810,6 +1227,25 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> PartitionSpec:
+        """Resolve a layout-like object to a sanitized :class:`PartitionSpec`.
+
+        Accepts existing :class:`PartitionSpec`s (returned as-is after
+        sanitization), :class:`TensorLayout`, :class:`spx.Sharding`, or plain
+        sequences of logical axis names.
+
+        Args:
+            layout: Layout description to resolve.
+            mode: Resolution mode (``NOT_GIVEN`` falls back to the layout's
+                own mode or ``MODE_TRAIN``).
+            shape: Concrete tensor shape used for safety checks.
+            mesh: Mesh override.
+
+        Returns:
+            PartitionSpec: The resolved partition spec.
+
+        Raises:
+            TypeError: If *layout* is not a supported type.
+        """
         if isinstance(layout, PartitionSpec):
             return self._sanitize_spec(layout, shape=shape, mesh=mesh)
 
@@ -845,6 +1281,23 @@ class RuntimeShardingResolver:
         mesh: OptionalMesh = None,
         metadata: dict[str, tp.Any] | None = None,
     ) -> NamedSharding:
+        """Build a :class:`NamedSharding` for a layout, honoring stage-local meshes.
+
+        Args:
+            layout: Layout description (see :meth:`resolve_layout`).
+            mode: Resolution mode.
+            shape: Concrete tensor shape.
+            mesh: Mesh override.
+            metadata: Optional variable metadata; when it carries a
+                ``stage_assignment`` the resulting NamedSharding is attached
+                to the stage-local submesh.
+
+        Returns:
+            NamedSharding: A JAX named sharding referencing the resolved mesh.
+
+        Raises:
+            ValueError: If no mesh is available.
+        """
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None:
             raise ValueError("A mesh is required to build NamedSharding.")
@@ -860,6 +1313,21 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> PartitionSpec | None:
+        """Resolve a parameter's metadata into a :class:`PartitionSpec`.
+
+        Looks up keys in priority order: ``tensor_layout``, ``sharding``,
+        ``axis_names``.
+
+        Args:
+            metadata: Parameter metadata dict, or ``None``.
+            mode: Resolution mode.
+            shape: Concrete tensor shape.
+            mesh: Mesh override.
+
+        Returns:
+            PartitionSpec | None: The resolved spec, or ``None`` if the
+            metadata is absent or contains no sharding info.
+        """
         if not metadata:
             return None
 
@@ -890,6 +1358,17 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> PartitionSpec | None:
+        """Alias of :meth:`resolve_metadata`.
+
+        Args:
+            metadata: Parameter metadata dict.
+            mode: Resolution mode.
+            shape: Concrete tensor shape.
+            mesh: Mesh override.
+
+        Returns:
+            PartitionSpec | None: The resolved partition spec, or ``None``.
+        """
         return self.resolve_metadata(metadata=metadata, mode=mode, shape=shape, mesh=mesh)
 
     def named_sharding_for_metadata(
@@ -900,6 +1379,19 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> NamedSharding | None:
+        """Build a :class:`NamedSharding` from parameter metadata.
+
+        Args:
+            metadata: Parameter metadata dict.
+            mode: Resolution mode.
+            shape: Concrete tensor shape.
+            mesh: Mesh override (defaults to ``self.mesh``).
+
+        Returns:
+            NamedSharding | None: ``None`` when the metadata is missing or
+            no mesh is available; otherwise a JAX named sharding routed
+            through the appropriate stage-local mesh.
+        """
         if not metadata:
             return None
         active_mesh = self.mesh if mesh is None else mesh
@@ -927,6 +1419,24 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> PartitionSpec | None:
+        """Resolve a SpectraX variable to a :class:`PartitionSpec`.
+
+        Tries native :meth:`spx.Variable.named_sharding` first when the
+        variable doesn't carry compound axis metadata, then falls back to
+        metadata-driven resolution and finally to the variable's existing
+        :class:`NamedSharding` if present.
+
+        Args:
+            var: The SpectraX variable.
+            mode: Resolution mode.
+            shape: Concrete tensor shape (otherwise inferred from the
+                variable's value).
+            mesh: Mesh override.
+
+        Returns:
+            PartitionSpec | None: The resolved spec, or ``None`` when no
+            sharding info is available.
+        """
         active_mesh = self.mesh if mesh is None else mesh
         if (
             var.metadata.get("tensor_layout") is None
@@ -963,6 +1473,19 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> NamedSharding:
+        """Wrap a :class:`PartitionSpec` in a :class:`NamedSharding`.
+
+        Args:
+            spec: Partition spec to wrap.
+            shape: Concrete tensor shape used for safety sanitization.
+            mesh: Mesh override (required either here or on ``self``).
+
+        Returns:
+            NamedSharding: The named sharding bound to the resolved JAX mesh.
+
+        Raises:
+            ValueError: If no mesh is available.
+        """
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None:
             raise ValueError("A mesh is required to build NamedSharding.")
@@ -978,6 +1501,18 @@ class RuntimeShardingResolver:
         shape: tuple[int, ...] | object = NOT_GIVEN,
         mesh: OptionalMesh = None,
     ) -> NamedSharding | None:
+        """Build a :class:`NamedSharding` for a SpectraX variable.
+
+        Args:
+            var: The SpectraX variable.
+            mode: Resolution mode.
+            shape: Concrete tensor shape.
+            mesh: Mesh override.
+
+        Returns:
+            NamedSharding | None: A named sharding for the variable, or
+            ``None`` when no mesh is available or no spec can be resolved.
+        """
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None:
             return None
@@ -1003,6 +1538,26 @@ class RuntimeShardingResolver:
         dynamic_axes: tp.Any = NOT_GIVEN,
         shape: tp.Sequence[int] | object = NOT_GIVEN,
     ) -> PartitionSpec:
+        """High-level entry point for axis-based or layout-based resolution.
+
+        Either provide ``axes`` (sequence of logical names) and ``mode``, or
+        a layout-like ``dynamic_axes`` value (e.g. :class:`TensorLayout`).
+        Layout-shaped ``axes`` are auto-promoted to ``dynamic_axes``.
+
+        Args:
+            axes: Sequence of logical axis names or a layout-like object.
+            mode: Resolution mode.
+            dynamic_axes: A :class:`TensorLayout`-compatible object that
+                supplies its own mode.
+            shape: Concrete tensor shape used for safety checks.
+
+        Returns:
+            PartitionSpec: The resolved partition spec.
+
+        Raises:
+            ValueError: If neither a layout nor ``axes``+``mode`` are
+                provided, or if ``dynamic_axes`` is not layout-compatible.
+        """
         if dynamic_axes is NOT_GIVEN and axes is not NOT_GIVEN:
             if (
                 (isinstance(axes, tuple) and hasattr(axes, "_fields"))
@@ -1040,6 +1595,20 @@ class RuntimeShardingResolver:
         dynamic_axes: tp.Any = NOT_GIVEN,
         auto_correct: bool = True,
     ) -> jax.Array:
+        """Apply a sharding constraint to *x* using the resolved partition spec.
+
+        Args:
+            x: Input array.
+            axes: Sequence of logical axis names (or layout) to resolve.
+            mode: Resolution mode.
+            dynamic_axes: Optional layout-like override.
+            auto_correct: Whether to drop non-divisible axes via shape-aware
+                sanitization.
+
+        Returns:
+            jax.Array: ``x`` with a sharding constraint applied (using
+            ``self.mesh``).
+        """
         spec = self.resolve(
             axes=axes,
             mode=mode,

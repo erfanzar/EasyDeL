@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the Aya Vision multimodal model.
+
+Defines :class:`AyaVisionConfig` — a composite config bundling a vision tower
+config (defaults to a SigLIP encoder) and a text decoder config (defaults to
+Cohere2). Adds AyaVision-specific knobs: vision feature selection strategy
+and layer, multi-modal projector downsample factor, adapter layer-norm
+epsilon, and the image token index used to splice image features into the
+text token stream.
+"""
 
 import typing
 
@@ -70,6 +79,34 @@ class AyaVisionConfig(EasyDeLBaseConfig):
         image_token_index: int = 255036,
         **kwargs,
     ):
+        """Initialize the AyaVision configuration.
+
+        Args:
+            vision_config (dict | EasyDeLBaseConfig | None, optional): Vision
+                tower config or its dict form. ``None`` falls back to a default
+                SigLIP encoder (``hidden_size=1152``, ``patch_size=14``,
+                ``image_size=384``, ``num_hidden_layers=26``,
+                ``num_attention_heads=14``).
+            text_config (dict | EasyDeLBaseConfig | None, optional): Text
+                decoder config or its dict form. ``None`` falls back to a
+                default :class:`Cohere2Config`.
+            vision_feature_select_strategy (str, optional): Vision feature
+                selection. ``"default"`` strips the CLS token; ``"full"``
+                keeps every patch token. Defaults to ``"full"``.
+            vision_feature_layer (int, optional): Index of the vision encoder
+                layer used as feature source. Defaults to ``-1`` (last layer).
+            downsample_factor (int, optional): Spatial downsampling factor for
+                the multi-modal projector's pixel-shuffle. Defaults to ``2``.
+            adapter_layer_norm_eps (float, optional): Epsilon for the
+                projector's layer normalization. Defaults to ``1e-6``.
+            image_token_index (int, optional): Token id reserved for image
+                placeholders in the text stream. Defaults to ``255036``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+
+        Raises:
+            ValueError: If ``vision_feature_select_strategy`` is not one of
+                ``"default"`` or ``"full"``.
+        """
         self.image_token_index = image_token_index
         self.downsample_factor = downsample_factor
         self.adapter_layer_norm_eps = adapter_layer_norm_eps

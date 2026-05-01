@@ -106,6 +106,24 @@ class SeqKDConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Validate and normalize the prompt/completion budget.
+
+        - When both ``max_length`` and ``max_completion_length`` are set,
+          enforces ``max_prompt_length + max_completion_length <= max_length``.
+        - When only ``max_length`` is set, derives the completion budget.
+        - Renormalizes ``max_length`` as the sum of the two parts.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias for
+                ``max_length``; forwarded to the base class.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the base class.
+
+        Raises:
+            ValueError: If ``max_length < max_prompt_length`` or if
+                ``max_prompt_length + max_completion_length`` exceeds
+                ``max_length``.
+        """
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:

@@ -224,31 +224,82 @@ class ModelStepExecutor:
             )
 
     def clear_cache(self) -> None:
-        """Clear all cached compiled functions."""
+        """Drop every compiled backbone / LM-head / legacy variant.
+
+        Called when the user explicitly asks for a recompile (e.g. after
+        weight hot-swap with ``bind_graphstate_for_aot=True``) or during
+        engine teardown. Does *not* shut down PP workers — see
+        :meth:`shutdown` for that.
+        """
         self._backbone_cache.clear()
         self._lm_head_cache.clear()
         self._cache.clear()
 
     def shutdown(self) -> None:
-        """Release resident PP stage workers."""
+        """Join the resident PP-stage worker threads, if any.
+
+        No-op when running SPMD (``_pipeline_runtime is None``). Called
+        from the engine's ``terminate`` / ``release_model_state`` paths so
+        the daemon threads do not survive the engine that owns them.
+        """
         if self._pipeline_runtime is not None:
             self._pipeline_runtime.shutdown()
 
     @staticmethod
     def _cache_store(cache: OrderedDict, key, value) -> None:
+        """Store ``value`` under ``key`` and mark it most-recently-used.
+
+        Args:
+            cache (OrderedDict): LRU cache to mutate in place.
+            key: Hashable cache key.
+            value: Cached payload.
+        """
         cache[key] = value
         cache.move_to_end(key)
 
     @staticmethod
     def _cache_lookup(cache: OrderedDict, key):
+        """Look up ``key`` and mark it most-recently-used.
+
+        Args:
+            cache (OrderedDict): LRU cache to read.
+            key: Hashable cache key.
+
+        Returns:
+            The cached value associated with ``key``.
+
+        Raises:
+            KeyError: If ``key`` is not in the cache.
+        """
         value = cache[key]
         cache.move_to_end(key)
         return value
 
     def _uses_mpmd_mesh(self) -> bool:
+        """Whether this executor's mesh requires the MPMD compile path.
+
+        Drives every PP/SPMD branch in this class: when ``True``, backbone
+        and LM head are compiled with ``mesh=`` and (optionally) a
+        SpectraX schedule, hidden states are explicitly placed on the
+        final-stage submesh, and the resident pipeline runtime is used in
+        place of ``spx.jit``'s default dispatcher.
+        """
         return self.mesh.is_mpmd
 
     def _final_stage_mesh(self):
+        """Resolve the submesh that owns the final transformer layer.
+
+        Three resolution strategies, in priority order:
+
+        1. The pipeline plan's recorded ``stage_meshes[final_stage]``,
+           when an enabled :class:`PipelineInferencePlan` is attached.
+        2. ``model._layer_physical_stage_assignment(N-1, N)`` when the
+           model exposes the per-layer assignment helper.
+        3. Heuristic fallback assuming the last layer lives on the last
+           pipeline stage (``stage = (mpmd_dim - 1, mpmd_dim)``).
+
+        Returns ``None`` on SPMD meshes (no PP topology to resolve).
+        """
         if not self._uses_mpmd_mesh():
             return None
         if self.pipeline_plan is not None and self.pipeline_plan.is_enabled and self.pipeline_plan.stage_meshes:
@@ -263,6 +314,14 @@ class ModelStepExecutor:
         return resolve_stage_mesh(self.mesh, stage=stage)
 
     def _embedding_stage_mesh(self):
+        """Resolve the submesh that owns the input embedding layer.
+
+        Mirror of :meth:`_final_stage_mesh` but always points at stage 0
+        (the embedding always lives on the first pipeline stage). Used
+        for tied-embedding LM-head placement, where the projection
+        weights are physically the same as the input embedding's. Returns
+        ``None`` on SPMD meshes.
+        """
         if not self._uses_mpmd_mesh():
             return None
         if self.pipeline_plan is not None and self.pipeline_plan.is_enabled and self.pipeline_plan.stage_meshes:
@@ -271,17 +330,45 @@ class ModelStepExecutor:
         return resolve_stage_mesh(self.mesh, stage=(0, mpmd_dim))
 
     def _lm_head_stage_mesh(self):
+        """Pick the embedding-stage or final-stage mesh based on tied-embedding policy.
+
+        For tied-embedding models the LM head reuses the embedding
+        weights and must therefore run on the same stage as the embedding
+        (stage 0). For untied heads it lives on the same stage as the
+        final transformer layer. Centralizing the choice here keeps every
+        LM-head sharding helper consistent.
+        """
         if self._lm_head_uses_tied_projection:
             return self._embedding_stage_mesh()
         return self._final_stage_mesh()
 
     def _lm_head_replicated_sharding(self) -> NamedSharding | None:
+        """``NamedSharding`` that fully replicates over the LM-head stage.
+
+        Used as the ``out_shardings`` of the LM-head jit so the resulting
+        ``[padded_num_reqs, vocab]`` logits are replicated across every
+        device in the head stage — convenient because the sampler then
+        sees a tensor that doesn't need any cross-stage gather. Returns
+        ``None`` on SPMD or when no LM-head stage exists.
+        """
         stage_mesh = self._lm_head_stage_mesh()
         if stage_mesh is None:
             return None
         return NamedSharding(stage_mesh, PartitionSpec())
 
     def _uses_tied_lm_head(self) -> bool:
+        """Check whether the loaded model exposes a tied-embedding LM head.
+
+        Inspects ``self.model.config`` (and its nested text config when
+        present) for either of the standard tied-embedding flags
+        ``tie_word_embeddings`` / ``share_input_output_layers``. Both
+        sub-configs are scanned because some HF wrappers only set the
+        flag on the inner text config.
+
+        Returns:
+            ``True`` when at least one matching flag is truthy on either
+            config; ``False`` otherwise (untied head).
+        """
         configs = [self.model.config]
         get_text_config = getattr(self.model.config, "get_text_config", None)
         if callable(get_text_config):
@@ -296,6 +383,21 @@ class ModelStepExecutor:
         return False
 
     def _lm_head_hidden_sharding(self, shape: tuple[int, ...]) -> NamedSharding | None:
+        """Sharding for the LM head's input ``[padded_num_reqs, hidden_dim]`` tensor.
+
+        Asks the model's runtime sharding resolver (rebound to the
+        LM-head stage mesh) for the ``[EMPTY, EMBED]`` decode-mode
+        layout for the given shape, then wraps it in a
+        :class:`NamedSharding`. Used both as the ``in_shardings`` for
+        the head jit and as the placement target for the gathered hidden
+        states fed to it. Returns ``None`` on SPMD or when no LM-head
+        stage exists.
+
+        Args:
+            shape: Concrete shape of the hidden-state tensor at the call
+                site; passed through to ``runtime_sharding_resolver``
+                because some resolvers specialize on shape.
+        """
         stage_mesh = self._lm_head_stage_mesh()
         if stage_mesh is None:
             return None
@@ -308,6 +410,16 @@ class ModelStepExecutor:
         return NamedSharding(stage_mesh, spec)
 
     def _place_lm_head_hidden(self, hidden_states: jax.Array) -> jax.Array:
+        """Move ``hidden_states`` to the LM-head sharding when needed; pass through otherwise.
+
+        Skips the move when (a) the executor is on an SPMD mesh, (b) no
+        LM-head sharding can be resolved, or (c) ``hidden_states`` is
+        already on the matching mesh+spec. Otherwise issues
+        ``jax.device_put`` to satisfy the LM-head jit's
+        ``in_shardings`` invariant. The cheap fast path matters because
+        every step gathers from the backbone's ``hidden_states`` and
+        feeds the result here.
+        """
         if not self._uses_mpmd_mesh():
             return hidden_states
         sharding = self._lm_head_hidden_sharding(tuple(hidden_states.shape))
@@ -323,6 +435,24 @@ class ModelStepExecutor:
         return jax.device_put(hidden_states, sharding)
 
     def _stage_local_lm_head_state(self, state: tp.Any) -> tp.Any:
+        """Pin every leaf of an exported LM-head state onto the head-stage mesh.
+
+        After :func:`spx.export` produces the LM-head sub-graph state,
+        leaves still carry shardings from the full model mesh. This
+        helper rebinds them onto just the LM-head stage submesh via
+        :func:`spx.extract_sharding_structure` followed by
+        :func:`jax.device_put` per leaf. Result is a state pytree whose
+        compile-time placement matches the dedicated head jit and which
+        does not retain references to devices on other stages. SPMD and
+        no-stage-mesh cases pass through unchanged.
+
+        Args:
+            state: LM-head state pytree as returned by
+                :func:`spx.export`.
+
+        Returns:
+            New pytree with the same structure but stage-local leaves.
+        """
         if not self._uses_mpmd_mesh():
             return state
         stage_mesh = self._lm_head_stage_mesh()
@@ -336,6 +466,29 @@ class ModelStepExecutor:
         )
 
     def _refresh_lm_head_postprocess(self, model: "EasyDeLBaseModule") -> None:
+        """Capture model-level logit post-processing parameters into instance state.
+
+        Compile-time inputs to the dedicated LM-head jit. Reads three
+        scalars off the live bound model (re-derived after every weight
+        refresh because they may depend on weights):
+
+        * ``_lm_head_clip_cap`` — symmetric ``±cap`` clip applied to
+          logits, when the model exposes a ``_logit_cap_feature``.
+        * ``_lm_head_logit_scale`` — multiplicative scaling, taken as
+          the product of any of ``logit_scale``,
+          ``output_multiplier_scale``, and ``base_model.lm_head_multiplier``.
+        * ``_lm_head_soft_cap`` — Gemma-style ``cap * tanh(logits / cap)``
+          soft cap, sourced from ``config.final_logit_softcapping`` (or
+          its nested text config).
+
+        These three are then closed over by the :meth:`compile_lm_head`
+        jit so the head's compiled output already includes the
+        post-processing — no extra eager pass is needed during sampling.
+
+        Args:
+            model: Live :class:`EasyDeLBaseModule` bound from the
+                current ``(graphdef, graphstate, graphother)``.
+        """
         clip_feature = getattr(model, "_logit_cap_feature", None)
         self._lm_head_clip_cap = getattr(clip_feature, "cap_value", None)
 
@@ -369,12 +522,31 @@ class ModelStepExecutor:
         )
 
     def refresh_lm_head_state(self, *, graphdef: tp.Any, graphstate: tp.Any, graphother: tp.Any) -> None:
-        """Refresh the stage-local LM-head state without touching backbone weights.
+        """Re-export the LM-head sub-graph and place it on the final-stage mesh.
 
-        PP inference runs the transformer backbone through ``spx.jit`` and then
-        projects only sampled rows on the final stage.  The projection must not
-        close over a full bound model: that makes the head executable compile
-        too much state and can leave it stale after graph updates.
+        Pipeline inference compiles the transformer backbone via
+        ``spx.jit`` and only projects the sampled-row hidden states
+        through the LM head on the final stage. To keep that head
+        executable small and reusable across hot weight updates, the
+        head graph is re-exported separately each time backbone weights
+        change. This method:
+
+        1. Resolves whether the model uses tied embeddings (and if so,
+           targets the embedding-stage mesh; otherwise the final-stage
+           mesh).
+        2. Builds a transient bound model from ``(graphdef, graphstate,
+           graphother)``, invokes :meth:`_refresh_lm_head_postprocess`
+           to capture clip / scale / soft-cap policy from the live
+           model, and selects either ``get_embedding()`` (tied) or
+           ``get_lm_head()`` as the projection module.
+        3. Exports that projection through :func:`spx.export` and pins
+           the resulting state onto the LM-head stage mesh via
+           :meth:`_stage_local_lm_head_state` so the per-stage compile
+           in :meth:`compile_lm_head` can close over a small, correctly-
+           sharded state.
+
+        No-op on SPMD meshes — there's no "final stage" to materialize
+        the head on.
         """
         if not self._uses_mpmd_mesh():
             return
@@ -393,6 +565,21 @@ class ModelStepExecutor:
         self._lm_head_state = self._stage_local_lm_head_state(lm_head_state)
 
     def _compile_mode(self) -> str:
+        """Return the cache-key suffix that identifies the active compile path.
+
+        Three values, mutually exclusive:
+
+        * ``"mpmd"`` — pipeline-parallel MPMD compile (forced when the
+          executor's mesh is MPMD, regardless of ``use_aot_forward``).
+        * ``"aot"`` — non-PP ahead-of-time compile via
+          ``spx.jit(...).lower(...).compile()``.
+        * ``"jit"`` — non-PP lazy JIT compile.
+
+        Embedded into every backbone / LM-head / sampler cache key so
+        a single :class:`ModelStepExecutor` instance can hold compiled
+        variants for several modes simultaneously (useful when toggling
+        AOT off for debugging without invalidating MPMD entries).
+        """
         if self._uses_mpmd_mesh():
             return "mpmd"
         return "aot" if self.use_aot_forward else "jit"
@@ -404,29 +591,90 @@ class ModelStepExecutor:
         return self._cache_lookup(self._cache, key)
 
     def cache_keys(self) -> list:
-        """Get all keys currently in backbone + lm_head caches."""
+        """Concatenated key list across the backbone and LM-head caches.
+
+        Useful for diagnostics and tests that want to assert which buckets
+        have been compiled. The two caches are keyed differently
+        (``(num_tokens, "backbone", mode)`` vs
+        ``(padded_num_reqs, "lm_head", mode)``) so the returned list is
+        heterogeneous.
+        """
         return list(self._backbone_cache.keys()) + list(self._lm_head_cache.keys())
 
     def has(self, key: tuple[int, int, str, str]) -> bool:
-        """Check if a (num_tokens, padded_num_reqs) pair is fully compiled."""
+        """Whether *both* halves of a ``(num_tokens, padded_num_reqs)`` are cached.
+
+        Convenience for legacy callers that still treat the two-stage
+        compile as a single (num_tokens, padded_num_reqs, "model_step",
+        mode) key. Splits the input into the backbone and LM-head sub-keys
+        and tests cache membership for each.
+
+        Args:
+            key: Four-tuple ``(num_tokens, padded_num_reqs, _, mode)``;
+                the third element is ignored (kept for backward compat),
+                and ``mode`` is auto-resolved from
+                :meth:`_compile_mode` when only three elements are
+                provided.
+
+        Returns:
+            ``True`` iff a backbone has been compiled for ``num_tokens``
+            *and* an LM head has been compiled for ``padded_num_reqs``
+            under the same compile mode.
+        """
         mode = key[3] if len(key) == 4 else self._compile_mode()
         backbone_key = (key[0], "backbone", mode)
         lm_head_key = (key[1], "lm_head", mode)
         return backbone_key in self._backbone_cache and lm_head_key in self._lm_head_cache
 
     def has_backbone(self, num_tokens: int) -> bool:
+        """Whether a backbone variant has been compiled for the given token bucket.
+
+        Args:
+            num_tokens: Token-axis bucket size to look up.
+
+        Returns:
+            ``True`` if the backbone cache already contains an entry for
+            ``num_tokens`` under the executor's current compile mode.
+        """
         mode = self._compile_mode()
         return (int(num_tokens), "backbone", mode) in self._backbone_cache
 
     def has_lm_head(self, padded_num_reqs: int) -> bool:
+        """Whether an LM-head variant has been compiled for the given request bucket.
+
+        Args:
+            padded_num_reqs: Request-axis bucket size to look up.
+
+        Returns:
+            ``True`` if the LM-head cache already contains an entry for
+            ``padded_num_reqs`` under the executor's current compile mode.
+        """
         mode = self._compile_mode()
         return (int(padded_num_reqs), "lm_head", mode) in self._lm_head_cache
 
     def get_compiled(self, *, num_tokens: int, padded_num_reqs: int) -> tp.Any:
-        """Retrieve pre-compiled backbone + lm_head as a combined callable.
+        """Stitch backbone + LM head into a single combined callable.
 
-        Returns a cached wrapper that calls backbone then lm_head, producing
-        a ``ModelStepOutputs`` — same interface as before the split.
+        Looks both compiled halves up under the executor's current compile
+        mode and returns a closure that mimics the pre-split unified
+        ``model_step`` signature: ``(graphstate, graphother, kv_pages,
+        metadata) -> ModelStepOutputs``. The closure performs the
+        ``hidden_states[logits_indices]`` gather *outside* the LM-head
+        executable so that compiled variant sees a ``[padded_num_reqs,
+        hidden_dim]`` input regardless of ``num_tokens``.
+
+        Args:
+            num_tokens: Token-axis bucket size; selects the backbone
+                variant.
+            padded_num_reqs: Request-axis bucket size; selects the LM-head
+                variant.
+
+        Returns:
+            Callable producing :class:`ModelStepOutputs` from
+            ``(graphstate, graphother, kv_pages, metadata)``. The returned
+            ``ModelStepOutputs`` carries the updated KV pages, the full
+            backbone hidden states (so callers may reuse them for spec
+            decoding etc.), and the gathered logits.
         """
         mode = self._compile_mode()
         backbone_fn = self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
@@ -452,12 +700,40 @@ class ModelStepExecutor:
         return _combined
 
     def get_backbone(self, *, num_tokens: int) -> tp.Any:
-        """Retrieve a pre-compiled backbone function."""
+        """Look up the compiled backbone for ``num_tokens``.
+
+        Args:
+            num_tokens: Token-axis bucket size identifying the variant.
+
+        Returns:
+            The compiled backbone callable. Has signature
+            ``(graphstate, graphother, kv_pages, metadata) -> BackboneOutputs``
+            (or, in the AOT-bound path, ``(kv_pages, metadata)`` with
+            graphstate / graphother captured as constants).
+
+        Raises:
+            KeyError: If no backbone has been compiled for that bucket
+                under the current compile mode.
+        """
         mode = self._compile_mode()
         return self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
 
     def get_lm_head(self, *, padded_num_reqs: int) -> tp.Any:
-        """Retrieve a pre-compiled lm_head function."""
+        """Look up the compiled LM head for ``padded_num_reqs``.
+
+        Args:
+            padded_num_reqs: Request-axis bucket size identifying the
+                variant.
+
+        Returns:
+            The compiled LM-head callable producing ``logits`` of shape
+            ``[padded_num_reqs, vocab_size]`` from
+            ``(graphstate, graphother, gathered_hidden_states)``.
+
+        Raises:
+            KeyError: If no LM head has been compiled for that bucket
+                under the current compile mode.
+        """
         mode = self._compile_mode()
         return self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
 
@@ -471,10 +747,30 @@ class ModelStepExecutor:
         graphother: tp.Any,
         inputs: StepFunctionInputs,
     ) -> ModelStepOutputs | None:
-        """Compile backbone and lm_head for the given dimensions.
+        """Compile (or no-op-if-cached) the backbone and the LM head.
 
-        The backbone is keyed by ``num_tokens`` only; the lm_head by
-        ``padded_num_reqs`` only.  Each is skipped if already cached.
+        Backbone is keyed solely by ``num_tokens`` because its compute
+        cost dominates and depends only on the token-axis padding;
+        request-axis padding is absorbed by the LM-head executable, which
+        is keyed solely by ``padded_num_reqs``. This split keeps the
+        compile-cache product small (``|num_tokens|`` + ``|padded_num_reqs|``
+        instead of their cartesian product).
+
+        Args:
+            num_tokens: Token-axis bucket size to compile for.
+            padded_num_reqs: Request-axis bucket size to compile for.
+            graphdef: Static model graph definition. Stashed on ``self`` so
+                wrapper closures can see fresh weights after a hot-swap.
+            graphstate: Live mutable parameters used as the trace template.
+            graphother: Live auxiliary buffers used as the trace template.
+            inputs: Dummy ``StepFunctionInputs`` shaped for ``num_tokens``
+                used by the AOT path's ``lower(...).compile()`` call.
+
+        Returns:
+            :class:`BackboneOutputs` produced by the eager pre-touch when
+            the backbone path is JIT (lazy) — useful for warming caches.
+            ``None`` if either half was already compiled or when the AOT
+            path is taken (no eager call is made).
         """
         self.graphdef = graphdef
         backbone_out = self.compile_backbone(
@@ -502,9 +798,37 @@ class ModelStepExecutor:
         graphother: tp.Any,
         inputs: StepFunctionInputs,
     ) -> BackboneOutputs | None:
-        """Compile the backbone (transformer forward) for a token bucket.
+        """Compile the transformer forward for one token bucket.
 
-        Keyed by ``num_tokens`` only — independent of ``padded_num_reqs``.
+        Selects between three implementations depending on the active
+        compile mode (set by :meth:`_compile_mode`):
+
+        * **MPMD** — wraps the call in a closure that defers to
+          :meth:`_dispatch_pipeline_backbone`, which routes through the
+          resident :class:`PipelineStageRuntime` when available; eagerly
+          warms once with the dummy inputs.
+        * **AOT** — lowers and compiles the backbone jit through
+          ``spx.jit(...).lower(...).compile()``. When
+          ``bind_graphstate_for_aot=True``, captures graphstate / graphother
+          as compile-time constants and exposes a wrapper that swallows
+          them at call time so the runtime signature stays stable.
+        * **JIT** — stores a closure around the lazy ``spx.jit`` so the
+          first dispatch traces.
+
+        Caches the resulting callable in ``self._backbone_cache`` keyed
+        by ``(num_tokens, "backbone", mode)``.
+
+        Args:
+            num_tokens: Token-axis bucket to compile for.
+            graphdef: Updated graphdef pinned on ``self`` for closure use.
+            graphstate, graphother: Trace templates / capture constants.
+            inputs: Dummy ``StepFunctionInputs`` providing concrete shapes
+                for the lower step.
+
+        Returns:
+            :class:`BackboneOutputs` from the eager warm-up call when the
+            MPMD or non-bound JIT paths are taken; ``None`` for the AOT
+            paths (no eager call) and when the bucket was already cached.
         """
         self.graphdef = graphdef
         mode = self._compile_mode()
@@ -549,6 +873,27 @@ class ModelStepExecutor:
         return out
 
     def _dispatch_pipeline_backbone(self, graphstate_, graphother_, kv_pages_, metadata_) -> BackboneOutputs:
+        """Run the backbone through the resident PP runtime, falling back to direct call.
+
+        Called from the MPMD-mode wrapper installed by
+        :meth:`compile_backbone`. When :class:`PipelineStageRuntime` is
+        available (it is, whenever the executor was built with an
+        enabled :class:`PipelineInferencePlan`), the call is routed
+        through :meth:`PipelineStageRuntime.dispatch` so the
+        per-stage worker threads service the SpectraX compile plan and
+        last-call dispatch stats are surfaced via
+        :meth:`last_pipeline_stats`. With no runtime configured (single-
+        stage MPMD topology), the fallback path invokes ``self._backbone_fn``
+        directly, leaving SpectraX's default in-line dispatcher in
+        charge.
+
+        Args:
+            graphstate_, graphother_, kv_pages_, metadata_: Same step
+                inputs the compiled wrapper received from the runner.
+
+        Returns:
+            :class:`BackboneOutputs` for this step.
+        """
         pipeline_runtime = getattr(self, "_pipeline_runtime", None)
         if pipeline_runtime is None:
             return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
@@ -562,6 +907,27 @@ class ModelStepExecutor:
         )
 
     def last_pipeline_stats(self) -> dict[str, float | int]:
+        """Per-step pipeline-dispatch counters for the runner perf log.
+
+        Surfaced through ``ExecutionManager.execute`` and merged into the
+        per-step metrics dict that :class:`eSurgeRunner` formats into the
+        ``[perf]`` log line. Two reporting paths:
+
+        * **Resident runtime present** — pulls
+          :attr:`PipelineStageRuntime.last_stats` and reports
+          ``pp_stage_launches``, ``pp_stage_dispatch_time``, and
+          ``pp_queue_wait_time`` (the only counters worth tracking from
+          the dispatcher side).
+        * **Fallback to SpectraX dispatcher** — peeks at the sxjit
+          function's private ``_mpmd_state`` and, if it has recorded a
+          forward-only stage-launch count, returns just
+          ``pp_stage_launches``; returns an empty dict when no PP work
+          ran this step (e.g. SPMD path).
+
+        Returns:
+            Mapping from metric name to value, suitable for direct
+            inclusion in the runner's per-step metrics dict.
+        """
         if self._pipeline_runtime is None:
             state = getattr(self._backbone_fn, "_mpmd_state", {})
             launches = int(state.get("forward_stage_launches", 0) or 0)
@@ -586,9 +952,39 @@ class ModelStepExecutor:
         hidden_dim: int | None = None,
         dtype: tp.Any = None,
     ) -> None:
-        """Compile the lm_head for a request bucket.
+        """Compile the LM-head projection for one request-axis bucket.
 
-        Keyed by ``padded_num_reqs`` only — independent of ``num_tokens``.
+        Mirrors :meth:`compile_backbone` but operates on a much smaller
+        slice of work: a gather-then-matmul over the ``padded_num_reqs``
+        sampled rows. Three branches are taken based on the compile mode:
+
+        * **MPMD** — refreshes the stage-local LM-head state, places dummy
+          hidden states on the LM-head stage submesh, and compiles a
+          dedicated ``_stage_lm_head`` jit that runs ``projection(...)``
+          (or the tied-embedding ``attend``) plus any logit clip / scale
+          / soft-cap post-processing on the final-stage submesh.
+        * **AOT** — lowers and compiles either a graphstate-bound or
+          unbound variant of ``self._lm_head_fn``, mirroring the
+          ``bind_graphstate_for_aot`` policy used for the backbone.
+        * **JIT** — caches a closure around the lazy ``spx.jit`` form for
+          on-demand tracing.
+
+        Stores the resulting callable in ``self._lm_head_cache`` keyed by
+        ``(padded_num_reqs, "lm_head", mode)``. Idempotent.
+
+        Args:
+            padded_num_reqs: Request-axis bucket to compile for.
+            graphdef: Updated graphdef pinned on ``self`` so wrappers see
+                fresh weights after a hot-swap.
+            graphstate, graphother: Trace templates / capture constants.
+            inputs: Reserved for symmetry with :meth:`compile_backbone`;
+                the LM head only consumes pre-gathered hidden states, so
+                ``inputs`` is unused here.
+            hidden_dim: Override for the hidden-size dimension of the
+                dummy input. ``None`` reads it from the model's text
+                config.
+            dtype: dtype of the dummy hidden states. ``None`` reads
+                ``self.model.dtype``.
         """
         self.graphdef = graphdef
         mode = self._compile_mode()

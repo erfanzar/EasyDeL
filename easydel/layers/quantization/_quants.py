@@ -95,6 +95,20 @@ _QMM_KWARG_ALIASES: dict[str, str] = {
 
 
 def _extract_explicit_qmm_kwargs(kwargs: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    """Map externally supplied kwargs to their canonical qmm names.
+
+    Allows callers of :meth:`EasyQuantizer.apply_quantization` to pass either
+    the new ``qmm_*`` form or one of the legacy aliases (e.g.
+    ``use_qmm_best_config``).
+
+    Args:
+        kwargs: Mapping of keyword arguments forwarded to
+            :meth:`EasyQuantizer.apply_quantization`.
+
+    Returns:
+        Dict containing only the entries whose keys match a known qmm alias,
+        with each key normalized to its canonical form.
+    """
     overrides: dict[str, typing.Any] = {}
     for key, value in kwargs.items():
         mapped_key = _QMM_KWARG_ALIASES.get(key)
@@ -104,6 +118,18 @@ def _extract_explicit_qmm_kwargs(kwargs: dict[str, typing.Any]) -> dict[str, typ
 
 
 def _extract_model_qmm_defaults(model: spx.Module) -> dict[str, typing.Any]:
+    """Read default qmm controls from a model's ``config`` attribute.
+
+    Looks for ``qmm_*`` (or legacy aliased) attributes on ``model.config`` and
+    returns them as canonical kwargs that downstream layers can consume.
+
+    Args:
+        model: SpecTrax module whose ``config`` (if any) is inspected.
+
+    Returns:
+        Dict of canonical qmm kwargs derived from the config, or an empty dict
+        when the model has no config or no relevant attributes.
+    """
     config = getattr(model, "config", None)
     if config is None:
         return {}
@@ -135,6 +161,21 @@ def _filter_supported_to_quantized_kwargs(
     to_quantized: typing.Callable[..., typing.Any],
     overrides: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
+    """Drop kwargs that the layer's ``to_quantized`` does not accept.
+
+    Quantized linear layers expose runtime controls via ``to_quantized`` but
+    not every linear layer (or LoRA-wrapped linear) exposes the same set.
+    Inspect the callable signature and forward only the recognised keys, or
+    forward everything when the callable accepts ``**kwargs``.
+
+    Args:
+        to_quantized: The bound ``to_quantized`` method to be invoked.
+        overrides: Candidate kwargs to forward.
+
+    Returns:
+        Filtered dict of kwargs safe to pass to ``to_quantized``. Returns an
+        empty dict when ``overrides`` is empty.
+    """
     if not overrides:
         return {}
     try:
@@ -324,7 +365,6 @@ class EasyQuantizer:
     """
 
     def __init__(self, quantization_config: QuantizationConfig | None = None) -> None:
-        super().__init__()
         """Initialize the EasyQuantizer with a configuration.
 
         Args:
@@ -332,6 +372,7 @@ class EasyQuantizer:
                 block size, pattern, and other settings. Pass None to create
                 a no-op quantizer that passes inputs through unchanged.
         """
+        super().__init__()
         self._config = quantization_config
 
     @property

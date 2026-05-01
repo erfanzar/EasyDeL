@@ -46,7 +46,16 @@ if _INFERENCE_MODE_STATE is None:
 
 
 def is_inference_mode() -> bool:
-    """Return ``True`` when execution is inside ``set_inference_mode()``."""
+    """Return ``True`` when execution is inside ``set_inference_mode()``.
+
+    The check reads the current ``ContextVar`` value, so it is safe to call
+    from anywhere in the program (including inside JAX traces, where the
+    JIT-cache key has been propagated separately by the user-context state).
+
+    Returns:
+        ``True`` when an enclosing ``set_inference_mode`` block has set the
+        flag, ``False`` otherwise (the default).
+    """
 
     return _inference_mode_var.get()
 
@@ -55,11 +64,18 @@ def is_inference_mode() -> bool:
 def set_inference_mode(enabled: bool = True) -> Iterator[bool]:
     """Temporarily mark execution as inference mode.
 
+    The flag is stored both in a ``ContextVar`` (for plain Python branching)
+    and in a JAX user context (so JITted functions traced inside the block
+    see a different cache key than those traced outside).
+
     Args:
         enabled: Whether inference mode should be active inside the block.
 
     Yields:
         The ``enabled`` value for convenience.
+
+    Raises:
+        TypeError: If ``enabled`` is not a ``bool``.
     """
 
     if not isinstance(enabled, bool):

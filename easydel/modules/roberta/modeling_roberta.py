@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""RoBERTa model implementation for EasyDeL.
+
+This module implements Facebook AI's RoBERTa encoder-only transformer.
+RoBERTa is a BERT-derivative trained with dynamic masking and larger
+batches; architecturally it uses absolute (learned) position
+embeddings, LayerNorm, GELU activations, and a token-type-free
+embedding setup.
+
+Exposes :class:`RobertaModel` (encoder trunk) and the task wrappers
+:class:`RobertaForCausalLM`, :class:`RobertaForMaskedLM`,
+:class:`RobertaForSequenceClassification`,
+:class:`RobertaForTokenClassification`,
+:class:`RobertaForMultipleChoice`, and :class:`RobertaForQuestionAnswering`.
+"""
 
 import jax
 import spectrax as spx
@@ -63,6 +77,29 @@ from .roberta_configuration import RobertaConfig as RobertaConfig
 def dot_product_attention_weights(
     query, key, *, init_bias=None, dropout_rate=0.0, broadcast_dropout=False, dtype=None, precision=None
 ):
+    """Compute scaled dot-product attention weights without applying values.
+
+    Returns the softmax over query/key dot products, scaled by
+    ``1/sqrt(depth)``, with an optional additive bias and optional
+    dropout. Used by RoBERTa's encoder attention.
+
+    Args:
+        query: Query tensor of shape ``(..., q, h, d)``.
+        key: Key tensor of shape ``(..., k, h, d)``.
+        init_bias: Optional additive attention bias broadcastable to
+            ``(..., h, q, k)`` (e.g. an attention mask). ``None`` means
+            no bias.
+        dropout_rate: Probability of dropping individual attention
+            weights after softmax. Defaults to ``0.0`` (disabled).
+        broadcast_dropout: Currently unused; preserved for API
+            compatibility with sibling implementations.
+        dtype: Currently unused; preserved for API compatibility.
+        precision: Currently unused; preserved for API compatibility.
+
+    Returns:
+        Attention weight tensor of shape ``(..., h, q, k)`` with the
+        softmax applied along the key axis.
+    """
     depth = query.shape[-1]
     attn_scores = jnp.einsum("...qhd,...khd->...hqk", query, key) / jnp.sqrt(depth).astype(query.dtype)
     if init_bias is not None:
@@ -993,6 +1030,13 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
             past_key_values = TransformerCache.init_empty(len(self.layer))
 
         def _layer_loop(layer, carry):
+            """Apply a single encoder layer inside the layer-stack scan.
+
+            Body of ``self.layer.scan``; runs ``layer`` on the current
+            hidden states, optionally accumulates per-layer hidden
+            states, self-attention weights and cross-attention weights,
+            and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, all_cross_attentions, i = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1636,31 +1680,48 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
         )
 
     def get_encoder(self):
-        """Returns the encoder part of the model."""
+        """Return the underlying RoBERTa transformer encoder.
+
+        Returns:
+            RobertaModel: The encoder stack that produces token hidden
+            states; the classifier consumes only the ``[CLS]``-position
+            output.
+        """
         return self.roberta
 
     def get_decoder(self):
-        """Returns the decoder part of the model.
+        """RoBERTa is encoder-only — no decoder is available.
 
         Raises:
-            NotImplementedError: RoBERTa is an encoder-only model.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head.
+        """No LM head — this wrapper provides a classification head.
 
         Raises:
-            NotImplementedError: This model has a classification head, not an LM head.
+            NotImplementedError: Always. Use
+                :class:`RobertaForMaskedLM` for masked-LM logits.
         """
         raise NotImplementedError("This model has a sequence classification head, not a language model head.")
 
     def get_embedding(self):
-        """Returns the embedding layer of the model."""
+        """Return the RoBERTa word/position/type embedding stack.
+
+        Returns:
+            spx.Module: The embedding module exposed by
+            :meth:`RobertaModel.get_embedding`.
+        """
         return self.roberta.get_embedding()
 
     def get_task_head(self):
-        """Returns the sequence classification head."""
+        """Return the sequence-level classification head.
+
+        Returns:
+            RobertaClassificationHead: The MLP that maps the ``[CLS]``
+            hidden state to ``num_labels`` class logits.
+        """
         return self.classifier
 
 
@@ -1786,27 +1847,37 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """Returns the encoder part of the model."""
+        """Return the underlying RoBERTa transformer encoder.
+
+        Returns:
+            RobertaModel: The encoder stack run independently for each
+            of the reshaped ``num_choices`` candidates before pooling.
+        """
         return self.roberta
 
     def get_decoder(self):
-        """Returns the decoder part of the model.
+        """RoBERTa is encoder-only — no decoder is available.
 
         Raises:
-            NotImplementedError: RoBERTa is an encoder-only model.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head.
+        """No LM head — this wrapper produces a per-choice score.
 
         Raises:
-            NotImplementedError: This model has a multiple choice head, not an LM head.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This model has a multiple choice classification head, not a language model head.")
 
     def get_embedding(self):
-        """Returns the embedding layer of the model."""
+        """Return the RoBERTa embedding stack.
+
+        Returns:
+            spx.Module: Same word/position/type embedding the encoder
+            uses; shared across all choices in the batch.
+        """
         return self.roberta.get_embedding()
 
 
@@ -1924,31 +1995,45 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         )
 
     def get_encoder(self):
-        """Returns the encoder part of the model."""
+        """Return the underlying RoBERTa transformer encoder.
+
+        Returns:
+            RobertaModel: Encoder used to compute per-token contextual
+            representations consumed by the per-token classifier.
+        """
         return self.roberta
 
     def get_decoder(self):
-        """Returns the decoder part of the model.
+        """RoBERTa is encoder-only — no decoder is available.
 
         Raises:
-            NotImplementedError: RoBERTa is an encoder-only model.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head.
+        """No LM head — this wrapper provides a token-level classifier.
 
         Raises:
-            NotImplementedError: This model has a token classification head, not an LM head.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This model has a token classification head, not a language model head.")
 
     def get_embedding(self):
-        """Returns the embedding layer of the model."""
+        """Return the RoBERTa embedding stack.
+
+        Returns:
+            spx.Module: The shared word/position/type embedding module.
+        """
         return self.roberta.get_embedding()
 
     def get_task_head(self):
-        """Returns the token classification head."""
+        """Return the per-token classification head.
+
+        Returns:
+            ColumnParallelLinear: Linear layer mapping each token's
+            hidden state to ``num_labels`` class logits.
+        """
         return self.classifier
 
 
@@ -2065,31 +2150,46 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
         )
 
     def get_encoder(self):
-        """Returns the encoder part of the model."""
+        """Return the underlying RoBERTa transformer encoder.
+
+        Returns:
+            RobertaModel: Encoder used to compute per-token representations
+            consumed by the QA span head.
+        """
         return self.roberta
 
     def get_decoder(self):
-        """Returns the decoder part of the model.
+        """RoBERTa is encoder-only — no decoder is available.
 
         Raises:
-            NotImplementedError: RoBERTa is an encoder-only model.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head.
+        """No LM head — this wrapper produces span start/end logits.
 
         Raises:
-            NotImplementedError: This model has a QA head, not an LM head.
+            NotImplementedError: Always.
         """
         raise NotImplementedError("This model has a question answering head, not a language model head.")
 
     def get_embedding(self):
-        """Returns the embedding layer of the model."""
+        """Return the RoBERTa embedding stack.
+
+        Returns:
+            spx.Module: The shared word/position/type embedding module.
+        """
         return self.roberta.get_embedding()
 
     def get_task_head(self):
-        """Returns the question answering head."""
+        """Return the QA span-prediction head.
+
+        Returns:
+            ColumnParallelLinear: A 2-output linear layer whose two
+            channels are split into ``start_logits`` and ``end_logits``
+            in :meth:`forward`.
+        """
         return self.qa_outputs
 
 
@@ -2258,13 +2358,32 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
         raise NotImplementedError("This CausalLM model does not have a separate encoder.")
 
     def get_decoder(self):
-        """Returns the decoder part of the model."""
+        """Return the RoBERTa transformer used as a causal decoder.
+
+        The same encoder layers are reused but with a causal attention
+        mask supplied by the wrapper, plus optional cross-attention to
+        ``encoder_hidden_states`` for sequence-to-sequence settings.
+
+        Returns:
+            spx.Module: The underlying ``RobertaModel`` decoder.
+        """
         return self.roberta.get_decoder()
 
     def get_lm_head(self):
-        """Returns the language model head."""
+        """Return the masked-language-modelling-style LM head.
+
+        Returns:
+            spx.Module: The :class:`RobertaLMHead` projecting hidden
+            states through a dense + GELU + LayerNorm stack to vocabulary
+            logits, with the bias term applied separately.
+        """
         return self.lm_head
 
     def get_embedding(self):
-        """Returns the embedding layer of the model."""
+        """Return the RoBERTa embedding stack.
+
+        Returns:
+            spx.Module: The shared word/position/type embedding module
+            from the underlying ``RobertaModel``.
+        """
         return self.roberta.get_embedding()

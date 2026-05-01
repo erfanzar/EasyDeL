@@ -33,7 +33,7 @@ dependencies = [
 	"jaxlib>=0.10.0",
 	"eformer==0.0.100",
 	"ejkernel==0.0.79",
-	"spectrax-lib==0.0.5",
+	"spectrax-lib==0.0.6",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
 	"transformers~=5.5.0",

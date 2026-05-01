@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Lazy-import infrastructure used by EasyDeL packages.
+
+Provides :class:`LazyModule`, a ``ModuleType`` subclass that defers
+sub-module imports until the first attribute access. EasyDeL's top-level
+``__init__`` swaps itself for a ``LazyModule`` so that ``import easydel`` is
+fast and individual heavy sub-modules (modeling, trainers, kernels, etc.)
+are only imported when actually used. The implementation is adapted from
+HuggingFace's lazy-module pattern.
+
+Also provides :class:`DummyObject`, a metaclass for placeholder classes that
+stand in for symbols whose backend dependencies are missing, and the
+:func:`is_package_available` import-checking helper.
+"""
+
 import importlib
 import os
 import typing as tp
@@ -44,6 +58,25 @@ class LazyModule(ModuleType):
         module_spec: importlib.machinery.ModuleSpec | None = None,
         extra_objects: dict[str, object] | None = None,
     ):
+        """Initialize a lazy module skeleton.
+
+        Two ``import_structure`` shapes are accepted:
+
+        * Mapping of ``frozenset(backend_name, ...)`` to ``{module: {symbol, ...}}``
+          (the new HF style with backend-gated symbols).
+        * Mapping of ``module: [symbol, ...]`` (the legacy flat shape).
+
+        Args:
+            name: The fully-qualified module name being installed (e.g.
+                ``"easydel"``).
+            module_file: The ``__file__`` of the underlying ``__init__.py``.
+            import_structure: Description of which symbols come from which
+                sub-module, optionally gated on backend frozensets.
+            module_spec: Optional ``ModuleSpec`` to attach (preserves package
+                semantics).
+            extra_objects: Mapping of symbol name to a concrete value that
+                should be returned directly without importing a sub-module.
+        """
         super().__init__(name)
 
         self._object_missing_backend = {}
@@ -89,6 +122,12 @@ class LazyModule(ModuleType):
             self._import_structure = import_structure
 
     def __dir__(self):
+        """Return ``dir()`` augmented with all lazy-export names.
+
+        Returns:
+            The default ``ModuleType.__dir__`` result extended with every name
+            declared in ``__all__`` so IDE auto-completion sees lazy exports.
+        """
         result = super().__dir__()
         for attr in self.__all__:
             if attr not in result:
@@ -96,12 +135,32 @@ class LazyModule(ModuleType):
         return result
 
     def __getattr__(self, name: str) -> tp.Any:
+        """Resolve a lazy attribute by importing its backing sub-module.
+
+        Args:
+            name: Attribute being accessed on the lazy module.
+
+        Returns:
+            The resolved object, which is also cached on ``self`` so further
+            accesses don't reimport.
+
+        Raises:
+            AttributeError: If ``name`` is not registered as a sub-module,
+                a class export, an extra object, or a missing-backend stub.
+        """
         if name in self._objects:
             return self._objects[name]
         if name in self._object_missing_backend.keys():
             missing_backends = self._object_missing_backend[name]
 
             class Placeholder(metaclass=DummyObject):
+                """Stub class returned when required backends are missing.
+
+                Tagged with ``_backends`` so callers can introspect which
+                optional dependencies they would need to install before this
+                symbol becomes usable.
+                """
+
                 _backends = missing_backends
 
             Placeholder.__name__ = name
@@ -120,6 +179,18 @@ class LazyModule(ModuleType):
         return value
 
     def _get_module(self, module_name: str):
+        """Import and return a child sub-module by relative name.
+
+        Args:
+            module_name: The sub-module name relative to this package.
+
+        Returns:
+            The imported module.
+
+        Raises:
+            RuntimeError: If the import raises any exception (with the
+                original error chained as ``__cause__`` for full traceback).
+        """
         try:
             return importlib.import_module("." + module_name, self.__name__)
         except Exception as e:
@@ -129,6 +200,11 @@ class LazyModule(ModuleType):
             ) from e
 
     def __reduce__(self):
+        """Support ``pickle`` round-trips by rebuilding the lazy module.
+
+        Returns:
+            A ``(class, args)`` tuple suitable for ``pickle`` to call.
+        """
         return (self.__class__, (self._name, self.__file__, self._import_structure))
 
 
@@ -139,6 +215,17 @@ class DummyObject(type):
     """
 
     def __getattribute__(cls, key):
+        """Forward dunder lookups to the standard machinery, swallow others.
+
+        Args:
+            key: Attribute name being accessed on the placeholder class.
+
+        Returns:
+            The result of ``type.__getattribute__`` for private/dunder names
+            (and ``_from_config``); ``None`` is returned implicitly for any
+            other attribute, which keeps ``hasattr`` checks falsey without
+            raising at the access site.
+        """
         if key.startswith("_") and key != "_from_config":
             return super().__getattribute__(key)
 

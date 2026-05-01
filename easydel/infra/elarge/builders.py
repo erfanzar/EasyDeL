@@ -233,6 +233,17 @@ _ESURGE_BOOL_FIELDS = frozenset(
 
 
 def _coerce_esurge_value(key: str, value: Any) -> Any:
+    """Coerce an eSurge config value to the canonical type for *key*.
+
+    Args:
+        key: eSurge config field name.
+        value: Raw value from a JSON/YAML/dict source.
+
+    Returns:
+        Any: The value cast to the field's expected type (``int``, ``float``,
+        ``bool``, list of ints, list of strings, etc.). Returns ``None`` for
+        ``None`` inputs.
+    """
     if value is None:
         return None
     if key == "max_num_seq_buckets":
@@ -1000,6 +1011,17 @@ def tokenize_dataset(
     from easydel.data.utils import is_streaming
 
     def tokenize_fn(examples):
+        """Tokenize a batch (or single example) of raw text.
+
+        Args:
+            examples: A dict with at least ``text_field`` containing either a
+                single string or a list of strings.
+
+        Returns:
+            dict: A dict containing the tokenized output under ``output_field``
+            (and optionally ``"attention_mask"`` when ``return_attention_mask``
+            is true).
+        """
         # Handle both batched and single examples
         texts = examples[text_field]
         if isinstance(texts, str):
@@ -1368,6 +1390,15 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     }
 
     def _normalize_name(raw: str) -> str:
+        """Strip glob characters and outer punctuation from a candidate name.
+
+        Args:
+            raw: Raw name fragment (possibly containing wildcard characters).
+
+        Returns:
+            str: Cleaned identifier with ``*``, ``?``, ``[]``, ``{}`` and
+            outer ``._- `` chars removed.
+        """
         cleaned = re.sub(r"[\*\?\[\]\{\}]", "", raw)
         cleaned = cleaned.strip().strip("._- ")
         return cleaned

@@ -130,6 +130,27 @@ def sdpo_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
+        """Compute the SDPO loss for a single minibatch.
+
+        The student (current policy parameters under gradient) and the
+        self-teacher (the same parameters with feedback-conditioned input
+        and ``stop_gradient``) are scored either in one shot or in
+        completion-axis chunks (when ``completion_chunk_size`` is set).
+
+        Args:
+            tree: Differentiable parameter tree.
+            minibatch (collections.abc.Mapping[str, jax.Array]): Minibatch
+                with prompt / completion / teacher fields and, when
+                ``beta != 0``, ``ref_per_token_logps``.
+
+        Returns:
+            tuple[jax.Array, LossMetrics]: Scalar loss plus a
+            :class:`LossMetrics` capturing SDPO diagnostics
+            (advantage statistics, student / teacher log-probs, etc.).
+
+        Raises:
+            ValueError: If ``distillation_type`` is not ``'kl'`` or ``'jsd'``.
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree)
@@ -287,6 +308,15 @@ def sdpo_step(
             loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(num_items, 1.0)
 
             def masked_mean(x):
+                """Compute the mean of ``x`` over completion-mask positions.
+
+                Args:
+                    x (jax.Array): Per-token statistic with shape
+                        matching ``completion_mask``.
+
+                Returns:
+                    jax.Array: Scalar mean over masked positions.
+                """
                 return jnp.sum(x * completion_mask) / jnp.maximum(completion_token_count, 1.0)
 
             per_token_advantage = teacher_logps - student_logps

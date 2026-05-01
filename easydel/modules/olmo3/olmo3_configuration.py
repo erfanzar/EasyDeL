@@ -22,16 +22,21 @@ from easydel.infra.factory import register_config
 
 @register_config("olmo3")
 class Olmo3Config(EasyDeLBaseConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`Olmo3Model`]. It is used to instantiate an OLMo3
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the [allenai/OLMo-3-0725-1B](https://huggingface.co/allenai/OLMo-3-0725-1B).
+    r"""Configuration for AI2's OLMo-3 family.
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    OLMo-3 is the third iteration of AI2's fully-open OLMo decoder LMs.
+    Compared to OLMo-2 it adopts a **hybrid sliding-window / full-attention
+    layer schedule**: most layers use sliding-window attention of size
+    ``sliding_window``, with a small number of full-attention layers
+    sprinkled in (controlled by ``layer_types`` — a list whose entries
+    are either ``"sliding_attention"`` or ``"full_attention"``). This
+    is the same idea behind Mistral-Nemo / Llama-4 NoPE: cheap local
+    attention on most layers, dense long-range mixing on a few. OLMo-3
+    keeps OLMo-2's QK-norm (RMSNorm on Q and K) and post-normalization
+    architecture for training stability. Default sizing mirrors the
+    public ``allenai/OLMo-3-0725-1B`` checkpoint.
 
-
-    Args:
+    Attributes:
             vocab_size (`int`, *optional*, defaults to 50304):
                     Vocabulary size of the Olmo3 model. Defines the number of different tokens that can be represented by the
                     `inputs_ids` passed when calling [`Olmo3Model`]

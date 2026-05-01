@@ -135,7 +135,25 @@ class SmolLM3Attention(UnifiedAttention):
         """
 
         def _dummy(query, key, positions=None, frequencies=None):
-            """Dummy RoPE function that returns query/key unchanged (NoPE)."""
+            """Identity RoPE used for SmolLM3 "NoPE" decoder layers.
+
+            Some SmolLM3 layers are configured to skip rotary
+            embeddings entirely (``no_rope_layers[layer_idx] == 0``).
+            For those layers the attention module still calls a RoPE
+            callable, so this function stands in as a no-op: it
+            returns the supplied query/key tensors unchanged and
+            ignores ``positions`` / ``frequencies``.
+
+            Args:
+                query: Per-head query tensor.
+                key: Per-head key tensor.
+                positions: Ignored — accepted for API parity with the
+                    real RoPE callable.
+                frequencies: Ignored — accepted for API parity.
+
+            Returns:
+                The original ``(query, key)`` tuple, unmodified.
+            """
             return query, key
 
         if not self.use_rope:
@@ -642,6 +660,13 @@ class SmolLM3Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

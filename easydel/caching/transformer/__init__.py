@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Standard transformer KV cache.
+
+Re-exports the configuration, per-layer view, multi-layer container and
+runtime metadata that implement EasyDeL's classic dense KV cache. This is
+the cache used by most attention-only architectures.
+"""
+
 from .cache import TransformerCache, TransformerCacheConfig, TransformerCacheView, TransformerMetadata
 
 __all__ = ("TransformerCache", "TransformerCacheConfig", "TransformerCacheView", "TransformerMetadata")

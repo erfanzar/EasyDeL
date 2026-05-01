@@ -135,6 +135,62 @@ class MiniMaxConfig(EasyDeLBaseConfig):
         mlp_beta_factor: int = 1,
         **kwargs,
     ):
+        """Initialize the MiniMax configuration.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 32000.
+            hidden_size (int, optional): Hidden dimension. Defaults to 4096.
+            intermediate_size (int, optional): MLP intermediate dimension. Defaults to 14336.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to 32.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+            num_key_value_heads (int | None, optional): Number of key/value heads for
+                grouped-query attention. Defaults to 8.
+            head_dim (int | None, optional): Per-head dimension. Defaults to None
+                (computed as ``hidden_size // num_attention_heads``).
+            hidden_act (str, optional): MLP activation function. Defaults to "silu".
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``4096 * 32``.
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            rms_norm_eps (float, optional): Epsilon for RMSNorm. Defaults to 1e-5.
+            use_cache (bool, optional): Whether to enable KV caching. Defaults to True.
+            pad_token_id (int | None, optional): Padding token id. Defaults to None.
+            bos_token_id (int, optional): Beginning-of-sequence token id. Defaults to 1.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 2.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            rope_theta (float, optional): RoPE base period. Defaults to 1e6.
+            sliding_window (int | None, optional): Sliding-window size for full-attention
+                layers. Defaults to None.
+            attention_dropout (float, optional): Attention dropout. Defaults to 0.0.
+            num_experts_per_tok (int, optional): MoE top-k routing parameter.
+                Defaults to 2.
+            num_local_experts (int, optional): Total experts per MoE layer. Defaults to 8.
+            output_router_logits (bool, optional): Whether to output router logits.
+                Defaults to False.
+            router_aux_loss_coef (float, optional): Auxiliary load-balancing loss
+                coefficient. Defaults to 0.001.
+            router_jitter_noise (float, optional): Router jitter noise. Defaults to 0.0.
+            layer_types (list[str] | None, optional): Per-layer attention type
+                (``"full_attention"`` or ``"linear_attention"``); auto-derived to
+                alternate when ``None``. Defaults to None.
+            block_size (int, optional): Block size for lightning attention. Defaults to 256.
+            full_attn_alpha_factor (int, optional): Residual scaling alpha for
+                full-attention layers. Defaults to 1.
+            full_attn_beta_factor (int, optional): Residual scaling beta for
+                full-attention layers. Defaults to 1.
+            linear_attn_alpha_factor (int, optional): Residual scaling alpha for
+                lightning-attention layers. Defaults to 1.
+            linear_attn_beta_factor (int, optional): Residual scaling beta for
+                lightning-attention layers. Defaults to 1.
+            mlp_alpha_factor (int, optional): Residual scaling alpha for MLP. Defaults to 1.
+            mlp_beta_factor (int, optional): Residual scaling beta for MLP. Defaults to 1.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+
+        Raises:
+            ValueError: If ``layer_types`` is provided with a length different from
+                ``num_hidden_layers``.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

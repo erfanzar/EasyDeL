@@ -28,14 +28,21 @@ def make_divisible(
     divisor: int | None = 8,
     min_value: float | int | None = None,
 ) -> float | int:
-    """This function is taken from the original tf repo.
-    It ensures that all layers have a channel number that is divisible by the divisor
+    """Round ``v`` to the nearest multiple of ``divisor`` that is at least ``min_value``.
+
+    Mirrors the helper from the original TF MobileNet codebase: ensures that all
+    layers have a channel count divisible by ``divisor`` while never rounding
+    down by more than 10%.
+
     Args:
-        v: input value
-        divisor: default to 8
-        min_value: minimum divisor value
+        v (float | int): Input value to round.
+        divisor (int | None, optional): Required divisor. Defaults to 8.
+        min_value (float | int | None, optional): Minimum allowed result; defaults
+            to ``divisor`` when ``None``. Defaults to None.
+
     Returns:
-        new_v: new divisible value
+        float | int: The rounded value, divisible by ``divisor`` and at least
+        ``min_value``.
     """
     if divisor is None:
         divisor = 8
@@ -66,11 +73,31 @@ def compute_heads(model_dim: int, head_dim: int) -> int:
 
 @register_config("openelm")
 class OpenELMConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for Apple's OpenELM family of layer-wise-scaled decoder LMs.
 
-    Args:
+    OpenELM differs from a standard LLaMA-style transformer in that
+    *attention head count* and *FFN width* vary across depth, controlled
+    by the multipliers ``qkv_multipliers`` and ``ffn_multipliers`` (each
+    can be either a scalar applied uniformly or a length-2 ``(low, high)``
+    range linearly interpolated between the first and last layer). The
+    constructor materializes these into per-layer integer schedules
+    ``num_query_heads_per_layer``, ``num_kv_heads_per_layer``, and
+    ``ffn_intermediate_size_per_layer`` (rounded by
+    :func:`make_divisible` to be divisible by ``ffn_dim_divisor``).
+    Per-layer GQA grouping is encoded by ``num_gqa_groups``: every group
+    of ``num_query_heads / num_gqa_groups`` query heads shares a single
+    KV head, giving cheaper inference at the cost of slightly noisier
+    attention.
+
+    Other notable knobs:
+        * ``normalize_qk_projections``: optional QK-norm (RMSNorm on Q
+          and K) for training stability.
+        * ``share_input_output_layers`` (alias of ``tie_word_embeddings``):
+          tie LM head and input embeddings.
+        * ``activation_fn_name``: typically ``"swish"`` (SiLU) producing
+          SwiGLU when ``ffn_with_glu`` is set.
+
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 32000):
             Vocabulary size of the OpenELM model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.

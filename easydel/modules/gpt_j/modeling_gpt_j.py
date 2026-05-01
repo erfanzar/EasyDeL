@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of EleutherAI's GPT-J decoder-only language model.
+
+GPT-J is a 6B-parameter autoregressive transformer notable for two design
+choices: parallel attention/FFN execution within a block and partial rotary
+position embeddings applied to only a subset of the head dimension.
+
+Architectural traits:
+    - Parallel attention + MLP per block (sum of branches into the residual
+      stream), enabling efficient pipelining during training.
+    - Partial rotary embeddings: ``rotary_dim`` (default 64) of each head is
+      rotated; the rest is left untouched.
+    - Dense full attention with no GQA or sliding window.
+    - GeLU (``gelu_new``) MLP with optional embedding tying.
+
+Exports:
+    - :class:`GPTJModel`: Backbone returning hidden states.
+    - :class:`GPTJForCausalLM`: Decoder LM with optional tied LM head.
+"""
 
 from functools import cached_property
 from typing import ClassVar

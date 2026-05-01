@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Sequence-level Knowledge Distillation (SeqKD) trainer module.
+
+SeqKD is a black-box distillation method (Kim & Rush, 2016): a teacher
+generates text completions from prompts and the student is trained on
+those completions with standard causal-LM cross-entropy loss. Because
+no teacher logits or hidden states are used, this trainer also supports
+API-based teachers via a callable.
+
+Public symbols:
+    - :class:`SeqKDConfig`: Hyperparameters for prompt/completion lengths
+      and teacher sampling.
+    - :class:`SeqKDTrainer`: Trainer implementing teacher-then-CE
+      distillation.
+"""
+
 from .seq_kd_config import SeqKDConfig
 from .seq_kd_trainer import SeqKDTrainer
 

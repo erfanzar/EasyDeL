@@ -87,7 +87,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, Float, Int
 from spectrax import nn
 
-from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.sharding import is_mpmd_mesh, replicated_named_sharding
 from easydel.infra.utils import ArrayParam, materialize_meta_leaves
 from easydel.layers.norms import LayerNorm
 from easydel.utils import traversals
@@ -127,6 +127,17 @@ BaseConf = EasyDeLBaseConfig
 
 
 def _looks_like_config(value: tp.Any) -> bool:
+    """Return whether *value* duck-types as an EasyDeL config.
+
+    Accepts either an :class:`EasyDeLBaseConfig` subclass instance or any
+    object exposing both ``runtime_sharding_resolver`` and ``mesh`` attributes.
+
+    Args:
+        value: Object to inspect.
+
+    Returns:
+        bool: ``True`` if the value can be used as an EasyDeL config.
+    """
     return isinstance(value, EasyDeLBaseConfig) or (
         value is not None and hasattr(value, "runtime_sharding_resolver") and hasattr(value, "mesh")
     )
@@ -135,6 +146,22 @@ def _looks_like_config(value: tp.Any) -> bool:
 def _resolve_init_config(
     init: tp.Callable, instance: tp.Any, args: tuple[tp.Any, ...], kwargs: dict[str, tp.Any]
 ) -> tp.Any:
+    """Locate the ``config`` argument inside an ``__init__`` call.
+
+    Inspects positional and keyword arguments to find the first value that
+    looks like an EasyDeL config so the surrounding decorator can install
+    parameter-init sharding context before the inner ``__init__`` runs.
+
+    Args:
+        init: The wrapped ``__init__`` method (used for signature binding).
+        instance: The module instance being initialized.
+        args: Positional arguments passed to ``__init__``.
+        kwargs: Keyword arguments passed to ``__init__``.
+
+    Returns:
+        Any | None: The resolved config object, or ``None`` if no config-like
+        argument is found.
+    """
     if _looks_like_config(kwargs.get("config")):
         return kwargs["config"]
 
@@ -154,11 +181,35 @@ def _resolve_init_config(
 
 
 def _is_reusable_context(value: tp.Any) -> bool:
+    """Return whether *value* implements the context-manager protocol.
+
+    Args:
+        value: Candidate context manager.
+
+    Returns:
+        bool: ``True`` if ``value`` defines both ``__enter__`` and
+        ``__exit__``.
+    """
     return hasattr(value, "__enter__") and hasattr(value, "__exit__")
 
 
 @contextlib.contextmanager
 def _parameter_init_sharding_context(config: tp.Any):
+    """Install mesh, axis rules, and variable placement during parameter init.
+
+    Yields a context in which fresh ``jax.Array`` parameters created by an
+    EasyDeL module's ``__init__`` are placed on the proper mesh according to
+    the config's :class:`RuntimeShardingResolver`. If *config* doesn't look
+    like an EasyDeL config, this is a pass-through.
+
+    Args:
+        config: An EasyDeL config (or duck-typed equivalent) supplying the
+            mesh, runtime sharding resolver, and logical axis rules.
+
+    Yields:
+        None: Inside the ``with`` block, parameter creation respects the
+        config's sharding metadata.
+    """
     if not _looks_like_config(config):
         yield
         return
@@ -170,6 +221,20 @@ def _parameter_init_sharding_context(config: tp.Any):
         resolver = resolver.with_mesh(mesh)
 
     def place(value: tp.Any, metadata: dict[str, tp.Any], explicit_sharding: bool) -> tp.Any | None:
+        """Place a freshly-created parameter on its target named sharding.
+
+        Args:
+            value: The candidate parameter (typically a ``jax.Array``).
+            metadata: Variable metadata describing the parameter (sharding,
+                tensor layout, etc.).
+            explicit_sharding: Whether the caller is asking for explicit
+                sharding even when the array already has a NamedSharding.
+
+        Returns:
+            Any | None: A device-placed array (when sharding can be applied),
+            the input value unchanged when already correctly sharded, or
+            ``None`` to signal that no placement should be performed.
+        """
         if not metadata or not isinstance(value, jax.Array):
             return None
 
@@ -249,7 +314,36 @@ class ParameterTransformRule:
 
 
 class EasyDeLLayerStackMixin:
-    """Shared repeated-layer cache, scan, and pipeline-stage helpers."""
+    """Shared utilities for modules built around a stack of identical sub-layers.
+
+    Mixed into :class:`EasyDeLBaseModule` (and selectively into model trunks
+    such as transformer blocks) to centralize three concerns that recur across
+    architectures:
+
+    1. **Per-layer KV-cache view plumbing** — :meth:`_layer_cache_view_at` and
+       :meth:`_layer_cache_view_update` read/write the per-layer slice of a
+       paged-attention cache using a single mutable cache-views handle, so
+       caller code does not need to special-case ``cache``-vs-``cache_views``
+       call paths during trace and execution.
+    2. **Pipeline-parallel stage assignment** — methods prefixed
+       ``_pipeline_stage_*`` and ``_layer_stage_*`` resolve a logical layer
+       index to its physical PP owner under SpecTrax's virtual / interleaved
+       schedules and emit ``spx.assign_stage`` / ``spx.sxstage_region``
+       contexts so that newly-created variables and activations land on the
+       correct stage. This keeps creation-time sharding aligned with the
+       pipeline schedule and avoids cross-rank parameter movement at runtime.
+    3. **Scan-vs-trace dispatch and stage-boundary marking** —
+       :meth:`_layer_scan_trace` decides whether a stack must use the Python
+       trace path (cache views, hidden-state output, virtual stages, etc.)
+       and :meth:`_mark_layer_stage_boundary` emits ``spx.sxstage_iter``
+       between layers that span a PP boundary.
+
+    All methods read configuration off ``self.config`` (a
+    :class:`EasyDeLBaseConfig` or subclass) and rely on
+    ``config.mesh``, ``config.pipeline_*`` settings, and
+    ``config.runtime_sharding_resolver`` being available. The mixin holds no
+    state of its own.
+    """
 
     config: tp.Any
 
@@ -319,6 +413,18 @@ class EasyDeLLayerStackMixin:
         """Build the SpectraX region wrapper used by EasyDeL module calls."""
         return spx.sxstage_region(self._pipeline_stage_region_name())
 
+    def _pipeline_layer_position(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
+        """Map a stack-local layer index into the model-wide PP layer order."""
+        offset = int(getattr(self.config, "pipeline_layer_offset", 0) or 0)
+        total = int(getattr(self.config, "pipeline_layer_total", total_layers) or total_layers)
+        return offset + int(layer_idx), max(1, total)
+
+    def _pipeline_logical_stage(self: Self, layer_idx: int, total_layers: int) -> int:
+        """Resolve a stack-local layer index to a model-wide logical PP stage."""
+        logical_pp = self._pipeline_stage_count()
+        global_idx, global_total = self._pipeline_layer_position(layer_idx, total_layers)
+        return min(logical_pp - 1, (global_idx * logical_pp) // global_total)
+
     def _layer_physical_stage_assignment(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
         """Resolve a layer position to the physical PP owner used for sharding.
 
@@ -330,8 +436,7 @@ class EasyDeLLayerStackMixin:
         physical_pp = self._pipeline_physical_stage_count()
         if physical_pp <= 1:
             return 0, 1
-        logical_pp = self._pipeline_stage_count()
-        logical_stage = min(logical_pp - 1, (int(layer_idx) * logical_pp) // int(total_layers))
+        logical_stage = self._pipeline_logical_stage(layer_idx, total_layers)
         layout = self.config.pipeline_stage_layout
         if layout == "contiguous":
             virtual_stages = max(1, int(self.config.pipeline_virtual_stages))
@@ -409,10 +514,11 @@ class EasyDeLLayerStackMixin:
             return hidden_states
         total = len(layers if layers is not None else self.layers)  # type: ignore[attr-defined]
         pp = self._pipeline_stage_count()
-        if pp <= 1 or idx + 1 >= total:
+        global_idx, global_total = self._pipeline_layer_position(idx, total)
+        if pp <= 1 or global_idx + 1 >= global_total:
             return hidden_states
-        current = min(pp - 1, (idx * pp) // total)
-        nxt = min(pp - 1, ((idx + 1) * pp) // total)
+        current = min(pp - 1, (global_idx * pp) // global_total)
+        nxt = min(pp - 1, ((global_idx + 1) * pp) // global_total)
         if current != nxt:
             edge_sharding = self._layer_stage_boundary_sharding(hidden_states)
             return spx.sxstage_iter(hidden_states, stage=current, sharding=edge_sharding)
@@ -497,6 +603,20 @@ class EasyDeLBaseModule(
     _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
 
     def __init_subclass__(cls, **kwargs: tp.Any) -> None:
+        """Wrap subclass ``__init__`` to install parameter-init sharding context.
+
+        Each :class:`EasyDeLBaseModule` subclass automatically gets its
+        ``__init__`` wrapped so that parameter creation runs inside
+        :func:`_parameter_init_sharding_context`, ensuring fresh ``jax.Array``
+        weights are placed on the configured mesh. The wrapper is idempotent
+        (skipped if already applied).
+
+        Args:
+            **kwargs: Forwarded to ``super().__init_subclass__``.
+
+        Returns:
+            None.
+        """
         super().__init_subclass__(**kwargs)
         original_init = cls.__dict__.get("__init__")
         if original_init is None or getattr(original_init, "_easydel_init_sharding_wrapped", False):
@@ -504,6 +624,15 @@ class EasyDeLBaseModule(
 
         @wraps(original_init)
         def init_with_parameter_sharding(self, *args, **kwargs):
+            """Run the original ``__init__`` inside the parameter sharding context.
+
+            Args:
+                *args: Positional ``__init__`` arguments.
+                **kwargs: Keyword ``__init__`` arguments.
+
+            Returns:
+                None.
+            """
             config = _resolve_init_config(original_init, self, args, kwargs)
             with _parameter_init_sharding_context(config):
                 original_init(self, *args, **kwargs)
@@ -1039,6 +1168,15 @@ class EasyDeLBaseModule(
         gdef, params, others = self.split_module()
 
         def _map_leaf(leaf):
+            """Cast a single leaf to the target dtype if non-None.
+
+            Args:
+                leaf: A pytree leaf, typically a ``jax.Array`` or ``None``.
+
+            Returns:
+                The leaf cast to ``dtype``, or ``None`` if the input was
+                ``None``.
+            """
             if leaf is not None:
                 leaf = leaf.astype(dtype)
             return leaf
@@ -1148,6 +1286,15 @@ class EasyDeLBaseModule(
         gdef, params, others = self.split_module()
 
         def _map(array):
+            """Cast a floating-point array to ``dtype``; leave others as-is.
+
+            Args:
+                array: A ``jax.Array`` leaf.
+
+            Returns:
+                The array cast to ``dtype`` if it has a floating-point dtype,
+                otherwise the input unchanged.
+            """
             if array.dtype in [
                 jnp.bfloat16,
                 jnp.float16,
@@ -1544,6 +1691,18 @@ class EasyDeLBaseModule(
         fallback_spec = PartitionSpec()
 
         def _sharding_for(var, shape):
+            """Resolve a NamedSharding for a variable using metadata fallbacks.
+
+            Args:
+                var: A SpectraX variable carrying sharding metadata, or
+                    ``None`` to indicate an absent parameter.
+                shape: Concrete tensor shape, or ``None`` for replicated.
+
+            Returns:
+                jax.sharding.NamedSharding: Resolved named sharding (variable
+                metadata if available, otherwise a replicated or
+                shape-corrected fallback).
+            """
             if var is not None and hasattr(var, "metadata"):
                 ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=full_mesh)
                 if ns is not None:
@@ -1729,6 +1888,14 @@ class EasyDeLBaseModule(
         rngs = kwargs.pop("rngs", None)
 
         def _init(rngs):
+            """Construct the module with bound kwargs and the supplied ``rngs``.
+
+            Args:
+                rngs: SpectraX random-number-generator container.
+
+            Returns:
+                cls: A freshly constructed module instance.
+            """
             return cls(**kwargs, rngs=rngs)
 
         return jax.eval_shape(_init, rngs=rngs)
@@ -2337,6 +2504,23 @@ class EasyDeLBaseModule(
 
         outputs = self(**forward_batch)
 
+        config_mesh = getattr(self.config, "_hidden_mesh", None) or getattr(self.config, "mesh", None)
+        config_mesh_shape = getattr(config_mesh, "shape", {})
+        axis_names = tuple(getattr(self.config, "sharding_axis_names", ()))
+        axis_dims = tuple(getattr(self.config, "sharding_axis_dims", ()))
+        config_has_pp = False
+        if "pp" in axis_names:
+            pp_index = axis_names.index("pp")
+            config_has_pp = pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
+        loss_paxis = (
+            None
+            if is_mpmd_mesh(config_mesh)
+            or int(config_mesh_shape.get("pp", 1)) > 1
+            or config_has_pp
+            or getattr(self.mesh, "is_mpmd", False)
+            else self.config.partition_axis
+        )
+
         loss_output: LossMetrics = self.loss_strategy.compute(
             module=self,
             outputs=outputs,
@@ -2344,7 +2528,7 @@ class EasyDeLBaseModule(
             loss_config=loss_config,
             batch=batch,
             loss_kwargs=loss_kwargs,
-            paxis=None if self.mesh.is_mpmd else self.config.partition_axis,
+            paxis=loss_paxis,
             forward_plan=forward_plan,
         )
         if hasattr(outputs, "aux_loss"):
@@ -2433,11 +2617,28 @@ class EasyDeLBaseModule(
         if _native_forward is None:
 
             def _native_forward(hidden_states: "Array", *, w: "Array | None" = None) -> "Array":
+                """Fallback LM-head forward used when the head exposes no ``native_forward``.
+
+                Args:
+                    hidden_states: Hidden states ``[..., hidden]`` to project.
+                    w: Optional override weight matrix for tied embeddings.
+
+                Returns:
+                    Array: Projected logits over the vocabulary.
+                """
                 if w is None:
                     return head(hidden_states)
                 return head(hidden_states, w=w)
 
         def _project(hidden_states: "Array") -> "Array":
+            """Trace-safe LM-head projection bound to the resolved tied weight.
+
+            Args:
+                hidden_states: Hidden states to project to vocabulary logits.
+
+            Returns:
+                Array: Logits over the vocabulary.
+            """
             return _native_forward(hidden_states, w=w)
 
         return _project
@@ -2491,6 +2692,20 @@ class EasyDeLBaseModule(
 
     @staticmethod
     def _normalize_rebuild_quantization_config(config: EasyDeLBaseConfig):
+        """Coerce a config's ``quantization_config`` dict into a typed object.
+
+        If the config already carries an instantiated
+        :class:`QuantizationConfig` (or ``None``), the value is returned
+        as-is. Plain dicts are upgraded in-place on the config so subsequent
+        rebuild paths see the typed form.
+
+        Args:
+            config: The (mutable) EasyDeL config being rebuilt.
+
+        Returns:
+            QuantizationConfig | None: The normalized quantization config, or
+            ``None`` if the config has no quantization configured.
+        """
         quantization_config = getattr(config, "quantization_config", None)
         if quantization_config is None:
             return None
@@ -2503,6 +2718,19 @@ class EasyDeLBaseModule(
         return quantization_config
 
     def _lazy_init_rebuilt_module(self, config: EasyDeLBaseConfig):
+        """Lazy-init a sibling module from *config*, re-applying quantization if needed.
+
+        Used by :meth:`update_module` and :meth:`new_graphdef` to materialize a
+        new graph definition that mirrors the current module's dtype/precision/
+        rng configuration.
+
+        Args:
+            config: Target config used to construct the new lazy module.
+
+        Returns:
+            EasyDeLBaseModule: A lazy module instance, optionally wrapped by
+            :class:`EasyQuantizer` when this module is already quantized.
+        """
         module = self.lazy_init(
             config=config,
             dtype=self.dtype,
@@ -2534,8 +2762,93 @@ class EasyDeLBaseModule(
             recursive_update: If True, recursively apply the same updates to
                 any nested config objects that are subclasses of EasyDeLBaseConfig.
                 Defaults to False.
-            **kwargs: Configuration parameters to update (e.g., attn_mechanism,
-                gradient_checkpointing).
+            **kwargs: Configuration overrides typed by ``EasyDeLBaseConfigDict``
+                (consumed via ``Unpack[EasyDeLBaseConfigDict]``). Recognized
+                keys are:
+
+                sharding_axis_dims (Sequence[int]): Parallelism sizes for
+                    ``(pp, dp, fsdp, ep, tp, sp)``.
+                sharding_dcn_axis_dims (Sequence[int] | None): Optional DCN
+                    mesh sizes for multi-host/multi-slice setups.
+                sharding_axis_names (Sequence[str]): Logical mesh axis names.
+                attn_mechanism (str): Forward-pass attention implementation.
+                decode_attn_mechanism (str): Decode-time attention
+                    implementation.
+                mla_attn_mechanism (str): Attention mechanism override for MLA
+                    layers.
+                mla_attn_dtype (jnp.dtype | str | None): MLA-specific
+                    attention activation dtype.
+                mla_attn_softmax_dtype (jnp.dtype | str | None): MLA-specific
+                    softmax compute dtype.
+                blocksize_k (int): Key block size for attention kernels.
+                blocksize_q (int): Query block size for attention kernels.
+                blocksize_b (int): Batch/block size for attention kernels.
+                moe_tiling_size_batch (int): MoE batch tiling.
+                moe_tiling_size_seqlen (int): MoE sequence-length tiling.
+                moe_tiling_size_dim (int): MoE hidden-dim tiling.
+                partition_axis (PartitionAxis): Logical-to-mesh axis mapping.
+                axis_policy (AxisPolicy): Canonical semantic-axis policy.
+                use_sharded_kv_caching (bool): Shard the KV cache instead of
+                    replicating.
+                use_sharding_constraint (bool): Insert explicit sharding
+                    constraints during model build.
+                backend (EasyDeLBackends | str | None): Explicit JAX backend.
+                platform (EasyDeLPlatforms | str | None): Kernel platform hint.
+                easy_method (Literal["train","serve","convert"]): Workflow
+                    context.
+                bits (int | None): Optional weight quantization bit width.
+                scan_ring_attention (bool): Scan ring-attention impls.
+                scan_attention_layers (bool): Apply scan to attention blocks.
+                scan_layers (bool): Apply scan over repeated model layers.
+                pipeline_stage_regions (bool): Enable pipeline stage region
+                    annotations.
+                pipeline_virtual_stages (int): Number of virtual pipeline
+                    stages.
+                pipeline_stage_layout (Literal["contiguous","interleaved",
+                    "loop"]): Pipeline-stage layout strategy.
+                use_scan_mlp (bool): Apply scan to MLP blocks.
+                scan_mlp_chunk_size (int): Chunk size when scanning MLPs.
+                sequence_axis_name (str): Sequence/attention axis name.
+                gradient_checkpointing (EasyDeLGradientCheckPointers | str):
+                    Gradient checkpointing policy.
+                gradient_checkpointing_targets (list[str] | None): Selective
+                    checkpointing target names.
+                kv_cache_quantization_config (QuantizationConfig | None): KV
+                    cache quantization config.
+                kv_cache_sharding_sequence_axis_name (str | tuple[str,...]):
+                    Axis (or axes) used when sharding the KV cache.
+                use_qmm_best_config (bool): Request ejkernel tuned block
+                    configs for quantized matmuls.
+                qmm_platform_override (str | None): Quantized-matmul platform
+                    override.
+                qmm_tpu_path_override (str | None): Quantized-matmul TPU
+                    fused-path override.
+                flash_attention_backward_pass_impl (Literal["triton","xla"]):
+                    Backward kernel for flash attention.
+                attn_dtype (jnp.dtype): Attention activation dtype.
+                kvdtype (jnp.dtype): KV cache dtype.
+                attn_softmax_dtype (jnp.dtype): Softmax compute dtype.
+                fcm_max_ratio (float): Max ratio for forgetful causal masks.
+                fcm_min_ratio (float): Min ratio for forgetful causal masks.
+                use_expert_tensor_mode (bool): Treat experts as a tensor-
+                    parallel axis.
+                moe_method (str): Mixture-of-experts implementation.
+                moe_force_xla_gmm (bool): Force XLA GMM kernels for MoE.
+                use_ring_of_experts (bool): Use ring expert dispatch.
+                fsdp_is_ep_bound (bool): Fold FSDP axis into expert axis.
+                sp_is_ep_bound (bool): Fold sequence-parallel axis into
+                    expert axis.
+                quantization_config (QuantizationConfig | None): Linear-layer
+                    quantization config.
+                operation_configs (dict[str, BaseOperationConfig] | None):
+                    Per-operation kernel configs.
+                mask_max_position_embeddings (int): Max positions for
+                    attention mask precompute.
+                freq_max_position_embeddings (int): Max positions for RoPE
+                    frequency precompute.
+                precompute_masks (bool): Precompute and cache causal masks.
+                lmhead_chunksize (int | None): Optional token chunk size for
+                    chunked LM-head projection.
 
         Returns:
             Self: Updated module with new configuration and same parameter values.
@@ -2577,8 +2890,38 @@ class EasyDeLBaseModule(
             recursive_update: If True, recursively apply the same updates to
                 any nested config objects that are subclasses of EasyDeLBaseConfig.
                 Defaults to False.
-            **kwargs: Configuration parameters to update. Applied to a copy
-                of the current configuration.
+            **kwargs: Configuration overrides typed by ``EasyDeLBaseConfigDict``
+                (consumed via ``Unpack[EasyDeLBaseConfigDict]``). Applied to a
+                deep-copied configuration; see :meth:`update_module` for the
+                full list of recognized keys, which include
+                ``sharding_axis_dims``, ``sharding_dcn_axis_dims``,
+                ``sharding_axis_names``, ``attn_mechanism``,
+                ``decode_attn_mechanism``, ``mla_attn_mechanism``,
+                ``mla_attn_dtype``, ``mla_attn_softmax_dtype``,
+                ``blocksize_k``, ``blocksize_q``, ``blocksize_b``,
+                ``moe_tiling_size_batch``, ``moe_tiling_size_seqlen``,
+                ``moe_tiling_size_dim``, ``partition_axis``, ``axis_policy``,
+                ``use_sharded_kv_caching``, ``use_sharding_constraint``,
+                ``backend``, ``platform``, ``easy_method``, ``bits``,
+                ``scan_ring_attention``, ``scan_attention_layers``,
+                ``scan_layers``, ``pipeline_stage_regions``,
+                ``pipeline_virtual_stages``, ``pipeline_stage_layout``,
+                ``use_scan_mlp``, ``scan_mlp_chunk_size``,
+                ``sequence_axis_name``, ``gradient_checkpointing``,
+                ``gradient_checkpointing_targets``,
+                ``kv_cache_quantization_config``,
+                ``kv_cache_sharding_sequence_axis_name``,
+                ``use_qmm_best_config``, ``qmm_platform_override``,
+                ``qmm_tpu_path_override``,
+                ``flash_attention_backward_pass_impl``, ``attn_dtype``,
+                ``kvdtype``, ``attn_softmax_dtype``, ``fcm_max_ratio``,
+                ``fcm_min_ratio``, ``use_expert_tensor_mode``, ``moe_method``,
+                ``moe_force_xla_gmm``, ``use_ring_of_experts``,
+                ``fsdp_is_ep_bound``, ``sp_is_ep_bound``,
+                ``quantization_config``, ``operation_configs``,
+                ``mask_max_position_embeddings``,
+                ``freq_max_position_embeddings``, ``precompute_masks``, and
+                ``lmhead_chunksize``.
 
         Returns:
             spx.GraphDef: A new graph definition with updated configuration

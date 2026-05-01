@@ -40,13 +40,20 @@ logger = logging.getLogger(__name__)
 
 
 def parse_size(size: str | int) -> int:
-    """Parse a size string (e.g., '500MB') to bytes.
+    """Convert a human-readable size string into a raw byte count.
+
+    Recognises the suffixes ``B``, ``KB``, ``MB``, ``GB``, and ``TB``
+    (powers of 1024, case-insensitive). Integer inputs are passed
+    through unchanged so the helper is convenient to use even when
+    the caller already has a byte count. Strings without a recognised
+    unit are coerced to ``int`` directly.
 
     Args:
-        size: Size as string with unit or integer bytes.
+        size: Either a raw byte count (``int``) or a string with an
+            optional unit suffix (``"500MB"``, ``"1 gb"``, ``"1024"``).
 
     Returns:
-        Size in bytes.
+        int: Size in bytes.
 
     Examples:
         >>> parse_size(1024)
@@ -82,13 +89,25 @@ def parse_size(size: str | int) -> int:
 
 @dataclass
 class WriteStats:
-    """Statistics from a dataset write operation.
+    """Summary returned by every :class:`DatasetWriter` after a successful save.
+
+    Aggregates the row count, shard count, total on-disk size, and
+    the list of files produced — enough for callers to report progress
+    and (optionally) drive a subsequent Hub upload (see
+    :meth:`SaveStage._push_to_hub`).
 
     Attributes:
-        num_examples: Total number of examples written.
-        num_shards: Number of output shard files created.
-        total_bytes: Total bytes written across all shards.
-        output_paths: List of paths to the created shard files.
+        num_examples (int): Total rows written across every shard.
+        num_shards (int): Number of distinct output files produced.
+            Differs from :attr:`SaveStageConfig.num_shards` when the
+            writer is size-bounded rather than count-bounded.
+        total_bytes (int): Sum of file sizes across :attr:`output_paths`
+            in bytes; queried via the writer's filesystem after each
+            shard is flushed.
+        output_paths (list[str] | None): Filesystem (or fsspec URI)
+            paths of the produced shards in write order. Defaulted to
+            an empty list by ``__post_init__`` so callers can iterate
+            without a None-check.
     """
 
     num_examples: int = 0
@@ -97,16 +116,27 @@ class WriteStats:
     output_paths: list[str] | None = None
 
     def __post_init__(self):
+        """Replace a ``None`` :attr:`output_paths` with an empty list.
+
+        Mutable default arguments are unsafe to declare directly on a
+        dataclass; this hook keeps the field always non-``None`` for
+        callers while still allowing explicit construction with a
+        non-default list.
+        """
         if self.output_paths is None:
             self.output_paths = []
 
 
 class DatasetWriter:
-    """Base class for dataset writers.
+    """Abstract base for the format-specific writers used by the save stage.
 
-    Provides the common interface and configuration for writing
-    ShardedDataSource data to disk in various formats with configurable
-    sharding and compression.
+    Subclasses (:class:`ParquetWriter`, :class:`ArrowWriter`,
+    :class:`JsonlWriter`) implement :meth:`write` to consume a
+    :class:`ShardedDataSource` and produce one or more on-disk files.
+    The base class exists to share the constructor and to give the
+    factory :func:`create_writer` a common return type. All sharding
+    and compression decisions are made by the subclass; the base
+    fields are configuration storage.
     """
 
     def __init__(
@@ -117,14 +147,24 @@ class DatasetWriter:
         compression: str | None = None,
         overwrite: bool = False,
     ):
-        """Initialize DatasetWriter.
+        """Capture the writer's output settings without performing any I/O.
 
         Args:
-            output_path: Base output path (directory or file prefix).
-            max_shard_size: Maximum size per shard in bytes.
-            num_shards: Fixed number of shards (overrides max_shard_size).
-            compression: Compression algorithm.
-            overwrite: Whether to overwrite existing files.
+            output_path: Filesystem path or fsspec URI used as the
+                directory for the produced shard files (one file per
+                shard, named ``shard-NNNNN.<ext>``).
+            max_shard_size: Soft cap on per-shard byte size; once a
+                buffer exceeds this it is flushed to a new file.
+                Ignored when ``num_shards`` forces a fixed shard
+                count.
+            num_shards: Fixed shard count; when set, overrides the
+                size-based shard rotation.
+            compression: Codec name forwarded to the subclass-specific
+                writer (``"snappy"``, ``"gzip"``, …); semantics depend
+                on the format.
+            overwrite: Whether to clobber existing files at
+                ``output_path``. Currently advisory — concrete writers
+                may not all enforce this.
         """
         self.output_path = output_path
         self.max_shard_size = max_shard_size
@@ -133,32 +173,48 @@ class DatasetWriter:
         self.overwrite = overwrite
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write a sharded source to output.
+        """Abstract: walk ``source`` and produce sharded files in this writer's format.
 
         Args:
-            source: Data source to write.
+            source: :class:`ShardedDataSource` whose rows are streamed
+                out and grouped into shards.
 
         Returns:
-            Write statistics.
+            WriteStats: Counts (rows, shards, bytes) and the list of
+            files produced.
+
+        Raises:
+            NotImplementedError: Always, in the base class. Subclasses
+                must override.
         """
         raise NotImplementedError
 
 
 class ParquetWriter(DatasetWriter):
-    """Writer for Apache Parquet columnar format.
+    """Apache Parquet writer that produces sharded ``.parquet`` files via PyArrow.
 
-    Writes data in sharded Parquet files with configurable compression
-    (default: snappy). Supports cloud storage via fsspec.
+    Buffers rows in memory and flushes to a fresh ``shard-NNNNN.parquet``
+    file when the rough byte estimate exceeds
+    :attr:`max_shard_size`. Output paths are passed through ``fsspec``
+    so cloud URIs (``s3://``, ``gs://``) work transparently.
+    Compression defaults to ``"snappy"`` when not set, matching the
+    Parquet ecosystem norm.
     """
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write all data from source to sharded Parquet files.
+        """Stream rows from ``source`` into one or more Parquet shards.
+
+        Builds a row buffer, periodically converting it to a PyArrow
+        table and writing to disk via :func:`pyarrow.parquet.write_table`.
+        Uses the rough length of ``str(example)`` as a size estimate
+        — intentionally cheap, intentionally approximate.
 
         Args:
-            source: Data source to write.
+            source: :class:`ShardedDataSource` whose rows are
+                serialised and grouped into shards.
 
         Returns:
-            WriteStats with counts and paths of written shards.
+            WriteStats: Aggregated stats about the produced files.
         """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
@@ -174,6 +230,17 @@ class ParquetWriter(DatasetWriter):
         current_size = 0
 
         def flush_shard():
+            """Inline closure: serialise the buffered rows to a Parquet shard.
+
+            Captures ``self``, ``fs``, ``path``, ``pa``/``pq``,
+            ``stats``, and the rolling buffer state (via ``nonlocal``)
+            from the enclosing :meth:`write` scope. Builds an
+            in-memory PyArrow table from the buffered row dicts,
+            writes it through ``fsspec`` to ``shard-NNNNN.parquet``,
+            updates :class:`WriteStats`, and rolls the buffer/index
+            counters. A no-op when the buffer is empty so a final
+            ``flush_shard()`` after iteration is idempotent.
+            """
             nonlocal current_rows, current_size, current_shard
 
             if not current_rows:
@@ -218,19 +285,24 @@ class ParquetWriter(DatasetWriter):
 
 
 class ArrowWriter(DatasetWriter):
-    """Writer for Apache Arrow IPC (Feather) format.
+    """Apache Arrow IPC (Feather) writer that produces sharded ``.arrow`` files.
 
-    Writes data in sharded Arrow IPC files. Supports cloud storage via fsspec.
+    Like :class:`ParquetWriter` but writes the row buffers using
+    :func:`pyarrow.ipc.new_file`, which is lossless for arbitrary
+    Arrow types and faster to load back via memory mapping at the
+    cost of larger on-disk size. Supports ``fsspec`` URIs so cloud
+    targets work without code changes.
     """
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write all data from source to sharded Arrow IPC files.
+        """Stream rows from ``source`` into one or more Arrow IPC shards.
 
         Args:
-            source: Data source to write.
+            source: :class:`ShardedDataSource` whose rows are buffered
+                and flushed to sharded Arrow files.
 
         Returns:
-            WriteStats with counts and paths of written shards.
+            WriteStats: Aggregated stats about the produced files.
         """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
@@ -245,6 +317,15 @@ class ArrowWriter(DatasetWriter):
         current_size = 0
 
         def flush_shard():
+            """Inline closure: serialise the buffered rows to a single Arrow IPC shard.
+
+            Mirrors :meth:`ParquetWriter.write`'s flush helper: builds
+            a PyArrow table from the buffer, writes it through
+            :func:`pyarrow.ipc.new_file` to a fresh
+            ``shard-NNNNN.arrow`` file via ``fsspec``, updates
+            :class:`WriteStats`, and rolls the buffer/index counters.
+            No-op on empty buffer.
+            """
             nonlocal current_rows, current_size, current_shard
 
             if not current_rows:
@@ -287,20 +368,27 @@ class ArrowWriter(DatasetWriter):
 
 
 class JsonlWriter(DatasetWriter):
-    """Writer for JSON Lines format.
+    """JSON-Lines writer that produces sharded ``.jsonl`` (or ``.jsonl.gz``) files.
 
-    Writes data in sharded JSONL files with optional gzip compression.
-    Supports cloud storage via fsspec.
+    Each row is serialised with :func:`json.dumps` (UTF-8, no ASCII
+    escaping) and written one-per-line. Optional ``gzip`` compression
+    appends ``.gz`` to the filename. Cloud targets are supported via
+    ``fsspec``. Despite being the least efficient on-disk
+    representation, JSONL is convenient for human inspection and
+    cross-tool interchange.
     """
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write all data from source to sharded JSONL files.
+        """Stream rows from ``source`` into one or more JSONL shards.
 
         Args:
-            source: Data source to write.
+            source: :class:`ShardedDataSource` whose rows are
+                serialised line-by-line.
 
         Returns:
-            WriteStats with counts and paths of written shards.
+            WriteStats: Aggregated stats about the produced files;
+            paths reflect the ``.gz`` suffix when gzip compression is
+            in effect.
         """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
@@ -313,6 +401,15 @@ class JsonlWriter(DatasetWriter):
         current_size = 0
 
         def flush_shard():
+            """Inline closure: persist buffered JSON lines as a JSONL shard.
+
+            Joins the buffered already-encoded JSON strings with
+            newlines and writes them to ``shard-NNNNN.jsonl`` via
+            ``fsspec``. When ``self.compression == "gzip"``, wraps
+            the file object with :class:`gzip.GzipFile` and renames
+            the path to add ``.gz``. Updates :class:`WriteStats` and
+            rolls buffer/index counters.
+            """
             nonlocal current_lines, current_size, current_shard
 
             if not current_lines:
@@ -364,18 +461,33 @@ def create_writer(
     compression: str | None = None,
     overwrite: bool = False,
 ) -> DatasetWriter:
-    """Create a dataset writer for the specified format.
+    """Build the appropriate :class:`DatasetWriter` for a given format string.
+
+    Resolves the human-readable size cap via :func:`parse_size` and
+    constructs the matching subclass. Defaults to ``snappy``
+    compression for Parquet (matching the ecosystem norm) and leaves
+    the other formats' compression at the caller's choice.
 
     Args:
-        output_path: Base output path.
-        format: Output format (parquet, arrow, jsonl).
-        max_shard_size: Maximum shard size.
-        num_shards: Fixed number of shards.
-        compression: Compression algorithm.
-        overwrite: Whether to overwrite existing files.
+        output_path: Filesystem path or fsspec URI for the output
+            directory.
+        format: Container format — one of ``"parquet"``, ``"arrow"``,
+            ``"jsonl"``.
+        max_shard_size: Soft cap on per-shard byte size; accepts the
+            same syntax as :func:`parse_size`.
+        num_shards: Optional fixed shard count; overrides the
+            size-based rotation.
+        compression: Codec name forwarded to the writer; semantics
+            depend on the format. ``None`` lets each writer pick its
+            sensible default.
+        overwrite: Forwarded to the writer; advisory.
 
     Returns:
-        Appropriate DatasetWriter instance.
+        DatasetWriter: A configured :class:`ParquetWriter`,
+        :class:`ArrowWriter`, or :class:`JsonlWriter` instance.
+
+    Raises:
+        ValueError: When ``format`` is not one of the supported values.
     """
     max_size_bytes = parse_size(max_shard_size)
 
@@ -408,24 +520,39 @@ def create_writer(
 
 
 class SaveStage(BaseStage):
-    """Pipeline stage for saving processed datasets to disk.
+    """Pipeline stage that persists each dataset and optionally uploads it to the Hub.
 
-    Supports per-dataset save paths and formats, with optional
-    push to HuggingFace Hub. Each dataset can override the global
-    save path and format through its DatasetConfig.
+    For every entry in the rolling source dict, the stage resolves the
+    output location (per-dataset :attr:`DatasetConfig.save_path` if
+    set, else ``output_dir/<dataset_name>``), constructs an appropriate
+    :class:`DatasetWriter` via :func:`create_writer`, runs it, and
+    records counts as stage metrics. When :attr:`SaveStageConfig.push_to_hub`
+    is enabled it forwards the produced shards to the configured
+    HuggingFace Hub repo via :class:`huggingface_hub.HfApi`. Save is a
+    side-effect-only stage — the input data dict is returned unchanged
+    so further stages can chain after it.
     """
 
     def __init__(self, config: SaveStageConfig | None = None):
-        """Initialize SaveStage.
+        """Capture the save configuration and prime the base stage.
 
         Args:
-            config: Save stage configuration.
+            config: :class:`SaveStageConfig` controlling output
+                directory, format, sharding, compression, overwrite,
+                and Hub upload behaviour. Defaulted to a fresh
+                :class:`SaveStageConfig` when ``None`` so the stage
+                is constructible without arguments in tests.
         """
         super().__init__(config.__dict__ if config else {})
         self._stage_config = config or SaveStageConfig()
 
     @property
     def name(self) -> str:
+        """Stage identifier used in metric and log namespaces.
+
+        Returns:
+            str: The constant string ``"save"``.
+        """
         return "save"
 
     def process(
@@ -433,14 +560,26 @@ class SaveStage(BaseStage):
         data: dict[str, ShardedDataSource],
         context: PipelineContext,
     ) -> dict[str, ShardedDataSource]:
-        """Process datasets through save stage.
+        """Persist every dataset in ``data`` according to the configured save policy.
+
+        For each ``(name, source)`` pair, looks up the matching
+        :class:`DatasetConfig` on the context to honour per-dataset
+        overrides (``save_path``, ``save_format``), constructs the
+        right writer, runs it, and records ``"<name>_save_path"``,
+        ``"<name>_num_examples"``, and ``"<name>_num_shards"`` as
+        stage metrics. When the stage is disabled the data dict is
+        returned unchanged so callers can chain saves conditionally.
 
         Args:
-            data: Dictionary mapping dataset names to sources.
-            context: Pipeline context.
+            data: Rolling ``{dataset_name: ShardedDataSource}`` dict
+                from the previous stage.
+            context: Shared pipeline context whose
+                :class:`PipelineConfig` is consulted for per-dataset
+                overrides.
 
         Returns:
-            Same data dictionary (save is a side effect).
+            dict[str, ShardedDataSource]: ``data`` itself, unchanged
+            — saving is a pure side effect.
         """
         if not self._stage_config.enabled:
             return data
@@ -484,7 +623,23 @@ class SaveStage(BaseStage):
         return data
 
     def _push_to_hub(self, local_path: str, ds_name: str, stats: WriteStats):
-        """Push saved dataset to HuggingFace Hub."""
+        """Upload every produced shard to the configured Hub dataset repo.
+
+        Idempotently creates the destination repo (with the configured
+        privacy flag) and then uploads each entry in
+        ``stats.output_paths`` under ``<ds_name>/<filename>``.
+        Gracefully no-ops on missing optional dependency
+        (``huggingface_hub``) and logs (rather than raises) on upload
+        errors so a Hub outage does not lose the local artefacts.
+
+        Args:
+            local_path: Local base path of the saved dataset (purely
+                informational; the upload itself is driven from
+                ``stats.output_paths``).
+            ds_name: Dataset name used as the in-repo directory prefix.
+            stats: :class:`WriteStats` whose ``output_paths`` lists the
+                files to upload.
+        """
         try:
             from huggingface_hub import HfApi
 
@@ -527,20 +682,28 @@ def save_dataset(
     num_shards: int | None = None,
     compression: str | None = None,
 ) -> WriteStats:
-    """Save a sharded source to disk.
+    """One-call helper: write a sharded source to disk without setting up a pipeline.
 
-    Convenience function for saving without a full pipeline.
+    Constructs the appropriate :class:`DatasetWriter` via
+    :func:`create_writer` and runs it. Convenient for scripts that
+    have already built a :class:`ShardedDataSource` (often after some
+    transforms) and just need to persist it.
 
     Args:
-        source: Data source to save.
-        output_path: Output directory path.
-        format: Output format (parquet, arrow, jsonl).
-        max_shard_size: Maximum size per shard.
-        num_shards: Fixed number of shards.
-        compression: Compression algorithm.
+        source: :class:`ShardedDataSource` to write.
+        output_path: Filesystem path or fsspec URI for the output
+            directory.
+        format: Container format — ``"parquet"``, ``"arrow"``, or
+            ``"jsonl"``.
+        max_shard_size: Soft size cap per shard; same syntax as
+            :func:`parse_size`.
+        num_shards: Optional fixed shard count; overrides
+            ``max_shard_size``.
+        compression: Codec name forwarded to the writer.
 
     Returns:
-        Write statistics.
+        WriteStats: Aggregated statistics (rows, shards, bytes,
+        produced paths).
     """
     writer = create_writer(
         output_path=output_path,
@@ -559,34 +722,81 @@ def save_iterator(
     max_shard_size: str | int = "500MB",
     compression: str | None = None,
 ) -> WriteStats:
-    """Save an iterator of examples to disk.
+    """Persist an arbitrary iterator-of-rows by adapting it as a single-shard source.
+
+    Wraps the input iterator into a degenerate :class:`ShardedDataSource`
+    with one synthetic shard, then defers to :func:`save_dataset`.
+    Useful when callers have a plain Python generator they want to
+    persist without rebuilding it as a real sharded source.
 
     Args:
-        iterator: Iterator yielding dictionaries.
-        output_path: Output directory path.
-        format: Output format (parquet, arrow, jsonl).
-        max_shard_size: Maximum size per shard.
-        compression: Compression algorithm.
+        iterator: Iterator yielding row dicts; consumed once.
+        output_path: Filesystem path or fsspec URI for the output
+            directory.
+        format: Container format — ``"parquet"``, ``"arrow"``, or
+            ``"jsonl"``.
+        max_shard_size: Soft size cap per shard; same syntax as
+            :func:`parse_size`.
+        compression: Codec name forwarded to the writer.
 
     Returns:
-        Write statistics.
+        WriteStats: Aggregated statistics from the underlying
+        :func:`save_dataset` call.
     """
 
     # Wrap iterator as a simple sharded source
     class IteratorSource(ShardedDataSource[dict]):
-        """Adapter wrapping a plain iterator as a single-shard ShardedDataSource."""
+        """Local adapter that exposes a plain iterator as a single-shard sharded source.
+
+        Defined inside :func:`save_iterator` because it is purely an
+        implementation detail of the helper — the only consumer is
+        :func:`save_dataset` immediately below. Reports a single
+        synthetic shard named ``"shard_0"`` and forwards
+        :meth:`open_shard` to the captured iterator (which therefore
+        gets consumed exactly once).
+        """
 
         def __init__(self, it):
+            """Capture the iterator that backs the synthetic shard.
+
+            Args:
+                it: Iterator of row dicts. The adapter does not copy
+                    or duplicate it; iterating the source once
+                    exhausts it.
+            """
             self._it = it
 
         @property
         def shard_names(self):
+            """Single-element shard list satisfying the protocol.
+
+            Returns:
+                list[str]: ``["shard_0"]`` — the only shard the
+                adapter exposes.
+            """
             return ["shard_0"]
 
         def num_shards(self):
+            """Constant shard count — this adapter is single-shard by construction.
+
+            Returns:
+                int: Always ``1``.
+            """
             return 1
 
         def open_shard(self, shard_name):
+            """Return the wrapped iterator regardless of which shard was requested.
+
+            ``shard_name`` is ignored because only one synthetic shard
+            exists. The iterator is returned as-is and is consumed in
+            place by the caller.
+
+            Args:
+                shard_name: Ignored.
+
+            Returns:
+                Iterator: The wrapped row iterator.
+            """
             return self._it
 
     source = IteratorSource(iterator)

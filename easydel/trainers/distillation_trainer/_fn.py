@@ -362,6 +362,18 @@ def chunked_distillation_loss(
 
     @jax.checkpoint
     def _chunk_kl_ce(s_h, t_h, m, sl):
+        """Project a token-chunk of hidden states and compute KL/CE contributions.
+
+        Args:
+            s_h: Student hidden-state slice ``[batch, chunk, hidden_dim]``.
+            t_h: Teacher hidden-state slice with the same shape.
+            m: Loss-mask slice ``[batch, chunk]``.
+            sl: Safe-label slice (with ``-100`` replaced by 0) ``[batch, chunk]``.
+
+        Returns:
+            ``(distill_xent, teacher_entropy, ce, mask_sum)`` scalars
+            for this chunk.
+        """
         s_logits = student_lm_head_fn(s_h)
         t_logits = teacher_lm_head_fn(t_h)
         return _compute_kl_and_ce(
@@ -375,6 +387,16 @@ def chunked_distillation_loss(
         )
 
     def _scan_body(carry, xs):
+        """Add one chunk's KL/CE contributions into the scan accumulators.
+
+        Args:
+            carry: ``(distill_xent_sum, teacher_entropy_sum, ce_sum,
+                mask_sum)`` accumulator.
+            xs: ``(s_h, t_h, m, sl)`` batched chunk inputs.
+
+        Returns:
+            ``(new_carry, None)`` per the ``jax.lax.scan`` contract.
+        """
         s_h, t_h, m, sl = xs
         distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
         return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
@@ -404,6 +426,24 @@ def _resolve_indices(
     *,
     default_all: bool,
 ) -> tuple[int, ...]:
+    """Resolve user-supplied (possibly negative) layer indices to positive ones.
+
+    Args:
+        collection_length: Total number of layers/attentions available.
+        indices: Optional layer indices (negative values count from the
+            end).  ``None`` falls back to either all layers or just the
+            last layer based on ``default_all``.
+        default_all: When ``True`` and ``indices`` is empty, return all
+            layer indices; otherwise return only the last layer.
+
+    Returns:
+        A tuple of strictly positive indices in
+        ``[0, collection_length)``.
+
+    Raises:
+        ValueError: If ``collection_length`` is zero.
+        IndexError: If any resolved index is out of range.
+    """
     if collection_length == 0:
         raise ValueError("Cannot select layers from an empty collection.")
     if not indices:
@@ -420,6 +460,20 @@ def _resolve_indices(
 
 
 def _masked_mse(values: jax.Array, targets: jax.Array, mask: jax.Array | None) -> jax.Array:
+    """Compute mean squared error optionally restricted to a mask.
+
+    Args:
+        values: Predicted tensor.
+        targets: Reference tensor with the same shape as ``values``.
+        mask: Optional broadcastable mask; positions where ``mask`` is
+            zero are excluded from both numerator and denominator.
+
+    Returns:
+        A scalar MSE.
+
+    Raises:
+        ValueError: If ``values`` and ``targets`` have mismatched shapes.
+    """
     if values.shape != targets.shape:
         raise ValueError(f"Mismatched tensor shapes for distillation: {values.shape} vs {targets.shape}.")
     diff = values - targets
@@ -435,6 +489,17 @@ def _masked_mse(values: jax.Array, targets: jax.Array, mask: jax.Array | None) -
 
 
 def _build_attention_mask(attention_mask: jax.Array | None, *, dtype: jnp.dtype) -> jax.Array | None:
+    """Expand a 2-D padding mask into a 4-D attention-matrix mask.
+
+    Args:
+        attention_mask: ``[batch, seq_len]`` 0/1 mask; ``None`` short-
+            circuits to ``None``.
+        dtype: Output dtype.
+
+    Returns:
+        A ``[batch, 1, seq_len, seq_len]`` mask suitable for masking
+        attention probability matrices.
+    """
     if attention_mask is None:
         return None
     mask = attention_mask.astype(dtype)
@@ -442,12 +507,31 @@ def _build_attention_mask(attention_mask: jax.Array | None, *, dtype: jnp.dtype)
 
 
 def _normalize_attention(tensor: jax.Array) -> jax.Array:
+    """Row-normalise an attention probability tensor along the last axis.
+
+    Args:
+        tensor: ``[..., q, k]`` attention scores.
+
+    Returns:
+        A tensor of the same shape whose last-axis sums are 1
+        (row-stochastic), with a tiny denominator floor for numerical
+        stability.
+    """
     denom = jnp.sum(tensor, axis=-1, keepdims=True)
     denom = jnp.maximum(denom, jnp.finfo(tensor.dtype).tiny)
     return tensor / denom
 
 
 def _stop_gradient_tree(tree):
+    """Apply :func:`jax.lax.stop_gradient` to every JAX array leaf.
+
+    Args:
+        tree: Pytree of JAX-array and Python-leaf mixed values.
+
+    Returns:
+        A pytree of the same shape with all JAX arrays detached from
+        the autograd graph.
+    """
     return jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
 
 
@@ -459,6 +543,28 @@ def _distillation_forward_outputs(
     request_hidden_states: bool,
     request_attentions: bool,
 ) -> dict[str, tp.Any]:
+    """Run the model forward and collect the outputs needed by the distillation loss.
+
+    Args:
+        model: Student or teacher model module.
+        batch: Input batch.
+        use_chunked: If ``True``, the LM head is *not* applied so the
+            chunked path can stream logits later; the last hidden state
+            is returned under ``hidden_for_kl``.
+        request_hidden_states: Whether to also collect the per-layer
+            hidden states.
+        request_attentions: Whether to also collect the per-layer
+            attention probabilities.
+
+    Returns:
+        A dict with at minimum ``logits`` (or ``hidden_for_kl`` in the
+        chunked path) plus optional ``hidden_states`` and ``attentions``
+        keys.
+
+    Raises:
+        TypeError: If the model does not return logits in the
+            non-chunked path.
+    """
     call_kwargs = dict(batch)
     call_kwargs.pop("labels", None)
     call_kwargs.pop("completion_mask", None)
@@ -500,7 +606,29 @@ def _make_distillation_aux_forward(
     request_hidden_states: bool,
     request_attentions: bool,
 ):
+    """Build a cached auxiliary forward closure for the scheduled-VJP path.
+
+    Args:
+        use_chunked: Whether the chunked logits path is active.
+        request_hidden_states: Whether to surface per-layer hidden
+            states.
+        request_attentions: Whether to surface per-layer attentions.
+
+    Returns:
+        A two-argument callable ``forward(model, batch)`` returning the
+        distillation forward outputs.
+    """
+
     def forward(model, batch):
+        """Run :func:`_distillation_forward_outputs` with the captured options.
+
+        Args:
+            model: Student or teacher model module.
+            batch: Input batch.
+
+        Returns:
+            The distillation forward outputs dict.
+        """
         return _distillation_forward_outputs(
             model,
             batch,
@@ -597,6 +725,19 @@ def distillation_step(
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
     def teacher_forward(minibatch: collections.abc.Mapping[str, jax.Array]) -> dict[str, tp.Any]:
+        """Run the teacher in stop-gradient mode for one minibatch.
+
+        Args:
+            minibatch: Input minibatch dictionary.
+
+        Returns:
+            A dict with teacher logits / hidden states / attentions
+            ready to be consumed by the distillation loss.
+
+        Raises:
+            TypeError: If the teacher does not return logits in the
+                non-chunked code path.
+        """
         teacher_call_kwargs = dict(minibatch)
         teacher_call_kwargs.pop("labels", None)
         teacher_call_kwargs.pop("completion_mask", None)
@@ -623,6 +764,16 @@ def distillation_step(
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         def _teacher_fwd(kw, t_graphstate):
+            """Re-materializable teacher forward used inside ``teacher_forward``.
+
+            Args:
+                kw: Dynamic kwargs forwarded to the teacher module.
+                t_graphstate: Stop-gradient teacher graphstate.
+
+            Returns:
+                A dict with stop-gradient teacher outputs (logits or
+                hidden states plus optional layer activations).
+            """
             teacher_module = teacher_state.merge(t_graphstate)
             teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
             result: dict[str, tp.Any] = {}
@@ -646,6 +797,21 @@ def distillation_step(
         )
 
     def loss_fn(tree, minibatch):
+        """Compute the distillation loss for one minibatch.
+
+        Runs the student forward (with quantization-aware STE in
+        training), pulls the teacher outputs from
+        :func:`teacher_forward`, evaluates the KL/CE term and adds the
+        optional hidden-state and attention MSE terms.
+
+        Args:
+            tree: Student graphstate to differentiate against.
+            minibatch: One minibatch slice.
+
+        Returns:
+            ``(loss, metrics)`` where ``metrics`` is a populated
+            :class:`LossMetrics`.
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = student_state.merge(tree)
@@ -781,6 +947,24 @@ def distillation_step(
 
 
 def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Inject precomputed teacher outputs into ``call.batch``.
+
+    Runs the teacher model under :func:`cached_scheduled_auxiliary` and
+    stashes either ``teacher_logits`` (full path) or
+    ``teacher_hidden_for_kl`` (chunked path), plus optional teacher
+    hidden states and attentions when the trainer requested them.
+
+    Args:
+        call: The :class:`ScheduledStepCall` describing the current
+            step.
+
+    Returns:
+        A copy of ``call.batch`` with the appropriate teacher outputs
+        attached.
+
+    Raises:
+        RuntimeError: If no teacher state is available.
+    """
     batch = dict(call.batch)
     use_chunked = call.get("logits_chunk_size") is not None and call.get("logits_chunk_size") > 0
     request_hidden_states = call.get("hidden_state_weight", 0.0) != 0.0
@@ -812,6 +996,17 @@ def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
 
 
 def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the distillation scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering all distillation knobs that influence
+        compilation (temperature, alpha, hidden-state / attention
+        weights and layer indices, logits chunk size, partition spec,
+        plus the teacher state and quantizer identities).
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=(
@@ -831,6 +1026,19 @@ def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_distillation_scheduled_loss(call):
+    """Build a SpectraX-scheduled distillation scalar-loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` carrying the trainer's
+            current configuration.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` ready to feed to
+        :func:`spx.sxvalue_and_grad`.
+
+    Raises:
+        ValueError: If an unsupported hidden-state loss is configured.
+    """
     partition_spec = call.get("partition_spec")
     temperature = call.get("temperature", 4.0)
     alpha = call.get("alpha", 0.9)
@@ -850,6 +1058,24 @@ def _make_distillation_scheduled_loss(call):
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the scalar distillation loss inside the SpectraX scheduled VJP.
+
+        Combines the KL/CE term, the optional hidden-state MSE term,
+        and the optional attention MSE term using the captured weights.
+
+        Args:
+            tree: Student graphstate to differentiate against.
+            batch: Minibatch dict with precomputed teacher outputs.
+
+        Returns:
+            The combined scalar distillation loss.
+
+        Raises:
+            ValueError: If hidden-state / attention distillation is
+                requested but the relevant outputs are missing.
+            RuntimeError: If the chunked path is requested without a
+                teacher state.
+        """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
         student_outputs = _distillation_forward_outputs(

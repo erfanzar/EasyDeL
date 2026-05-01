@@ -31,11 +31,22 @@ if tp.TYPE_CHECKING:
 
 
 class HFDatasetShardedSource(ShardedDataSource[dict]):
-    """Wraps HuggingFace Dataset/IterableDataset as ShardedDataSource.
+    """Adapter that exposes any pre-loaded HF dataset as a single-shard sharded source.
 
-    This adapter allows trainers to work with a single data type internally
-    while accepting both HF datasets and ShardedDataSource from users.
-    HF datasets are treated as a single shard for simplicity.
+    The trainers and pipeline stages in EasyDeL expect their inputs as
+    :class:`ShardedDataSource` instances; this wrapper lets users pass
+    in already-built ``datasets.Dataset`` or ``datasets.IterableDataset``
+    objects and have them participate in the same machinery. The
+    wrapper exposes one synthetic shard, picks the right random-access
+    strategy at construction time (indexing for in-memory ``Dataset``,
+    iteration for streaming ``IterableDataset``), and caches the
+    length of in-memory datasets so :meth:`__len__` and
+    :meth:`get_shard_info` are cheap.
+
+    For dataset families where multiple file-level shards exist on
+    the Hub, prefer :class:`HuggingFaceShardedSource` which exposes
+    real shard granularity. Use this class when you already have a
+    materialised dataset object.
 
     Example:
         >>> from datasets import load_dataset
@@ -56,11 +67,23 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         dataset: "Dataset | IterableDataset",
         name: str | None = None,
     ):
-        """Initialize HFDatasetShardedSource.
+        """Detect the dataset shape and (when possible) cache its length.
+
+        Streaming detection happens up front via
+        :meth:`_check_is_iterable` so :meth:`open_shard` can pick the
+        right access pattern without reflecting on every call. For
+        in-memory datasets, ``len(dataset)`` is queried once and
+        memoised on ``self._length``; failures (some custom dataset
+        objects don't implement ``__len__``) are caught silently and
+        the source falls back to streaming-style iteration.
 
         Args:
-            dataset: HuggingFace Dataset or IterableDataset to wrap.
-            name: Optional name for the shard. Defaults to "hf_dataset".
+            dataset: HuggingFace ``Dataset`` (in-memory) or
+                ``IterableDataset`` (streaming) to wrap.
+            name: Optional shard label embedded in the synthetic
+                shard name (``"{name}:0"``); useful when several
+                wrapped sources are composed and need distinguishable
+                shard ids. Defaults to ``"hf_dataset"``.
         """
         self._dataset = dataset
         self._name = name or "hf_dataset"
@@ -76,13 +99,21 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
 
     @staticmethod
     def _check_is_iterable(dataset) -> bool:
-        """Check if the dataset is a streaming IterableDataset.
+        """Decide whether to treat ``dataset`` as a streaming or random-access source.
+
+        Prefers an :class:`isinstance` check against
+        ``datasets.IterableDataset`` when the ``datasets`` package is
+        importable. Falls back to a duck-typed check (treats anything
+        without ``__len__`` as streaming) when the import fails — this
+        keeps the helper usable in environments that wrap HF-like
+        objects without depending on the package.
 
         Args:
-            dataset: HuggingFace dataset object to check.
+            dataset: The dataset object to classify.
 
         Returns:
-            True if the dataset is an IterableDataset.
+            bool: ``True`` for streaming/iterable datasets, ``False``
+            for indexable in-memory ones.
         """
         try:
             from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -94,7 +125,25 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
 
     @staticmethod
     def _to_example(value: tp.Any) -> dict[str, tp.Any]:
-        """Normalize a dataset element to a plain dictionary example."""
+        """Coerce HF row payloads into plain Python dicts for downstream consumers.
+
+        HuggingFace's ``Dataset.__getitem__`` and iteration may return
+        rich row proxies depending on the format flag and column types.
+        Rather than rely on those proxies' shape, this helper
+        normalises into a plain ``dict`` so the rest of the pipeline
+        can be schema-agnostic. Mirrors
+        :func:`_coerce_example` in :mod:`base`.
+
+        Args:
+            value: Whatever the underlying dataset yielded.
+
+        Returns:
+            dict[str, Any]: Plain dict; original ``dict`` instances
+            are returned unchanged (caller owns mutation).
+
+        Raises:
+            TypeError: When ``value`` is not mapping-like at all.
+        """
         if isinstance(value, dict):
             return value
         if isinstance(value, Mapping):
@@ -108,11 +157,19 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
 
     @property
     def shard_names(self) -> Sequence[str]:
-        """Return shard names. HF datasets are treated as single shard."""
+        """Return shard names; HF datasets expose a single synthetic shard.
+
+        Returns:
+            One-element list of ``"{name}:0"``.
+        """
         return [f"{self._name}:0"]
 
     def num_shards(self) -> int:
-        """Return number of shards. HF datasets are treated as single shard."""
+        """Return the constant shard count of one.
+
+        Returns:
+            Always ``1``.
+        """
         return 1
 
     def open_shard(self, shard_name: str) -> Iterator[dict]:
@@ -170,12 +227,20 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
 
     @property
     def is_streaming(self) -> bool:
-        """Check if this is a streaming (IterableDataset) source."""
+        """Whether the wrapped dataset is a streaming ``IterableDataset``.
+
+        Returns:
+            True for streaming datasets, False for in-memory ``Dataset``.
+        """
         return self._is_iterable
 
     @property
     def estimated_length(self) -> int | None:
-        """Return estimated number of examples, if known."""
+        """Return the cached length, if available.
+
+        Returns:
+            Number of examples for in-memory datasets, otherwise ``None``.
+        """
         return self._length
 
     def __len__(self) -> int:
@@ -189,6 +254,11 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         raise TypeError("Streaming HuggingFace datasets don't support len()")
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"HFDatasetShardedSource(Dataset|IterableDataset, length=N)"``.
+        """
         ds_type = "IterableDataset" if self._is_iterable else "Dataset"
         length_str = f", length={self._length}" if self._length else ""
         return f"HFDatasetShardedSource({ds_type}{length_str})"
@@ -197,18 +267,28 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
 def wrap_hf_dataset(
     dataset: "Dataset | IterableDataset | ShardedDataSource",
 ) -> ShardedDataSource:
-    """Wrap a HuggingFace dataset as ShardedDataSource if needed.
+    """Coerce any supported dataset shape into a :class:`ShardedDataSource`.
 
-    This is a convenience function for trainers to normalize input datasets.
+    The trainers in :mod:`easydel.trainers` accept user inputs as any
+    of: a real :class:`ShardedDataSource` (passed through unchanged),
+    a HuggingFace ``Dataset``/``IterableDataset`` (wrapped via
+    :class:`HFDatasetShardedSource`), or any duck-typed object that
+    looks iterable plus indexable/sized. This helper is the single
+    entry point that performs that normalisation so each trainer
+    does not need to repeat the type plumbing.
 
     Args:
-        dataset: Either a HF Dataset, IterableDataset, or existing ShardedDataSource.
+        dataset: Either a :class:`ShardedDataSource`, a HuggingFace
+            dataset, or any object with ``__iter__`` plus either
+            ``__len__`` or ``__getitem__``.
 
     Returns:
-        ShardedDataSource wrapping the input.
+        ShardedDataSource: ``dataset`` itself when already a
+        :class:`ShardedDataSource`; otherwise a fresh
+        :class:`HFDatasetShardedSource` wrapping it.
 
     Raises:
-        TypeError: If dataset type is not supported.
+        TypeError: When ``dataset`` is none of the supported shapes.
 
     Example:
         >>> # In trainer __init__:

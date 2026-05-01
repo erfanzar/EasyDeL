@@ -239,6 +239,11 @@ class LightningCacheView(BaseCacheView):
         )
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing the unified KV shape and layer index.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         kv_shape = self.key_value.shape if self.key_value is not None else None
         return self.__class__.__name__ + f"(key_value={kv_shape}, layer_index={self.layer_index})"
 
@@ -304,6 +309,11 @@ class LightningCache(BaseCache):
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def __repr__(self) -> str:
+        """Return a multi-line ``repr`` listing each Lightning cache view.
+
+        Returns:
+            A string with one ``repr`` per layer, indented for readability.
+        """
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
 
     def to_pure(self) -> tuple[list[dict[str, tp.Any]], LightningCacheConfig | None]:
@@ -401,10 +411,16 @@ class LightningCache(BaseCache):
 
 
 class LightningMetadata(BaseRunTimeMetadata):
-    """Runtime metadata for Lightning attention cache operations.
+    """Runtime-side companion metadata for :class:`LightningCacheView`.
 
-    Placeholder class for future Lightning-specific runtime metadata.
-    Currently empty but reserved for Lightning-specific runtime state.
+    Lightning's fused linear-recurrent kernel currently does not need extra
+    per-step runtime fields beyond the cached ``key_value`` tensor itself —
+    sequence positions advance implicitly with each kernel call and there
+    is no padded KV table to mask. This class therefore exists as a typed
+    placeholder so the unified :class:`OperationsMetadata` wrapper has a
+    slot for Lightning runs and so future Lightning-specific bookkeeping
+    (segment boundaries, layer-skip flags, …) can be added without
+    breaking existing call sites.
     """
 
     ...

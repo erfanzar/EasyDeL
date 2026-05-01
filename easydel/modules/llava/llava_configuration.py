@@ -74,6 +74,34 @@ class LlavaConfig(EasyDeLBaseConfig):
         multimodal_projector_bias: bool = True,
         **kwargs,
     ):
+        """Initialize the LLaVA configuration.
+
+        Args:
+            vision_config (dict | EasyDeLBaseConfig | None, optional): Vision encoder
+                configuration. Accepts a dict, an ``EasyDeLBaseConfig`` instance, or
+                ``None`` for a CLIP-ViT default. Defaults to None.
+            text_config (dict | EasyDeLBaseConfig | None, optional): Text decoder
+                configuration. Accepts a dict, an ``EasyDeLBaseConfig`` instance, or
+                ``None`` for a LLaMA default. Defaults to None.
+            image_token_id (int, optional): Token id used as a placeholder for image
+                features. Defaults to 32000.
+            projector_hidden_act (str, optional): Activation used by the multimodal
+                projector. Defaults to "gelu".
+            vision_feature_select_strategy (str, optional): Strategy for selecting
+                vision features (``"default"`` for the CLS token, ``"full"`` for all
+                patch tokens). Defaults to "default".
+            vision_feature_layer (int | list[int], optional): Index (or indices) of the
+                vision encoder hidden layer(s) to extract features from. Defaults to -2.
+            image_seq_length (int, optional): Sequence length contributed by one image.
+                Defaults to 576.
+            multimodal_projector_bias (bool, optional): Whether to use bias in the
+                multimodal projector. Defaults to True.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+
+        Raises:
+            ValueError: If ``vision_feature_select_strategy`` is not ``"default"`` or
+                ``"full"``.
+        """
         self.image_token_id = image_token_id
         self.projector_hidden_act = projector_hidden_act
         self.image_seq_length = image_seq_length

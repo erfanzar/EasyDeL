@@ -11,6 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Qwen2-VL multimodal model implementation for EasyDeL.
+
+This module implements Alibaba's Qwen2-VL family of vision-language
+models. Qwen2-VL combines a vision tower (a ViT-style encoder with
+window/full attention and 2-D rotary position embeddings) with a Qwen2
+language backbone that uses 3-D rotary position embeddings (mRoPE) to
+encode the temporal/height/width position structure of image and video
+tokens.
+
+Components:
+- Vision encoder: patch merger, vision blocks, and the
+  :class:`Qwen2VLVisionTransformerPretrainedModel`.
+- Language model: Qwen2-style decoder layers with mRoPE; the trunk is
+  :class:`Qwen2VLModel`.
+- Multimodal wrappers: :class:`Qwen2VLForConditionalGeneration` merges
+  vision/text embeddings at placeholder positions and runs the LM.
+"""
+
 import math
 import typing as tp
 from collections.abc import Mapping
@@ -487,13 +506,37 @@ class Qwen2VLPatchEmbed(spx.Module):
 
 
 class _GeluModule(spx.Module):
-    """Tiny wrapper so GELU can live inside a ModuleList."""
+    """Module-shaped wrapper around ``jax.nn.gelu``.
+
+    Functions cannot be stored inside an :class:`spx.nn.ModuleList`
+    because the list expects pytree-aware modules with a ``forward``
+    method. This thin wrapper exposes the GELU activation as such a
+    module so it can sit alongside ``Linear`` blocks inside the vision
+    MLP definition. Toggling :attr:`approximate` controls whether the
+    exact ``erf``-based GELU or the tanh-based approximation is used.
+    """
 
     def __init__(self, approximate: bool = False):
+        """Initialize the GELU wrapper.
+
+        Args:
+            approximate: When ``True``, use the tanh-based approximation
+                of GELU; otherwise use the exact ``erf``-based form.
+                Defaults to ``False``.
+        """
         super().__init__()
         self.approximate = approximate
 
     def forward(self, x: Array) -> Array:
+        """Apply GELU activation to the input.
+
+        Args:
+            x: Input tensor of arbitrary shape.
+
+        Returns:
+            Tensor with the same shape as ``x``, with GELU applied
+            element-wise.
+        """
         return jax.nn.gelu(x, approximate=self.approximate)
 
 
@@ -674,7 +717,16 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         self.head_dim = dim // num_heads
 
         class ConfigAdapter:
-            """Adapts Qwen2VL vision config to a format compatible with UnifiedAttention."""
+            """Translate Qwen2-VL vision-config fields to UnifiedAttention names.
+
+            :class:`UnifiedAttention` expects a config with Llama-flavor
+            attribute names (``hidden_size``, ``num_attention_heads``,
+            ``num_key_value_heads``, ``head_dim``, ``attention_bias``).
+            The vision config exposes the same dimensions under
+            different names; this adapter materializes a lightweight
+            object with the expected attributes so the shared attention
+            module can be reused without modification.
+            """
 
             def __init__(self, config, dim, num_heads):
                 """Create adapter by mapping vision config fields to attention-compatible names.
@@ -1408,6 +1460,11 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
         def _layer_loop(block, carry):
+            """Apply a single vision-encoder block inside the layer-stack scan.
+
+            Body of ``self.blocks.scan``; runs ``block`` on the current
+            hidden states and returns the updated carry tuple.
+            """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 hidden_states = block(
@@ -1639,6 +1696,13 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single language-model decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
@@ -2040,11 +2104,24 @@ class Qwen2VLModel(EasyDeLBaseModule):
         )
 
     def get_embedding(self):
-        """Returns the embedding layer of the module."""
+        """Return the text token embedding from the wrapped language model.
+
+        Returns:
+            spx.Module: ``self.language_model.get_embedding()`` — the
+            shared embedding used to project text token ids before
+            visual fusion.
+        """
         return self.language_model.get_embedding()
 
     def get_decoder(self):
-        """Returns the decoder part of the model."""
+        """Return the wrapped Qwen2 language-model trunk.
+
+        Returns:
+            spx.Module: The text decoder that consumes the merged
+            text + visual embedding sequence; ``self.language_model``
+            owns the transformer layers but not the LM head, which is
+            attached on the outer ``ForConditionalGeneration`` wrapper.
+        """
         return self.language_model
 
 
@@ -2492,15 +2569,38 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         return model_kwargs
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head."""
+        """Project text hidden states to vocabulary logits.
+
+        Overrides the base implementation to skip weight-tying logic
+        (Qwen2-VL's LM head is unconditionally an independent
+        ``ColumnParallelLinear``) and avoid a redundant config lookup
+        in the hot generation loop.
+
+        Args:
+            hidden_states: Final-layer hidden states of shape
+                ``(batch, seq_len, hidden_size)``.
+
+        Returns:
+            Logits of shape ``(batch, seq_len, vocab_size)``.
+        """
         return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> spx.Module:
-        """Returns the vision tower component."""
+        """Return the vision tower (VLM protocol method).
+
+        Returns:
+            spx.Module: The Qwen2-VL vision transformer owned by the
+            wrapped :class:`Qwen2VLModel` (``base_model.visual``).
+        """
         return self.base_model.visual
 
     def get_language_model(self) -> spx.Module:
-        """Returns the language model component."""
+        """Return the text decoder (VLM protocol method).
+
+        Returns:
+            spx.Module: The Qwen2 language-model trunk owned by the
+            wrapped :class:`Qwen2VLModel`.
+        """
         return self.base_model.language_model
 
     def prepare_inputs_for_call(

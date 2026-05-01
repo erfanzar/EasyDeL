@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Offline knowledge-distillation trainer.
+
+Trains a smaller "student" model to match a frozen "teacher" via a
+combination of temperature-scaled KL divergence on token logits and a
+standard supervised cross-entropy term, mixed by ``alpha``.  Hidden-
+state matching and routing logits are supported through optional
+projection heads when configured in :class:`DistillationConfig`.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -90,6 +99,27 @@ class DistillationTrainer(Trainer):
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
         data_collator: DataCollatorForCompletionOnlyLM | None = None,
     ):
+        """Initialize the offline distillation trainer.
+
+        Resolves the student and teacher into :class:`EasyDeLState`
+        objects, ensures the tokenizer has a pad token, and forwards
+        construction to :class:`Trainer`.
+
+        Args:
+            arguments: Distillation-specific training configuration.
+            processing_class: Tokenizer/processor used for SFT-style
+                preprocessing of completions.
+            student_model: Trainable student module or state.
+            teacher_model: Frozen teacher module or state.
+            train_dataset: Training dataset of completion examples.
+            eval_dataset: Optional evaluation dataset.
+            data_collator: Optional custom collator; otherwise the
+                default completion-only collator is used.
+
+        Raises:
+            TypeError: If ``arguments`` is not a
+                :class:`DistillationConfig`.
+        """
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
             tokenizer = processing_class.tokenizer
@@ -117,16 +147,21 @@ class DistillationTrainer(Trainer):
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """
-        Configures and JIT-compiles the training and evaluation step functions.
+        """Build the JIT-compiled distillation training/evaluation step functions.
 
-        This method sets up the necessary functions for training and evaluation, including:
-            - Initialization of the model state.
-            - Sharding of the model parameters and optimizer state.
-            - JIT-compilation of the training and evaluation step functions.
+        Resolves the optional QAT straight-through emulator, captures
+        the temperature/alpha/auxiliary-loss weights and the
+        hidden-state / attention layer indices, and compiles
+        :func:`distillation_step` once for training (with student
+        state donation) and once for evaluation under the active
+        MPMD pipeline schedule. The teacher state's sharding spec is
+        threaded through ``in_shardings`` so the compiled step can
+        run the teacher forward in stop-gradient mode in place.
 
         Returns:
-            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
         """
         mesh = self.model.mesh
 
@@ -284,8 +319,10 @@ class DistillationTrainer(Trainer):
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Forward the teacher state to the shared training step."""
         return (self.teacher_state,)
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Forward the teacher state to the shared evaluation step."""
         return (self.teacher_state,)

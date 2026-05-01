@@ -587,6 +587,12 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
 
         # Note: For simplicity, we process without cu_seqlens chunking
         def _layer_loop(layer, carry):
+            """Apply a single audio-encoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``layer`` on the current
+            audio hidden states under the appropriate stage context and
+            returns the updated carry tuple.
+            """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states = layer(hidden_states, attention_mask)
@@ -608,24 +614,66 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     def get_encoder(self):
-        """Returns the encoder (the audio encoder itself)."""
+        """Return the audio encoder itself.
+
+        The Qwen3-Omni audio tower is encoder-only; calling code that
+        expects an encoder/decoder split (e.g. via the
+        ``EncoderDecoderProtocol`` contract) gets the same module back.
+
+        Returns:
+            spx.Module: ``self``.
+        """
         return self
 
     def get_decoder(self):
-        """Returns the decoder (not applicable for encoder-only audio model)."""
+        """Encoder-only audio model has no decoder.
+
+        Raises:
+            NotImplementedError: Always — the audio encoder produces
+                continuous features that are merged into the text
+                trunk; there is no separate decoder stage.
+        """
         raise NotImplementedError("Audio encoder does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable for audio encoder)."""
+        """Audio encoder does not project to a vocabulary.
+
+        Raises:
+            NotImplementedError: Always — audio features are consumed by
+                the text decoder via projection layers, not by an LM head
+                on the encoder itself.
+        """
         raise NotImplementedError("Audio encoder does not have a language model head.")
 
     def get_embedding(self):
-        """Returns the initial convolution layer used for mel-spectrogram embedding."""
+        """Return the front-end convolution that embeds mel-spectrograms.
+
+        The audio encoder's "embedding" is the first 2-D convolution
+        (``conv2d1``) which strides over the mel-spectrogram input and
+        produces the initial sequence of audio tokens consumed by the
+        transformer blocks.
+
+        Returns:
+            spx.Module: The initial ``Conv2D`` patchifier.
+        """
         return self.conv2d1
 
 
 def rotate_half(x: Array) -> Array:
-    """Rotate half the hidden dims for RoPE."""
+    """Rotate the second half of the trailing dim by negation.
+
+    Helper used by the vision RoPE implementation: given a tensor whose
+    last dimension is split into two halves ``[a, b]``, returns
+    ``[-b, a]``. Combined with element-wise ``cos``/``sin``
+    multiplications this realises a 2-D rotation per pair of channels.
+
+    Args:
+        x: Input tensor with an even-sized trailing dimension.
+
+    Returns:
+        Tensor of identical shape with the lower / upper halves swapped
+        and the new lower half negated.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
@@ -637,7 +685,24 @@ def apply_rotary_pos_emb_vision(
     cos: Array,
     sin: Array,
 ) -> tuple[Array, Array]:
-    """Apply rotary positional embeddings to vision features."""
+    """Apply rotary position embeddings to vision query/key tensors.
+
+    Promotes ``q``/``k`` and the precomputed ``cos``/``sin`` tables to
+    float32 to avoid bf16 round-off in the trigonometric mixing, applies
+    the standard RoPE rotation ``x * cos + rotate_half(x) * sin``, and
+    casts the results back to the original dtypes of the inputs.
+
+    Args:
+        q: Query tensor with trailing rotated dim.
+        k: Key tensor with trailing rotated dim.
+        cos: Cosine table broadcastable to ``q``/``k`` after a heads-axis
+            expand (``..., heads_axis, dim``).
+        sin: Sine table with the same shape as ``cos``.
+
+    Returns:
+        Tuple of ``(q_rot, k_rot)`` with the same shapes/dtypes as the
+        inputs, rotated according to the supplied frequency table.
+    """
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.astype("f4"), k.astype("f4")
@@ -648,7 +713,28 @@ def apply_rotary_pos_emb_vision(
 
 
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create attention mask from cumulative sequence lengths."""
+    """Build a block-diagonal additive attention mask from a cu_seqlens vector.
+
+    Vision/audio encoders pack multiple variable-length samples into a
+    single sequence of length ``seq_length`` and use ``cu_seqlens``
+    (cumulative token offsets, length ``num_samples + 1``) to delimit
+    them. This helper produces the additive mask that allows attention
+    only within a single sample's span: positions in different blocks
+    receive ``-inf`` and positions in the same block receive ``0``.
+
+    Args:
+        cu_seqlens: Cumulative token offsets, shape
+            ``(num_samples + 1,)``. Block ``i`` covers indices
+            ``[cu_seqlens[i], cu_seqlens[i + 1])``.
+        seq_length: Total packed sequence length.
+        dtype: Dtype of the resulting mask. ``finfo(dtype).min`` is used
+            for the masked-out positions so the mask can be added
+            directly to attention logits in the same dtype.
+
+    Returns:
+        Additive mask of shape ``(1, seq_length, seq_length)`` ready to
+        be broadcast across attention heads.
+    """
     attention_mask = jnp.full((1, seq_length, seq_length), jnp.finfo(dtype).min, dtype=dtype)
     mask_updates = jnp.zeros((1, seq_length, seq_length), dtype=dtype)
 
@@ -1145,7 +1231,27 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
     def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
-        """Compute rotary position embeddings for vision features."""
+        """Compute 2-D RoPE frequencies for the packed vision tokens.
+
+        For every visual sample described in ``grid_thw`` (one row per
+        image/video, columns ``T, H, W``), generates per-token height
+        and width position indices, expands them with
+        ``spatial_merge_size`` so the patch-merge layout matches the
+        rest of the encoder, repeats them along the temporal axis, and
+        finally indexes a precomputed inverse-frequency table to obtain
+        the rotary embedding for each spatial token.
+
+        Args:
+            grid_thw: Per-sample grid sizes of shape ``(num_samples, 3)``
+                with columns ``(T, H, W)``.
+            max_grid_size: Upper bound on grid extent used to size the
+                shared inverse-frequency table.
+
+        Returns:
+            Rotary position embedding of shape
+            ``(total_tokens, head_dim_ro)`` where ``total_tokens`` is
+            the sum of ``T * H * W`` over the batch.
+        """
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = jnp.arange(h)[:, None]
@@ -1204,6 +1310,12 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
         def _layer_loop(block, carry):
+            """Apply a single vision-encoder block inside the layer-stack scan.
+
+            Body of ``self.blocks.scan``; runs ``block`` on the current
+            vision hidden states with the precomputed ``cu_seqlens`` and
+            ``rotary_pos_emb``, and returns the updated carry tuple.
+            """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 hidden_states = block(hidden_states, cu_seqlens, rotary_pos_emb)
@@ -1219,19 +1331,42 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         return self.merger(hidden_states)
 
     def get_encoder(self):
-        """Returns the encoder (the vision encoder itself)."""
+        """Return the vision encoder itself.
+
+        Returns:
+            spx.Module: ``self`` — Qwen3-Omni's vision tower is
+            encoder-only.
+        """
         return self
 
     def get_decoder(self):
-        """Returns the decoder (not applicable for encoder-only vision model)."""
+        """Encoder-only vision model has no decoder.
+
+        Raises:
+            NotImplementedError: Always — visual features are merged into
+                the text decoder via the patch merger and projector;
+                there is no separate vision decoder.
+        """
         raise NotImplementedError("Vision model does not have a decoder.")
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable for vision encoder)."""
+        """Vision encoder does not project to a vocabulary.
+
+        Raises:
+            NotImplementedError: Always — the LM head lives on the text
+                generation wrapper, not the vision tower.
+        """
         raise NotImplementedError("Vision model does not have a language model head.")
 
     def get_embedding(self):
-        """Returns the patch embedding layer used for image tokenization."""
+        """Return the patch embedding that turns pixels into vision tokens.
+
+        Returns:
+            spx.Module: The ``patch_embed`` module, which projects
+            flattened ``(channels, T, H, W)`` patches to
+            ``hidden_size``-dimensional tokens consumed by the
+            transformer blocks.
+        """
         return self.patch_embed
 
 
@@ -2338,11 +2473,39 @@ class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply per-head RMSNorm to query and key projections.
+
+        Overrides :class:`UnifiedAttention._postprocess_qkv` to perform
+        the Qwen3-style QK normalization before attention. The value
+        projection is passed through unchanged.
+
+        Args:
+            query_states: Projected query of shape
+                ``(batch, seq_len, num_heads, head_dim)``.
+            key_states: Projected key of shape
+                ``(batch, seq_len, num_kv_heads, head_dim)``.
+            value_states: Projected value of shape
+                ``(batch, seq_len, num_kv_heads, head_dim)``.
+
+        Returns:
+            ``(query_states, key_states, value_states)`` triple with
+            QK normalization applied.
+        """
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(spx.Module):
-    """Decoder layer for Talker code predictor (non-MoE)."""
+    """Single transformer block of the Talker code-predictor stack.
+
+    Combines :class:`Qwen3OmniMoeTalkerCodePredictorAttention` (causal
+    self-attention with sliding window and Q/K RMSNorm) with a dense
+    SwiGLU MLP, both wrapped in pre-norm RMSNorm + residual connections.
+
+    Unlike the upstream Qwen3-Omni text decoder, the code-predictor uses
+    a *non-MoE* feed-forward block: every token sees the same dense MLP
+    weights, which keeps acoustic-token prediction deterministic and
+    avoids router stochasticity in the speech path.
+    """
 
     def __init__(
         self,
@@ -2574,6 +2737,13 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
 
         def _layer_loop(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan`` for a non-MoE decoder stack;
+            runs ``block`` on the current hidden states, optionally
+            accumulates per-layer hidden states / attention weights, and
+            returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -2612,26 +2782,64 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for decoder-only model)."""
+        """Code predictor is decoder-only — no separate encoder.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the decoder (the code predictor model itself)."""
+        """Return the code-predictor decoder stack (``self``).
+
+        Returns:
+            spx.Module: ``self``. The base model *is* the decoder; the
+            per-group LM heads live on
+            :class:`Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration`.
+        """
         return self
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable, use ForConditionalGeneration variant)."""
+        """Base code predictor has no LM head.
+
+        Per-group acoustic LM heads are attached by the
+        ``ForConditionalGeneration`` wrapper because there are
+        ``num_code_groups - 1`` independent heads (one per residual
+        codec quantizer level), which does not fit the single-head
+        contract of the base module.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("Use Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration for LM head.")
 
     def get_embedding(self):
-        """Returns the first codec embedding layer if available."""
+        """Return the first codec quantizer's embedding table.
+
+        The code predictor maintains one ``Embed`` per quantizer level;
+        the first table is treated as the canonical embedding for
+        weight-tying / introspection purposes.
+
+        Returns:
+            spx.Module | None: The first ``Embed`` in
+            ``self.codec_embedding``, or ``None`` if no codec embeddings
+            are configured.
+        """
         return self.codec_embedding[0] if self.codec_embedding else None
 
 
 class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
     BaseConditionalGenerationModule[Qwen3OmniMoeTalkerCodePredictorModel, Qwen3OmniMoeTalkerCodePredictorConfig]  # type: ignore
 ):
-    """Talker code predictor with per-group LM heads."""
+    """Talker code-predictor wrapper with per-quantizer LM heads.
+
+    Wraps :class:`Qwen3OmniMoeTalkerCodePredictorModel` and attaches
+    ``num_code_groups - 1`` independent linear heads — one per residual
+    quantizer level — so the model emits a separate logits tensor per
+    codec group at every position. This enables Talker to predict the
+    full residual codec token stack autoregressively while sharing a
+    single transformer backbone.
+    """
 
     def __init__(
         self,
@@ -2735,24 +2943,57 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
         )
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for decoder-only model)."""
+        """Code-predictor wrapper is decoder-only — no encoder.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the decoder from the underlying code predictor model."""
+        """Return the wrapped code-predictor decoder.
+
+        Returns:
+            spx.Module: ``self.model`` — the decoder owns the
+            transformer stack and codec embeddings.
+        """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """Returns the per-group language model heads."""
+        """Return the per-quantizer LM head list.
+
+        Returns:
+            spx.nn.ModuleList: One :class:`ColumnParallelLinear` head per
+            residual quantizer level (length ``num_code_groups - 1``).
+            Index ``g`` produces logits for the ``g+1``-th codec group
+            (group 0 is consumed by the upstream Talker text model).
+        """
         return self.lm_head
 
     def get_embedding(self):
-        """Returns the embedding layer from the underlying code predictor model."""
+        """Return the canonical codec embedding from the wrapped model.
+
+        Returns:
+            spx.Module | None: The first codec quantizer's embedding
+            table, as exposed by
+            :meth:`Qwen3OmniMoeTalkerCodePredictorModel.get_embedding`.
+        """
         return self.model.get_embedding()
 
 
 class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
-    """Talker text model that processes codec embeddings."""
+    """Talker text-side model that conditions on codec embeddings.
+
+    The Talker stack consumes a sequence of codec tokens (acoustic
+    quantizer indices) plus optional textual context, embeds the codec
+    tokens through :attr:`codec_embedding`, and passes the result
+    through a stack of MoE-aware decoder layers to produce hidden states
+    consumed by the downstream code predictor and Code2Wav vocoder.
+
+    This module is the speech-side analogue of a text decoder: it owns
+    the codec embedding table and transformer body but no LM head; the
+    head is supplied by the surrounding ``ForCausalLM`` wrapper.
+    """
 
     def __init__(
         self,
@@ -2886,6 +3127,13 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         all_router_logits = () if output_router_logits else None
 
         def _layer_loop(block, carry):
+            """Apply a single Thinker MoE decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan`` for the Thinker text decoder;
+            runs ``block`` on the current hidden states, optionally
+            accumulates per-layer hidden states, attention weights, and
+            MoE router logits, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -2929,19 +3177,39 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for decoder-only talker model)."""
+        """Talker is decoder-only — no separate encoder.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the decoder (the talker model itself)."""
+        """Return the Talker text decoder stack (``self``).
+
+        Returns:
+            spx.Module: ``self``. The first-group codec head is attached
+            by the surrounding ``ForConditionalGeneration`` wrapper.
+        """
         return self
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable for base talker model)."""
+        """Base Talker text model has no LM head.
+
+        Raises:
+            NotImplementedError: Always — use
+                :class:`Qwen3OmniMoeTalkerForConditionalGeneration` to
+                attach the codec head.
+        """
         raise NotImplementedError("Base model does not have a language model head.")
 
     def get_embedding(self):
-        """Returns the codec embedding layer."""
+        """Return the codec token embedding table.
+
+        Returns:
+            spx.Module: The :class:`Embed` mapping codec quantizer
+            indices to ``hidden_size``-dimensional vectors.
+        """
         return self.codec_embedding
 
 
@@ -3098,26 +3366,55 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         )
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for decoder-only talker model)."""
+        """Talker generator is decoder-only — no encoder.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the decoder from the underlying talker model."""
+        """Return the wrapped Talker text decoder.
+
+        Returns:
+            spx.Module: ``self.model.get_decoder()`` — the underlying
+            :class:`Qwen3OmniMoeTalkerModel`.
+        """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """Returns the codec head used for acoustic token prediction."""
+        """Return the first-group codec acoustic head.
+
+        The full Talker generator predicts the codec stack jointly:
+        group 0 is produced by ``self.codec_head`` from the Talker's
+        own hidden states, while groups ``1 .. num_code_groups - 1``
+        are produced by ``self.code_predictor``.
+
+        Returns:
+            ColumnParallelLinear: The codec head projecting
+            ``hidden_size`` to the codec vocabulary.
+        """
         return self.codec_head
 
     def get_embedding(self):
-        """Returns the embedding layer from the underlying talker model."""
+        """Return the codec token embedding from the wrapped Talker.
+
+        Returns:
+            spx.Module: The codec :class:`Embed` table owned by
+            :class:`Qwen3OmniMoeTalkerModel`.
+        """
         return self.model.get_embedding()
 
 
 class Qwen3OmniMoeCode2WavLayerScale(spx.Module):
-    """Learnable per-channel scaling for residual branches.
+    """Learnable per-channel scaling factor applied to residual branches.
 
-    Helps stabilize training of deep networks.
+    Implements the LayerScale trick (CaiT, He et al. 2021): after each
+    sublayer the residual contribution is multiplied element-wise by a
+    learned ``hidden_size``-shaped vector ``gamma``. ``gamma`` is
+    initialised to a small constant so that early in training each
+    residual branch is essentially identity, which stabilises training
+    of deep vocoder stacks.
     """
 
     def __init__(
@@ -3156,7 +3453,15 @@ class Qwen3OmniMoeCode2WavLayerScale(spx.Module):
 
 
 class Qwen3OmniMoeCode2WavMLP(spx.Module):
-    """MLP for Code2Wav transformer."""
+    """SwiGLU feed-forward block used inside the Code2Wav transformer.
+
+    Implements the standard ``down_proj(act(gate_proj(x)) * up_proj(x))``
+    gated activation: a ``ColumnParallelLinear`` produces the gate and a
+    parallel ``ColumnParallelLinear`` produces the up-projection; the
+    elementwise product is then projected back to ``hidden_size`` via a
+    ``RowParallelLinear``. The activation function is selected by
+    ``config.hidden_act`` and ranges over ``ACT2FN``.
+    """
 
     def __init__(
         self,
@@ -3214,7 +3519,16 @@ class Qwen3OmniMoeCode2WavMLP(spx.Module):
 
 
 class Qwen3OmniMoeCode2WavAttention(spx.Module):
-    """Sliding window attention for Code2Wav vocoder."""
+    """Causal multi-head attention with sliding-window mask for Code2Wav.
+
+    Specialised attention block used by the Code2Wav vocoder: the same
+    QKVO projection pattern as the text decoder but with a fixed
+    ``config.sliding_window`` causal mask, which limits each query to a
+    bounded local context. This bounded attention preserves the
+    locality required for high-fidelity waveform synthesis while
+    keeping the per-step cost independent of the total decoded
+    duration.
+    """
 
     def __init__(
         self,
@@ -3360,7 +3674,15 @@ class Qwen3OmniMoeCode2WavAttention(spx.Module):
 
 
 class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
-    """Transformer layer with LayerScale for Code2Wav vocoder."""
+    """Pre-norm transformer block for the Code2Wav vocoder.
+
+    Stacks RMSNorm + sliding-window self-attention + LayerScale, then a
+    second RMSNorm + SwiGLU MLP + LayerScale. Each residual branch is
+    multiplied by its own learnable per-channel ``gamma`` so the early
+    block is near-identity, which is critical for stable training of
+    the deep stack used to predict raw waveform samples from codec
+    tokens.
+    """
 
     def __init__(
         self,
@@ -3460,7 +3782,15 @@ class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
 
 
 class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
-    """Transformer model for Code2Wav, containing layers and norm."""
+    """Stacked Code2Wav transformer trunk consumed by the upsampler.
+
+    Owns the list of :class:`Qwen3OmniMoeCode2WavTransformerLayer`
+    blocks and the final RMSNorm. The output is a sequence of
+    ``hidden_size``-dimensional vectors that downstream upsampling
+    convolutions transform into raw audio samples; no LM head is
+    attached because Code2Wav synthesises waveforms directly rather
+    than predicting discrete tokens.
+    """
 
     def __init__(
         self,
@@ -3523,6 +3853,13 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
         hidden_states = inputs_embeds
 
         def _layer_loop(layer, carry):
+            """Apply a single code-predictor decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan`` for the Talker code-predictor
+            decoder; runs ``layer`` on the current hidden states with
+            ``attention_mask`` and ``position_ids``, and returns the
+            updated carry tuple.
+            """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states = layer(hidden_states, attention_mask, position_ids)
@@ -3621,19 +3958,39 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         return outputs
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for Code2Wav vocoder)."""
+        """Code2Wav is decoder-only — no encoder.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("Code2Wav is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the decoder (the Code2Wav model itself)."""
+        """Return ``self`` — Code2Wav owns its own pre-transformer body.
+
+        Returns:
+            spx.Module: ``self``.
+        """
         return self
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable, Code2Wav uses upsampling)."""
+        """Code2Wav synthesises waveforms via upsampling, not via an LM head.
+
+        Raises:
+            NotImplementedError: Always — there is no token vocabulary at
+                the output; the post-transformer upsampling blocks emit
+                continuous audio samples directly.
+        """
         raise NotImplementedError("Code2Wav uses upsampling blocks, not an LM head.")
 
     def get_embedding(self):
-        """Returns the code embedding layer for codec token encoding."""
+        """Return the codec token embedding consumed by the pre-transformer.
+
+        Returns:
+            spx.Module: The :class:`Embed` table indexed by quantizer
+            tokens (after applying the per-quantizer offset stored in
+            ``self.code_offset``).
+        """
         return self.code_embedding
 
 
@@ -3643,7 +4000,33 @@ def merge_multimodal_embeddings(
     multimodal_embeddings: jax.Array,
     placeholder_token_id: int | list[int],
 ) -> jax.Array:
-    """Overwrite inputs_embeds wherever input_ids matches placeholder tokens."""
+    """Splice multimodal embeddings into a text embedding sequence.
+
+    Replaces every position in ``inputs_embeds`` whose corresponding
+    ``input_ids`` value is a registered placeholder token (e.g.
+    ``<image>``, ``<video>``, ``<audio>``) with the next vector from
+    ``multimodal_embeddings``. The fill order follows the natural
+    left-to-right scan of ``input_ids``.
+
+    The implementation uses the cumsum-gather pattern shared by
+    :class:`MultiModalMergeFeature`: we prepend a zero row to the
+    multimodal table so that non-placeholder positions index the dummy
+    row, and then ``jnp.where`` picks the original or replaced
+    embedding per-position. This formulation is JIT-safe and produces
+    O(seq_len * hidden) memory traffic.
+
+    Args:
+        input_ids: Token ids of shape ``(batch, seq_len)``.
+        inputs_embeds: Text embeddings of shape
+            ``(batch, seq_len, hidden_size)``.
+        multimodal_embeddings: Concatenated visual / audio embeddings of
+            shape ``(num_multimodal_tokens, hidden_size)``.
+        placeholder_token_id: Single token id or list of ids that mark
+            multimodal slots in ``input_ids``.
+
+    Returns:
+        Merged embedding tensor with the same shape as ``inputs_embeds``.
+    """
     if isinstance(placeholder_token_id, list):
         placeholder_token_id = jnp.array(placeholder_token_id)
         is_multimodal = jnp.isin(input_ids, placeholder_token_id)
@@ -3787,6 +4170,14 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         hidden_states = inputs_embeds
 
         def _layer_loop(layer, carry):
+            """Apply a single Talker code-predictor MoE layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan`` for the Talker code-predictor
+            MoE decoder; runs ``layer`` on the current hidden states,
+            optionally accumulates per-layer hidden states, self-attention
+            weights, and MoE router logits, and returns the updated
+            carry tuple.
+            """
             hidden_states, all_hidden_states, all_self_attentions, all_router_logits, layer_idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -3829,15 +4220,32 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         )
 
     def get_input_embeddings(self):
-        """Returns the token embedding layer."""
+        """Return the text token embedding (HuggingFace-compatible alias).
+
+        Returns:
+            spx.Module: The :attr:`embed_tokens` table.
+        """
         return self.embed_tokens
 
     def set_input_embeddings(self, value):
-        """Sets the token embedding layer to a new value."""
+        """Replace the text token embedding in-place.
+
+        Args:
+            value: Replacement embedding module — must accept
+                integer ``input_ids`` of shape ``(batch, seq_len)`` and
+                produce hidden states of shape
+                ``(batch, seq_len, hidden_size)``.
+        """
         self.embed_tokens = value
 
     def get_embedding(self):
-        """Returns the token embedding layer."""
+        """Return the text token embedding (EasyDeL-style alias).
+
+        Returns:
+            spx.Module: Same module as :meth:`get_input_embeddings`;
+            duplicated to satisfy both the EasyDeL and HF naming
+            conventions used elsewhere in the codebase.
+        """
         return self.embed_tokens
 
 
@@ -4154,6 +4562,13 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Apply a single Talker MoE decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan`` for the Talker text decoder;
+            runs ``block`` on the current hidden states, optionally
+            accumulates per-layer hidden states, attention weights, and
+            MoE router logits, and returns the updated carry tuple.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -4197,19 +4612,36 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for decoder-only model)."""
+        """Base Qwen3-Omni model is decoder-only — no encoder.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the decoder (the base Qwen3OmniMoe model itself)."""
+        """Return ``self`` — the model is its own decoder.
+
+        Returns:
+            spx.Module: ``self``.
+        """
         return self
 
     def get_lm_head(self):
-        """Returns the language model head (not applicable for base model)."""
+        """Base text model has no LM head.
+
+        Raises:
+            NotImplementedError: Always — the LM head lives on
+                :class:`Qwen3OmniMoeThinkerForConditionalGeneration`.
+        """
         raise NotImplementedError("Base model does not have a language model head.")
 
     def get_embedding(self):
-        """Returns the token embedding layer."""
+        """Return the text token embedding table.
+
+        Returns:
+            spx.Module: The :attr:`embed_tokens` module.
+        """
         return self.embed_tokens
 
 
@@ -4319,7 +4751,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     @property
     def audio(self):
-        """Property to access the audio encoder (alias for audio_tower)."""
+        """HuggingFace-compatible alias for the audio encoder.
+
+        Some upstream configs reference ``model.audio`` rather than the
+        EasyDeL-canonical ``model.audio_tower``; this property forwards
+        to the same underlying :class:`Qwen3OmniMoeAudioEncoder` so both
+        naming conventions resolve identically.
+
+        Returns:
+            spx.Module: ``self.audio_tower``.
+        """
         return self.audio_tower
 
     def compute_embedding(
@@ -4531,35 +4972,79 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         )
 
     def get_encoder(self):
-        """Returns the vision encoder component."""
+        """Return the vision encoder for compatibility with VLM utilities.
+
+        VLMs that follow ``EncoderDecoderProtocol`` expose the visual
+        tower as the encoder; the audio encoder is reachable separately
+        via :attr:`audio_tower` / :attr:`audio`.
+
+        Returns:
+            spx.Module: The :attr:`visual` :class:`Qwen3OmniMoeVisionEncoder`.
+        """
         return self.visual
 
     def get_decoder(self):
-        """Returns the text decoder model."""
+        """Return the text decoder backbone.
+
+        Returns:
+            spx.Module: The wrapped
+            :class:`Qwen3OmniMoeThinkerTextModel` (a stack of MoE
+            decoder layers).
+        """
         return self.model
 
     def get_embedding(self):
-        """Returns the token embedding layer from the text model."""
+        """Return the text token embedding from the wrapped text model.
+
+        Returns:
+            spx.Module: ``self.model.embed_tokens``.
+        """
         return self.model.embed_tokens
 
     def get_input_embeddings(self):
-        """Returns the input token embedding layer."""
+        """HuggingFace-compatible alias of :meth:`get_embedding`.
+
+        Returns:
+            spx.Module: ``self.model.embed_tokens``.
+        """
         return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
-        """Sets the input token embedding layer to a new value."""
+        """Replace the text token embedding in-place.
+
+        Args:
+            value: Replacement embedding module accepting ``input_ids``
+                of shape ``(batch, seq_len)``.
+        """
         self.model.embed_tokens = value
 
     def get_lm_head(self):
-        """Returns the language model head for text generation."""
+        """Return the text-side LM head.
+
+        The Thinker emits text logits via :attr:`lm_head` even though
+        the inputs may include audio and visual tokens; speech tokens
+        are produced by the separate Talker / Code2Wav stack.
+
+        Returns:
+            ParallelLinear: The text LM head.
+        """
         return self.lm_head
 
     def get_vision_tower(self) -> spx.Module:
-        """Returns the vision encoder tower."""
+        """Return the vision encoder tower (VLM protocol method).
+
+        Returns:
+            spx.Module: ``self.visual`` (a
+            :class:`Qwen3OmniMoeVisionEncoder`).
+        """
         return self.visual
 
     def get_language_model(self) -> spx.Module:
-        """Returns the language model (text decoder)."""
+        """Return the text decoder (VLM protocol method).
+
+        Returns:
+            spx.Module: ``self.model``.
+        """
         return self.model
 
     def get_image_features(
@@ -4702,12 +5187,28 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     @property
     def visual(self):
-        """Property to access the vision encoder."""
+        """Forward to the Thinker's vision encoder.
+
+        The top-level Omni wrapper does not own the vision tower itself;
+        instead it delegates to the Thinker, which is the multimodal
+        understanding component that fuses vision/audio/text. This
+        property keeps the HF-style ``model.visual`` access pattern
+        working at the outer layer.
+
+        Returns:
+            spx.Module: ``self.thinker.visual`` (a
+            :class:`Qwen3OmniMoeVisionEncoder`).
+        """
         return self.thinker.visual
 
     @property
     def audio(self):
-        """Property to access the audio encoder."""
+        """Forward to the Thinker's audio encoder.
+
+        Returns:
+            spx.Module: ``self.thinker.audio`` (a
+            :class:`Qwen3OmniMoeAudioEncoder`).
+        """
         return self.thinker.audio
 
     def compute_embedding(self, input_ids, *args, **kwargs):
@@ -4769,15 +5270,35 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
     def get_encoder(self):
-        """Returns the encoder (not applicable for the top-level omni model)."""
+        """Top-level Omni model has no monolithic encoder.
+
+        Audio, vision, and text encoders live inside the Thinker
+        component and are reachable via :attr:`audio` / :attr:`visual`
+        / :meth:`get_decoder`. Surfacing a single encoder here would
+        misrepresent the architecture, so this method intentionally
+        raises.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
-        """Returns the text decoder from the Thinker component."""
+        """Return the Thinker's text decoder.
+
+        Returns:
+            spx.Module: ``self.thinker.get_decoder()`` — the underlying
+            :class:`Qwen3OmniMoeThinkerTextModel` that processes the
+            merged multimodal sequence.
+        """
         return self.thinker.get_decoder()
 
     def get_embedding(self):
-        """Returns the token embedding layer from the Thinker component."""
+        """Return the Thinker's text token embedding.
+
+        Returns:
+            spx.Module: ``self.thinker.get_embedding()``.
+        """
         return self.thinker.get_embedding()
 
     def get_image_features(
@@ -4786,7 +5307,25 @@ class Qwen3OmniMoeForConditionalGeneration(
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
         **kwargs,
     ) -> Float[Array, "num_patches hidden"]:
-        """Extract image features from the vision encoder."""
+        """Extract image features via the Thinker's vision encoder.
+
+        Convenience wrapper that proxies to
+        :meth:`Qwen3OmniMoeThinkerForConditionalGeneration.get_image_features`
+        so callers operating on the top-level model do not need to
+        reach into the Thinker explicitly.
+
+        Args:
+            pixel_values: Packed image patches of shape
+                ``(num_patches, channels, height, width)``.
+            image_grid_thw: Per-image grid sizes ``(T, H, W)`` (``T == 1``
+                for still images), needed to delimit per-image token
+                spans in the vision tower output.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            Visual features of shape ``(num_patches, hidden_size)`` ready
+            for placeholder substitution into the text sequence.
+        """
         return self.thinker.get_image_features(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,

@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Qwen3-MoE model family.
+
+Defines :class:`Qwen3MoeConfig`, the EasyDeL configuration object for
+the Mixture-of-Experts variant of Qwen3. Inherits Qwen3's attention/MLP
+hyperparameters (RMSNorm, GQA with QK-norm, RoPE, layer_types) and adds
+MoE-specific knobs: ``num_experts``, ``num_experts_per_tok``,
+``moe_intermediate_size``, ``router_aux_loss_coef``, and shared-expert
+configuration when applicable.
+"""
 
 from eformer.loggings import get_logger
 

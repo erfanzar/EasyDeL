@@ -68,6 +68,29 @@ class eLoRA(nn.LoRA):
         b_init: tp.Callable | None = None,
         dtype: jnp.dtype | None = None,
     ) -> None:
+        """Initialize the LoRA wrapper around an EasyDeL linear module.
+
+        Args:
+            d_in: Input feature dimension of the wrapped module.
+            rank: Low-rank LoRA bottleneck size. Smaller values trade
+                expressivity for memory and compute.
+            d_out: Output feature dimension of the wrapped module.
+            base_module: Optional underlying module (typically a
+                ``ParallelLinear``) whose output is added to the LoRA update.
+                When ``None`` only the LoRA delta is returned.
+            alpha: Optional LoRA scaling coefficient. When ``None`` the
+                Spectrax default (no scaling) is used.
+            rngs: PRNG state used to initialize the LoRA factors.
+            a_init: Initializer for the down-projection ``A`` factor of shape
+                ``(d_in, rank)``. Defaults to Spectrax's built-in initializer.
+            b_init: Initializer for the up-projection ``B`` factor of shape
+                ``(rank, d_out)``. Defaults to zeros so the initial residual
+                is exactly the base-module output.
+            dtype: Computation dtype. When ``None`` no casting is performed.
+
+        Returns:
+            None.
+        """
         super().__init__(
             d_in=d_in,
             rank=rank,
@@ -83,6 +106,16 @@ class eLoRA(nn.LoRA):
 
     @staticmethod
     def _maybe_cast(x: jax.Array, dtype: jnp.dtype | None) -> jax.Array:
+        """Cast ``x`` to ``dtype`` if it is provided.
+
+        Args:
+            x: Input array.
+            dtype: Target dtype, or ``None`` to skip casting.
+
+        Returns:
+            ``x`` cast to ``dtype`` if ``dtype is not None``, otherwise ``x``
+            itself unchanged.
+        """
         return x.astype(dtype) if dtype is not None else x
 
     def forward(self, x: jax.Array, *args, **kwargs):

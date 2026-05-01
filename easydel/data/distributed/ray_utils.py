@@ -41,11 +41,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TokenizeBatch:
-    """A batch of texts to tokenize.
+    """Container struct for a tokenization request shipped between processes.
+
+    Pairs the raw text payload with optional per-row metadata so the
+    downstream :class:`TokenizedBatch` can carry the metadata through
+    unchanged. Used as the input shape of
+    :meth:`RayTokenizeWorker.tokenize_batch` style calls and any
+    user-supplied tokenization workers.
 
     Attributes:
-        texts: List of text strings to tokenize.
-        metadata: Optional list of metadata dictionaries for each text.
+        texts (list[str]): Raw strings to tokenize, in input order.
+        metadata (list[dict] | None): Optional sidecar dict per row,
+            aligned positionally with :attr:`texts`. ``None`` indicates
+            no metadata accompanies the batch.
     """
 
     texts: list[str]
@@ -54,12 +62,21 @@ class TokenizeBatch:
 
 @dataclass
 class TokenizedBatch:
-    """Result of a batch tokenization operation.
+    """Container struct for the output of a batched tokenization call.
+
+    Mirrors :class:`TokenizeBatch` on the way out — token id lists are
+    aligned positionally with the input texts, and any input metadata
+    is forwarded verbatim. Attention masks may be omitted when the
+    caller did not request them.
 
     Attributes:
-        input_ids: List of token ID sequences, one per input text.
-        attention_masks: Optional list of attention masks, one per input text.
-        metadata: Optional list of metadata dictionaries carried from input.
+        input_ids (list[list[int]]): One token id sequence per input
+            text, in the same order as the original :attr:`TokenizeBatch.texts`.
+        attention_masks (list[list[int]] | None): Optional per-row
+            attention masks, aligned with :attr:`input_ids`. ``None``
+            when masks are not produced (e.g. no padding requested).
+        metadata (list[dict] | None): Per-row metadata propagated from
+            the request side; ``None`` when none was supplied.
     """
 
     input_ids: list[list[int]]
@@ -69,9 +86,14 @@ class TokenizedBatch:
 
 @ray.remote
 class RayTokenizeWorker:
-    """Ray actor for distributed tokenization.
+    """Ray actor that owns a tokenizer and serves batched tokenization RPCs.
 
-    Each worker loads its own tokenizer and processes batches independently.
+    Each actor loads its own copy of the tokenizer in its constructor so
+    workers can run completely independently — there is no shared
+    tokenizer state across the cluster. The actor exposes two RPC
+    entry points: :meth:`tokenize_batch` for raw text lists and
+    :meth:`tokenize_shard` for full shards of dict examples (the
+    high-level coordinator :class:`RayPreprocessor` uses the latter).
     """
 
     def __init__(
@@ -80,12 +102,18 @@ class RayTokenizeWorker:
         max_length: int = 2048,
         trust_remote_code: bool = True,
     ):
-        """Initialize RayTokenizeWorker.
+        """Construct a tokenizer in this worker's process.
 
         Args:
-            tokenizer_name: HuggingFace tokenizer name or path.
-            max_length: Maximum sequence length.
-            trust_remote_code: Whether to trust remote code.
+            tokenizer_name: Identifier accepted by
+                ``AutoTokenizer.from_pretrained`` — Hub repo id or
+                local path. Each actor pulls its own copy.
+            max_length: Truncation length applied to every subsequent
+                tokenize call. Stored on ``self`` because
+                :meth:`tokenize_batch` reuses it on every invocation.
+            trust_remote_code: Forwarded to
+                ``AutoTokenizer.from_pretrained``; ``True`` is required
+                for tokenizers shipping custom Python code on the Hub.
         """
         from transformers import AutoTokenizer
 
@@ -96,13 +124,19 @@ class RayTokenizeWorker:
         self.max_length = max_length
 
     def tokenize_batch(self, texts: list[str]) -> TokenizedBatch:
-        """Tokenize a batch of texts.
+        """RPC entry point: tokenize a list of strings with this worker's tokenizer.
+
+        Truncation is on, padding is off (so packing/batching downstream
+        gets unpadded sequences), and attention masks are always
+        returned.
 
         Args:
-            texts: List of texts to tokenize.
+            texts: Strings to tokenize, in caller order.
 
         Returns:
-            TokenizedBatch with tokenized results.
+            TokenizedBatch: Result with one ``input_ids`` and one
+            ``attention_mask`` row per input text. Metadata is not
+            populated by this entry point.
         """
         result = self.tokenizer(
             texts,
@@ -122,14 +156,23 @@ class RayTokenizeWorker:
         shard_data: list[dict],
         content_field: str = "text",
     ) -> list[dict]:
-        """Tokenize all examples in a shard.
+        """RPC entry point: tokenize every row of a shard, preserving sidecar fields.
+
+        The shard is processed in slices of 1000 rows to keep memory
+        bounded on the worker. Each row's text is read from
+        ``content_field`` and the resulting ``input_ids`` /
+        ``attention_mask`` are merged with any non-text columns
+        (labels, metadata, …) before being emitted.
 
         Args:
-            shard_data: List of examples from a shard.
-            content_field: Field containing text content.
+            shard_data: All rows for a single shard, already loaded into
+                memory by the coordinator.
+            content_field: Row key holding the text to tokenize.
+                Defaults to ``"text"``.
 
         Returns:
-            List of tokenized examples.
+            list[dict]: One dict per input row containing the tokenized
+            output plus all non-text fields from the source row.
         """
         results = []
         batch_size = 1000  # Process in smaller batches for memory
@@ -158,9 +201,14 @@ class RayTokenizeWorker:
 
 
 class RayPreprocessor:
-    """Coordinator for distributed preprocessing with Ray.
+    """Driver-side coordinator that fans tokenization out across a Ray actor pool.
 
-    Distributes tokenization and other preprocessing across Ray workers.
+    Constructs a pool of :class:`RayTokenizeWorker` actors lazily on
+    first use, then round-robins shards from a
+    :class:`ShardedDataSource` across them. The class encapsulates the
+    Ray init lifecycle (start-on-demand, optional shutdown) so callers
+    do not have to manage Ray manually. Resource requests
+    (CPU/GPU per actor) are derived from :class:`RayConfig`.
     """
 
     def __init__(
@@ -168,11 +216,20 @@ class RayPreprocessor:
         config: RayConfig,
         tokenizer_config: TokenizerConfig | None = None,
     ):
-        """Initialize RayPreprocessor.
+        """Capture the Ray and tokenizer configurations without starting any actors.
+
+        Worker creation is deferred to :meth:`_create_workers` so the
+        Ray runtime is only initialised on first use, making the
+        coordinator cheap to instantiate in tests.
 
         Args:
-            config: Ray configuration.
-            tokenizer_config: Tokenizer configuration for workers.
+            config: :class:`RayConfig` controlling cluster settings —
+                worker count, resource requests, GPU usage,
+                object-store sizing.
+            tokenizer_config: :class:`TokenizerConfig` describing the
+                tokenizer the workers should each load. Required for
+                :meth:`tokenize_source`; passing ``None`` is only valid
+                for non-tokenization use cases.
         """
 
         self._config = config
@@ -181,7 +238,10 @@ class RayPreprocessor:
         self._initialized = False
 
     def _init_ray(self):
-        """Initialize Ray if not already running."""
+        """Initialize Ray if it has not already been started.
+
+        Honors ``object_store_memory`` from the configured ``RayConfig``.
+        """
         if not ray.is_initialized():
             init_kwargs = {}
             if self._config.object_store_memory:
@@ -189,7 +249,17 @@ class RayPreprocessor:
             ray.init(**init_kwargs)
 
     def _create_workers(self):
-        """Create Ray worker actors."""
+        """Lazily create the Ray ``RayTokenizeWorker`` actor pool.
+
+        Initializes Ray, validates that a tokenizer config has been
+        provided, configures per-worker resources from
+        ``self._config.resources_per_worker`` and ``use_gpu``, and spawns
+        ``num_workers`` actors. Subsequent calls are no-ops.
+
+        Raises:
+            ValueError: If ``tokenizer_config`` was not supplied to the
+                ``RayPreprocessor``.
+        """
         if self._initialized:
             return
 
@@ -221,14 +291,25 @@ class RayPreprocessor:
         source: ShardedDataSource,
         content_field: str = "text",
     ) -> "Iterator[dict]":
-        """Tokenize a sharded source using distributed workers.
+        """Stream tokenized rows produced by tokenizing every shard of ``source`` in parallel.
+
+        The driver loads each shard sequentially (so memory never holds
+        more than one shard at a time on the driver), submits it to a
+        worker via round-robin, and uses :func:`ray.wait` to yield rows
+        from the first completed shard while the rest are still
+        running. This overlaps disk I/O on the driver with tokenization
+        on the workers.
 
         Args:
-            source: Data source to tokenize.
-            content_field: Field containing text content.
+            source: Sharded source providing :attr:`ShardedDataSource.shard_names`
+                and :meth:`ShardedDataSource.open_shard`.
+            content_field: Row key holding the text to tokenize.
+                Defaults to ``"text"``.
 
         Yields:
-            Tokenized examples.
+            dict: One tokenized row per source row, preserving non-text
+            sidecar fields and adding ``input_ids`` /
+            ``attention_mask``.
         """
         self._create_workers()
 
@@ -259,7 +340,11 @@ class RayPreprocessor:
                 yield from results
 
     def shutdown(self):
-        """Shutdown Ray and cleanup workers."""
+        """Kill any active workers and reset the actor pool.
+
+        Safe to call multiple times; if Ray was never initialized the
+        method returns without error.
+        """
         if self._initialized and ray.is_initialized():
             for worker in self._workers:
                 ray.kill(worker)
@@ -274,19 +359,28 @@ def tokenize_with_ray(
     max_length: int = 2048,
     content_field: str = "text",
 ) -> "Iterator[dict]":
-    """Tokenize a source using Ray distributed workers.
+    """One-shot helper: build a :class:`RayPreprocessor` and stream tokenized rows.
 
-    Convenience function for simple distributed tokenization.
+    Convenience wrapper that constructs a temporary
+    :class:`RayPreprocessor` from minimal arguments, yields all
+    tokenized rows produced from ``source``, and tears down the actor
+    pool when iteration finishes (or the caller raises). Equivalent to
+    instantiating :class:`RayPreprocessor` directly but saves the
+    boilerplate when the caller doesn't need to reuse the actor pool.
 
     Args:
-        source: Data source to tokenize.
-        tokenizer: Tokenizer name or path.
-        num_workers: Number of Ray workers.
-        max_length: Maximum sequence length.
-        content_field: Field containing text content.
+        source: :class:`ShardedDataSource` whose shards should be
+            tokenized in parallel.
+        tokenizer: Tokenizer identifier (Hub repo id or local path)
+            passed to each worker.
+        num_workers: Number of Ray actors to spawn.
+        max_length: Truncation length applied to every tokenization
+            call.
+        content_field: Row key holding the text to tokenize.
 
     Yields:
-        Tokenized examples.
+        dict: Tokenized rows produced by
+        :meth:`RayPreprocessor.tokenize_source`.
     """
 
     config = RayConfig(enabled=True, num_workers=num_workers)
@@ -306,23 +400,51 @@ def parallel_process_shards(
     process_fn: tp.Callable[[list[dict]], list[dict]],
     num_workers: int = 4,
 ) -> "Iterator[dict]":
-    """Process shards in parallel using Ray.
+    """Generic Ray-backed parallel shard processor for arbitrary user functions.
 
-    Generic function for parallel shard processing.
+    Submits each shard from ``source`` as a Ray task that runs
+    ``process_fn`` over its rows, then streams the rows back out as
+    individual results using :func:`ray.wait`. Unlike
+    :class:`RayPreprocessor`, this function does not require a
+    tokenizer — ``process_fn`` is whatever pure transformation the
+    caller needs (filtering, augmentation, format conversion, …).
+
+    Note: ``num_workers`` parameter is currently advisory; Ray's
+    scheduler picks parallelism based on cluster resources rather than
+    a fixed worker count. The function uses task-style submission, not
+    a sized actor pool.
 
     Args:
-        source: Data source to process.
-        process_fn: Function to apply to each shard's data.
-        num_workers: Number of Ray workers.
+        source: :class:`ShardedDataSource` whose shards are loaded by
+            the driver and shipped to remote tasks.
+        process_fn: Pure callable applied to each shard's rows. Takes
+            a list of dicts and returns a list of dicts.
+        num_workers: Currently unused; reserved for future actor-pool
+            implementations.
 
     Yields:
-        Processed examples.
+        dict: Each row produced by ``process_fn`` across all shards,
+        in completion order.
     """
     if not ray.is_initialized():
         ray.init()
 
     @ray.remote
     def process_shard(shard_data: list[dict]) -> list[dict]:
+        """Ray task body: invoke the closed-over ``process_fn`` on a shard's rows.
+
+        Captures ``process_fn`` from the enclosing scope so the task
+        does not need it as an explicit argument; that means
+        ``process_fn`` must be picklable for Ray to ship it to the
+        worker.
+
+        Args:
+            shard_data: All examples loaded from a single shard,
+                shipped from the driver via Ray's object store.
+
+        Returns:
+            list[dict]: Rows produced by ``process_fn(shard_data)``.
+        """
         return process_fn(shard_data)
 
     shard_names = list(source.shard_names)

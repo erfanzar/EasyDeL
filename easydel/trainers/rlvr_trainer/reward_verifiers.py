@@ -88,6 +88,14 @@ class MathVerifier:
     """
 
     def __init__(self, answer_key: str = "answer", tolerance: float = 1e-6):
+        """Initialize a math answer verifier.
+
+        Args:
+            answer_key (str): Column name in the batch dict carrying gold
+                answer strings.
+            tolerance (float): Absolute tolerance used for numeric
+                comparison between predicted and gold answers.
+        """
         self._answer_key = answer_key
         self._tolerance = tolerance
 
@@ -140,7 +148,18 @@ class MathVerifier:
         batch: dict[str, tp.Any] | None,
         n: int,
     ) -> list[str | None]:
-        """Extract gold answers from the batch dict."""
+        """Extract gold answers from the batch dict.
+
+        Args:
+            batch (dict[str, tp.Any] | None): Source batch.
+            n (int): Number of completions; the result list is padded with
+                ``None`` to this length.
+
+        Returns:
+            list[str | None]: Normalized gold-answer strings of length
+            ``n``; entries are ``None`` when the answer is missing or
+            cannot be parsed.
+        """
         if batch is None:
             return [None] * n
 
@@ -182,6 +201,14 @@ class CodeVerifier:
     """
 
     def __init__(self, timeout: float = 10.0, test_key: str = "tests"):
+        """Initialize a code-execution verifier.
+
+        Args:
+            timeout (float): Hard time budget in seconds for each test
+                case execution.
+            test_key (str): Column name in the batch dict carrying test
+                source code.
+        """
         self._timeout = timeout
         self._test_key = test_key
 
@@ -233,7 +260,17 @@ class CodeVerifier:
         return None
 
     def _run_tests(self, code: str, test_code: str) -> bool:
-        """Execute code + test assertions in a sandboxed environment."""
+        """Execute code + test assertions in a sandboxed environment.
+
+        Args:
+            code (str): The candidate code to execute.
+            test_code (str): The test/assertion source appended to the
+                candidate code.
+
+        Returns:
+            bool: True if the combined script ran to completion without
+            raising or timing out, False otherwise.
+        """
         import contextlib
         import io
         import signal
@@ -242,6 +279,15 @@ class CodeVerifier:
         try:
 
             def _handler(signum, frame):
+                """Convert ``SIGALRM`` into a ``TimeoutError`` for ``exec``.
+
+                Args:
+                    signum: Signal number (unused).
+                    frame: Current stack frame (unused).
+
+                Raises:
+                    TimeoutError: Always, to abort the running ``exec``.
+                """
                 raise TimeoutError
 
             old = signal.signal(signal.SIGALRM, _handler)
@@ -258,6 +304,17 @@ class CodeVerifier:
             return False
 
     def _get_tests(self, batch: dict[str, tp.Any] | None, n: int) -> list[str | None]:
+        """Extract per-completion test sources from the batch dict.
+
+        Args:
+            batch (dict[str, tp.Any] | None): Source batch.
+            n (int): Number of completions; the returned list is padded
+                with ``None`` to length ``n``.
+
+        Returns:
+            list[str | None]: Test-code strings of length ``n``; entries
+            are ``None`` when no test source is provided for that index.
+        """
         if batch is None:
             return [None] * n
         tests = batch.get(self._test_key)
@@ -287,6 +344,13 @@ class FormatVerifier:
     """
 
     def __init__(self, pattern: str, require_full_match: bool = False):
+        """Initialize a format-compliance verifier.
+
+        Args:
+            pattern (str): Regex pattern compiled with ``re.DOTALL``.
+            require_full_match (bool): When True, require ``fullmatch``
+                instead of ``search``.
+        """
         self._pattern = re.compile(pattern, re.DOTALL)
         self._full = require_full_match
 
@@ -339,6 +403,16 @@ class LengthPenaltyVerifier:
         min_length: int = 10,
         max_length: int = 5000,
     ):
+        """Initialize a length-penalty verifier.
+
+        Args:
+            target_length (int): Desired completion length (in
+                characters); produces reward 1.0 at the target.
+            min_length (int): Lower bound; completions shorter than this
+                receive 0.0.
+            max_length (int): Upper bound; completions longer than this
+                receive 0.0.
+        """
         self._target = target_length
         self._min = min_length
         self._max = max_length

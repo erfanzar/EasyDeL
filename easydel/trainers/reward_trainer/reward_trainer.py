@@ -83,6 +83,29 @@ class RewardTrainer(Trainer):
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         data_collator: RewardDataCollatorWithPaddingTFDS | RewardDataCollatorWithPaddingGrain | None = None,
     ):
+        """Initialize the reward-model trainer.
+
+        Args:
+            arguments (RewardConfig): Training configuration; must be a
+                :class:`RewardConfig`.
+            processing_class (ProcessingClassType): Tokenizer / processor.
+                Required.
+            model (EasyDeLBaseModule | EasyDeLState | None): The reward
+                model (typically with a scalar regression head). Plain
+                modules are converted to a state via ``model.to_state(...)``.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Preference training dataset.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation dataset(s).
+            data_collator (RewardDataCollatorWithPaddingTFDS |
+                RewardDataCollatorWithPaddingGrain | None): Optional explicit
+                data collator. When ``None``, default reward-model padding
+                collators are constructed for both Grain and TFDS pipelines.
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`RewardConfig`.
+            ValueError: If ``processing_class`` is None.
+        """
         if not isinstance(arguments, RewardConfig):
             raise TypeError("passed argument must be a `RewardConfig`.")
         if processing_class is None:
@@ -122,7 +145,23 @@ class RewardTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> RewardPreprocessTransform | None:
-        """Get Reward Model preprocessing transform for ShardedDataSource."""
+        """Build the lazy preference-pair preprocessing transform.
+
+        Reward training expects each row to expose a ``chosen`` and a
+        ``rejected`` text. The transform tokenises both branches
+        independently, truncates to ``arguments.max_length``, and emits
+        the matched columns ``input_ids_chosen`` /
+        ``attention_mask_chosen`` / ``input_ids_rejected`` /
+        ``attention_mask_rejected`` that the reward collator then pads to
+        a common length. The transform runs lazily inside the data
+        loader.
+
+        Returns:
+            A :class:`RewardPreprocessTransform`, or ``None`` if
+            :meth:`_is_pretokenized` indicates the source already
+            provides ``input_ids_chosen`` and the transform would be a
+            no-op.
+        """
 
         if self._is_pretokenized():
             return None
@@ -133,7 +172,19 @@ class RewardTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Detect whether the bound source already exposes tokenised reward columns.
+
+        Peeks at the first row of the first shard and reports whether
+        the column ``"input_ids_chosen"`` is present. The presence of
+        that field is the signal the trainer uses to skip
+        :class:`RewardPreprocessTransform` and route the source rows
+        directly to the reward collator. Defensive against unset
+        sources, empty shard lists and shards that yield no rows.
+
+        Returns:
+            ``True`` when the first sample of the first shard contains
+            ``"input_ids_chosen"``; ``False`` otherwise.
+        """
         if self._train_source is None:
             return False
         try:
@@ -143,7 +194,42 @@ class RewardTrainer(Trainer):
             return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile training and evaluation step functions."""
+        """Compile the reward-model training and evaluation steps.
+
+        The reward objective is the Bradley-Terry pairwise loss
+
+        ``L = -log sigmoid(r_chosen - r_rejected)
+              + center_coef * (r_chosen + r_rejected)^2``
+
+        where the optional centring term anchors the reward to mean zero
+        when ``arguments.center_rewards_coefficient`` is non-zero. The
+        method:
+
+        * Resolves the optional straight-through emulator from the
+          configured quantisation knobs so the reward backbone can be
+          traced under simulated quantisation while keeping the
+          gradient path differentiable.
+        * Caches the static-argument tuples for both phases under
+          ``self._train_shared_fn_static_args`` and
+          ``self._eval_shared_fn_static_args``; eval drops the
+          scheduler / accumulation / STE entries because eval is a
+          single-pass forward.
+        * JITs :func:`training_step` with state donation and a
+          ``(state, metrics)`` output and :func:`evaluation_step` with a
+          metrics-only output. Both share the state's resident
+          shardings; the batch and metrics ride on a fully replicated
+          sharding.
+
+        Side effects:
+            Stores the compiled functions' ``static_argnums_`` for
+            downstream introspection and ensures the checkpoint
+            directory exists.
+
+        Returns:
+            A :class:`TrainerConfigureFunctionOutput` carrying the two
+            compiled step functions, the active mesh, and the streaming
+            checkpoint manager.
+        """
         empty_sharding = jax.sharding.NamedSharding(
             spec=PartitionSpec(),
             mesh=self.model.mesh,
@@ -211,7 +297,25 @@ class RewardTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collection function for Grain batching."""
+        """Return the cached Grain collator that pads chosen/rejected pairs.
+
+        The pre-instantiated collator already knows the configured
+        ``max_length`` and ``truncation_mode``; this method simply
+        returns it so the base :class:`Trainer` can hand it to the
+        loader. Both branches of each preference pair are padded to the
+        same length so the reward backbone can run them under a single
+        compiled forward.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; unused.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; unused.
+
+        Returns:
+            The :class:`RewardDataCollatorWithPaddingGrain` instance
+            built in ``__init__``.
+        """
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -219,5 +323,21 @@ class RewardTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collection function for TFDS batching."""
+        """Return the cached TFDS collator that pads chosen/rejected pairs.
+
+        TFDS analogue of :meth:`create_grain_collect_function`. The
+        collator was pre-built in ``__init__`` with the reward training
+        ``max_length`` and ``truncation_mode``; this method simply
+        returns it.
+
+        Args:
+            max_sequence_length: Accepted for compatibility with
+                :class:`Trainer`; unused.
+            truncation_mode: Accepted for compatibility with
+                :class:`Trainer`; unused.
+
+        Returns:
+            The :class:`RewardDataCollatorWithPaddingTFDS` instance
+            built in ``__init__``.
+        """
         return self.input_data_collator_tfds

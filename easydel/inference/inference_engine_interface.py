@@ -92,16 +92,27 @@ logger = get_logger("InferenceApiServer")
 
 
 class ServerStatus(StrEnum):
-    """Server status enumeration.
+    """Lifecycle states reported by every EasyDeL inference server.
 
-    Represents the operational state of an inference server.
+    Used both as the value of :attr:`BaseInferenceApiServer.status` and
+    as the ``status`` field on health-check responses, this enum gives
+    operators and load balancers a single vocabulary for deciding
+    whether to send traffic to a replica. The states form a directed
+    graph driven by FastAPI lifespan and ``_graceful_shutdown``:
+    ``STARTING -> READY -> SHUTTING_DOWN`` for a clean lifecycle, with
+    ``BUSY`` / ``ERROR`` reachable from ``READY`` when the engine
+    saturates or hits a fatal condition.
 
     Attributes:
-        STARTING: Server is initializing
-        READY: Server is ready to accept requests
-        BUSY: Server is processing requests at capacity
-        ERROR: Server encountered an error
-        SHUTTING_DOWN: Server is gracefully shutting down
+        STARTING: Lifespan startup hooks are still running; the model
+            and tokenizer are typically being loaded.
+        READY: Server can accept requests and the engine is responsive.
+        BUSY: Generation slots are exhausted; ``max_concurrent_generations``
+            is throttling new requests with HTTP 503.
+        ERROR: An unrecoverable subsystem error occurred; ``/health``
+            returns 503 and operators should restart the replica.
+        SHUTTING_DOWN: Shutdown is in progress; existing requests are
+            being drained and no new traffic should be routed in.
     """
 
     STARTING = "starting"
@@ -113,18 +124,31 @@ class ServerStatus(StrEnum):
 
 @dataclass
 class ServerMetrics:
-    """Server performance metrics.
+    """Aggregate per-server counters surfaced through ``/metrics``.
 
-    Tracks key performance indicators for the inference server.
+    Mutated by the request-tracking middleware in
+    :meth:`BaseInferenceApiServer._setup_middleware` (``total_requests``,
+    ``successful_requests``, ``failed_requests``) and by streaming code
+    paths that reconcile metrics after SSE failures. Token-throughput
+    fields are populated by subclasses when they observe per-request
+    completion stats. Operators normally consume this struct through
+    the JSON payload returned by :meth:`BaseInferenceApiServer.get_metrics`.
 
     Attributes:
-        total_requests: Total number of requests received
-        successful_requests: Number of successfully completed requests
-        failed_requests: Number of failed requests
-        total_tokens_generated: Total tokens generated across all requests
-        average_tokens_per_second: Average generation speed
-        uptime_seconds: Time since server started
-        start_time: Unix timestamp when server started
+        total_requests: Cumulative count of HTTP requests handled by the
+            ``add_request_id`` middleware (includes failed ones).
+        successful_requests: Number of requests whose response status
+            was ``< 400`` at the middleware boundary.
+        failed_requests: Number of requests whose response status was
+            ``>= 400`` or that raised an exception inside the handler.
+        total_tokens_generated: Cumulative completion tokens emitted
+            across all requests; intended to be incremented by subclasses.
+        average_tokens_per_second: Rolling tokens-per-second average; the
+            update strategy is left to subclasses.
+        uptime_seconds: Seconds elapsed since :attr:`start_time`; refreshed
+            on every request.
+        start_time: Unix timestamp captured when the dataclass was
+            instantiated; serves as the epoch for uptime computations.
     """
 
     total_requests: int = 0
@@ -137,17 +161,31 @@ class ServerMetrics:
 
 
 class EndpointConfig(BaseModel):
-    """Configuration for a FastAPI endpoint.
+    """Declarative description of one FastAPI endpoint registered by the server.
 
-    Defines the structure for registering API endpoints.
+    Concrete servers expose the entire HTTP surface as a list of these
+    configs (see :meth:`BaseInferenceApiServer._endpoints`); the
+    registration helper iterates the list and forwards each field to
+    ``FastAPI.add_api_route``. Capturing routes this way prevents drift
+    between the documented surface and the actual routes installed at
+    runtime, makes it easy for subclasses to add or remove endpoints,
+    and keeps the OpenAPI schema and middleware in lock-step with the
+    list contents.
 
     Attributes:
-        path: URL path for the endpoint
-        handler: Callable that handles requests
-        methods: HTTP methods supported (GET, POST, etc.)
-        summary: Brief description of the endpoint
-        tags: Tags for API documentation grouping
-        response_model: Pydantic model for response validation
+        path: URL path template (``"/v1/chat/completions"``,
+            ``"/v1/models/{model_id}"``, …) registered with FastAPI.
+        handler: Async callable that processes requests reaching ``path``;
+            forwarded directly as the route's ``endpoint`` parameter.
+        methods: HTTP verbs the endpoint accepts (``["GET"]``,
+            ``["POST"]`` and so on).
+        summary: Human-readable summary surfaced in the OpenAPI schema
+            and the ``/docs`` UI.
+        tags: Optional documentation tags that group related endpoints
+            in the OpenAPI page.
+        response_model: Optional Pydantic model used by FastAPI for
+            response validation and schema generation; ``None`` disables
+            automatic validation.
     """
 
     path: str
@@ -159,14 +197,24 @@ class EndpointConfig(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Standard error response model.
+    """Standardized JSON error envelope returned by every server endpoint.
 
-    Provides a consistent error response format across all endpoints.
+    Used by :func:`create_error_response` to wrap HTTP-level error
+    payloads so that clients see a consistent shape regardless of the
+    underlying failure (validation, auth, engine 5xx, etc.). The
+    structure mirrors the OpenAI error schema, with ``error.message``
+    carrying the human-readable text and ``error.type`` carrying the
+    HTTP status name.
 
     Attributes:
-        error: Dictionary containing error message and type
-        request_id: Optional unique identifier for the request
-        timestamp: Unix timestamp when error occurred
+        error: Mapping with ``"message"`` (human-readable failure text)
+            and ``"type"`` (HTTP status name like ``"BAD_REQUEST"``).
+        request_id: Optional correlation ID propagated from
+            ``X-Request-ID`` so operators can trace failures across
+            logs and dashboards.
+        timestamp: Unix timestamp captured when the response was
+            constructed; defaults to the current time so middleware can
+            record server-side latency without re-running ``time.time()``.
     """
 
     error: dict[str, str]
@@ -190,11 +238,48 @@ def create_error_response(status_code: HTTPStatus, message: str, request_id: str
 
 
 class BaseInferenceApiServer(ABC):
-    """
-    Abstract base class for inference API servers.
+    """Abstract FastAPI scaffolding shared by every EasyDeL inference server.
 
-    This interface defines the standard structure and methods that all inference
-    API servers should implement to ensure consistency across different inference modules.
+    This base class provides the OpenAI-compatible HTTP surface — chat
+    completions, completions, the new Responses API, model listing,
+    metrics, health checks, and tool execution endpoints — together with
+    the cross-cutting concerns that live around them (CORS, request
+    metrics, stream-to-async bridging, generation-slot saturation
+    control, response-store LRU caches, and SSE serialization helpers).
+
+    Concrete servers (``eSurgeApiServer`` today, hypothetically others
+    tomorrow) only need to implement the abstract methods that decide
+    *how* tokens are produced (``chat_completions``, ``completions``,
+    ``health_check``, ``list_models``, ``get_model``, ``get_metrics``,
+    ``list_tools``, ``execute_tool``) plus the two helper hooks
+    ``_create_sampling_params`` and ``_count_tokens``. Everything else —
+    routing, lifecycle, shutdown draining, conversation persistence,
+    Responses-payload conversion, etc. — is provided here.
+
+    Two extension points worth knowing about:
+
+    1. :meth:`on_startup` / :meth:`on_shutdown` are called inside the
+       FastAPI lifespan context and are a good place to load models,
+       open connections, or persist state.
+    2. The ``_endpoints`` property is the single source of truth for the
+       HTTP routes registered with FastAPI; subclasses can extend it to
+       add additional endpoints without rebuilding the entire app.
+
+    Attributes:
+        thread_pool: ThreadPoolExecutor used to run blocking code paths
+            (token counting, synchronous engine streams) off the asyncio
+            event loop.
+        max_request_size: Maximum allowed request body size in bytes.
+        request_timeout: Per-request timeout in seconds (informational —
+            actually enforced at the engine level).
+        status: Current :class:`ServerStatus` enum value.
+        metrics: :class:`ServerMetrics` instance accumulating request and
+            token counters.
+        app: The constructed :class:`FastAPI` application.
+        enable_function_calling: Whether the ``/v1/tools`` and
+            ``/v1/tools/execute`` endpoints are exposed.
+        default_function_format: :class:`FunctionCallFormat` used when a
+            request does not pin a specific format.
     """
 
     def __init__(
@@ -308,7 +393,18 @@ class BaseInferenceApiServer(ABC):
 
     @asynccontextmanager
     async def _lifespan(self, app: FastAPI):
-        """Manage server lifecycle."""
+        """FastAPI lifespan context that drives server startup and shutdown.
+
+        Calls :meth:`on_startup` before yielding control to the application and
+        :meth:`on_shutdown` (after :meth:`_graceful_shutdown`) once shutdown is
+        requested, while keeping :attr:`status` in sync with the lifecycle.
+
+        Args:
+            app: The FastAPI application instance owning the lifespan.
+
+        Yields:
+            None: The window during which the server accepts requests.
+        """
         logger.info(f"Starting {self.app.title}...")
         await self.on_startup()
         self.status = ServerStatus.READY
@@ -573,7 +669,12 @@ class BaseInferenceApiServer(ABC):
         ]
 
     def _add_function_calling_endpoints(self) -> None:
-        """Add function calling specific endpoints."""
+        """Register additional endpoints used for function/tool calling.
+
+        Adds two routes (``GET /v1/tools`` and ``POST /v1/tools/execute``) to
+        the FastAPI application. Subclasses must implement
+        :meth:`list_tools` and :meth:`execute_tool` for these to function.
+        """
         additional_endpoints = [
             EndpointConfig(
                 path="/v1/tools",
@@ -601,7 +702,12 @@ class BaseInferenceApiServer(ABC):
             )
 
     def _register_endpoints(self) -> None:
-        """Register all API endpoints."""
+        """Register every endpoint declared by :attr:`_endpoints` with FastAPI.
+
+        Iterates the property and calls ``add_api_route`` for each
+        :class:`EndpointConfig`, propagating path, method, summary, tags, and
+        response model so the OpenAPI schema stays consistent.
+        """
         for endpoint in self._endpoints:
             self.app.add_api_route(
                 path=endpoint.path,
@@ -613,7 +719,12 @@ class BaseInferenceApiServer(ABC):
             )
 
     async def _graceful_shutdown(self) -> None:
-        """Perform graceful shutdown."""
+        """Wait for active requests to drain before tearing down the server.
+
+        Waits up to 30 seconds for in-flight requests to finish, then
+        force-shuts the worker thread pool. Logs progress messages so
+        operators can see how many requests remain.
+        """
         max_wait = 30
         start = time.time()
 
@@ -684,7 +795,13 @@ class BaseInferenceApiServer(ABC):
         return resolved_tools
 
     def _mark_stream_failure(self) -> None:
-        """Adjust metrics when a streaming response fails after headers are sent."""
+        """Adjust metrics when a streaming response fails after headers are sent.
+
+        FastAPI middleware counts the request as successful as soon as a
+        ``200 OK`` headers frame is emitted, so a downstream stream error must
+        manually decrement ``successful_requests`` and increment
+        ``failed_requests`` to keep counters honest.
+        """
 
         if self.metrics.successful_requests > 0:
             self.metrics.successful_requests -= 1
@@ -697,6 +814,15 @@ class BaseInferenceApiServer(ABC):
         Prevents token loss under concurrent streaming by computing delta from
         full accumulated text rather than relying on potentially incomplete
         ``delta_text`` values supplied by an inference engine.
+
+        Args:
+            current_text: Current cumulative output text from the engine.
+            previous_text: Previously emitted cumulative text.
+            fallback_delta: Delta provided by the engine, used when the
+                cumulative comparison cannot be performed.
+
+        Returns:
+            The text segment newly produced since ``previous_text``.
         """
         return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
@@ -710,7 +836,25 @@ class BaseInferenceApiServer(ABC):
         raw_request: Request | None = None,
         stream: bool | None = None,
     ) -> AsyncIterator[None]:
-        """Acquire a generation slot or raise HTTP 503 when the server is saturated."""
+        """Acquire a generation slot or raise HTTP 503 when the server is saturated.
+
+        When ``max_concurrent_generations`` was configured during init, this
+        context manager pulls a token from the slot queue before yielding.
+        If the queue is empty it logs detailed context and raises a 503.
+
+        Args:
+            endpoint: Endpoint name (for diagnostics only).
+            request_id: Request identifier (for diagnostics only).
+            model: Requested model name (for diagnostics only).
+            raw_request: The raw FastAPI request (used to extract client info).
+            stream: Whether the request is streaming (for diagnostics only).
+
+        Yields:
+            None: While the caller holds an exclusive generation slot.
+
+        Raises:
+            HTTPException: With ``503`` status when no slot is available.
+        """
 
         queue = self._generation_slots
         if queue is None:
@@ -771,12 +915,35 @@ class BaseInferenceApiServer(ABC):
         self,
         stream_fn: tp.Callable[[], Iterator[tp.Any]],
     ) -> tp.Any:
-        """Run blocking ``stream_fn`` in a worker thread and expose async ``get``."""
+        """Run blocking ``stream_fn`` in a worker thread and expose async ``get``.
+
+        Bridges a synchronous generator (typical of inference engines) to the
+        async world by hosting it on the server's thread pool and shuttling
+        results through a thread-safe queue. The returned object provides an
+        ``await get()`` method that yields ``("data", payload)`` tuples,
+        ``("error", exc)`` on failure, and ``("end", None)`` when complete.
+
+        Args:
+            stream_fn: Zero-argument callable returning a synchronous iterator
+                of streaming payloads.
+
+        Returns:
+            An ``_AsyncStreamQueue``-like object whose ``get`` coroutine
+            yields the tagged payload tuples.
+        """
 
         queue: queue_lib.Queue[tuple[str, tp.Any]] = queue_lib.Queue()
 
         class _AsyncStreamQueue:
+            """Async-friendly accessor backed by the synchronous queue."""
+
             async def get(self) -> tuple[str, tp.Any]:
+                """Block until a tagged payload is available and return it.
+
+                Returns:
+                    Tuple ``(kind, payload)`` where ``kind`` is one of
+                    ``"data"``, ``"error"``, or ``"end"``.
+                """
                 while True:
                     try:
                         return queue.get_nowait()
@@ -784,9 +951,11 @@ class BaseInferenceApiServer(ABC):
                         await asyncio.sleep(0.001)
 
         def _enqueue(kind: str, payload: tp.Any) -> None:
+            """Push ``(kind, payload)`` onto the cross-thread queue."""
             queue.put((kind, payload))
 
         def _producer() -> None:
+            """Drive ``stream_fn`` in a worker thread, capturing exceptions."""
             try:
                 for output in stream_fn():
                     _enqueue("data", output)
@@ -801,7 +970,19 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _normalize_conversation_id(value: tp.Any) -> str | None:
-        """Extract a conversation ID from request payload."""
+        """Extract a conversation ID from request payload.
+
+        Accepts a raw string, a :class:`ConversationReference`, or a dict with
+        any of the keys ``id``/``conversation_id``/``conversation`` and
+        returns the trimmed identifier or ``None`` when nothing valid is
+        provided.
+
+        Args:
+            value: Conversation reference value pulled from a request body.
+
+        Returns:
+            The normalized conversation ID, or ``None`` if absent or invalid.
+        """
 
         if isinstance(value, str):
             return value.strip() or None
@@ -817,6 +998,14 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _lru_set(store: OrderedDict[str, tp.Any], key: str, value: tp.Any, max_size: int) -> None:
+        """Insert ``key``/``value`` into ``store`` with LRU eviction.
+
+        Args:
+            store: Ordered dict acting as the LRU cache.
+            key: Cache key to insert or refresh.
+            value: Value to associate with the key.
+            max_size: Maximum number of entries; ``0`` clears the store.
+        """
         store[key] = value
         store.move_to_end(key)
         if max_size <= 0:
@@ -830,7 +1019,16 @@ class BaseInferenceApiServer(ABC):
         messages: list[ChatMessage],
         assistant_turn: str | ChatMessage,
     ) -> list[dict[str, tp.Any]]:
-        """Create conversation items (excluding ``instructions``) for storage."""
+        """Create conversation items (excluding ``instructions``) for storage.
+
+        Args:
+            messages: Sequence of input chat messages from the request.
+            assistant_turn: The assistant reply, either as a plain string or as
+                a :class:`ChatMessage` with structured content.
+
+        Returns:
+            A serialized list of message dicts ready for persistence.
+        """
 
         history = [message.model_dump(exclude_none=True) for message in messages]
         if isinstance(assistant_turn, ChatMessage):
@@ -846,6 +1044,12 @@ class BaseInferenceApiServer(ABC):
         Behavior is default-on for local OpenAI-mock parity goals and can be
         explicitly disabled using ``reasoning=False`` or
         ``reasoning.summary`` values like ``"none"``/``false``.
+
+        Args:
+            request: The Responses API request to inspect.
+
+        Returns:
+            ``True`` when the response should embed a reasoning summary item.
         """
 
         include = request.include
@@ -874,7 +1078,18 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _normalize_chat_message(message: ChatMessage) -> ChatMessage:
-        """Canonicalize multimodal/text content parts in a typed chat message."""
+        """Canonicalize multimodal/text content parts in a typed chat message.
+
+        Converts Responses-style content parts (``input_text``, ``input_image``,
+        ``input_video``) into the chat-completions equivalents expected by the
+        rest of the stack. Non-list content is deep-copied unchanged.
+
+        Args:
+            message: Chat message whose content parts may need normalization.
+
+        Returns:
+            A new :class:`ChatMessage` with canonical content parts.
+        """
 
         content = message.content
         if not isinstance(content, list):
@@ -917,6 +1132,15 @@ class BaseInferenceApiServer(ABC):
             - ``instructions`` is treated as an ephemeral system message. By default we do
               not include it in the returned message list so it won't be persisted when
               implementing multi-turn state via ``previous_response_id``.
+
+        Args:
+            request: The Responses API request to flatten.
+            include_instructions: When True, prepend the request's
+                ``instructions`` as a system message.
+
+        Returns:
+            List of :class:`ChatMessage` objects representing the conversation
+            in chat-completions form.
         """
 
         messages: list[ChatMessage] = []
@@ -991,7 +1215,15 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _flatten_messages_to_text(messages: list[ChatMessage]) -> list[ChatMessage]:
-        """Collapse content arrays into plain text for tool parsing and templating."""
+        """Collapse content arrays into plain text for tool parsing and templating.
+
+        Args:
+            messages: Chat messages whose content may be a list of typed parts.
+
+        Returns:
+            New list of :class:`ChatMessage` instances with plain string
+            content suitable for templating engines that expect strings.
+        """
 
         flattened: list[ChatMessage] = []
         for msg in messages:
@@ -1014,7 +1246,17 @@ class BaseInferenceApiServer(ABC):
     def _extract_responses_tools(
         request: ResponsesRequest,
     ) -> tuple[list[ToolDefinition | FunctionDefinition] | None, list[dict[str, tp.Any]] | None]:
-        """Return (raw_tools, tools_for_chat_template) from a Responses payload."""
+        """Return (raw_tools, tools_for_chat_template) from a Responses payload.
+
+        Args:
+            request: The Responses API request describing the call.
+
+        Returns:
+            A two-tuple ``(raw_tools, tools_for_template)`` where the first
+            element preserves the original objects for downstream parsers and
+            the second contains chat-template-compatible dicts. Both are
+            ``None`` when the request did not declare tools.
+        """
 
         raw_tools = request.tools or request.functions
         if not raw_tools:
@@ -1036,7 +1278,15 @@ class BaseInferenceApiServer(ABC):
         return list(raw_tools), tools_for_template or None
 
     def _infer_sequence_length_from_engine(self, engine: tp.Any | None = None) -> int:
-        """Infer maximum sequence length from the engine or fall back to 128 tokens."""
+        """Infer maximum sequence length from the engine or fall back to 128 tokens.
+
+        Args:
+            engine: The inference engine adapter whose ``runtime_config`` is
+                consulted. ``None`` triggers the fallback.
+
+        Returns:
+            ``runtime_config.max_model_len`` when available, otherwise ``128``.
+        """
 
         runtime_config = getattr(engine, "runtime_config", None)
         max_model_len = getattr(runtime_config, "max_model_len", None) if runtime_config is not None else None
@@ -1048,7 +1298,23 @@ class BaseInferenceApiServer(ABC):
         return 128
 
     def _parse_responses_max_tokens(self, request: ResponsesRequest, engine: tp.Any | None) -> tuple[int, int | None]:
-        """Return (requested_tokens_for_auth, max_tokens_for_sampling)."""
+        """Return (requested_tokens_for_auth, max_tokens_for_sampling).
+
+        Reconciles the three possible token-budget fields on a Responses
+        request (``max_output_tokens``/``max_tokens``/``max_completion_tokens``)
+        and produces both an authentication-side budget and an
+        engine-side ``max_tokens``.
+
+        Args:
+            request: The Responses API request being processed.
+            engine: Engine adapter used to derive a sensible default when the
+                request does not specify a budget.
+
+        Returns:
+            Tuple ``(requested_tokens, max_tokens)`` where ``requested_tokens``
+            is always a positive integer and ``max_tokens`` is ``None`` when
+            sampling should run open-ended.
+        """
 
         raw_value = request.max_output_tokens
         if raw_value is None:
@@ -1071,7 +1337,20 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _create_sampling_params_from_responses(request: ResponsesRequest, max_tokens: int | None) -> SamplingParams:
-        """Translate a Responses API payload into SamplingParams."""
+        """Translate a Responses API payload into SamplingParams.
+
+        Applies clamps and defaults consistent with the OpenAI reference
+        implementation (temperature in ``[0.0, 2.0]``, non-negative ``top_k``)
+        so downstream code can rely on validated values.
+
+        Args:
+            request: The Responses API request being translated.
+            max_tokens: Pre-computed sampling budget, possibly ``None`` for
+                open-ended generation.
+
+        Returns:
+            A populated :class:`SamplingParams` ready for the engine.
+        """
 
         temperature = 1.0 if request.temperature is None else request.temperature
         top_p = 1.0 if request.top_p is None else request.top_p
@@ -1113,14 +1392,39 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _build_responses_reasoning_item(reasoning_text: str) -> ResponseReasoningItem:
+        """Build a Responses ``reasoning`` output item from raw text.
+
+        Args:
+            reasoning_text: The reasoning summary text to embed.
+
+        Returns:
+            A :class:`ResponseReasoningItem` payload object.
+        """
         return build_responses_reasoning_item(reasoning_text)
 
     @staticmethod
     def _build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[ResponseFunctionCallItem]:
+        """Build Responses ``function_call`` output items from tool calls.
+
+        Args:
+            tool_calls: Tool call records produced by the engine, or ``None``.
+
+        Returns:
+            List of :class:`ResponseFunctionCallItem` objects (empty when
+            ``tool_calls`` is falsy).
+        """
         return build_responses_function_call_items(tool_calls)
 
     @staticmethod
     def _build_responses_message_item(output_text: str) -> ResponseMessageItem:
+        """Build a Responses ``message`` output item from generated text.
+
+        Args:
+            output_text: Assistant-visible text to wrap.
+
+        Returns:
+            A :class:`ResponseMessageItem` payload object.
+        """
         return build_responses_message_item(output_text)
 
     @staticmethod
@@ -1128,7 +1432,16 @@ class BaseInferenceApiServer(ABC):
         output_text: str,
         tool_calls: list[tp.Any] | None = None,
     ) -> bool:
-        """Return whether a Responses output should include a message item."""
+        """Return whether a Responses output should include a message item.
+
+        Args:
+            output_text: Generated text to consider for inclusion.
+            tool_calls: Optional tool calls accompanying the output.
+
+        Returns:
+            ``True`` when the message item should be emitted alongside any
+            tool/reasoning items.
+        """
         return should_emit_responses_message_item(output_text, tool_calls)
 
     @classmethod
@@ -1140,6 +1453,19 @@ class BaseInferenceApiServer(ABC):
         reasoning_text: str | None = None,
         include_reasoning_summary: bool = False,
     ) -> list[ResponsesOutputItem]:
+        """Build the ordered list of output items for a Responses payload.
+
+        Args:
+            output_text: Assistant-visible text generated by the model.
+            tool_calls: Optional tool/function call records.
+            reasoning_text: Optional reasoning text emitted by the model.
+            include_reasoning_summary: When True, attach the reasoning summary
+                even if no other reasoning content was produced.
+
+        Returns:
+            Ordered list of :class:`ResponsesOutputItem` objects suitable for
+            inclusion in the final :class:`ResponsesResponse`.
+        """
         return build_responses_output_items(
             output_text=output_text,
             tool_calls=tool_calls,
@@ -1151,6 +1477,15 @@ class BaseInferenceApiServer(ABC):
     def _responses_assistant_message_from_output_items(
         output_items: list[ResponsesOutputItem],
     ) -> ChatMessage:
+        """Reduce Responses output items to an assistant :class:`ChatMessage`.
+
+        Args:
+            output_items: Output items from a Responses payload.
+
+        Returns:
+            A :class:`ChatMessage` with role ``"assistant"`` summarizing the
+            output items.
+        """
         return responses_assistant_message_from_output_items(output_items)
 
     @classmethod
@@ -1167,6 +1502,23 @@ class BaseInferenceApiServer(ABC):
         include_reasoning_summary: bool = False,
         output_items: list[ResponsesOutputItem] | None = None,
     ) -> ResponsesResponse:
+        """Construct a complete :class:`ResponsesResponse` for the Responses API.
+
+        Args:
+            response_id: Unique response identifier (e.g. ``"resp_..."``).
+            model: Model identifier echoed in the response.
+            output_text: Assistant-visible text.
+            prompt_tokens: Token count for the prompt.
+            completion_tokens: Token count for the completion.
+            tool_calls: Optional tool/function call records.
+            reasoning_text: Optional reasoning summary text.
+            include_reasoning_summary: Whether to include the reasoning item.
+            output_items: Pre-built output items; constructed automatically
+                when not provided.
+
+        Returns:
+            Fully populated :class:`ResponsesResponse`.
+        """
         return build_responses_object(
             response_id=response_id,
             model=model,
@@ -1181,6 +1533,14 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _jsonify_tool_calls(tool_calls: tp.Any) -> list[tp.Any] | None:
+        """Serialize tool call objects to JSON-compatible primitives.
+
+        Args:
+            tool_calls: Tool call records produced by the engine.
+
+        Returns:
+            JSON-friendly list of dicts, or ``None`` when the input is empty.
+        """
         return jsonify_tool_calls(tool_calls)
 
     @classmethod
@@ -1191,7 +1551,17 @@ class BaseInferenceApiServer(ABC):
         fallback_text: str = "",
         default_role: str | None = None,
     ) -> DeltaMessage | None:
-        """Normalize parser/engine streaming deltas into a safe DeltaMessage."""
+        """Normalize parser/engine streaming deltas into a safe DeltaMessage.
+
+        Args:
+            delta_message: Raw delta object emitted by an engine or parser.
+            fallback_text: Text to use when ``delta_message`` lacks a text body.
+            default_role: Role to assign when the delta omits one.
+
+        Returns:
+            A :class:`DeltaMessage` ready for SSE emission, or ``None`` when
+            no usable content was produced.
+        """
         return coerce_stream_delta_message(
             delta_message,
             fallback_text=fallback_text,
@@ -1200,6 +1570,15 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _sse_event(event: str, payload: BaseModel | dict[str, tp.Any]) -> str:
+        """Format a Server-Sent Events frame for streaming responses.
+
+        Args:
+            event: SSE ``event`` field name.
+            payload: Either a Pydantic model or a JSON-serializable dict.
+
+        Returns:
+            The serialized SSE frame ending with the required blank line.
+        """
         payload_json = (
             payload.model_dump_json(exclude_none=True)
             if isinstance(payload, BaseModel)
@@ -1208,6 +1587,14 @@ class BaseInferenceApiServer(ABC):
         return f"event: {event}\ndata: {payload_json}\n\n"
 
     async def _response_store_get_response(self, response_id: str) -> dict[str, tp.Any] | None:
+        """Look up a stored Responses record by ID.
+
+        Args:
+            response_id: Identifier returned by a previous call.
+
+        Returns:
+            The stored record dict or ``None`` if absent or storage is off.
+        """
         if not self._enable_response_store:
             return None
 
@@ -1218,6 +1605,12 @@ class BaseInferenceApiServer(ABC):
             return self._stored_responses.get(response_id)
 
     async def _response_store_put_response(self, response_id: str, record: dict[str, tp.Any]) -> None:
+        """Persist a Responses record under ``response_id``.
+
+        Args:
+            response_id: Identifier to store the record under.
+            record: Serialized response payload to retain.
+        """
         if not self._enable_response_store:
             return
 
@@ -1229,6 +1622,15 @@ class BaseInferenceApiServer(ABC):
             self._lru_set(self._stored_responses, response_id, record, self._max_stored_responses)
 
     async def _response_store_get_conversation(self, conversation_id: str) -> list[dict[str, tp.Any]] | None:
+        """Fetch the cached conversation history for a conversation ID.
+
+        Args:
+            conversation_id: Conversation identifier to look up.
+
+        Returns:
+            The list of historical messages or ``None`` when storage is off
+            or no matching record exists.
+        """
         if not self._enable_response_store:
             return None
 
@@ -1243,6 +1645,12 @@ class BaseInferenceApiServer(ABC):
         conversation_id: str,
         history: list[dict[str, tp.Any]],
     ) -> None:
+        """Persist a conversation history under ``conversation_id``.
+
+        Args:
+            conversation_id: Identifier under which the history is stored.
+            history: Ordered list of messages comprising the conversation.
+        """
         if not self._enable_response_store:
             return
 
@@ -1254,7 +1662,18 @@ class BaseInferenceApiServer(ABC):
             self._lru_set(self._stored_conversations, conversation_id, history, self._max_stored_conversations)
 
     async def responses(self, request: ResponsesRequest, raw_request: Request) -> JSONResponse:
-        """Handle OpenAI Responses API requests (default: not implemented)."""
+        """Handle OpenAI Responses API requests (default: not implemented).
+
+        Subclasses should override this to implement the Responses surface.
+        The base implementation returns ``501 Not Implemented``.
+
+        Args:
+            request: The parsed Responses API request body.
+            raw_request: Raw FastAPI request, primarily for header access.
+
+        Returns:
+            A :class:`JSONResponse` containing an error payload.
+        """
         return create_error_response(
             HTTPStatus.NOT_IMPLEMENTED,
             "This server does not implement the OpenAI Responses API (/v1/responses).",
@@ -1266,15 +1685,24 @@ class BaseInferenceApiServer(ABC):
         request: ChatCompletionRequest,
         raw_request: Request,
     ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
-        """
-        Handle chat completion requests.
+        """Handle ``POST /v1/chat/completions`` requests.
+
+        Concrete subclasses must dispatch the parsed request to the
+        underlying inference engine and shape the response into either a
+        full :class:`ChatCompletionResponse`, an SSE :class:`StreamingResponse`
+        when ``request.stream`` is set, or a :class:`JSONResponse` carrying
+        an error envelope.
 
         Args:
-            request: The chat completion request
-            raw_request: Raw FastAPI request containing headers
+            request: Parsed chat-completion request body.
+            raw_request: The underlying FastAPI request, primarily used
+                to read headers (``X-Request-ID``, authentication) and
+                client info for diagnostics.
 
         Returns:
-            Chat completion response (streaming or non-streaming)
+            One of :class:`ChatCompletionResponse` (non-streaming success),
+            :class:`StreamingResponse` (SSE delta stream), or
+            :class:`JSONResponse` (error response).
         """
         raise NotImplementedError
 
@@ -1284,94 +1712,131 @@ class BaseInferenceApiServer(ABC):
         request: CompletionRequest,
         raw_request: Request,
     ) -> CompletionResponse | StreamingResponse | JSONResponse:
-        """
-        Handle completion requests.
+        """Handle ``POST /v1/completions`` (legacy text-completion) requests.
+
+        The completions endpoint operates on raw prompts (strings or
+        lists of strings) without chat-template scaffolding, mirroring
+        OpenAI's pre-chat completion API. Subclasses should support both
+        single-shot responses and SSE streaming based on ``request.stream``.
 
         Args:
-            request: The completion request
-            raw_request: Raw FastAPI request containing headers
+            request: Parsed completion request body.
+            raw_request: The underlying FastAPI request used for headers
+                and client info.
 
         Returns:
-            Completion response (streaming or non-streaming)
+            :class:`CompletionResponse` for non-streaming requests,
+            :class:`StreamingResponse` for streaming, or
+            :class:`JSONResponse` carrying an error envelope.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def health_check(self, raw_request: Request) -> JSONResponse:
-        """
-        Perform comprehensive health check.
+        """Report a comprehensive health snapshot of the server.
+
+        The response should reflect at minimum :attr:`status`, server
+        uptime, active request count, and any subsystem (model, tokenizer,
+        engine) state that operators or load balancers need to decide
+        whether to route traffic.
 
         Args:
-            raw_request: Raw FastAPI request containing headers
+            raw_request: The raw FastAPI request (typically used only to
+                propagate request IDs into the response headers).
 
         Returns:
-            Health status information
+            A :class:`JSONResponse` with HTTP 200 when healthy and 503
+            when the server is degraded; the body must include the
+            :class:`ServerStatus` value.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def get_metrics(self, raw_request: Request) -> JSONResponse:
-        """
-        Get server performance metrics.
+        """Expose aggregate request and token-throughput counters.
+
+        Subclasses should serialize :attr:`metrics` along with any
+        engine-level counters (KV-cache utilisation, queue depth, etc.)
+        in a Prometheus-friendly JSON format so SRE dashboards and
+        autoscalers can consume the same payload.
 
         Args:
-            raw_request: Raw FastAPI request containing headers
+            raw_request: The raw FastAPI request, kept for symmetry with
+                the other endpoints — typically unused.
 
         Returns:
-            Server metrics information
+            A :class:`JSONResponse` containing the metrics snapshot.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def list_models(self, raw_request: Request) -> JSONResponse:
-        """
-        List available models.
+        """Enumerate the models the server has loaded.
+
+        The response payload should follow the OpenAI ``/v1/models``
+        schema (``object: "list"`` with a ``data`` array of model
+        records) so existing tooling can introspect the deployment
+        without custom code paths.
 
         Args:
-            raw_request: Raw FastAPI request containing headers
+            raw_request: The raw FastAPI request used for header access.
 
         Returns:
-            List of available models with metadata
+            A :class:`JSONResponse` containing the model catalog.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def get_model(self, model_id: str, raw_request: Request) -> JSONResponse:
-        """
-        Get detailed information about a specific model.
+        """Return detailed metadata for a single loaded model.
+
+        Subclasses should report tokenizer capabilities, context length,
+        owner/version, and any feature flags (chat template, tool calling,
+        reasoning) clients need to decide how to call the model.
 
         Args:
-            model_id: The model identifier
-            raw_request: Raw FastAPI request containing headers
+            model_id: The model identifier from the URL path.
+            raw_request: The raw FastAPI request used for header access.
 
         Returns:
-            Model details
+            A :class:`JSONResponse` with the model record, or an error
+            envelope (e.g. HTTP 404) when ``model_id`` is unknown.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def list_tools(self, raw_request: Request) -> JSONResponse:
-        """
-        List available tools/functions.
+        """List the tools/functions registered with the server.
+
+        Backends that bundle tools (e.g. function-calling samples or
+        agent toolkits) expose them here so clients can introspect what
+        is callable through ``/v1/tools/execute``.
 
         Args:
-            raw_request: Raw FastAPI request containing headers
+            raw_request: The raw FastAPI request used for header access.
 
         Returns:
-            Available tools information
+            A :class:`JSONResponse` containing the tool catalog.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def execute_tool(self, request: Request) -> JSONResponse:
-        """
-        Execute a tool/function call.
+        """Execute a tool/function call dispatched through the API.
+
+        Subclasses route the request payload to the appropriate tool
+        runner, capture its result, and return a structured response.
+        Errors should map to the appropriate HTTP status codes (400 for
+        bad input, 500 for runtime failures, 501 when the backend has
+        no executor configured).
 
         Args:
-            request: The tool execution request
+            request: The raw FastAPI request whose body carries the
+                tool name and arguments.
 
         Returns:
-            Tool execution result
+            A :class:`JSONResponse` containing the tool execution
+            result or error envelope.
         """
         raise NotImplementedError
 
@@ -1379,58 +1844,85 @@ class BaseInferenceApiServer(ABC):
 
     @abstractmethod
     def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
-        """
-        Create sampling parameters from request.
+        """Translate a chat or text completion request into ``SamplingParams``.
+
+        Concrete implementations are responsible for clamping or
+        defaulting any backend-specific fields and for surfacing
+        validation errors when the request asks for a configuration the
+        underlying engine cannot honour.
 
         Args:
-            request: The completion request
+            request: Either a :class:`ChatCompletionRequest` or
+                :class:`CompletionRequest`; both share the OpenAI-style
+                generation parameters.
 
         Returns:
-            Sampling parameters for the inference engine
+            A populated :class:`SamplingParams` ready to be handed to
+            the inference engine.
         """
         raise NotImplementedError
 
     def _determine_finish_reason(self, tokens_generated: int, max_tokens: float, text: str) -> str:
-        """
-        Determine the finish reason for a generation.
+        """Pick an OpenAI-style ``finish_reason`` from generation metadata.
+
+        The default implementation uses the simplest budget-based rule:
+        if the number of generated tokens reached the requested budget,
+        the reason is ``"length"``; otherwise the model is assumed to
+        have produced an end-of-sequence token and the reason is
+        ``"stop"``. Subclasses can override this to surface
+        ``"tool_calls"``, ``"content_filter"``, or other reasons that
+        depend on engine-specific signals.
 
         Args:
-            tokens_generated: Number of tokens generated
-            max_tokens: Maximum tokens allowed
-            text: Generated text
+            tokens_generated: Total tokens produced for this completion.
+            max_tokens: Sampling budget the engine was asked to honour.
+            text: The decoded completion text (kept for subclass hooks
+                that may rely on textual signals such as forced stop
+                strings).
 
         Returns:
-            Finish reason string
+            One of the literals expected by the OpenAI API
+            (``"stop"``, ``"length"``, ``"tool_calls"``, …).
         """
         if tokens_generated >= max_tokens:
             return "length"
         return "stop"
 
     async def _count_tokens_async(self, content: str, model_name: str | None = None) -> int:
-        """
-        Count tokens asynchronously.
+        """Run :meth:`_count_tokens` on the worker thread pool.
+
+        Tokenization is generally CPU-bound and tokenizer libraries
+        often hold the GIL during tokenize calls, so this helper
+        offloads the work to :attr:`thread_pool` instead of stalling the
+        asyncio event loop.
 
         Args:
-            content: Text content to tokenize
-            model_name: Optional model name for model-specific tokenization
+            content: Text whose token count is needed.
+            model_name: Optional model identifier passed through to
+                :meth:`_count_tokens` so subclasses can dispatch to
+                model-specific tokenizers.
 
         Returns:
-            Number of tokens
+            Token count produced by :meth:`_count_tokens`.
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(self.thread_pool, self._count_tokens, content, model_name)
 
     @abstractmethod
     def _count_tokens(self, content: str, model_name: str | None = None) -> int:
-        """
-        Count tokens for the given content.
+        """Synchronously count tokens in ``content`` for ``model_name``.
+
+        Implementations must use the model's own tokenizer so that the
+        returned count matches what the inference engine sees on the
+        prompt path, including any chat-template scaffolding.
 
         Args:
-            content: Text content to tokenize
-            model_name: Optional model name for model-specific tokenization
+            content: Text whose token count is needed.
+            model_name: Optional model identifier; ``None`` should fall
+                back to the server's default tokenizer.
 
         Returns:
-            Number of tokens
+            Number of tokens produced by the model's tokenizer.
         """
         raise NotImplementedError
 
@@ -1444,17 +1936,25 @@ class BaseInferenceApiServer(ABC):
         ssl_certfile: str | None = None,
         reload: bool = False,
     ) -> None:
-        """
-        Start the server with enhanced configuration.
+        """Launch the FastAPI server with uvicorn under the configured options.
+
+        Spawns a uvicorn instance bound to ``host``/``port`` and (when
+        available) installs ``uvloop`` as the asyncio event loop policy
+        for higher throughput. SSL is enabled when both ``ssl_keyfile``
+        and ``ssl_certfile`` are supplied. ``workers`` is forced to 1
+        when ``reload=True`` because uvicorn's reload mode is
+        incompatible with multi-worker setups.
 
         Args:
-            host: Host address to bind to
-            port: Port to listen on
-            workers: Number of worker processes
-            log_level: Logging level
-            ssl_keyfile: Path to SSL key file
-            ssl_certfile: Path to SSL certificate file
-            reload: Enable auto-reload for development
+            host: Address to bind to (``"0.0.0.0"`` for all interfaces).
+            port: TCP port to listen on.
+            workers: Number of worker processes (clamped to 1 when
+                ``reload`` is enabled).
+            log_level: uvicorn log level (``"debug"``, ``"info"``,
+                ``"warning"``, ``"error"``).
+            ssl_keyfile: Optional path to an SSL private-key PEM file.
+            ssl_certfile: Optional path to an SSL certificate PEM file.
+            reload: Enable uvicorn's auto-reload mode (development only).
         """
         uvicorn_config = {
             "app": self.app,
@@ -1485,11 +1985,23 @@ class BaseInferenceApiServer(ABC):
 
 
 class InferenceEngineAdapter(ABC):
-    """
-    Abstract adapter interface for different inference engines.
+    """Adapter contract bridging EasyDeL's API server to an inference engine.
 
-    This allows different inference engines (eSurge, vLLM, TGI, etc.) to be used
-    with the same API server interface.
+    This protocol decouples the FastAPI surface defined by
+    :class:`BaseInferenceApiServer` from the concrete inference engine
+    implementation, so the same server can be backed by eSurge, an
+    external HTTP gateway, or test stubs without changes to the
+    HTTP/SSE layer. Implementations wrap the engine's native API and
+    expose a small set of methods that the server invokes:
+
+    - :meth:`generate` for text generation (streaming or non-streaming),
+    - :meth:`count_tokens` for prompt-length accounting,
+    - :meth:`get_model_info` for the ``/v1/models`` payload,
+    - the :attr:`model_name` and :attr:`processor` properties for
+      identifying the active model and its tokenizer.
+
+    The adapter is intentionally minimal so that even a thin in-memory
+    test double satisfies it without dragging in the full engine.
     """
 
     @abstractmethod
@@ -1499,50 +2011,75 @@ class InferenceEngineAdapter(ABC):
         sampling_params: SamplingParams,
         stream: bool = False,
     ) -> list[ReturnSample] | AsyncGenerator[list[ReturnSample], None]:
-        """
-        Generate text from prompts.
+        """Run text generation through the underlying engine.
 
         Args:
-            prompts: Input prompts
-            sampling_params: Sampling parameters
-            stream: Whether to stream the response
+            prompts: A single prompt or a batch of prompts to generate
+                completions for.
+            sampling_params: Sampling configuration produced by the
+                server's :meth:`BaseInferenceApiServer._create_sampling_params`.
+            stream: When ``True``, the adapter must return an async
+                generator yielding :class:`ReturnSample` snapshots; when
+                ``False``, it must return a final list.
 
         Returns:
-            Generated samples (list or async generator)
+            A ``list[ReturnSample]`` for non-streaming calls, or an
+            ``AsyncGenerator[list[ReturnSample], None]`` for streaming
+            calls (one outer list per generation step).
         """
         raise NotImplementedError
 
     @abstractmethod
     def count_tokens(self, content: str) -> int:
-        """
-        Count tokens in the given content.
+        """Return the engine-side token count for ``content``.
+
+        The count must match what the engine itself sees during
+        prompt processing so that the server can enforce context-
+        length budgets accurately.
 
         Args:
-            content: Text content
+            content: Text whose token count is needed.
 
         Returns:
-            Number of tokens
+            Tokenized length of ``content`` according to the engine's
+            tokenizer.
         """
         raise NotImplementedError
 
     @abstractmethod
     def get_model_info(self) -> dict[str, tp.Any]:
-        """
-        Get information about the loaded model.
+        """Return a dictionary suitable for inclusion in ``/v1/models`` responses.
+
+        The dict typically carries the model name, owner, capabilities
+        (chat / tools / reasoning), and any engine-specific metadata
+        (parameter count, quantization, attention backend) that
+        operators want to surface.
 
         Returns:
-            Model information dictionary
+            A model-info dict ready to be serialized as JSON.
         """
         raise NotImplementedError
 
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """Get the name of the model."""
+        """Identifier of the active model (e.g. ``"my-org/my-model"``).
+
+        Returns:
+            The model identifier echoed back in API responses.
+        """
         raise NotImplementedError
 
     @property
     @abstractmethod
     def processor(self) -> tp.Any:
-        """Get the processor/tokenizer for the model."""
+        """Return the model's tokenizer / multimodal processor.
+
+        Used by the server for chat-template rendering, prompt token
+        counting, and to share the same tokenizer with reasoning and
+        tool parsers.
+
+        Returns:
+            The ``transformers``-style tokenizer or processor instance.
+        """
         raise NotImplementedError

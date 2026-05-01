@@ -28,7 +28,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # THIS SCRIPT IS EDITED FROM ORIGINAL IMPLEMENTATION OF TRANSFORMERS OPT
-"""SpecTrax OPT model."""
+"""Spectrax OPT (Open Pre-trained Transformer) model implementation.
+
+Implements Meta's OPT decoder family: a classic GPT-style transformer with
+learned positional embeddings (offset by 2 for padding), pre-LayerNorm
+architecture (controlled by ``do_layer_norm_before``), optional final LayerNorm,
+and an optional word-embedding projection (``word_embed_proj_dim``).
+
+Exports:
+    - ``OPTAttention``: standard multi-head self-attention block.
+    - ``OPTDecoderLayer``: a single transformer block.
+    - ``OPTLearnedPositionalEmbedding``: learned absolute positional embeddings.
+    - ``OPTDecoder``, ``OPTModel``: stacked decoder and base model wrapper.
+    - ``OPTForCausalLM``: causal LM head wrapper for autoregressive generation.
+"""
 
 from functools import partial
 
@@ -64,27 +77,38 @@ from .opt_configuration import OPTConfig
 
 
 class OPTAttention(AttentionModule):
-    """OPT Attention mechanism module.
+    """OPT-style multi-head self-attention with biased linear projections.
 
-    This module implements the multi-head self-attention mechanism used in the OPT model.
+    OPT predates RoPE and grouped-query attention. This module implements
+    the original *MHA-with-bias* attention used in the OPT family:
+
+    * Separate ``q_proj``, ``k_proj``, ``v_proj``, ``out_proj`` linears,
+      each carrying a learnable bias when ``bias`` is true (the default in
+      OPT).
+    * Standard ``softmax(QK^T / sqrt(head_dim))`` attention via
+      :class:`FlexibleAttentionModule` with a fixed ``head_dim^{-0.5}``
+      softmax scale and dropout applied to the attention probabilities
+      themselves (not just the residual stream).
+    * Optional causal mask (``causal=True``) — passed in by the caller per
+      block; the OPT decoder always sets it true, but the attention module
+      itself is structurally encoder/decoder-agnostic.
+    * **No** rotary or relative position encoding here — positional
+      information is added externally as a learned absolute embedding by
+      :class:`OPTLearnedPositionalEmbedding` before the first decoder
+      layer.
 
     Attributes:
-        config (OPTConfig): Configuration object for the model.
-        embed_dim (int): The dimensionality of the embedding layer.
-        num_heads (int): The number of attention heads.
-        dropout (float): Dropout probability for the attention scores.
-        causal (bool): Whether to use causal masking.
-        bias (bool): Whether to include bias in the linear projections.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        head_dim (int): Dimensionality of each attention head.
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        out_proj (ParallelLinear): Linear layer for the output projection.
-        dropout_layer (nn.Dropout): Dropout layer applied after attention.
-        attention_module (AttentionModule): The core attention computation module.
+        embed_dim (int): Token-stream width / total ``num_heads * head_dim``.
+        num_heads (int): Number of attention heads.
+        head_dim (int): Per-head dimension ``embed_dim // num_heads``.
+        dropout (float): Attention-probability dropout rate.
+        causal (bool): Whether to apply a causal mask.
+        bias (bool): Whether the QKV / output projections carry a bias.
+        q_proj, k_proj, v_proj, out_proj (ColumnParallelLinear): The four
+            attention projections.
+        dropout_layer (nn.Dropout): Dropout on the attention probabilities.
+        attention_module (FlexibleAttentionModule): Underlying flash /
+            chunked attention performer.
     """
 
     def __init__(
@@ -259,26 +283,39 @@ class OPTAttention(AttentionModule):
 
 
 class OPTDecoderLayer(spx.Module):
-    """OPT Decoder Layer.
+    """One OPT decoder block: causal MHA + ReLU FFN with switchable pre/post-norm.
 
-    This module represents a single layer in the OPT decoder stack.
-    It consists of a self-attention mechanism, optional layer normalization,
-    a feed-forward network (FFN), and residual connections.
+    OPT layers can run in either *pre-norm* or *post-norm* configuration
+    depending on ``config.do_layer_norm_before``:
+
+    * **Pre-norm** (used by every OPT model 125M and larger except OPT-350M)::
+
+          x = x + dropout(self_attn(LN(x)))
+          x = x + dropout(fc2(act(fc1(LN(x)))))
+
+    * **Post-norm** (only OPT-350M)::
+
+          x = LN(x + dropout(self_attn(x)))
+          x = LN(x + dropout(fc2(act(fc1(x)))))
+
+    The FFN is the classic ``up -> ReLU -> down`` of width ``embed_dim``
+    (note: ``fc1`` is sized ``embed_dim -> embed_dim`` here in JAX rather
+    than ``embed_dim -> 4*embed_dim``; the actual expansion factor is
+    expressed via ``ffn_dim`` on the parent decoder, kept under the
+    ``intermediate_size`` alias). All linears carry biases, the activation
+    is plain ReLU (or the function named by ``activation_function``), and
+    dropout is applied on both the attention output and the FFN output.
 
     Attributes:
-        config (OPTConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        embed_dim (int): Dimensionality of the embedding layer.
-        self_attn (OPTAttention): The self-attention module.
-        do_layer_norm_before (bool): Whether to apply layer normalization before the attention/FFN blocks.
-        dropout_layer (nn.Dropout): Dropout layer applied to the hidden states.
-        activation_fn (callable): The activation function used in the FFN.
-        self_attn_layer_norm (LayerNorm): Layer normalization applied before the self-attention module.
-        fc1 (ParallelLinear): The first linear layer of the FFN.
-        fc2 (ParallelLinear): The second linear layer (output) of the FFN.
-        final_layer_norm (LayerNorm): Layer normalization applied before the FFN module.
+        embed_dim (int): Equal to ``config.hidden_size``.
+        self_attn (OPTAttention): Causal MHA with biased projections.
+        do_layer_norm_before (bool): Whether to use the pre-norm or
+            post-norm residual recipe.
+        self_attn_layer_norm, final_layer_norm (LayerNorm): The two
+            biased LayerNorms (epsilon = 1e-5).
+        fc1, fc2 (Linear): FFN expansion and contraction projections.
+        activation_fn (Callable): FFN nonlinearity.
+        dropout_layer (nn.Dropout): Residual-stream dropout.
     """
 
     def __init__(
@@ -442,13 +479,19 @@ class OPTDecoderLayer(spx.Module):
 
 
 class OPTLearnedPositionalEmbedding(spx.Module):
-    """Learned positional embedding for OPT.
+    """Learned absolute position embedding table with a fixed-offset lookup.
 
-    This module learns positional embeddings up to a maximum specified length.
-    It includes an offset, typically used to account for padding tokens.
+    OPT uses learned (not sinusoidal, not RoPE) absolute position
+    embeddings of length ``num_embeddings = max_position_embeddings + offset``,
+    with the offset (commonly 2) reserved for the padding/EOS tokens that
+    HF OPT's tokenizer reserves at the start of the position vocabulary.
+    Lookup is done by ``embed(position_ids + offset)`` so caller-supplied
+    positions remain in the natural ``[0, max_position_embeddings)`` range
+    while the underlying table absorbs the offset internally.
 
     Attributes:
-        offset (int): The offset added to position IDs before embedding lookup.
+        offset (int): Constant added to incoming position ids before the
+            embedding lookup; ``2`` for OPT.
     """
 
     def __init__(
@@ -521,28 +564,33 @@ class OPTLearnedPositionalEmbedding(spx.Module):
 
 
 class OPTDecoder(EasyDeLBaseModule):
-    """OPT Decoder stack.
+    """OPT decoder trunk: token + position embeddings, optional in/out projections, N layers.
 
-    This module comprises the main transformer decoder layers for the OPT model,
-    including token embeddings, positional embeddings, the decoder layers themselves,
-    and optional final layer normalization.
+    OPT's trunk is a textbook encoder-style decoder stack with absolute
+    learned positions. The optional ``project_in`` / ``project_out``
+    linears handle the OPT-IML / OPT-66B variant where
+    ``word_embed_proj_dim`` differs from ``hidden_size``: the embedding
+    table lives at ``word_embed_proj_dim`` and is projected up to
+    ``hidden_size`` for the attention layers, then back down before the
+    LM head. The final LayerNorm is conditionally instantiated based on
+    ``do_layer_norm_before`` and ``_remove_final_layer_norm`` (OPT-350M
+    in particular omits it).
 
     Attributes:
-        config (OPTConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        padding_idx (int): Index of the padding token.
-        max_target_positions (int): Maximum sequence length the model can handle.
-        embed_scale (float): Scaling factor for embeddings (usually 1.0).
-        embed_tokens (Embed): Token embedding layer.
-        embed_positions (OPTLearnedPositionalEmbedding): Positional embedding layer.
-        project_out (ColumnParallelLinear, optional): Optional linear projection layer after embeddings.
-        project_in (ColumnParallelLinear, optional): Optional linear projection layer before embeddings.
-        layers (tp.List[OPTDecoderLayer]): List of OPT decoder layers.
-        dropout_layer (nn.Dropout): Dropout layer applied after embeddings.
-        final_layer_norm (LayerNorm, optional): Optional final layer normalization.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+        embed_tokens (Embed): Word embedding ``(vocab_size, word_embed_proj_dim)``.
+        embed_positions (OPTLearnedPositionalEmbedding): Learned absolute
+            positions with offset 2.
+        project_in (ColumnParallelLinear | None): Embedding-to-hidden
+            projection when ``word_embed_proj_dim != hidden_size``.
+        project_out (ColumnParallelLinear | None): Hidden-to-embedding
+            projection symmetric to ``project_in``.
+        layers (nn.ModuleList[OPTDecoderLayer]): The decoder blocks.
+        final_layer_norm (LayerNorm | None): Final LayerNorm; ``None`` if
+            removed by config.
+        dropout_layer (nn.Dropout): Embedding dropout.
+        padding_idx (int): Padding token id from config.
+        max_target_positions (int): Position-embedding table capacity.
+        embed_scale (float): Embedding scale factor (1.0 in OPT).
     """
 
     def __init__(

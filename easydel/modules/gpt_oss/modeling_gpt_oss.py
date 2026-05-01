@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of OpenAI's GPT-OSS sparse Mixture-of-Experts decoder.
+
+GPT-OSS is a large-scale sparse MoE language model that scales parameter
+count via sparsely routed experts while keeping per-token compute fixed,
+combined with alternating sliding-window and full attention layers and
+YARN-scaled RoPE for very long context lengths.
+
+Architectural traits:
+    - Sparse MoE FFN with ``num_local_experts`` experts and top-k routing
+      (``num_experts_per_tok``); strong auxiliary load-balancing coefficient.
+    - Grouped-query attention with sliding-window attention on alternating
+      layers and full attention on the rest.
+    - YARN-scaled rotary positional embeddings for extended context.
+    - RMSNorm pre-normalization throughout.
+
+Exports:
+    - :class:`GptOssModel`: Backbone returning hidden states.
+    - :class:`GptOssForCausalLM`: Decoder LM with optional tied LM head.
+    - :class:`GptOssForSequenceClassification`: Pooled classifier head.
+"""
 
 import typing
 
@@ -77,33 +97,50 @@ class GptOssRMSNorm(RMSNorm):
 
 
 class GptOssExperts(spx.Module):
-    """Grouped expert feed-forward network used inside GPT-OSS MoE layers.
+    """Stacked expert FFNs for GPT-OSS using a clipped Swish-GLU with bias-shifted up.
 
-    This module implements the expert network for Mixture-of-Experts (MoE) routing
-    in GPT-OSS. Each expert is a feed-forward network with a gated linear unit (GLU)
-    activation. The experts process tokens routed to them based on router decisions.
+    Holds the parameters for all ``num_local_experts`` experts as 3-D
+    tensors and lets the fused MoE dispatch invoke them with
+    ``grouped_matmul`` over expert groups. Each individual expert
+    implements a *non-standard* gated MLP, deliberately tuned for
+    stability under aggressive bf16 / int8 quantisation:
 
-    The forward pass applies a modified GLU activation with clipping for numerical
-    stability:
-        1. Compute gate projection with sigmoid activation (scaled by alpha)
-        2. Compute up projection and add 1.0
-        3. Multiply gate output with up output
-        4. Apply down projection to produce final output
+    1. ``w0 = gate_proj(x)`` → clipped to ``(-inf, 7.0]``.
+    2. ``w1 = up_proj(x)`` → clipped to ``[-7.0, 7.0]``.
+    3. ``glu = w0 * sigmoid(alpha * w0)`` with ``alpha=1.702`` (the
+       Swish-style approximation to GeLU used by xAI / OpenAI).
+    4. ``intermediate = (w1 + 1.0) * glu`` — note the **+1 shift on the up
+       branch**: this keeps the multiplicative path well-defined even when
+       ``up_proj`` is exactly zero, and is what lets the experts initialise
+       to "approximately identity" before training.
+    5. ``out = down_proj(intermediate)``.
+
+    All three projections (``gate_proj``, ``up_proj``, ``down_proj``)
+    carry **bias parameters** (unlike the typical biasless gated-MLP) and
+    are stored as MoE-parallel linears: column-sharded for gate/up,
+    row-sharded for down. The ``reform_param`` class variable splits the
+    HF-fused ``gate_up_proj`` weight (interleaved gate/up channels via
+    ``[..., 0::2]`` / ``[..., 1::2]``) into the separate ``gate_proj`` /
+    ``up_proj`` tensors expected by EasyDeL.
 
     Attributes:
-        config (GptOssConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        intermediate_size (int): Size of the intermediate (hidden) layer in the FFN.
-        num_experts (int): Number of expert networks.
-        hidden_size (int): Size of the hidden dimension.
-        expert_dim (int): Dimension of each expert's intermediate layer.
-        gate_proj (ColumnParallelMoELinear): Gate projection layer for GLU.
-        up_proj (ColumnParallelMoELinear): Up projection layer.
-        down_proj (RowParallelMoELinear): Down projection layer.
-        alpha (float): Scaling factor for the sigmoid in GLU activation.
-        act_fn (callable): Activation function.
+        config: Source ``GptOssConfig``.
+        dtype: Activation dtype.
+        param_dtype: Parameter dtype.
+        precision: ``jax.lax.PrecisionLike`` for the three matmuls.
+        intermediate_size: Per-expert intermediate dimension.
+        num_experts: Number of routed experts (``config.num_local_experts``).
+        hidden_size: Decoder hidden dimension.
+        expert_dim: Alias for ``intermediate_size``.
+        gate_proj: ``ColumnParallelMoELinear`` storing all experts'
+            ``hidden -> intermediate`` gate weights.
+        up_proj: ``ColumnParallelMoELinear`` storing the up weights.
+        down_proj: ``RowParallelMoELinear`` storing
+            ``intermediate -> hidden`` down weights.
+        alpha: Sigmoid scale fixed at ``1.702`` (the Swish-GLU /
+            ``gelu_approx`` constant).
+        act_fn: Configured activation (kept for API parity; the actual
+            GLU math is hand-rolled in :meth:`forward`).
     """
 
     reform_param: typing.ClassVar = {
@@ -237,25 +274,33 @@ class GptOssExperts(spx.Module):
 
 
 class GptOssMLP(BaseMoeModule):
-    """Mixture-of-Experts MLP module for GPT-OSS.
+    """Sparse MoE block: 128 experts, top-4 routing, scattered-softmax weights.
 
-    This module implements the MoE layer that routes input tokens to specialized
-    expert networks. It uses a learned router to determine which experts should
-    process each token, enabling sparse computation and increased model capacity.
+    Implements GPT-OSS's flagship sparse FFN. Routing protocol per token:
 
-    The routing mechanism uses top-k selection with softmax normalization,
-    allowing each token to be processed by multiple experts with weighted
-    contributions. Custom hooks handle the routing probability computation
-    and weight refinement.
+    1. **Router projection** (``self.router``, a ColumnParallelLinear with
+       bias) emits per-expert logits of shape ``(num_local_experts,)``.
+    2. **Top-k selection** picks the ``num_experts_per_tok`` (=4)
+       highest-scoring experts via :func:`jax.lax.top_k`.
+    3. **Softmax-on-selected** (the ``after_gate=_scatter_topk_probs``
+       hook) computes a softmax *over the four selected scores only* and
+       scatters the resulting probabilities back into a zero-initialised
+       full-width vector, so the unrouted experts contribute exactly zero
+       — equivalent to the standard top-k softmax but written so the
+       fused-MoE dispatch never has to look at unselected experts.
+    4. **Refinement** (``refine_weights_hook=_softmax_topk_weights``) is a
+       no-op renormalisation safety net used by the parent
+       :class:`BaseMoeModule` to handle hooks uniformly.
+    5. **Expert dispatch** is handled by :meth:`moe_call` in
+       :class:`BaseMoeModule`: tokens are sorted by their assigned expert,
+       each contiguous run is processed by :class:`GptOssExperts` via
+       ``grouped_matmul``, and the outputs are scattered back into token
+       order and convex-combined by the top-k weights.
 
-    Attributes:
-        config (GptOssConfig): Configuration object for the model.
-        router (ColumnParallelLinear): Router network that computes expert selection logits.
-        experts (GptOssExperts): The collection of expert networks.
-        moe_hooks: Hooks for customizing MoE routing behavior.
-        n_routed_experts (int): Total number of routed experts.
-        num_experts_per_tok (int): Number of experts selected per token.
-        hidden_size (int): Hidden dimension size.
+    The activation inside each expert is a *clipped GLU with bias-shifted
+    up branch* — see :class:`GptOssExperts` for the math. There is no
+    shared expert; every token's contribution is purely the weighted sum
+    of its four routed experts.
     """
 
     def __init__(
@@ -371,23 +416,43 @@ class GptOssMLP(BaseMoeModule):
 
 
 class GptOssAttention(UnifiedAttention):
-    """GPT-OSS Attention module with sink tokens support.
+    """GQA attention with per-layer sliding window and learnable softmax-sink logits.
 
-    This module implements the multi-head attention mechanism for GPT-OSS with
-    support for layer-specific sliding window attention and sink tokens. The
-    attention type (global or sliding) is determined per-layer based on the
-    configuration.
+    Builds on :class:`UnifiedAttention` with two GPT-OSS-specific extensions:
 
-    Sink tokens are learnable parameters that help stabilize attention patterns
-    by providing consistent anchor points for the attention mechanism.
+    **Per-layer sliding/full alternation.** Each layer reads its mode from
+    ``config.layer_types[layer_idx]``. When set to ``"sliding_attention"``,
+    the attention kernel is given ``sliding_window=config.sliding_window``
+    and tokens beyond the window in the past are masked out in addition to
+    the causal mask. Other layers run full causal attention. The published
+    GPT-OSS checkpoints alternate the two so most layers benefit from the
+    sliding-window's long-context speedup while a minority retain global
+    receptive field for cross-document mixing.
+
+    **Per-head attention sinks** (``self.sinks``). One *learnable scalar
+    logit per attention head* is appended into the softmax denominator at
+    every attention step:
+
+        ``softmax([Q·K^T_full ; sink_h])`` along the key axis,
+
+    where ``sink_h`` is the head-specific sink logit broadcast across all
+    queries. The softmax probability mass that lands on the sink slot is
+    *discarded* (no value is gathered for it), which gives the model an
+    explicit "attend to nothing" outlet. This is the same mechanism used in
+    the DeepSeek family and in StreamingLLM-style papers, and it
+    significantly improves stability for long-context inference where one
+    or two outlier-dominated tokens would otherwise hijack the softmax
+    distribution. The sink logits are initialised from
+    ``Normal(0, initializer_range)``.
 
     Attributes:
-        config (GptOssConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        layer_idx (int): Index of this layer in the model.
-        sinks (ArrayParam): Learnable sink token parameters per attention head.
+        config: Source ``GptOssConfig``.
+        dtype: Activation dtype.
+        param_dtype: Parameter dtype.
+        precision: ``jax.lax.PrecisionLike`` for matmuls.
+        layer_idx: Layer index used to look up the per-layer attention type.
+        sinks: Bound :class:`ArrayParam` of shape ``(num_attention_heads,)``
+            holding one learnable softmax-sink logit per head.
     """
 
     def __init__(
@@ -441,29 +506,26 @@ class GptOssAttention(UnifiedAttention):
 
 
 class GptOssDecoderLayer(spx.Module):
-    """GPT-OSS decoder layer with attention and Mixture-of-Experts MLP.
+    """Pre-norm decoder block: sliding-or-full attention with sinks → 128-expert MoE.
 
-    This module represents a single transformer decoder block in GPT-OSS,
-    consisting of a self-attention layer followed by a Mixture-of-Experts
-    MLP layer. Both sub-layers use pre-normalization (RMSNorm) and residual
-    connections.
+    Single transformer block of GPT-OSS, in standard pre-norm shape:
+    ``x + attn(input_norm(x))`` followed by ``x + mlp(post_attn_norm(x))``.
+    Two pieces are model-specific:
 
-    The layer supports different attention patterns (global or sliding window)
-    based on the layer configuration, enabling efficient processing of long
-    sequences while maintaining the ability to capture both local and global
-    dependencies.
+    - The attention sub-block is :class:`GptOssAttention`, which (1) reads
+      ``config.layer_types[layer_idx]`` to pick between sliding-window and
+      full causal attention, and (2) maintains per-head learnable
+      *attention sinks* — extra logits that absorb softmax mass without
+      contributing values, stabilising long-context decoding.
+    - The MLP is :class:`GptOssMLP`, a sparse Mixture-of-Experts block
+      with 128 experts and top-4 routing per token in the released
+      checkpoint. The router emits ``router_logits`` for trainer-side
+      auxiliary losses.
 
-    Attributes:
-        config (GptOssConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        layer_idx (int): Index of this layer in the model.
-        self_attn (GptOssAttention): Self-attention module.
-        mlp (GptOssMLP): Mixture-of-Experts MLP module.
-        input_layernorm (GptOssRMSNorm): Pre-attention layer normalization.
-        post_attention_layernorm (GptOssRMSNorm): Pre-MLP layer normalization.
-        attention_type (str): Type of attention used in this layer.
+    The ``attention_type`` attribute caches the layer's regime
+    (``"sliding_attention"`` or ``"standard"``) for downstream consumers
+    that need to distinguish the two without re-reading
+    ``config.layer_types``.
     """
 
     def __init__(

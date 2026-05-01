@@ -50,16 +50,37 @@ class ValidationResult:
 
     @classmethod
     def success(cls, warnings: list[str] | None = None) -> ValidationResult:
-        """Create a successful validation result."""
+        """Build a successful :class:`ValidationResult`.
+
+        Args:
+            warnings: Optional non-fatal warnings to attach.
+
+        Returns:
+            ValidationResult: ``is_valid=True`` with the supplied warnings
+            (or an empty list).
+        """
         return cls(is_valid=True, errors=[], warnings=warnings or [])
 
     @classmethod
     def failure(cls, errors: list[str], warnings: list[str] | None = None) -> ValidationResult:
-        """Create a failed validation result."""
+        """Build a failed :class:`ValidationResult`.
+
+        Args:
+            errors: Error messages explaining the failure.
+            warnings: Optional non-fatal warnings to attach.
+
+        Returns:
+            ValidationResult: ``is_valid=False`` with the supplied errors
+            and warnings.
+        """
         return cls(is_valid=False, errors=errors, warnings=warnings or [])
 
     def __bool__(self) -> bool:
-        """Allow using result in boolean context."""
+        """Truth value for use in boolean contexts.
+
+        Returns:
+            bool: The :attr:`is_valid` flag.
+        """
         return self.is_valid
 
     def raise_if_invalid(self, error_class: type[Exception] = ValueError) -> None:

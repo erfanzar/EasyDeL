@@ -81,7 +81,26 @@ _TRAINER_TRANSFORMS = {
 
 
 def __getattr__(name: str):
-    """Lazy import trainer transforms for backwards compatibility."""
+    """Module-level ``__getattr__`` that forwards trainer-transform names to :mod:`easydel.trainers`.
+
+    The trainer preprocessing transforms (SFT, DPO, KTO, …) used
+    to live in :mod:`easydel.data.transforms` and many user
+    scripts still import them from here. This hook intercepts
+    matching attribute lookups and delegates to
+    :mod:`easydel.trainers.prompt_transforms` to avoid the
+    circular dependency that an eager re-export would introduce.
+
+    Args:
+        name: Attribute name being looked up on the module.
+
+    Returns:
+        Any: The matching trainer transform class.
+
+    Raises:
+        AttributeError: When ``name`` is neither in
+            :data:`_TRAINER_TRANSFORMS` nor a top-level export
+            of this module.
+    """
     if name in _TRAINER_TRANSFORMS:
         from easydel.trainers import prompt_transforms as prompt_transforms
 

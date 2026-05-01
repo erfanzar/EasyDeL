@@ -525,7 +525,35 @@ class ExecutionManager:
         self._scatter_sampler_outputs = _scatter_sampler_outputs
 
     def _init_operations_cache_with_retry(self, *, quantizer: tp.Any, masking_details: tp.Any) -> tp.Any:
-        """Allocate operation caches, shrinking PP page pools on real HBM OOM."""
+        """Allocate the model's operations cache, shrinking pages on PP HBM-OOM.
+
+        Wraps :meth:`EasyDeLBaseModule.init_operations_cache` with a bounded
+        retry loop that only fires when (a) the active pipeline plan is
+        enabled and (b) the failure looks like an XLA OOM
+        (``RESOURCE_EXHAUSTED`` / ``RuntimeBufferAllocationFailure``). On
+        each retry the page count carried on ``self.metadata`` is multiplied
+        by 0.78 (subject to ``num_pages >= 1``) and the allocation is tried
+        again. Non-PP allocations (and non-OOM exceptions) re-raise after
+        the first attempt because their page count is already validated by
+        :class:`PipelineInferencePlan`.
+
+        Args:
+            quantizer: KV-cache quantizer instance built from the model's
+                ``kv_cache_quantization_config`` (``None`` for unquantized).
+            masking_details: Optional mask metadata returned by the model's
+                ``get_mask_details``; passed through to
+                :meth:`init_operations_cache`.
+
+        Returns:
+            The freshly-allocated KV pages cache returned by
+            :meth:`init_operations_cache`.
+
+        Raises:
+            Whatever the underlying allocation raises on the final attempt
+            (or immediately for non-OOM / non-PP failures).
+            RuntimeError: If the retry loop terminates without success or
+                a raise (defensive — should never happen).
+        """
 
         def _allocate() -> tp.Any:
             return self.model.init_operations_cache(
@@ -585,7 +613,23 @@ class ExecutionManager:
         token_ids_cpu: numpy.ndarray | None = None,
         seq_lens_cpu: numpy.ndarray | None = None,
     ) -> None:
-        """Mark incremental sampler penalty state dirty after host-side row changes."""
+        """Mark sampler penalty counters dirty after host-side row reorderings.
+
+        The frequency / presence / repetition penalty kernels keep an
+        incremental device-side count of how often each token has appeared
+        per request. That counter must be rebuilt whenever the runner
+        permutes rows in :class:`SequenceBuffer` (e.g. swap_rows /
+        condense). This method records the new ground-truth host views
+        and flips the dirty flag so the next sampler call goes through
+        :meth:`_ensure_sampler_penalty_state`.
+
+        Args:
+            token_ids_cpu: ``(max_num_reqs, max_model_len)`` host array of
+                token ids per slot — the source of truth used during the
+                next rebuild. ``None`` keeps the previously-recorded view.
+            seq_lens_cpu: ``(max_num_reqs,)`` host array of effective
+                sequence lengths. ``None`` keeps the previous view.
+        """
         if token_ids_cpu is not None:
             self._sampler_penalty_rebuild_token_ids_cpu = token_ids_cpu
         if seq_lens_cpu is not None:
@@ -594,7 +638,21 @@ class ExecutionManager:
         self._sampler_penalty_state_ready = False
 
     def _ensure_sampler_penalty_state(self) -> None:
-        """Rebuild exact device-side token counts from full sequence state when needed."""
+        """Recompute device-side per-token frequency counts when dirty.
+
+        No-op when the cached counters are clean. On dirty, takes the
+        host views captured by :meth:`invalidate_sampler_penalty_state`,
+        broadcasts them across ranks under multi-host JAX, transfers
+        them onto the sampler sharding, and runs ``_rebuild_penalty_counts``
+        to rebuild the exact device-side per-token counts. Toggles the
+        dirty / ready flags on success.
+
+        Raises:
+            RuntimeError: If a rebuild is requested without a previously
+                recorded host source — indicates a missing
+                :meth:`invalidate_sampler_penalty_state` call earlier in the
+                step.
+        """
         if self._sampler_penalty_state_ready and not self._sampler_penalty_state_dirty:
             return
         if self._sampler_penalty_rebuild_token_ids_cpu is None or self._sampler_penalty_rebuild_seq_lens_cpu is None:
@@ -1106,17 +1164,35 @@ class ExecutionManager:
         return outputs
 
     def shutdown(self) -> None:
-        """Release resident executors owned by this manager."""
+        """Release resources owned by sub-executors.
+
+        Forwards to :meth:`ModelStepExecutor.shutdown`, which joins the
+        resident PP-stage worker threads when running in MPMD mode. The
+        sampler executor has no background threads so is not touched here.
+        Safe to call multiple times.
+        """
         if hasattr(self, "_model_executor"):
             self._model_executor.shutdown()
 
     def clear_recurrent_slots(self, slot_indices: list[int]) -> None:
-        """Zero out recurrent/SSM state for freed request slots.
+        """Zero recurrent/SSM state in freed slots before slot reuse.
 
-        When a request finishes, its conv_state and recurrent_state must be
-        cleared so the next request assigned to the same slot starts from a
-        clean state.  Only layers with RecurrentCacheView (or
-        ParallelHybridCacheView wrapping one) are affected.
+        Recurrent layers (Mamba/SSM, RWKV, parallel hybrids) keep
+        ``conv_state`` and ``recurrent_state`` per request slot. When a
+        request finishes and its row is later reassigned to a new request,
+        the new request must start from clean state — otherwise the new
+        request inherits stale activations from the previous occupant.
+        This method writes zeros into those tensors at the indicated
+        rows for every recurrent or hybrid layer present, leaving
+        attention layers untouched.
+
+        No-op when the cache is not a :class:`HybridCache` (purely
+        attention models have no recurrent state to clear) or when no
+        slots were freed.
+
+        Args:
+            slot_indices: Row indices in ``[0, max_num_reqs)`` whose
+                recurrent state should be zeroed. Empty list short-circuits.
         """
         if not slot_indices:
             return

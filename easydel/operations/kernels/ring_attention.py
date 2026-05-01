@@ -144,25 +144,38 @@ class RingAttn(OperationImpl):
         fused_backward: bool = False,
         **ignore,
     ) -> AttentionOutput:
-        """
-        Computes attention using the scan-based `blockwise_attn` function.
+        """Compute attention using ejkernel's ``ring_attention`` kernel.
 
-        Handles optional mask/bias, KV head repetition, and sharding constraints.
+        Handles MLA-style fallback to :class:`VanillaAttn` when QKV head
+        dims disagree, and otherwise dispatches to the scan-based ring
+        kernel under the configured sequence-axis name.
 
         Args:
-            q: Query tensor (B, T, H, D).
-            k: Key tensor (B, S, H_kv, D).
-            v: Value tensor (B, S, H_kv, D).
-            mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
-            bias: Optional attention bias (broadcastable to B, H, T, S).
-            init_bias: Optional callable to initialize bias if mask/bias are None.
-            deterministic: If False, enables dropout. Requires `dropout_rng`.
-            dropout_rng: JAX PRNG key for dropout if `deterministic` is False.
-            causal: Apply causal mask if True.
-            **ignore: Ignored keyword arguments.
+            query: Query tensor of shape ``(B, seq_len_q, num_heads,
+                head_dim)``.
+            key: Key tensor of shape ``(B, seq_len_k, num_kv_heads,
+                head_dim)``.
+            value: Value tensor of shape ``(B, seq_len_k, num_kv_heads,
+                head_dim)``.
+            softmax_aux: Optional sink-token logits, shape
+                ``(num_kv_heads, num_sinks)`` or ``(num_sinks,)``. Reshaped
+                to a flat vector before the kernel call.
+            mask_info: Optional :class:`MaskInfo` describing the attention
+                pattern; axis names are populated from the resolved
+                query/key sharding before the kernel is invoked.
+            logits_soft_cap: Optional soft-cap for logits.
+            softmax_scale: Logits scaling factor; defaults to
+                ``1 / sqrt(head_dim)``.
+            sliding_window: ``int`` or ``(left, right)`` tuple for
+                sliding-window attention.
+            causal: Whether to apply causal masking. Forced ``False`` in
+                decode mode.
+            fused_backward: Use the fused backward kernel during training.
+            **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
-            AttentionOutput containing the attention result.
+            AttentionOutput: ``attention_outputs`` of shape ``(B, seq_len_q,
+            num_heads, head_dim)``. ``attention_weights`` is ``None``.
         """
         # Check dimension compatibility for MLA-style attention
         query_dim: int = query.shape[-1]
@@ -281,6 +294,15 @@ class RingAttn(OperationImpl):
         return self.forward_cuda(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
+        """TPU dispatch path; delegates to :meth:`forward_native`.
+
+        Args:
+            *args: Forwarded positional arguments.
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            AttentionOutput: The attention result.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
@@ -337,25 +359,26 @@ class RingAttn(OperationImpl):
         fused_backward: bool = False,
         **ignore,
     ) -> AttentionOutput:
-        """
-        Executes the Ring Attention computation.
+        """Run Ring Attention by directly invoking :meth:`forward_native`.
 
-        Currently bypasses the backend dispatch and directly calls `forward_native`.
+        Bypasses the backend dispatch in :class:`OperationImpl` because all
+        backends currently use the same scan/Pallas-based kernel.
 
         Args:
-            q: Query tensor.
-            k: Key tensor.
-            v: Value tensor.
-            mask: Optional attention mask.
-            bias: Optional attention bias.
-            init_bias: Optional callable to initialize bias.
-            deterministic: If False, enables dropout (requires dropout_rng).
-            dropout_rng: JAX PRNG key for dropout if deterministic is False.
-            causal: Apply causal mask if True.
-            **ignore: Additional ignored keyword arguments.
+            query: Query tensor ``(B, seq_len_q, num_heads, head_dim)``.
+            key: Key tensor ``(B, seq_len_k, num_kv_heads, head_dim)``.
+            value: Value tensor ``(B, seq_len_k, num_kv_heads, head_dim)``.
+            softmax_aux: Optional sink-token logits.
+            mask_info: Optional mask info object.
+            logits_soft_cap: Optional soft-cap for logits.
+            softmax_scale: Optional logits scaling factor.
+            sliding_window: Optional sliding-window size or tuple.
+            causal: Whether to apply causal masking.
+            fused_backward: Use the fused backward kernel.
+            **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
-            An `AttentionOutput` object containing the results.
+            AttentionOutput: The attention result.
         """
         return self.forward_native(
             query=query,

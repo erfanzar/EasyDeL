@@ -20,7 +20,28 @@ from ..basic_parsers import BaseThinkingReasoningParser
 
 @ReasoningParserManager.register_module(["deepseek_r1", "deepseek-r1"])  # pyright: ignore[reportUntypedClassDecorator]
 class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for DeepSeek R1 models using <think>...</think> tags."""
+    """Reasoning parser for DeepSeek-R1 chain-of-thought outputs.
+
+    The DeepSeek-R1 family emits chain-of-thought wrapped in literal
+    ``<think>``/``</think>`` markers; everything between the markers is
+    private reasoning, everything after is the visible assistant response.
+    Either marker may also be injected by the chat template (when
+    ``add_generation_prompt`` is on), in which case the model output starts
+    *inside* the reasoning section and only emits the closing tag.
+
+    The class is a thin specialization of
+    :class:`BaseThinkingReasoningParser` that fixes the grammar to
+    ``<think>`` / ``</think>``. All state tracking — the prompt-gated
+    asymmetric mode, partial start/end tag detection, streaming-event
+    emission of :class:`DeltaMessage` with ``reasoning_content`` and/or
+    ``content`` fields — is inherited from the base class.
+
+    Attributes:
+        start_token: The opening reasoning marker ``"<think>"`` matched in
+            both batch and streaming text.
+        end_token: The closing reasoning marker ``"</think>"`` that flips
+            the parser from ``REASONING`` into ``CONTENT`` mode.
+    """
 
     start_token = "<think>"
     end_token = "</think>"

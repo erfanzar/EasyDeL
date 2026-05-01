@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of GLM-4V-MoE vision-language model.
+
+GLM-4V-MoE marries the GLM-4V vision-language stack (vision encoder + mRoPE
+text decoder) with GLM-4-MoE's grouped mixture-of-experts FFN: the first
+``first_k_dense_replace`` layers use a dense MLP and the rest use grouped
+MoE with shared and routed experts.
+
+Architectural traits:
+    - Vision encoder: GLM-4V ViT with patch embedding and spatial merging.
+    - Text decoder: mRoPE positions + grouped MoE FFN with shared experts.
+    - Hybrid dense/sparse layer schedule controlled by
+      ``first_k_dense_replace``.
+    - Image and video token merging at special placeholder positions.
+
+Exports:
+    - :class:`Glm4vMoeVisionModel`: Vision tower.
+    - :class:`Glm4vMoeTextModel`: MoE text decoder.
+    - :class:`Glm4vMoeModel`: Multimodal backbone.
+    - :class:`Glm4vMoeForConditionalGeneration`: VLM with LM head.
+"""
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx

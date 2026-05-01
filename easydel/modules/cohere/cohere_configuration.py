@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the Cohere Command family of decoder-only LLMs.
+
+Defines :class:`CohereConfig` — a Llama-shaped decoder with these Cohere-specific
+choices: a learnable logit scale (default ``1/16``), optional QK RMSNorm,
+SwiGLU MLPs, full RoPE, GQA, and tied input/output embeddings by default.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -111,6 +117,47 @@ class CohereConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize a :class:`CohereConfig`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``256000``.
+            hidden_size (int, optional): Hidden dimension. Defaults to ``8192``.
+            intermediate_size (int, optional): SwiGLU FFN intermediate width.
+                Defaults to ``22528``.
+            logit_scale (float, optional): Multiplicative scale applied to LM head
+                logits before softmax. Defaults to ``0.0625``.
+            num_hidden_layers (int, optional): Number of decoder layers.
+                Defaults to ``40``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``64``.
+            num_key_value_heads (int | None, optional): KV heads for GQA. ``None``
+                defaults to ``num_attention_heads``.
+            hidden_act (str, optional): Activation function. Defaults to ``"silu"``.
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``8192``.
+            initializer_range (float, optional): Truncated-normal init stddev.
+                Defaults to ``0.02``.
+            layer_norm_eps (float, optional): LayerNorm epsilon. Defaults to ``1e-5``.
+            use_cache (bool, optional): Return KV caches. Defaults to ``True``.
+            pad_token_id (int, optional): Padding token id. Defaults to ``0``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``5``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``255001``.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to ``True``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            attention_bias (bool, optional): Bias on Q/K/V/O projections.
+                Defaults to ``False``.
+            attention_dropout (float, optional): Attention dropout probability.
+                Defaults to ``0.0``.
+            use_qk_norm (bool, optional): Apply RMSNorm to Q and K projections.
+                Defaults to ``False``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                Checkpointing strategy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            layer_types (list[str] | None, optional): Per-layer attention types.
+                ``None`` fills with ``"full_attention"``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

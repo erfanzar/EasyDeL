@@ -181,19 +181,48 @@ def align_to_multiple(value: int, multiple: int) -> int:
 
 
 def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, kvdtype: jnp.dtype) -> int:
-    """Return packed combined KV heads for a given cache dtype."""
+    """Return packed combined KV heads for a given cache dtype.
+
+    The storage layout interleaves keys and values into a single packed axis
+    whose width is a multiple of the dtype packing factor. This helper reports
+    that aligned width for ``num_kv_heads`` heads.
+
+    Args:
+        num_kv_heads: Number of distinct KV heads (per-layer).
+        k_headdim: Per-head dimension (currently unused, retained for symmetry
+            with downstream layout helpers).
+        kvdtype: KV cache storage dtype.
+
+    Returns:
+        The padded number of combined KV head slots for ``kvdtype``.
+    """
     del k_headdim
     packing = get_dtype_packing(kvdtype)
     return align_to_multiple(num_kv_heads * 2, packing)
 
 
 def _canonicalize_dtype(dtype: jnp.dtype) -> type:
-    """Normalize dtype objects/classes to the scalar type form used by eformer maps."""
+    """Normalize dtype objects/classes to the scalar type form used by eformer maps.
+
+    Args:
+        dtype: A NumPy/JAX dtype, dtype class, or string accepted by ``jnp.dtype``.
+
+    Returns:
+        The scalar Python ``type`` underlying ``dtype`` (e.g. ``np.float16``).
+    """
     return jnp.dtype(dtype).type
 
 
 def _dtype_to_string(dtype: jnp.dtype) -> str:
-    """Convert a dtype to the stable cache-config string representation."""
+    """Convert a dtype to the stable cache-config string representation.
+
+    Args:
+        dtype: Any value acceptable to ``_canonicalize_dtype``.
+
+    Returns:
+        The canonical eformer dtype string, falling back to ``str(jnp.dtype(...))``
+        when the dtype is not in the lookup table.
+    """
     dtype = _canonicalize_dtype(dtype)
     return DTYPE_TO_STRING_MAP.get(dtype, str(jnp.dtype(dtype)))
 
@@ -205,12 +234,36 @@ def _select_compatible_v3_kv_cache_dtype(
     k_headdim: int,
     kv_head_shards: int,
 ) -> jnp.dtype:
-    """Upcast packed v3 cache storage when TP sharding would otherwise be invalid."""
+    """Upcast packed v3 cache storage when TP sharding would otherwise be invalid.
+
+    The v3 ragged-page layout packs combined KV heads into 32-bit storage
+    groups. When the configured KV-head sharding does not evenly divide the
+    storage groups, attention can't be split cleanly. This helper picks the
+    smallest larger dtype (bfloat16, then float32) whose packed groups divide
+    by ``kv_head_shards``.
+
+    Args:
+        kvdtype: Requested KV cache dtype.
+        num_kv_heads: Distinct KV heads per layer.
+        k_headdim: Per-head dimension (forwarded for layout symmetry).
+        kv_head_shards: Number of TP shards across the KV-head axis.
+
+    Returns:
+        ``kvdtype`` if it already divides cleanly, otherwise an upcast dtype.
+    """
     kvdtype = _canonicalize_dtype(kvdtype)
     if kv_head_shards <= 1:
         return kvdtype
 
     def _storage_groups(dtype: jnp.dtype) -> int:
+        """Return the number of 32-bit storage groups for a candidate dtype.
+
+        Args:
+            dtype: Candidate KV storage dtype.
+
+        Returns:
+            Storage groups (combined heads divided by packing factor).
+        """
         return _storage_num_combined_kv_heads_for_dtype(num_kv_heads, k_headdim, dtype) // get_dtype_packing(dtype)
 
     storage_groups = _storage_groups(kvdtype)
@@ -247,7 +300,25 @@ def _resolve_ragged_cache_layout(
     k_headdim: int,
     kv_head_shards: int,
 ) -> tuple[jnp.dtype, int]:
-    """Resolve cache dtype and effective KV-head shard count for ragged caches."""
+    """Resolve cache dtype and effective KV-head shard count for ragged caches.
+
+    Determines whether the requested ``kv_head_shards`` partitioning is
+    realisable for the chosen ragged-page version. When sharding is feasible,
+    the function may upcast ``kvdtype`` (v3) or simply pass through (v2);
+    otherwise it falls back to replication and emits a warning.
+
+    Args:
+        kvdtype: Requested KV cache dtype.
+        version: Ragged-page format version, ``"v2"`` or ``"v3"``.
+        num_kv_heads: Number of distinct KV heads per layer.
+        k_headdim: Per-head dimension.
+        kv_head_shards: Mesh shard count requested for the KV-head axis.
+
+    Returns:
+        A pair ``(dtype, effective_shards)`` where ``dtype`` is the dtype that
+        should actually be allocated and ``effective_shards`` is ``1`` when
+        replication was chosen.
+    """
     kvdtype = _canonicalize_dtype(kvdtype)
     kv_head_shards = max(1, int(kv_head_shards))
 
@@ -870,6 +941,21 @@ class RaggedPagesCacheView(BaseCacheView):
                 pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"],
                 num_update_slices: Int[Array, ""],
             ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
+                """Insert ``kv`` into ``pages`` according to ``slots``.
+
+                Picks between the Pallas TPU kernel and the pure-JAX reference
+                implementation based on backend, head size, and DP sharding.
+
+                Args:
+                    kv: Concatenated key/value tokens to write.
+                    slots: Flat slot indices describing the destination cells.
+                    pages: Target page buffer (will be returned updated).
+                    num_update_slices: Number of valid update slices in ``slots``.
+
+                Returns:
+                    The page buffer with the new KV pairs written in place of
+                    the slots indicated by ``slot_mapping``.
+                """
                 orgshape = pages.shape
                 pages = pages.reshape(-1, *orgshape[2:])
                 page_shard_index = jnp.int32(0)
@@ -968,6 +1054,11 @@ class RaggedPagesCacheView(BaseCacheView):
         return flat[:, :, 1::2, :]
 
     def __repr__(self) -> str:
+        """Return a short ``repr`` showing layer index and KV page shape.
+
+        Returns:
+            A human-readable representation of the cache view.
+        """
         return f"{self.__class__.__name__}(layer_index={self.layer_index}, kv_shape={self.key_pages.shape})"
 
     __str__ = __repr__
@@ -990,6 +1081,12 @@ class RaggedPagesCache(BaseCache):
 
     @property
     def metadata(self) -> RaggedPagesCacheConfig | None:
+        """Return the cache configuration shared by all layer views.
+
+        Returns:
+            The :class:`RaggedPagesCacheConfig` from the last view, or ``None``
+            when the cache has not been populated.
+        """
         if self.views[-1] is None:
             return None
         return self.views[-1].metadata
@@ -1032,11 +1129,36 @@ class RaggedPagesCache(BaseCache):
         return cls(views=views)
 
     def init_empty(self, *args, **kwargs) -> None:
-        """Not typically used for RaggedPagesCache; returns None."""
+        """No-op stub kept only to satisfy the ``BaseCache`` contract.
+
+        ``RaggedPagesCache`` always allocates its physical KV-page buffer up
+        front through :meth:`init_cache`; the empty-skeleton workflow used
+        by :class:`TransformerCache` doesn't apply here because pages are
+        managed by ejkernel against fixed shapes. This method therefore
+        ignores its arguments and returns ``None`` so that callers using
+        the abstract API don't crash.
+
+        Args:
+            *args: Ignored.
+            **kwargs: Ignored.
+
+        Returns:
+            None: Always.
+        """
         return None
 
     def __repr__(self) -> str:
-        """Provides a string representation of the entire paged cache."""
+        """Return a one-block summary identifying the page buffer and layer count.
+
+        Inspects the last view to read the shared ``kv_pages`` shape. If
+        the buffer hasn't been allocated yet (``shape`` access raises) the
+        repr falls back to ``"Uninitialized"`` so debugging output stays
+        useful even before the first ``init_cache`` call.
+
+        Returns:
+            str: Human-readable one-block summary including the KV-page
+            tensor shape and the number of layer views.
+        """
         idx = self.views[-1]
         try:
             kv_shape = idx.kv_pages.shape

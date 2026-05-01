@@ -31,7 +31,12 @@ from .base import Example, Transform
 
 
 class RenameFields(Transform):
-    """Rename fields in examples.
+    """Per-row :class:`Transform` that re-keys top-level dict entries.
+
+    Useful for aligning heterogeneous source schemas onto a single
+    canonical schema before downstream stages (tokenization, packing)
+    run. Keys not present in the rename map are passed through
+    unchanged. Returns a fresh dict — the input is not mutated.
 
     Example:
         >>> transform = RenameFields({"conversations": "messages", "id": "example_id"})
@@ -40,21 +45,25 @@ class RenameFields(Transform):
     """
 
     def __init__(self, mapping: dict[str, str]):
-        """Initialize RenameFields.
+        """Capture the rename map.
 
         Args:
-            mapping: Dictionary mapping old field names to new field names.
+            mapping: ``{old_key: new_key}`` map applied to every row.
+                Keys that do not appear in the row are silently
+                ignored at call time.
         """
         self._mapping = mapping
 
     def __call__(self, example: Example) -> Example:
-        """Rename fields according to the mapping.
+        """Apply the rename map to a row, returning a new dict.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            New dictionary with fields renamed per the mapping.
+            dict: New row dict with each key replaced by
+            ``mapping.get(key, key)``. Values are forwarded by
+            reference.
         """
         result = {}
         for key, value in example.items():
@@ -63,11 +72,21 @@ class RenameFields(Transform):
         return result
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"RenameFields({old: new, ...})"``.
+        """
         return f"RenameFields({self._mapping!r})"
 
 
 class SelectFields(Transform):
-    """Select only specified fields, dropping all others.
+    """Per-row :class:`Transform` that projects a row down to a whitelist of keys.
+
+    Useful before tokenization to drop large unused columns
+    (metadata, raw HTML, embeddings, …) so they don't carry through
+    the rest of the pipeline. Keys in the whitelist that don't
+    appear in the row produce no entry in the output.
 
     Example:
         >>> transform = SelectFields(["text", "label"])
@@ -76,30 +95,41 @@ class SelectFields(Transform):
     """
 
     def __init__(self, fields: list[str]):
-        """Initialize SelectFields.
+        """Capture the whitelist of field names to keep.
 
         Args:
-            fields: List of field names to keep.
+            fields: Names of the row keys to retain. Stored as a set
+                internally for O(1) membership checks during call.
         """
         self._fields = set(fields)
 
     def __call__(self, example: Example) -> Example:
-        """Keep only the specified fields, dropping all others.
+        """Filter a row down to the configured whitelist.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            New dictionary containing only the selected fields.
+            dict: New row dict containing only the keys that are
+            both in ``example`` and in the configured whitelist.
         """
         return {k: v for k, v in example.items() if k in self._fields}
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"SelectFields([...])"``.
+        """
         return f"SelectFields({list(self._fields)!r})"
 
 
 class DropFields(Transform):
-    """Drop specified fields from examples.
+    """Per-row :class:`Transform` that removes a blacklist of keys (complement of :class:`SelectFields`).
+
+    Use when you want to keep most of the row but explicitly remove
+    a few large/irrelevant columns. Names in the blacklist that do
+    not appear in the row are silently ignored.
 
     Example:
         >>> transform = DropFields(["metadata", "source"])
@@ -108,25 +138,32 @@ class DropFields(Transform):
     """
 
     def __init__(self, fields: list[str]):
-        """Initialize DropFields.
+        """Capture the blacklist of field names to drop.
 
         Args:
-            fields: List of field names to remove.
+            fields: Names of the row keys to remove. Stored as a set
+                internally for O(1) membership checks.
         """
         self._fields = set(fields)
 
     def __call__(self, example: Example) -> Example:
-        """Remove the specified fields from the example.
+        """Return a new row dict without the configured blacklist of fields.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            New dictionary without the dropped fields.
+            dict: New row dict containing only the keys that are not
+            in the blacklist.
         """
         return {k: v for k, v in example.items() if k not in self._fields}
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"DropFields([...])"``.
+        """
         return f"DropFields({list(self._fields)!r})"
 
 
@@ -152,25 +189,34 @@ class ExtractField(Transform):
         target_field: str,
         default: tp.Any = None,
     ):
-        """Initialize ExtractField.
+        """Capture the path-expression and target details.
 
         Args:
-            source_path: Path to the nested field (e.g., "metadata.author" or "items[0].name").
-            target_field: Name of the new top-level field.
-            default: Default value if the path doesn't exist.
+            source_path: Path expression resolved by
+                :meth:`_extract_path`. Supports ``"."`` for nested
+                dict access and ``"[i]"`` for list indexing — for
+                example, ``"messages[0].content"`` or
+                ``"meta.author"``.
+            target_field: Top-level row key under which the extracted
+                value is written.
+            default: Value used when ``source_path`` cannot be
+                resolved (any segment is missing or a type
+                mismatches). Defaults to ``None``.
         """
         self._source_path = source_path
         self._target_field = target_field
         self._default = default
 
     def __call__(self, example: Example) -> Example:
-        """Extract the nested value and add it as a new top-level field.
+        """Resolve ``source_path`` against the row and write the result to ``target_field``.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            Copy of the example with the extracted field added.
+            dict: Copy of ``example`` augmented with
+            ``{target_field: value}``. ``value`` is the resolved
+            path or ``self._default`` when resolution fails.
         """
         result = example.copy()
         value = self._extract_path(example, self._source_path)
@@ -178,7 +224,24 @@ class ExtractField(Transform):
         return result
 
     def _extract_path(self, data: tp.Any, path: str) -> tp.Any:
-        """Extract value from nested path like 'a.b[0].c'."""
+        """Walk a dotted/bracketed path expression against an arbitrary nested value.
+
+        Implements a small ad-hoc path resolver: bracket indices are
+        normalised to dot segments (``"a[0].b"`` -> ``"a.0.b"``) and
+        each segment is consumed in turn. Numeric segments index into
+        lists, non-numeric segments index into dicts via ``.get``.
+        Returns ``None`` instead of raising on any kind of mismatch
+        so :meth:`__call__` can substitute the default value.
+
+        Args:
+            data: Root value to traverse — typically the row dict.
+            path: Pre-normalised path expression
+                (e.g. ``"messages[0].content"``).
+
+        Returns:
+            Any: The resolved value, or ``None`` if any segment
+            cannot be resolved.
+        """
         # Normalize path: replace [n] with .n
         parts = path.replace("]", "").replace("[", ".").split(".")
         current = data
@@ -201,6 +264,11 @@ class ExtractField(Transform):
         return current
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"ExtractField('source_path' -> 'target_field')"``.
+        """
         return f"ExtractField({self._source_path!r} -> {self._target_field!r})"
 
 
@@ -229,15 +297,22 @@ class CombineFields(Transform):
         separator: str = " ",
         drop_sources: bool = False,
     ):
-        """Initialize CombineFields.
+        """Capture the source and target fields plus the combination strategy.
 
         Args:
-            source_fields: List of field names to combine.
-            target_field: Name of the combined output field.
-            combiner: Optional custom function to combine values.
-                If not provided, values are concatenated as strings with separator.
-            separator: Separator for string concatenation (used if combiner is None).
-            drop_sources: Whether to remove the source fields after combining.
+            source_fields: Row keys whose values are passed (in order)
+                into the combiner.
+            target_field: Row key under which the combined value is
+                stored.
+            combiner: Optional callable mapping ``list[value]`` to a
+                single combined value. When ``None`` (default),
+                the source values are coerced to strings, ``None``
+                entries are skipped, and the rest are joined with
+                :attr:`separator`.
+            separator: String used by the default combiner. Ignored
+                when ``combiner`` is supplied.
+            drop_sources: When ``True``, the source fields are
+                removed from the output row after the combine.
         """
         self._source_fields = source_fields
         self._target_field = target_field
@@ -246,13 +321,18 @@ class CombineFields(Transform):
         self._drop_sources = drop_sources
 
     def __call__(self, example: Example) -> Example:
-        """Combine the specified fields into a single target field.
+        """Read ``source_fields`` from the row and write the combined value to ``target_field``.
+
+        Missing source fields contribute ``None`` to the combiner's
+        argument list (and are silently skipped by the default
+        string combiner).
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            Copy of the example with the combined field added.
+            dict: Copy of ``example`` with ``target_field`` populated
+            and (optionally) the source fields removed.
         """
         values = [example.get(f) for f in self._source_fields]
 
@@ -272,6 +352,11 @@ class CombineFields(Transform):
         return result
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"CombineFields([...] -> 'target_field')"``.
+        """
         return f"CombineFields({self._source_fields!r} -> {self._target_field!r})"
 
 
@@ -299,24 +384,32 @@ class AddField(Transform):
         field: str,
         value: tp.Any | tp.Callable[[Example], tp.Any],
     ):
-        """Initialize AddField.
+        """Capture the destination field and the value source.
 
         Args:
-            field: Name of the field to add.
-            value: Either a constant value or a callable that takes the example
-                and returns the value.
+            field: Row key under which the new value is written. If
+                the row already has this key, it is overwritten.
+            value: Either a constant value (any type) or a callable
+                ``Callable[[dict], Any]`` invoked once per row to
+                produce the value. The callable distinction is made
+                by ``callable(value)`` at call time.
         """
         self._field = field
         self._value = value
 
     def __call__(self, example: Example) -> Example:
-        """Add the new field to the example.
+        """Resolve the configured value and write it to ``field`` on a row copy.
+
+        For callable ``value``, the row is passed in so the new
+        column can depend on existing fields (e.g. computing length
+        from ``text``); for non-callable values, the value is used
+        verbatim.
 
         Args:
-            example: Input example dictionary.
+            example: Input row dict; not mutated.
 
         Returns:
-            Copy of the example with the new field added.
+            dict: Copy of ``example`` with ``self._field`` populated.
         """
         result = example.copy()
 
@@ -328,6 +421,11 @@ class AddField(Transform):
         return result
 
     def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"AddField('name', value_repr)"``.
+        """
         if callable(self._value):
             val_name = getattr(self._value, "__name__", "lambda")
             return f"AddField({self._field!r}, {val_name})"

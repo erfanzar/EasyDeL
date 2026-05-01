@@ -243,7 +243,19 @@ class ToolParser:
         start_marker: str | None,
         end_marker: str | None,
     ) -> bool:
-        """Return whether *text* contains an unmatched tool/control marker."""
+        """Return whether *text* contains an unmatched tool/control marker.
+
+        Args:
+            text: The streaming text to inspect.
+            start_marker: Opening marker (e.g. ``"<tool_call>"``); ``None`` or
+                empty disables the check.
+            end_marker: Matching closing marker; ``None`` means a single-shot
+                marker that has no terminator.
+
+        Returns:
+            ``True`` when at least one ``start_marker`` is present but not yet
+            balanced by a matching ``end_marker``.
+        """
 
         if not text or not isinstance(start_marker, str) or not start_marker:
             return False
@@ -259,7 +271,17 @@ class ToolParser:
         return text.count(start_marker) > text.count(end_marker)
 
     def get_streaming_buffer_marker_pairs(self) -> Sequence[tuple[str, str | None]]:
-        """Return parser-owned marker pairs used to detect buffered protocol."""
+        """Return parser-owned marker pairs used to detect buffered protocol.
+
+        Discovers ``(start, end)`` marker tuples by introspecting standard
+        attribute names that subclasses set (``tool_call_start_token``,
+        ``parameter_prefix``, etc.). Both the start and end can be ``None``,
+        in which case the pair is skipped.
+
+        Returns:
+            Tuple of ``(start_marker, end_marker)`` pairs. ``end_marker`` is
+            ``None`` for one-shot markers without a terminator.
+        """
 
         marker_pairs: list[tuple[str, str | None]] = []
         for start_attr, end_attr in (
@@ -282,7 +304,15 @@ class ToolParser:
         return tuple(marker_pairs)
 
     def get_streaming_buffer_hints(self) -> Sequence[str]:
-        """Return parser-owned substrings that hint a protocol chunk is in-flight."""
+        """Return parser-owned substrings that hint a protocol chunk is in-flight.
+
+        Combines every start marker (and its no-trailing-``>`` variant) into
+        a deduplicated list that the buffering check can scan against
+        ``delta_text`` to detect partial protocol prefixes.
+
+        Returns:
+            Tuple of unique substrings to look for in incoming text.
+        """
 
         hints: list[str] = []
         seen: set[str] = set()
@@ -303,7 +333,20 @@ class ToolParser:
         current_text: str,
         delta_text: str,
     ) -> bool:
-        """Return whether the parser is currently buffering unfinished tool protocol."""
+        """Return whether the parser is currently buffering unfinished tool protocol.
+
+        Used by the delegating parser to suppress visible content while a
+        partial tool-call protocol is being assembled.
+
+        Args:
+            current_text: Cumulative visible text seen so far.
+            delta_text: Newly produced text since the last step.
+
+        Returns:
+            ``True`` when an unmatched start marker exists, when the parser's
+            ``is_tool_call_started`` flag is set, or when a marker prefix is
+            partially present in ``delta_text``.
+        """
 
         if bool(getattr(self, "is_tool_call_started", False)):
             return True
@@ -630,6 +673,7 @@ class ToolParserManager:
             return module
 
         def _register(module):
+            """Register ``module`` and return it so the decorator preserves the class."""
             cls._register_module(module=module, module_name=name, force=force)
             return module
 

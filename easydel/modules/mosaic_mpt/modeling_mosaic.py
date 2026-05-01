@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""MosaicML Pretrained Transformer (MPT) implementation.
+
+Implements MosaicML's MPT decoder family — a GPT-style architecture with no
+position embeddings (replaced by Attention with Linear Biases / ALiBi), a fused
+QKV projection, optional QK LayerNorm, and a configurable LayerNorm variant
+(``low_precision_layernorm``). Supports causal language modeling.
+
+Exports:
+    - ``MptMLP``: GELU feed-forward block with residual.
+    - ``MptAttention``: ALiBi attention with fused QKV.
+    - ``MptBlock``: a single transformer block.
+    - ``MptModel``: base transformer trunk with cached ALiBi tensor.
+    - ``MptForCausalLM``: causal LM head wrapper.
+    - ``build_mpt_alibi_tensor``: helper to build ALiBi bias tensors.
+"""
 
 import math
 from functools import cached_property, partial
@@ -48,19 +63,20 @@ from .mosaic_configuration import MptConfig as MptConfig
 
 
 class MptMLP(spx.Module):
-    """MPT MLP module.
+    """Two-layer GELU FFN for MPT, returning the post-residual output directly.
 
-    This module implements the feed-forward network (MLP) used in the MPT model.
-    It consists of an up-projection, GELU activation, and a down-projection, followed by dropout.
+    Unlike most modern decoder MLPs (gated SwiGLU), MPT uses a plain
+    ``up -> GELU(exact) -> down`` feed-forward of width
+    ``expansion_ratio * d_model``. Dropout is applied only on the residual
+    branch (matching MPT's original training recipe), and the residual is
+    *added inside* this module rather than by the parent block — that is
+    why ``forward`` accepts and returns the post-add hidden state.
 
     Attributes:
-        config (MptConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        up_proj (ParallelLinear): Linear layer for up-projection.
-        down_proj (ParallelLinear): Linear layer for down-projection.
-        hidden_dropout (nn.Dropout): Dropout layer applied to the output.
+        up_proj (ColumnParallelLinear): ``d_model -> expansion_ratio * d_model``.
+        down_proj (ColumnParallelLinear): ``expansion_ratio * d_model -> d_model``.
+        hidden_dropout (nn.Dropout): Dropout applied to the down-projected
+            output before the residual add (rate ``attn_config.attn_pdrop``).
     """
 
     def __init__(
@@ -141,20 +157,31 @@ class MptMLP(spx.Module):
 
 
 class MptAttention(UnifiedAttention):
-    """MPT Attention module with ALiBi positional bias.
+    """MPT multi-head attention with ALiBi position biases.
 
-    Inherits from UnifiedAttention.
-    Uses fused QKV projection and ALiBi (Attention with Linear Biases) for positional information.
-    Overrides forward_alibi to handle custom ALiBi bias computation with masking.
+    Differences from a standard transformer attention:
+
+    * **Fused QKV**: a single linear ``Wqkv`` of width ``3 * d_model`` is
+      split into Q, K, V slices instead of three separate projections.
+    * **No RoPE / learned positional embeddings**: positional information
+      enters as a per-head ALiBi bias matrix
+      ``-m_h * (i - j)`` for ``j <= i`` added directly to the QK scores
+      before softmax. The slopes ``m_h`` form a geometric sequence capped
+      by ``alibi_bias_max`` and are precomputed once per model in
+      :func:`build_mpt_alibi_tensor`.
+    * **Optional QK-LayerNorm** (``qk_ln``) applied to Q and K before the
+      score computation for training stability.
+    * **No bias** on Wqkv / out_proj when ``no_bias`` is set (the default).
+
+    The module overrides ``forward_alibi`` on :class:`UnifiedAttention` so
+    that the precomputed ALiBi slopes plus the live attention mask are
+    combined into a single additive bias before the softmax kernel.
 
     Attributes:
-        config (MptConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        Wqkv (ColumnParallelLinear): Fused linear layer for query, key, and value projections.
-        out_proj (RowParallelLinear): Linear layer for the output projection.
-        resid_dropout (nn.Dropout): Dropout layer applied after the output projection.
+        Wqkv (ColumnParallelLinear): Fused QKV projection ``d_model -> 3 * d_model``.
+        out_proj (RowParallelLinear): Output projection ``d_model -> d_model``.
+        resid_dropout (nn.Dropout): Residual-stream dropout applied to the
+            attention output.
     """
 
     def __init__(
@@ -389,23 +416,25 @@ class MptAttention(UnifiedAttention):
 
 
 class MptBlock(spx.Module):
-    """MPT Transformer block.
+    """One MPT decoder block: pre-norm attention plus pre-norm GELU FFN.
 
-    This module represents a single transformer block in the MPT model,
-    containing self-attention and MLP sub-layers with residual connections
-    and layer normalization. It utilizes ALiBi for positional information.
+    Layout (input ``x``)::
+
+        h = x + Dropout(attn(LN1(x), alibi_bias=...))
+        out = h + Dropout(MLP(LN2(h)))         # residual added inside MptMLP
+
+    Both LayerNorms are MPT's "low-precision LayerNorm" (epsilon =
+    ``layer_norm_epsilon``, optional bias per ``use_norm_bias``). Note the
+    asymmetry: the attention residual is added *here* (with a residual-only
+    dropout), while the FFN residual is added *inside* :class:`MptMLP` —
+    that matches the upstream MosaicML implementation.
 
     Attributes:
-        config (MptConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (spx.Rngs): Random number generators.
-        norm_1 (LayerNorm): Layer normalization before the attention layer.
-        attn (MptAttention): The self-attention module.
-        norm_2 (LayerNorm): Layer normalization before the MLP layer.
-        ffn (MptMLP): The feed-forward (MLP) module.
-        resid_attn_dropout (nn.Dropout): Dropout applied after the attention layer's residual connection.
+        norm_1, norm_2 (LayerNorm): Pre-attention and pre-FFN LayerNorms.
+        attn (MptAttention): The ALiBi multi-head attention.
+        ffn (MptMLP): GELU feed-forward (returns post-residual hidden state).
+        resid_attn_dropout (nn.Dropout): Dropout applied to the attention
+            output before adding the residual.
     """
 
     def __init__(
@@ -525,19 +554,32 @@ class MptBlock(spx.Module):
 
 
 def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
-    """Builds the ALiBi tensor for MPT models.
+    """Precompute the per-head ALiBi position-bias tensor.
 
-    ALiBi (Attention with Linear Biases) is a method to incorporate positional information
-    into transformer models without explicit position embeddings. It adds a bias to the
-    attention scores based on the distance between query and key positions.
+    ALiBi (Press, Smith & Lewis, 2022) replaces sinusoidal/learned position
+    embeddings with an additive bias on the attention scores
+
+    .. math::
+        \\text{score}_{ij} \\mathrel{+}= -m_h \\, \\max(i - j, 0)
+
+    where :math:`m_h` is a fixed per-head slope from a geometric sequence.
+    Slopes are chosen to be ``2^{-(8 / H_2) k}`` for ``k = 1, …, H_2`` with
+    ``H_2`` the next power of two ≥ ``num_heads``; when the next power of
+    two overshoots, the function interleaves the even and odd entries and
+    truncates to ``num_heads`` to preserve the slope schedule used in the
+    original MPT paper. Because the slopes are fixed (not learned) and the
+    bias is purely a function of ``i - j``, MPT can extrapolate to context
+    lengths longer than seen at training time.
 
     Args:
-        num_heads (int): The number of attention heads.
-        sequence_length (int): The length of the sequence.
-        alibi_bias_max (int, optional): The maximum bias value allowed by ALiBi. Defaults to 8.
+        num_heads: Number of attention heads ``H``.
+        sequence_length: Maximum context length to materialize.
+        alibi_bias_max: Cap on the largest slope (default ``8`` matches MPT).
 
     Returns:
-        Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
+        jax.Array: Tensor of shape ``(1, num_heads, 1, sequence_length)``
+        of non-positive position biases ready to be broadcast into the
+        attention score matrix.
     """
     alibi = jnp.arange(
         1 - sequence_length,
@@ -573,23 +615,23 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
 
 @register_module(TaskType.BASE_MODULE, config=MptConfig, model_type="mpt")
 class MptModel(EasyDeLBaseModule):
-    """MPT model implementation.
+    """MPT base trunk: token embeddings + N MptBlocks + final LayerNorm.
 
-    This class implements the main MPT transformer model architecture, consisting of
-    an embedding layer (token and optional positional), multiple MptBlock layers,
-    and a final layer normalization.
+    No positional embedding table is allocated — MPT relies entirely on the
+    cached ALiBi bias produced by :func:`build_mpt_alibi_tensor` and reused
+    across every block (computed lazily once per forward to a length that
+    bounds the input). Tied LM head behaviour is governed by ``use_lm_head``
+    in the config (note the unusual semantic: in MPT, ``use_lm_head=True``
+    means the LM logits come from the input embedding rather than a separate
+    matrix). The trunk uses :class:`LayerNorm` rather than RMSNorm because
+    that is what MPT was trained with.
 
     Attributes:
-        config (MptConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (spx.Rngs): Random number generators.
-        wte (Embed): Token embedding layer.
-        emb_drop (nn.Dropout): Dropout layer applied after embeddings.
-        blocks (tp.List[MptBlock]): List of transformer blocks.
-        norm_f (LayerNorm): Final layer normalization.
-        alibi (Array, optional): Precomputed ALiBi tensor if using ALiBi.
+        wte (Embed): Token embedding ``(vocab_size, d_model)``.
+        emb_drop (nn.Dropout): Embedding dropout (rate ``emb_prob_drop``).
+        blocks (nn.ModuleList[MptBlock]): ``n_layers`` decoder blocks.
+        norm_f (LayerNorm): Final LayerNorm at ``layer_norm_epsilon``.
+        alibi (jax.Array | None): Lazily-cached ALiBi position-bias tensor.
     """
 
     def __init__(

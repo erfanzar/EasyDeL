@@ -22,11 +22,29 @@ from easydel.infra.factory import register_config
 
 @register_config("mamba2")
 class Mamba2Config(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for Mamba-2 (the SSD / state-space dual formulation).
 
-    Args:
+    Mamba-2 generalizes Mamba's selective recurrence to a *grouped* form
+    (``num_heads`` heads × ``head_dim`` channels per head, sharing ``B``/``C``
+    across ``n_groups`` head-groups) that is mathematically equivalent to a
+    structured masked attention over chunks. The recurrence is
+
+    .. math::
+        h_t = a_t \\, h_{t-1} + B_t \\, x_t, \\quad y_t = C_t \\, h_t + D \\, x_t
+
+    with :math:`a_t = \\exp(-\\Delta_t \\, \\text{softplus}(A))` a *scalar*
+    decay per head — diagonal-of-scalar SSM — making the closed-form chunked
+    matmul (the "state-space dual", SSD) cheap to run in O(L · chunk_size +
+    L · state_size) instead of the full O(L · state_size · intermediate_size)
+    of Mamba-1. ``chunk_size`` controls the chunked-matmul block size on
+    hardware; ``conv_kernel`` is still a short causal depthwise conv giving
+    each token a local window before the SSM.
+
+    State carried per token across batch/seq:
+        * ``conv_state``: rolling depthwise-conv window of length ``conv_kernel``.
+        * ``ssm_state``: per-head state of shape ``(num_heads, head_dim, state_size)``.
+
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 32768):
             Vocabulary size of the Mamba2 model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.
@@ -129,6 +147,55 @@ class Mamba2Config(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
     ):
+        """Initialize the Mamba2 configuration.
+
+        Args:
+            num_heads (int, optional): Number of selective-scan heads. Defaults to 128.
+            head_dim (int, optional): Dimensionality per head. Defaults to 64.
+            vocab_size (int, optional): Vocabulary size. Defaults to 32768.
+            hidden_size (int, optional): Hidden dimension. Defaults to 4096.
+            state_size (int, optional): SSM state dimension. Defaults to 128.
+            num_hidden_layers (int, optional): Number of Mamba2 blocks. Defaults to 64.
+            layer_norm_epsilon (float, optional): Epsilon for normalization layers.
+                Defaults to 1e-5.
+            pad_token_id (int, optional): Padding token id. Defaults to 1.
+            bos_token_id (int, optional): Beginning-of-sequence token id. Defaults to 0.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 2.
+            expand (int, optional): Intermediate-size expansion factor. Defaults to 2.
+            conv_kernel (int, optional): 1D convolution kernel size. Defaults to 4.
+            n_groups (int, optional): Number of groups in the grouped selective scan.
+                Defaults to 8.
+            use_bias (bool, optional): Whether linear layers use bias. Defaults to False.
+            use_conv_bias (bool, optional): Whether the conv layer uses bias.
+                Defaults to True.
+            hidden_act (str, optional): Activation function. Defaults to "silu".
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.1.
+            residual_in_fp32 (bool, optional): Whether to compute residuals in float32.
+                Defaults to True.
+            time_step_rank (str | int, optional): Rank of the time-step projection
+                (``"auto"`` for ``ceil(hidden_size / 16)``). Defaults to "auto".
+            time_step_min (float, optional): Minimum time-step bias. Defaults to 0.001.
+            time_step_max (float, optional): Maximum time-step bias. Defaults to 0.1.
+            time_step_floor (float, optional): Floor applied to the time-step bias.
+                Defaults to 1e-4.
+            time_step_limit (tuple[float, float] | None, optional): Inference clip
+                limits ``(min, max)`` for the time step. Defaults to ``(0.0, inf)``.
+            rescale_prenorm_residual (bool, optional): Rescale the pre-norm residual.
+                Defaults to False.
+            use_cache (bool, optional): Whether to enable recurrent state caching.
+                Defaults to True.
+            norm_before_gate (bool, optional): Apply RMSNorm before the gate activation.
+                Defaults to True.
+            rms_norm (bool, optional): Use RMSNorm rather than LayerNorm. Defaults to True.
+            chunk_size (int, optional): Chunk size for chunked sequence processing.
+                Defaults to 256.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient
+                checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.state_size = state_size

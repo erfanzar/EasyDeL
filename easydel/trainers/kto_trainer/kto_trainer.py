@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Kahneman-Tversky Optimization (KTO) trainer.
+
+KTO learns from unpaired desirable/undesirable feedback by minimising
+a prospect-theory-inspired loss against a reference model.  Compared
+to DPO, it does not require explicit ``(chosen, rejected)`` pairs and
+instead consumes ``(prompt, completion, label)`` triples where
+``label`` is a boolean.
+"""
 
 from __future__ import annotations
 
@@ -49,20 +57,31 @@ logger = get_logger(__name__)
 
 @Registry.register("trainer", "kto")
 class KTOTrainer(Trainer):
-    """Kahneman-Tversky Optimization trainer.
+    """Trainer for Kahneman-Tversky Optimization (KTO).
 
-    Implements KTO training which uses human binary feedback (desirable/undesirable)
-    to align language models. Unlike DPO which requires paired preferences, KTO
-    works with unpaired binary labels.
+    Implements the unpaired prospect-theoretic alignment objective
+    from Ethayarajh et al. 2024: each example carries a single
+    boolean ``label`` (desirable vs. undesirable) and the loss
+    shapes the implicit reward
+    ``r = beta * (logp - logp_ref)`` against the running KL anchor
+    ``z`` (estimated from a *mismatched-completion* batch built by
+    :func:`_build_kl_batch`). With ``loss_type = "apo_zero_unpaired"``
+    the trainer instead runs the APO-zero unpaired surrogate.
 
-    Args:
-        arguments: KTO-specific training configuration.
-        model: Policy model to train (EasyDeLBaseModule or EasyDeLState).
-        reference_model: Reference model for KL penalty computation.
-        processing_class: Tokenizer or processor for text encoding.
-        train_dataset: Training dataset with prompt, completion, and label fields.
-        eval_dataset: Optional evaluation dataset.
-        data_collator: Optional custom data collator.
+    See :func:`kto_objective` for the loss form and
+    :func:`training_step` for the per-step pipeline.
+
+    Attributes:
+        arguments: :class:`KTOConfig` controlling losses, lengths,
+            UDM-style weighting, and the inherited
+            ``TrainingArguments`` surface.
+        processing_class: Tokenizer/processor used for prompt and
+            completion encoding.
+        reference_state: Frozen reference :class:`EasyDeLState`;
+            falls back to a deep copy of the policy when none is
+            provided.
+        calculate_kl: Cached flag controlling whether the running KL
+            anchor is computed (``True`` for ``loss_type == "kto"``).
     """
 
     arguments: KTOConfig
@@ -77,6 +96,30 @@ class KTOTrainer(Trainer):
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         data_collator: BCODataCollatorTFDS | BCODataCollatorGrain | None = None,
     ):
+        """Initialize the KTO trainer.
+
+        Resolves the policy and reference states (deep-copying when no
+        reference is provided), validates required inputs, configures
+        padding, and forwards construction to :class:`Trainer`.
+
+        Args:
+            arguments: KTO-specific training configuration.
+            model: Policy module or state.
+            reference_model: Optional reference module/state; deep-
+                copied from ``model`` when omitted.
+            processing_class: Tokenizer/processor used for prompt and
+                completion encoding.
+            train_dataset: Dataset of ``(prompt, completion, label)``
+                triples.
+            eval_dataset: Optional evaluation dataset.
+            data_collator: Optional custom collator (defaults to the
+                BCO-compatible KTO collator).
+
+        Raises:
+            TypeError: If ``arguments`` is not a :class:`KTOConfig`.
+            ValueError: If required inputs are missing or no padding
+                token can be determined.
+        """
         if not isinstance(arguments, KTOConfig):
             raise TypeError(f"`arguments` must be a `KTOConfig`, received {type(arguments)}")
         if processing_class is None:
@@ -244,10 +287,19 @@ class KTOTrainer(Trainer):
             return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure JIT-compiled training and evaluation functions.
+        """Build the JIT-compiled KTO training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, defines
+        the BCO-style concatenated forward used to score
+        ``(prompt, completion)`` pairs, and compiles
+        :func:`training_step` and :func:`evaluation_step` with the
+        right input/output shardings (including the reference state's
+        sharding spec) and the active MPMD pipeline schedule.
 
         Returns:
-            Configuration containing compiled step functions and mesh.
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
@@ -260,6 +312,16 @@ class KTOTrainer(Trainer):
         )
 
         def forward_fn(model, batch):
+            """Run the BCO-style concatenated forward shared with KTO.
+
+            Args:
+                model: The current policy or reference model module.
+                batch: The collated KTO batch.
+
+            Returns:
+                The dict of completion log-probs / mean logits used by
+                the KTO loss.
+            """
             return concatenated_forward(
                 model,
                 batch,

@@ -86,6 +86,30 @@ class ORPOTrainer(Trainer):
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType = None,
     ):
+        """Initialize an ORPO trainer.
+
+        Args:
+            arguments (ORPOConfig | None): Training configuration. Required.
+            model (EasyDeLBaseModule | EasyDeLState | None): Base module or
+                pre-built state to train. Plain modules are converted to a
+                state via ``model.to_state(...)``.
+            data_collator (DPODataCollatorWithPaddingTFDS |
+                DPODataCollatorWithPaddingGrain | None): Optional explicit
+                collator. When ``None`` default DPO-style padding collators
+                are constructed for both Grain and TFDS pipelines.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset; preference pairs with ``chosen``/``rejected``
+                fields (or pre-tokenized columns).
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation dataset(s).
+            processing_class (ProcessingClassType): Tokenizer or processor
+                used to tokenize prompts/responses. Required.
+
+        Raises:
+            ValueError: If ``arguments`` is None, if ``processing_class`` is
+                None, or if no ``padding_value`` can be resolved.
+            TypeError: If ``arguments`` is not an :class:`ORPOConfig`.
+        """
         if arguments is None:
             raise ValueError("arguments cannot be None")
         if not isinstance(arguments, ORPOConfig):
@@ -154,7 +178,24 @@ class ORPOTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> ORPOPreprocessTransform | None:
-        """Get ORPO preprocessing transform for ShardedDataSource."""
+        """Build the lazy ORPO preprocessing transform attached to a :class:`ShardedDataSource`.
+
+        The transform tokenises a row that contains raw ``prompt`` /
+        ``chosen`` / ``rejected`` fields, applies the configured chat
+        template (and any tool schema in ``arguments.tools``), trims to
+        ``max_prompt_length`` / ``max_completion_length``, and replaces
+        prompt-side label positions with ``label_pad_token_id`` so that
+        the cross-entropy term in the ORPO NLL only scores completion
+        tokens. The transform is intentionally lazy: it runs at iteration
+        time inside the data loader rather than eagerly via
+        ``Dataset.map``.
+
+        Returns:
+            An :class:`ORPOPreprocessTransform` configured against the
+            current tokenizer/processor, or ``None`` when the training
+            source already exposes pre-tokenised fields (detected by
+            :meth:`_is_pretokenized`) and no further work is required.
+        """
 
         if self._is_pretokenized():
             return None
@@ -168,7 +209,22 @@ class ORPOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Detect whether the bound training source already carries tokenised ORPO columns.
+
+        Opens the first shard of ``self._train_source``, peeks at one
+        row, and reports whether it exposes the tokeniser-output column
+        ``"prompt_input_ids"``. When present, the trainer skips the
+        :class:`ORPOPreprocessTransform` and feeds the source rows
+        directly to the collator. When the source is missing or empty
+        the method returns ``False`` so that the preprocessing transform
+        is still attached as a defensive default.
+
+        Returns:
+            ``True`` when the first sample of the first shard contains a
+            ``"prompt_input_ids"`` field; ``False`` if the source is
+            ``None``, the shard list is empty, the shard yields no
+            rows, or the field is absent.
+        """
         if self._train_source is None:
             return False
         try:
@@ -178,7 +234,47 @@ class ORPOTrainer(Trainer):
             return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile training and evaluation step functions."""
+        """Build the JIT-compiled ORPO training/eval step functions and supporting auxiliaries.
+
+        The method wires three compiled artefacts that the base
+        :class:`Trainer` loop later calls:
+
+        * **``concatenated_forward``** -- a stateless utility that
+          concatenates the chosen and rejected completions, runs a
+          single forward pass, and returns per-sequence log-probabilities
+          (and, when in chunked mode, vocabulary-tiled logsumexp). It is
+          captured as ``self.concatenated_forward`` for use by metric
+          probes outside the JITted step.
+        * **Sharded training step** -- :func:`orpo_training_step`
+          partial-applied with ``concatenated_forward``, the ORPO
+          ``beta``, the scheduler, ``loss_config``, partition spec,
+          gradient-accumulation count, and the resolved straight-through
+          quantisation emulator. Static argnums freeze those Python-side
+          values into the compiled cache so the JAX cache hits across
+          steps.
+        * **Sharded evaluation step** -- :func:`orpo_step` compiled with
+          the same statics plus the literal mode tag ``"eval"`` so
+          dropout/labels/logging are routed through the eval branch.
+
+        Sharding is built from the trainer's mesh: state is donated and
+        round-trips at ``self.state_shardings`` while the batch and
+        scalar metrics ride on a fully replicated sharding. Compilation
+        honours ``arguments.mpmd_scheduler`` so MPMD-pipelined runs
+        forward to the scheduled-loss adapter automatically.
+
+        Side effects:
+            Caches ``self._train_shared_fn_static_args``,
+            ``self._eval_shared_fn_static_args``,
+            ``self.concatenated_forward``,
+            ``self._extra_forward_flops_per_token``, and
+            ``self._extra_backward_flops_per_token`` for downstream FLOP
+            accounting; ensures the checkpoint directory exists.
+
+        Returns:
+            A :class:`TrainerConfigureFunctionOutput` carrying the two
+            compiled step functions, the active mesh, and the streaming
+            checkpoint manager.
+        """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
@@ -265,7 +361,28 @@ class ORPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collection function for Grain batching."""
+        """Return the Grain collator that batches ORPO preference pairs.
+
+        The base :class:`Trainer` calls this hook when assembling a
+        Grain-driven loader. ORPO ignores ``max_sequence_length`` and
+        ``truncation_mode`` because the per-pair lengths
+        (``max_prompt_length`` / ``max_completion_length``) and
+        truncation policy were already resolved when
+        :class:`DPODataCollatorWithPaddingGrain` was constructed in
+        ``__init__``. The returned callable left-pads the chosen and
+        rejected branches symmetrically (``prepadded=True``) so that
+        downstream concatenation in :func:`concatenated_forward` lines
+        up token positions across the two branches.
+
+        Args:
+            max_sequence_length: Accepted for interface compatibility
+                with :class:`Trainer`; unused.
+            truncation_mode: Accepted for interface compatibility with
+                :class:`Trainer`; unused.
+
+        Returns:
+            The pre-instantiated Grain DPO/ORPO padding collator.
+        """
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -273,5 +390,22 @@ class ORPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collection function for TFDS batching."""
+        """Return the TFDS collator that batches ORPO preference pairs.
+
+        Mirrors :meth:`create_grain_collect_function` for the TFDS
+        loader path. The collator was constructed in ``__init__`` with
+        the ORPO-specific prompt/completion budgets and the resolved
+        ``padding_value`` / ``label_pad_token_id``; the arguments to
+        this method are kept only to satisfy the
+        :class:`Trainer`-imposed signature.
+
+        Args:
+            max_sequence_length: Accepted for interface compatibility
+                with :class:`Trainer`; unused.
+            truncation_mode: Accepted for interface compatibility with
+                :class:`Trainer`; unused.
+
+        Returns:
+            The pre-instantiated TFDS DPO/ORPO padding collator.
+        """
         return self.input_data_collator_tfds

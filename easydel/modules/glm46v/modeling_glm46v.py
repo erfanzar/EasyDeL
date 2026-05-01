@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of GLM-4.6V vision-language model.
+
+GLM-4.6V is a vision-language model that pairs the GLM-4V vision encoder with
+the GLM-4V text decoder using multi-dimensional RoPE for joint spatial,
+temporal, and textual position encoding. The text decoder, vision tower, and
+spatial-merging projector are inherited from :mod:`easydel.modules.glm4v` and
+this module provides only the registered wrapper classes that point to
+GLM-4.6-series special tokens.
+
+Architectural traits:
+    - Reuses :class:`Glm4vModel` for the vision tower and merger.
+    - Reuses :class:`Glm4vTextModel` (M-RoPE, GQA) for the text decoder.
+    - Image/video token merging at GLM-4.6-specific placeholder ids.
+
+Exports:
+    - :class:`Glm46VModel`: Multimodal backbone.
+    - :class:`Glm46VForConditionalGeneration`: VLM with LM head and soft-cap.
+"""
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx

@@ -156,7 +156,20 @@ def _fallback_maybe_truncate(
     side: str = "left",
     verbose: bool = False,
 ) -> tuple[list[int], int]:
-    """Fallback for lm-eval's ``maybe_truncate`` when lm-eval isn't installed."""
+    """Fallback for lm-eval's ``maybe_truncate`` when lm-eval isn't installed.
+
+    Args:
+        prompt_token_ids: Tokenized prompt to potentially truncate.
+        max_gen_toks: Generation budget; reserved before truncation.
+        max_model_len: Total context window size or ``None`` to skip truncation.
+        side: Side from which to truncate the prompt (``"left"`` or
+            ``"right"``).
+        verbose: Unused; accepted for signature compatibility with lm-eval.
+
+    Returns:
+        Tuple of the (possibly truncated) token list and the maximum
+        generation token budget after reserving room for it.
+    """
     del verbose
     request_max_tokens = max(1, int(max_gen_toks))
     if max_model_len is None:
@@ -180,6 +193,15 @@ def _postprocess_generation_text(
     post-process step is only a final cleanup for eval outputs, so it first
     discards any text before ``think_end_token`` while preserving the visible
     text verbatim, then trims residual stop strings from that visible content.
+
+    Args:
+        generation: Full text produced by the model.
+        stop: A stop string, list of stop strings, or ``None``.
+        think_end_token: Optional reasoning-end marker; everything before the
+            first occurrence is discarded.
+
+    Returns:
+        Cleaned generation text suitable for benchmark scoring.
     """
     if think_end_token:
         _, separator, visible_text = generation.partition(think_end_token)
@@ -201,6 +223,15 @@ def _strip_empty_reasoning_scaffold(
     generation prefix. For code-completion style eval tasks this pollutes the
     prompt without carrying information, so we strip only the empty scaffold and
     leave any non-empty reasoning content untouched.
+
+    Args:
+        rendered_prompt: Prompt produced by ``apply_chat_template``.
+        think_start_token: Reasoning-start marker (e.g. ``"<think>"``) or
+            ``None`` to fall back to the literal default.
+        think_end_token: Matching reasoning-end marker.
+
+    Returns:
+        The prompt with any empty reasoning scaffold removed.
     """
     if not rendered_prompt:
         return rendered_prompt
@@ -220,7 +251,15 @@ def _strip_empty_reasoning_scaffold(
 
 
 def _freeze_generation_value(value: Any) -> Any:
-    """Convert nested generation kwargs into a hashable grouping key."""
+    """Convert nested generation kwargs into a hashable grouping key.
+
+    Args:
+        value: The value to convert. May be a dict, list, tuple, set, or
+            any object exposing ``tolist``; otherwise returned unchanged.
+
+    Returns:
+        A hashable representation of ``value`` suitable for use as a dict key.
+    """
     if isinstance(value, dict):
         return tuple(sorted((str(k), _freeze_generation_value(v)) for k, v in value.items()))
     if isinstance(value, (list, tuple)):
@@ -233,7 +272,17 @@ def _freeze_generation_value(value: Any) -> Any:
 
 
 def _coerce_optional_bool(value: Any) -> bool | None:
-    """Normalize optional boolean-like values from lm-eval configs."""
+    """Normalize optional boolean-like values from lm-eval configs.
+
+    Args:
+        value: A boolean, ``None``, or a string that may represent a boolean
+            (``"true"``, ``"yes"``, ``"on"``, ``"1"`` and the negative
+            counterparts).
+
+    Returns:
+        The matching ``bool`` for recognized values, ``None`` when input is
+        ``None``, otherwise ``bool(value)``.
+    """
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -246,7 +295,15 @@ def _coerce_optional_bool(value: Any) -> bool | None:
 
 
 def _normalize_stop_list(stop_value: Any) -> list[str]:
-    """Coerce lm-eval stop configuration into a flat string list."""
+    """Coerce lm-eval stop configuration into a flat string list.
+
+    Args:
+        stop_value: A string, an iterable of strings, ``None``, or any other
+            value that will be stringified.
+
+    Returns:
+        A flat list of stop strings (empty when ``stop_value`` is ``None``).
+    """
     if stop_value is None:
         return []
     if isinstance(stop_value, str):
@@ -257,7 +314,16 @@ def _normalize_stop_list(stop_value: Any) -> list[str]:
 
 
 def _merge_stop_lists(existing_stops: Any, requested_stops: Any) -> list[str]:
-    """Merge stop strings while preserving order and avoiding duplicates."""
+    """Merge stop strings while preserving order and avoiding duplicates.
+
+    Args:
+        existing_stops: First list (or string/iterable) of stop strings.
+        requested_stops: Second list (or string/iterable) of stop strings to
+            be merged after existing ones.
+
+    Returns:
+        Combined list of unique stop strings preserving original order.
+    """
     merged = _normalize_stop_list(existing_stops)
     for stop in _normalize_stop_list(requested_stops):
         if stop not in merged:
@@ -268,7 +334,21 @@ def _merge_stop_lists(existing_stops: Any, requested_stops: Any) -> list[str]:
 def _coerce_sampling_params_template(
     sampling_params: SamplingParams | collections.abc.Mapping[str, Any] | None,
 ) -> tuple[SamplingParams | None, frozenset[str]]:
-    """Normalize a benchmark sampling_params template into SamplingParams."""
+    """Normalize a benchmark sampling_params template into SamplingParams.
+
+    Args:
+        sampling_params: A :class:`SamplingParams` instance, a mapping of
+            sampling kwargs, or ``None``.
+
+    Returns:
+        Tuple of ``(template, explicit_fields)`` where ``template`` is a
+        cloned :class:`SamplingParams` (or ``None``) and ``explicit_fields``
+        is the frozenset of field names that were explicitly provided.
+
+    Raises:
+        TypeError: If ``sampling_params`` is neither a SamplingParams
+            instance nor a mapping.
+    """
     if sampling_params is None:
         return None, frozenset()
 
@@ -712,6 +792,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 return model(input_ids=input_ids, attention_mask=attention_mask).logits
 
             def _call(input_ids, attention_mask):
+                """Bind ``scoring_model`` and forward to the jitted scorer."""
                 return _forward(scoring_model, input_ids, attention_mask)
 
             self._scoring_logits_fn = _call
@@ -1052,7 +1133,18 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         return prompts, generation_kwargs
 
     def _maybe_normalize_math(self, generations: list[str], instances) -> list[str]:
-        """Apply math answer normalization for GSM-like tasks when enabled."""
+        """Apply math answer normalization for GSM-like tasks when enabled.
+
+        Args:
+            generations: Model outputs aligned positionally with
+                ``instances``.
+            instances: lm-eval instance objects whose ``task_name`` attribute
+                drives the math-task detection.
+
+        Returns:
+            The list of generations, with math-task entries normalized to end
+            with a ``#### <answer>`` line when an answer can be extracted.
+        """
         if not self.normalize_math_answers:
             return generations
         normalized: list[str] = []

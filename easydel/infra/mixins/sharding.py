@@ -52,7 +52,47 @@ from easydel.utils.traversals import flatten_dict
 
 
 class EasyShardingMixin:
-    """Mixin providing sharding and partitioning functionality for EasyDeL modules."""
+    """Mixin that gives :class:`EasyDeLBaseModule` its sharding/gathering surface area.
+
+    ``EasyShardingMixin`` is the host-class facade over the lower-level
+    :mod:`easydel.infra.sharding` resolver. It expects to be mixed into a
+    SpecTrax module that exposes a ``config`` carrying a
+    :class:`RuntimeShardingResolver` and one or more JAX device meshes; in
+    return, it provides the methods used throughout EasyDeL to:
+
+    - **Inspect** how the module is or should be sharded:
+      :attr:`shardings`, :attr:`parameters_sharding`,
+      :attr:`graphstate_sharding`, :attr:`graphother_sharding`, and
+      :attr:`runtime_sharding_resolver` expose the active sharding metadata
+      derived from variable annotations.
+    - **Resolve** generic sharding pytrees from regex rules:
+      :meth:`resolve_shardings_regex` returns one ``(regex, NamedSharding)``
+      rule per ``(variable, alias)`` so that pipeline-parallel layers retain
+      per-stage submesh assignments, and :meth:`resolve_sharding_for_tree`
+      maps an arbitrary parameter pytree onto those rules with a replicated
+      fallback for tiny/scalar leaves.
+    - **Apply** the resulting sharding to live arrays:
+      :meth:`apply_sharding_for_tree` device-puts each leaf, while
+      :meth:`shard_model` and :meth:`gather_model` provide the high-level
+      "split, transform, recombine" path used by trainers.
+      :meth:`apply_out_shardings` and :meth:`fully_gather` use ``spx.jit``
+      with ``out_shardings`` so that MPMD meshes route through ``sxjit`` and
+      gathering across pipeline stages becomes a scheduled cross-mesh
+      transfer rather than an unsharded copy.
+    - **Pick a mesh**: :attr:`mesh`, :attr:`explicit_mesh`,
+      :attr:`manual_mesh`, :meth:`mesh_call`, and :meth:`_get_mesh` provide
+      the canonical entry points so callers don't have to repeat
+      ``self.config.mesh`` in every site.
+
+    The mixin holds no state of its own — every operation is derived from
+    ``self.config`` and the live SpecTrax variable metadata, so operations
+    are safe to call any number of times.
+
+    Attributes:
+        config (Any): The host module's :class:`EasyDeLBaseConfig` instance.
+            Read for ``mesh``, ``explicit_mesh``, ``manual_mesh``, and
+            ``runtime_sharding_resolver``.
+    """
 
     config: tp.Any
 
@@ -257,6 +297,19 @@ class EasyShardingMixin:
         return tuple(rules)
 
     def resolve_sharding_for_tree(self, tree=None, *, mesh: spx.SpxMesh | None = None):
+        """Build a NamedSharding pytree mirroring *tree* using regex rules.
+
+        Resolves each leaf path against the model's regex sharding rules and
+        falls back to a fully-replicated sharding for tiny or scalar leaves.
+
+        Args:
+            tree: A parameter pytree (defaults to ``self.graphstate_shape``).
+            mesh: Optional mesh override; defaults to the config mesh.
+
+        Returns:
+            Any: A pytree of :class:`NamedSharding` objects with the same
+            structure as *tree*.
+        """
         from easydel.infra.utils import jax_path_to_string
 
         mesh = self._get_mesh(mesh)
@@ -267,6 +320,16 @@ class EasyShardingMixin:
         rules = self.resolve_shardings_regex(mesh=mesh)
 
         def _spec_for(path: str, leaf: tp.Any):
+            """Resolve the NamedSharding for a single ``(path, leaf)`` pair.
+
+            Args:
+                path: Stringified pytree path for the leaf.
+                leaf: The pytree leaf (typically a shape-bearing array).
+
+            Returns:
+                NamedSharding: A regex-matched sharding, or the replicated
+                fallback for small/scalar/non-array leaves.
+            """
             if (
                 (hasattr(leaf, "shape") and int(numpy.prod(leaf.shape)) < 128)
                 or (len(getattr(leaf, "shape", ())) == 0)
@@ -294,6 +357,16 @@ class EasyShardingMixin:
         return jax.tree_util.tree_map_with_path(lambda path, leaf: _spec_for(jax_path_to_string(path), leaf), tree)
 
     def apply_sharding_for_tree(self, tree, *, mesh: spx.SpxMesh | None = None):
+        """Apply :meth:`resolve_sharding_for_tree` results to a value tree.
+
+        Args:
+            tree: A pytree of arrays to be device-placed.
+            mesh: Optional mesh override.
+
+        Returns:
+            Any: The tree with each leaf device-put under the resolved
+            NamedSharding (donating the original buffer).
+        """
         shardings = self.resolve_sharding_for_tree(tree, mesh=mesh)
         return jax.tree_util.tree_map(lambda x, s: jax.device_put(x, s, donate=True), tree, shardings)
 
@@ -340,6 +413,14 @@ class EasyShardingMixin:
         _shard_keys = list(sharding_fns.keys())
 
         def _apply_state(state: spx.State) -> spx.State:
+            """Apply the sharding-fn map to a single SpectraX state container.
+
+            Args:
+                state: A :class:`spx.State` of leaves.
+
+            Returns:
+                spx.State: A new state with eligible leaves transformed.
+            """
             new_data: dict[str, dict[str, tp.Any]] = {}
             for c, p, leaf in state.items():
                 path = tuple((c + "/" + p).split("/"))
@@ -481,6 +562,16 @@ class EasyShardingMixin:
         # sxjit and per-stage out_shardings land on the right submesh.
         @partial(spx.jit, mesh=self.mesh, out_shardings=out_shardings)
         def _call(graphstate, graphother):
+            """Identity ``spx.jit`` wrapper that pins outputs to ``out_shardings``.
+
+            Args:
+                graphstate: SpectraX parameter state.
+                graphother: SpectraX non-parameter state.
+
+            Returns:
+                tuple: ``(graphstate, graphother)`` re-emitted with the
+                requested out-shardings.
+            """
             return graphstate, graphother
 
         splits[1:] = _call(*splits[1:])
@@ -510,6 +601,14 @@ class EasyShardingMixin:
 
         @partial(spx.jit, mesh=self.mesh, out_shardings=shardings)
         def _apply(state):
+            """Identity ``spx.jit`` wrapper enforcing replicated out-shardings.
+
+            Args:
+                state: The combined SpectraX state to be re-emitted.
+
+            Returns:
+                Any: The same state with replicated out-shardings applied.
+            """
             return state
 
         gstate = _apply(gstate)

@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the offline distillation trainer.
+
+Defines :class:`DistillationConfig`, including the temperature, the
+KL/CE mixing weight ``alpha``, and optional projection-head configs
+for hidden-state and routing-logit matching.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -25,41 +32,75 @@ from ..training_configurations import TrainingArguments
 @Registry.register("trainer-arguments", "distillation")
 @dataclass
 class DistillationConfig(TrainingArguments):
-    """Configuration class for knowledge distillation training.
+    """Configuration class for offline knowledge distillation training.
 
-    This configuration extends TrainingArguments with parameters specific to
-    knowledge distillation, where a smaller student model learns to mimic
-    a larger teacher model's behavior.
+    Trains a student model against a frozen teacher model using a
+    convex combination of:
 
-    Knowledge distillation uses temperature scaling to soften the probability
-    distributions from both models, allowing the student to learn from the
-    teacher's confidence across all classes rather than just hard labels.
+    * a temperature-softened KL on the next-token distributions
+      ``KL(softmax(student / T) || softmax(teacher / T)) * T**2``, and
+    * the standard supervised cross-entropy on the ground-truth labels
+      (when present).
+
+    Optionally adds two further matching terms when the corresponding
+    weights are positive:
+
+    * **Hidden-state matching** -- MSE between selected layers of the
+      student and teacher hidden states (after a learned projection
+      when shapes differ).
+    * **Attention matching** -- distance between selected layers'
+      attention probability tensors (with optional L1 renormalization
+      when one model emits unnormalized attention).
+
+    Construct using dict-literal kwargs:
+
+    >>> cfg = DistillationConfig(temperature=5.0, alpha=0.7,
+    ...                          learning_rate=1e-4)
+
+    The total loss is
+    ``alpha * KD + (1 - alpha) * CE + hidden_w * hidden_loss
+    + attn_w * attn_loss``.
 
     Attributes:
-        trainer_prefix (str | None): Prefix for trainer logs and checkpoints.
-            Default: "distillationtrainer"
-        temperature (float): Temperature parameter for softening probability
-            distributions. Higher values create softer distributions, revealing
-            more information about the teacher's relative confidence across classes.
-            Typical values range from 3.0 to 10.0. Default: 2.0
-        alpha (float): Weight balancing distillation loss vs supervised loss.
-            - alpha=1.0: Pure distillation (only learn from teacher)
-            - alpha=0.0: Pure supervised learning (only learn from labels)
-            - 0<alpha<1: Combination of both losses
-            Default: 0.9 (90% distillation, 10% supervised)
-
-    Example:
-        >>> config = DistillationConfig(
-        ...     temperature=5.0,
-        ...     alpha=0.7,
-        ...     learning_rate=1e-4,
-        ...     num_train_epochs=10
-        ... )
-
-    Note:
-        The distillation loss is computed as:
-        Loss = alpha * KL(student/T, teacher/T) + (1-alpha) * CE(student, labels)
-        where T is the temperature parameter.
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"Distillation"``).
+        temperature: Softmax temperature applied to both student and
+            teacher logits before computing the KL term. Larger values
+            (3-10) reveal more of the teacher's relative confidence
+            ordering. Default ``2.0``.
+        alpha: Mixing weight on the distillation term. ``1.0`` is pure
+            distillation; ``0.0`` is pure supervised CE. Must be in
+            ``[0, 1]`` (validated in ``__post_init__``). Default ``0.9``.
+        dataset_text_field: Field name read by the SFT-style
+            tokenization fallback when the dataset is plain text.
+            Default ``"text"``.
+        assistant_only_loss: When ``True``, the supervised CE term is
+            masked to assistant/completion tokens only (requires a
+            chat-style tokenization that emits an assistant mask).
+        completion_only_loss: Deprecated alias for
+            ``assistant_only_loss``; if explicitly set, it overrides.
+        hidden_state_loss_weight: Coefficient on the hidden-state
+            matching term. ``None`` (or non-positive) disables that
+            term.
+        hidden_state_layers: Tuple of layer indices to match in the
+            hidden-state term. Negative indices follow Python
+            convention. ``None`` matches the last layer only.
+        hidden_state_loss: Distance function for hidden-state
+            matching. Currently only ``"mse"``.
+        attention_loss_weight: Coefficient on the attention matching
+            term. ``None`` (or non-positive) disables it.
+        attention_layers: Tuple of attention-layer indices to match.
+            ``None`` matches all available layers.
+        attention_normalize: When ``True``, L1-normalises attention
+            tensors before computing the distance (use when one of
+            the models exposes unnormalized weights).
+        logits_chunk_size: When set, computes the KL term in
+            sequence-axis chunks of this size instead of materialising
+            the full ``[B, L, V]`` student logits tensor at once.
+            Trades a small amount of extra compute (LM head recomputed
+            per chunk in the backward pass) for an ``O(L)`` -> ``O(chunk)``
+            peak memory reduction. Recommended values 128-512 for
+            large vocabularies; ``None`` disables chunking.
     """
 
     trainer_prefix: str | None = field(
@@ -164,6 +205,19 @@ class DistillationConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
+        """Finalize distillation-specific config invariants.
+
+        Mirrors the legacy ``completion_only_loss`` flag onto the
+        canonical ``assistant_only_loss``, normalises the optional
+        layer-index lists into tuples for hashing, and forwards
+        ``max_sequence_length`` / ``quantization_block`` to the base
+        :class:`TrainingArguments.__post_init__`.
+
+        Args:
+            max_sequence_length: Legacy alias for ``max_length``.
+            quantization_block: Legacy alias for the quantization group
+                size.
+        """
         if self.completion_only_loss is not None:
             self.assistant_only_loss = bool(self.completion_only_loss)
         self.completion_only_loss = bool(self.assistant_only_loss)

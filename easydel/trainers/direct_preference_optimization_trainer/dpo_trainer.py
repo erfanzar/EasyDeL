@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Direct Preference Optimization (DPO) trainer.
+
+DPO -- introduced by Rafailov et al. (2023) -- aligns a language model
+to human preferences without a reward model.  Given pairs
+``(prompt, chosen, rejected)`` the trainer maximises a simple
+log-likelihood-ratio margin between the policy and a frozen reference,
+optionally with several loss variants (sigmoid, IPO, hinge, KTO-style,
+SimPO, etc.).
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -96,6 +106,31 @@ class DPOTrainer(Trainer):
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         data_collator: tp.Callable | None = None,
     ):
+        """Initialize the DPO trainer.
+
+        Resolves the policy and reference states (deep-copying the
+        policy when no reference is provided), configures the padding
+        value, builds the default preference collators, and forwards
+        construction to :class:`Trainer`.
+
+        Args:
+            arguments: DPO-specific training configuration.  Required.
+            model: Policy module or state.
+            reference_model: Optional reference module/state; deep-
+                copied from ``model`` when omitted.
+            processing_class: Tokenizer/processor used to encode
+                preference triples.
+            train_dataset: Training dataset of preference triples.
+            eval_dataset: Optional evaluation dataset.
+            data_collator: Optional custom collator; otherwise the
+                default :class:`DataCollatorForPreferenceTFDS`/
+                :class:`DataCollatorForPreferenceGrain` is built.
+
+        Raises:
+            ValueError: If ``arguments`` or ``processing_class`` is
+                missing, or no padding token can be determined.
+            TypeError: If ``arguments`` is not a :class:`DPOConfig`.
+        """
         if arguments is None:
             raise ValueError("arguments cannot be None")
         if not isinstance(arguments, DPOConfig):
@@ -189,6 +224,13 @@ class DPOTrainer(Trainer):
         return self._build_preprocess_transform()
 
     def _build_preprocess_transform(self) -> DPOPreprocessTransform:
+        """Construct a :class:`DPOPreprocessTransform` from the trainer's config.
+
+        Returns:
+            A transform that tokenizes ``(prompt, chosen, rejected)``
+            triples using the trainer's processing class and configured
+            length caps.
+        """
         return DPOPreprocessTransform(
             tokenizer=self.processing_class,
             max_prompt_length=self.arguments.max_prompt_length,
@@ -199,6 +241,15 @@ class DPOTrainer(Trainer):
 
     @staticmethod
     def _source_is_pretokenized(source: "ShardedDataSource | None") -> bool:
+        """Detect whether ``source`` already contains DPO-tokenized fields.
+
+        Args:
+            source: Optional :class:`ShardedDataSource`.
+
+        Returns:
+            ``True`` when the first sample exposes ``prompt_input_ids``;
+            ``False`` for empty / missing sources.
+        """
         if source is None:
             return False
         try:
@@ -209,6 +260,17 @@ class DPOTrainer(Trainer):
 
     @staticmethod
     def _source_has_reference_logps(source: "ShardedDataSource | None") -> bool:
+        """Detect whether ``source`` already contains precomputed reference logps.
+
+        Args:
+            source: Optional :class:`ShardedDataSource`.
+
+        Returns:
+            ``True`` when the first sample exposes either of the
+            recognised reference-logp column-pair conventions
+            (``ref_chosen_logps``/``ref_rejected_logps`` or the legacy
+            ``reference_*_log_probs`` aliases).
+        """
         if source is None:
             return False
         try:
@@ -223,6 +285,15 @@ class DPOTrainer(Trainer):
         self,
         dataset: "Dataset | IterableDataset | ShardedDataSource | None",
     ) -> "ShardedDataSource | None":
+        """Wrap a dataset in a sharded source, applying DPO tokenization if needed.
+
+        Args:
+            dataset: Raw dataset (may be ``None``).
+
+        Returns:
+            A :class:`ShardedDataSource` carrying either the
+            already-tokenized rows or a freshly attached DPO transform.
+        """
         source = self._to_sharded_source(dataset)
         if source is None or self._source_is_pretokenized(source):
             return source
@@ -233,7 +304,22 @@ class DPOTrainer(Trainer):
         return self._source_is_pretokenized(self._train_source)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile training and evaluation step functions."""
+        """Build the JIT-compiled DPO training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, partials
+        the chosen/rejected concatenated forward with all
+        tokenisation knobs from the config, compiles it through
+        :func:`compile_trainer_auxiliary` (so it can be reused as a
+        stand-alone reference scoring path), and finally compiles
+        :func:`training_step` and :func:`evaluation_step` with the
+        right input/output shardings, donated argnums, and the active
+        MPMD pipeline schedule.
+
+        Returns:
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the reference mesh,
+            and the streaming checkpoint manager.
+        """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
         straight_through_emulator = resolve_straight_through_emulator(
@@ -357,7 +443,20 @@ class DPOTrainer(Trainer):
         return self.input_data_collator_tfds
 
     def configure_dataloaders(self):
-        """Configure dataloaders with optional precomputed reference log probs."""
+        """Build train/eval dataloaders, optionally caching reference logps.
+
+        When ``arguments.precompute_ref_log_probs`` is set (and the
+        dataset does not already carry ``ref_chosen_logps`` /
+        ``ref_rejected_logps``), iterates the dataset once through the
+        reference model and stores the per-example reference logps as
+        new dataset columns. This eliminates the per-step reference
+        forward during training at the cost of a larger materialised
+        dataset.
+
+        Returns:
+            The base trainer's dataloader objects after any reference
+            precomputation step has run.
+        """
         if self.dataset_train is not None:
             if self._source_has_reference_logps(self._train_source):
                 self._precomputed_train_ref_log_probs = True
@@ -393,6 +492,29 @@ class DPOTrainer(Trainer):
         is_train: bool,
         desc: str,
     ) -> bool:
+        """Precompute and attach reference log-probs for one dataset split.
+
+        Iterates the dataloader once (in eval mode), runs the reference
+        model's concatenated forward to obtain
+        ``(ref_chosen_logp, ref_rejected_logp)`` per example, and adds
+        the resulting columns back onto the underlying HF dataset.  The
+        sharded source is rebuilt so subsequent iterations consume the
+        cached values.
+
+        Args:
+            dataset_attr: Trainer attribute holding the HF dataset to
+                augment (e.g. ``"dataset_train"``).
+            source_attr: Trainer attribute holding the corresponding
+                :class:`ShardedDataSource` (e.g. ``"_train_source"``).
+            batch_size: Batch size to use during precomputation.
+            is_train: Whether the split is the training split.
+            desc: Description shown by the tqdm progress bar.
+
+        Returns:
+            ``True`` when reference logps were successfully computed and
+            attached, ``False`` when the split is missing or its
+            backing dataset does not support ``add_column``.
+        """
         dataset = getattr(self, dataset_attr)
         source = getattr(self, source_attr)
 
@@ -442,7 +564,23 @@ class DPOTrainer(Trainer):
         self,
         padded_batch: dict,
     ) -> tuple[tp.Any, tp.Any]:
-        """Compute log probabilities of the reference model for a batch."""
+        """Score a preference batch under the frozen reference model.
+
+        Used by :meth:`_precompute_reference_log_probs_for_split` to
+        cache reference logps and by ad-hoc evaluation. Falls back to
+        the policy model when no separate reference state is wired up
+        (typical for ``reference_free`` runs that still want
+        diagnostics).
+
+        Args:
+            padded_batch: A DPO batch already padded by the data
+                collator.
+
+        Returns:
+            ``(ref_chosen_logps, ref_rejected_logps)``: per-example
+            summed log-probs of the chosen and rejected completions
+            under the reference.
+        """
         reference_model = self.model_state.model if self.reference_state is None else self.reference_state.model
         reference_model.eval()
         forward_fn = getattr(self, "concatenated_forward", None)
@@ -465,10 +603,12 @@ class DPOTrainer(Trainer):
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Forward the reference state alongside the shared training step."""
         return (self.reference_state,)
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Forward the reference state alongside the shared evaluation step."""
         return (self.reference_state,)
 
     def on_step_end(

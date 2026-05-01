@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the SmolLM3 model family.
+
+Defines :class:`SmolLM3Config`, the EasyDeL configuration object for
+HuggingFace's SmolLM3 small decoder-only language model. SmolLM3 uses
+RMSNorm, SwiGLU MLP, GQA, RoPE, and a "NoPE"-style schedule where
+selected layers omit rotary position embeddings entirely (controlled by
+``no_rope_layers``).
+"""
 
 import typing
 
@@ -120,6 +128,14 @@ class SmolLM3Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize SmolLM3Config.
+
+        See the class docstring for parameter semantics. ``no_rope_layers``
+        and ``no_rope_layer_interval`` together control SmolLM3's
+        characteristic NoPE schedule (selected layers omit rotary
+        position embeddings). ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -176,7 +192,20 @@ class SmolLM3Config(EasyDeLBaseConfig):
         )
 
     def _rope_scaling_validation(self):
-        """Validate rope_scaling configuration."""
+        """Validate and normalise the ``rope_scaling`` configuration.
+
+        SmolLM3 supports ``"linear"`` and ``"dynamic"`` scaling. The
+        validator (a) accepts ``"rope_type"`` as an alias for
+        ``"type"`` for forward-compat with newer HF schemas, (b)
+        clears ``rope_scaling`` to ``None`` when the requested type is
+        ``"default"``/``None`` so downstream code can use a simple
+        ``is None`` check, and (c) coerces the ``factor`` field to
+        ``float`` while requiring ``factor >= 1``.
+
+        Raises:
+            ValueError: When ``rope_scaling`` is not a mapping, uses an
+                unknown type, or carries a non-float / sub-unity factor.
+        """
         if self.rope_scaling is None:
             return
 
@@ -207,7 +236,20 @@ class SmolLM3Config(EasyDeLBaseConfig):
         self.rope_scaling = {"type": rope_scaling_type, "factor": rope_scaling_factor}
 
     def _validate_no_rope_layers(self):
-        """Validate no_rope_layers list."""
+        """Sanity-check the per-layer NoPE flag list.
+
+        Each entry of ``no_rope_layers`` is a 0/1 indicator that
+        controls whether the corresponding decoder layer applies RoPE
+        (1) or skips it entirely (0; "NoPE" layers in SmolLM3
+        terminology). The validator confirms the length matches
+        ``num_hidden_layers`` and that every entry is one of the two
+        allowed values.
+
+        Raises:
+            ValueError: If the list length differs from
+                ``num_hidden_layers`` or contains any value other than
+                0/1.
+        """
         if len(self.no_rope_layers) != self.num_hidden_layers:
             raise ValueError(
                 f"`no_rope_layers` must have length equal to `num_hidden_layers` ({self.num_hidden_layers}), "
@@ -219,7 +261,17 @@ class SmolLM3Config(EasyDeLBaseConfig):
                 raise ValueError(f"`no_rope_layers[{idx}]` must be 0 or 1, got {use_rope}")
 
     def _validate_layer_types(self):
-        """Validate layer_types list."""
+        """Sanity-check the per-layer attention-type list.
+
+        SmolLM3 lets the configuration mix sliding-window and full
+        attention layers via ``layer_types``. The validator ensures the
+        list has exactly ``num_hidden_layers`` entries and that each
+        entry is one of ``"sliding_attention"`` or ``"full_attention"``.
+
+        Raises:
+            ValueError: If the list length is wrong or contains an
+                unsupported attention type.
+        """
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError(
                 f"`layer_types` must have length equal to `num_hidden_layers` ({self.num_hidden_layers}), "

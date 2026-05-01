@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Loss and step implementations for the GKD trainer.
+
+Implements the generalised Jensen-Shannon divergence (GJSD) loss that
+interpolates between forward and reverse KL by ``beta``, mixed with a
+supervised cross-entropy term, and the scheduled-VJP variants for
+MPMD pipeline parallelism.
+"""
 
 from __future__ import annotations
 
@@ -56,6 +63,15 @@ def _stop_gradient_tree(tree):
     """
 
     def _maybe_stop(x):
+        """Apply ``jax.lax.stop_gradient`` to JAX-array leaves only.
+
+        Args:
+            x: Pytree leaf (JAX array or Python value).
+
+        Returns:
+            ``x`` with ``stop_gradient`` applied if it is a JAX array,
+            otherwise unchanged.
+        """
         if isinstance(x, jax.Array):
             return jax.lax.stop_gradient(x)
         return x
@@ -86,21 +102,37 @@ def generalized_jsd_loss(
     beta: float = 0.5,
     temperature: float = 1.0,
 ) -> jax.Array:
-    """Compute generalized Jensen-Shannon divergence for knowledge distillation.
+    """Compute the generalized Jensen-Shannon divergence used by GKD.
 
-    Implements the generalized JSD loss from Agarwal et al. (2024). When beta=0,
-    reduces to KL(student || teacher); when beta=1, reduces to KL(teacher || student).
+    From Agarwal et al. 2024. Given the temperature-softened
+    distributions ``p_s = softmax(student / T)`` and
+    ``p_t = softmax(teacher / T)`` and a midpoint
+    ``m = beta * p_s + (1 - beta) * p_t``, the loss is the convex
+    combination
+    ``beta * KL(p_t || m) + (1 - beta) * KL(p_s || m)``.
+    The ``beta`` knob therefore interpolates the GKD objective between
+    forward KL (``beta == 0``: ``KL(p_s || p_t)``) and reverse KL
+    (``beta == 1``: ``KL(p_t || p_s)``); the canonical JSD corresponds
+    to ``beta == 0.5``. The midpoint ``m`` is computed in log-space via
+    ``logsumexp`` for numerical stability.
+
+    Per-token contributions are masked by ``mask`` (preferred) or
+    ``labels != -100`` and averaged over the masked positions.
 
     Args:
-        student_logits: Student model logits.
-        teacher_logits: Teacher model logits.
-        labels: Optional labels for masking (-100 positions are ignored).
-        mask: Optional explicit mask for valid positions.
-        beta: Interpolation factor between student and teacher KL.
-        temperature: Temperature for softmax scaling.
+        student_logits: ``[batch, seq, vocab]`` raw student logits.
+        teacher_logits: ``[batch, seq, vocab]`` raw teacher logits
+            (caller should stop-gradient).
+        labels: Optional ``[batch, seq]`` int labels; positions equal
+            to ``-100`` are excluded.
+        mask: Optional explicit ``[batch, seq]`` valid-position mask;
+            takes priority over ``labels`` when both are provided.
+        beta: Interpolation factor in ``[0, 1]``.
+        temperature: Softmax temperature ``T``. Larger values produce
+            softer distributions.
 
     Returns:
-        Scalar loss value.
+        Scalar mean per-token GJSD across the masked positions.
     """
     student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
     teacher_log_probs = jax.nn.log_softmax(teacher_logits / temperature, axis=-1)
@@ -138,6 +170,22 @@ def generalized_jsd_loss(
 
 
 def _gkd_forward_logits(model, batch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
+    """Run ``model`` on ``batch`` and return token logits for GKD.
+
+    Drops loss-only fields (``labels``, ``completion_mask``,
+    ``assistant_masks``, ``teacher_logits``) so they don't reach the
+    model forward.
+
+    Args:
+        model: Student or teacher module.
+        batch: Input batch dictionary.
+
+    Returns:
+        ``[batch, seq_len, vocab_size]`` logits.
+
+    Raises:
+        TypeError: If the model does not return logits.
+    """
     call_kwargs = dict(batch)
     call_kwargs.pop("labels", None)
     call_kwargs.pop("completion_mask", None)
@@ -165,22 +213,41 @@ def gkd_step(
     temperature: float = 1.0,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """Execute GKD training or evaluation step.
+    """Run one GKD training or evaluation step.
+
+    Forwards the batch through both student and teacher, computes the
+    generalized Jensen-Shannon divergence (see
+    :func:`generalized_jsd_loss`), and -- when ``is_training`` is
+    ``True`` -- accumulates gradients via ``minibatch_call`` and
+    applies an optimizer update. The teacher forward is wrapped in
+    ``jax.checkpoint`` with ``nothing_saveable`` and stop-gradient'd
+    so its activations are not retained for backprop and so its
+    parameters can never receive gradient signal.
+
+    On-policy and ``seq_kd`` batch swaps are performed by the trainer
+    *before* this step is invoked; this function consumes whatever
+    ``batch`` it receives.
 
     Args:
-        student_state: Student model state.
-        batch: Input batch.
-        teacher_state: Teacher model state.
-        loss_config: Optional loss configuration.
-        learning_rate_fn: Function mapping step to learning rate.
-        partition_spec: Sharding specification.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
-        is_training: Whether this is a training step.
-        beta: Interpolation factor for generalized JSD.
-        temperature: Temperature for softmax scaling.
+        student_state: Student ``EasyDeLState`` being differentiated.
+        batch: Input batch with ``input_ids`` / ``attention_mask`` and
+            optional ``labels``, ``completion_mask``, ``assistant_masks``.
+        teacher_state: Frozen teacher ``EasyDeLState``.
+        loss_config: ``LossConfig`` controlling NaN handling.
+        learning_rate_fn: Schedule mapping step to learning rate.
+        partition_spec: Sharding spec applied to the input batch.
+        gradient_accumulation_steps: Gradient-accumulation factor.
+        is_training: When ``False`` skips gradient computation and
+            returns only ``LossMetrics``.
+        beta: GJSD interpolation knob in ``[0, 1]``.
+        temperature: GJSD softmax temperature.
+        straight_through_emulator: Optional STE callable applied to
+            the student graphstate before the forward pass (QAT path).
 
     Returns:
-        Updated student state and metrics (if training) or just metrics (if eval).
+        ``(new_state, metrics)`` when ``is_training`` is ``True``;
+        otherwise ``LossMetrics``. ``other_metrics["gkd_jsd_loss"]``
+        records the raw scalar GJSD value.
     """
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -190,6 +257,15 @@ def gkd_step(
     batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
     def teacher_forward(minibatch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
+        """Run the teacher in stop-gradient mode and return its logits.
+
+        Args:
+            minibatch: Input minibatch.
+
+        Returns:
+            ``[batch, seq_len, vocab_size]`` teacher logits with
+            gradients detached.
+        """
         teacher_call_kwargs = dict(minibatch)
         teacher_call_kwargs.pop("labels", None)
         teacher_call_kwargs.pop("completion_mask", None)
@@ -210,6 +286,15 @@ def gkd_step(
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         def _teacher_fwd(kw, t_graphstate):
+            """Re-materializable teacher forward used inside ``teacher_forward``.
+
+            Args:
+                kw: Dynamic kwargs for the teacher module call.
+                t_graphstate: Stop-gradient teacher graphstate.
+
+            Returns:
+                Stop-gradient teacher logits.
+            """
             teacher_module = teacher_state.merge(t_graphstate)
             teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
             return jax.lax.stop_gradient(teacher_outputs.logits)
@@ -220,6 +305,21 @@ def gkd_step(
         )
 
     def loss_fn(tree, minibatch):
+        """Compute the GKD loss for one minibatch.
+
+        Runs the student forward, the teacher forward (in
+        ``stop_gradient`` mode), and then evaluates the generalized
+        Jensen-Shannon divergence with optional masking from
+        ``completion_mask`` / ``attention_mask``.
+
+        Args:
+            tree: Student graphstate to differentiate against.
+            minibatch: One minibatch dict.
+
+        Returns:
+            ``(loss, metrics)`` where ``metrics`` records the GJSD
+            value under ``other_metrics["gkd_jsd_loss"]``.
+        """
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = student_state.merge(tree)
@@ -274,6 +374,17 @@ def gkd_step(
 
 
 def _prepare_gkd_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Inject precomputed teacher logits into ``call.batch`` for GKD.
+
+    Args:
+        call: The :class:`ScheduledStepCall` being prepared.
+
+    Returns:
+        A copy of ``call.batch`` with ``teacher_logits`` populated.
+
+    Raises:
+        RuntimeError: If no teacher state is available.
+    """
     batch = dict(call.batch)
     if "teacher_logits" in batch:
         return batch
@@ -292,6 +403,15 @@ def _prepare_gkd_scheduled_batch(call) -> dict[str, tp.Any]:
 
 
 def _gkd_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build a cache key for the GKD scheduled-loss compilation.
+
+    Args:
+        call: The current :class:`ScheduledStepCall`.
+
+    Returns:
+        A tuple covering ``beta``, ``temperature``, the partition spec,
+        and the quantization emulator identity.
+    """
     return scheduled_loss_cache_key(
         call,
         value_fields=("beta", "temperature", "partition_spec"),
@@ -300,11 +420,30 @@ def _gkd_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_gkd_scheduled_loss(call):
+    """Build a SpectraX-scheduled GKD scalar-loss closure for ``call``.
+
+    Args:
+        call: The :class:`ScheduledStepCall` carrying loss config.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> scalar`` evaluating the
+        generalized Jensen-Shannon divergence against precomputed
+        teacher logits.
+    """
     beta = call.get("beta", 0.5)
     temperature = call.get("temperature", 1.0)
     partition_spec = call.get("partition_spec")
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
+        """Compute the scalar GKD loss inside the SpectraX scheduled VJP.
+
+        Args:
+            tree: Student graphstate to differentiate against.
+            batch: Minibatch dict with precomputed ``teacher_logits``.
+
+        Returns:
+            The generalized JSD loss scalar.
+        """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
         labels = call_batch.get("labels")

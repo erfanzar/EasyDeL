@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen2 model implementation for EasyDeL.
+
+This module implements Alibaba's Qwen2 dense decoder-only architecture.
+Notable architectural traits:
+
+- RMSNorm normalization with pre-norm residual placement.
+- SwiGLU MLP with gate / up / down projections.
+- Grouped-query attention (GQA) with full RoPE.
+- Optional sliding-window attention controlled per layer via
+  ``layer_types``.
+- Optional weight tying between input embeddings and the LM head.
+
+Exposes :class:`Qwen2Model` (transformer trunk) and the task wrappers
+:class:`Qwen2ForCausalLM`, :class:`Qwen2ForSequenceClassification`, and
+the embedding-only :class:`Qwen2ForEmbedding`.
+"""
 
 from functools import partial
 
@@ -190,7 +206,18 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=True for query projection (Qwen2-specific)."""
+        """Build the query projection with the Qwen2 always-on bias.
+
+        Qwen2 attaches a learned bias to every QKV projection (in
+        contrast to Llama, which omits it). This override wires that
+        bias on for the ``Q`` ``ColumnParallelLinear`` while keeping
+        the rest of the construction inherited from
+        :class:`UnifiedAttention`.
+
+        Returns:
+            ColumnParallelLinear: Q projection mapping
+            ``hidden_size`` → ``num_attention_heads * head_dim``.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -203,7 +230,13 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=True for key projection (Qwen2-specific)."""
+        """Build the key projection with the Qwen2 always-on bias.
+
+        Output dim follows GQA: ``num_key_value_heads * head_dim``.
+
+        Returns:
+            ColumnParallelLinear: K projection.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
@@ -216,7 +249,12 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=True for value projection (Qwen2-specific)."""
+        """Build the value projection with the Qwen2 always-on bias.
+
+        Returns:
+            ColumnParallelLinear: V projection mapping
+            ``hidden_size`` → ``num_key_value_heads * head_dim``.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
@@ -229,7 +267,17 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=False for output projection (Qwen2-specific)."""
+        """Build the output projection without bias.
+
+        Qwen2 keeps the output projection bias-free even when QKV is
+        biased — the convention preserves the residual stream
+        magnitude. Maps ``num_attention_heads * head_dim`` back to
+        ``hidden_size`` via a row-parallel linear so the row-sharded
+        output reduces along the sequence dim cleanly.
+
+        Returns:
+            RowParallelLinear: O projection.
+        """
         from easydel.layers import RowParallelLinear
 
         return RowParallelLinear(
@@ -244,7 +292,15 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: Qwen2Config, dtype: jnp.dtype):
-        """Create Qwen2-specific rotary embedding layer."""
+        """Create the RoPE module for Qwen2 attention.
+
+        Qwen2 uses full (not partial) rotary embeddings, so both
+        ``head_size`` and ``rotary_dim`` are set to the full
+        ``head_dim``; the period is controlled by ``config.rope_theta``.
+
+        Returns:
+            RoPE module produced by ``config.get_basic_rope``.
+        """
         return config.get_basic_rope(
             head_size=config.hidden_size // config.num_attention_heads,
             rotary_dim=config.hidden_size // config.num_attention_heads,
@@ -253,7 +309,17 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config: Qwen2Config, rngs: spx.Rngs):
-        """Create attention performer with Qwen2's attention dropout."""
+        """Create the FlexibleAttention performer with Qwen2 settings.
+
+        Threads ``config.attention_dropout`` and the canonical
+        ``head_dim**-0.5`` softmax scale through to the shared
+        attention dispatcher.
+
+        Returns:
+            FlexibleAttentionModule: Attention dispatcher used by this
+            layer; selects an appropriate kernel based on the active
+            ``attention_type`` and ``sliding_window`` settings.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -575,6 +641,22 @@ class Qwen2Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Used as the body function for ``self.layers.scan``. Unpacks
+            the carry, runs ``block`` under the appropriate pipeline
+            stage context, accumulates per-layer hidden states /
+            attention weights when requested, and returns the updated
+            carry.
+
+            Args:
+                block: The current decoder layer being scanned.
+                carry: Tuple ``(hidden_states, cache_views,
+                    all_hidden_states, all_attentions, layer_idx)``.
+
+            Returns:
+                Updated carry tuple with ``layer_idx`` incremented.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
