@@ -1631,11 +1631,26 @@ def _create_source_from_inform(
         elif first_file.endswith(".txt"):
             source_type = "txt"
 
+    def _projection_columns() -> list[str] | None:
+        columns: list[str] = []
+
+        def add_column(value: Any) -> None:
+            if isinstance(value, str) and value and value not in columns:
+                columns.append(value)
+
+        add_column(inform_cfg.get("content_field"))
+        add_column(inform_cfg.get("pixel_field"))
+        for field in inform_cfg.get("additional_fields") or []:
+            add_column(field)
+        for field in (inform_cfg.get("format_fields") or {}).keys():
+            add_column(field)
+        return columns or None
+
     # Create appropriate source
     if source_type in ("json", "jsonl"):
         source = JsonShardedSource(files)
     elif source_type == "parquet":
-        source = ParquetShardedSource(files)
+        source = ParquetShardedSource(files, columns=_projection_columns())
     elif source_type == "arrow":
         source = ArrowShardedSource(files)
     elif source_type in ("csv", "tsv"):
