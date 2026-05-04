@@ -283,8 +283,8 @@ name = "array-record"
 version = "0.8.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "absl-py" },
-    { name = "etils", extra = ["epath"] },
+    { name = "absl-py", marker = "sys_platform != 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "etils", extra = ["epath"], marker = "sys_platform != 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/44/e0/90048c75afdbb7e49526fee93f7e113986565a0b36b7c779eb35f745ec7e/array_record-0.8.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:8a0caee17d2583638391fb9f90c9c12a43f9665576f18ec3604ba49d62bd2dcc", size = 3988901, upload-time = "2025-11-13T16:15:29.35Z" },
@@ -825,7 +825,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "setuptools", marker = "extra == 'profile'", specifier = ">=70,<81" },
-    { name = "spectrax-lib", editable = "../Spectrax" },
+    { name = "spectrax-lib", specifier = "==0.0.7" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = "~=2.19.0" },
     { name = "tensorflow-datasets", marker = "extra == 'tensorflow'", specifier = "~=4.9.9" },
@@ -1569,9 +1569,9 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
 ]
 dependencies = [
-    { name = "googleapis-common-protos" },
-    { name = "grpcio" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "googleapis-common-protos", marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
+    { name = "grpcio", marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8a/cd/89ce482a931b543b92cdd9b2888805518c4620e0094409acb8c81dd4610a/grpcio_status-1.78.0.tar.gz", hash = "sha256:a34cfd28101bfea84b5aa0f936b4b423019e9213882907166af6b3bddc59e189", size = 13808, upload-time = "2026-02-06T10:01:48.034Z" }
 wheels = [
@@ -4221,7 +4221,7 @@ wheels = [
 [[package]]
 name = "spectrax-lib"
 version = "0.0.7"
-source = { editable = "../Spectrax" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fsspec", extra = ["http"] },
     { name = "jax" },
@@ -4232,29 +4232,10 @@ dependencies = [
     { name = "tensorstore" },
     { name = "treescope" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "fsspec", extras = ["http"], specifier = ">=2024.2,<2026" },
-    { name = "jax", specifier = ">=0.10.0" },
-    { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.10.0" },
-    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.10.0" },
-    { name = "jaxlib", specifier = ">=0.10.0" },
-    { name = "myst-nb", marker = "extra == 'docs'", specifier = ">=1" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "optax", marker = "extra == 'contrib'", specifier = ">=0.2.8" },
-    { name = "protobuf", specifier = ">=5.29.6,<7" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
-    { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7" },
-    { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'", specifier = ">=2" },
-    { name = "sphinx-book-theme", marker = "extra == 'docs'", specifier = ">=1.1" },
-    { name = "sphinx-design", marker = "extra == 'docs'", specifier = ">=0.6" },
-    { name = "tensorstore", specifier = ">=0.1.76" },
-    { name = "treescope", specifier = ">=0.1.7" },
+sdist = { url = "https://files.pythonhosted.org/packages/b1/fd/2e99f778dc499d942bd48848aeb9adc68196938e89ab95f33d4f7b63a6e4/spectrax_lib-0.0.7.tar.gz", hash = "sha256:ee22a46afd5d448ad88484ffe7b06d002cc33e4b8bd5c8c6b9d49214153d44f6", size = 464324, upload-time = "2026-05-03T22:46:35.032Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/99/9e/2d164a121187e1bad8ca6b4f783f0107bfe39d87b58a7e71059a48a393c5/spectrax_lib-0.0.7-py3-none-any.whl", hash = "sha256:b98392eb076ce73f1a5217e277e4b1412066ed54aac644ce93a9b4345dfe159b", size = 550388, upload-time = "2026-05-03T22:46:33.627Z" },
 ]
-provides-extras = ["cuda", "tpu", "test", "dev", "contrib", "docs"]
 
 [[package]]
 name = "sqlitedict"
