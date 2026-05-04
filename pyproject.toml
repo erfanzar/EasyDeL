@@ -188,5 +188,4 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-spectrax-lib = { path = "../Spectrax", editable = true }
 torch = { index = "pytorch-cpu", marker = "extra == 'torch'" }
