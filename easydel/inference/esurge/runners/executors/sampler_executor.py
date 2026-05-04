@@ -281,30 +281,14 @@ class SamplerExecutor:
         )
 
         sampler_args = (
-            jnp.ones((int(padded_num_reqs), 1), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jnp.ones((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jnp.zeros((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
-            jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jnp.ones((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
-            jax.device_put(jnp.arange(int(padded_num_reqs), dtype=jnp.int32), self._empty_sharding),
-            jnp.ones((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
-            jnp.ones((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
-            jax.device_put(jnp.int32(int(padded_num_reqs)), self._empty_sharding),
-            jax.device_put(jnp.int32(int(num_tokens)), self._empty_sharding),
-            jnp.ones((int(padded_num_reqs),), dtype=inputs.req_num_tokens_full.dtype, out_sharding=self._empty_sharding),
-            jnp.ones((int(padded_num_reqs),), dtype=jnp.bool_, out_sharding=self._empty_sharding),
+            jnp.ones((6, int(padded_num_reqs)), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.zeros((7, int(padded_num_reqs)), dtype=jnp.int32, out_sharding=self._empty_sharding),
+            jnp.array([int(padded_num_reqs), int(num_tokens)], dtype=jnp.int32, out_sharding=self._empty_sharding),
             dummy_logits,
             jax.device_put(inputs.rng_key, self._empty_sharding),
             jnp.zeros(
                 (int(inputs.req_num_tokens_full.shape[0]), vocab_size),
                 dtype=jnp.uint32,
-                out_sharding=self._empty_sharding,
-            ),
-            jnp.zeros(
-                (int(padded_num_reqs),),
-                dtype=jnp.int32,
                 out_sharding=self._empty_sharding,
             ),
         )
@@ -330,117 +314,115 @@ class SamplerExecutor:
         Note:
             The returned function signature is:
             (
-                temperatures,
-                top_ps,
-                top_ks,
-                min_ps,
-                frequency_penalties,
-                presence_penalties,
-                repetition_penalties,
-                sampling_seeds,
-                scheduled,
-                seq_lens,
-                num_requests,
-                total_tokens,
-                req_num_tokens,
-                active_mask,
+                packed_f32,
+                packed_i32,
+                packed_misc_i32,
                 logits,
                 rng_key,
                 token_counts_full,
-                window_row_indices,
             ) -> (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts_full)
         """
 
         @ejit
         def _sampling_fn(
-            temperatures: jax.Array,
-            top_ps: jax.Array,
-            top_ks: jax.Array,
-            min_ps: jax.Array,
-            frequency_penalties: jax.Array,
-            presence_penalties: jax.Array,
-            repetition_penalties: jax.Array,
-            sampling_seeds: jax.Array,
-            scheduled: jax.Array,
-            seq_lens: jax.Array,
-            num_requests: jax.Array,
-            total_tokens: jax.Array,
-            req_num_tokens: jax.Array,
-            active_mask: jax.Array,
+            packed_f32: jax.Array,
+            packed_i32: jax.Array,
+            packed_misc_i32: jax.Array,
             logits: jax.Array,
             rng_key: jax.Array,
             token_counts_full: jax.Array,
-            window_row_indices: jax.Array,
         ):
-            batch_size = logits.shape[0]
-            i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
+            with jax.named_scope("easydel/esurge/sampler_step"):
+                batch_size = logits.shape[0]
+                i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
-            active_mask = (i_reqs < num_requests) & active_mask[:batch_size]
+                with jax.named_scope("easydel/esurge/sampler_step/unpack_metadata"):
+                    temperatures = packed_f32[0]
+                    top_ps = packed_f32[1]
+                    min_ps = packed_f32[2]
+                    frequency_penalties = packed_f32[3]
+                    presence_penalties = packed_f32[4]
+                    repetition_penalties = packed_f32[5]
+                    sampling_seeds = packed_i32[0]
+                    scheduled = packed_i32[1]
+                    seq_lens = packed_i32[2]
+                    window_row_indices = packed_i32[3]
+                    active_mask = packed_i32[4].astype(jnp.bool_)
+                    top_ks = packed_i32[5]
+                    req_num_tokens = packed_i32[6]
+                    num_requests = packed_misc_i32[0]
+                    total_tokens = packed_misc_i32[1]
+                    active_mask = (i_reqs < num_requests) & active_mask[:batch_size]
 
-            temp = temperatures[:batch_size].reshape(-1, 1).astype(logits.dtype)
-            temp = jnp.where(active_mask[:, None], temp, jnp.ones_like(temp))
-            topp = top_ps[:batch_size].astype(logits.dtype)
-            topk = top_ks[:batch_size].astype(jnp.int32)
-            minp = min_ps[:batch_size].astype(logits.dtype)
+                    temp = temperatures[:batch_size].reshape(-1, 1).astype(logits.dtype)
+                    temp = jnp.where(active_mask[:, None], temp, jnp.ones_like(temp))
+                    topp = top_ps[:batch_size].astype(logits.dtype)
+                    topk = top_ks[:batch_size].astype(jnp.int32)
+                    minp = min_ps[:batch_size].astype(logits.dtype)
 
-            is_all_greedy = jnp.all(jnp.where(active_mask[:, None], temp <= 0.0, True))
-            need_min_p_sampling = jnp.any((minp > 0.0) & active_mask)
-            need_history_penalties = jnp.any(
-                active_mask
-                & (
-                    (presence_penalties[:batch_size] != 0.0)
-                    | (frequency_penalties[:batch_size] != 0.0)
-                    | (repetition_penalties[:batch_size] != 1.0)
+                with jax.named_scope("easydel/esurge/sampler_step/penalty_flags"):
+                    is_all_greedy = jnp.all(jnp.where(active_mask[:, None], temp <= 0.0, True))
+                    need_min_p_sampling = jnp.any((minp > 0.0) & active_mask)
+                    need_history_penalties = jnp.any(
+                        active_mask
+                        & (
+                            (presence_penalties[:batch_size] != 0.0)
+                            | (frequency_penalties[:batch_size] != 0.0)
+                            | (repetition_penalties[:batch_size] != 1.0)
+                        )
+                    )
+                    window_rows = window_row_indices[:batch_size].astype(jnp.int32)
+
+                with jax.named_scope("easydel/esurge/sampler_step/apply_history_penalties"):
+                    logits = jax.lax.cond(
+                        need_history_penalties,
+                        lambda legi: apply_history_penalties_from_counts(
+                            legi,
+                            token_counts=token_counts_full[window_rows],
+                            active_mask=active_mask,
+                            presence_penalties=presence_penalties[:batch_size],
+                            frequency_penalties=frequency_penalties[:batch_size],
+                            repetition_penalties=repetition_penalties[:batch_size],
+                        ),
+                        lambda legi: legi,
+                        logits,
+                    )
+
+                sampling_metadata = SamplingMetadata(
+                    temperatures=temp,
+                    top_ps=topp,
+                    top_ks=topk,
+                    min_ps=minp,
+                    sampling_seeds=sampling_seeds[:batch_size],
+                    is_all_greedy=is_all_greedy,
+                    need_min_p_sampling=need_min_p_sampling,
+                    do_penalties=False,
+                    linear_penalty=None,
                 )
-            )
-            window_rows = window_row_indices[:batch_size].astype(jnp.int32)
 
-            logits = jax.lax.cond(
-                need_history_penalties,
-                lambda legi: apply_history_penalties_from_counts(
-                    legi,
-                    token_counts=token_counts_full[window_rows],
-                    active_mask=active_mask,
-                    presence_penalties=presence_penalties[:batch_size],
-                    frequency_penalties=frequency_penalties[:batch_size],
-                    repetition_penalties=repetition_penalties[:batch_size],
-                ),
-                lambda legi: legi,
-                logits,
-            )
+                with jax.named_scope("easydel/esurge/sampler_step/sample_tokens"):
+                    sampled_flat = sample_tokens_fn(logits, sampling_metadata, rng_key)
+                    rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
 
-            sampling_metadata = SamplingMetadata(
-                temperatures=temp,
-                top_ps=topp,
-                top_ks=topk,
-                min_ps=minp,
-                sampling_seeds=sampling_seeds[:batch_size],
-                is_all_greedy=is_all_greedy,
-                need_min_p_sampling=need_min_p_sampling,
-                do_penalties=False,
-                linear_penalty=None,
-            )
-
-            sampled_flat = sample_tokens_fn(logits, sampling_metadata, rng_key)
-            rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
-
-            scheduled_slice = scheduled[:batch_size]
-            seq_lens_now = seq_lens[:batch_size]
-            req_num_tokens_slice = req_num_tokens[:batch_size]
-            meets_len = seq_lens_now >= req_num_tokens_slice
-            valid_mask = (i_reqs < num_requests) & active_mask & (scheduled_slice > 0) & meets_len
-            out_tokens = jnp.where(valid_mask, sampled_flat, -1)
-            token_counts_full = jax.lax.cond(
-                need_history_penalties,
-                lambda counts: update_token_counts(
-                    counts,
-                    row_indices=window_rows,
-                    sampled_tokens=sampled_flat,
-                    valid_mask=valid_mask,
-                ),
-                lambda counts: counts,
-                token_counts_full,
-            )
-            return rng_key, out_tokens, valid_mask, token_counts_full
+                with jax.named_scope("easydel/esurge/sampler_step/valid_mask"):
+                    scheduled_slice = scheduled[:batch_size]
+                    seq_lens_now = seq_lens[:batch_size]
+                    req_num_tokens_slice = req_num_tokens[:batch_size]
+                    emits_next_token = seq_lens_now >= req_num_tokens_slice
+                    valid_mask = (i_reqs < num_requests) & active_mask & (scheduled_slice > 0) & emits_next_token
+                    out_tokens = jnp.where(valid_mask, sampled_flat, -1)
+                with jax.named_scope("easydel/esurge/sampler_step/update_token_counts"):
+                    token_counts_full = jax.lax.cond(
+                        need_history_penalties,
+                        lambda counts: update_token_counts(
+                            counts,
+                            row_indices=window_rows,
+                            sampled_tokens=sampled_flat,
+                            valid_mask=valid_mask,
+                        ),
+                        lambda counts: counts,
+                        token_counts_full,
+                    )
+                return rng_key, out_tokens, valid_mask, token_counts_full
 
         return _sampling_fn

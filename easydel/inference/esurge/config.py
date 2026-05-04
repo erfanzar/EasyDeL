@@ -33,7 +33,7 @@ Example:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, Unpack
 
 from spectrax.common_types import NOT_GIVEN, _Empty
 
@@ -46,35 +46,39 @@ else:
     MpMdSchedulers = object
 
 LONG_PREFILL_TRS: int = 2048
-
-PipelineInferenceMode: TypeAlias = Literal["auto", "on", "off"]
-PIPELINE_INFERENCE_MODES: frozenset[str] = frozenset(("auto", "on", "off"))
+PPMicrobatchPolicy = int | Literal["auto"] | None
 
 
-def normalize_pipeline_inference_mode(mode: str | None) -> PipelineInferenceMode:
-    """Normalize a pipeline-inference mode string to a canonical literal.
+def _normalize_pp_microbatch_policy(value: Any, *, field_name: str) -> PPMicrobatchPolicy:
+    """Normalize PP microbatch runtime knobs.
 
-    Args:
-        mode (str | None): Raw value from configuration. ``None`` is treated as
-            ``"auto"``; other values are lowercased and validated.
-
-    Returns:
-        The canonical literal — one of ``"auto"``, ``"on"``, or ``"off"``.
-
-    Raises:
-        ValueError: If ``mode`` is not in :data:`PIPELINE_INFERENCE_MODES`.
+    ``"auto"`` preserves the built-in policy, ``None`` or ``0`` disables the
+    wavefront path, and a positive integer pins either count or rows per
+    microbatch depending on the field being normalized.
     """
-    normalized = "auto" if mode is None else str(mode).lower()
-    if normalized not in PIPELINE_INFERENCE_MODES:
-        raise ValueError(f"pipeline_inference must be one of 'auto', 'on', or 'off'; got {mode!r}.")
-    return cast(PipelineInferenceMode, normalized)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "auto":
+            return "auto"
+        if lowered in {"none", "off", "disable", "disabled"}:
+            return None
+        try:
+            value = int(lowered)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be 'auto', None, 0, or a positive integer; got {value!r}") from exc
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {value}")
+    return None if value == 0 else value
 
 
 def _validate_esurge_runtime_config(self):
     """Validate and normalize an :class:`eSurgeRuntimeConfig` after construction.
 
     Wired via ``post_init`` of the ``@typed_config`` decorator. Mutates ``self``
-    in place to canonicalize ``pipeline_inference`` and ``kernel_tile_policy``.
+    in place to canonicalize ``kernel_tile_policy``.
 
     Args:
         self: The newly-built ``eSurgeRuntimeConfig`` (a dict subclass) whose
@@ -83,8 +87,8 @@ def _validate_esurge_runtime_config(self):
     Raises:
         ValueError: If any of ``max_model_len``, ``min_input_pad``,
             ``min_token_pad``, ``max_num_seqs``, ``max_num_batched_tokens``, or
-            ``long_prefill_token_threshold`` violates positivity / non-negativity
-            invariants, or if the pipeline / kernel-tile policy strings are
+            ``long_prefill_token_threshold`` violates positivity /
+            non-negativity invariants, or if the kernel-tile policy string is
             invalid.
     """
     if self.max_model_len <= 0:
@@ -100,7 +104,16 @@ def _validate_esurge_runtime_config(self):
             raise ValueError(f"max_num_batched_tokens must be positive, got {self.max_num_batched_tokens}")
     if self.long_prefill_token_threshold is not None and self.long_prefill_token_threshold < 0:
         raise ValueError(f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}")
-    self.pipeline_inference = normalize_pipeline_inference_mode(self.pipeline_inference)
+    self.pp_microbatch_count = _normalize_pp_microbatch_policy(
+        self.pp_microbatch_count,
+        field_name="pp_microbatch_count",
+    )
+    self.pp_microbatch_size = _normalize_pp_microbatch_policy(
+        self.pp_microbatch_size,
+        field_name="pp_microbatch_size",
+    )
+    if self.pp_microbatch_count not in ("auto", None) and self.pp_microbatch_size not in ("auto", None):
+        raise ValueError("Only one of pp_microbatch_count or pp_microbatch_size may be set to a positive integer.")
     self.kernel_tile_policy = normalize_kernel_tile_policy(self.kernel_tile_policy)
 
 
@@ -108,7 +121,6 @@ def _validate_esurge_runtime_config(self):
     defaults={
         "max_model_len": 8192,
         "esurge_name": None,
-        "pipeline_inference": "auto",
         "kernel_tile_policy": "auto",
         "min_input_pad": 16,
         "min_token_pad": None,
@@ -117,7 +129,6 @@ def _validate_esurge_runtime_config(self):
         "async_scheduling": True,
         "max_num_batched_tokens": NOT_GIVEN,
         "use_aot_forward": True,
-        "bind_graphstate_for_aot": False,
         "compile_runner": True,
         "runner_verbose": False,
         "overlap_execution": True,
@@ -125,6 +136,8 @@ def _validate_esurge_runtime_config(self):
         "long_prefill_token_threshold": None,
         "enable_window_aware_runtime_cap": False,
         "mpmd_scheduler": None,
+        "pp_microbatch_count": "auto",
+        "pp_microbatch_size": "auto",
     },
     post_init=_validate_esurge_runtime_config,
 )
@@ -142,19 +155,14 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     :meth:`eSurgeRuntimeConfig.from_dict` (or pass an instance directly to
     :class:`eSurge`) to construct one. The post-init validator
     :func:`_validate_esurge_runtime_config` enforces positivity / range
-    invariants on the integer fields and normalizes ``pipeline_inference`` /
-    ``kernel_tile_policy`` to their canonical literals.
+    invariants on the integer fields and normalizes ``kernel_tile_policy`` to
+    its canonical literal.
 
     Attributes:
         esurge_name: Optional human-readable engine name embedded into
             Prometheus metric labels and dashboard headers; useful when
             multiple engines run in the same process. ``None`` falls back
             to the model's repo id.
-        pipeline_inference: Pipeline-parallel inference mode. ``"auto"``
-            enables PP only when the model's mesh is a SpectraX MPMD mesh;
-            ``"on"`` forces PP and raises if the mesh is SPMD; ``"off"``
-            disables PP even on MPMD meshes (forces single-stage SPMD-style
-            execution).
         kernel_tile_policy: Tile-shape selection policy for the Pallas/GDN
             inference kernels. ``"auto"`` defers to per-backend heuristics;
             other values pin a specific tile recipe (see
@@ -167,21 +175,24 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             looking up a compiled executable; raising it reduces the number
             of compiled buckets but increases padding overhead.
         min_token_pad: Optional floor on the *token-count* bucket ladder.
-            ``None`` defers to a runtime default (``min_input_pad`` for SPMD,
-            ``1`` for PP so a single-token decode does not have to go through
-            the larger backbone bucket). Must be positive when set.
-        max_num_seqs: Hard ceiling on concurrent in-flight sequences. Acts
-            as the largest entry in the request-count bucket ladder. The
+            ``None`` defers to ``min_input_pad``. Set this explicitly when the
+            request-count floor and token-count floor should differ. Must be
+            positive when set.
+        max_num_seqs: Hard ceiling on concurrent in-flight sequences. The
             actual runtime concurrency may be smaller when KV pages are
             scarce.
         max_num_seq_buckets: Explicit list of bucket sizes for the
             request-count axis. ``None`` builds an exponential ladder from
-            ``min_input_pad`` up to ``max_num_seqs``. The largest entry is
-            always padded up to ``max_num_seqs``.
+            ``min_input_pad`` up to ``max_num_seqs``. Explicit buckets may be
+            larger than ``max_num_seqs`` when matching another serving
+            runtime's static request padding; scheduler admission remains
+            capped by ``max_num_seqs``.
         async_scheduling: When ``True``, the scheduler runs on a background
             thread so it can produce the next batch while the device finishes
             the previous one. Disable for deterministic step ordering or when
-            debugging scheduler-side races.
+            debugging scheduler-side races. PP MPMD keeps the requested value;
+            stage-to-stage sampled-token handoff belongs in the runner/runtime,
+            not in config policy that silently changes user intent.
         max_num_batched_tokens: Per-scheduler-step token budget. ``NOT_GIVEN``
             keeps the framework default (auto-sized from the cache metadata);
             ``None`` falls back to ``max_model_len``. Must be positive when
@@ -190,11 +201,6 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             compiled ahead of time per ``(num_tokens, padded_num_reqs)``
             bucket. When ``False``, ``spx.jit`` traces lazily on first use.
             AOT yields lower per-step host overhead but longer cold-start.
-        bind_graphstate_for_aot: When ``True`` (and ``use_aot_forward`` is
-            also ``True``), each AOT-compiled variant captures the live
-            graphstate / graphother as compile-time constants. This unlocks
-            weight-aware kernel specializations (e.g. TPU predecode-once)
-            but requires re-compilation when weights are swapped.
         compile_runner: When ``True``, runner-side helper kernels and
             bucketed model executables are pre-compiled at engine start.
             Setting to ``False`` defers compilation to the first matching
@@ -204,8 +210,11 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
         overlap_execution: When ``True``, the lifecycle loop dispatches the
             next scheduler step while the previous device step is still in
             flight. Mutually exclusive with multi-host distributed mode
-            (the lockstep control plane requires deterministic step
-            ordering).
+            (the lockstep control plane requires deterministic step ordering).
+            With ``async_scheduling`` enabled, the async-handle lifecycle loop
+            is used for both TP/SPMD and PP decode; the runner decides per step
+            whether device-resident sampled-token handoff is safe, otherwise it
+            drains before launching the next step.
         sampler_metrics: When ``True``, the sampler emits per-step
             log-probability tensors so downstream code can record token-level
             metrics. Adds an extra D2H copy each step.
@@ -222,10 +231,17 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             When provided, scheduled training-style MPMD runs can reuse the
             same schedule object inside the inference forward pass. ``None``
             uses the forward-only marker-cluster path.
+        pp_microbatch_count: Expert PP decode wavefront knob. ``"auto"``
+            keeps the built-in policy, ``None`` / ``0`` disables wavefront
+            microbatching, and a positive integer pins the maximum number of
+            decode microbatches to launch per active window.
+        pp_microbatch_size: Expert PP decode wavefront knob. ``"auto"``
+            keeps the built-in policy, ``None`` / ``0`` disables wavefront
+            microbatching, and a positive integer pins rows per microbatch.
+            Mutually exclusive with a positive ``pp_microbatch_count``.
     """
 
     esurge_name: NotRequired[str | None]
-    pipeline_inference: NotRequired[PipelineInferenceMode]
     kernel_tile_policy: NotRequired[KernelTilePolicy]
     max_model_len: NotRequired[int]
     min_input_pad: NotRequired[int]
@@ -235,7 +251,6 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     async_scheduling: NotRequired[bool]
     max_num_batched_tokens: NotRequired[int | None | _Empty]
     use_aot_forward: NotRequired[bool]
-    bind_graphstate_for_aot: NotRequired[bool]
     compile_runner: NotRequired[bool]
     runner_verbose: NotRequired[bool]
     overlap_execution: NotRequired[bool]
@@ -243,6 +258,8 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
     long_prefill_token_threshold: NotRequired[int | None]
     enable_window_aware_runtime_cap: NotRequired[bool]
     mpmd_scheduler: NotRequired[MpMdSchedulers | None]
+    pp_microbatch_count: NotRequired[PPMicrobatchPolicy]
+    pp_microbatch_size: NotRequired[PPMicrobatchPolicy]
 
     @classmethod
     def from_dict(

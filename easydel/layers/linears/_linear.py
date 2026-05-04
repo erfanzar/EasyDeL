@@ -326,19 +326,13 @@ class ParallelLinear(spx.Module):
 
         inputs_ndim: int = inputs_promoted.ndim
         inputs_gt_one_dim: bool = inputs_ndim > 1
-        subscript: str
         if inputs_gt_one_dim:
-            subscript = "...ik,...kj->...ij"
+            leading_shape = inputs_promoted.shape[:-1]
+            flat_inputs = jnp.reshape(inputs_promoted, (-1, inputs_promoted.shape[-1]))
+            flat_y = jnp.matmul(flat_inputs, kernel_promoted, precision=self.precision)
+            y: Shaped[Array, "... out_features"] = jnp.reshape(flat_y, (*leading_shape, kernel_promoted.shape[-1]))
         else:
-            subscript = "...k,...kj->...j"
-
-        y: Shaped[Array, "... out_features"] = jnp.einsum(
-            subscript,
-            inputs_promoted,
-            kernel_promoted,
-            precision=self.precision,
-            optimize=True,
-        )
+            y = jnp.matmul(inputs_promoted, kernel_promoted, precision=self.precision)
 
         y_scaled: Shaped[Array, "... out_features"] = self._scale_operator(y)
 

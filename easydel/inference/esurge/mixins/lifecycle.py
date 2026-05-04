@@ -28,6 +28,7 @@ Exposes :class:`EngineLifecycleMixin`, mixed into :class:`eSurge`.
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import threading
 import time
@@ -38,6 +39,7 @@ import jax
 import spectrax as spx
 
 from ..logger import logger
+from ..request import EngineRequestStatus
 from ..scheduler import Scheduler, SchedulerOutput
 
 MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
@@ -195,6 +197,62 @@ class EngineLifecycleMixin:
         except Exception:
             return False
         return True
+
+    def _apply_parser_stop_requests_locked(self, stop_string_finishes: dict[str, str]) -> None:
+        """Apply parser-detected stop strings while the scheduler lock is held.
+
+        Text parsing runs on the output worker, not on the generation thread.
+        When that worker discovers a stop string it must still tell the
+        scheduler to free the request, but it should never grab
+        ``_scheduler_lock`` itself. The worker enqueues a tiny stop-signal
+        packet and the generation loop drains it at scheduler-safe points.
+
+        Args:
+            stop_string_finishes: Mapping from request id to matched stop
+                string. The caller must hold ``_scheduler_lock``.
+        """
+        if not stop_string_finishes:
+            return
+        for rid, stop_reason in stop_string_finishes.items():
+            request = self.scheduler.requests.get(rid)
+            if request is not None:
+                request.stop_reason = stop_reason
+        self.scheduler.finish_requests(stop_string_finishes.keys(), EngineRequestStatus.FINISHED_STOPPED)
+
+    def _enqueue_parser_stop_requests(self, stop_string_finishes: dict[str, str]) -> None:
+        """Queue parser-detected stop strings for the generation thread.
+
+        This is intentionally non-blocking with respect to ``_scheduler_lock``.
+        It keeps reasoning/tool/stop-string parsing from contending with the
+        scheduler loop. Lightweight tests that do not define
+        ``_parser_stop_queue`` fall back to the old inline behaviour.
+        """
+        if not stop_string_finishes:
+            return
+        stop_queue = getattr(self, "_parser_stop_queue", None)
+        if stop_queue is None:
+            with self._scheduler_lock:
+                self._apply_parser_stop_requests_locked(dict(stop_string_finishes))
+            return
+        stop_queue.put(dict(stop_string_finishes))
+
+    def _drain_parser_stop_requests_locked(self) -> None:
+        """Drain queued parser stop signals on the generation thread.
+
+        Called immediately before ``scheduler.schedule()`` while
+        ``_scheduler_lock`` is already held. Merging all currently queued
+        packets keeps the scheduler transition tiny and deterministic.
+        """
+        stop_queue = getattr(self, "_parser_stop_queue", None)
+        if stop_queue is None:
+            return
+        merged: dict[str, str] = {}
+        while True:
+            try:
+                merged.update(stop_queue.get_nowait())
+            except queue.Empty:
+                break
+        self._apply_parser_stop_requests_locked(merged)
 
     @classmethod
     def _resolve_graphdef_for_weight_update(cls, model: EasyDeLBaseModule, split_graphdef=None):
@@ -364,6 +422,81 @@ class EngineLifecycleMixin:
                 continue
             self._request_outputs.pop(old_id, None)
 
+    def _start_engine_output_worker(self) -> None:
+        """Start the background parser/output worker when the engine owns one.
+
+        The scheduler loop is the hot generation path. It should apply model
+        tokens to scheduler state and immediately return to launching work.
+        Detokenization, reasoning/tool parsing, stream-delta assembly, and
+        request-event wakeups are handled by this single FIFO worker so output
+        processing overlaps the next device step while preserving per-token
+        ordering.
+
+        Lightweight lifecycle test harnesses do not define
+        ``_engine_output_queue``; those keep the historical synchronous path.
+        """
+        output_queue = getattr(self, "_engine_output_queue", None)
+        if output_queue is None:
+            return
+
+        thread = getattr(self, "_engine_output_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+
+        def _output_loop() -> None:
+            while True:
+                engine_outputs = output_queue.get()
+                try:
+                    if engine_outputs is None:
+                        return
+                    self._process_engine_outputs(engine_outputs)
+                except Exception as exc:
+                    traceback.print_exc()
+                    logger.error("Engine output worker failed: %s", exc)
+                    self._scheduler_exception = exc
+                    self._scheduler_exception_tb = traceback.format_exc()
+                    self._scheduler_running = False
+                    with self._request_lock:
+                        for event in self._request_events.values():
+                            event.set()
+                    self._output_event.set()
+                finally:
+                    output_queue.task_done()
+
+        self._engine_output_thread = threading.Thread(target=_output_loop, name="eSurgeOutputWorker", daemon=True)
+        self._engine_output_thread.start()
+
+    def _enqueue_engine_outputs(self, engine_outputs) -> None:
+        """Queue engine outputs for asynchronous parsing, or process inline.
+
+        Args:
+            engine_outputs: Scheduler-produced output bundle from
+                ``update_from_output``.
+        """
+        if not engine_outputs:
+            return
+        output_queue = getattr(self, "_engine_output_queue", None)
+        thread = getattr(self, "_engine_output_thread", None)
+        if output_queue is None or thread is None or not thread.is_alive():
+            self._process_engine_outputs(engine_outputs)
+            return
+        output_queue.put(engine_outputs)
+
+    def _stop_engine_output_worker(self) -> None:
+        """Drain and stop the asynchronous parser/output worker."""
+        output_queue = getattr(self, "_engine_output_queue", None)
+        thread = getattr(self, "_engine_output_thread", None)
+        if output_queue is None or thread is None:
+            return
+        if thread.is_alive():
+            output_queue.put(None)
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                logger.warning("Engine output worker did not stop gracefully")
+                return
+        if getattr(self, "_engine_output_thread", None) is thread:
+            self._engine_output_thread = None
+
     def initiate(self) -> None:
         """Start (or wake) the background scheduler so requests can flow.
 
@@ -387,8 +520,9 @@ class EngineLifecycleMixin:
         2. **Overlap path** — dispatch the model asynchronously via
            :meth:`eSurgeRunner.execute_model_async`, use
            :meth:`_can_prefetch_scheduler_output` to decide whether to
-           compute the next batch while the device is still busy, and
-           drain the prior step via :meth:`_drain_runner_future`.
+           compute the next batch while the device is still busy, use the
+           runner's async-drain capability gate for placeholder-token decode,
+           and drain the prior step via :meth:`_drain_runner_future`.
 
         Both paths are wrapped in a retry budget
         (:data:`MAX_CONSECUTIVE_SCHEDULER_ERRORS`) and routed through
@@ -427,6 +561,8 @@ class EngineLifecycleMixin:
                 self.runner.initialize_kv_cache()
                 self._kv_cache_valid = True
 
+            self._start_engine_output_worker()
+
             # Clear any previous crash state before starting a fresh scheduler thread.
             self._scheduler_exception = None
             self._scheduler_exception_tb = None
@@ -446,12 +582,43 @@ class EngineLifecycleMixin:
 
                 _diag_iter = 0
                 _diag_last_log = time.time()
-                if not self.runtime_config.overlap_execution:
+                def _overlap_loop_enabled() -> bool:
+                    """Return whether the lifecycle loop should use async handles.
+
+                    ``async_scheduling=True`` is not itself enough to remove
+                    sampled-token materialization from the launch path: the
+                    synchronous loop calls ``execute_model()``, which must
+                    resolve the token before returning. The overlap loop calls
+                    ``execute_model_async()`` instead, then lets the runner's
+                    capability check decide whether the next launch may be
+                    issued before draining the previous sampled token. This is
+                    required for both TP/SPMD and PP decode; otherwise each
+                    token step is serialized by the host lifecycle even when the
+                    device kernels themselves are short.
+                    """
+                    if not self.runtime_config.overlap_execution:
+                        return False
+                    return hasattr(self.runner, "execute_model_async")
+
+                use_overlap_loop = _overlap_loop_enabled()
+                if getattr(self.runtime_config, "runner_verbose", False):
+                    logger.info(
+                        "Using %s eSurge scheduler lifecycle "
+                        "(async_scheduling=%s, overlap_execution=%s)",
+                        "async-overlap" if use_overlap_loop else "synchronous",
+                        bool(self.runtime_config.async_scheduling),
+                        bool(self.runtime_config.overlap_execution),
+                    )
+                if not use_overlap_loop:
                     while self._scheduler_running:
                         try:
                             _diag_iter += 1
+                            prof_loop_t0 = time.perf_counter()
+                            prof_phase = prof_loop_t0
                             with self._scheduler_lock:
+                                self._drain_parser_stop_requests_locked()
                                 scheduler_output = self.scheduler.schedule()
+                            prof_sched = time.perf_counter() - prof_phase
                             _n = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
                             _now = time.time()
                             if _n > 0 or (_now - _diag_last_log) > 30:
@@ -466,14 +633,42 @@ class EngineLifecycleMixin:
                             self._update_scheduler_heartbeat()
                             dispatch = None
                             if distributed_controller is not None and distributed_controller.has_remote_workers:
+                                prof_phase = time.perf_counter()
                                 dispatch = distributed_controller.dispatch_step(scheduler_output)
+                                prof_dispatch = time.perf_counter() - prof_phase
+                            else:
+                                prof_dispatch = 0.0
+                            prof_phase = time.perf_counter()
                             model_output = self.runner.execute_model(scheduler_output)
+                            prof_execute = time.perf_counter() - prof_phase
                             if dispatch is not None:
+                                prof_phase = time.perf_counter()
                                 distributed_controller.verify_step(dispatch, model_output)
+                                prof_dispatch += time.perf_counter() - prof_phase
+                            prof_phase = time.perf_counter()
                             with self._scheduler_lock:
                                 engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-                            if engine_outputs:
-                                self._process_engine_outputs(engine_outputs)
+                            prof_update = time.perf_counter() - prof_phase
+                            prof_phase = time.perf_counter()
+                            self._enqueue_engine_outputs(engine_outputs)
+                            prof_process = time.perf_counter() - prof_phase
+                            if (
+                                getattr(self.runtime_config, "runner_verbose", False)
+                                and scheduler_output.total_num_scheduled_tokens > 0
+                            ):
+                                logger.info(
+                                    "[esurge-prof-core] it=%06d tok=%d reqs=%d sched=%.3fms "
+                                    "dispatch=%.3fms execute=%.3fms update=%.3fms process=%.3fms total=%.3fms",
+                                    _diag_iter,
+                                    int(scheduler_output.total_num_scheduled_tokens),
+                                    len(scheduler_output.num_scheduled_tokens),
+                                    prof_sched * 1e3,
+                                    prof_dispatch * 1e3,
+                                    prof_execute * 1e3,
+                                    prof_update * 1e3,
+                                    prof_process * 1e3,
+                                    (time.perf_counter() - prof_loop_t0) * 1e3,
+                                )
                             # Reset error counter on success
                             consecutive_errors = 0
                             self._update_scheduler_heartbeat()
@@ -517,16 +712,89 @@ class EngineLifecycleMixin:
                         "with remote distributed workers."
                     )
 
+                def _can_dispatch_next_before_drain(current: SchedulerOutput) -> bool:
+                    """Whether async decode may launch before draining tokens.
+
+                    AsyncScheduler tracks one-step-ahead decode with optimistic
+                    output placeholders. When the runner says the current step
+                    is eligible, the next step can be queued before
+                    host-materializing the previous sampled token; the runner
+                    patches that placeholder from the previous device token via
+                    ``DeviceInputTokenHandoff``. CPU update/streaming still
+                    happens in scheduler order when the older handle is drained.
+                    """
+                    try:
+                        return bool(self.runner.can_dispatch_next_before_async_drain(current))
+                    except Exception:
+                        return False
+
                 def _can_prefetch_next(current: SchedulerOutput) -> bool:
+                    # Async scheduling uses optimistic output placeholders and
+                    # runner-side deferred sampled-token state. Advancing the
+                    # scheduler before the previous async result is drained can
+                    # make those two state machines observe different request
+                    # lengths. Plain overlap remains enabled for non-async
+                    # scheduler outputs.
+                    if current.async_scheduling:
+                        return False
                     return self._can_prefetch_scheduler_output(self.scheduler, current)
+
+                def _execute_zero_token_schedule(scheduler_output: SchedulerOutput) -> None:
+                    model_output = self.runner.execute_model(scheduler_output)
+                    with self._scheduler_lock:
+                        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                    self._enqueue_engine_outputs(engine_outputs)
+                    self._handle_profiling_step()
 
                 while self._scheduler_running:
                     try:
                         if pending_execution is not None:
                             future, prev_sched_out = pending_execution
 
+                            if _can_dispatch_next_before_drain(prev_sched_out):
+                                with self._scheduler_lock:
+                                    self._drain_parser_stop_requests_locked()
+                                    next_sched_out = self.scheduler.schedule()
+                                self._update_scheduler_heartbeat()
+
+                                if next_sched_out.total_num_scheduled_tokens > 0:
+                                    next_future = self.runner.execute_model_async(next_sched_out)
+                                    try:
+                                        self._drain_runner_future(future, prev_sched_out)
+                                    except Exception as e:
+                                        pending_execution = None
+                                        prefetched_schedule = None
+                                        logger.critical(
+                                            "Async deferred drain failed after launching the next step. "
+                                            "Aborting scheduler because scheduler state has advanced."
+                                        )
+                                        self._abort_scheduler_due_to_error(e)
+                                        break
+                                    pending_execution = (next_future, next_sched_out)
+                                    consecutive_errors = 0
+                                    self._update_scheduler_heartbeat()
+                                    continue
+
+                                try:
+                                    self._drain_runner_future(future, prev_sched_out)
+                                    _execute_zero_token_schedule(next_sched_out)
+                                except Exception as e:
+                                    pending_execution = None
+                                    prefetched_schedule = None
+                                    logger.critical(
+                                        "Async drain failed after preparing an empty follow-up schedule. "
+                                        "Aborting scheduler because scheduler state has advanced."
+                                    )
+                                    self._abort_scheduler_due_to_error(e)
+                                    break
+                                pending_execution = None
+                                consecutive_errors = 0
+                                self._update_scheduler_heartbeat()
+                                continue
+
                             if prefetched_schedule is None and _can_prefetch_next(prev_sched_out):
                                 with self._scheduler_lock:
+                                    self._drain_parser_stop_requests_locked()
                                     prefetched_schedule = self.scheduler.schedule()
 
                             try:
@@ -549,16 +817,12 @@ class EngineLifecycleMixin:
                             prefetched_schedule = None
                         else:
                             with self._scheduler_lock:
+                                self._drain_parser_stop_requests_locked()
                                 scheduler_output = self.scheduler.schedule()
                         self._update_scheduler_heartbeat()
 
                         if scheduler_output.total_num_scheduled_tokens == 0:
-                            model_output = self.runner.execute_model(scheduler_output)
-                            with self._scheduler_lock:
-                                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-                            if engine_outputs:
-                                self._process_engine_outputs(engine_outputs)
-                            self._handle_profiling_step()
+                            _execute_zero_token_schedule(scheduler_output)
                         else:
                             future = self.runner.execute_model_async(scheduler_output)
                             pending_execution = (future, scheduler_output)
@@ -620,10 +884,11 @@ class EngineLifecycleMixin:
         Engine-stop path. Steps:
 
         1. Stop the idle-reset watchdog so it cannot fire mid-shutdown.
-        2. Set ``_scheduler_running = False`` and ``join`` the scheduler
-           thread with a five-second timeout (logs a WARNING if it
-           refuses to stop). Workers in distributed mode are also asked
-           to shut down their control servers here.
+        2. Set ``_scheduler_running = False`` under ``_scheduler_lock``, then
+           release the lock before joining the scheduler thread. The release is
+           important because the scheduler may need the same lock to apply the
+           final runner output before it can exit. Workers in distributed mode
+           are also asked to shut down their control servers here.
         3. If a profiler trace is active, stop it via
            :meth:`stop_profiling` (best-effort; failures are demoted to
            DEBUG).
@@ -640,6 +905,7 @@ class EngineLifecycleMixin:
         and returns.
         """
         self._stop_idle_monitor()
+        scheduler_thread: threading.Thread | None = None
         with self._scheduler_lock:
             if not self._scheduler_running:
                 distributed_controller = getattr(self, "_distributed_controller", None)
@@ -648,28 +914,36 @@ class EngineLifecycleMixin:
                         distributed_controller.shutdown()
                     except Exception:
                         logger.debug("Distributed worker controller shutdown encountered an error", exc_info=True)
+                self._stop_engine_output_worker()
                 self._info("Scheduler loop is not running")
                 return
             self._info("Stopping background scheduler loop...")
             self._scheduler_running = False
-            if self._scheduler_thread:
-                self._scheduler_thread.join(timeout=5.0)
-                if self._scheduler_thread.is_alive():
-                    logger.warning("Scheduler thread did not stop gracefully")
+            scheduler_thread = self._scheduler_thread
+
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=5.0)
+            if scheduler_thread.is_alive():
+                logger.warning("Scheduler thread did not stop gracefully")
+
+        with self._scheduler_lock:
+            if self._scheduler_thread is scheduler_thread:
                 self._scheduler_thread = None
-            self._info("Background scheduler terminated")
-            if self._profiling_active:
-                try:
-                    self.stop_profiling()
-                except Exception:
-                    logger.debug("Profiler stop encountered an error", exc_info=True)
-            if hasattr(self.runner, "shutdown"):
-                try:
-                    self.runner.shutdown()
-                except Exception:
-                    logger.debug("Runner shutdown encountered an error", exc_info=True)
-            # Clear runner buffers if idle to avoid stale state on next start.
-            self._reset_runner_state_if_idle("terminate")
+
+        self._stop_engine_output_worker()
+        self._info("Background scheduler terminated")
+        if self._profiling_active:
+            try:
+                self.stop_profiling()
+            except Exception:
+                logger.debug("Profiler stop encountered an error", exc_info=True)
+        if hasattr(self.runner, "shutdown"):
+            try:
+                self.runner.shutdown()
+            except Exception:
+                logger.debug("Runner shutdown encountered an error", exc_info=True)
+        # Clear runner buffers if idle to avoid stale state on next start.
+        self._reset_runner_state_if_idle("terminate")
 
     def pause(self) -> None:
         """Stop the scheduler loop while preserving request bookkeeping.
@@ -961,11 +1235,28 @@ class EngineLifecycleMixin:
                 ``future``; needed by ``update_from_output`` to map
                 sampled tokens back to the right requests.
         """
+        wait_start = time.perf_counter()
         model_output = self.runner.wait_for_execution(future)
+        wait_time = time.perf_counter() - wait_start
+        total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+        update_start = time.perf_counter()
         with self._scheduler_lock:
             engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-        if engine_outputs:
-            self._process_engine_outputs(engine_outputs)
+        update_time = time.perf_counter() - update_start
+        process_start = time.perf_counter()
+        self._enqueue_engine_outputs(engine_outputs)
+        process_time = time.perf_counter() - process_start
+        if total_tokens:
+            total_time = wait_time + update_time + process_time
+            self.runner.log_it(
+                "[perf] overlap_drain tok=%d wait=%.2fms update=%.2fms process=%.2fms total=%.2fms wait_tps=%.1f",
+                total_tokens,
+                wait_time * 1e3,
+                update_time * 1e3,
+                process_time * 1e3,
+                total_time * 1e3,
+                total_tokens / wait_time if wait_time > 0 else 0.0,
+            )
         self._handle_profiling_step()
 
     def _handle_profiling_step(self) -> None:

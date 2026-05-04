@@ -833,7 +833,7 @@ class GatedDeltaRuleOp(OperationImpl):
         if kernel_cfg is None and not is_inference:
             adaptive_chunk = min(max(16, seq_len), 64)
             adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
-            kernel_cfg = GatedDeltaRuleConfig(chunk_size=adaptive_chunk)
+            kernel_cfg = GatedDeltaRuleConfig(platform="xla", chunk_size=adaptive_chunk)
 
         mode = self.get_mode(query=query, BTHD=True)
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
@@ -912,6 +912,7 @@ class GatedDeltaRuleOp(OperationImpl):
         in_specs = None
         out_specs = None
         mesh = self.metadata.mesh
+        output_constraint_mesh = mesh
         if mesh is not None:
             in_specs = (
                 query_sharding,
@@ -948,9 +949,13 @@ class GatedDeltaRuleOp(OperationImpl):
             platform=platform,
         )
 
-        if mesh is not None:
-            with mesh:
-                outputs = with_sharding_constraint(arr=outputs, sharding=shardings_bthd.output, mesh=mesh)
+        if output_constraint_mesh is not None:
+            with output_constraint_mesh:
+                outputs = with_sharding_constraint(
+                    arr=outputs,
+                    sharding=shardings_bthd.output,
+                    mesh=output_constraint_mesh,
+                )
 
         return GatedDeltaRuleOutput(
             attention_outputs=outputs,

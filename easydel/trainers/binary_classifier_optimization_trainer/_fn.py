@@ -805,38 +805,10 @@ def evaluation_step(
     return metrics
 
 
-def detach_metrics(metrics: LossMetrics) -> LossMetrics:
-    """Convert metrics to host scalars for serialization.
-
-    Args:
-        metrics: Loss metrics to detach.
-
-    Returns:
-        Detached metrics with scalar values.
-    """
-
-    if metrics.other_metrics is not None:
-        filtered_other = {}
-        for key, value in metrics.other_metrics.items():
-            if key.startswith("mask/"):
-                continue
-            filtered_other[key] = float(value)
-    else:
-        filtered_other = None
-
-    return metrics.replace(
-        loss=float(metrics.loss),
-        chosen_rewards=None,
-        rejected_rewards=None,
-        other_metrics=filtered_other,
-    )
-
-
 __all__ = [
     "RunningMoments",
     "compute_bco_loss",
     "concatenated_forward",
-    "detach_metrics",
     "evaluation_step",
     "training_step",
 ]

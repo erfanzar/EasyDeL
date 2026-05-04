@@ -270,6 +270,34 @@ class EasyShardingMixin:
                 deduped.append(alias_path)
             return tuple(deduped)
 
+        def _metadata_rule_patterns(path: str) -> tuple[str, ...]:
+            """Return path regexes for checkpoint and live SpectraX state paths."""
+            parts = path.split(".")
+            slash_pattern = r"^(?:.*/)?" + "/".join(re.escape(part) for part in parts) + r"(?:/.*)?$"
+            dotted_pattern = r"^(?:.*/)?" + re.escape(path) + r"(?:/.*)?$"
+
+            patterns = [slash_pattern, dotted_pattern]
+            if len(parts) > 1:
+                # Some pytrees stringify module scopes as slash-separated while
+                # keeping the leaf variable name attached with a dot.
+                hybrid_pattern = (
+                    r"^(?:.*/)?"
+                    + "/".join(re.escape(part) for part in parts[:-1])
+                    + r"\."
+                    + re.escape(parts[-1])
+                    + r"(?:/.*)?$"
+                )
+                patterns.append(hybrid_pattern)
+
+            deduped: list[str] = []
+            seen_patterns: set[str] = set()
+            for pattern in patterns:
+                if pattern in seen_patterns:
+                    continue
+                seen_patterns.add(pattern)
+                deduped.append(pattern)
+            return tuple(deduped)
+
         mesh = self._get_mesh(mesh)
         resolver = self.runtime_sharding_resolver.with_mesh(mesh)
         _, graph = spx.export(self)
@@ -288,12 +316,11 @@ class EasyShardingMixin:
             if ns is None:
                 continue
             for aliased_path in _metadata_rule_path_aliases(path):
-                regex_parts = [re.escape(part) for part in aliased_path.split(".")]
-                pattern = r"^(?:.*/)?" + "/".join(regex_parts) + r"(?:/.*)?$"
-                if pattern in seen:
-                    continue
-                seen.add(pattern)
-                rules.append((pattern, ns))
+                for pattern in _metadata_rule_patterns(aliased_path):
+                    if pattern in seen:
+                        continue
+                    seen.add(pattern)
+                    rules.append((pattern, ns))
         return tuple(rules)
 
     def resolve_sharding_for_tree(self, tree=None, *, mesh: spx.SpxMesh | None = None):

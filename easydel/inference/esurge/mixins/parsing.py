@@ -28,6 +28,7 @@ Exposes :class:`EngineParsingMixin`, mixed into :class:`eSurge`.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import time
 
 from ...stream_protocol import compute_stream_delta_text
@@ -35,6 +36,41 @@ from ..engine_types import EngineCoreOutputs
 from ..logger import logger
 from ..metrics import get_metrics_collector
 from ..request import EngineRequestStatus
+
+
+class _TokenPrefixView(Sequence[int]):
+    """Fixed-length view over an append-only token list.
+
+    Streaming parsers need the previous token count to compute the current
+    delta. Keeping a prefix view avoids copying the full token history every
+    token while still behaving like the previous list for ``len()``,
+    iteration, indexing, and membership checks.
+    """
+
+    __slots__ = ("_tokens", "_length")
+
+    def __init__(self, tokens: list[int], length: int):
+        self._tokens = tokens
+        self._length = int(length)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._length)
+            return [self._tokens[idx] for idx in range(start, stop, step)]
+        if index < 0:
+            index += self._length
+        if index < 0 or index >= self._length:
+            raise IndexError(index)
+        return self._tokens[index]
+
+    def __contains__(self, value: object) -> bool:
+        for idx in range(self._length):
+            if self._tokens[idx] == value:
+                return True
+        return False
 
 
 class EngineParsingMixin:
@@ -279,7 +315,9 @@ class EngineParsingMixin:
         Args:
             rd: Per-request bookkeeping dict; reads ``delegating_parser``,
                 ``parser_previous_text``, ``parser_previous_token_ids`` and
-                writes the latter two on exit.
+                writes the latter two on exit. Token ids are stored as a
+                prefix view so the hot path keeps the old length without
+                copying the full generated-token history.
             accumulated_text: Full detokenized text so far.
             delta_text: New text since the previous call.
             token_ids: Token-id sequence aligned with ``accumulated_text``.
@@ -314,7 +352,7 @@ class EngineParsingMixin:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
         rd["parser_previous_text"] = accumulated_text
-        rd["parser_previous_token_ids"] = list(token_ids)
+        rd["parser_previous_token_ids"] = _TokenPrefixView(token_ids, len(token_ids))
 
         return result.to_dict()
 
@@ -358,6 +396,7 @@ class EngineParsingMixin:
         request_id: str,
         *,
         metrics_collector,
+        now: float,
     ) -> None:
         """Close out a request that the scheduler ended without a final token.
 
@@ -380,6 +419,9 @@ class EngineParsingMixin:
             request_id: Sample-level id reported by the scheduler.
             metrics_collector: Optional metrics collector;
                 ``complete_request`` is invoked when the parent finishes.
+            now: Generation-loop timestamp for the scheduler output that
+                reported the finish. Metrics use this instead of output-worker
+                wall time so parser latency cannot depress generation TPS.
         """
 
         rd = self._active_requests.get(request_id)
@@ -407,7 +449,7 @@ class EngineParsingMixin:
 
         start_time = rd.get("start_time")
         if start_time is not None:
-            elapsed = max(0.0, time.perf_counter() - float(start_time))
+            elapsed = max(0.0, now - float(start_time))
             ro.processing_time = max(ro.processing_time, elapsed)
             ro.time_spent_generating = max(ro.time_spent_generating, elapsed)
 
@@ -488,6 +530,7 @@ class EngineParsingMixin:
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
+            tokens_are_eos_filtered=True,
         )
         rd["last_decoded_index"] = pipeline_result.last_decoded_index
         if not finished:
@@ -504,6 +547,37 @@ class EngineParsingMixin:
             finished=finished,
         )
         return parsed, raw_accumulated, raw_delta, stop_hit, stop_reason
+
+    def _append_decodable_tokens(self, rd: dict, new_tokens: list[int]) -> list[int]:
+        """Append newly generated tokens to the per-request decode stream.
+
+        ``rd["generated_tokens"]`` intentionally records the exact engine
+        output, including EOS ids for accounting and final ``token_ids``.
+        The detokenizer wants the same stream with EOS ids removed. Keeping
+        ``rd["decodable_tokens"]`` incremental avoids re-filtering the full
+        generated list on every streaming update.
+        """
+        decodable_tokens = rd.setdefault("decodable_tokens", [])
+        eos_set = getattr(self, "_eos_set", None)
+        if eos_set is None:
+            eos_set = getattr(self, "_eSurge__eos_set", None)
+        if eos_set:
+            decodable_tokens.extend(token_id for token_id in new_tokens if token_id not in eos_set)
+        else:
+            decodable_tokens.extend(new_tokens)
+        return decodable_tokens
+
+    def _get_decodable_tokens_for_final(self, rd: dict) -> list[int]:
+        """Return the EOS-filtered decode stream for a terminal parse pass.
+
+        Normal generation updates keep this list incrementally. The fallback
+        preserves correctness for older request dictionaries or tests that
+        construct ``rd`` directly without ``decodable_tokens``.
+        """
+        decodable_tokens = rd.get("decodable_tokens")
+        if decodable_tokens is not None:
+            return decodable_tokens
+        return self._filter_eos_tokens(rd["generated_tokens"])
 
     @staticmethod
     def _update_outputs(
@@ -597,8 +671,10 @@ class EngineParsingMixin:
             ro: Parent :class:`RequestOutput` whose ``processing_time`` /
                 ``time_spent_generating`` / ``num_generated_tokens`` /
                 ``tokens_per_second`` fields are refreshed.
-            now: Wall-clock seconds (``time.monotonic`` or ``time.time``)
-                used for the elapsed computation.
+            now: Scheduler-output timestamp used for elapsed computation.
+                This is intentionally produced before asynchronous output
+                parsing so host-side parsing latency does not change the
+                reported generation TPS.
             num_generated: Cumulative count of generated tokens reported
                 for this step.
         """
@@ -661,7 +737,7 @@ class EngineParsingMixin:
                 which stop string ended each request.
             metrics_collector: Optional metrics collector;
                 ``complete_request`` is called when ``ro.finished``.
-            now: Wall-clock timestamp used for elapsed-time computations.
+            now: Scheduler-output timestamp used for elapsed-time computations.
 
         Returns:
             ``(text_changed, structured_changed)`` flags for the streaming
@@ -681,7 +757,7 @@ class EngineParsingMixin:
         else:
             ro.finished = all(output.finish_reason is not None for output in ro.outputs)
 
-        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
+        decodable_tokens = self._get_decodable_tokens_for_final(rd)
         parsed, raw_accumulated, raw_delta, stop_hit, stop_reason = self._decode_and_parse(
             request_id,
             rd,
@@ -756,6 +832,7 @@ class EngineParsingMixin:
 
         with self._request_lock, self._output_lock:
             for client_outputs in engine_outputs.values():
+                now = float(client_outputs.timestamp or time.perf_counter())
                 for engine_output in client_outputs.outputs:
                     request_id = engine_output.request_id
                     rd = self._active_requests.get(request_id)
@@ -772,7 +849,6 @@ class EngineParsingMixin:
                     structured_changed = False
                     force_finished = False
                     new_tokens = engine_output.new_token_ids
-                    now = time.perf_counter()
 
                     if new_tokens:
                         rd["generated_tokens"].extend(new_tokens)
@@ -790,7 +866,7 @@ class EngineParsingMixin:
                         if metrics_collector:
                             metrics_collector.add_generated_tokens(parent_request_id, len(new_tokens))
 
-                        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
+                        decodable_tokens = self._append_decodable_tokens(rd, new_tokens)
                         parsed, raw_accumulated, raw_delta, stop_hit, stop_reason = self._decode_and_parse(
                             request_id,
                             rd,
@@ -845,15 +921,19 @@ class EngineParsingMixin:
                     self._finish_request_from_scheduler_signal(
                         finished_request_id,
                         metrics_collector=metrics_collector,
+                        now=now,
                     )
 
         if stop_string_finishes:
-            with self._scheduler_lock:
-                for rid, stop_reason in stop_string_finishes.items():
-                    request = self.scheduler.requests.get(rid)
-                    if request is None:
-                        continue
-                    request.stop_reason = stop_reason
-                self.scheduler.finish_requests(stop_string_finishes.keys(), EngineRequestStatus.FINISHED_STOPPED)
+            enqueue_stops = getattr(self, "_enqueue_parser_stop_requests", None)
+            if enqueue_stops is not None:
+                enqueue_stops(stop_string_finishes)
+            else:
+                with self._scheduler_lock:
+                    for rid, stop_reason in stop_string_finishes.items():
+                        request = self.scheduler.requests.get(rid)
+                        if request is not None:
+                            request.stop_reason = stop_reason
+                    self.scheduler.finish_requests(stop_string_finishes.keys(), EngineRequestStatus.FINISHED_STOPPED)
 
         self._output_event.set()

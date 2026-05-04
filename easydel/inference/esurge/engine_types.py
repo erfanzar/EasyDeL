@@ -308,7 +308,7 @@ class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=
     Attributes:
         engine_index: Index of the engine that produced these outputs.
         outputs: List of individual request outputs.
-        timestamp: Monotonic timestamp when outputs were generated.
+        timestamp: High-resolution monotonic timestamp when outputs were generated.
         utility_output: Optional utility operation result.
         finished_requests: Set of request IDs that finished in this batch.
         wave_complete: Wave number that completed (for data parallel).
@@ -331,9 +331,9 @@ class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=
     start_wave: int | None = None
 
     def __post_init__(self):
-        """Set timestamp to current monotonic time if not provided."""
+        """Set timestamp to current generation-loop time if not provided."""
         if self.timestamp == 0.0:
-            self.timestamp = time.monotonic()
+            self.timestamp = time.perf_counter()
 
 
 class EngineCoreRequestType(enum.Enum):

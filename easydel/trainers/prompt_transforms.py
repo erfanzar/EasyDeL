@@ -1161,6 +1161,172 @@ class SFTPreprocessTransform(Transform):
         # No recognized format, return as-is
         return result
 
+    def map_batch(self, examples: list[Example]) -> list[Example]:
+        """Apply SFT preprocessing to a small row batch.
+
+        Chat templates are still rendered per example because tool schemas and
+        message structure can differ by row, but the expensive tokenizer call is
+        batched whenever the row shape can be handled without changing labels or
+        masks.
+        """
+        if self._formatting_func is not None or self._return_assistant_tokens_mask:
+            return [self(example) for example in examples]
+
+        outputs: list[Example | None] = [None] * len(examples)
+        tokenization_jobs: dict[bool, list[tuple[int, dict, str]]] = {False: [], True: []}
+        conversational_jobs: dict[str, tuple[list | None, list[tuple[int, dict, list]]]] = {}
+
+        for index, example in enumerate(examples):
+            if "input_ids" in example:
+                outputs[index] = example
+                continue
+
+            result = maybe_convert_to_chatml(dict(example))
+            raw_messages = result.get(self._messages_field)
+            if raw_messages is None and self._messages_field != "messages":
+                raw_messages = result.get("messages")
+            messages = normalize_message_payload(raw_messages, allow_plain_text=True)
+            if messages:
+                if self._messages_field in result:
+                    result[self._messages_field] = messages
+                elif "messages" in result:
+                    result["messages"] = messages
+                self._prepare_batched_conversational(index, result, messages, conversational_jobs)
+                continue
+
+            text_value = result.get(self._text_field)
+            messages = self._normalize_message_list(text_value)
+            if messages:
+                self._prepare_batched_conversational(index, result, messages, conversational_jobs)
+                continue
+
+            if "prompt" in result and "completion" in result:
+                outputs[index] = self._tokenize_prompt_completion(result)
+                continue
+
+            if self._text_field in result:
+                text = result[self._text_field]
+                if self._add_eos and not text.endswith(self._tokenizer.eos_token):
+                    text = text + self._tokenizer.eos_token
+                tokenization_jobs[True].append((index, result, text))
+                continue
+
+            outputs[index] = result
+
+        for _, (tools, jobs) in conversational_jobs.items():
+            try:
+                tokens = self._tokenizer.apply_chat_template(
+                    [messages for _, _, messages in jobs],
+                    tools=tools,
+                    tokenize=True,
+                    return_dict=True,
+                    return_attention_mask=True,
+                    truncation=self._truncation,
+                    max_length=self._max_length,
+                    padding="max_length" if self._max_length else False,
+                    return_tensors="np",
+                )
+                input_ids_rows = self._as_int32_rows(tokens["input_ids"])
+                attention_mask_rows = self._as_int32_rows(tokens["attention_mask"])
+                for row_index, (example_index, result, _) in enumerate(jobs):
+                    result["input_ids"] = input_ids_rows[row_index]
+                    result["attention_mask"] = attention_mask_rows[row_index]
+                    outputs[example_index] = purify_example(result)
+            except Exception:
+                for example_index, result, messages in jobs:
+                    self._prepare_rendered_conversational(
+                        example_index,
+                        result,
+                        messages,
+                        tools,
+                        tokenization_jobs,
+                    )
+
+        for add_special_tokens, jobs in tokenization_jobs.items():
+            if not jobs:
+                continue
+            tokens = self._tokenizer(
+                [text for _, _, text in jobs],
+                truncation=self._truncation,
+                max_length=self._max_length,
+                padding="max_length" if self._max_length else False,
+                return_attention_mask=True,
+                add_special_tokens=add_special_tokens,
+                return_tensors="np",
+            )
+            input_ids_rows = self._as_int32_rows(tokens["input_ids"])
+            attention_mask_rows = self._as_int32_rows(tokens["attention_mask"])
+            for row_index, (example_index, result, _) in enumerate(jobs):
+                result["input_ids"] = input_ids_rows[row_index]
+                result["attention_mask"] = attention_mask_rows[row_index]
+                outputs[example_index] = purify_example(result)
+
+        return [tp.cast(Example, output) for output in outputs if output is not None]
+
+    def _prepare_batched_conversational(
+        self,
+        index: int,
+        result: dict,
+        messages: list,
+        conversational_jobs: dict[str, tuple[list | None, list[tuple[int, dict, list]]]],
+    ) -> None:
+        """Normalize one conversational row and queue it for batched chat templating."""
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
+
+        tools = resolve_example_tools(result)
+        key = self._tool_cache_key(tools)
+        if key not in conversational_jobs:
+            conversational_jobs[key] = (tools, [])
+        conversational_jobs[key][1].append((index, result, messages))
+
+    def _prepare_rendered_conversational(
+        self,
+        index: int,
+        result: dict,
+        messages: list,
+        tools: list | None,
+        tokenization_jobs: dict[bool, list[tuple[int, dict, str]]],
+    ) -> None:
+        """Render one conversational row and queue fallback batched tokenization."""
+        try:
+            text = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                tools=tools,
+            )
+            tokenization_jobs[False].append((index, result, text))
+        except Exception:
+            try:
+                text = self._tokenizer.apply_chat_template(messages, tokenize=False)
+            except Exception:
+                text = self._simple_format_messages(messages)
+
+            if self._add_eos and not text.endswith(self._tokenizer.eos_token):
+                text = text + self._tokenizer.eos_token
+            tokenization_jobs[True].append((index, result, text))
+
+    @staticmethod
+    def _tool_cache_key(tools: list | None) -> str:
+        """Return a stable grouping key for per-example tool schemas."""
+        if tools is None:
+            return ""
+        try:
+            return json.dumps(tools, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return repr(tools)
+
+    @staticmethod
+    def _as_int32_rows(value: tp.Any) -> tp.Any:
+        """Convert batched tokenizer integer output to int32 rows when possible."""
+        try:
+            import numpy as np
+
+            return np.asarray(value, dtype=np.int32)
+        except Exception:
+            return value
+
     @staticmethod
     def _normalize_message_list(messages: tp.Any) -> list[dict[str, tp.Any]] | None:
         """Normalize an arbitrary message payload to the canonical chat format.

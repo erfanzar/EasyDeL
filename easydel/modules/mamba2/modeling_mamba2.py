@@ -11,10 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import itertools
-import typing as tp
-from collections.abc import Callable, Sequence
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -36,20 +32,6 @@ from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM2Op
 
 from .mamba2_configuration import Mamba2Config as Mamba2Config
-
-
-def init_to_value(x, dtype):
-    """Return a parameter initializer that fills tensors with a fixed value.
-
-    Args:
-        x (jnp.ndarray): Constant array used as the initializer's output.
-        dtype (jnp.dtype): Data type that the initializer casts ``x`` to.
-
-    Returns:
-        Callable[..., jnp.ndarray]: An initializer that ignores its arguments and
-        always returns ``x.astype(dtype)``.
-    """
-    return lambda *_: x.astype(dtype)
 
 
 @auto_pytree
@@ -80,128 +62,6 @@ class Mamba2CausalLMOutput(BaseModelOutput):
     logits: Array = None
     cache_params: RecurrentCache | None = None
     hidden_states: tuple[Array] | None = None
-
-
-def pad_tensor_by_size(input_tensor: jnp.ndarray, pad_size: int):
-    """Pad a tensor along the sequence-length dimension.
-
-    Adds ``pad_size`` zero-valued positions at the end of axis 1 of either a 3-D
-    ``(batch, seq, dim)`` or 4-D ``(batch, seq, dim_a, dim_b)`` tensor.
-
-    Args:
-        input_tensor (jnp.ndarray): 3-D or 4-D tensor whose axis 1 is the sequence
-            dimension.
-        pad_size (int): Number of trailing positions to pad (zeros).
-
-    Returns:
-        jnp.ndarray: Padded tensor with shape matching the input except along
-        axis 1 which grows by ``pad_size``.
-    """
-    if input_tensor.ndim == 4:
-        pad_width = [(0, 0), (0, pad_size), (0, 0), (0, 0)]
-    else:
-        pad_width = [(0, 0), (0, pad_size), (0, 0)]
-
-    return jnp.pad(input_tensor, pad_width, mode="constant", constant_values=0)
-
-
-def reshape_into_chunks(input_tensor, pad_size, chunk_size):
-    """Pad and reshape a sequence into uniform chunks.
-
-    First pads along the sequence axis (axis 1) using :func:`pad_tensor_by_size`,
-    then splits the padded sequence into ``chunk_size``-sized chunks.
-
-    Args:
-        input_tensor (jnp.ndarray): Tensor of shape ``(batch, seq, ...)``.
-        pad_size (int): Number of trailing positions to pad (chosen so that
-            ``(seq + pad_size)`` is a multiple of ``chunk_size``).
-        chunk_size (int): Length of each chunk after splitting.
-
-    Returns:
-        jnp.ndarray: Tensor with the sequence axis split into a
-        ``(num_chunks, chunk_size)`` pair, preserving trailing dimensions.
-    """
-    input_tensor = pad_tensor_by_size(input_tensor, pad_size)
-
-    if input_tensor.ndim == 3:
-        return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2])
-    else:
-        return input_tensor.reshape(
-            input_tensor.shape[0],
-            -1,
-            chunk_size,
-            input_tensor.shape[2],
-            input_tensor.shape[3],
-        )
-
-
-def segment_sum(input_tensor):
-    """Compute a numerically stable cumulative segment sum.
-
-    Builds a strictly-lower-triangular mask, accumulates contributions, and then
-    fills the upper triangle with ``-inf`` so the result can be used directly
-    as a log-domain mask (e.g. for SSM cumulative decays).
-
-    Args:
-        input_tensor (jnp.ndarray): Tensor whose last dimension equals
-            ``chunk_size``; segment sums are computed along that axis.
-
-    Returns:
-        jnp.ndarray: Tensor of shape ``(*input_tensor.shape, chunk_size)`` with
-        cumulative sums in the lower triangle and ``-inf`` elsewhere.
-    """
-    chunk_size = input_tensor.shape[-1]
-    input_tensor = jnp.expand_dims(input_tensor, axis=-1)
-    input_tensor = jnp.tile(input_tensor, (1,) * (input_tensor.ndim - 1) + (chunk_size,))
-
-    mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool), k=-1)
-    input_tensor = jnp.where(mask, input_tensor, 0)
-
-    tensor_segsum = jnp.cumsum(input_tensor, axis=-2)
-
-    mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool), k=0)
-    tensor_segsum = jnp.where(mask, tensor_segsum, -jnp.inf)
-
-    return tensor_segsum
-
-
-_T = tp.TypeVar("_T")
-
-
-def create_tuple_parser(
-    n: int,
-) -> Callable[[_T | Sequence[_T]], tuple[_T, ...]]:
-    """Ensure a scalar or sequence is expanded into a tuple of length ``n``.
-
-    Args:
-        n (int): Required tuple length.
-
-    Returns:
-        Callable[[_T | Sequence[_T]], tuple[_T, ...]]: A parser that returns
-        ``(x,) * n`` for scalars and validates length for sequences.
-    """
-
-    def parse(x: _T | Sequence[_T]) -> tuple[_T, ...]:
-        """Coerce ``x`` to a length-``n`` tuple.
-
-        Args:
-            x (_T | Sequence[_T]): Scalar value or already-correct-length sequence.
-
-        Returns:
-            tuple[_T, ...]: The corresponding length-``n`` tuple.
-
-        Raises:
-            ValueError: If ``x`` is a sequence whose length is not ``n``.
-        """
-        if isinstance(x, Sequence):
-            if len(x) == n:
-                return tuple(x)
-            else:
-                raise ValueError(f"x!=n ({x}!=({n}))")
-        else:
-            return tuple(itertools.repeat(x, n))
-
-    return parse
 
 
 class Conv1D(spx.Module):
@@ -868,7 +728,7 @@ class Mamba2Model(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     Mamba2Block(
                         config=config,

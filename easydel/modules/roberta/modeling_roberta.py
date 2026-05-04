@@ -340,7 +340,7 @@ class RobertaSelfAttention(AttentionModule):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         layer_head_mask: Bool[Array, "num_heads"] | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -578,7 +578,7 @@ class RobertaAttention(spx.Module):
         hidden_states,
         mask_info: MaskInfo | None,
         layer_head_mask,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states=None,
@@ -842,7 +842,7 @@ class RobertaLayer(spx.Module):
         hidden_states,
         mask_info: MaskInfo | None,
         layer_head_mask,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -959,7 +959,7 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
         )
         self.layer = nn.ModuleList([])
         for _ in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=_):
+            with self.assign_layer_stage(_, total_layers=config.num_hidden_layers):
                 self.layer.append(
                     block(
                         config=config,
@@ -975,7 +975,7 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
         hidden_states,
         mask_info: MaskInfo | None,
         head_mask,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,

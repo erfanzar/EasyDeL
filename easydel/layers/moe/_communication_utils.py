@@ -208,28 +208,6 @@ def bincount(x: jax.Array, length: int) -> jax.Array:
     return jnp.bincount(x, length=length)
 
 
-def all_i32(*xs: jax.Array) -> tuple[jax.Array, ...]:
-    """Casts all input arrays to int32 dtype.
-
-    Utility function for ensuring integer arrays use consistent int32 type,
-    which is often required for indexing operations and compatibility with
-    certain XLA operations.
-
-    Args:
-        *xs: Variable number of JAX arrays to cast.
-
-    Returns:
-        Tuple of arrays with all elements cast to jnp.int32.
-
-    Example:
-        >>> a = jnp.array([1, 2, 3], dtype=jnp.int64)
-        >>> b = jnp.array([4, 5], dtype=jnp.int16)
-        >>> a32, b32 = all_i32(a, b)
-        >>> # Both are now int32
-    """
-    return tuple(z.astype(jnp.int32) for z in xs)
-
-
 def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp: bool = True) -> jax.Array:
     """Reorders activations using provided sort indices with optional custom gradient.
 

@@ -33,7 +33,7 @@ dependencies = [
 	"jaxlib>=0.10.0",
 	"eformer==0.0.100",
 	"ejkernel==0.0.79",
-	"spectrax-lib==0.0.6",
+	"spectrax-lib==0.0.7",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
 	"transformers~=5.5.0",
@@ -82,6 +82,8 @@ tpu = ["jax[tpu]>=0.10.0", "ejkernel[tpu]==0.0.79"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.11"]
 profile = [
+	"protobuf>=6.31.1",
+	"setuptools>=70,<81",
 	"xprof>=2.20.6",
 	"tb-nightly>=2.21.0a20250820",
 	"xprof-nightly>=2.21.6a20250820",
@@ -174,6 +176,10 @@ conflicts = [
 		{ extra = "cuda" },
 		{ extra = "torch" },
 	],
+	[
+		{ extra = "profile" },
+		{ extra = "tensorflow" },
+	],
 ]
 
 [[tool.uv.index]]
@@ -182,4 +188,5 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+spectrax-lib = { path = "../Spectrax", editable = true }
 torch = { index = "pytorch-cpu", marker = "extra == 'torch'" }

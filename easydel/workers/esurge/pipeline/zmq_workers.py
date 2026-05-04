@@ -177,6 +177,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         if not endpoint:
             raise ValueError("Detokenizer worker endpoint must be provided.")
         super().__init__(endpoint)
+        self._sent_lengths: dict[str, int] = {}
 
     def decode(
         self,
@@ -207,19 +208,33 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         Raises:
             RuntimeError: If the worker returns an error.
         """
+        prev_sent = int(self._sent_lengths.get(request_id, 0))
+        total_tokens = len(generated_tokens)
+        if prev_sent < 0 or prev_sent > total_tokens:
+            prev_sent = 0
+        token_delta = generated_tokens[prev_sent:]
+
         msg = {
             "cmd": "decode",
             "request_id": request_id,
-            "tokens": generated_tokens,
+            "tokens_delta": token_delta,
+            "token_offset": prev_sent,
+            "total_tokens": total_tokens,
             "finished": finished,
             "skip_special_tokens": skip_special_tokens,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
+        if prev_sent == 0 or finished:
+            msg["tokens"] = generated_tokens
         if prompt_context:
             msg["prompt_context"] = prompt_context
         resp = self._request(msg)
         if resp.get("status") != "ok":
             raise RuntimeError(resp.get("message", "Detokenizer worker failed"))
+        if finished:
+            self._sent_lengths.pop(request_id, None)
+        else:
+            self._sent_lengths[request_id] = total_tokens
         result_payload = resp["result"]
         return DetokenizerResult(**result_payload)
 
@@ -229,6 +244,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         Args:
             request_id: The request ID to reset.
         """
+        self._sent_lengths.pop(request_id, None)
         self._request({"cmd": "reset", "request_id": request_id})
 
     def drain(self) -> None:
@@ -237,6 +253,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
 
     def shutdown(self) -> None:
         """Shutdown the detokenizer worker and close the connection."""
+        self._sent_lengths.clear()
         try:
             self._request({"cmd": "shutdown"})
         except Exception:

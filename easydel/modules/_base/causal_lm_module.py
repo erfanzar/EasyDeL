@@ -263,22 +263,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 **self._gradient_checkpointing_feature.get_config(),
             )
 
-        base_layers = getattr(self.base_model, "layers", None)
-        stage_total = len(base_layers) if base_layers is not None else 0
-        if stage_total:
-            with self._assign_layer_stage(stage_total - 1, total_layers=stage_total):
-                lm_head = lm_head_class(
-                    config.hidden_size,
-                    config.vocab_size,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    use_bias=self._head_bias,
-                    kernel_init=self._head_kernel_init,
-                    precision=precision,
-                    rngs=rngs,
-                )
-        else:
-            lm_head = lm_head_class(
+        def _build_lm_head():
+            return lm_head_class(
                 config.hidden_size,
                 config.vocab_size,
                 dtype=dtype,
@@ -288,6 +274,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 precision=precision,
                 rngs=rngs,
             )
+
+        lm_head = self._create_task_head_on_last_stage(_build_lm_head)
         setattr(self, lm_head_name, lm_head)
         if tie_word_embeddings:
             self._tie_embeddings_feature.setup(self.get_embedding(), lm_head)

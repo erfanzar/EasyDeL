@@ -246,15 +246,6 @@ class Scheduler(SchedulerInterface):
         self.max_num_seq_buckets = buckets
         self._current_seq_bucket = self._select_seq_bucket(0)
 
-    def _dp_shard_hint_for_row(self, row_index: int) -> int | None:
-        """Compute a DP shard hint for a logical request row index."""
-        dp_size = int(getattr(self, "data_parallel_size", 1))
-        if dp_size <= 1:
-            return None
-        rows_cap = max(1, int(self.max_num_seq_buckets[-1]))
-        rows_per_shard = max(1, rows_cap // dp_size)
-        return min(max(int(row_index), 0) // rows_per_shard, dp_size - 1)
-
     @classmethod
     def from_runner(
         cls,
@@ -989,7 +980,11 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             self.waiting.remove_requests(stopped_preempted_reqs)
 
-        engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        output_timestamp = time.perf_counter()
+        engine_core_outputs = {
+            client_index: EngineCoreOutputs(outputs=outs, timestamp=output_timestamp)
+            for client_index, outs in outputs.items()
+        }
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
@@ -997,7 +992,10 @@ class Scheduler(SchedulerInterface):
                 if (eco := engine_core_outputs.get(client_index)) is not None:
                     eco.finished_requests = finished_set
                 else:
-                    engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
+                    engine_core_outputs[client_index] = EngineCoreOutputs(
+                        finished_requests=finished_set,
+                        timestamp=output_timestamp,
+                    )
             finished_req_ids.clear()
 
         return engine_core_outputs

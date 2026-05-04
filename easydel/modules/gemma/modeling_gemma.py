@@ -400,7 +400,7 @@ class GemmaDecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -487,7 +487,7 @@ class GemmaModel(EasyDeLBaseModule):
     :class:`TransformerCache` for dense KV layouts and
     :class:`RaggedPagesCache` for paged (vLLM-style) attention used by the
     eSurge inference engine. Layers are stage-assigned for pipeline
-    parallelism (see :meth:`_assign_layer_stage`) and optionally
+    parallelism (see :meth:`assign_layer_stage`) and optionally
     ``ModuleList.stack`` ed when ``config.scan_layers`` is set and there is
     only a single pipeline stage.
 
@@ -547,7 +547,7 @@ class GemmaModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=self.config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         self.config,
@@ -560,7 +560,9 @@ class GemmaModel(EasyDeLBaseModule):
                 )
         if self.config.scan_layers and self._pipeline_stage_count() == 1:
             self.layers = self.layers.stack()
-        self.norm = GemmaRMSNorm(self.config, dtype=self.dtype)
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = GemmaRMSNorm(self.config, dtype=self.dtype)
 
     # Ignore copy
     def forward(
@@ -570,7 +572,7 @@ class GemmaModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -793,7 +795,7 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
@@ -947,7 +949,7 @@ class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,

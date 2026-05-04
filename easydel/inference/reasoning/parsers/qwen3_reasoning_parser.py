@@ -68,19 +68,14 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         request=None,
     ) -> DeltaMessage | None:
         """Stream with strict mode: treat as content if no start tag seen early enough."""
-        has_start_in_current = self.start_token in current_text or (
-            self._start_token_id is not None and self._start_token_id in current_token_ids
-        )
-
         # Strict behavior: if no start tag is observed and we are not in prompt-aware
         # asymmetric mode, treat streaming output as content.
-        if (
-            not self._is_prompt_reasoning_active()
-            and current_text
-            and not has_start_in_current
-            and len(current_text) > len(self.start_token)
-        ):
-            return DeltaMessage(content=delta_text) if delta_text else None
+        if not self._is_prompt_reasoning_active():
+            has_start_in_current = self.start_token in current_text or (
+                self._start_token_id is not None and self._start_token_id in current_token_ids
+            )
+            if current_text and not has_start_in_current and len(current_text) > len(self.start_token):
+                return DeltaMessage(content=delta_text) if delta_text else None
 
         return super().extract_reasoning_streaming(
             previous_text,

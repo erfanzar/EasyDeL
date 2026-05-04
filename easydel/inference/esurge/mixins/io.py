@@ -297,6 +297,8 @@ class EngineIOMixin:
 
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
+        defer_batch_enqueue = len(prompts) > 1
+        deferred_scheduler_requests = []
         for prompt, req_id in zip(prompts, request_ids, strict=True):
             prompt_tokens = self._tokenize_prompt(req_id, prompt)
             effective_params = self._prepare_sampling_params_for_request(
@@ -304,12 +306,25 @@ class EngineIOMixin:
                 request_id=req_id,
                 prompt=prompt,
             )
-            self._add_request(
+            maybe_scheduler_requests = self._add_request(
                 req_id,
                 prompt,
                 effective_params,
                 prompt_token_ids=prompt_tokens,
                 tool_parser_request=tool_parser_request,
+                defer_scheduler_enqueue=defer_batch_enqueue,
+            )
+            if maybe_scheduler_requests:
+                deferred_scheduler_requests.extend(maybe_scheduler_requests)
+
+        if deferred_scheduler_requests:
+            with self._scheduler_lock:
+                for scheduler_request in deferred_scheduler_requests:
+                    self.scheduler.add_request(scheduler_request)
+            logger.info(
+                "Queued generate batch: parent_requests=%d scheduler_requests=%d",
+                len(prompts),
+                len(deferred_scheduler_requests),
             )
 
         outputs = []
@@ -468,15 +483,22 @@ class EngineIOMixin:
 
                     if ro.update_seq != last_update_seq:
                         # Snapshot without holding the lock during yield
+                        finished_snapshot = bool(ro.finished)
                         outputs_copy = []
                         for comp in ro.outputs:
+                            token_ids = list(comp.token_ids) if finished_snapshot else comp.token_ids
+                            logprobs = (
+                                [dict(lp) for lp in comp.logprobs]
+                                if finished_snapshot and comp.logprobs
+                                else comp.logprobs
+                            )
                             outputs_copy.append(
                                 CompletionOutput(
                                     index=comp.index,
                                     text=comp.text,
-                                    token_ids=list(comp.token_ids),
+                                    token_ids=token_ids,
                                     cumulative_logprob=comp.cumulative_logprob,
-                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                    logprobs=logprobs,
                                     finish_reason=comp.finish_reason,
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,
@@ -1021,15 +1043,22 @@ class EngineIOMixin:
                         break
 
                     if ro.update_seq != last_update_seq:
+                        finished_snapshot = bool(ro.finished)
                         outputs_copy = []
                         for comp in ro.outputs:
+                            token_ids = list(comp.token_ids) if finished_snapshot else comp.token_ids
+                            logprobs = (
+                                [dict(lp) for lp in comp.logprobs]
+                                if finished_snapshot and comp.logprobs
+                                else comp.logprobs
+                            )
                             outputs_copy.append(
                                 CompletionOutput(
                                     index=comp.index,
                                     text=comp.text,
-                                    token_ids=list(comp.token_ids),
+                                    token_ids=token_ids,
                                     cumulative_logprob=comp.cumulative_logprob,
-                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                    logprobs=logprobs,
                                     finish_reason=comp.finish_reason,
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,

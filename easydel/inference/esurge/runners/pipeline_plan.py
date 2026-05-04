@@ -48,12 +48,7 @@ from easydel.caching import (
 )
 from easydel.infra.sharding import is_mpmd_mesh
 
-from ..config import (
-    KernelTilePolicy,
-    PipelineInferenceMode,
-    normalize_kernel_tile_policy,
-    normalize_pipeline_inference_mode,
-)
+from ..config import KernelTilePolicy, normalize_kernel_tile_policy
 
 logger = get_logger("eSurge-PipelinePlan")
 
@@ -64,16 +59,13 @@ class PipelineInferencePlan:
 
     Built once by :func:`build_pipeline_inference_plan` and treated as
     read-only thereafter. Disabled plans (``enabled=False``) still carry the
-    normalized ``mode`` and ``kernel_tile_policy`` so SPMD callers can
-    consult them uniformly.
+    normalized ``kernel_tile_policy`` so SPMD callers can consult them
+    uniformly.
 
     Attributes:
         enabled: ``True`` iff PP inference is active for this engine. False
-            when the model's mesh is SPMD or the user explicitly set
-            ``pipeline_inference="off"``. Most other fields are empty /
+            when the model's mesh is SPMD. Most other fields are empty /
             trivial when this is False.
-        mode: Resolved literal — ``"auto"`` / ``"on"`` / ``"off"`` — kept
-            for telemetry and post-hoc validation.
         mpmd_dim: Number of pipeline stages (i.e. ``mpmd_mesh.mpmd_dim``).
             ``1`` on disabled plans.
         final_stage: Rank of the stage that produces the final hidden
@@ -109,7 +101,6 @@ class PipelineInferencePlan:
     """
 
     enabled: bool
-    mode: PipelineInferenceMode
     mpmd_dim: int
     final_stage: int
     stage_meshes: tuple[tp.Any, ...]
@@ -171,8 +162,6 @@ def _cache_bearing_layer_indices(model: tp.Any) -> set[int]:
 def build_pipeline_inference_plan(
     *,
     model: tp.Any,
-    mpmd_scheduler: tp.Any,
-    pipeline_inference: PipelineInferenceMode | None = "auto",
     max_cache_tokens: int | None = None,
     cache_capacity_margin: float = 0.92,
     kernel_tile_policy: KernelTilePolicy | None = "auto",
@@ -186,33 +175,24 @@ def build_pipeline_inference_plan(
 
     Args:
         model (Any): Loaded EasyDeL model.
-        mpmd_scheduler (Any): Reserved for future scheduler-aware planning;
-            unused today (currently dropped).
-        pipeline_inference (PipelineInferenceMode | None): Requested mode.
-            ``"auto"`` enables PP when the mesh is an MPMD mesh.
         max_cache_tokens (int | None): Optional global cap on cached tokens.
         cache_capacity_margin (float): Safety margin in ``(0, 1]``.
         kernel_tile_policy (KernelTilePolicy | None): Pallas/GDN tile policy.
 
     Returns:
         PipelineInferencePlan: A plan with ``is_enabled`` reflecting whether
-        PP is active. Disabled plans still carry the normalized mode and
-        cache caps for downstream consumers.
+        PP is active. Disabled plans still carry cache caps and kernel policy
+        for downstream consumers.
 
     Raises:
-        ValueError: If ``pipeline_inference='on'`` but the mesh isn't MPMD,
-            ``max_cache_tokens`` is non-positive, or
+        ValueError: If ``max_cache_tokens`` is non-positive, or
             ``cache_capacity_margin`` is outside ``(0, 1]``.
     """
 
-    mode = normalize_pipeline_inference_mode(pipeline_inference)
     tile_policy = normalize_kernel_tile_policy(kernel_tile_policy)
     mesh = getattr(model, "mesh", None)
     is_mpmd = is_mpmd_mesh(mesh)
-    del mpmd_scheduler
-    enabled = mode == "on" or (mode == "auto" and is_mpmd)
-    if mode == "on" and not is_mpmd:
-        raise ValueError("pipeline_inference='on' requires a SpectraX MPMD mesh.")
+    enabled = is_mpmd
 
     if max_cache_tokens is not None and int(max_cache_tokens) <= 0:
         raise ValueError(f"max_cache_tokens must be positive when provided; got {max_cache_tokens}.")
@@ -222,7 +202,6 @@ def build_pipeline_inference_plan(
     if not enabled:
         return PipelineInferencePlan(
             enabled=False,
-            mode=mode,
             mpmd_dim=1,
             final_stage=0,
             stage_meshes=(),
@@ -262,7 +241,6 @@ def build_pipeline_inference_plan(
     final_stage = layer_to_stage.get(max(total_layers - 1, 0), mpmd_dim - 1)
     plan = PipelineInferencePlan(
         enabled=True,
-        mode=mode,
         mpmd_dim=mpmd_dim,
         final_stage=int(final_stage),
         stage_meshes=stage_meshes,

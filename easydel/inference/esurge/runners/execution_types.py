@@ -68,6 +68,7 @@ from __future__ import annotations
 import typing
 
 import jax
+import jax.numpy as jnp
 from eformer.pytree import auto_pytree
 
 from easydel.caching import HybridCache, RaggedPagesCache, UnifiedAttentionCache
@@ -152,6 +153,10 @@ class BatchMetadata:
     pages_tables: jax.Array
     input_ids_buf: jax.Array
     position_ids_buf: jax.Array
+    input_token_handoff_positions: jax.Array | None = None
+    input_token_handoff_ids: jax.Array | None = None
+    input_token_handoff_count: jax.Array | None = None
+    input_token_handoff_offset: jax.Array | None = None
 
     # Total number of tokens in the batch (used by hybrid mode)
     num_tokens: jax.Array | None = None
@@ -177,6 +182,48 @@ class BatchMetadata:
     # DeepStack-style visual injection (optional, model-specific)
     visual_pos_masks: jax.Array | None = None
     deepstack_visual_embeds: tuple[jax.Array, ...] | None = None
+
+    @property
+    def model_input_ids(self) -> jax.Array:
+        """Input ids with any device-resident PP sampled-token handoff applied.
+
+        Pipeline decode has a one-token loop-carried dependency: the token
+        sampled by the final pipeline stage on step N is the next input consumed
+        by stage 0 on step N+1.  The host-prepared ``input_ids_buf`` may still
+        contain scheduler placeholders at those positions.  When the optional
+        handoff buffers are present, this property resolves those placeholders
+        inside the compiled model step by selecting replacement ids from the
+        fixed-size handoff arrays.
+
+        The handoff arrays are padded to a stable shape, and
+        ``input_token_handoff_count`` marks the live span length and
+        ``input_token_handoff_offset`` selects that span inside the padded
+        arrays.  The offset is what lets PP microbatches reuse the full-window
+        sampled-token handoff directly instead of constructing a new device
+        scatter buffer for each stage launch.
+        """
+        if (
+            self.input_token_handoff_positions is None
+            or self.input_token_handoff_ids is None
+            or self.input_token_handoff_count is None
+            or self.input_token_handoff_offset is None
+        ):
+            return self.input_ids_buf
+
+        input_positions = jnp.arange(self.input_ids_buf.shape[0], dtype=jnp.int32)
+        handoff_slots = jnp.arange(self.input_token_handoff_positions.shape[0], dtype=jnp.int32)
+        offset = jnp.asarray(self.input_token_handoff_offset, dtype=jnp.int32).reshape(())
+        count = jnp.asarray(self.input_token_handoff_count, dtype=jnp.int32).reshape(())
+        live = (handoff_slots >= offset) & (handoff_slots < (offset + count))
+        handoff_positions = self.input_token_handoff_positions - offset
+        matches = input_positions[:, None] == handoff_positions[None, :]
+        matches = matches & live[None, :]
+        has_replacement = jnp.any(matches, axis=1)
+        replacements = jnp.sum(
+            jnp.where(matches, self.input_token_handoff_ids[None, :], jnp.zeros((), dtype=self.input_ids_buf.dtype)),
+            axis=1,
+        ).astype(self.input_ids_buf.dtype)
+        return jnp.where(has_replacement, replacements, self.input_ids_buf)
 
     @property
     def query_start_loc(self) -> jax.Array:

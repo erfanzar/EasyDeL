@@ -723,6 +723,7 @@ class EngineUtilsMixin:
         skip_special_tokens: bool = False,
         spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
+        tokens_are_eos_filtered: bool = False,
     ) -> DetokenizerResult:
         """Decode tokens using the detokenizer worker pipeline.
 
@@ -736,11 +737,14 @@ class EngineUtilsMixin:
             spaces_between_special_tokens: Whether to preserve tokenizer-inserted
                 spacing between adjacent special tokens.
             prompt_context: Last N prompt token IDs for first-token context.
+            tokens_are_eos_filtered: Set when ``generated_tokens`` has already
+                had EOS ids removed by the caller. This avoids another
+                full-list walk in the hot streaming path.
 
         Returns:
             DetokenizerResult with accumulated_text, delta_text, and indices.
         """
-        tokens_for_decode = self._filter_eos_tokens(generated_tokens)
+        tokens_for_decode = generated_tokens if tokens_are_eos_filtered else self._filter_eos_tokens(generated_tokens)
         return self._detokenizer_client.decode(
             request_id,
             tokens_for_decode,

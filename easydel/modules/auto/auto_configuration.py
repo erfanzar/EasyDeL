@@ -462,6 +462,15 @@ def _shard_gather_fns_from_named_shardings(
     return shard_fns, gather_fns
 
 
+def _add_parameter_collection_aliases(fns: Mapping[tp.Any, tp.Any]) -> dict[tp.Any, tp.Any]:
+    """Add ``parameters``-stripped aliases for HF conversion key tuples."""
+    aliased = dict(fns)
+    for key, fn in tuple(fns.items()):
+        if isinstance(key, tuple) and len(key) > 1 and key[0] == "parameters":
+            aliased.setdefault(key[1:], fn)
+    return aliased
+
+
 class AutoShardAndGatherFunctions:
     """Factory of per-leaf shard / gather closures for an EasyDeL model.
 
@@ -477,8 +486,8 @@ class AutoShardAndGatherFunctions:
       full ``module.lazy_init`` to derive shapes/shardings (slow on large
       models but the most common path).
     * :meth:`from_model` — cheap path when a ``lazy_init`` already happened;
-      reads the live ``NamedSharding`` from each Variable, preserving
-      pipeline-stage submeshes (MPMD-safe).
+      resolves the intended metadata-driven ``NamedSharding`` for each
+      Variable, preserving pipeline-stage submeshes (MPMD-safe).
     * :meth:`from_params` — derive from raw params + a mesh, replicating
       every leaf with a default ``PartitionSpec()``.
 
@@ -531,20 +540,22 @@ class AutoShardAndGatherFunctions:
         already paid the lazy_init cost — it avoids running ``lazy_init`` a
         second time just to compute parameter shapes.
 
-        Uses the MPMD-aware path: ``spx.extract_sharding_structure`` reads each
-        Variable's *live* ``NamedSharding`` (with per-stage submeshes
-        preserved) and we build per-leaf ``device_put`` closures from
-        that.
+        Uses the MPMD-aware path: resolve the model's metadata-derived
+        sharding tree instead of reading the lazy arrays' current placement.
+        Lazy-initialized parameters commonly start on a single default device,
+        and using that live placement would make checkpoint loading keep large
+        weights unsharded.
         """
-        with _shardgen_phase("from_model: extract_sharding_structure"):
-            _gdef, gstate = spx.export(model)
-            named_shardings = spx.extract_sharding_structure(gstate.raw(), mesh=model.mesh)
+        with _shardgen_phase("from_model: resolve_sharding_for_tree"):
+            named_shardings = model.resolve_sharding_for_tree(model.graphstate_shape).raw()
         with _shardgen_phase("from_model: build per-leaf shard/gather fns"):
             shard_fns, gather_fns = _shard_gather_fns_from_named_shardings(named_shardings, model.mesh)
 
         if flatten and not is_flatten(shard_fns):
             gather_fns = flatten_dict(gather_fns)
             shard_fns = flatten_dict(shard_fns)
+            gather_fns = _add_parameter_collection_aliases(gather_fns)
+            shard_fns = _add_parameter_collection_aliases(shard_fns)
         elif not flatten and is_flatten(shard_fns):
             gather_fns = unflatten_dict(gather_fns)
             shard_fns = unflatten_dict(shard_fns)

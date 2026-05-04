@@ -24,10 +24,11 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import os
 import typing as tp
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 
 from ..core.config import (
     DatasetConfig,
@@ -486,6 +487,10 @@ def pretokenize(
     show_progress: bool = True,
     num_shards: int | None = None,
     log_process: bool | int = False,
+    transform_batch_size: int | None = None,
+    transform_backend: str = "thread",
+    drop_fields: tp.Iterable[str] | None = None,
+    arrays_only: bool = False,
 ) -> WriteStats:
     """Pretokenize a data source using a trainer transform and save to disk.
 
@@ -508,6 +513,15 @@ def pretokenize(
         log_process: When enabled, show a tqdm progress bar for transformed
             examples as they pass into the writer. ``True`` refreshes the bar
             every 1,000 examples; an integer refreshes every N examples.
+        transform_batch_size: Number of source rows grouped into one transform
+            task. Trainer transforms with a ``map_batch`` method can use this
+            to batch tokenizer calls.
+        transform_backend: Parallel executor backend, either ``"thread"`` or
+            ``"process"``. Process mode is faster for Python-heavy chat
+            templating when the transform is picklable.
+        drop_fields: Optional transformed-row fields to remove before saving.
+        arrays_only: When ``True``, remove non-numeric/non-array metadata
+            fields before saving pretokenized rows.
 
     Returns:
         WriteStats with num_examples, num_shards, total_bytes, output_paths.
@@ -558,13 +572,24 @@ def pretokenize(
 
     # Wrap source with transform
     if num_proc and num_proc > 1:
-        transformed_source = _ParallelTransformedShardedSource(
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        parallel_source_cls = (
+            _ProcessParallelTransformedShardedSource
+            if str(transform_backend).lower() in {"process", "processes", "multiprocess", "multiprocessing"}
+            else _ParallelTransformedShardedSource
+        )
+        transformed_source = parallel_source_cls(
             source,
             transform,
             num_workers=int(num_proc),
+            batch_size=transform_batch_size,
         )
     else:
         transformed_source = TransformedShardedSource(source, transform)
+    if drop_fields:
+        transformed_source = _DropFieldsShardedSource(transformed_source, frozenset(drop_fields))
+    if arrays_only:
+        transformed_source = _ArrayFieldsOnlyShardedSource(transformed_source)
     progress_update_interval = _resolve_log_process_update_interval(log_process)
     if progress_update_interval is not None:
         transformed_source = _ProgressBarShardedSource(transformed_source, progress_update_interval)
@@ -615,6 +640,44 @@ def _apply_transform_to_example(transform: tp.Any, example: dict) -> list[dict]:
     return [] if result is None else [result]
 
 
+def _apply_transform_to_examples(transform: tp.Any, examples: list[dict]) -> list[dict]:
+    """Apply a transform to a row chunk, using a batched fast path when present."""
+    map_batch = getattr(transform, "map_batch", None)
+    if callable(map_batch) and not isinstance(transform, ExpandTransform):
+        return [result for result in map_batch(examples) if result is not None]
+
+    transformed: list[dict] = []
+    for example in examples:
+        transformed.extend(_apply_transform_to_example(transform, example))
+    return transformed
+
+
+def _iter_chunks(examples: tp.Iterator[dict], batch_size: int) -> tp.Iterator[list[dict]]:
+    """Yield fixed-size chunks from an example iterator."""
+    chunk: list[dict] = []
+    for example in examples:
+        chunk.append(example)
+        if len(chunk) >= batch_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+_PROCESS_TRANSFORM: tp.Any = None
+
+
+def _init_process_transform(transform: tp.Any) -> None:
+    """Install one transform instance in each process-pool worker."""
+    global _PROCESS_TRANSFORM
+    _PROCESS_TRANSFORM = transform
+
+
+def _apply_process_transform_to_examples(examples: list[dict]) -> list[dict]:
+    """Apply the process-local transform to one row chunk."""
+    return _apply_transform_to_examples(_PROCESS_TRANSFORM, examples)
+
+
 class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
     """Bounded ordered parallel transform wrapper for pretokenization."""
 
@@ -624,11 +687,13 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
         transform: tp.Any,
         num_workers: int,
         max_pending: int | None = None,
+        batch_size: int | None = None,
     ):
         self._source = source
         self._transform = transform
         self._num_workers = max(1, int(num_workers))
-        self._max_pending = max_pending or self._num_workers * 8
+        self._batch_size = max(1, int(batch_size or 4))
+        self._max_pending = max_pending or self._num_workers * 2
 
     @property
     def shard_names(self) -> tp.Sequence[str]:
@@ -650,8 +715,8 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
         pending: deque[Future[list[dict]]] = deque()
 
         with ThreadPoolExecutor(max_workers=self._num_workers) as executor:
-            for example in examples:
-                pending.append(executor.submit(_apply_transform_to_example, self._transform, example))
+            for chunk in _iter_chunks(examples, self._batch_size):
+                pending.append(executor.submit(_apply_transform_to_examples, self._transform, chunk))
                 if len(pending) >= self._max_pending:
                     for transformed in pending.popleft().result():
                         yield transformed
@@ -659,6 +724,122 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
             while pending:
                 for transformed in pending.popleft().result():
                     yield transformed
+
+
+class _ProcessParallelTransformedShardedSource(_ParallelTransformedShardedSource):
+    """Process-backed ordered parallel transform wrapper for CPU-heavy templates."""
+
+    def _iter_parallel(self, examples: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        pending: deque[Future[list[dict]]] = deque()
+        mp_context = mp.get_context("spawn")
+
+        with ProcessPoolExecutor(
+            max_workers=self._num_workers,
+            mp_context=mp_context,
+            initializer=_init_process_transform,
+            initargs=(self._transform,),
+        ) as executor:
+            for chunk in _iter_chunks(examples, self._batch_size):
+                pending.append(executor.submit(_apply_process_transform_to_examples, chunk))
+                if len(pending) >= self._max_pending:
+                    for transformed in pending.popleft().result():
+                        yield transformed
+
+            while pending:
+                for transformed in pending.popleft().result():
+                    yield transformed
+
+
+class _DropFieldsShardedSource(ShardedDataSource[dict]):
+    """Pass-through source wrapper that removes fields from transformed rows."""
+
+    def __init__(self, source: ShardedDataSource[dict], fields: frozenset[str]):
+        self._source = source
+        self._fields = fields
+
+    @property
+    def shard_names(self) -> tp.Sequence[str]:
+        return self._source.shard_names
+
+    def num_shards(self) -> int:
+        return self._source.num_shards()
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        return self._source.get_shard_info(shard_name)
+
+    def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        yield from self._drop_fields(self._source.open_shard(shard_name))
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        yield from self._drop_fields(self._source.open_shard_at_row(shard_name, row))
+
+    def _drop_fields(self, rows: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        for row in rows:
+            for field in self._fields:
+                row.pop(field, None)
+            yield row
+
+
+def _is_numeric_scalar(value: tp.Any) -> bool:
+    """Return whether a value is a scalar tensor-like payload."""
+    return isinstance(value, bool | int | float) and not isinstance(value, str | bytes | bytearray)
+
+
+def _is_numeric_sequence(value: tp.Any) -> bool:
+    """Return whether a Python sequence contains only numeric tensor values."""
+    if not isinstance(value, list | tuple):
+        return False
+    if not value:
+        return True
+    return all(_is_numeric_scalar(item) or _is_numeric_sequence(item) for item in value)
+
+
+def _is_array_field_value(value: tp.Any) -> bool:
+    """Return whether a pretokenized field is safe to persist as tensor data."""
+    if _is_numeric_scalar(value) or _is_numeric_sequence(value):
+        return True
+
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return value.dtype.kind in {"b", "i", "u", "f"}
+    except Exception:
+        pass
+
+    dtype = getattr(value, "dtype", None)
+    shape = getattr(value, "shape", None)
+    if dtype is not None and shape is not None:
+        return str(dtype).lower() not in {"object", "str", "string"}
+
+    return False
+
+
+class _ArrayFieldsOnlyShardedSource(ShardedDataSource[dict]):
+    """Pass-through source wrapper that keeps only tensor-like row fields."""
+
+    def __init__(self, source: ShardedDataSource[dict]):
+        self._source = source
+
+    @property
+    def shard_names(self) -> tp.Sequence[str]:
+        return self._source.shard_names
+
+    def num_shards(self) -> int:
+        return self._source.num_shards()
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        return self._source.get_shard_info(shard_name)
+
+    def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        yield from self._array_fields_only(self._source.open_shard(shard_name))
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        yield from self._array_fields_only(self._source.open_shard_at_row(shard_name, row))
+
+    def _array_fields_only(self, rows: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        for row in rows:
+            yield {key: value for key, value in row.items() if _is_array_field_value(value)}
 
 
 class _ProgressBarShardedSource(ShardedDataSource[dict]):

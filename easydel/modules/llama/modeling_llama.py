@@ -229,7 +229,7 @@ class LlamaDecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -331,7 +331,7 @@ class LlamaModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        with self._assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
             self.embed_tokens = Embed(
                 num_embeddings=self.config.vocab_size,
                 features=self.config.hidden_size,
@@ -349,7 +349,7 @@ class LlamaModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(self.config.num_hidden_layers):
-            with self._assign_layer_stage(layer_idx, total_layers=self.config.num_hidden_layers):
+            with self.assign_layer_stage(layer_idx, total_layers=self.config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -362,7 +362,7 @@ class LlamaModel(EasyDeLBaseModule):
                 )
         if self.config.scan_layers and self._pipeline_stage_count() == 1:
             self.layers = self.layers.stack()
-        with self._assign_layer_stage(self.config.num_hidden_layers - 1, total_layers=self.config.num_hidden_layers):
+        with self.assign_layer_stage(self.config.num_hidden_layers - 1, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
                 self.config.hidden_size,
                 eps=self.config.rms_norm_eps,
@@ -378,7 +378,7 @@ class LlamaModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,

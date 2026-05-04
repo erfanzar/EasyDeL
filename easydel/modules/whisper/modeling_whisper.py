@@ -767,7 +767,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for _ in range(self.config.encoder_layers):
-            with spx.assign_stage(total=self.config.encoder_layers, current=_):
+            with self.assign_layer_stage(_, total_layers=self.config.encoder_layers):
                 self.layers.append(
                     block(
                         config=config,
@@ -787,13 +787,15 @@ class WhisperEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layer_norm = LayerNorm(
-            self.config.d_model,
-            param_dtype=self.param_dtype,
-            dtype=self.dtype,
-            epsilon=1e-05,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, self.config.encoder_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.encoder_layers):
+            self.layer_norm = LayerNorm(
+                self.config.d_model,
+                param_dtype=self.param_dtype,
+                dtype=self.dtype,
+                epsilon=1e-05,
+                rngs=rngs,
+            )
         self.layerdrop = self.config.decoder_layerdrop
 
     def forward(
@@ -959,7 +961,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for _ in range(self.config.decoder_layers):
-            with spx.assign_stage(total=self.config.decoder_layers, current=_):
+            with self.assign_layer_stage(_, total_layers=self.config.decoder_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -976,13 +978,15 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layer_norm = LayerNorm(
-            self.config.d_model,
-            param_dtype=self.param_dtype,
-            dtype=self.dtype,
-            epsilon=1e-05,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, self.config.decoder_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.decoder_layers):
+            self.layer_norm = LayerNorm(
+                self.config.d_model,
+                param_dtype=self.param_dtype,
+                dtype=self.dtype,
+                epsilon=1e-05,
+                rngs=rngs,
+            )
 
     def forward(
         self,

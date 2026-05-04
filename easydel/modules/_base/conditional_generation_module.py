@@ -228,16 +228,21 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
                     **self._gradient_checkpointing_feature.get_config(),
                 )
 
-            lm_head = head_block(
-                config.get_text_config().hidden_size,
-                config.get_text_config().vocab_size,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                use_bias=self._head_bias,
-                kernel_init=self._head_kernel_init,
-                precision=precision,
-                rngs=rngs,
-            )
+            text_config = config.get_text_config()
+
+            def _build_lm_head():
+                return head_block(
+                    text_config.hidden_size,
+                    text_config.vocab_size,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    use_bias=self._head_bias,
+                    kernel_init=self._head_kernel_init,
+                    precision=precision,
+                    rngs=rngs,
+                )
+
+            lm_head = self._create_task_head_on_last_stage(_build_lm_head)
             setattr(self, lm_head_name, lm_head)
 
             if tie_word_embeddings:

@@ -2,39 +2,105 @@ version = 1
 revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
-    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
 ]
 conflicts = [[
     { package = "easydel", extra = "cuda" },
@@ -42,6 +108,9 @@ conflicts = [[
 ], [
     { package = "easydel", extra = "cuda" },
     { package = "easydel", extra = "torch" },
+], [
+    { package = "easydel", extra = "profile" },
+    { package = "easydel", extra = "tensorflow" },
 ]]
 
 [[package]]
@@ -148,7 +217,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "frozenlist" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz", hash = "sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7", size = 25007, upload-time = "2025-07-03T22:54:43.528Z" }
 wheels = [
@@ -179,7 +248,7 @@ version = "4.12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/96/f0/5eb65b2bb0d09ac6776f2eb54adee6abe8228ea05b20a5ad0e4945de8aac/anyio-4.12.1.tar.gz", hash = "sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703", size = 228685, upload-time = "2026-01-06T11:45:21.246Z" }
 wheels = [
@@ -214,8 +283,8 @@ name = "array-record"
 version = "0.8.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "absl-py", marker = "sys_platform != 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
-    { name = "etils", extra = ["epath"], marker = "sys_platform != 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "absl-py" },
+    { name = "etils", extra = ["epath"] },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/44/e0/90048c75afdbb7e49526fee93f7e113986565a0b36b7c779eb35f745ec7e/array_record-0.8.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:8a0caee17d2583638391fb9f90c9c12a43f9665576f18ec3604ba49d62bd2dcc", size = 3988901, upload-time = "2025-11-13T16:15:29.35Z" },
@@ -283,7 +352,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -427,7 +496,7 @@ name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3d/fa/656b739db8587d7b5dfa22e22ed02566950fbfbcdc20311993483657a5c0/click-8.3.1.tar.gz", hash = "sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a", size = 295065, upload-time = "2025-11-15T20:45:42.706Z" }
 wheels = [
@@ -457,7 +526,7 @@ name = "colorful"
 version = "0.5.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/82/31/109ef4bedeb32b4202e02ddb133162457adc4eb890a9ed9c05c9dd126ed0/colorful-0.5.8.tar.gz", hash = "sha256:bb16502b198be2f1c42ba3c52c703d5f651d826076817185f0294c1a549a7445", size = 209361, upload-time = "2025-10-29T11:53:21.663Z" }
 wheels = [
@@ -478,7 +547,7 @@ name = "cryptography"
 version = "46.0.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/60/04/ee2a9e8542e4fa2773b81771ff8349ff19cdd56b7258a0cc442639052edb/cryptography-46.0.5.tar.gz", hash = "sha256:abace499247268e3757271b2f1e244b36b06f8515cf27c4d49468fc9eb16e93d", size = 750064, upload-time = "2026-02-10T19:18:38.255Z" }
 wheels = [
@@ -694,8 +763,8 @@ dependencies = [
 
 [package.optional-dependencies]
 cuda = [
-    { name = "ejkernel", extra = ["cuda", "triton"], marker = "extra == 'extra-7-easydel-cuda'" },
-    { name = "jax", extra = ["cuda13"], marker = "extra == 'extra-7-easydel-cuda'" },
+    { name = "ejkernel", extra = ["cuda", "triton"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax", extra = ["cuda13"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 lm-eval = [
     { name = "lm-eval" },
@@ -707,6 +776,8 @@ podutils = [
     { name = "eopod" },
 ]
 profile = [
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "setuptools" },
     { name = "tb-nightly" },
     { name = "xprof" },
     { name = "xprof-nightly" },
@@ -716,12 +787,12 @@ tensorflow = [
     { name = "tensorflow-datasets" },
 ]
 torch = [
-    { name = "torch", version = "2.8.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
-    { name = "torch", version = "2.8.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra != 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "torch", version = "2.8.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "torch", version = "2.8.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra != 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 tpu = [
-    { name = "ejkernel", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
-    { name = "jax", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "ejkernel", extra = ["tpu"], marker = "(extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu')" },
+    { name = "jax", extra = ["tpu"], marker = "(extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu')" },
 ]
 
 [package.metadata]
@@ -748,11 +819,13 @@ requires-dist = [
     { name = "msgspec", specifier = "~=0.19.0" },
     { name = "partial-json-parser", specifier = ">=0.2.1.1.post6" },
     { name = "pillow", marker = "extra == 'mm'", specifier = ">=12.1.1" },
+    { name = "protobuf", marker = "extra == 'profile'", specifier = ">=6.31.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "pyzmq", specifier = ">=27.1.0" },
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
-    { name = "spectrax-lib", specifier = "==0.0.6" },
+    { name = "setuptools", marker = "extra == 'profile'", specifier = ">=70,<81" },
+    { name = "spectrax-lib", editable = "../Spectrax" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = "~=2.19.0" },
     { name = "tensorflow-datasets", marker = "extra == 'tensorflow'", specifier = "~=4.9.9" },
@@ -828,13 +901,13 @@ wheels = [
 
 [package.optional-dependencies]
 cuda = [
-    { name = "jax", extra = ["cuda13"], marker = "extra == 'extra-7-easydel-cuda'" },
+    { name = "jax", extra = ["cuda13"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "jax-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "extra == 'extra-7-easydel-cuda'" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "triton" },
 ]
 tpu = [
-    { name = "jax", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "jax", extra = ["tpu"], marker = "(extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu')" },
 ]
 triton = [
     { name = "triton" },
@@ -1091,7 +1164,8 @@ dependencies = [
     { name = "google-auth" },
     { name = "googleapis-common-protos" },
     { name = "proto-plus" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "requests" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/98/586ec94553b569080caef635f98a3723db36a38eac0e3d7eb3ea9d2e4b9a/google_api_core-2.30.0.tar.gz", hash = "sha256:02edfa9fab31e17fc0befb5f161b3bf93c9096d99aed584625f38065c511ad9b", size = 176959, upload-time = "2026-02-18T20:28:11.926Z" }
@@ -1102,7 +1176,8 @@ wheels = [
 [package.optional-dependencies]
 grpc = [
     { name = "grpcio" },
-    { name = "grpcio-status" },
+    { name = "grpcio-status", version = "1.71.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "grpcio-status", version = "1.78.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 
 [[package]]
@@ -1201,7 +1276,8 @@ dependencies = [
     { name = "grpc-google-iam-v1" },
     { name = "grpcio" },
     { name = "proto-plus" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cb/c0/12dfbf7c5e86e34da4af971bb043f11cdc9be8d204eb06ac8a1f9b1d5c74/google_cloud_storage_control-1.10.0.tar.gz", hash = "sha256:2bcbfa4ca6530d25a5baa8dbe80caf0eeabe4c6804798f4f107279719c316bdb", size = 116845, upload-time = "2026-02-12T14:50:07.096Z" }
 wheels = [
@@ -1262,7 +1338,8 @@ name = "googleapis-common-protos"
 version = "1.73.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/99/96/a0205167fa0154f4a542fd6925bdc63d039d88dab3588b875078107e6f06/googleapis_common_protos-1.73.0.tar.gz", hash = "sha256:778d07cd4fbeff84c6f7c72102f0daf98fa2bfd3fa8bea426edc545588da0b5a", size = 147323, upload-time = "2026-03-06T21:53:09.727Z" }
 wheels = [
@@ -1292,11 +1369,12 @@ version = "0.2.16"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
-    { name = "array-record", marker = "sys_platform != 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "array-record", marker = "sys_platform != 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "cloudpickle" },
     { name = "etils", extra = ["epath", "epy"] },
     { name = "numpy" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/64/2e/8aafa233d0c5d3a09a82406ca1fc9a20398dc8986039461b7ab91b73c303/grain-0.2.16-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:af572d514c8082f50cd4d05753e7b318a3539b11aa6cf2cd97914faf3fdff960", size = 528840, upload-time = "2026-02-25T16:12:19.173Z" },
@@ -1320,7 +1398,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "googleapis-common-protos", extra = ["grpc"] },
     { name = "grpcio" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/76/1e/1011451679a983f2f5c6771a1682542ecb027776762ad031fd0d7129164b/grpc_google_iam_v1-0.14.3.tar.gz", hash = "sha256:879ac4ef33136c5491a6300e27575a9ec760f6cdf9a2518798c1b8977a5dc389", size = 23745, upload-time = "2025-10-15T21:14:53.318Z" }
 wheels = [
@@ -1372,14 +1451,131 @@ wheels = [
 name = "grpcio-status"
 version = "1.71.2"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+]
 dependencies = [
-    { name = "googleapis-common-protos" },
-    { name = "grpcio" },
-    { name = "protobuf" },
+    { name = "googleapis-common-protos", marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "grpcio", marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/fd/d1/b6e9877fedae3add1afdeae1f89d1927d296da9cf977eca0eb08fb8a460e/grpcio_status-1.71.2.tar.gz", hash = "sha256:c7a97e176df71cdc2c179cd1847d7fc86cca5832ad12e9798d7fed6b7a1aab50", size = 13677, upload-time = "2025-06-28T04:24:05.426Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/67/58/317b0134129b556a93a3b0afe00ee675b5657f0155509e22fcb853bafe2d/grpcio_status-1.71.2-py3-none-any.whl", hash = "sha256:803c98cb6a8b7dc6dbb785b1111aed739f241ab5e9da0bba96888aa74704cfd3", size = 14424, upload-time = "2025-06-28T04:23:42.136Z" },
+]
+
+[[package]]
+name = "grpcio-status"
+version = "1.78.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+]
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8a/cd/89ce482a931b543b92cdd9b2888805518c4620e0094409acb8c81dd4610a/grpcio_status-1.78.0.tar.gz", hash = "sha256:a34cfd28101bfea84b5aa0f936b4b423019e9213882907166af6b3bddc59e189", size = 13808, upload-time = "2026-02-06T10:01:48.034Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/83/8a/1241ec22c41028bddd4a052ae9369267b4475265ad0ce7140974548dc3fa/grpcio_status-1.78.0-py3-none-any.whl", hash = "sha256:b492b693d4bf27b47a6c32590701724f1d3b9444b36491878fb71f6208857f34", size = 14523, upload-time = "2026-02-06T10:01:32.584Z" },
 ]
 
 [[package]]
@@ -1538,7 +1734,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
     { name = "fsspec" },
-    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "httpx" },
     { name = "packaging" },
     { name = "pyyaml" },
@@ -1611,7 +1807,7 @@ wheels = [
 
 [package.optional-dependencies]
 cuda13 = [
-    { name = "jax-cuda13-plugin", extra = ["with-cuda"], marker = "extra == 'extra-7-easydel-cuda'" },
+    { name = "jax-cuda13-plugin", extra = ["with-cuda"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "jaxlib" },
 ]
 tpu = [
@@ -1649,18 +1845,18 @@ wheels = [
 
 [package.optional-dependencies]
 with-cuda = [
-    { name = "nvidia-cublas", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-nvcc", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cudnn-cu13", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cuda-nvcc", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cudnn-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "nvidia-nvvm" },
 ]
 
@@ -2373,9 +2569,9 @@ name = "nvidia-cuda-nvcc"
 version = "13.2.51"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cuda-crt", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "nvidia-cuda-runtime", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "nvidia-nvvm", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-cuda-crt", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cuda-runtime", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-nvvm", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4d/d8/3d1d733db86c1f18359151b0be0171b04738f17f09f98658caf9e3b5299d/nvidia_cuda_nvcc-13.2.51-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:48e070550a1290d696f055fa78443831bce5452cd2800eb3ab83f89b22c3b6cf", size = 38713648, upload-time = "2026-03-09T09:35:12.217Z" },
@@ -2408,7 +2604,7 @@ name = "nvidia-cudnn-cu13"
 version = "9.20.0.48"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-cublas", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/56/c5/83384d846b2fd17c44bd499b36c75a45ed4f095fbbb2252294e89cea5c5c/nvidia_cudnn_cu13-9.20.0.48-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:e31454ae00094b0c55319d9d15b6fa2fc50a9e1c0f5c8c80fb75258234e731e1", size = 444574296, upload-time = "2026-03-09T19:28:27.751Z" },
@@ -2421,7 +2617,7 @@ name = "nvidia-cufft"
 version = "12.2.0.37"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-nvjitlink", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/4d/31158ab042b044b269019574da4430ecce8d05fec7af1d270e1ba28e3512/nvidia_cufft-12.2.0.37-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d0d762b7ece2f2a4971a5f29a6cef13f26fd87c7cd0003b48ed82d9a1d7380d7", size = 218244744, upload-time = "2026-03-09T09:48:16.661Z" },
@@ -2434,9 +2630,9 @@ name = "nvidia-cusolver"
 version = "12.1.0.51"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "nvidia-cusparse", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "nvidia-nvjitlink", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-cublas", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cusparse", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-nvjitlink", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/09/6214d11749dfc2d1be9a9e0bcfb04069077b98f7df0ad41115da87c84700/nvidia_cusolver-12.1.0.51-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:2a0bde343f956934103bc19344584a2d7b95d03b8cca9c0d22c90ff8917bbc3c", size = 224103511, upload-time = "2026-03-09T09:51:14.704Z" },
@@ -2449,7 +2645,7 @@ name = "nvidia-cusparse"
 version = "12.7.9.17"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-nvjitlink", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/06/5a/6bb7fc5f9658902efebc8551b1a9265b7a5908cbf9efdabdf97bc30b168a/nvidia_cusparse-12.7.9.17-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7c5d21980dc5f064c7ba13af2250e7fb4036283f1d1943c2915573c27928c89e", size = 168894384, upload-time = "2026-03-09T09:52:23.003Z" },
@@ -2534,7 +2730,7 @@ name = "nvidia-nvshmem-cu13"
 version = "3.5.21"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cuda-cccl", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-cuda-cccl", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/44/48/55705c0a9c6c5cfed0fcc4729d001570b36e3ff4b19bb8516c1c5b767890/nvidia_nvshmem_cu13-3.5.21-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:b6c2f7dc8c8f3084e0a23e495b020a30c6cbaf4e1674500860bcb65c79a8cb3d", size = 72192841, upload-time = "2026-02-27T00:20:16.542Z" },
@@ -2615,7 +2811,8 @@ name = "opentelemetry-proto"
 version = "1.40.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4c/77/dd38991db037fdfce45849491cb61de5ab000f49824a00230afb112a4392/opentelemetry_proto-1.40.0.tar.gz", hash = "sha256:03f639ca129ba513f5819810f5b1f42bcb371391405d99c168fe6937c62febcd", size = 45667, upload-time = "2026-03-04T14:17:31.194Z" }
 wheels = [
@@ -2752,7 +2949,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "python-dateutil" },
-    { name = "tzdata", marker = "sys_platform == 'emscripten' or sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "tzdata", marker = "sys_platform == 'emscripten' or sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2e/0c/b28ed414f080ee0ad153f848586d61d1878f91689950f037f976ce15f6c8/pandas-3.0.1.tar.gz", hash = "sha256:4186a699674af418f655dbd420ed87f50d56b4cd6603784279d9eef6627823c8", size = 4641901, upload-time = "2026-02-17T22:20:16.434Z" }
 wheels = [
@@ -2896,7 +3093,7 @@ name = "portalocker"
 version = "3.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5e/77/65b857a69ed876e1951e88aaba60f5ce6120c33703f7cb61a3c894b8c1b6/portalocker-3.2.0.tar.gz", hash = "sha256:1f3002956a54a8c3730586c5c77bf18fae4149e07eaf1c29fc3faf4d5a3f89ac", size = 95644, upload-time = "2025-06-14T13:20:40.03Z" }
 wheels = [
@@ -2995,7 +3192,8 @@ name = "proto-plus"
 version = "1.27.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3a/02/8832cde80e7380c600fbf55090b6ab7b62bd6825dbedde6d6657c15a1f8e/proto_plus-1.27.1.tar.gz", hash = "sha256:912a7460446625b792f6448bade9e55cd4e41e6ac10e27009ef71a7f317fa147", size = 56929, upload-time = "2026-02-02T17:34:49.035Z" }
 wheels = [
@@ -3006,6 +3204,41 @@ wheels = [
 name = "protobuf"
 version = "5.29.6"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/7e/57/394a763c103e0edf87f0938dafcd918d53b4c011dfc5c8ae80f3b0452dbb/protobuf-5.29.6.tar.gz", hash = "sha256:da9ee6a5424b6b30fd5e45c5ea663aef540ca95f9ad99d1e887e819cdf9b8723", size = 425623, upload-time = "2026-02-04T22:54:40.584Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/88/9ee58ff7863c479d6f8346686d4636dd4c415b0cbeed7a6a7d0617639c2a/protobuf-5.29.6-cp310-abi3-win32.whl", hash = "sha256:62e8a3114992c7c647bce37dcc93647575fc52d50e48de30c6fcb28a6a291eb1", size = 423357, upload-time = "2026-02-04T22:54:25.805Z" },
@@ -3014,6 +3247,89 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/d7/48cbf6b0c3c39761e47a99cb483405f0fde2be22cf00d71ef316ce52b458/protobuf-5.29.6-cp38-abi3-manylinux2014_aarch64.whl", hash = "sha256:a8866b2cff111f0f863c1b3b9e7572dc7eaea23a7fae27f6fc613304046483e6", size = 320284, upload-time = "2026-02-04T22:54:31.782Z" },
     { url = "https://files.pythonhosted.org/packages/e3/dd/cadd6ec43069247d91f6345fa7a0d2858bef6af366dbd7ba8f05d2c77d3b/protobuf-5.29.6-cp38-abi3-manylinux2014_x86_64.whl", hash = "sha256:e3387f44798ac1106af0233c04fb8abf543772ff241169946f698b3a9a3d3ab9", size = 320478, upload-time = "2026-02-04T22:54:32.909Z" },
     { url = "https://files.pythonhosted.org/packages/5a/cb/e3065b447186cb70aa65acc70c86baf482d82bf75625bf5a2c4f6919c6a3/protobuf-5.29.6-py3-none-any.whl", hash = "sha256:6b9edb641441b2da9fa8f428760fc136a49cf97a52076010cf22a2ff73438a86", size = 173126, upload-time = "2026-02-04T22:54:39.462Z" },
+]
+
+[[package]]
+name = "protobuf"
+version = "6.33.6"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.12' and sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra != 'extra-7-easydel-tensorflow' and extra != 'extra-7-easydel-tpu'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/70/e908e9c5e52ef7c3a6c7902c9dfbb34c7e29c25d2f81ade3856445fd5c94/protobuf-6.33.6.tar.gz", hash = "sha256:a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135", size = 444531, upload-time = "2026-03-18T19:05:00.988Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fc/9f/2f509339e89cfa6f6a4c4ff50438db9ca488dec341f7e454adad60150b00/protobuf-6.33.6-cp310-abi3-win32.whl", hash = "sha256:7d29d9b65f8afef196f8334e80d6bc1d5d4adedb449971fefd3723824e6e77d3", size = 425739, upload-time = "2026-03-18T19:04:48.373Z" },
+    { url = "https://files.pythonhosted.org/packages/76/5d/683efcd4798e0030c1bab27374fd13a89f7c2515fb1f3123efdfaa5eab57/protobuf-6.33.6-cp310-abi3-win_amd64.whl", hash = "sha256:0cd27b587afca21b7cfa59a74dcbd48a50f0a6400cfb59391340ad729d91d326", size = 437089, upload-time = "2026-03-18T19:04:50.381Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/01/a3c3ed5cd186f39e7880f8303cc51385a198a81469d53d0fdecf1f64d929/protobuf-6.33.6-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:9720e6961b251bde64edfdab7d500725a2af5280f3f4c87e57c0208376aa8c3a", size = 427737, upload-time = "2026-03-18T19:04:51.866Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/90/b3c01fdec7d2f627b3a6884243ba328c1217ed2d978def5c12dc50d328a3/protobuf-6.33.6-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:e2afbae9b8e1825e3529f88d514754e094278bb95eadc0e199751cdd9a2e82a2", size = 324610, upload-time = "2026-03-18T19:04:53.096Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/ca/25afc144934014700c52e05103c2421997482d561f3101ff352e1292fb81/protobuf-6.33.6-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:c96c37eec15086b79762ed265d59ab204dabc53056e3443e702d2681f4b39ce3", size = 339381, upload-time = "2026-03-18T19:04:54.616Z" },
+    { url = "https://files.pythonhosted.org/packages/16/92/d1e32e3e0d894fe00b15ce28ad4944ab692713f2e7f0a99787405e43533a/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593", size = 323436, upload-time = "2026-03-18T19:04:55.768Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/72/02445137af02769918a93807b2b7890047c32bfb9f90371cbc12688819eb/protobuf-6.33.6-py3-none-any.whl", hash = "sha256:77179e006c476e69bf8e8ce866640091ec42e1beb80b213c3900006ecfba6901", size = 170656, upload-time = "2026-03-18T19:04:59.826Z" },
 ]
 
 [[package]]
@@ -3340,7 +3656,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "implementation_name == 'pypy' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "cffi", marker = "implementation_name == 'pypy' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
@@ -3393,7 +3709,8 @@ dependencies = [
     { name = "jsonschema" },
     { name = "msgpack" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "pyyaml" },
     { name = "requests" },
 ]
@@ -3436,7 +3753,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
     { name = "rpds-py" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/f5/df4e9027acead3ecc63e50fe1e36aca1523e1719559c499951bb4b53188f/referencing-0.37.0.tar.gz", hash = "sha256:44aefc3142c5b842538163acb373e24cce6632bd54bdb01b21ad5863489f50d8", size = 78036, upload-time = "2025-10-13T15:30:48.871Z" }
 wheels = [
@@ -3842,11 +4159,11 @@ wheels = [
 
 [[package]]
 name = "setuptools"
-version = "82.0.1"
+version = "80.10.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/4f/db/cfac1baf10650ab4d1c111714410d2fbb77ac5a616db26775db562c8fab2/setuptools-82.0.1.tar.gz", hash = "sha256:7d872682c5d01cfde07da7bccc7b65469d3dca203318515ada1de5eda35efbf9", size = 1152316, upload-time = "2026-03-09T12:47:17.221Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/95/faf61eb8363f26aa7e1d762267a8d602a1b26d4f3a1e758e92cb3cb8b054/setuptools-80.10.2.tar.gz", hash = "sha256:8b0e9d10c784bf7d262c4e5ec5d4ec94127ce206e8738f29a437945fbc219b70", size = 1200343, upload-time = "2026-01-25T22:38:17.252Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/76/f789f7a86709c6b087c5a2f52f911838cad707cc613162401badc665acfe/setuptools-82.0.1-py3-none-any.whl", hash = "sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb", size = 1006223, upload-time = "2026-03-09T12:47:15.026Z" },
+    { url = "https://files.pythonhosted.org/packages/94/b8/f1f62a5e3c0ad2ff1d189590bfa4c46b4f3b6e49cef6f26c6ee4e575394d/setuptools-80.10.2-py3-none-any.whl", hash = "sha256:95b30ddfb717250edb492926c92b5221f7ef3fbcc2b07579bcd4a27da21d0173", size = 1064234, upload-time = "2026-01-25T22:38:15.216Z" },
 ]
 
 [[package]]
@@ -3903,21 +4220,41 @@ wheels = [
 
 [[package]]
 name = "spectrax-lib"
-version = "0.0.6"
-source = { registry = "https://pypi.org/simple" }
+version = "0.0.7"
+source = { editable = "../Spectrax" }
 dependencies = [
     { name = "fsspec", extra = ["http"] },
     { name = "jax" },
     { name = "jaxlib" },
     { name = "numpy" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "tensorstore" },
     { name = "treescope" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c6/cb/c36269d511672761b366edcded0cdafddbb3899f58be078fb79f49d2dd43/spectrax_lib-0.0.6.tar.gz", hash = "sha256:b11e9bf88d133fc203e66c4c51c20dcf382ad0446dce9f24e876ab0d010aa674", size = 459043, upload-time = "2026-05-01T18:09:23.53Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/42/add7e1b2b92728cc96530e24e87ca694836ace85b61f3d41e16556fc0a6e/spectrax_lib-0.0.6-py3-none-any.whl", hash = "sha256:ee70c1a22e7039bb7c92d184ca01d1e806cfdd5280ac3f4670cb2b55872713f1", size = 545814, upload-time = "2026-05-01T18:09:22.147Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "fsspec", extras = ["http"], specifier = ">=2024.2,<2026" },
+    { name = "jax", specifier = ">=0.10.0" },
+    { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.10.0" },
+    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.10.0" },
+    { name = "jaxlib", specifier = ">=0.10.0" },
+    { name = "myst-nb", marker = "extra == 'docs'", specifier = ">=1" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "optax", marker = "extra == 'contrib'", specifier = ">=0.2.8" },
+    { name = "protobuf", specifier = ">=5.29.6,<7" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
+    { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7" },
+    { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'", specifier = ">=2" },
+    { name = "sphinx-book-theme", marker = "extra == 'docs'", specifier = ">=1.1" },
+    { name = "sphinx-design", marker = "extra == 'docs'", specifier = ">=0.6" },
+    { name = "tensorstore", specifier = ">=0.1.76" },
+    { name = "treescope", specifier = ">=0.1.7" },
 ]
+provides-extras = ["cuda", "tpu", "test", "dev", "contrib", "docs"]
 
 [[package]]
 name = "sqlitedict"
@@ -3931,7 +4268,7 @@ version = "0.52.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
 wheels = [
@@ -3983,7 +4320,7 @@ dependencies = [
     { name = "numpy" },
     { name = "packaging" },
     { name = "pillow" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "setuptools" },
     { name = "tensorboard-data-server" },
     { name = "werkzeug" },
@@ -4020,7 +4357,7 @@ dependencies = [
     { name = "markdown" },
     { name = "numpy" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" } },
     { name = "setuptools" },
     { name = "six" },
     { name = "tensorboard-data-server" },
@@ -4058,7 +4395,7 @@ dependencies = [
     { name = "numpy" },
     { name = "opt-einsum" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" } },
     { name = "requests" },
     { name = "setuptools" },
     { name = "six" },
@@ -4087,11 +4424,11 @@ dependencies = [
     { name = "absl-py" },
     { name = "array-record", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
     { name = "dm-tree" },
-    { name = "etils", extra = ["edc", "enp", "epath", "epy", "etree"] },
+    { name = "etils", extra = ["edc", "enp", "epath", "epy", "etree"], marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
     { name = "immutabledict" },
     { name = "numpy" },
     { name = "promise" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" } },
     { name = "psutil" },
     { name = "pyarrow" },
     { name = "requests" },
@@ -4129,7 +4466,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
     { name = "googleapis-common-protos" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" } },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fc/cc/9c53720c3b9f43a7b5aa57b465536579d7e011bab06c0ad927283fcdb20b/tensorflow_metadata-1.17.3-py3-none-any.whl", hash = "sha256:452912e6398b3cb7302f0de6139dea794b3be1bd0eb40e6765eb3a04e51ea991", size = 31540, upload-time = "2026-01-09T00:02:48.944Z" },
@@ -4234,13 +4571,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "sys_platform == 'darwin'" },
-    { name = "networkx", marker = "sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "python_full_version >= '3.12' and sys_platform == 'darwin'" },
-    { name = "sympy", marker = "sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
+    { name = "filelock", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "fsspec", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jinja2", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "networkx", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "setuptools", marker = "(python_full_version >= '3.12' and sys_platform == 'darwin') or (python_full_version < '3.12' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform != 'darwin' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "sympy", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.8.0-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:3d05017d19bc99741288e458888283a44b0ee881d53f05f72f8b1cfea8998122", upload-time = "2025-10-01T23:35:48Z" },
@@ -4265,13 +4602,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "sys_platform != 'darwin'" },
-    { name = "networkx", marker = "sys_platform != 'darwin'" },
-    { name = "setuptools", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
-    { name = "sympy", marker = "sys_platform != 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
+    { name = "filelock", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "fsspec", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jinja2", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "networkx", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "setuptools", marker = "(python_full_version >= '3.12' and sys_platform != 'darwin') or (python_full_version < '3.12' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'darwin' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "sympy", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp311-cp311-linux_s390x.whl", hash = "sha256:2bfc013dd6efdc8f8223a0241d3529af9f315dffefb53ffa3bf14d3f10127da6", upload-time = "2025-10-01T23:33:07Z" },
@@ -4301,7 +4638,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "rich" },
 ]
 wheels = [
@@ -4313,7 +4651,7 @@ name = "tqdm"
 version = "4.67.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/09/a9/6ba95a270c6f1fbcd8dac228323f2777d886cb206987444e4bce66338dd4/tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb", size = 169598, upload-time = "2026-02-03T17:35:53.048Z" }
 wheels = [
@@ -4464,11 +4802,11 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "httptools" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "uvloop", marker = "(platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32') or (platform_python_implementation == 'PyPy' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (platform_python_implementation == 'PyPy' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "uvloop", marker = "(platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32') or (platform_python_implementation == 'PyPy' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (platform_python_implementation == 'PyPy' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (platform_python_implementation == 'PyPy' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'cygwin' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu')" },
     { name = "watchfiles" },
     { name = "websockets" },
 ]
@@ -4532,7 +4870,8 @@ dependencies = [
     { name = "gitpython" },
     { name = "packaging" },
     { name = "platformdirs" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-easydel-profile' or extra != 'extra-7-easydel-tensorflow' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -4746,11 +5085,11 @@ version = "2.22.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cheroot" },
-    { name = "etils", extra = ["epath"] },
+    { name = "etils", extra = ["epath"], marker = "extra == 'extra-7-easydel-profile' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
     { name = "fsspec" },
     { name = "gcsfs" },
     { name = "gviz-api" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "setuptools" },
     { name = "six" },
     { name = "werkzeug" },
@@ -4773,11 +5112,11 @@ version = "2.23.2a20260421"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cheroot" },
-    { name = "etils", extra = ["epath"] },
+    { name = "etils", extra = ["epath"], marker = "extra == 'extra-7-easydel-profile' or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
     { name = "fsspec" },
     { name = "gcsfs" },
     { name = "gviz-api" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "setuptools" },
     { name = "six" },
     { name = "werkzeug" },

@@ -94,7 +94,6 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
     "runtime": frozenset(
         {
             "esurge_name",
-            "pipeline_inference",
             "kernel_tile_policy",
             "max_model_len",
             "min_input_pad",
@@ -104,7 +103,6 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "async_scheduling",
             "max_num_batched_tokens",
             "use_aot_forward",
-            "bind_graphstate_for_aot",
             "compile_runner",
             "runner_verbose",
             "overlap_execution",
@@ -112,6 +110,8 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "long_prefill_token_threshold",
             "enable_window_aware_runtime_cap",
             "mpmd_scheduler",
+            "pp_microbatch_count",
+            "pp_microbatch_size",
         }
     ),
     "cache": frozenset(
@@ -211,7 +211,6 @@ _ESURGE_BOOL_FIELDS = frozenset(
     {
         "async_scheduling",
         "use_aot_forward",
-        "bind_graphstate_for_aot",
         "compile_runner",
         "runner_verbose",
         "overlap_execution",
@@ -248,6 +247,15 @@ def _coerce_esurge_value(key: str, value: Any) -> Any:
         return None
     if key == "max_num_seq_buckets":
         return [int(v) for v in value] if value is not None else None
+    if key in {"pp_microbatch_count", "pp_microbatch_size"}:
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered == "auto":
+                return "auto"
+            if lowered in {"none", "off", "disable", "disabled"}:
+                return None
+            return int(lowered)
+        return int(value)
     if key == "extra_eos_token_ids":
         return [int(v) for v in value] if value is not None else None
     if key == "extra_stops" and not isinstance(value, str):
@@ -273,14 +281,21 @@ def normalize_esurge_sections(esurge: Mapping[str, Any] | None) -> dict[str, dic
     """Normalize nested and legacy flat eSurge config into section dictionaries."""
     source = dict(esurge or {})
     sections: dict[str, dict[str, Any]] = {}
+    explicit_null_fields = {"tool_parser", "reasoning_parser"}
     for section in _ESURGE_SECTION_FIELDS:
         value = source.get(section)
         if isinstance(value, Mapping):
-            sections[section] = {key: _coerce_esurge_value(key, item) for key, item in value.items()}
+            sections[section] = {
+                key: _coerce_esurge_value(key, item)
+                for key, item in value.items()
+                if item is not None or key in explicit_null_fields
+            }
         else:
             sections[section] = {}
 
     for key, value in source.items():
+        if value is None and key not in explicit_null_fields:
+            continue
         if key in _ESURGE_SECTION_FIELDS:
             continue
         if key == "verbose" and "runner_verbose" not in sections["runtime"]:

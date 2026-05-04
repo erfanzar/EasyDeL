@@ -121,7 +121,6 @@ DEFAULTS: eLMConfig = {
         "runtime": {
             "min_input_pad": 16,
             "max_num_seqs": 32,
-            "bind_graphstate_for_aot": False,
             "enable_window_aware_runtime_cap": False,
             "runner_verbose": False,
         },

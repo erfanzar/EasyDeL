@@ -62,6 +62,7 @@ Technical Details:
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -113,6 +114,8 @@ if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 # Configuration constants
+
+
 DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
 DEFAULT_PAGE_SIZE_GPU_MIN = 256  # Minimum efficient page size for GPU
 DEFAULT_DECODE_INTERVAL_TOKENS = 16  # Decode every N tokens
@@ -128,24 +131,6 @@ _MLA_RAGGED_ATTN_MECHANISMS = {
     "multi_latent_ragged_page_attention_v1",
     "multi_latent_ragged_page_attention_v2",
 }
-
-
-def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
-    """Set the generation length on a SamplingParams object.
-
-    Attempts to set both ``max_tokens`` and ``max_new_tokens`` attributes
-    when they exist, ensuring compatibility across different SamplingParams
-    variants.
-
-    Args:
-        sp: A SamplingParams-like object whose token-limit fields will be
-            mutated in place.
-        n: The desired number of new tokens to generate.
-    """
-    if hasattr(sp, "max_tokens"):
-        sp.max_tokens = int(n)
-    if hasattr(sp, "max_new_tokens"):
-        sp.max_new_tokens = int(n)
 
 
 def _normalize_data_parallelism_axis(axis: str) -> str:
@@ -523,9 +508,6 @@ class eSurge(
                 and execution config. Fields (see :class:`eSurgeRuntimeConfig`):
 
                 - ``esurge_name`` (str | None): Optional human-readable engine name.
-                - ``pipeline_inference`` (Literal["auto", "on", "off"]): Whether
-                  to enable pipeline-parallel inference. ``"auto"`` decides from
-                  the mesh.
                 - ``kernel_tile_policy`` (KernelTilePolicy): GDN/Pallas kernel
                   tile policy.
                 - ``max_model_len`` (int): Maximum sequence length (prompt + new).
@@ -538,8 +520,6 @@ class eSurge(
                 - ``max_num_batched_tokens`` (int | None | _Empty): Per-step
                   token budget. ``NOT_GIVEN`` triggers backend-specific defaults.
                 - ``use_aot_forward`` (bool): Compile the forward pass ahead-of-time.
-                - ``bind_graphstate_for_aot`` (bool): Bind graph state into the
-                  AOT-compiled callable.
                 - ``compile_runner`` (bool): Pre-compile runner buckets at startup.
                 - ``runner_verbose`` (bool): Verbose runner logging.
                 - ``overlap_execution`` (bool): Overlap host/device work across
@@ -1067,11 +1047,12 @@ class eSurge(
         self._profiling_python_level: int | None = None
         self._possible_name = self._get_model_name(model)
 
+        self.runtime_config.async_scheduling = bool(self.runtime_config.async_scheduling)
+
         self.runner = eSurgeRunner(
             model=model.esurge_compatible_model,
             hbm_utilization=self.cache_config.hbm_utilization,
             page_size=self.cache_config.page_size,
-            pipeline_inference=self.runtime_config.pipeline_inference,
             max_cache_tokens=self.cache_config.max_cache_tokens,
             cache_capacity_margin=self.cache_config.cache_capacity_margin,
             kernel_tile_policy=self.runtime_config.kernel_tile_policy,
@@ -1081,14 +1062,15 @@ class eSurge(
             min_input_pad=self.runtime_config.min_input_pad,
             max_num_seqs=self.runtime_config.max_num_seqs,
             max_num_seq_buckets=self.runtime_config.max_num_seq_buckets,
-            async_scheduling=self.runtime_config.async_scheduling,
+            async_scheduling=bool(self.runtime_config.async_scheduling),
             min_token_pad=self.runtime_config.min_token_pad,
             use_aot_forward=self.runtime_config.use_aot_forward,
-            bind_graphstate_for_aot=self.runtime_config.bind_graphstate_for_aot,
             verbose=self.runtime_config.runner_verbose,
             enable_overlap_execution=self.runtime_config.overlap_execution,
             enable_sampler_metrics=self.runtime_config.sampler_metrics,
             mpmd_scheduler=self.runtime_config.mpmd_scheduler,
+            pp_microbatch_count=self.runtime_config.pp_microbatch_count,
+            pp_microbatch_size=self.runtime_config.pp_microbatch_size,
         )
 
         if self.runtime_config.compile_runner:
@@ -1101,7 +1083,7 @@ class eSurge(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
-            async_scheduling=self.runtime_config.async_scheduling,
+            async_scheduling=bool(self.runtime_config.async_scheduling),
             long_prefill_token_threshold=self.runtime_config.long_prefill_token_threshold,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
@@ -1116,6 +1098,9 @@ class eSurge(
         self._request_outputs: dict[str, RequestOutput] = {}
         self._max_request_outputs = self.worker_config.max_request_outputs
         self._finished_request_ids: deque[str] = deque()
+        self._engine_output_queue: queue.Queue = queue.Queue()
+        self._engine_output_thread: threading.Thread | None = None
+        self._parser_stop_queue: queue.SimpleQueue[dict[str, str]] = queue.SimpleQueue()
 
         # Per-request events to support many concurrent streams
         self._request_events: dict[str, threading.Event] = {}

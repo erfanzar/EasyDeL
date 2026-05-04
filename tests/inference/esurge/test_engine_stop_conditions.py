@@ -88,6 +88,7 @@ class _ProcessHarness(EngineParsingMixin, EngineUtilsMixin):
         skip_special_tokens,
         spaces_between_special_tokens,
         prompt_context=None,
+        tokens_are_eos_filtered=False,
     ):
         return DetokenizerResult(
             accumulated_text=self._decoded_text,
@@ -306,6 +307,99 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
     assert output.raw_accumulated_text == "<think>plan</think><tool_call>{}</tool_call>"
     assert completion.reasoning_content == "plan"
     assert completion.text == "<tool_call>{}</tool_call>"
+
+
+def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
+    harness = _ProcessHarness(decoded_text="xy", delta_text="y")
+    request_id = "req-engine-timestamp-metrics"
+    start_time = 100.0
+    harness._active_requests[request_id] = {
+        "parent_request_id": request_id,
+        "sample_index": 0,
+        "generated_tokens": [],
+        "decodable_tokens": [],
+        "last_decoded_index": 0,
+        "last_decode_time": start_time,
+        "start_time": start_time,
+        "first_token_time": None,
+        "reported_generated_count": 0,
+        "sampling_params": SamplingParams(max_tokens=16),
+        "prompt_token_ids": [1, 2],
+        "delegating_parser": DelegatingParser(),
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+    }
+    harness._request_outputs[request_id] = RequestOutput(
+        request_id=request_id,
+        prompt="hi",
+        prompt_token_ids=[[1, 2]],
+        outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+    )
+
+    harness._process_engine_outputs(
+        {
+            0: EngineCoreOutputs(
+                outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[11])],
+                timestamp=start_time + 1.0,
+            )
+        }
+    )
+    harness._process_engine_outputs(
+        {
+            0: EngineCoreOutputs(
+                outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[12])],
+                timestamp=start_time + 2.0,
+            )
+        }
+    )
+
+    output = harness._request_outputs[request_id]
+    assert output.time_spent_generating == 2.0
+    assert output.first_token_time == 1.0
+    assert output.num_generated_tokens == 2
+    assert output.tokens_per_second == 2.0
+
+
+def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
+    harness = _ProcessHarness(decoded_text="hello STOP tail", delta_text="hello STOP tail")
+    queued_stops = []
+    harness._enqueue_parser_stop_requests = lambda stops: queued_stops.append(dict(stops))
+    request_id = "req-parser-stop-queued"
+    harness._active_requests[request_id] = {
+        "parent_request_id": request_id,
+        "sample_index": 0,
+        "generated_tokens": [],
+        "decodable_tokens": [],
+        "last_decoded_index": 0,
+        "last_decode_time": 0.0,
+        "start_time": time.perf_counter(),
+        "first_token_time": None,
+        "reported_generated_count": 0,
+        "sampling_params": SamplingParams(max_tokens=16, stop=["STOP"]),
+        "prompt_token_ids": [1, 2],
+        "delegating_parser": DelegatingParser(),
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+    }
+    harness._request_outputs[request_id] = RequestOutput(
+        request_id=request_id,
+        prompt="hi",
+        prompt_token_ids=[[1, 2]],
+        outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+    )
+
+    harness._process_engine_outputs(
+        {
+            0: EngineCoreOutputs(
+                outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[11])],
+            )
+        }
+    )
+
+    output = harness._request_outputs[request_id]
+    assert queued_stops == [{request_id: "STOP"}]
+    assert output.finished is True
+    assert output.outputs[0].finish_reason == "stop"
 
 
 def test_process_engine_outputs_marks_finished_requests_without_token_output():

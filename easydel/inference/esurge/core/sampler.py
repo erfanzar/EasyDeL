@@ -72,57 +72,13 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         - Binary search: O(32 reductions) for top-k/p vs O(V log V) for sorting
         - Vectorized: Per-sample parameters via vmap
     """
-    # Convert to float32 for numerical stability in sampling operations
-    logits = logits.astype(jnp.float32)
-
     min_val = -1e10
 
-    # Top-k filtering
     need_top_k = jnp.any(sampling_metadata.top_ks > 0)
-
-    def apply_topk(legi):
-        """Apply top-k filtering to each sample in the batch."""
-
-        def topk_per_sample(logits_i, k_i):
-            """Apply top-k mask to a single sample if k > 0."""
-            return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
-
-        return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
-
-    logits = lax.cond(need_top_k, apply_topk, lambda legi: legi, logits)
-
-    # Top-p filtering
     need_top_p = jnp.any(sampling_metadata.top_ps < 1.0)
-
-    def apply_topp(legi):
-        """Apply top-p (nucleus) filtering to each sample in the batch."""
-
-        def topp_per_sample(logits_i, p_i):
-            """Apply top-p mask to a single sample if p < 1.0."""
-            return lax.cond(p_i < 1.0, lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0], lambda: logits_i)
-
-        return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
-
-    logits = lax.cond(need_top_p, apply_topp, lambda legi: legi, logits)
-
-    # Temperature scaling (apply before min-p to match sglang-jax behavior)
     need_temp = jnp.any(sampling_metadata.temperatures != 1.0)
+    need_filter_math = need_top_k | need_top_p | need_temp | sampling_metadata.need_min_p_sampling
 
-    def apply_temp(legi):
-        """Scale logits by per-sample temperature values."""
-        return legi / sampling_metadata.temperatures
-
-    logits = lax.cond(need_temp, apply_temp, lambda legi: legi, logits)
-
-    # Min-p filtering (applied after temperature scaling)
-    logits = lax.cond(
-        sampling_metadata.need_min_p_sampling,
-        lambda legi: apply_min_p_mask(legi, sampling_metadata),
-        lambda legi: legi,
-        logits,
-    )
-
-    # Sample from filtered distribution
     batch_size = logits.shape[0]
 
     if sampling_metadata.sampling_seeds is None:
@@ -135,8 +91,58 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         per_sample_rng = jax.random.fold_in(rng, seed_i)
         return jax.random.categorical(per_sample_rng, logits_i).astype(jnp.int32)
 
-    samples = jax.vmap(sample_one)(logits, sampling_seeds)
-    return samples
+    def sample_direct(legi):
+        return jax.vmap(sample_one)(legi, sampling_seeds)
+
+    def sample_filtered(legi):
+        # Convert to float32 for numerical stability in filtering operations.
+        legi = legi.astype(jnp.float32)
+
+        def apply_topk(legi):
+            """Apply top-k filtering to each sample in the batch."""
+
+            def topk_per_sample(logits_i, k_i):
+                """Apply top-k mask to a single sample if k > 0."""
+                return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
+
+            return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
+
+        legi = lax.cond(need_top_k, apply_topk, lambda x: x, legi)
+
+        def apply_topp(legi):
+            """Apply top-p (nucleus) filtering to each sample in the batch."""
+
+            def topp_per_sample(logits_i, p_i):
+                """Apply top-p mask to a single sample if p < 1.0."""
+                return lax.cond(
+                    p_i < 1.0,
+                    lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0],
+                    lambda: logits_i,
+                )
+
+            return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
+
+        legi = lax.cond(need_top_p, apply_topp, lambda x: x, legi)
+
+        def apply_temp(legi):
+            """Scale logits by per-sample temperature values."""
+            return legi / sampling_metadata.temperatures
+
+        legi = lax.cond(need_temp, apply_temp, lambda x: x, legi)
+
+        # Min-p filtering is applied after temperature scaling.
+        legi = lax.cond(
+            sampling_metadata.need_min_p_sampling,
+            lambda x: apply_min_p_mask(x, sampling_metadata),
+            lambda x: x,
+            legi,
+        )
+        return sample_direct(legi)
+
+    # Keep the common no-filter path in the model logits dtype. For bf16 TPU
+    # inference this avoids a full-vocab fp32 materialization before categorical
+    # sampling. Filtering paths still promote to fp32 for numerical stability.
+    return lax.cond(need_filter_math, sample_filtered, sample_direct, logits)
 
 
 def build_history_token_counts(

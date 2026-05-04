@@ -38,6 +38,107 @@ if tp.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_JSON_ENCODED_ARROW_COLUMNS = frozenset({"tools"})
+
+
+def _json_default(value: tp.Any) -> tp.Any:
+    """Best-effort conversion for JSON metadata stored beside token arrays."""
+    if isinstance(value, bytes | bytearray):
+        return bytes(value).decode("utf-8", errors="replace")
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _json_encode_metadata_value(value: tp.Any) -> str | None:
+    """Encode sideband metadata as JSON text for Arrow/Parquet storage."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
+
+
+def _contains_nested_metadata(values: tp.Iterable[tp.Any]) -> bool:
+    """Return whether values look like JSON-style sideband metadata."""
+    for value in values:
+        if isinstance(value, dict):
+            return True
+        if isinstance(value, list | tuple) and any(isinstance(item, dict | list | tuple) for item in value):
+            return True
+    return False
+
+
+def _row_keys(rows: list[dict[str, tp.Any]]) -> list[str]:
+    """Collect row keys in first-seen order, including keys absent from row zero."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+    return keys
+
+
+def _rows_to_arrow_table(rows: list[dict[str, tp.Any]], pa: tp.Any) -> tp.Any:
+    """Build an Arrow table while keeping token arrays typed and metadata stable.
+
+    PyArrow cannot infer a nested schema for tool/function metadata when one
+    shard contains mixed JSON scalar types, such as ``20`` in one row and
+    ``"20"`` in another. Store known sideband metadata columns as JSON text so
+    tokenized Parquet shards stay writable and have a stable cross-shard schema.
+    """
+    columns = {}
+    for key in _row_keys(rows):
+        values = [row.get(key) for row in rows]
+        if key in _JSON_ENCODED_ARROW_COLUMNS:
+            columns[key] = pa.array([_json_encode_metadata_value(value) for value in values], type=pa.string())
+            continue
+
+        fixed_size_column = _try_fixed_size_numeric_list(values, pa)
+        if fixed_size_column is not None:
+            columns[key] = fixed_size_column
+            continue
+
+        try:
+            columns[key] = pa.array(values)
+        except Exception as exc:
+            if not _contains_nested_metadata(values):
+                raise ValueError(f"Failed to convert column {key!r} to an Arrow array: {exc}") from exc
+            logger.warning(
+                "Column %r contains nested metadata with mixed Arrow types; storing it as JSON text.",
+                key,
+            )
+            columns[key] = pa.array([_json_encode_metadata_value(value) for value in values], type=pa.string())
+    return pa.table(columns)
+
+
+def _try_fixed_size_numeric_list(values: list[tp.Any], pa: tp.Any) -> tp.Any | None:
+    """Build a zero-copy-ish fixed-size Arrow list from equal-shaped arrays."""
+    try:
+        import numpy as np
+
+        arrays = [np.asarray(value) for value in values]
+        if not arrays or any(array.ndim != 1 for array in arrays):
+            return None
+        size = arrays[0].shape[0]
+        if any(array.shape != (size,) for array in arrays):
+            return None
+        dtype = np.result_type(*[array.dtype for array in arrays])
+        if dtype.kind not in {"b", "i", "u", "f"}:
+            return None
+        if dtype.kind in {"i", "u"} and dtype.itemsize > 4:
+            dtype = np.dtype("int32")
+        elif dtype.kind == "b":
+            dtype = np.dtype("bool")
+        stacked = np.asarray(arrays, dtype=dtype)
+        flat = pa.array(stacked.reshape(-1), type=pa.from_numpy_dtype(stacked.dtype))
+        return pa.FixedSizeListArray.from_arrays(flat, size)
+    except Exception:
+        return None
+
 
 def estimate_row_size(value: tp.Any) -> int:
     """Cheap approximate serialized size without stringifying large token lists."""
@@ -277,9 +378,7 @@ class ParquetWriter(DatasetWriter):
 
             # Convert to Arrow table
             if current_rows:
-                keys = current_rows[0].keys()
-                columns = {k: [row.get(k) for row in current_rows] for k in keys}
-                table = pa.table(columns)
+                table = _rows_to_arrow_table(current_rows, pa)
 
                 # Write shard
                 shard_path = f"{path}/shard-{current_shard:05d}.parquet"
@@ -360,9 +459,7 @@ class ArrowWriter(DatasetWriter):
                 return
 
             # Convert to Arrow table
-            keys = current_rows[0].keys()
-            columns = {k: [row.get(k) for row in current_rows] for k in keys}
-            table = pa.table(columns)
+            table = _rows_to_arrow_table(current_rows, pa)
 
             # Write shard
             shard_path = f"{path}/shard-{current_shard:05d}.arrow"
@@ -467,7 +564,7 @@ class JsonlWriter(DatasetWriter):
 
         for shard_name in source.shard_names:
             for example in source.open_shard(shard_name):
-                line = json.dumps(example, ensure_ascii=False)
+                line = json.dumps(example, ensure_ascii=False, default=_json_default)
                 current_lines.append(line)
                 current_size += len(line)
                 stats.num_examples += 1

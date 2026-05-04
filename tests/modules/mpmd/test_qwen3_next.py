@@ -36,6 +36,15 @@ class TestQwen3Next:
             num_key_value_heads=small_model_config["num_key_value_heads"],
             intermediate_size=small_model_config["intermediate_size"],
             max_position_embeddings=small_model_config["max_position_embeddings"],
+            head_dim=small_model_config["head_dim"],
+            linear_key_head_dim=small_model_config["head_dim"],
+            linear_value_head_dim=small_model_config["head_dim"],
+            linear_num_key_heads=small_model_config["num_key_value_heads"],
+            linear_num_value_heads=small_model_config["num_attention_heads"],
+            moe_intermediate_size=small_model_config["intermediate_size"],
+            shared_expert_intermediate_size=small_model_config["intermediate_size"],
+            num_experts=small_model_config["num_experts"],
+            num_experts_per_tok=small_model_config["num_experts_per_tok"],
         )
 
     @pytest.mark.parametrize("mpmd_schedule_kind", LOSS_SCHEDULE_KINDS, indirect=True)

@@ -236,7 +236,9 @@ def get_rope_index(
             position_ids = jnp.arange(seq_length).reshape(1, 1, -1).repeat(3, axis=0).repeat(batch_size, axis=1)
             mrope_position_deltas = jnp.zeros((batch_size,), dtype=input_ids.dtype)
 
-    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)  # pyright: ignore[reportReturnType]
+    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(
+        -1, 1
+    )  # pyright: ignore[reportReturnType]
 
 
 @auto_pytree
@@ -358,26 +360,6 @@ def merge_multimodal_embeddings(
     else:
         is_multimodal = input_ids == placeholder_token_id
     return _merge_multimodal_embeddings(inputs_embeds, is_multimodal, multimodal_embeddings)
-
-
-def precompute_vl_rotary(dim, theta, max_position):
-    """Precompute rotary position embedding frequencies for vision-language attention.
-
-    Computes the inverse frequency matrix used for rotary position embeddings
-    in the vision-language attention stack.
-
-    Args:
-        dim (int): Dimension of the rotary embedding (typically head_dim).
-        theta (float): Base value for computing inverse frequencies (typically 10000.0).
-        max_position (int): Maximum sequence position to precompute embeddings for.
-
-    Returns:
-        jnp.ndarray: Rotary angle matrix of shape (max_position, dim // 2) containing
-            the outer product of position indices and inverse frequencies.
-    """
-    inv = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype="f4") / dim))
-    seq = jnp.arange(0, max_position, "f4")
-    return jnp.outer(seq, inv)
 
 
 def rotate_half(x):
@@ -1099,7 +1081,7 @@ class Qwen2VLAttention(UnifiedAttention):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"] | Int[Array, "3 batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -1207,7 +1189,7 @@ class Qwen2VLDecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -1308,9 +1290,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         Raises:
             AssertionError: If config is not a Qwen2VLVisionConfig instance.
         """
-        assert isinstance(config, Qwen2VLVisionConfig), (
-            "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
-        )
+        assert isinstance(
+            config, Qwen2VLVisionConfig
+        ), "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1336,7 +1318,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
 
         self.blocks = nn.ModuleList([])
         for idx in range(config.depth):
-            with spx.assign_stage(total=config.depth, current=idx):
+            with self.assign_layer_stage(idx, total_layers=config.depth):
                 self.blocks.append(
                     Qwen2VLVisionBlock(
                         config=config,
@@ -1573,7 +1555,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for idx in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+            with self.assign_layer_stage(idx, total_layers=self.config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -1584,13 +1566,15 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = RMSNorm(
+                self.config.hidden_size,
+                eps=self.config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -1599,7 +1583,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
@@ -2016,7 +2000,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         rope_deltas: Array | None = None,
         cache_position: Array | None = None,
         mask_info: MaskInfo | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         **kwargs,
     ):
@@ -2277,7 +2261,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

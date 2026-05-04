@@ -287,6 +287,45 @@ def test_pre_tokenize_num_proc_parallel_path_writes_rows(tmp_path):
     assert set(row) == {"input_ids", "attention_mask"}
 
 
+def test_pre_tokenize_sft_saves_arrays_only_by_default(tmp_path):
+    data_path = tmp_path / "tools.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "messages": [{"role": "user", "content": "use a tool"}],
+                "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                "source": "debug-id",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    elm = _elm_with_tokenizer(
+        {
+            "model": {"name_or_path": "dummy-model"},
+            "mixture": {
+                "informs": [
+                    {
+                        "type": "jsonl",
+                        "data_files": str(data_path),
+                        "content_field": "messages",
+                        "additional_fields": ["tools", "source"],
+                    }
+                ],
+                "save": {"format": "jsonl"},
+            },
+            "trainer": {"trainer_type": "distillation", "max_length": 16},
+        }
+    )
+
+    stats = elm.pre_tokenize(tmp_path / "tools-out", compression=None, show_progress=False)
+
+    assert stats.num_examples == 1
+    row = _read_first_jsonl(stats)
+    assert set(row) == {"input_ids", "attention_mask"}
+
+
 def test_parquet_inform_projects_declared_columns(tmp_path):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -313,7 +352,7 @@ def test_parquet_inform_projects_declared_columns(tmp_path):
     assert source._columns == ["messages", "tools"]
 
 
-def test_pre_tokenize_generated_path_joins_named_mixture_datasets(tmp_path):
+def test_pre_tokenize_generated_path_uses_one_dataset_name(tmp_path):
     data_a = tmp_path / "a.jsonl"
     data_b = tmp_path / "b.jsonl"
     data_a.write_text('{"text": "a"}\n', encoding="utf-8")
@@ -344,9 +383,51 @@ def test_pre_tokenize_generated_path_joins_named_mixture_datasets(tmp_path):
     )
 
     trainer_cfg, arguments = elm._build_training_arguments_for_type()
-    folder = elm._build_pre_tokenize_folder_name(trainer_cfg, arguments, elm.build_tokenizer())
+    folder = elm._build_pre_tokenize_folder_name(
+        trainer_cfg,
+        arguments,
+        elm.build_tokenizer(),
+        dataset_name="reasoning/and calling",
+    )
 
-    assert folder == "dpo-SimpleTokenizer-MXL48-PL12-CL8-agentic-behave-1_reasoning_and_calling"
+    assert folder == "dpo-SimpleTokenizer-MXL48-PL12-CL8-reasoning_and_calling"
+
+
+def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path):
+    data_a = tmp_path / "a.jsonl"
+    data_b = tmp_path / "b.jsonl"
+    data_a.write_text('{"text": "a"}\n', encoding="utf-8")
+    data_b.write_text('{"text": "b"}\n', encoding="utf-8")
+    base_output = tmp_path / "elarge-data"
+
+    elm = _elm_with_tokenizer(
+        {
+            "model": {"name_or_path": "dummy-model"},
+            "mixture": {
+                "informs": [
+                    {"name": "agentic-behave-1", "type": "jsonl", "data_files": str(data_a), "content_field": "text"},
+                    {
+                        "name": "reasoning/and calling",
+                        "type": "jsonl",
+                        "data_files": str(data_b),
+                        "content_field": "text",
+                    },
+                ],
+                "save": {"format": "jsonl"},
+            },
+            "trainer": {"trainer_type": "sft", "max_length": 16},
+        }
+    )
+
+    stats = elm.pre_tokenize(base_output, compression=None, show_progress=False)
+
+    assert stats.num_examples == 2
+    output_paths = "\n".join(stats.output_paths)
+    expected_a = base_output / "sft-SimpleTokenizer-MXL16-PLNA-CLNA-agentic-behave-1"
+    expected_b = base_output / "sft-SimpleTokenizer-MXL16-PLNA-CLNA-reasoning_and_calling"
+    assert str(expected_a) in output_paths
+    assert str(expected_b) in output_paths
+    assert "agentic-behave-1_reasoning_and_calling" not in output_paths
 
 
 @pytest.mark.parametrize(
