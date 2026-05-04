@@ -67,6 +67,7 @@ from easydel.infra.sharding import (
     MeshLike,
     RuntimeShardingResolver,
     coerce_runtime_sharding_resolver,
+    mesh_matches,
     mesh_axis_size,
     resolve_stage_cache_mesh,
 )
@@ -880,6 +881,16 @@ class RaggedPagesCacheView(BaseCacheView):
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
             kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=config.kvdtype, device=kv_pages_sharding))
+        kv_mesh = getattr(getattr(kv_pages, "sharding", None), "mesh", None)
+        if kv_mesh is not None and not mesh_matches(kv_mesh, mesh):
+            logger.warning(
+                "Ragged KV cache layer %s initialized on a mesh that does not match its stage mesh: "
+                "kv_mesh_axes=%s stage_mesh_axes=%s kv_shape=%s",
+                layer_index,
+                getattr(kv_mesh, "axis_names", None),
+                getattr(mesh, "axis_names", None),
+                kv_pages_shape,
+            )
 
         return cls(
             metadata=config,

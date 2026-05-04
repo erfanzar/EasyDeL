@@ -294,14 +294,38 @@ def _detokenizer_worker(
             cmd = message.get("cmd")
             if cmd == "decode":
                 rid = message["request_id"]
-                generated_tokens = message["tokens"]
                 finished = message["finished"]
                 skip_special = message["skip_special_tokens"]
                 spaces_between_special = message.get("spaces_between_special_tokens", True)
 
                 state = states.setdefault(
-                    rid, {"last_index": 0, "previous_text": "", "buffered": [], "prompt_context": None}
+                    rid,
+                    {
+                        "last_index": 0,
+                        "previous_text": "",
+                        "buffered": [],
+                        "prompt_context": None,
+                        "tokens": [],
+                    },
                 )
+                if "tokens_delta" in message:
+                    token_offset = int(message.get("token_offset", 0))
+                    token_delta = list(message.get("tokens_delta") or [])
+                    state_tokens = state.setdefault("tokens", [])
+                    if token_offset != len(state_tokens):
+                        full_tokens = message.get("tokens")
+                        if full_tokens is None:
+                            raise RuntimeError(
+                                "Detokenizer delta stream lost synchronization: "
+                                f"request_id={rid!r} offset={token_offset} stored={len(state_tokens)}"
+                            )
+                        state_tokens[:] = list(full_tokens)
+                    else:
+                        state_tokens.extend(token_delta)
+                    generated_tokens = state_tokens
+                else:
+                    generated_tokens = list(message["tokens"])
+                    state["tokens"] = generated_tokens
                 # Store prompt context on first encounter so callers
                 # only need to send it once.
                 if "prompt_context" not in state or state["prompt_context"] is None:

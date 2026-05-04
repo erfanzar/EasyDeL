@@ -488,7 +488,7 @@ class Gemma3DecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -636,7 +636,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=self.config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         self.config,
@@ -647,7 +647,9 @@ class Gemma3TextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = Gemma3RMSNorm(self.config, param_dtype=self.dtype)
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = Gemma3RMSNorm(self.config, param_dtype=self.dtype)
 
     @cached_property
     def default_frequencies(self):
@@ -679,7 +681,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         token_type_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> BaseModelOutput:
@@ -937,7 +939,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
         token_type_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
@@ -1116,7 +1118,7 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -1495,7 +1497,7 @@ class Gemma3Model(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         token_type_ids: Array | None = None,
@@ -1610,7 +1612,9 @@ class Gemma3Model(EasyDeLBaseModule):
         Returns:
             TransformerCache: Initialized cache for the language model.
         """
-        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)  # pyright: ignore[reportReturnType]
+        return self.language_model.init_cache(
+            batch_size, max_length, starts, shardings, pad_token_id
+        )  # pyright: ignore[reportReturnType]
 
     def prepare_inputs_for_generation(
         self,
@@ -1817,7 +1821,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

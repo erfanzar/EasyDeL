@@ -769,7 +769,7 @@ class RwkvModel(EasyDeLBaseModule):
         )
         self.blocks = nn.ModuleList([])
         for idx in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+            with self.assign_layer_stage(idx, total_layers=self.config.num_hidden_layers):
                 self.blocks.append(
                     remat_layer_block(
                         config=config,

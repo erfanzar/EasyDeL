@@ -291,6 +291,24 @@ def test_add_request_creates_delegating_parser_for_single_request():
     assert dp.tool_request is None
 
 
+def test_add_request_can_defer_scheduler_enqueue_for_batching():
+    engine = _RequestsHarness()
+
+    scheduler_requests = engine._add_request(
+        request_id="req-1",
+        prompt="hi",
+        sampling_params=SamplingParams(max_tokens=1),
+        tool_parser_request=None,
+        defer_scheduler_enqueue=True,
+    )
+
+    assert scheduler_requests is not None
+    assert len(scheduler_requests) == 1
+    assert scheduler_requests[0].request_id == "req-1"
+    assert engine.scheduler.requests == []
+    assert "req-1" in engine._active_requests
+
+
 def test_build_tool_parser_request_returns_none_without_tools():
     """When both tools and tool_choice are None, should return None."""
     from easydel.inference.esurge.mixins.io import EngineIOMixin

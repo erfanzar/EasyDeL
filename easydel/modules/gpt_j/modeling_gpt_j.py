@@ -530,7 +530,7 @@ class GPTJBlock(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -654,7 +654,7 @@ class GPTJModel(EasyDeLBaseModule):
         )
         self.h = nn.ModuleList([])
         for i in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=self.config.num_hidden_layers):
                 self.h.append(
                     remat_layer_block(
                         config,
@@ -665,13 +665,15 @@ class GPTJModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.ln_f = LayerNorm(
-            self.config.hidden_size,
-            epsilon=self.config.layer_norm_epsilon,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.ln_f = LayerNorm(
+                self.config.hidden_size,
+                epsilon=self.config.layer_norm_epsilon,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     @cached_property
     def frequencies(self):
@@ -702,7 +704,7 @@ class GPTJModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -762,7 +764,9 @@ class GPTJModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        hidden_states = (inputs_embeds + extra_embedding) if extra_embedding is not None else inputs_embeds  # pyright: ignore[reportOptionalOperand]
+        hidden_states = (
+            (inputs_embeds + extra_embedding) if extra_embedding is not None else inputs_embeds
+        )  # pyright: ignore[reportOptionalOperand]
 
         if mode is None:
             mode = (

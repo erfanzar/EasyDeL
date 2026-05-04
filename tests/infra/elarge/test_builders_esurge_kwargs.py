@@ -48,7 +48,6 @@ def test_to_esurge_kwargs_keeps_extra_stops_none_by_default():
     kwargs = to_esurge_kwargs(cfg)
 
     assert kwargs["parsing"].extra_stops is None
-    assert kwargs["runtime"].bind_graphstate_for_aot is False
     assert kwargs["runtime"].enable_window_aware_runtime_cap is False
 
 
@@ -93,17 +92,6 @@ def test_to_esurge_kwargs_forwards_data_parallelism_axis():
     assert kwargs["cache"].data_parallelism_axis == "ep"
 
 
-def test_to_esurge_kwargs_forwards_bind_graphstate_for_aot():
-    cfg = {
-        "model": {"name_or_path": "dummy-model"},
-        "esurge": {"bind_graphstate_for_aot": True},
-    }
-
-    kwargs = to_esurge_kwargs(cfg)
-
-    assert kwargs["runtime"].bind_graphstate_for_aot is True
-
-
 def test_to_esurge_kwargs_forwards_worker_startup_timeout():
     cfg = {
         "model": {"name_or_path": "dummy-model"},
@@ -124,6 +112,18 @@ def test_to_esurge_kwargs_forwards_async_scheduling():
     kwargs = to_esurge_kwargs(cfg)
 
     assert kwargs["runtime"].async_scheduling is False
+
+
+def test_to_esurge_kwargs_forwards_pp_microbatch_policy():
+    cfg = {
+        "model": {"name_or_path": "dummy-model"},
+        "esurge": {"pp_microbatch_size": "4"},
+    }
+
+    kwargs = to_esurge_kwargs(cfg)
+
+    assert kwargs["runtime"].pp_microbatch_size == 4
+    assert kwargs["runtime"].pp_microbatch_count == "auto"
 
 
 def test_to_esurge_kwargs_defaults_distributed_controls():
@@ -195,23 +195,6 @@ def test_set_esurge_preserves_parsers_when_omitted_and_clears_when_none():
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
     assert esurge["parsing"]["tool_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
     assert esurge["parsing"]["reasoning_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
-
-
-def test_set_esurge_bind_graphstate_for_aot_override_is_optional():
-    elm = object.__new__(eLargeModel)
-    elm._config = {"model": {"name_or_path": "dummy-model"}, "esurge": {}}
-
-    elm.set_esurge(bind_graphstate_for_aot=True)
-    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["runtime"]["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
-
-    elm.set_esurge(max_num_seqs=8)
-    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["runtime"]["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
-
-    elm.set_esurge(bind_graphstate_for_aot=False)
-    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-    assert esurge["runtime"]["bind_graphstate_for_aot"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
 def test_set_esurge_window_aware_runtime_cap_override_is_optional():

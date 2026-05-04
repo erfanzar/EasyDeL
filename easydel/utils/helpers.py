@@ -22,7 +22,6 @@ Classes:
     LazyLogger: Deferred initialization logger
     Timer: Simple timing utility
     Timers: Multiple timer management with logging
-    DummyStream: Null output stream for suppression
 
 Functions:
     get_logger: Create a lazy logger instance
@@ -30,7 +29,6 @@ Functions:
     capture_time: Context manager for timing
     get_cache_dir: Get EasyDeL cache directory
     is_remote_path: Return whether a path uses a non-local URI scheme
-    quiet: Context manager to suppress output
     check_bool_flag: Parse boolean environment variables
 
 Constants:
@@ -51,7 +49,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import sys
 import time
 import typing as tp
 import warnings
@@ -479,63 +476,6 @@ def get_cache_dir() -> Path:
         cache_dir = home_dir / ".cache" / app_name
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
-
-
-class DummyStream:
-    """A null device-like stream that discards all writes.
-
-    Used for suppressing output by replacing stdout/stderr.
-    All write and flush operations are no-ops.
-    """
-
-    def write(self, *args, **kwargs):
-        """Discard all write operations."""
-        pass
-
-    def flush(self, *args, **kwargs):
-        """Discard all flush operations."""
-        pass
-
-
-@contextmanager
-def quiet(suppress_stdout=True, suppress_stderr=True):
-    """Context manager to temporarily suppress stdout and/or stderr output.
-
-    Replaces stdout/stderr with null streams to discard all output.
-    Restores original streams on exit.
-
-    Args:
-        suppress_stdout: Whether to suppress stdout.
-        suppress_stderr: Whether to suppress stderr.
-
-    Yields:
-        None
-
-    Example:
-        >>> with quiet():
-        ...     print("This won't be displayed")
-        ...     noisy_function()
-        >>> print("This will be displayed")
-
-    Note:
-        This will suppress ALL output to the specified streams within
-        the context, including output from C extensions and system calls.
-    """
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-
-    try:
-        if suppress_stdout:
-            sys.stdout = DummyStream()
-        if suppress_stderr:
-            sys.stderr = DummyStream()
-        yield
-
-    finally:
-        if suppress_stdout:
-            sys.stdout = original_stdout
-        if suppress_stderr:
-            sys.stderr = original_stderr
 
 
 def check_bool_flag(name: str, default: bool = True) -> bool:

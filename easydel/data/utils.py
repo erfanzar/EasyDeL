@@ -21,7 +21,6 @@ file globbing, format detection, column alignment, and cloud storage utilities.
 from __future__ import annotations
 
 import time
-import warnings
 from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
@@ -358,15 +357,3 @@ def align_columns_intersection(datasets: list):
     return [ds.remove_columns([c for c in ds.column_names if c not in common]) for ds in datasets]
 
 
-def warn_deprecated(msg: str):
-    """Emit a :class:`DeprecationWarning` with ``stacklevel=2``.
-
-    Wrapping :func:`warnings.warn` ensures every deprecation in
-    the data layer is consistently surfaced (same category,
-    same stack level so the warning points at the caller's
-    deprecated usage rather than at this helper).
-
-    Args:
-        msg: Deprecation message shown to the user.
-    """
-    warnings.warn(msg, DeprecationWarning, stacklevel=2)

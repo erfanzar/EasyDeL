@@ -23,7 +23,6 @@ Modules:
     _linear: Core parallel linear layers (ParallelLinear, Row/ColumnParallelLinear).
     _linear_moe: MoE-specific linear layers with grouped matmul support.
     _linear_quantized: Quantized linear layers (INT8, NF4, MXFP formats).
-    _linear_moe_quantized: Placeholder for quantized MoE layers.
     _utils: Low-level utilities for quantized operations.
 
 Classes:

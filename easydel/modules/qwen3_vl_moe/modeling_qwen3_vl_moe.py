@@ -925,7 +925,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
 
         self.blocks = nn.ModuleList([])
         for idx in range(config.depth):
-            with spx.assign_stage(total=config.depth, current=idx):
+            with self.assign_layer_stage(idx, total_layers=config.depth):
                 self.blocks.append(
                     Qwen3VLMoeVisionBlock(
                         config=config,
@@ -1627,7 +1627,7 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
         hidden_states: Array,
         mask_info: MaskInfo,
         position_ids: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -1731,9 +1731,9 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
-        assert isinstance(config, Qwen3VLMoeTextConfig), (
-            f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
-        )
+        assert isinstance(
+            config, Qwen3VLMoeTextConfig
+        ), f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1759,7 +1759,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -1771,13 +1771,15 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     @cached_property
     def frequencies(self):
@@ -1803,7 +1805,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -2503,7 +2505,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -2881,7 +2883,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

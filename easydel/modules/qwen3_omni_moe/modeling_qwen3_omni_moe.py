@@ -513,7 +513,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
 
         self.layers = nn.ModuleList([])
         for i in range(config.encoder_layers):
-            with spx.assign_stage(total=config.encoder_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=config.encoder_layers):
                 self.layers.append(
                     Qwen3OmniMoeAudioEncoderLayer(
                         config=config,
@@ -1108,23 +1108,6 @@ class Qwen3OmniMoeVisionBlock(spx.Module):
         return hidden_states
 
 
-def create_vision_rotary_embedding(dim: int, theta: float = 10000.0, max_seqlen: int = 8192) -> Array:
-    """Create vision rotary position embeddings.
-
-    Args:
-        dim: Dimension of the embedding (head_dim // 2).
-        theta: Base for computing frequencies.
-        max_seqlen: Maximum sequence length.
-
-    Returns:
-        Frequencies of shape [max_seqlen, dim].
-    """
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    seq = jnp.arange(max_seqlen, dtype=jnp.float32)
-    freqs = jnp.outer(seq, inv_freq)
-    return freqs
-
-
 class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
     """Vision encoder for Qwen3OmniMoe.
 
@@ -1207,7 +1190,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
         self.blocks = nn.ModuleList([])
         for idx in range(config.depth):
-            with spx.assign_stage(total=config.depth, current=idx):
+            with self.assign_layer_stage(idx, total_layers=config.depth):
                 self.blocks.append(
                     Qwen3OmniMoeVisionBlock(
                         config=config,
@@ -1768,7 +1751,7 @@ class Qwen3OmniMoeTextDecoderLayer(spx.Module):
         hidden_states: Array,
         mask_info: MaskInfo,
         position_ids: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -2310,7 +2293,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(spx.Module):
         hidden_states: Array,
         mask_info: MaskInfo,
         position_ids: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -2565,7 +2548,7 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(spx.Module):
         hidden_states: Array,
         mask_info: MaskInfo,
         position_ids: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -2665,7 +2648,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -2677,13 +2660,15 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -2691,7 +2676,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -2896,7 +2881,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -3038,7 +3023,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -3050,13 +3035,15 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -3065,7 +3052,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -3304,7 +3291,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -3814,7 +3801,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
 
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     Qwen3OmniMoeCode2WavTransformerLayer(
                         config=config,
@@ -3826,13 +3813,15 @@ class Qwen3OmniMoeCode2WavTransformerModel(EasyDeLLayerStackMixin, spx.Module):
                     )
                 )
 
-        self.norm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -4093,7 +4082,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -4105,13 +4094,15 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -4123,7 +4114,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> VLMCausalLMOutput:
@@ -4325,7 +4316,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(text_config.num_hidden_layers):
-            with spx.assign_stage(total=text_config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=text_config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=text_config,
@@ -4337,13 +4328,15 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm = RMSNorm(
-            text_config.hidden_size,
-            eps=text_config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, text_config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=text_config.num_hidden_layers):
+            self.norm = RMSNorm(
+                text_config.hidden_size,
+                eps=text_config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def compute_embedding(
         self,
@@ -4468,7 +4461,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> VLMCausalLMOutput:
@@ -4887,7 +4880,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
@@ -5239,7 +5232,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

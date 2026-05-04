@@ -160,7 +160,6 @@ def _full_elm_config() -> dict[str, Any]:
             "hbm_utilization": 0.85,
             "page_size": 256,
             "use_aot_forward": True,
-            "bind_graphstate_for_aot": True,
             "enable_window_aware_runtime_cap": True,
             "enable_prefix_caching": True,
             "auto_shard_model": True,

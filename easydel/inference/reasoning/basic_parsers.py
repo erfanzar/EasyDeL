@@ -59,6 +59,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._start_token_id: int | None = self.vocab.get(self.start_token)
         self._end_token_id: int | None = self.vocab.get(self.end_token)
         self._prompt_started_reasoning: bool = False
+        self._stream_seen_start: bool = False
+        self._stream_seen_end: bool = False
+        self._stream_state_initialized: bool = False
 
     def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
         """Infer whether the prompt already entered reasoning mode.
@@ -73,6 +76,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         has_start_suffix_by_text = bool(prompt_text) and prompt_text.rstrip().endswith(self.start_token)
         self._prompt_started_reasoning = has_start_suffix_by_token or has_start_suffix_by_text
+        self._stream_seen_start = self._prompt_started_reasoning
+        self._stream_seen_end = False
+        self._stream_state_initialized = True
 
     def _is_prompt_reasoning_active(self) -> bool:
         """Return ``True`` when the prompt already opened the reasoning block.
@@ -168,24 +174,44 @@ class BaseThinkingReasoningParser(ReasoningParser):
         if not delta_text:
             return None
 
-        has_start_in_prev = self.start_token in previous_text or (
-            self._start_token_id is not None and self._start_token_id in previous_token_ids
-        )
-        has_end_in_prev = self.end_token in previous_text or (
-            self._end_token_id is not None and self._end_token_id in previous_token_ids
-        )
-        has_start_in_current = self.start_token in current_text or (
-            self._start_token_id is not None and self._start_token_id in current_token_ids
-        )
-        has_end_in_current = self.end_token in current_text or (
-            self._end_token_id is not None and self._end_token_id in current_token_ids
-        )
-        has_start_in_delta = self.start_token in delta_text
-        has_end_in_delta = self.end_token in delta_text
+        if not self._stream_state_initialized:
+            self._stream_seen_start = self._is_prompt_reasoning_active() or self.start_token in previous_text or (
+                self._start_token_id is not None and self._start_token_id in previous_token_ids
+            )
+            self._stream_seen_end = self.end_token in previous_text or (
+                self._end_token_id is not None and self._end_token_id in previous_token_ids
+            )
+            self._stream_state_initialized = True
+
+        def _marker_in_delta(marker: str) -> tuple[bool, bool]:
+            in_delta = marker in delta_text
+            if in_delta:
+                return True, True
+            if previous_text and len(marker) > 1:
+                boundary = previous_text[-(len(marker) - 1) :] + delta_text
+                if marker in boundary:
+                    return True, False
+            return False, False
+
+        has_start_marker, has_start_text_in_delta = _marker_in_delta(self.start_token)
+        has_end_marker, has_end_text_in_delta = _marker_in_delta(self.end_token)
+        has_start_token_in_delta = self._start_token_id is not None and self._start_token_id in delta_token_ids
+        has_end_token_in_delta = self._end_token_id is not None and self._end_token_id in delta_token_ids
+        has_start_in_delta = has_start_marker or has_start_token_in_delta
+        has_end_in_delta = has_end_marker or has_end_token_in_delta
+        has_start_in_prev = self._stream_seen_start
+        has_end_in_prev = self._stream_seen_end
+        has_start_in_current = has_start_in_prev or has_start_in_delta
+        has_end_in_current = has_end_in_prev or has_end_in_delta
         reasoning_started = has_start_in_prev or self._is_prompt_reasoning_active()
 
+        if has_start_in_delta:
+            self._stream_seen_start = True
+        if has_end_in_delta:
+            self._stream_seen_end = True
+
         # Case 1: Both start and end appear in the delta itself
-        if has_start_in_delta and has_end_in_delta:
+        if has_start_text_in_delta and has_end_text_in_delta:
             after_start = delta_text.split(self.start_token, 1)[1]
             reasoning_part, content_part = after_start.split(self.end_token, 1)
             return DeltaMessage(
@@ -199,7 +225,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         # Case 3: Start token appears in this delta (reasoning begins). Keep this
         # before inferred-reasoning checks so literal start tokens are stripped.
-        if has_start_in_delta:
+        if has_start_text_in_delta:
             after_start = delta_text.split(self.start_token, 1)[1]
             if after_start:
                 return DeltaMessage(reasoning_content=after_start)
@@ -208,6 +234,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # Case 4: Reasoning already active (explicitly started or prompt-gated),
         # and end token arrives in this chunk.
         if reasoning_started and has_end_in_delta:
+            if not has_end_text_in_delta:
+                return None
             parts = delta_text.split(self.end_token, 1)
             reasoning_part = parts[0]
             content_part = parts[1] if len(parts) > 1 else None

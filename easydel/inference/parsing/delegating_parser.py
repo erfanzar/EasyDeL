@@ -506,7 +506,7 @@ class DelegatingParser:
                         result.delta_content = ""
                         result.accumulated_content = self._raw_content_text
 
-                if self.phase == ParsePhase.REASONING:
+                if self.phase == ParsePhase.REASONING and delta_msg is None:
                     reasoning, content = self.reasoning_parser.extract_reasoning(accumulated_text)
                     if content is not None and content != accumulated_text:
                         self.phase = ParsePhase.CONTENT

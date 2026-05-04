@@ -22,7 +22,6 @@ Functions:
     save_compiled_fn: Save compiled function to disk
     load_compiled_fn: Load compiled function from disk
     load_cached_functions: Load multiple cached functions
-    smart_compile: Smart compilation with auto-caching
     hash_fn: Generate hash for function signature
 
 Constants:
@@ -83,7 +82,6 @@ __all__ = [
     "load_cached_functions",
     "load_compiled_fn",
     "save_compiled_fn",
-    "smart_compile",
 ]
 
 P = tp.ParamSpec("P")
@@ -99,7 +97,6 @@ if not isinstance(COMPILE_FUNC_DIR, str):
     COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 
 COMPILED_FILE_NAME = "compiled.executable"
-SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
 
 
@@ -318,84 +315,6 @@ def get_hash_of_lowering(lowered_func: Lowered):
     hash_object = hashlib.sha256(text_representation.encode("utf-8"))
     hash_digest = hash_object.hexdigest()
     return hash_digest
-
-
-def smart_compile(
-    lowered_func: Lowered,
-    tag: str | None = None,
-    verbose: bool = True,
-    cache_key: tuple[str, tuple] | None = None,
-) -> tuple[Compiled, tuple[str, tuple] | None]:
-    """Compile a lowered JAX function with two-level (disk + memory) caching.
-
-    Attempts to load a previously compiled version from disk. On cache miss
-    the function is compiled normally, and optionally saved to disk for
-    future runs when ``EASYDEL_CACHE_COMPILES`` is enabled.
-
-    Args:
-        lowered_func: A lowered JAX function to compile.
-        tag: Optional human-readable tag prepended to the cache directory
-            name for easier identification.
-        verbose: Whether to emit warnings on cache load/save failures.
-        cache_key: Optional key stored alongside the compiled function to
-            enable external signature verification.
-
-    Returns:
-        A tuple of ``(compiled_function, cache_key)``.
-    """
-    func_hash = get_hash_of_lowering(lowered_func)
-    foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
-    func_dir = COMPILE_FUNC_DIR / foldername
-    filepath = func_dir / COMPILED_FILE_NAME
-    signature_filepath = func_dir / SIGNATURE_FILE_NAME
-    post_fix = f" (TAG : {tag})" if tag else ""
-    signature = cache_key
-
-    if filepath.exists() and not RECOMPILE_FORCE:
-        try:
-            (serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
-            signature = pickle.load(open(signature_filepath, "rb"))
-            compiled_func = deserialize_and_load(
-                serialized=serialized,
-                in_tree=in_tree,
-                out_tree=out_tree,
-            )
-            return compiled_func, signature
-        except Exception as e:
-            if verbose:
-                warnings.warn(
-                    f"couldn't load compiled function due to {e}" + post_fix,
-                    stacklevel=4,
-                )
-            compiled_func: Compiled = lowered_func.compile()
-            if ECACHE_COMPILES:
-                serialized, in_tree, out_tree = serialize(compiled_func)
-                func_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
-                    pickle.dump(cache_key, open(signature_filepath, "wb"))
-                except Exception as e:
-                    if verbose:
-                        warnings.warn(
-                            f"couldn't save compiled function due to {e}" + post_fix,
-                            stacklevel=4,
-                        )
-            return compiled_func, signature
-    else:
-        compiled_func: Compiled = lowered_func.compile()
-        if ECACHE_COMPILES:
-            try:
-                serialized, in_tree, out_tree = serialize(compiled_func)
-                func_dir.mkdir(parents=True, exist_ok=True)
-                pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
-                pickle.dump(cache_key, open(signature_filepath, "wb"))
-            except Exception as e:
-                if verbose:
-                    warnings.warn(
-                        f"couldn't save and serialize compiled function due to {e}" + post_fix,
-                        stacklevel=4,
-                    )
-        return compiled_func, signature
 
 
 class NoCompileContext:

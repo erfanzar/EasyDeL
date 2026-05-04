@@ -77,12 +77,13 @@ def pack_prompts(token_ids, num_prompt_tokens, padded_num_reqs, padded_prompt_le
         This function is JIT-compiled with static arguments for padded dimensions
         to enable efficient compilation caching.
     """
-    slice_tokens = token_ids[:padded_num_reqs, :padded_prompt_len]
-    lengths = num_prompt_tokens[:padded_num_reqs, None]  # [B,1]
-    arange = jnp.arange(padded_prompt_len, dtype=lengths.dtype)[None, :]  # [1,T]
-    mask = arange < lengths  # [B,T]
-    pad_mat = jnp.full_like(slice_tokens, pad_id)
-    return jnp.where(mask, slice_tokens, pad_mat)
+    with jax.named_scope("easydel/esurge/sequence_buffer/pack_prompts"):
+        slice_tokens = token_ids[:padded_num_reqs, :padded_prompt_len]
+        lengths = num_prompt_tokens[:padded_num_reqs, None]  # [B,1]
+        arange = jnp.arange(padded_prompt_len, dtype=lengths.dtype)[None, :]  # [1,T]
+        mask = arange < lengths  # [B,T]
+        pad_mat = jnp.full_like(slice_tokens, pad_id)
+        return jnp.where(mask, slice_tokens, pad_mat)
 
 
 @ejit(static_argnames=("padded_num_reqs",))  # pyright: ignore[reportUntypedFunctionDecorator]
@@ -124,12 +125,13 @@ def build_sampling_arrays(temperature, min_p, top_p, top_k, num_reqs, padded_num
         out = jnp.full((padded_num_reqs,), fill_val, dtype=arr.dtype)
         return out.at[:num_reqs].set(arr[:num_reqs])
 
-    return (
-        fill(temperature, -1.0).astype(jnp.float32),
-        fill(min_p, 0.0).astype(jnp.float32),
-        fill(top_p, 1.0).astype(jnp.float32),
-        fill(top_k, 0).astype(jnp.int32),
-    )
+    with jax.named_scope("easydel/esurge/sequence_buffer/build_sampling_arrays"):
+        return (
+            fill(temperature, -1.0).astype(jnp.float32),
+            fill(min_p, 0.0).astype(jnp.float32),
+            fill(top_p, 1.0).astype(jnp.float32),
+            fill(top_k, 0).astype(jnp.int32),
+        )
 
 
 def swap_rows(arr, i1, i2):
@@ -166,20 +168,6 @@ def swap_rows(arr, i1, i2):
     out[i1] = out[i2]
     out[i2] = tmp
     return out
-
-
-def swap_rows_pytree(arrs, i1, i2):
-    """Swap rows across all arrays in a pytree.
-
-    Args:
-        arrs: PyTree containing arrays.
-        i1: Index of first row to swap.
-        i2: Index of second row to swap.
-
-    Returns:
-        PyTree with same structure but rows swapped in all arrays.
-    """
-    return jax.tree_util.tree_map(lambda a: swap_rows(a, i1, i2), arrs)
 
 
 def move_row(arr, from_idx, to_idx):
@@ -230,22 +218,23 @@ def build_allowed_mask(allowed_ids_padded, allowed_lens, vocab_size, max_allowed
         The inverted logic (True=disallowed) is used for compatibility
         with masking operations that zero out disallowed values.
     """
-    B = allowed_ids_padded.shape[0]
-    mask = jnp.ones((B, vocab_size), dtype=bool)
+    with jax.named_scope("easydel/esurge/sequence_buffer/build_allowed_mask"):
+        B = allowed_ids_padded.shape[0]
+        mask = jnp.ones((B, vocab_size), dtype=bool)
 
-    batch_idx = jnp.repeat(jnp.arange(B)[:, None], max_allowed, axis=1)  # [B, max_allowed]
-    flat_batch = batch_idx.reshape(-1)
-    flat_token = allowed_ids_padded.reshape(-1)
+        batch_idx = jnp.repeat(jnp.arange(B)[:, None], max_allowed, axis=1)  # [B, max_allowed]
+        flat_batch = batch_idx.reshape(-1)
+        flat_token = allowed_ids_padded.reshape(-1)
 
-    ar = jnp.arange(max_allowed)[None, :]
-    valid = ar < allowed_lens[:, None]
-    flat_valid = valid.reshape(-1)
+        ar = jnp.arange(max_allowed)[None, :]
+        valid = ar < allowed_lens[:, None]
+        flat_valid = valid.reshape(-1)
 
-    flat_batch = flat_batch[flat_valid]
-    flat_token = flat_token[flat_valid]
+        flat_batch = flat_batch[flat_valid]
+        flat_token = flat_token[flat_valid]
 
-    mask = mask.at[flat_batch, flat_token].set(False)
-    return mask
+        mask = mask.at[flat_batch, flat_token].set(False)
+        return mask
 
 
 class SequenceBuffer:
@@ -952,32 +941,6 @@ class SequenceBuffer:
 
         raise RuntimeError("SequenceBuffer is full; cannot allocate a new request index.")
 
-    def _make_prompt_token_ids_tensor(self) -> jax.Array:
-        """Create a padded tensor of prompt token IDs.
-
-        Returns:
-            A padded array of prompt tokens suitable for batch processing.
-            Shape is [num_reqs, max_prompt_len].
-
-        Note:
-            Uses the JIT-compiled pack_prompts function for efficiency.
-        """
-        if self.num_reqs == 0:
-            return jnp.empty((0, 0), dtype=jnp.int32)
-
-        max_prompt_len = int(np.max(self.num_prompt_tokens[: self.num_reqs]))
-        # Convert to JAX for pack_prompts (which is JIT-compiled)
-        result = pack_prompts(
-            jnp.asarray(self.token_ids),
-            jnp.asarray(self.num_prompt_tokens),
-            self.num_reqs,
-            max_prompt_len,
-            self.vocab_size,
-        )
-        if not isinstance(result, jax.Array):
-            raise RuntimeError(f"pack_prompts must return a jax.Array, but got {type(result)}")
-        return result
-
     def get_request_indices_with_penalty(self) -> jax.Array:
         """Get indices of requests with penalties.
 
@@ -1188,4 +1151,5 @@ def fill_slice(arr, fill_val, num_reqs, padded_num_reqs):
     Returns:
         Array with padding applied from num_reqs to padded_num_reqs.
     """
-    return arr.at[num_reqs:padded_num_reqs].set(fill_val)[:padded_num_reqs]
+    with jax.named_scope("easydel/esurge/sequence_buffer/fill_slice"):
+        return arr.at[num_reqs:padded_num_reqs].set(fill_val)[:padded_num_reqs]

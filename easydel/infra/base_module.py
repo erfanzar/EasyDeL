@@ -449,9 +449,18 @@ class EasyDeLLayerStackMixin:
         return logical_stage % physical_pp, physical_pp
 
     @contextlib.contextmanager
-    def _assign_layer_stage(self: Self, layer_idx: int, *, total_layers: int):
-        """Assign subsequently-created variables to the layer's physical PP owner."""
-        current, total = self._layer_physical_stage_assignment(layer_idx, total_layers)
+    def assign_layer_stage(self: Self, layer_idx: int, *, total_layers: int):
+        """Assign subsequently-created variables to a logical layer slot.
+
+        ``spx.assign_stage`` stores a logical ``(current, total)`` hint on
+        variables. SpectraX resolves that hint to the active physical MPMD rank
+        later via ``resolve_stage_rank``. Keeping the logical layer slot here is
+        important for stacks with per-layer state/cache metadata: collapsing
+        multiple layers to the same physical rank at construction time loses
+        layer identity even though the final physical owner is the same.
+        """
+        current, total = self._pipeline_layer_position(layer_idx, total_layers)
+        current = min(max(0, int(current)), max(1, int(total)) - 1)
         with spx.assign_stage(total=total, current=current):
             yield
 
@@ -463,7 +472,7 @@ class EasyDeLLayerStackMixin:
         layers: tp.Sized | None = None,
         total_layers: int | None = None,
     ):
-        """Enter the physical PP owner context for a concrete repeated layer."""
+        """Enter the physical PP owner context for executing a concrete layer."""
         try:
             idx = int(layer_idx)
         except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
@@ -474,7 +483,8 @@ class EasyDeLLayerStackMixin:
         if self._pipeline_stage_count() <= 1:
             yield
             return
-        with self._assign_layer_stage(idx, total_layers=total_layers):
+        current, total = self._layer_physical_stage_assignment(idx, total_layers)
+        with spx.assign_stage(total=total, current=current):
             yield
 
     def _layer_scan_trace(

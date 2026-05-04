@@ -110,6 +110,7 @@ class TestToEsurgeKwargs:
     def test_default_values(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_esurge_kwargs(cfg)
+        assert result["runtime"].min_input_pad == 16
         assert result["runtime"].max_num_seqs == 32
         assert result["cache"].hbm_utilization == 0.80
         assert result["cache"].page_size == 128

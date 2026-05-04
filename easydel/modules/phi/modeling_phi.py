@@ -354,7 +354,7 @@ class PhiDecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -484,7 +484,7 @@ class PhiModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for idx in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=idx):
+            with self.assign_layer_stage(idx, total_layers=self.config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -525,7 +525,7 @@ class PhiModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -762,7 +762,7 @@ class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

@@ -1015,7 +1015,7 @@ class FalconH1DecoderLayer(spx.Module):
         hidden_states: Array,
         mask_info: MaskInfo | None,
         position_ids: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: HybridCacheView | None = None,
         cache_metadata: OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -1181,7 +1181,7 @@ class FalconH1Model(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     layer_block(
                         config=config,
@@ -1210,7 +1210,7 @@ class FalconH1Model(EasyDeLBaseModule):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         mask_info: MaskInfo | None = None,
         cache_metadata: OperationsMetadata | None = None,
         **kwargs,
@@ -1434,7 +1434,7 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         mask_info: MaskInfo | None = None,
         cache_metadata: OperationsMetadata | None = None,
         apply_lm_head: bool = True,

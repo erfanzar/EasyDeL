@@ -394,18 +394,6 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: UsageInfo  # Usage info might be included in chunks, often zero until the end
 
 
-class CountTokenRequest(OpenAIBaseModel):
-    """Represents a request to the token counting endpoint.
-
-    Attributes:
-        model: Model to use for tokenization.
-        conversation: Content to count tokens for (string or message list).
-    """
-
-    model: str
-    conversation: str | list[ChatMessage]  # Can count tokens for a string or a list of messages
-
-
 class CompletionRequest(OpenAIBaseModel):
     """Represents a request to the completions endpoint.
 

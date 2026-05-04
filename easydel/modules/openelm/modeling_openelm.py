@@ -309,7 +309,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -635,7 +635,7 @@ class OpenELMDecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -757,7 +757,7 @@ class OpenELMModel(EasyDeLBaseModule):
         remat_layer_block = _openelm_decoder_layer_block(config)
         self.layers = nn.ModuleList([])
         for i in range(self.config.num_transformer_layers):
-            with spx.assign_stage(total=self.config.num_transformer_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=self.config.num_transformer_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -768,13 +768,15 @@ class OpenELMModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = RMSNorm(
-            config.model_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            eps=1e-6,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, self.config.num_transformer_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_transformer_layers):
+            self.norm = RMSNorm(
+                config.model_dim,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                eps=1e-6,
+                rngs=rngs,
+            )
         if config.share_input_output_layers:
             self.classifier = None
         else:
@@ -809,7 +811,7 @@ class OpenELMModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -859,9 +861,9 @@ class OpenELMModel(EasyDeLBaseModule):
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
         sequence_length = inputs_embeds.shape[1]
 
-        assert sequence_length <= self.config.max_context_length, (
-            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
-        )
+        assert (
+            sequence_length <= self.config.max_context_length
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,

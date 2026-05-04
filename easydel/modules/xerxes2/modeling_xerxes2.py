@@ -682,7 +682,7 @@ class Xerxes2DecoderLayer(spx.Module):
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         frequencies: tuple[Array, Array],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -816,7 +816,7 @@ class Xerxes2Model(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -827,12 +827,14 @@ class Xerxes2Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = RMSNorm(
-            dim=config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                dim=config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            )
 
     @functools.cached_property
     def frequencies(self) -> jnp.ndarray:
@@ -850,7 +852,7 @@ class Xerxes2Model(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -1097,7 +1099,7 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # ty
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

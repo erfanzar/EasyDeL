@@ -892,34 +892,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         return sampling_params
 
     @staticmethod
-    def _looks_like_tool_protocol_text(text: str | None) -> bool:
-        """Return True when text appears to be tool protocol/control markup."""
-
-        if not text:
-            return False
-        normalized = text.lower()
-        markers = (
-            "<tool_call",
-            "<tool",
-            "</tool_call>",
-            "</tool",
-            "<arg_key>",
-            "<arg",
-            "</arg_key>",
-            "</arg",
-            "<arg_value>",
-            "</arg_value>",
-            "<|observation|>",
-            "<|observ",
-            "observation|>",
-            "<|assistant|>",
-            "<|assist",
-        )
-        if any(marker in normalized for marker in markers):
-            return True
-        return ("<" in normalized) and ("tool" in normalized or "arg_" in normalized or "observation" in normalized)
-
-    @staticmethod
     def _stream_debug_preview(text: tp.Any, *, max_chars: int = 160) -> str | None:
         """Return a compact escaped preview for debug logging."""
 
@@ -1362,21 +1334,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             logger.exception(f"Error applying chat template: {e}")
             raise RuntimeError(f"Error tokenizing input: {e}") from e
 
-    async def _prepare_chat_input_async(self, request: ChatCompletionRequest, esurge: eSurge) -> str:
-        """Prepare chat input asynchronously.
-
-        Async wrapper for _prepare_chat_input using thread pool.
-
-        Args:
-            request: Chat completion request.
-            esurge: eSurge instance.
-
-        Returns:
-            Formatted prompt string.
-        """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.thread_pool, self._prepare_chat_input, request, esurge)
-
     async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request) -> tp.Any:
         """Handle chat completion requests.
 
@@ -1519,28 +1476,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             msg_copy["content"] = " ".join(part for part in text_parts if part)
             normalized.append(msg_copy)
         return normalized
-
-    async def _handle_chat_completion_multimodal(
-        self,
-        request: ChatCompletionRequest,
-        esurge: eSurge,
-        messages: list[dict[str, tp.Any]],
-        request_id: str,
-        raw_request: Request,
-    ) -> ChatCompletionResponse:
-        """Backward-compatible wrapper around the unified chat completion path."""
-        return await self._handle_chat_completion(request, esurge, messages, request_id, raw_request)
-
-    async def _handle_chat_streaming_multimodal(
-        self,
-        request: ChatCompletionRequest,
-        esurge: eSurge,
-        messages: list[dict[str, tp.Any]],
-        request_id: str,
-        raw_request: Request,
-    ) -> StreamingResponse:
-        """Backward-compatible wrapper around the unified chat streaming path."""
-        return await self._handle_chat_streaming(request, esurge, messages, request_id, raw_request)
 
     @staticmethod
     def _prompt_token_count_from_output(output: RequestOutput) -> int:
@@ -2636,51 +2571,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
         self._authorize_request(raw_request)
         return JSONResponse(self._create_tools_response())
-
-    async def _create_standard_response(
-        self,
-        request: ChatCompletionRequest,
-        output: tp.Any,
-        prompt_tokens: int,
-        start_time: float,
-    ) -> ChatCompletionResponse:
-        """Create a standard chat completion response without function calling.
-
-        Builds a ChatCompletionResponse from generation output, calculating
-        usage statistics and formatting the response according to OpenAI API
-        specifications.
-
-        Args:
-            request: The original chat completion request.
-            output: The generation output containing completions.
-            prompt_tokens: Number of tokens in the input prompt.
-            start_time: Unix timestamp when generation started, used to
-                calculate processing time.
-
-        Returns:
-            ChatCompletionResponse with a single choice containing the
-            generated message and computed usage statistics.
-        """
-        completion = output.outputs[0]
-        completion_tokens = len(completion.token_ids)
-        generation_time = time.time() - start_time
-        tokens_per_second = completion_tokens / generation_time if generation_time > 0 else 0
-
-        message = ChatMessage(role="assistant", content=completion.text)
-
-        usage = UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            tokens_per_second=tokens_per_second,
-            processing_time=generation_time,
-        )
-
-        return ChatCompletionResponse(
-            model=request.model,
-            choices=[ChatCompletionResponseChoice(index=0, message=message, finish_reason="stop")],
-            usage=usage,
-        )
 
     async def execute_tool(self, raw_request: Request) -> JSONResponse:
         """Execute a tool/function call.

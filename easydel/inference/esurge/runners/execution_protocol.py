@@ -269,7 +269,7 @@ class ExecutionManagerProtocol(Protocol):
         sampler_padded_num_reqs: int,
         sampler_num_reqs: int,
         sampler_total_tokens: int,
-        req_num_tokens_full: jax.Array,
+        req_num_tokens_full_cpu: np.ndarray,
         logits: jax.Array,
         rng_key: jax.Array,
         gather_positions_cpu: np.ndarray,
@@ -299,7 +299,9 @@ class ExecutionManagerProtocol(Protocol):
             sampler_padded_num_reqs: Sampler-side padded request count after compaction.
             sampler_num_reqs: Actual compacted sampler rows.
             sampler_total_tokens: Total scheduled tokens in the compacted sampler batch.
-            req_num_tokens_full: Target token count per request.
+            req_num_tokens_full_cpu: Target token count per request. The
+                sampler packs the compact slice into its existing metadata
+                transfer, avoiding a separate device vector each token.
             logits: Model output logits [padded_num_reqs, vocab_size].
             rng_key: JAX random key for stochastic sampling.
             gather_positions_cpu: Model-row indices used to gather compact logits.

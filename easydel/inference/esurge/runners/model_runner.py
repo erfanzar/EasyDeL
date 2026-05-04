@@ -64,6 +64,7 @@ from bisect import bisect_left
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import numpy as np
@@ -72,7 +73,7 @@ from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
 
-from easydel.inference.esurge.config import KernelTilePolicy, PipelineInferenceMode
+from easydel.inference.esurge.config import KernelTilePolicy
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 from easydel.operations.kernels.inference_gdn import set_gdn_kernel_tile_policy
@@ -83,7 +84,7 @@ from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
-from .async_types import AsyncPreResults, AsyncWindowResult
+from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
 from .execution_manager import ExecutionManager
 from .pipeline_execution_manager import PipelineExecutionManager
 from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
@@ -213,31 +214,6 @@ class _AsyncExecutionHandle:
         return output
 
 
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
-    """Calculate padded request count for compilation efficiency.
-
-    Pads the number of requests to the nearest power of 2 that is at least
-    ``min_input_pad``.  This reduces the number of unique compilations
-    needed while maintaining good utilization.
-
-    Args:
-        x: Actual number of requests.
-        upper_limit: Maximum allowed requests.
-        min_input_pad: Minimum padding floor; values of ``x`` at or below
-            this threshold are padded up to ``min_input_pad``.
-
-    Returns:
-        Padded request count, capped at ``upper_limit``.
-
-    Example:
-        >>> _get_padded_num_reqs_with_upper_limit(3, 32, 8)   # Returns 8
-        >>> _get_padded_num_reqs_with_upper_limit(10, 32, 8)  # Returns 16
-        >>> _get_padded_num_reqs_with_upper_limit(20, 16, 8)  # Returns 16
-    """
-    res = min_input_pad if x <= min_input_pad else 1 << (x - 1).bit_length()
-    return min(res, upper_limit)
-
-
 class eSurgeRunner:
     """High-performance model runner for efficient batched inference.
 
@@ -300,7 +276,6 @@ class eSurgeRunner:
         model: EasyDeLBaseModule,
         hbm_utilization: float = 0.5,
         page_size: int = 128,
-        pipeline_inference: PipelineInferenceMode = "auto",
         max_cache_tokens: int | None = None,
         cache_capacity_margin: float = 0.92,
         kernel_tile_policy: KernelTilePolicy = "auto",
@@ -312,12 +287,13 @@ class eSurgeRunner:
         max_num_seq_buckets: list[int] | None = None,
         async_scheduling: bool = True,
         use_aot_forward: bool = True,
-        bind_graphstate_for_aot: bool = False,
         verbose: bool = False,
         enable_overlap_execution: bool = True,
         enable_sampler_metrics: bool = False,
         enable_window_aware_runtime_cap: bool = False,
         mpmd_scheduler: MpMdSchedulers | None = None,
+        pp_microbatch_count: int | str | None = "auto",
+        pp_microbatch_size: int | str | None = "auto",
     ):
         """Initialize the model runner.
 
@@ -334,9 +310,6 @@ class eSurgeRunner:
             max_num_seq_buckets: Optional explicit request-count buckets.
             async_scheduling: Whether scheduler async token sampling is enabled.
             use_aot_forward: Whether to use AOT compilation.
-            bind_graphstate_for_aot: Whether model-step AOT executables
-                capture graphstate/graphother as compile-time constants.
-                Default: False.
             verbose: Enable verbose execution logs.
             enable_overlap_execution: Enable overlap execution path.
             enable_sampler_metrics: Enable sampler-side metrics.
@@ -344,14 +317,19 @@ class eSurgeRunner:
                 request cap from the model's live KV-window page demand.
                 When False, the runner falls back to the cache metadata's
                 heuristic request cap instead.
+            pp_microbatch_count: Expert PP decode wavefront policy. ``"auto"``
+                keeps the built-in split, ``None`` or ``0`` disables the
+                wavefront path, and a positive integer pins max microbatches.
+            pp_microbatch_size: Expert PP decode wavefront policy. ``"auto"``
+                keeps the built-in split, ``None`` or ``0`` disables the
+                wavefront path, and a positive integer pins rows per
+                microbatch. Mutually exclusive with a positive count.
         """
         self.model = model.esurge_compatible_model
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
         self.pipeline_plan = build_pipeline_inference_plan(
             model=self.model,
-            mpmd_scheduler=mpmd_scheduler,
-            pipeline_inference=pipeline_inference,
             max_cache_tokens=max_cache_tokens,
             cache_capacity_margin=cache_capacity_margin,
             kernel_tile_policy=kernel_tile_policy,
@@ -415,12 +393,11 @@ class eSurgeRunner:
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
 
         if min_token_pad is None:
-            # Request-count padding and token-count padding have different
-            # latency tradeoffs.  In PP inference a decode step is commonly
-            # one token; tying token buckets to min_input_pad forces those
-            # steps through b4/b8/... backbone executables and directly
-            # increases per-token latency.
-            min_token_pad_i = 1 if self.pipeline_plan.is_enabled else self.min_input_pad
+            # Keep the token bucket floor aligned with the public runtime
+            # padding floor unless the caller explicitly requests a different
+            # min_token_pad. This keeps startup/runtime bucket logs consistent:
+            # min_input_pad=4 means the first token bucket is b4, not b1.
+            min_token_pad_i = self.min_input_pad
         else:
             min_token_pad_i = int(min_token_pad)
         min_token_pad_i = min(min_token_pad_i, int(self.max_model_len))
@@ -436,7 +413,6 @@ class eSurgeRunner:
         self.executor_manager = manager_cls(
             model=self.model,
             use_aot_forward=use_aot_forward,
-            bind_graphstate_for_aot=bind_graphstate_for_aot,
             min_input_pad=self.min_input_pad,
             max_model_len=max_model_len,
             max_num_reqs=self.max_num_reqs,
@@ -445,6 +421,8 @@ class eSurgeRunner:
             verbose=verbose,
             mpmd_scheduler=mpmd_scheduler,
             pipeline_plan=self.pipeline_plan,
+            pp_microbatch_count=pp_microbatch_count,
+            pp_microbatch_size=pp_microbatch_size,
         )
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
@@ -464,6 +442,8 @@ class eSurgeRunner:
         # Async scheduling state
         self._pre_async_results: AsyncPreResults | None = None
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
+        self._handoff_positions_cache: dict[int, jax.Array] = {}
+        self._handoff_scalar_cache: dict[int, jax.Array] = {}
         logger.debug("eSurgeRunner initialization complete")
         self._log_startup_summary()
 
@@ -788,18 +768,24 @@ class eSurgeRunner:
         """Initialize sequence count buckets for compilation.
 
         Args:
-            user_buckets: Optional user-provided bucket sizes.
-            max_num_seqs: Maximum number of sequences.
+            user_buckets: Optional user-provided compile bucket sizes. Values
+                may exceed ``max_num_seqs`` so the compiled static request
+                width can match another runtime's padding policy while the
+                scheduler still caps active concurrency at ``max_num_seqs``.
+            max_num_seqs: Maximum number of concurrently running sequences.
             min_input_pad: Minimum input padding.
 
         Returns:
-            Sorted list of bucket sizes, always including max_num_seqs.
+            Sorted list of request compile buckets. Without explicit buckets,
+            derives the usual padding ladder from ``min_input_pad`` to
+            ``max_num_seqs``. With explicit buckets, preserves valid positive
+            buckets and ensures at least one bucket can hold ``max_num_seqs``.
         """
         if user_buckets:
-            buckets = sorted({int(b) for b in user_buckets if 0 < int(b) <= max_num_seqs})
+            buckets = sorted({int(b) for b in user_buckets if int(b) > 0})
         else:
             buckets = self._get_request_paddings(min_input_pad, max_num_seqs)
-        if not buckets or buckets[-1] != max_num_seqs:
+        if not buckets or buckets[-1] < max_num_seqs:
             buckets.append(max_num_seqs)
         return buckets
 
@@ -1337,9 +1323,13 @@ class eSurgeRunner:
             prune_infeasible_pairs=self._allow_sparse_window_packing,
         )
 
+        helper_prompt_buckets = [min(n, self.max_model_len) for n in num_tokens_paddings]
+        if self.pipeline_plan.is_enabled:
+            helper_prompt_buckets = sorted({helper_prompt_buckets[0], helper_prompt_buckets[-1]})
+
         self._precompile_jitted_helpers(
             reqs_padds=self.active_num_seq_buckets,
-            prompt_len_buckets=[min(n, self.max_model_len) for n in num_tokens_paddings],
+            prompt_len_buckets=helper_prompt_buckets,
             precompile_allowed_mask=False,
             allowed_max=4096,
         )
@@ -1792,7 +1782,7 @@ class eSurgeRunner:
         has_changes = len(scheduler_output.preempted_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
 
-    def _modify_prev_results(self) -> None:
+    def _modify_prev_results(self, pre_results: AsyncPreResults | None = None) -> None:
         """Apply previous iteration's tokens to sequence buffer.
 
         This method is called at the beginning of each iteration when async
@@ -1806,11 +1796,13 @@ class eSurgeRunner:
         Note:
             This method should only be called when self._pre_async_results is not None.
         """
-        if self._pre_async_results is None:
+        if pre_results is None:
+            pre_results = self._pre_async_results
+        if pre_results is None:
             return
 
-        pre_windows = self._pre_async_results.windows
-        pre_request_seq_lens = self._pre_async_results.request_seq_lens
+        pre_windows = pre_results.windows
+        pre_request_seq_lens = pre_results.request_seq_lens
 
         valid_sampled_token_ids: list[np.ndarray] = []
         for window in pre_windows:
@@ -1822,7 +1814,7 @@ class eSurgeRunner:
                 valid_sampled_token_ids.append(np.array([int(next_tokens_cpu[row_pos])], dtype=np.int32))
 
         # Apply tokens to sequence buffer
-        for pre_req_idx, _, req_state, _ in pre_request_seq_lens:
+        for pre_req_idx, _, req_state, placeholder_idx in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if len(sampled_ids) == 0:
                 continue
@@ -1836,15 +1828,256 @@ class eSurgeRunner:
             if req_state is not self.requests[req_id]:
                 raise RuntimeError("Request state mismatch")
 
-            # Update token_ids array (replace placeholder)
-            end_idx = self.sequence_buffer.num_tokens_no_spec[req_idx]
-            start_idx = end_idx - 1
-            if end_idx > self.max_model_len:
-                raise ValueError(f"Token count {end_idx} exceeds max_model_len {self.max_model_len}")
+            start_idx = int(placeholder_idx)
+            end_idx = start_idx + 1
+            if start_idx < 0 or end_idx > self.max_model_len:
+                raise ValueError(f"Token position {start_idx} exceeds max_model_len {self.max_model_len}")
 
             self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = sampled_ids
             # Replace placeholder in output_token_ids
             req_state.output_token_ids[-1] = int(sampled_ids[-1])
+
+    def _finalize_async_scheduler_runner_state(
+        self,
+        sampled_token_ids: list[list[int]],
+        *,
+        request_seq_lens: list[tuple[int, int, CachedRequestState, int]],
+        expected_pre_results: AsyncPreResults | None = None,
+    ) -> None:
+        """Repair runner-side placeholders after async scheduler output drains.
+
+        AsyncScheduler inserts optimistic placeholders before the runner's
+        sampled token is host-visible. For PP decode we may launch the next
+        step from the previous device token directly, so the CPU repair should
+        happen when the previous async handle is drained, not inside the next
+        launch path. This finalizer consumes the tokens already materialized by
+        :class:`_AsyncExecutionHandle` and replaces the placeholder in both the
+        sequence buffer and the request's public output-token list.
+
+        ``expected_pre_results`` lets the drain path clear only the payload it
+        finalized. In the PP device-handoff path, step ``N+1`` may have already
+        installed its own async payload by the time step ``N`` drains; clearing
+        by identity avoids deleting that newer payload.
+        """
+        for pre_req_idx, _, req_state, placeholder_idx in request_seq_lens:
+            if pre_req_idx >= len(sampled_token_ids):
+                continue
+            sampled_ids = sampled_token_ids[pre_req_idx]
+            if len(sampled_ids) == 0:
+                continue
+
+            req_id = req_state.req_id
+            if req_id not in self.sequence_buffer.req_id_to_index or req_id not in self.requests:
+                continue
+
+            req_idx = self.sequence_buffer.req_id_to_index[req_id]
+            if req_state is not self.requests[req_id]:
+                raise RuntimeError("Request state mismatch")
+
+            start_idx = int(placeholder_idx)
+            end_idx = start_idx + 1
+            if start_idx < 0 or end_idx > self.max_model_len:
+                raise ValueError(f"Token position {start_idx} exceeds max_model_len {self.max_model_len}")
+
+            tid = int(sampled_ids[-1])
+            self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = np.asarray([tid], dtype=np.int32)
+            output_pos = start_idx - int(req_state.num_prompt_tokens)
+            if 0 <= output_pos < len(req_state.output_token_ids):
+                req_state.output_token_ids[output_pos] = tid
+            else:
+                req_state.output_token_ids[-1] = tid
+
+        if expected_pre_results is None or self._pre_async_results is expected_pre_results:
+            self._pre_async_results = None
+
+    def _model_uses_vlm_inputs(self) -> bool:
+        """Return whether the loaded model has multimodal prefill side inputs."""
+        cfg = getattr(self.model, "config", None)
+        task_type = getattr(self.model, "_task_type", None)
+        return task_type == "image-text-to-text" or (
+            cfg is not None
+            and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
+            and callable(getattr(self.model, "get_image_features", None))
+        )
+
+    def _has_default_sampling_penalties(self) -> bool:
+        """Return whether device-token handoff can ignore penalty state updates.
+
+        Async placeholder handoff patches only the next input token. Frequency,
+        presence, and repetition penalties are computed from CPU-side token
+        history during metadata preparation, so requests with non-default
+        penalties must keep the older repair-before-dispatch path until those
+        penalty buffers are also made device-resident.
+        """
+        return (
+            not bool(np.any(self.sequence_buffer.frequency_penalties != 0.0))
+            and not bool(np.any(self.sequence_buffer.presence_penalties != 0.0))
+            and not bool(np.any(self.sequence_buffer.repetition_penalties != 1.0))
+        )
+
+    def can_dispatch_next_before_async_drain(self, scheduler_output: SchedulerOutput) -> bool:
+        """Return whether the next async decode step may launch before drain.
+
+        The async scheduler advances decode with optimistic output placeholders.
+        If this returns ``True``, the lifecycle loop can schedule and dispatch
+        step ``N+1`` before host-materializing step ``N``. The runner then
+        replaces the placeholder input in ``N+1`` from step ``N``'s device
+        sampled-token array via :class:`DeviceInputTokenHandoff`.
+
+        This is deliberately a capability gate, not a pipeline-parallelism
+        check. It applies to both SPMD/TP and PP executions, but only when all
+        correctness-sensitive features that currently depend on CPU token
+        history are disabled.
+        """
+        if not self.async_scheduling or not scheduler_output.async_scheduling:
+            return False
+        if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
+            return False
+        if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
+            return False
+        if self._model_uses_vlm_inputs():
+            return False
+        return self._has_default_sampling_penalties()
+
+    def _can_delay_async_result_repair(
+        self,
+        *,
+        scheduler_output: SchedulerOutput,
+        return_async_output: bool,
+        is_vlm_model: bool,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
+    ) -> bool:
+        """Return whether previous async tokens may be repaired after dispatch.
+
+        The delayed path is a launch-path optimization: it lets the next decode
+        step consume previous sampled tokens from device arrays, then repairs
+        CPU sequence state after that step has been queued. It is only
+        profitable when the caller is already using the deferred-output path;
+        the synchronous async-scheduler loop has already materialized the token
+        for ``scheduler.update_from_output()``, so adding a scatter there just
+        adds work. Keep the gate conservative so correctness-sensitive features
+        continue using the old host-repair-before-dispatch path.
+        """
+        if not return_async_output:
+            return False
+        if not scheduler_output.async_scheduling:
+            return False
+        if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
+            return False
+        if is_vlm_model:
+            return False
+        if bool(np.any(frequency_penalties_cpu != 0.0)):
+            return False
+        if bool(np.any(presence_penalties_cpu != 0.0)):
+            return False
+        if bool(np.any(repetition_penalties_cpu != 1.0)):
+            return False
+        return True
+
+    def _build_device_token_handoff(
+        self,
+        *,
+        pre_results: AsyncPreResults,
+        req_ids_window: list[str | None],
+        scheduled_list: list[int],
+        window_row_indices: np.ndarray,
+    ) -> DeviceInputTokenHandoff | None:
+        """Build a device-side patch for decode placeholders in one window.
+
+        The current batch preparer reads token ids from the CPU
+        ``sequence_buffer``. When async scheduling inserted a placeholder at the
+        previous step, that CPU slot still contains ``0`` until
+        :meth:`_modify_prev_results` materializes the sampled token. For pure
+        decode rows whose next input is exactly that placeholder position, this
+        helper gathers the previous device sampled-token scalar and records the
+        flattened input offset that must be patched.
+
+        Returning ``None`` means the caller must use the old path and repair CPU
+        state before building/launching the next step.
+        """
+        sampled_by_req: dict[str, tuple[int, jax.Array, int]] = {}
+        for window_idx, window in enumerate(pre_results.windows):
+            for row_pos, req_id, is_valid in zip(window.row_positions, window.req_ids, window.valid_mask, strict=False):
+                if is_valid:
+                    sampled_by_req[str(req_id)] = (window_idx, window.sampled_token_ids, int(row_pos))
+
+        patch_positions: list[int] = []
+        patch_token_sources: list[tuple[jax.Array, int]] = []
+        patch_sources: list[tuple[int, int]] = []
+        flat_offset = 0
+        for local_row, rid in enumerate(req_ids_window):
+            scheduled = int(scheduled_list[local_row])
+            if scheduled <= 0:
+                continue
+            if rid is None:
+                flat_offset += scheduled
+                continue
+
+            global_row = int(window_row_indices[local_row])
+            start_tok = int(self.sequence_buffer.num_computed_tokens[global_row])
+            placeholder_pos = int(self.sequence_buffer.num_tokens_no_spec[global_row]) - 1
+            touches_placeholder = start_tok <= placeholder_pos < start_tok + scheduled
+            if not touches_placeholder:
+                flat_offset += scheduled
+                continue
+            if scheduled != 1 or start_tok != placeholder_pos:
+                return None
+            sampled = sampled_by_req.get(str(rid))
+            if sampled is None:
+                return None
+
+            sampled_window_idx, sampled_tokens, sampled_row_pos = sampled
+            patch_positions.append(flat_offset)
+            patch_token_sources.append((sampled_tokens, sampled_row_pos))
+            patch_sources.append((sampled_window_idx, sampled_row_pos))
+            flat_offset += scheduled
+
+        if not patch_token_sources:
+            return None
+
+        max_handoff = int(getattr(self.executor_manager, "max_num_reqs", len(patch_positions)) or len(patch_positions))
+        if len(patch_positions) > max_handoff:
+            return None
+
+        input_positions = self._get_handoff_positions(max_handoff)
+        count = self._get_handoff_scalar(len(patch_positions))
+        offset = self._get_handoff_scalar(0)
+        fast_dense_handoff = (
+            patch_positions == list(range(len(patch_positions)))
+            and patch_sources == [(patch_sources[0][0], idx) for idx in range(len(patch_sources))]
+            and int(pre_results.windows[patch_sources[0][0]].sampled_token_ids.shape[0]) >= max_handoff
+        )
+        if fast_dense_handoff:
+            token_ids = pre_results.windows[patch_sources[0][0]].sampled_token_ids
+        else:
+            token_ids = jnp.stack(
+                [jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32) for sampled_tokens, row_pos in patch_token_sources]
+            )
+            if token_ids.shape[0] < max_handoff:
+                token_ids = jnp.pad(token_ids, ((0, max_handoff - int(token_ids.shape[0])),))
+            token_ids = jax.device_put(token_ids, self.executor_manager._empty_sharding)
+        return DeviceInputTokenHandoff(input_positions=input_positions, token_ids=token_ids, count=count, offset=offset)
+
+    def _get_handoff_positions(self, size: int) -> jax.Array:
+        """Return cached ``[0, size)`` device positions for dense token handoff."""
+        cached = self._handoff_positions_cache.get(size)
+        if cached is not None:
+            return cached
+        positions = np.arange(size, dtype=np.int32)
+        cached = jax.device_put(positions, self.executor_manager._empty_sharding)
+        self._handoff_positions_cache[size] = cached
+        return cached
+
+    def _get_handoff_scalar(self, value: int) -> jax.Array:
+        """Return a cached int32 device scalar used by token handoff metadata."""
+        cached = self._handoff_scalar_cache.get(value)
+        if cached is not None:
+            return cached
+        cached = jax.device_put(np.asarray(value, dtype=np.int32), self.executor_manager._empty_sharding)
+        self._handoff_scalar_cache[value] = cached
+        return cached
 
     def _update_placeholder(
         self,
@@ -2062,11 +2295,13 @@ class eSurgeRunner:
         self._update_states(scheduler_output)
         updating_states_time = time.time() - updating_states_start
 
-        # Apply previous async results if available
+        # Apply previous async results if available. For safe PP decode windows,
+        # this repair is delayed until after the next device dispatch is queued:
+        # the next input token is patched from the previous device token directly.
         prev_async_start = time.time()
-        if self._pre_async_results is not None:
-            self._modify_prev_results()
-            self._pre_async_results = None  # Clear after applying
+        pending_pre_async_results = self._pre_async_results
+        self._pre_async_results = None
+        pre_async_repair_pending = pending_pre_async_results is not None
         prev_async_time = time.time() - prev_async_start
 
         # Align ordering with TPU runner: decode requests first.
@@ -2084,6 +2319,11 @@ class eSurgeRunner:
             )
 
         if not scheduler_output.total_num_scheduled_tokens:
+            if pending_pre_async_results is not None and pre_async_repair_pending:
+                prev_async_start = time.time()
+                self._modify_prev_results(pending_pre_async_results)
+                pre_async_repair_pending = False
+                prev_async_time += time.time() - prev_async_start
             return ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
@@ -2116,27 +2356,42 @@ class eSurgeRunner:
         total_prep_host_time = 0.0
         total_prep_put_time = 0.0
         total_prep_extra_put_time = 0.0
+        total_prep_batch_metadata_time = 0.0
+        total_prep_handoff_time = 0.0
+        total_prep_sampler_window_time = 0.0
+        total_prep_ensure_variants_time = 0.0
+        total_prep_pack_inputs_time = 0.0
         total_execute_overhead_time = 0.0
         total_pp_stage_dispatch_time = 0.0
         total_pp_queue_wait_time = 0.0
         total_pp_stage_launches = 0
         total_pp_stage_compute_time = 0.0
         total_pp_stage_max_time = 0.0
+        total_pp_prepare_time = 0.0
+        total_pp_submit_time = 0.0
+        total_pp_assemble_time = 0.0
+        total_pp_backbone_time = 0.0
+        total_pp_combine_time = 0.0
+        total_pp_lm_head_time = 0.0
+        total_pp_sampler_enqueue_time = 0.0
+        total_pp_microbatch_scratch_time = 0.0
+        total_pp_microbatch_metadata_time = 0.0
+        total_pp_microbatch_handoff_time = 0.0
+        total_pp_sampler_window_time = 0.0
+        total_pp_ensure_variants_time = 0.0
         pp_stage_times_by_index: dict[int, float] = {}
+        pp_stage_submit_times_by_index: dict[int, float] = {}
+        pp_stage_assemble_times_by_index: dict[int, float] = {}
+        pp_stage_execute_times_by_index: dict[int, float] = {}
         total_runner_host_time = 0.0
-        total_d2h_time = 0.0
+        total_async_copy_enqueue_time = 0.0
+        total_token_materialize_time = 0.0
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
         request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices: list[int] = []
 
-        cfg = getattr(self.model, "config", None)
-        task_type = getattr(self.model, "_task_type", None)
-        is_vlm_model = task_type == "image-text-to-text" or (
-            cfg is not None
-            and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
-            and callable(getattr(self.model, "get_image_features", None))
-        )
+        is_vlm_model = self._model_uses_vlm_inputs()
         uses_mrope_model = model_uses_mrope(self.model)
 
         while start_index < self.sequence_buffer.num_slots:
@@ -2197,7 +2452,6 @@ class eSurgeRunner:
 
                 if jax.process_count() > 1:
                     req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
-                self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
 
             mrope_position_ids_cpu: np.ndarray | None = None
             prefill_embeds_cpu: np.ndarray | None = None
@@ -2356,6 +2610,30 @@ class eSurgeRunner:
                             )
                             break
 
+            device_token_handoff: DeviceInputTokenHandoff | None = None
+            if pending_pre_async_results is not None and pre_async_repair_pending:
+                can_delay_repair = self._can_delay_async_result_repair(
+                    scheduler_output=scheduler_output,
+                    return_async_output=return_async_output,
+                    is_vlm_model=is_vlm_model,
+                    frequency_penalties_cpu=self.sequence_buffer.frequency_penalties,
+                    presence_penalties_cpu=self.sequence_buffer.presence_penalties,
+                    repetition_penalties_cpu=self.sequence_buffer.repetition_penalties,
+                )
+                if can_delay_repair:
+                    device_token_handoff = self._build_device_token_handoff(
+                        pre_results=pending_pre_async_results,
+                        req_ids_window=req_ids_window,
+                        scheduled_list=scheduled_list,
+                        window_row_indices=window_row_indices,
+                    )
+                if device_token_handoff is None:
+                    prev_async_start = time.time()
+                    self._modify_prev_results(pending_pre_async_results)
+                    pre_async_repair_pending = False
+                    pending_pre_async_results = None
+                    prev_async_time += time.time() - prev_async_start
+
             (
                 token_ids_window_cpu,
                 num_computed_tokens_window_cpu,
@@ -2375,6 +2653,7 @@ class eSurgeRunner:
                 page_table_version=page_table_version,
                 row_indices=window_row_indices if packed_window_rows else None,
             )
+
             total_runner_host_time += time.time() - host_start
             step_start = time.time()
             (
@@ -2388,7 +2667,7 @@ class eSurgeRunner:
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 scheduled_full_cpu=scheduled_full_cpu,
-                req_num_tokens_full=self.req_num_tokens_full_buf,
+                req_num_tokens_full_cpu=req_num_tokens_np,
                 active_mask_full_cpu=active_mask_full_cpu,
                 window_row_indices_cpu=window_row_indices_cpu,
                 input_ids_buf=self.input_ids_buf,
@@ -2410,8 +2689,16 @@ class eSurgeRunner:
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
                 visual_pos_masks_cpu=visual_pos_masks_cpu,
                 deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                device_token_handoff=device_token_handoff,
                 wait_for_outputs=not needs_async_output,
             )
+            if device_token_handoff is not None and pending_pre_async_results is not None and pre_async_repair_pending:
+                # The previous async handle will repair CPU placeholders when
+                # the lifecycle loop drains it. Doing that repair here would
+                # immediately wait on the previous sampled token and erase the
+                # point of the device-side PP token handoff.
+                pre_async_repair_pending = False
+                pending_pre_async_results = None
 
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
@@ -2422,6 +2709,11 @@ class eSurgeRunner:
             total_prep_host_time += float(window_metrics.get("prep_host_time", 0.0))
             total_prep_put_time += float(window_metrics.get("prep_put_time", 0.0))
             total_prep_extra_put_time += float(window_metrics.get("prep_extra_put_time", 0.0))
+            total_prep_batch_metadata_time += float(window_metrics.get("prep_batch_metadata_time", 0.0))
+            total_prep_handoff_time += float(window_metrics.get("prep_handoff_time", 0.0))
+            total_prep_sampler_window_time += float(window_metrics.get("prep_sampler_window_time", 0.0))
+            total_prep_ensure_variants_time += float(window_metrics.get("prep_ensure_variants_time", 0.0))
+            total_prep_pack_inputs_time += float(window_metrics.get("prep_pack_inputs_time", 0.0))
             total_execute_overhead_time += float(window_metrics.get("execute_overhead_time", 0.0))
             total_pp_stage_dispatch_time += float(window_metrics.get("pp_stage_dispatch_time", 0.0))
             total_pp_queue_wait_time += float(window_metrics.get("pp_queue_wait_time", 0.0))
@@ -2431,12 +2723,39 @@ class eSurgeRunner:
                 total_pp_stage_max_time,
                 float(window_metrics.get("pp_stage_max_time", 0.0)),
             )
+            total_pp_prepare_time += float(window_metrics.get("pp_prepare_time", 0.0))
+            total_pp_submit_time += float(window_metrics.get("pp_submit_time", 0.0))
+            total_pp_assemble_time += float(window_metrics.get("pp_assemble_time", 0.0))
+            total_pp_backbone_time += float(window_metrics.get("pp_backbone_time", 0.0))
+            total_pp_combine_time += float(window_metrics.get("pp_combine_time", 0.0))
+            total_pp_lm_head_time += float(window_metrics.get("pp_lm_head_time", 0.0))
+            total_pp_sampler_enqueue_time += float(window_metrics.get("pp_sampler_enqueue_time", 0.0))
+            total_pp_microbatch_scratch_time += float(window_metrics.get("pp_microbatch_scratch_time", 0.0))
+            total_pp_microbatch_metadata_time += float(window_metrics.get("pp_microbatch_metadata_time", 0.0))
+            total_pp_microbatch_handoff_time += float(window_metrics.get("pp_microbatch_handoff_time", 0.0))
+            total_pp_sampler_window_time += float(window_metrics.get("pp_sampler_window_time", 0.0))
+            total_pp_ensure_variants_time += float(window_metrics.get("pp_ensure_variants_time", 0.0))
             for stage_idx in range(8):
                 key = f"pp_stage_{stage_idx}_time"
                 if key in window_metrics:
                     pp_stage_times_by_index[stage_idx] = pp_stage_times_by_index.get(stage_idx, 0.0) + float(
                         window_metrics[key]
                     )
+                submit_key = f"pp_stage_{stage_idx}_submit_time"
+                if submit_key in window_metrics:
+                    pp_stage_submit_times_by_index[stage_idx] = pp_stage_submit_times_by_index.get(
+                        stage_idx, 0.0
+                    ) + float(window_metrics[submit_key])
+                assemble_key = f"pp_stage_{stage_idx}_assemble_time"
+                if assemble_key in window_metrics:
+                    pp_stage_assemble_times_by_index[stage_idx] = pp_stage_assemble_times_by_index.get(
+                        stage_idx, 0.0
+                    ) + float(window_metrics[assemble_key])
+                execute_key = f"pp_stage_{stage_idx}_execute_time"
+                if execute_key in window_metrics:
+                    pp_stage_execute_times_by_index[stage_idx] = pp_stage_execute_times_by_index.get(
+                        stage_idx, 0.0
+                    ) + float(window_metrics[execute_key])
             token_buckets_used.add(int(window_metrics.get("token_bucket", num_tokens_static)))
             req_buckets_used.add(int(window_metrics.get("padded_num_reqs", padded_num_reqs)))
 
@@ -2466,20 +2785,21 @@ class eSurgeRunner:
                     if is_valid:
                         if req_state is None or req_idx is None or seq_len is None:
                             raise RuntimeError(f"Missing runner state for async request {rid!r}")
-                        request_seq_lens.append((out_idx, req_idx, req_state, seq_len))
+                        placeholder_idx = int(self.sequence_buffer.num_tokens_no_spec[req_idx])
+                        request_seq_lens.append((out_idx, req_idx, req_state, placeholder_idx))
                     else:
                         discard_sampled_tokens_req_indices.append(out_idx)
                 elif return_async_output:
                     sync_finalize_entries.append((req_state, req_idx, seq_len))
 
             if needs_async_output:
-                d2h_start = time.time()
+                copy_enqueue_start = time.time()
                 row_positions = [row_pos for row_pos, *_rest in window_entries]
                 async_windows.append(
                     AsyncWindowResult(
                         req_ids=[rid for _, rid, *_rest in window_entries],
                         row_positions=row_positions,
-                        sampled_token_ids=jax.copy_to_host_async(out_tokens_win[:num_reqs]),
+                        sampled_token_ids=jax.copy_to_host_async(out_tokens_win[:padded_num_reqs]),
                         valid_mask=[is_valid for *_, is_valid in window_entries],
                         token_logprobs=(
                             jax.copy_to_host_async(_logits[:num_reqs])
@@ -2488,16 +2808,16 @@ class eSurgeRunner:
                         ),
                     )
                 )
-                total_d2h_time += time.time() - d2h_start
+                total_async_copy_enqueue_time += time.time() - copy_enqueue_start
                 total_post_proc_time += time.time() - up_wtime
                 start_index = next_start_index
                 continue
 
-            d2h_start = time.time()
+            token_materialize_start = time.time()
             tokens_np = np.asarray(out_tokens_win)
             _logits_maybe: typing.Any | None = _logits
             logits_np = np.asarray(_logits_maybe) if self.enable_sampler_metrics and _logits_maybe is not None else None
-            total_d2h_time += time.time() - d2h_start
+            total_token_materialize_time += time.time() - token_materialize_start
 
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
                 if not is_valid:
@@ -2537,10 +2857,15 @@ class eSurgeRunner:
                     discard_sampled_tokens_req_indices,
                     request_seq_lens,
                 )
-                self._pre_async_results = AsyncPreResults(
+                async_request_seq_lens = list(request_seq_lens)
+                async_pre_results = AsyncPreResults(
                     windows=async_windows,
-                    request_seq_lens=request_seq_lens,
+                    request_seq_lens=async_request_seq_lens,
                 )
+                self._pre_async_results = async_pre_results
+            else:
+                async_request_seq_lens = []
+                async_pre_results = None
 
             def _finalize_sync_runner_state(sampled_token_ids: list[list[int]]) -> None:
                 for sampled_ids, entry in zip(sampled_token_ids, sync_finalize_entries, strict=False):
@@ -2566,14 +2891,22 @@ class eSurgeRunner:
                     token_logprobs=None,
                 ),
                 windows=async_windows,
-                finalize=None if scheduler_output.async_scheduling else _finalize_sync_runner_state,
+                finalize=(
+                    partial(
+                        self._finalize_async_scheduler_runner_state,
+                        request_seq_lens=async_request_seq_lens,
+                        expected_pre_results=async_pre_results,
+                    )
+                    if scheduler_output.async_scheduling
+                    else _finalize_sync_runner_state
+                ),
             )
             if return_async_output:
                 final_output = async_output
             else:
-                d2h_finalize_start = time.time()
+                token_materialize_start = time.time()
                 resolved_output = async_output.get_output()
-                total_d2h_time += time.time() - d2h_finalize_start
+                total_token_materialize_time += time.time() - token_materialize_start
                 final_output = resolved_output
                 token_logprobs = resolved_output.token_logprobs or token_logprobs
         else:
@@ -2649,7 +2982,8 @@ class eSurgeRunner:
             updating_states_time
             + prev_async_time
             + total_runner_host_time
-            + total_d2h_time
+            + total_async_copy_enqueue_time
+            + total_token_materialize_time
             + total_post_proc_time
             + total_prep_time
             + total_exec_time
@@ -2666,6 +3000,20 @@ class eSurgeRunner:
                 f"(host={total_prep_host_time * 1e3:.2f}ms put={total_prep_put_time * 1e3:.2f}ms "
                 f"extra={total_prep_extra_put_time * 1e3:.2f}ms) "
             )
+        if (
+            total_prep_batch_metadata_time
+            + total_prep_handoff_time
+            + total_prep_sampler_window_time
+            + total_prep_ensure_variants_time
+            + total_prep_pack_inputs_time
+        ) > 0:
+            prep_detail += (
+                f"(batch={total_prep_batch_metadata_time * 1e3:.2f}ms "
+                f"handoff={total_prep_handoff_time * 1e3:.2f}ms "
+                f"samplerwin={total_prep_sampler_window_time * 1e3:.2f}ms "
+                f"ensure={total_prep_ensure_variants_time * 1e3:.2f}ms "
+                f"pack={total_prep_pack_inputs_time * 1e3:.2f}ms) "
+            )
 
         queue_detail = (
             f"q(run={int(getattr(scheduler_output, 'num_running_reqs', 0))},"
@@ -2678,6 +3026,51 @@ class eSurgeRunner:
             f"pp(stage={total_pp_stage_launches},dispatch={total_pp_stage_dispatch_time * 1e3:.2f}ms,"
             f"queue={total_pp_queue_wait_time * 1e3:.2f}ms)"
         )
+        if (
+            total_pp_prepare_time
+            + total_pp_submit_time
+            + total_pp_assemble_time
+            + total_pp_backbone_time
+            + total_pp_combine_time
+            + total_pp_lm_head_time
+            + total_pp_sampler_enqueue_time
+        ) > 0:
+            pp_detail += (
+                f" ppd(prep={total_pp_prepare_time * 1e3:.1f}ms,submit={total_pp_submit_time * 1e3:.1f}ms,"
+                f"asm={total_pp_assemble_time * 1e3:.1f}ms,bb={total_pp_backbone_time * 1e3:.1f}ms,"
+                f"comb={total_pp_combine_time * 1e3:.1f}ms,lm={total_pp_lm_head_time * 1e3:.1f}ms,"
+                f"sampq={total_pp_sampler_enqueue_time * 1e3:.1f}ms)"
+            )
+        if pp_stage_submit_times_by_index:
+            submit_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_submit_times_by_index.items())
+            )
+            pp_detail += f" pp_submit({submit_detail})"
+        if pp_stage_assemble_times_by_index or pp_stage_execute_times_by_index:
+            assemble_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_assemble_times_by_index.items())
+            )
+            execute_detail = ",".join(
+                f"s{stage_idx}={stage_time * 1e3:.1f}ms"
+                for stage_idx, stage_time in sorted(pp_stage_execute_times_by_index.items())
+            )
+            pp_detail += f" pp_split(asm=[{assemble_detail}],jit=[{execute_detail}])"
+        if (
+            total_pp_microbatch_scratch_time
+            + total_pp_microbatch_metadata_time
+            + total_pp_microbatch_handoff_time
+            + total_pp_sampler_window_time
+            + total_pp_ensure_variants_time
+        ) > 0:
+            pp_detail += (
+                f" ppmb(scratch={total_pp_microbatch_scratch_time * 1e3:.1f}ms,"
+                f"meta={total_pp_microbatch_metadata_time * 1e3:.1f}ms,"
+                f"handoff={total_pp_microbatch_handoff_time * 1e3:.1f}ms,"
+                f"samplerwin={total_pp_sampler_window_time * 1e3:.1f}ms,"
+                f"ensure={total_pp_ensure_variants_time * 1e3:.1f}ms)"
+            )
         if total_pp_stage_compute_time > 0:
             stage_detail = ",".join(
                 f"s{stage_idx}={stage_time * 1e3:.1f}ms"
@@ -2696,7 +3089,9 @@ class eSurgeRunner:
             f"{queue_detail}"
             f"agg_tps={agg_tps:,.0f} req_tps={req_tps:,.1f} ema={self._perf_tps_ema:,.0f} "
             f"{pp_detail} "
-            f"runner={total_runner_host_time * 1e3:.2f}ms d2h={total_d2h_time * 1e3:.2f}ms "
+            f"runner={total_runner_host_time * 1e3:.2f}ms "
+            f"copyq={total_async_copy_enqueue_time * 1e3:.2f}ms "
+            f"token_wait={total_token_materialize_time * 1e3:.2f}ms "
             f"prep={total_prep_time * 1e3:.2f}ms {prep_detail}"
             f"fwd={total_exec_time * 1e3:.2f}ms samp={total_sample_time * 1e3:.2f}ms "
             f"ovh={total_execute_overhead_time * 1e3:.2f}ms metrics={metrics_time * 1e3:.2f}ms "

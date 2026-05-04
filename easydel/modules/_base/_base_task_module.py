@@ -311,6 +311,43 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             exclude_names=getattr(config, "gradient_checkpointing_targets", None),
         )
 
+    def _base_model_layer_count_for_head(self) -> int:
+        """Return the decoder/text stack length used for task-head placement.
+
+        Task heads such as ``lm_head`` consume the final hidden states produced
+        by the decoder/text stack. In PP mode their parameters should therefore
+        be created under the final layer's stage assignment. Model families use
+        different attribute names for that stack, so this probes the common
+        containers without adding model-specific branches to every wrapper.
+        """
+        candidates = [self.base_model]
+        for owner in list(candidates):
+            for attr_name in ("language_model", "text_model", "decoder", "model", "transformer", "gpt"):
+                nested = getattr(owner, attr_name, None)
+                if nested is not None and nested not in candidates:
+                    candidates.append(nested)
+
+        for owner in candidates:
+            for layers_name in ("layers", "h", "blocks", "block", "layer"):
+                layers = getattr(owner, layers_name, None)
+                if layers is None:
+                    continue
+                try:
+                    count = len(layers)
+                except TypeError:
+                    continue
+                if count:
+                    return int(count)
+        return 0
+
+    def _create_task_head_on_last_stage(self, factory: Callable[[], Any]) -> Any:
+        """Create a task head on the decoder's final PP stage when possible."""
+        stage_total = self._base_model_layer_count_for_head()
+        if stage_total:
+            with self.assign_layer_stage(stage_total - 1, total_layers=stage_total):
+                return factory()
+        return factory()
+
     @property
     def base_model(self) -> ModelT:
         """Access the base model via the configured attribute name.

@@ -191,6 +191,14 @@ class BatchMetadataPreparer:
         self._slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
         self._num_kv_update_placeholder = np.zeros((1,), dtype=np.int32)
         self._async_slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
+        self._scheduled_full_placeholder_dev = jax.device_put(
+            np.zeros((self.max_num_reqs,), dtype=np.int32),
+            self._empty_sharding,
+        )
+        self._active_mask_full_placeholder_dev = jax.device_put(
+            np.zeros((self.max_num_reqs,), dtype=np.bool_),
+            self._empty_sharding,
+        )
 
         # Async staging buffers (avoid per-call allocations in overlap mode).
         self._async_input_ids_cpu = np.zeros((self.max_num_tokens,), dtype=np.int32)
@@ -728,12 +736,12 @@ class BatchMetadataPreparer:
         packed_qsl_seqlens[1].fill(0)
         packed_qsl_seqlens[1, :-1] = seq_lens
 
-        packed_i32_padded[:, :padded_num_reqs].fill(0)
+        packed_i32_padded.fill(0)
         packed_i32_padded[0, :padded_num_reqs] = scheduled[:padded_num_reqs]
         packed_i32_padded[1, :padded_num_reqs] = logits_indices[:padded_num_reqs]
         packed_i32_padded[2, :padded_num_reqs] = top_k_cpu[:padded_num_reqs]
 
-        packed_f32_padded[:, :padded_num_reqs].fill(0)
+        packed_f32_padded.fill(0)
         packed_f32_padded[0, :padded_num_reqs] = temperature_cpu[:padded_num_reqs]
         packed_f32_padded[1, :padded_num_reqs] = top_p_cpu[:padded_num_reqs]
         packed_f32_padded[2, :padded_num_reqs] = min_p_cpu[:padded_num_reqs]
@@ -746,10 +754,9 @@ class BatchMetadataPreparer:
         packed_misc_i32[1] = np.int32(padded_num_reqs)
         packed_misc_i32[2:5] = request_distribution
 
-        # Transfer full max_num_reqs arrays (not sliced to padded_num_reqs) so
-        # that BatchMetadata shapes are fixed and the backbone can be compiled
-        # once per num_tokens bucket.  The extra transfer is ~9KB at
-        # max_num_reqs=256 — negligible vs the compilation savings.
+        # Keep the transferred payload to arrays used by compiled kernels. The
+        # full scheduled/active vectors remain CPU-side scheduler state; the
+        # model-step ABI receives cached device placeholders for those fields.
         if self._use_slot_mapping:
             host_payload = (
                 input_ids,
@@ -761,8 +768,6 @@ class BatchMetadataPreparer:
                 packed_misc_i32,
                 slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
                 num_kv_update_cpu,
-                scheduled_full_cpu,
-                active_mask_full_cpu,
             )
         else:
             host_payload = (
@@ -773,8 +778,6 @@ class BatchMetadataPreparer:
                 packed_i32_padded,
                 packed_f32_padded,
                 packed_misc_i32,
-                scheduled_full_cpu,
-                active_mask_full_cpu,
             )
 
         return host_payload, padded_num_reqs, num_requests, rows_to_copy
@@ -900,8 +903,6 @@ class BatchMetadataPreparer:
                 packed_misc_i32_dev,
                 slot_mapping_dev,
                 num_kv_update_dev,
-                scheduled_full_dev,
-                active_mask_full_dev,
             ) = jax.device_put(host_payload, self._empty_sharding)
         else:
             (
@@ -912,9 +913,9 @@ class BatchMetadataPreparer:
                 packed_i32_padded_dev,
                 packed_f32_padded_dev,
                 packed_misc_i32_dev,
-                scheduled_full_dev,
-                active_mask_full_dev,
             ) = jax.device_put(host_payload, self._empty_sharding)
+        scheduled_full_dev = self._scheduled_full_placeholder_dev
+        active_mask_full_dev = self._active_mask_full_placeholder_dev
         device_put_took = time.time() - device_put_start
 
         # Cache device `pages_tables` when the caller provides a version counter.
@@ -994,6 +995,26 @@ class BatchMetadataPreparer:
             pages_tables=pages_tables_dev,
             input_ids_buf=input_ids_buf,
             position_ids_buf=position_ids_buf,
+            input_token_handoff_positions=self._get_zero_dev(
+                namespace="input_token_handoff_positions",
+                shape=(self.max_num_reqs,),
+                dtype=np.int32,
+            ),
+            input_token_handoff_ids=self._get_zero_dev(
+                namespace="input_token_handoff_ids",
+                shape=(self.max_num_reqs,),
+                dtype=np.int32,
+            ),
+            input_token_handoff_count=self._get_zero_dev(
+                namespace="input_token_handoff_count",
+                shape=(),
+                dtype=np.int32,
+            ),
+            input_token_handoff_offset=self._get_zero_dev(
+                namespace="input_token_handoff_offset",
+                shape=(),
+                dtype=np.int32,
+            ),
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
             pixel_values=pixel_values_dev,
@@ -1185,8 +1206,6 @@ class BatchMetadataPreparer:
                 packed_misc_i32_dev,
                 slot_mapping_dev,
                 num_kv_update_dev,
-                scheduled_full_dev,
-                active_mask_full_dev,
             ) = self._pending_transfer
         else:
             (
@@ -1197,9 +1216,9 @@ class BatchMetadataPreparer:
                 packed_i32_padded_dev,
                 packed_f32_padded_dev,
                 packed_misc_i32_dev,
-                scheduled_full_dev,
-                active_mask_full_dev,
             ) = self._pending_transfer
+        scheduled_full_dev = self._scheduled_full_placeholder_dev
+        active_mask_full_dev = self._active_mask_full_placeholder_dev
 
         # Update `pages_tables` cache when async prep is used.
         pt_ver = transfer_meta.get("page_table_version")
@@ -1227,6 +1246,26 @@ class BatchMetadataPreparer:
             pages_tables=pages_tables_dev,
             input_ids_buf=input_ids_buf,
             position_ids_buf=position_ids_buf,
+            input_token_handoff_positions=self._get_zero_dev(
+                namespace="input_token_handoff_positions",
+                shape=(self.max_num_reqs,),
+                dtype=np.int32,
+            ),
+            input_token_handoff_ids=self._get_zero_dev(
+                namespace="input_token_handoff_ids",
+                shape=(self.max_num_reqs,),
+                dtype=np.int32,
+            ),
+            input_token_handoff_count=self._get_zero_dev(
+                namespace="input_token_handoff_count",
+                shape=(),
+                dtype=np.int32,
+            ),
+            input_token_handoff_offset=self._get_zero_dev(
+                namespace="input_token_handoff_offset",
+                shape=(),
+                dtype=np.int32,
+            ),
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
         )

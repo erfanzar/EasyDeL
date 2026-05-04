@@ -61,6 +61,7 @@ import jax.numpy as jnp
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import (
     PartitionAxis,
@@ -604,7 +605,9 @@ def _apply_qwen3_next_packed_updates_unified(
         multi_slot_mask,
         size=num_prefill_chunks * prefill_chunk_size,
         fill_value=0,
-    )[0].reshape(num_prefill_chunks, prefill_chunk_size)
+    )[
+        0
+    ].reshape(num_prefill_chunks, prefill_chunk_size)
     packed_valid = (
         jnp.arange(num_prefill_chunks * prefill_chunk_size, dtype=jnp.int32) < jnp.sum(multi_slot_mask.astype(jnp.int32))
     ).reshape(num_prefill_chunks, prefill_chunk_size)
@@ -1606,7 +1609,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -1921,6 +1924,41 @@ class Qwen3NextLinearAttention(spx.Module):
         self.gdr_op = GatedDeltaRuleOp(metadata)
         self.ragged_gdr_op = RaggedGatedDeltaRule(metadata)
 
+    def _stage_replicated_depthwise_conv(
+        self,
+        conv_input: Float[Array, "batch seq conv_dim"],
+    ) -> Float[Array, "batch seq conv_dim"]:
+        """Run the causal depthwise conv with a stable stage-local contract.
+
+        Qwen3-Next's linear-attention convolution has ``groups == conv_dim``.
+        On a TP-sharded stage the channel axis is split, which works for many
+        SPMD graphs but can produce invalid grouped-convolution layouts once
+        SpectraX also slices the program into PP stages. The convolution is a
+        short local mixing step, so we replicate its input and kernel on the
+        current physical PP stage, run the depthwise conv there, and let the
+        following query/key/value sharding constraints restore the normal TP
+        layout before the GDR kernel.
+        """
+        stage_mesh = resolve_stage_mesh(self.config.mesh)
+        replicated_3d = PartitionSpec(None, None, None)
+        conv_input = with_sharding_constraint(conv_input, replicated_3d, mesh=stage_mesh)
+        kernel = with_sharding_constraint(self.conv1d.weight.value, replicated_3d, mesh=stage_mesh)
+        dim_numbers = jax.lax.conv_dimension_numbers(
+            conv_input.shape,
+            kernel.shape,
+            ("NHC", "HIO", "NHC"),
+        )
+        conv_output = jax.lax.conv_general_dilated(
+            lhs=conv_input,
+            rhs=kernel,
+            window_strides=self.conv1d.stride,
+            padding=self.conv1d.padding,
+            rhs_dilation=self.conv1d.dilation,
+            dimension_numbers=dim_numbers,
+            feature_group_count=self.conv1d.groups,
+        )
+        return with_sharding_constraint(conv_output, replicated_3d, mesh=stage_mesh)
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: Float[Array, "batch seq proj_dim"],
@@ -2095,7 +2133,10 @@ class Qwen3NextLinearAttention(spx.Module):
             )
         else:
             # Training/prefill without cache: use the full convolution directly.
-            conv_output = jax.nn.silu(self.conv1d(conv_input))
+            if self.uses_split_proj:
+                conv_output = jax.nn.silu(self.conv1d(conv_input))
+            else:
+                conv_output = jax.nn.silu(self._stage_replicated_depthwise_conv(conv_input))
 
         if use_packed_state_updates:
             output = self.norm(output, z)
@@ -2170,6 +2211,11 @@ class Qwen3NextLinearAttention(spx.Module):
                 output = gdr_output.attention_outputs
                 new_recurrent_state = gdr_output.recurrent_state
 
+        z = apply_logical_sharding(
+            z,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         output = self.norm(output, z)
         output = output.reshape(batch_size, seq_len, -1)
         output = apply_logical_sharding(
@@ -2291,7 +2337,7 @@ class Qwen3NextDecoderLayer(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -2426,7 +2472,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -2437,13 +2483,15 @@ class Qwen3NextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = Qwen3NextRMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = Qwen3NextRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -2455,9 +2503,10 @@ class Qwen3NextModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        trace: bool = False,
     ) -> MoeModelOutput:
         """Forward pass through the Qwen3Next base model.
 
@@ -2541,6 +2590,18 @@ class Qwen3NextModel(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or output_router_logits,
+        )
+        cache_views = views if trace_layers else None
 
         def _layer_loop(block, carry):
             """Apply a single Qwen3Next decoder layer inside the layer-stack scan.
@@ -2551,7 +2612,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
             attention weights, and MoE router logits, and returns the
             updated carry tuple.
             """
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2561,7 +2622,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
@@ -2571,18 +2632,25 @@ class Qwen3NextModel(EasyDeLBaseModule):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
-        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
+        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
@@ -2681,7 +2749,7 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

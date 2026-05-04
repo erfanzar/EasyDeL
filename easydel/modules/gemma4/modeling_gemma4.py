@@ -1075,7 +1075,7 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -2509,7 +2509,7 @@ class Gemma4DecoderLayer(spx.Module):
         hidden_states: Array,
         mask_info: MaskInfo,
         position_ids: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -2681,7 +2681,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config,
@@ -2692,7 +2692,9 @@ class Gemma4TextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
@@ -2885,7 +2887,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
         per_layer_inputs: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> BaseModelOutput:
@@ -3132,7 +3134,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         per_layer_inputs: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
@@ -3504,7 +3506,7 @@ class Gemma4Model(EasyDeLBaseModule):
         inputs_embeds: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> BaseModelOutput:
@@ -3728,7 +3730,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         inputs_embeds: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

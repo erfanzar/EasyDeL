@@ -697,7 +697,7 @@ class SiglipEncoder(EasyDeLLayerStackMixin, spx.Module):
         )
         self.layers = nn.ModuleList([])
         for _ in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=_):
+            with self.assign_layer_stage(_, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,

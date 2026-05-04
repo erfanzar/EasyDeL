@@ -682,7 +682,7 @@ class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
         )
         self.blocks = nn.ModuleList([])
         for _ in range(num_layers):
-            with spx.assign_stage(total=num_layers, current=_):
+            with self.assign_layer_stage(_, total_layers=num_layers):
                 self.blocks.append(
                     remat_layer_block(
                         base_config=base_config,
@@ -1190,7 +1190,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: object | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: object | None = None,
         cache_metadata: object | None = None,
         apply_lm_head: bool = True,

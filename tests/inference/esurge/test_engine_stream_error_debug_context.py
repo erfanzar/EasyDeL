@@ -42,8 +42,17 @@ class _StreamHarness(EngineIOMixin, EngineUtilsMixin):
         del request_id, prompt
         return sampling_params
 
-    def _add_request(self, request_id, prompt, sampling_params, prompt_token_ids=None, tool_parser_request=None):
+    def _add_request(
+        self,
+        request_id,
+        prompt,
+        sampling_params,
+        prompt_token_ids=None,
+        tool_parser_request=None,
+        defer_scheduler_enqueue=False,
+    ):
         del sampling_params, tool_parser_request
+        assert not defer_scheduler_enqueue
         event = threading.Event()
         event.set()
         with self._request_lock:
@@ -220,9 +229,3 @@ def test_stream_snapshot_does_not_replay_stale_raw_delta_text():
     second = next(stream)
     assert second.raw_delta_text == ""
     assert second.delta_reasoning_content == "reasoning"
-
-
-def test_tool_protocol_text_detection_handles_partial_markers():
-    assert eSurgeApiServer._looks_like_tool_protocol_text("<tool_call><arg_key>name</arg_key>") is True
-    assert eSurgeApiServer._looks_like_tool_protocol_text("<tool name") is True
-    assert eSurgeApiServer._looks_like_tool_protocol_text("normal assistant text") is False

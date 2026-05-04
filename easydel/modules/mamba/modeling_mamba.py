@@ -14,9 +14,7 @@
 
 
 import functools
-import itertools
 import typing as tp
-from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -41,22 +39,6 @@ from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM1Op
 
 from .mamba_configuration import MambaConfig as MambaConfig
-
-
-def init_to_value(x, dtype):
-    """Build an initializer that fills parameters with a broadcasted constant.
-
-    Args:
-        x (Any): Constant scalar (or array) that the initializer should produce.
-        dtype: Unused by the inner closure; the dtype passed to the resulting
-            initializer at call time wins.
-
-    Returns:
-        Callable[[jax.Array, tuple, jnp.dtype], jax.Array]: An initializer with
-        the standard ``(key, shape, dtype)`` signature returning ``x`` broadcast
-        to ``shape``.
-    """
-    return lambda _, shape, dtype: jnp.broadcast_to(jnp.asarray(x, dtype=dtype), shape)
 
 
 @auto_pytree
@@ -89,45 +71,6 @@ class MambaCausalLMOutput(BaseModelOutput):
     cache: RecurrentCache | None = None
     hidden_states: tuple[Array] | None = None
     last_hidden_state: Array | None = None
-
-
-_T = tp.TypeVar("_T")
-
-
-def create_tuple_parser(
-    n: int,
-) -> Callable[[_T | Sequence[_T]], tuple[_T, ...]]:
-    """Normalize a scalar or sequence into a tuple of length ``n``.
-
-    Args:
-        n (int): Required tuple length.
-
-    Returns:
-        Callable[[_T | Sequence[_T]], tuple[_T, ...]]: A parser that returns
-        ``(x,) * n`` for scalars and validates length for sequences.
-    """
-
-    def parse(x: _T | Sequence[_T]) -> tuple[_T, ...]:
-        """Coerce ``x`` to a length-``n`` tuple.
-
-        Args:
-            x (_T | Sequence[_T]): Scalar value or sequence already of length ``n``.
-
-        Returns:
-            tuple[_T, ...]: The corresponding length-``n`` tuple.
-
-        Raises:
-            ValueError: If ``x`` is a sequence whose length is not ``n``.
-        """
-        if isinstance(x, Sequence):
-            if len(x) == n:
-                return tuple(x)
-            else:
-                raise ValueError(f"x!=n ({x}!=({n}))")
-        else:
-            return tuple(itertools.repeat(x, n))
-
-    return parse
 
 
 class Lambda(spx.Module):
@@ -736,7 +679,7 @@ class MambaModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=layer_idx):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     MambaBlock(
                         config=config,

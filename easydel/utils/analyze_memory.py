@@ -25,8 +25,6 @@ usage on the local JAX devices:
 * :class:`MemoryMonitorServer` / :class:`MemoryMonitorClient` -- a tiny
   TCP server/client pair for collecting :class:`DeviceStats` from many
   workers in a SPMD/cluster setup.
-* :func:`start_server` / :func:`start_client` -- convenience constructors
-  that build and start the corresponding object on default ports.
 
 Pandas is used opportunistically in :meth:`SMPMemoryMonitor.get_summary`;
 when it isn't installed the module gracefully falls back to plain Python
@@ -633,29 +631,6 @@ class MemoryMonitorClient:
             logger.error(f"Error sending stats to server: {e}")
 
 
-def start_server():
-    """Create and start a ``MemoryMonitorServer`` on the default address.
-
-    Returns:
-        The running ``MemoryMonitorServer`` instance.
-    """
-    server = MemoryMonitorServer()
-    server.start()
-    return server
-
-
-def start_client(server_host):
-    """Create and start a ``MemoryMonitorClient`` that reports to the given host.
-
-    Args:
-        server_host: Hostname or IP address of the monitoring server.
-
-    Returns:
-        The running ``MemoryMonitorClient`` instance.
-    """
-    client = MemoryMonitorClient(server_host)
-    client.start_monitoring()
-    return client
 
 
 if __name__ == "__main__":

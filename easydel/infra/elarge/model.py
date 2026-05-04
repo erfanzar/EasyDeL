@@ -695,7 +695,6 @@ class eLargeModel:
         max_model_len: int | None = None,
         max_num_seqs: int = 16,
         hbm_utilization: float = 0.85,
-        bind_graphstate_for_aot: bool | object = _ESURGE_UNSET,
         enable_window_aware_runtime_cap: bool | object = _ESURGE_UNSET,
         tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
         reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
@@ -713,10 +712,6 @@ class eLargeModel:
                 Higher values increase throughput but require more memory.
             hbm_utilization: HBM memory utilization ratio (0.0-1.0).
                 Controls how much device memory to use for KV cache.
-            bind_graphstate_for_aot: Optional override for AOT model-step
-                compilation behavior. When True, compiled model-step variants
-                capture graphstate/graphother as compile-time constants.
-                When omitted, keeps the current value (default config is False).
             enable_window_aware_runtime_cap: Optional override for eSurge's
                 window-aware runtime-cap estimator. When False, runtime request
                 caps fall back to the cache metadata's heuristic estimate.
@@ -768,8 +763,6 @@ class eLargeModel:
         esurge["max_num_seqs"] = max_num_seqs
         esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
-        if bind_graphstate_for_aot is not _ESURGE_UNSET:
-            esurge["bind_graphstate_for_aot"] = bool(bind_graphstate_for_aot)
         if enable_window_aware_runtime_cap is not _ESURGE_UNSET:
             esurge["enable_window_aware_runtime_cap"] = bool(enable_window_aware_runtime_cap)
         if tool_parser is not _ESURGE_UNSET:
@@ -1274,8 +1267,16 @@ class eLargeModel:
             tok_path = self._config["model"].get("tokenizer", self.model_name)
             if not tok_path:
                 raise ValueError("Tokenizer path must be set")
-            trust_remote_code = bool(self._config.get("loader", {}).get("trust_remote_code", False))
-            self._tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=trust_remote_code)
+            loader_cfg = self._config.get("loader", {})
+            tokenizer_kwargs = dict(loader_cfg.get("tokenizer_kwargs", {}) or {})
+            tokenizer_kwargs.setdefault("trust_remote_code", bool(loader_cfg.get("trust_remote_code", False)))
+            tokenizer_kwargs.setdefault("use_fast", bool(loader_cfg.get("use_fast_tokenizer", True)))
+            self._tokenizer = AutoTokenizer.from_pretrained(tok_path, **tokenizer_kwargs)
+            logger.info(
+                "Loaded tokenizer %s (fast=%s)",
+                self._tokenizer.__class__.__name__,
+                getattr(self._tokenizer, "is_fast", None),
+            )
         return self._tokenizer
 
     def build_esurge(self) -> "eSurge":
@@ -1565,15 +1566,24 @@ class eLargeModel:
         text = text.strip("._-")
         return text or default
 
-    def _build_pre_tokenize_folder_name(self, trainer_cfg: Mapping[str, Any], arguments: Any, tokenizer: Any) -> str:
+    def _build_pre_tokenize_folder_name(
+        self,
+        trainer_cfg: Mapping[str, Any],
+        arguments: Any,
+        tokenizer: Any,
+        dataset_name: Any | None = None,
+    ) -> str:
         """Build the deterministic child folder for pre-tokenized data."""
-        mixture_cfg = self._config.get("mixture", {})
-        informs = mixture_cfg.get("informs", [])
-        dataset_names = [
-            self._sanitize_pre_tokenize_path_part(_extract_dataset_name(inform, fallback_index=index))
-            for index, inform in enumerate(informs)
-        ]
-        dataset_name = "_".join(dataset_names) if dataset_names else "mixture"
+        if dataset_name is None:
+            mixture_cfg = self._config.get("mixture", {})
+            informs = mixture_cfg.get("informs", [])
+            dataset_names = [
+                self._sanitize_pre_tokenize_path_part(_extract_dataset_name(inform, fallback_index=index))
+                for index, inform in enumerate(informs)
+            ]
+            dataset_name = "_".join(dataset_names) if dataset_names else "mixture"
+        else:
+            dataset_name = self._sanitize_pre_tokenize_path_part(dataset_name)
         tokenizer_class = self._sanitize_pre_tokenize_path_part(tokenizer.__class__.__name__, default="Tokenizer")
         trainer_type = self._sanitize_pre_tokenize_path_part(trainer_cfg.get("trainer_type", "sft"))
         max_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_length", None))
@@ -1581,7 +1591,7 @@ class eLargeModel:
         max_completion_length = self._sanitize_pre_tokenize_path_part(getattr(arguments, "max_completion_length", None))
         return (
             f"{trainer_type}-{tokenizer_class}-"
-            f"MXL{max_length}-PL{max_prompt_length}-CL{max_completion_length}-{dataset_name}"
+            f"MXL_{max_length}-PL_{max_prompt_length}-CL_{max_completion_length}-{dataset_name}"
         )
 
     def _resolve_pre_tokenize_output_path(
@@ -1590,11 +1600,12 @@ class eLargeModel:
         trainer_cfg: Mapping[str, Any],
         arguments: Any,
         tokenizer: Any,
+        dataset_name: Any | None = None,
     ) -> str:
         """Resolve the pre-tokenized output path from a base path plus generated metadata."""
         if path_to_save is not None:
             base_path = os.fspath(path_to_save)
-            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
             return f"{base_path.rstrip('/')}/{folder_name}"
 
         mixture_cfg = self._config.get("mixture", {})
@@ -1602,14 +1613,14 @@ class eLargeModel:
         output_path = save_cfg.get("output_path")
         if output_path:
             base_path = os.fspath(output_path)
-            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
             return f"{base_path.rstrip('/')}/{folder_name}"
 
         raw_trainer_cfg = self._config.get("trainer", {})
         save_directory = raw_trainer_cfg.get("save_directory")
         if save_directory:
             save_directory = os.fspath(save_directory).rstrip("/")
-            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer)
+            folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
             return f"{save_directory}/pretokenized/{folder_name}"
 
         raise ValueError(
@@ -1629,6 +1640,10 @@ class eLargeModel:
         num_proc: int | None = None,
         show_progress: bool = True,
         log_process: bool | int | None = None,
+        transform_batch_size: int | None = None,
+        transform_backend: str | None = None,
+        drop_fields: typing.Iterable[str] | None = None,
+        arrays_only: bool | None = None,
         formatting_func: typing.Callable | None = None,
     ) -> "WriteStats":
         """Pre-tokenize the configured data mixture for a trainer and save shards.
@@ -1636,7 +1651,9 @@ class eLargeModel:
         Args:
             path_to_save: Base output directory for the materialized tokenized
                 shards. The final folder is generated as
-                ``{trainer_type}-{tokenizer_class}-MXL{max_length}-PL{max_prompt_length}-CL{max_completion_length}-{dataset_names}``.
+                ``{trainer_type}-{tokenizer_class}-MXL{max_length}-PL{max_prompt_length}-CL{max_completion_length}-{dataset_name}``.
+                Multi-inform mixtures are written as one folder per inform
+                rather than one interleaved materialization.
                 When omitted, uses ``mixture.save.output_path`` and then falls
                 back to ``<trainer.save_directory>/pretokenized`` as the base.
             trainer_type: Trainer family whose preprocessing should be applied.
@@ -1655,6 +1672,19 @@ class eLargeModel:
                 examples as they pass into the writer. ``True`` refreshes every
                 1,000 examples; an integer refreshes every N examples. Defaults
                 to ``mixture.save.log_process`` when present.
+            transform_batch_size: Source rows grouped into one transform task
+                during parallel pre-tokenization. Defaults to
+                ``mixture.save.transform_batch_size`` when present.
+            transform_backend: Parallel transform backend, ``"process"`` or
+                ``"thread"``. Defaults to ``mixture.save.transform_backend``
+                and falls back to ``"process"``.
+            drop_fields: Transformed-row fields to remove before saving.
+                Defaults to ``mixture.save.drop_fields``. For SFT/GKD/
+                distillation this defaults to ``("tools",)`` because tools
+                are only needed before tokenization.
+            arrays_only: Keep only numeric tensor-like values in saved
+                pretokenized rows. Defaults to ``mixture.save.arrays_only``
+                and falls back to ``True``.
             formatting_func: Optional SFT-style formatting callable.
 
         Returns:
@@ -1662,31 +1692,88 @@ class eLargeModel:
         """
         from easydel.data import pretokenize
 
-        source = self.build_sharded_source()
-        if source is None:
+        mixture_cfg = self._config.get("mixture", {})
+        informs = list(mixture_cfg.get("informs", []) or [])
+        if not informs:
             raise ValueError("mixture.informs is required for pre_tokenize")
 
-        save_cfg = self._config.get("mixture", {}).get("save", {})
+        save_cfg = mixture_cfg.get("save", {})
         resolved_format = output_format or save_cfg.get("format", "parquet")
         if resolved_format == "json":
             resolved_format = "jsonl"
 
         trainer_cfg, arguments = self._build_training_arguments_for_type(trainer_type)
         tokenizer = self.build_tokenizer()
-        resolved_output_path = self._resolve_pre_tokenize_output_path(path_to_save, trainer_cfg, arguments, tokenizer)
         transform = self._build_pre_tokenize_transform(trainer_type, formatting_func=formatting_func)
-        return pretokenize(
-            source=source,
-            transform=transform,
-            output_path=resolved_output_path,
-            output_format=resolved_format,
-            max_shard_size=max_shard_size or save_cfg.get("max_shard_size", "500MB"),
-            compression=compression if compression is not None else save_cfg.get("compression", "snappy"),
-            num_shards=num_shards if num_shards is not None else save_cfg.get("num_shards"),
-            num_proc=num_proc,
-            show_progress=show_progress,
-            log_process=log_process if log_process is not None else save_cfg.get("log_process", False),
-        )
+        resolved_drop_fields = drop_fields if drop_fields is not None else save_cfg.get("drop_fields")
+        if resolved_drop_fields is None and trainer_cfg.get("trainer_type") in {"sft", "gkd", "distillation"}:
+            resolved_drop_fields = ("tools",)
+        common_kwargs = {
+            "output_format": resolved_format,
+            "max_shard_size": max_shard_size or save_cfg.get("max_shard_size", "500MB"),
+            "compression": compression if compression is not None else save_cfg.get("compression", "snappy"),
+            "num_shards": num_shards if num_shards is not None else save_cfg.get("num_shards"),
+            "num_proc": num_proc,
+            "show_progress": show_progress,
+            "log_process": log_process if log_process is not None else save_cfg.get("log_process", False),
+            "transform_batch_size": (
+                transform_batch_size
+                if transform_batch_size is not None
+                else save_cfg.get("transform_batch_size", 16)
+            ),
+            "transform_backend": (
+                transform_backend
+                if transform_backend is not None
+                else save_cfg.get("transform_backend", "thread")
+            ),
+            "drop_fields": resolved_drop_fields,
+            "arrays_only": arrays_only if arrays_only is not None else save_cfg.get("arrays_only", True),
+        }
+
+        if len(informs) == 1:
+            source = self.build_sharded_source()
+            if source is None:
+                raise ValueError("mixture.informs is required for pre_tokenize")
+            resolved_output_path = self._resolve_pre_tokenize_output_path(
+                path_to_save,
+                trainer_cfg,
+                arguments,
+                tokenizer,
+            )
+            return pretokenize(source=source, transform=transform, output_path=resolved_output_path, **common_kwargs)
+
+        from easydel.data import WriteStats
+
+        aggregate = WriteStats()
+        seen_names: set[str] = set()
+        for index, inform in enumerate(informs):
+            dataset_name = self._sanitize_pre_tokenize_path_part(_extract_dataset_name(inform, fallback_index=index))
+            if dataset_name in seen_names:
+                dataset_name = f"{dataset_name}-{index}"
+            seen_names.add(dataset_name)
+
+            single_cfg = dict(self._config)
+            single_mixture = dict(mixture_cfg)
+            single_mixture["informs"] = [inform]
+            single_cfg["mixture"] = single_mixture
+            source = build_sharded_source(single_cfg)
+            if source is None:
+                continue
+
+            resolved_output_path = self._resolve_pre_tokenize_output_path(
+                path_to_save,
+                trainer_cfg,
+                arguments,
+                tokenizer,
+                dataset_name=dataset_name,
+            )
+            stats = pretokenize(source=source, transform=transform, output_path=resolved_output_path, **common_kwargs)
+            aggregate.num_examples += stats.num_examples
+            aggregate.num_shards += stats.num_shards
+            aggregate.total_bytes += stats.total_bytes
+            aggregate.output_paths.extend(stats.output_paths)
+
+        return aggregate
 
     def get_train_source(self) -> "ShardedDataSource | Dataset | IterableDataset | None":
         """Get training data as ShardedDataSource or Dataset.

@@ -12,45 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resident per-stage worker runtime for eSurge pipeline-parallel inference.
-
-SpectraX's default ``sxjit`` MPMD path executes a forward-only clustering plan
-through a single host-side dispatcher loop that walks every stage in sequence.
-For inference we instead pin one daemon thread per pipeline rank — a
-:class:`_PipelineStageWorker` — and feed each thread its own activation queue.
-The dispatcher (:class:`PipelineStageRuntime`) reuses the SpectraX-prepared
-compile plan (``_mpmd_prepare``) for invar/outvar wiring, but routes every
-stage call through ``submit() → Future`` on the matching worker thread, then
-threads the resolved output activations back into the next stage's invars via
-SpectraX's private edge-sharding helpers (``_assemble_invars`` /
-``_assemble_outputs``).
-
-Public contract: a caller still submits one bucketed model-step pytree and
-receives the same output pytree; the runtime only changes *how* the per-stage
-launches reach the device, not what they compute. The win is twofold —
-per-stage Python overhead is amortized across the daemon thread, and the
-scheduler thread is freed to do prefetch work while a step is in flight.
-"""
+"""eSurge adapter over SpectraX's resident MPMD pipeline executor."""
 
 from __future__ import annotations
 
 import dataclasses
-import queue
-import threading
-import time
 import typing as tp
-from concurrent.futures import Future
 
-import jax
+import spectrax as spx
 from eformer.loggings import get_logger
-from spectrax.runtime.mpmd.runtime import (
-    _apply_out_shardings,
-    _assemble_invars,
-    _assemble_outputs,
-    _restore_result_treedef,
-)
-
-from easydel.infra.sharding import MeshLike
 
 from .pipeline_plan import PipelineInferencePlan
 
@@ -59,370 +29,245 @@ logger = get_logger("eSurge-PipelineRuntime")
 
 @dataclasses.dataclass(frozen=True)
 class PipelineDispatchStats:
-    """Per-call dispatch counters captured by :class:`PipelineStageRuntime`.
+    """Per-call SpectraX PP dispatch counters surfaced in eSurge perf logs.
 
-    Refreshed once per :meth:`PipelineStageRuntime.dispatch` invocation and
-    surfaced to the model runner via the ``last_pipeline_stats`` channel for
-    inclusion in step-level perf logs.
-
-    Attributes:
-        stage_launches (int): Number of stage submits issued during the call;
-            equals ``len(compiled)`` from the SpectraX plan.
-        stage_dispatch_time (float): Cumulative wall-clock seconds the
-            dispatcher spent in ``submit()`` plus blocking ``future.result()``
-            across all stages. Includes both queue wait and on-device
-            execution time because the dispatcher waits for each stage
-            result inline before moving on.
-        queue_wait_time (float): Lower-bounded estimate of time spent
-            waiting for worker threads, as opposed to actual device time.
-            Currently equal to ``stage_dispatch_time`` (clamped to
-            non-negative); kept as a separate field so future work can split
-            the two without breaking callers.
+    The execution manager treats these values as host-side scheduling metrics:
+    they describe how many physical stage calls were launched and how much wall
+    time was spent preparing, submitting, waiting for, and assembling an MPMD
+    pipeline call. They intentionally do not replace device-side XLA profiling;
+    they make the eSurge decode loop explainable from normal verbose logs.
     """
 
     stage_launches: int
     stage_dispatch_time: float
     queue_wait_time: float
-
-
-@dataclasses.dataclass
-class _StageTask:
-    """Producer→worker handoff record for one pipeline stage call.
-
-    Constructed by :meth:`_PipelineStageWorker.submit` (the producer side runs
-    on the dispatcher thread) and consumed by :meth:`_PipelineStageWorker._run`
-    on the worker thread. The task's ``future`` is the rendezvous: the
-    dispatcher blocks on ``future.result()`` to fetch stage activations before
-    assembling the next stage's invars.
-
-    Attributes:
-        stage_jit (Callable): The compiled per-stage jit returned by
-            SpectraX's compile plan. Closed over the layer subset that lives
-            on this rank.
-        submesh (MeshLike): Stage submesh entered as a context manager during
-            execution so XLA places the call on the right slice of devices.
-        invars (list[Any]): Flat list of stage inputs in plan order
-            (graphdef/state, kv pages, transferred activations from the
-            previous stage, …). Pre-assembled by :func:`_assemble_invars`.
-        future (Future): Result handle the dispatcher blocks on. Resolved
-            with the stage output pytree on success, or with the raised
-            exception on failure.
-        enqueued_at (float): Wall-clock seconds at submit time. Reserved
-            for future queue-latency telemetry; not currently consumed.
-    """
-
-    stage_jit: tp.Callable[..., tp.Any]
-    submesh: MeshLike
-    invars: list[tp.Any]
-    future: Future
-    enqueued_at: float
-
-
-class _PipelineStageWorker:
-    """Resident daemon thread serving one physical pipeline-parallel rank.
-
-    The constructor immediately starts a daemon thread that consumes
-    :class:`_StageTask` items from an unbounded :class:`queue.Queue` and
-    executes each ``stage_jit(*invars)`` under the task's submesh context.
-    There is exactly one worker per PP rank, instantiated lazily by
-    :meth:`PipelineStageRuntime._ensure_workers` after the SpectraX plan is
-    first observed. Workers outlive individual ``dispatch()`` calls; only
-    :meth:`PipelineStageRuntime.shutdown` (or a plan-shape change) tears them
-    down.
-
-    The dispatcher and worker threads communicate strictly through the queue
-    and the per-task :class:`Future`: enqueue, then block on ``future.result``.
-    No shared mutable state lives on the worker.
-    """
-
-    def __init__(self, *, rank: int) -> None:
-        """Spawn the daemon thread for ``rank`` and start polling the queue.
-
-        Args:
-            rank (int): Pipeline-stage rank this worker is dedicated to.
-                Encoded into the thread name (``eSurge-pp-stage-{rank}``)
-                for ``ps`` / profiler visibility; not otherwise consulted —
-                stage targeting is enforced by the ``submesh`` carried on
-                each task.
-        """
-        self.rank = int(rank)
-        self._queue: queue.Queue[_StageTask | None] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name=f"eSurge-pp-stage-{rank}", daemon=True)
-        self._thread.start()
-
-    def submit(self, *, stage_jit: tp.Callable[..., tp.Any], submesh: MeshLike, invars: list[tp.Any]) -> Future:
-        """Enqueue a stage call from the dispatcher thread.
-
-        Producer side of the producer/consumer handshake: builds a fresh
-        :class:`_StageTask`, copies ``invars`` defensively (the caller may
-        reuse the list to assemble the next stage), and puts it on the
-        worker's queue. Returns immediately without waiting for the worker
-        to pick the task up.
-
-        Args:
-            stage_jit (Callable): Compiled per-stage callable. Must accept
-                exactly the unpacked ``invars`` and return the pytree of
-                stage output activations.
-            submesh (MeshLike): Stage submesh activated as a context manager
-                around the call so XLA places it on the correct device slice.
-            invars (list[Any]): Flat list of stage inputs in the order
-                expected by ``stage_jit``. Copied before being attached to
-                the task.
-
-        Returns:
-            Future: Future the dispatcher should ``.result()`` on. Resolves
-            with the stage output pytree on success, or re-raises any
-            exception thrown inside ``stage_jit`` on the worker thread.
-        """
-        future: Future = Future()
-        self._queue.put(
-            _StageTask(
-                stage_jit=stage_jit,
-                submesh=submesh,
-                invars=list(invars),
-                future=future,
-                enqueued_at=time.time(),
-            )
-        )
-        return future
-
-    def shutdown(self) -> None:
-        """Send the sentinel and join the worker thread with a short timeout.
-
-        Pushes ``None`` onto the queue (interpreted by :meth:`_run` as the
-        exit signal) and waits up to five seconds for the daemon thread to
-        return. Idempotent — call as many times as you like.
-        """
-        self._queue.put(None)
-        self._thread.join(timeout=5.0)
-
-    def _run(self) -> None:
-        """Consume the task queue until a ``None`` sentinel arrives.
-
-        Worker-thread main loop. For each task: claim the future via
-        ``set_running_or_notify_cancel``, enter the task's submesh as a
-        context manager, invoke ``stage_jit(*invars)``, and either resolve
-        the future with the result or set its exception so the dispatcher
-        can re-raise on the originating thread. Always calls ``task_done``
-        so callers waiting on ``queue.join()`` (e.g. teardown paths) make
-        progress.
-        """
-        while True:
-            task = self._queue.get()
-            if task is None:
-                self._queue.task_done()
-                return
-            if task.future.set_running_or_notify_cancel():
-                try:
-                    with task.submesh:
-                        out = task.stage_jit(*task.invars)
-                    task.future.set_result(out)
-                except BaseException as exc:
-                    task.future.set_exception(exc)
-            self._queue.task_done()
+    prepare_time: float = 0.0
+    assemble_time: float = 0.0
+    submit_time: float = 0.0
+    stage_submit_times_ms: tuple[float, ...] = ()
+    stage_assemble_times_ms: tuple[float, ...] = ()
+    stage_execute_times_ms: tuple[float, ...] = ()
 
 
 class PipelineStageRuntime:
-    """Queue-backed dispatcher over a SpectraX forward-only stage compile plan.
+    """EasyDeL-facing adapter over ``spx.MpmdPipelineExecutor``.
 
-    Owns one :class:`_PipelineStageWorker` per pipeline rank and replaces the
-    default in-line SpectraX dispatcher with a producer (this object's
-    :meth:`dispatch`) plus N consumer threads (one per PP rank). The actual
-    activation transfer between stages still uses SpectraX's private edge-
-    sharding helpers (``_assemble_invars`` / ``_assemble_outputs`` /
-    ``_apply_out_shardings``); we only change *who* calls each stage's
-    compiled jit.
+    SpectraX owns the generic MPMD mechanics: preparing an ``sxjit`` stage
+    plan, routing activations, entering stage submeshes, and running resident
+    per-rank workers. EasyDeL owns the inference-specific semantics around it:
+    which model function to call, how KV-cache state is carried, and how the
+    final hidden states are projected and sampled.
 
-    Lifecycle:
-
-    1. Construct with an enabled :class:`PipelineInferencePlan` — workers are
-       not spawned yet.
-    2. The first :meth:`dispatch` call observes the SpectraX compile plan
-       (``_mpmd_prepare``), reads ``len(compiled)``, and provisions exactly
-       that many workers via :meth:`_ensure_workers`. Subsequent calls reuse
-       the same workers as long as the stage count is stable.
-    3. :meth:`shutdown` (called from :class:`ModelStepExecutor.shutdown` and
-       transitively from engine teardown) joins all worker threads.
-
-    Attributes:
-        plan: The enabled :class:`PipelineInferencePlan` whose ``stage_meshes``
-            and ``mpmd_dim`` are consulted as a fallback for the
-            ``mpmd_mesh`` lookup when the SpectraX plan does not surface one
-            directly.
+    The runtime keeps two executors:
+        * an inline executor for a single logical decode batch, where worker
+          futures cannot create overlap and only add a host rendezvous;
+        * a resident-worker executor for true multi-microbatch wavefronts,
+          where each physical stage needs its own queue to overlap with the
+          other stages.
     """
 
     def __init__(self, *, plan: PipelineInferencePlan) -> None:
-        """Construct an idle runtime; workers are spawned lazily on first dispatch.
-
-        Args:
-            plan (PipelineInferencePlan): Enabled pipeline plan. The runtime
-                does not consult ``stage_meshes`` until a dispatch needs to
-                resolve ``mpmd_mesh``, so the plan only needs to satisfy
-                ``is_enabled=True`` here.
-
-        Raises:
-            ValueError: If ``plan.is_enabled`` is ``False`` — pipeline-stage
-                workers make no sense without an MPMD topology.
-        """
         if not plan.is_enabled:
             raise ValueError("PipelineStageRuntime requires an enabled PipelineInferencePlan.")
         self.plan = plan
-        self._workers: list[_PipelineStageWorker] = []
-        self._worker_count = 0
+        self._inline_executor = spx.MpmdPipelineExecutor(stage_meshes=plan.stage_meshes, use_workers=False)
+        self._wavefront_executor = spx.MpmdPipelineExecutor(stage_meshes=plan.stage_meshes, use_workers=True)
         self._last_stats = PipelineDispatchStats(0, 0.0, 0.0)
+        self._logged_plan_keys: set[tuple[str, tp.Hashable]] = set()
 
     @property
     def last_stats(self) -> PipelineDispatchStats:
-        """Counters captured by the most recent :meth:`dispatch` call.
-
-        Reset to a zero-valued :class:`PipelineDispatchStats` at construction
-        time. Read by ``ModelStepExecutor.last_pipeline_stats`` for inclusion
-        in the per-step perf log line.
-        """
+        """Metrics for the most recent single-call or wavefront dispatch."""
         return self._last_stats
 
     def shutdown(self) -> None:
-        """Join every worker thread and clear the pool.
+        """Stop resident SpectraX stage workers and reset visible metrics."""
+        self._inline_executor.shutdown()
+        self._wavefront_executor.shutdown()
+        self._last_stats = PipelineDispatchStats(0, 0.0, 0.0)
 
-        Sends a sentinel to each worker and resets internal state so a fresh
-        :meth:`dispatch` would re-provision a new pool. Idempotent.
-        """
-        for worker in self._workers:
-            worker.shutdown()
-        self._workers = []
-        self._worker_count = 0
+    def clear_prepare_cache(self) -> None:
+        """Drop cached SpectraX prepare plans after graph/cache shape changes."""
+        self._inline_executor.clear_prepare_cache()
+        self._wavefront_executor.clear_prepare_cache()
 
-    def dispatch(self, sxjit_fn: tp.Callable[..., tp.Any], *args: tp.Any) -> tp.Any:
-        """Execute one bucketed model-step pytree through the resident workers.
-
-        Walks the SpectraX compile plan rank-by-rank. For each stage the
-        method (a) materializes its invars by gathering original inputs and
-        previously-computed activations through ``_assemble_invars``, (b)
-        ``submit``s the call to the rank's worker, (c) blocks on the future
-        before moving to the next stage so cross-stage transfers respect the
-        plan's edge-sharding metadata, and finally (d) stitches the
-        per-stage outputs back into the original result pytree using the
-        plan's ``fn_outvar_map`` and out-sharding specs.
-
-        Args:
-            sxjit_fn (Callable): The SpectraX ``@spx.jit`` function. Must
-                expose the private ``_mpmd_prepare`` callable used to lower
-                the inputs to a per-rank compile plan; this attribute is
-                only present on forward-only sxjit functions (i.e. those
-                that do not use the gradient/scheduler MPMD path).
-            *args: The same positional arguments the caller would have
-                passed to ``sxjit_fn`` directly. Forwarded verbatim into
-                ``_mpmd_prepare`` for tracing and used as the source of
-                ``flat_args`` during invar assembly.
-
-        Returns:
-            The reassembled output pytree, with each leaf placed under the
-            sharding specified by the plan's ``out_shardings``. The result
-            structure matches what calling ``sxjit_fn(*args)`` directly
-            would have produced.
-
-        Raises:
-            TypeError: If ``sxjit_fn`` lacks ``_mpmd_prepare`` (not a
-                SpectraX MPMD function), or if the plan dictionary doesn't
-                contain a forward-only ``compiled`` entry (i.e. the function
-                was compiled under a backward/scheduler MPMD plan that this
-                dispatcher cannot drive).
-        """
-
-        prepare = getattr(sxjit_fn, "_mpmd_prepare", None)
-        if prepare is None:
-            raise TypeError("PipelineStageRuntime requires a SpectraX sxjit function with _mpmd_prepare.")
-        state = prepare(*args)
-        if "compiled" not in state:
-            raise TypeError("PipelineStageRuntime only supports forward-only sxjit plans.")
-
-        compiled = state["compiled"]
-        self._ensure_workers(compiled)
-
-        placed = state["placed"]
-        dynamic = state["dynamic"]
-        explicit_in_sh = state["explicit_in_sh"]
-        rank_submeshes = [stage[1] for stage in compiled]
-        mpmd_mesh = state.get("mpmd_mesh")
-        if mpmd_mesh is None:
-            mpmd_mesh = getattr(getattr(rank_submeshes[0], "spmd_mesh", None), "mpmd_mesh", None)
-        if mpmd_mesh is None:
-            # SpectraX's private assembler only needs the object for
-            # edge-sharding helpers; the sxjit state always has compatible
-            # submeshes, so keep a direct reference from the model mesh if set.
-            mpmd_mesh = getattr(getattr(self.plan.stage_meshes[0], "spmd_mesh", None), "mpmd_mesh", None)
-        if mpmd_mesh is None:
-            mpmd_mesh = getattr(self.plan.stage_meshes[0], "mpmd_mesh", None)
-        if mpmd_mesh is None:
-            # Fallback for current SpectraX MpMdMesh.submesh objects: the
-            # private assembler only passes it through to edge transfer helpers.
-            mpmd_mesh = getattr(sxjit_fn, "_mpmd_mesh", None)
-
-        flat_args = jax.tree.leaves(args)
-        all_cluster_outputs: list[tuple] = []
-        prev_outputs: tuple = ()
-        stage_dispatch_time = 0.0
-        queue_wait_time = 0.0
-
-        for ri, (_, _, my_sh, _, invar_map) in enumerate(compiled):
-            stage_jit, submesh, *_ = compiled[ri]
-            rank_devices = set(rank_submeshes[ri].devices.flat)
-            invars = _assemble_invars(
-                invar_map,
-                flat_args,
-                placed,
-                dynamic,
-                explicit_in_sh,
-                prev_outputs,
-                all_cluster_outputs,
-                ri,
-                my_sh,
-                rank_devices,
-                rank_submeshes,
-                mpmd_mesh,
-                dynamic_flat_to_orig_flat=state.get("dynamic_flat_to_orig_flat"),
-            )
-            t0 = time.time()
-            future = self._workers[ri].submit(stage_jit=stage_jit, submesh=submesh, invars=invars)
-            prev_outputs = future.result()
-            elapsed = time.time() - t0
-            stage_dispatch_time += elapsed
-            queue_wait_time += max(0.0, elapsed)
-            all_cluster_outputs.append(prev_outputs)
-
-        result = _assemble_outputs(
-            state["fn_outvar_map"],
-            all_cluster_outputs,
-            flat_args,
-            dynamic_flat_to_orig_flat=state.get("dynamic_flat_to_orig_flat"),
-        )
-        result = _apply_out_shardings(result, state.get("out_shardings"))
-        result = _restore_result_treedef(result, state.get("result_treedef"))
+    def dispatch(
+        self,
+        sxjit_fn: tp.Callable[..., tp.Any],
+        *args: tp.Any,
+        prepare_cache_key: tp.Hashable | None = None,
+        runtime_static_argnums: tp.Iterable[int] | None = None,
+    ) -> tp.Any:
+        """Run one prepared ``sxjit`` backbone call through the PP executor."""
+        result = self._inline_executor.dispatch_many(
+            sxjit_fn,
+            (args,),
+            prepare_cache_key=prepare_cache_key,
+            runtime_static_argnums=runtime_static_argnums,
+        )[0]
+        stats = self._inline_executor.last_stats
         self._last_stats = PipelineDispatchStats(
-            stage_launches=len(compiled),
-            stage_dispatch_time=stage_dispatch_time,
-            queue_wait_time=queue_wait_time,
+            stage_launches=int(stats.stage_launches),
+            stage_dispatch_time=float(stats.stage_dispatch_time),
+            queue_wait_time=float(stats.queue_wait_time),
+            prepare_time=float(stats.prepare_time),
+            assemble_time=float(stats.assemble_time),
+            submit_time=float(stats.submit_time),
+            stage_submit_times_ms=tuple(float(x) for x in getattr(stats, "stage_submit_times_ms", ())),
+            stage_assemble_times_ms=tuple(float(x) for x in getattr(stats, "stage_assemble_times_ms", ())),
+            stage_execute_times_ms=tuple(float(x) for x in getattr(stats, "stage_execute_times_ms", ())),
         )
+        self._maybe_log_cached_plan("single", self._inline_executor, prepare_cache_key)
         return result
 
-    def _ensure_workers(self, compiled: list[tuple]) -> None:
-        """Provision exactly ``len(compiled)`` workers, replacing any stale pool.
+    def dispatch_many(
+        self,
+        sxjit_fn: tp.Callable[..., tp.Any],
+        arg_batches: tp.Iterable[tuple],
+        *,
+        carry_input_output_map: tp.Mapping[int, tp.Mapping[int, int]] | None = None,
+        prepare_cache_key: tp.Hashable | None = None,
+        runtime_static_argnums: tp.Iterable[int] | None = None,
+    ) -> list[tp.Any]:
+        """Run same-shaped microbatches through SpectraX's wavefront executor.
 
-        Called at the start of every :meth:`dispatch` so that re-tracing a
-        plan with a different number of pipeline stages (e.g. after a hot
-        weight update that altered layer assignment) transparently rebuilds
-        the worker pool. The fast path is a no-op when the existing pool
-        already matches the requested count.
-
-        Args:
-            compiled (list[tuple]): SpectraX compiled stage list — the
-                ``compiled`` entry of the ``_mpmd_prepare`` plan. Only its
-                length matters here; one worker is spawned per element.
+        This is the building block for overlapped PP decode. The caller is
+        still responsible for ensuring KV-cache updates are independent or
+        stage-local before submitting multiple microbatches concurrently.
         """
-        worker_count = len(compiled)
-        if self._worker_count == worker_count and len(self._workers) == worker_count:
+        arg_batches = tuple(arg_batches)
+        executor = self._inline_executor if len(arg_batches) <= 1 else self._wavefront_executor
+        results = executor.dispatch_many(
+            sxjit_fn,
+            arg_batches,
+            carry_input_output_map=carry_input_output_map,
+            prepare_cache_key=prepare_cache_key,
+            runtime_static_argnums=runtime_static_argnums,
+        )
+        stats = executor.last_stats
+        self._last_stats = PipelineDispatchStats(
+            stage_launches=int(stats.stage_launches),
+            stage_dispatch_time=float(stats.stage_dispatch_time),
+            queue_wait_time=float(stats.queue_wait_time),
+            prepare_time=float(stats.prepare_time),
+            assemble_time=float(stats.assemble_time),
+            submit_time=float(stats.submit_time),
+            stage_submit_times_ms=tuple(float(x) for x in getattr(stats, "stage_submit_times_ms", ())),
+            stage_assemble_times_ms=tuple(float(x) for x in getattr(stats, "stage_assemble_times_ms", ())),
+            stage_execute_times_ms=tuple(float(x) for x in getattr(stats, "stage_execute_times_ms", ())),
+        )
+        logger.debug(
+            "SpectraX MPMD wavefront dispatched %s microbatches over %s stage launches",
+            int(stats.microbatches),
+            int(stats.stage_launches),
+        )
+        self._maybe_log_cached_plan("wavefront", executor, prepare_cache_key)
+        return results
+
+    def _maybe_log_cached_plan(
+        self,
+        mode: str,
+        executor: spx.MpmdPipelineExecutor,
+        prepare_cache_key: tp.Hashable | None,
+    ) -> None:
+        """Log one compact audit of a cached SpectraX PP plan.
+
+        eSurge's split backbone calls pass
+        ``(graphdef, graphstate, graphother, kv_pages, metadata)`` while the
+        fused PP model-step path passes ``(graphstate, graphother, kv_pages,
+        metadata)``. Decode performance depends on SpectraX keeping KV/cache
+        leaves stage-local and treating metadata as ordinary dynamic inputs, so
+        the audit chooses the correct argument slots per cached executable
+        shape and reports only compact counts.
+        """
+        if prepare_cache_key is None:
             return
-        self.shutdown()
-        self._workers = [_PipelineStageWorker(rank=rank) for rank in range(worker_count)]
-        self._worker_count = worker_count
-        logger.info("Started %s PP stage workers.", len(compiled))
+        logged_key = (str(mode), prepare_cache_key)
+        if logged_key in self._logged_plan_keys:
+            return
+        cache = getattr(executor, "_prepare_cache", None)
+        if not isinstance(cache, dict):
+            return
+        entry = cache.get(prepare_cache_key)
+        if entry is None:
+            return
+        self._logged_plan_keys.add(logged_key)
+
+        arg_offsets = tuple(getattr(entry, "arg_offsets", ()))
+        arg_leaf_counts = tuple(getattr(entry, "arg_leaf_counts", ()))
+        invar_plans = tuple(getattr(entry, "invar_plans", ()))
+        state = getattr(entry, "state", {})
+        fn_outvar_map = state.get("fn_outvar_map", ()) if isinstance(state, dict) else ()
+        donated_by_stage = tuple(state.get("donate_argnums_per_stage", ())) if isinstance(state, dict) else ()
+
+        def _arg_span(argnum: int) -> range:
+            if argnum >= len(arg_offsets) or argnum >= len(arg_leaf_counts):
+                return range(0, 0)
+            start = int(arg_offsets[argnum])
+            count = int(arg_leaf_counts[argnum])
+            return range(start, start + count)
+
+        if (
+            isinstance(prepare_cache_key, tuple)
+            and len(prepare_cache_key) >= 1
+            and prepare_cache_key[0] == "model_step"
+        ):
+            kv_argnum = 2
+            metadata_argnum = 3
+        else:
+            kv_argnum = 3
+            metadata_argnum = 4
+
+        kv_span = _arg_span(kv_argnum)
+        metadata_span = _arg_span(metadata_argnum)
+        kv_indices = set(kv_span)
+        metadata_indices = set(metadata_span)
+        dynamic_kv_slots: list[int] = []
+        dynamic_metadata_slots: list[int] = []
+        dynamic_slots: list[int] = []
+        stage_slots: list[int] = []
+        prev_slots: list[int] = []
+        total_invars: list[int] = []
+
+        for plan in invar_plans:
+            plan_dynamic = tuple(getattr(plan, "dynamic_slots", ()))
+            dynamic_slots.append(len(plan_dynamic))
+            dynamic_kv_slots.append(sum(1 for _, orig_idx in plan_dynamic if int(orig_idx) in kv_indices))
+            dynamic_metadata_slots.append(sum(1 for _, orig_idx in plan_dynamic if int(orig_idx) in metadata_indices))
+            stage_slots.append(len(tuple(getattr(plan, "stage_slots", ()))))
+            prev_slots.append(len(tuple(getattr(plan, "prev_slots", ()))))
+            total_invars.append(len(tuple(getattr(plan, "template", ()))))
+
+        kv_outputs_by_stage: dict[int | str, int] = {}
+        for mapping in tuple(fn_outvar_map)[: len(kv_indices)]:
+            if not mapping:
+                continue
+            owner = mapping[0]
+            if isinstance(owner, int):
+                key: int | str = int(owner)
+            else:
+                key = str(owner)
+            kv_outputs_by_stage[key] = kv_outputs_by_stage.get(key, 0) + 1
+
+        logger.info(
+            "PP plan audit mode=%s key=%s arg_leaf_counts=%s kv_arg=%d metadata_arg=%d stages=%d "
+            "kv_leaves=%d metadata_leaves=%d dynamic/stage=%s dynamic_kv/stage=%s "
+            "dynamic_metadata/stage=%s stage_edges/stage=%s prev_edges/stage=%s "
+            "total_invars/stage=%s donate_argnums/stage=%s kv_outputs_by_stage=%s",
+            mode,
+            prepare_cache_key,
+            arg_leaf_counts,
+            kv_argnum,
+            metadata_argnum,
+            len(invar_plans),
+            len(kv_indices),
+            len(metadata_indices),
+            dynamic_slots,
+            dynamic_kv_slots,
+            dynamic_metadata_slots,
+            stage_slots,
+            prev_slots,
+            total_invars,
+            donated_by_stage,
+            kv_outputs_by_stage,
+        )

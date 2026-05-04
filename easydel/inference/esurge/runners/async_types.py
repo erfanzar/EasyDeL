@@ -27,6 +27,38 @@ from jax import Array
 from .states import CachedRequestState
 
 
+@dataclass(frozen=True)
+class DeviceInputTokenHandoff:
+    """Device-resident sampled tokens that should replace decode placeholders.
+
+    This is the eSurge equivalent of vLLM's PP sampled-token handoff: the final
+    stage samples token ``N`` on device, and the next decode step consumes that
+    token directly from a device array instead of waiting for the host-side
+    sequence buffer to be repaired first.
+
+    The handoff is intentionally narrow:
+        * ``input_positions`` index the flattened ``BatchMetadata.input_ids``
+          buffer for the current window. The array is padded to a stable shape.
+        * ``token_ids`` contains the sampled token ids gathered from the
+          previous step's device output, one element per input position, padded
+          the same way as ``input_positions``.
+        * ``count`` marks how many entries from the current offset are live.
+        * ``offset`` lets PP microbatches consume a contiguous slice of a
+          window-level handoff without building per-microbatch scatter buffers
+          on the launch path.
+
+    CPU state is still repaired after the next device dispatch is queued, so
+    streaming/accounting remains exact. The point of this object is only to
+    remove the sampled-token host materialization from the critical path that
+    launches the next PP decode step.
+    """
+
+    input_positions: Array
+    token_ids: Array
+    count: Array
+    offset: Array | None = None
+
+
 @dataclass
 class AsyncWindowResult:
     """One scheduler-window's worth of in-flight sampled-token state.

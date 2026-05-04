@@ -62,38 +62,6 @@ def compute_discounted_returns(
     return returns
 
 
-def compute_segment_discounted_returns(
-    step_rewards: np.ndarray,
-    segment_ids: np.ndarray,
-    gamma: float = 0.95,
-) -> np.ndarray:
-    """Compute discounted returns respecting segment (response turn) boundaries.
-
-    Each segment represents one agent response turn. Returns are
-    computed within segments and discounted across segments.
-
-    This implements the "agentic_reinforce" advantage estimator from ROLL,
-    where each response turn's return considers the discounted value of
-    all future turns.
-
-    Args:
-        step_rewards: Per-segment rewards, shape ``[num_segments]``.
-        segment_ids: Segment index for each token, shape ``[seq_len]``.
-            Tokens in segment ``i`` have ``segment_ids[token] == i``.
-        gamma: Discount factor across segments.
-
-    Returns:
-        Per-segment discounted returns, shape ``[num_segments]``.
-    """
-    num_segments = len(step_rewards)
-    returns = np.zeros(num_segments, dtype=np.float32)
-    running_return = 0.0
-    for t in reversed(range(num_segments)):
-        running_return = step_rewards[t] + gamma * running_return
-        returns[t] = running_return
-    return returns
-
-
 def normalize_rewards_group(
     rewards: jax.Array,
     group_size: int,

@@ -450,7 +450,7 @@ class SeedOssModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+            with self.assign_layer_stage(i, total_layers=config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -461,13 +461,15 @@ class SeedOssModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,

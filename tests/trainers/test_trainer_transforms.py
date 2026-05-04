@@ -128,6 +128,45 @@ class StrictChatTokenizer(MockTokenizer):
         return text
 
 
+class CountingBatchTokenizer(MockTokenizer):
+    """Tokenizer that records whether tokenization happened in batch mode."""
+
+    def __init__(self):
+        super().__init__()
+        self.batch_tokenizer_calls = 0
+        self.single_tokenizer_calls = 0
+        self.batch_chat_template_calls = 0
+        self.template_tools = []
+
+    def __call__(self, text, *args, **kwargs):
+        if isinstance(text, list):
+            self.batch_tokenizer_calls += 1
+        else:
+            self.single_tokenizer_calls += 1
+        return super().__call__(text, *args, **kwargs)
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+        self.template_tools.append(tools)
+        if messages and isinstance(messages[0], list):
+            self.batch_chat_template_calls += 1
+            rendered = ["".join(m.get("content", "") for m in conversation) for conversation in messages]
+            if tokenize:
+                rows = [[ord(c) % 100 for c in text] for text in rendered]
+                max_length = kwargs.get("max_length")
+                if max_length:
+                    rows = [row[:max_length] for row in rows]
+                if kwargs.get("return_dict", False):
+                    return {"input_ids": rows, "attention_mask": [[1] * len(row) for row in rows]}
+                return rows
+            return rendered
+        return super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+
+
 class ToolAwareTokenizer(MockTokenizer):
     """Tokenizer that records tool schemas passed to chat templating."""
 
@@ -350,6 +389,40 @@ class TestSFTPreprocessTransform:
             {"role": "assistant", "content": "Hi there!"},
         ]
         assert tokenizer.calls[-1]["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
+
+    def test_map_batch_batches_sft_tokenizer_calls_and_preserves_tools(self):
+        tokenizer = CountingBatchTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=128,
+        )
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        results = transform.map_batch(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Hi there!"},
+                    ],
+                    "tools": tools,
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "Ping"},
+                        {"role": "assistant", "content": "Pong"},
+                    ],
+                },
+            ]
+        )
+
+        assert len(results) == 2
+        assert all("input_ids" in result and "attention_mask" in result for result in results)
+        assert results[0]["tools"] == tools
+        assert tokenizer.batch_chat_template_calls == 2
+        assert tokenizer.batch_tokenizer_calls == 0
+        assert tokenizer.single_tokenizer_calls == 0
+        assert tokenizer.template_tools == [tools, None]
 
     def test_messages_in_text_field(self):
         tokenizer = MockTokenizer()

@@ -113,13 +113,14 @@ class EngineRequestsMixin:
         sampling_params: SamplingParams,
         prompt_token_ids: list[int] | None = None,
         tool_parser_request: Any | None = None,
+        defer_scheduler_enqueue: bool = False,
         # Vision-language model data (optional)
         pixel_values: Any | None = None,
         image_grid_thw: Any | None = None,
         pixel_values_videos: Any | None = None,
         video_grid_thw: Any | None = None,
         mm_features: list | None = None,
-    ) -> None:
+    ) -> list[EngineRequest] | None:
         """Add a new request to the scheduler queue with intelligent context management.
 
         Internal method that tokenizes the prompt, applies context length management
@@ -295,6 +296,7 @@ class EngineRequestsMixin:
                 "prompt_token_ids": token_ids,
                 "sampling_params": sampling_params,
                 "generated_tokens": [],
+                "decodable_tokens": [],
                 "reported_generated_count": 0,
                 "last_decoded_index": 0,
                 "start_time": start_ts,
@@ -398,6 +400,7 @@ class EngineRequestsMixin:
                     # This preserves correctness at the cost of extra memory.
                     mm_features_cache_key_only.append(feat)
 
+        scheduler_requests: list[EngineRequest] = []
         for sample_idx in range(n_samples):
             if n_samples == 1:
                 # For n=1, use the original request_id
@@ -417,6 +420,7 @@ class EngineRequestsMixin:
                         "prompt_token_ids": token_ids,
                         "sampling_params": sampling_params,
                         "generated_tokens": [],  # Fresh list for each sample
+                        "decodable_tokens": [],
                         "reported_generated_count": 0,
                         "last_decoded_index": 0,
                         "start_time": start_ts,
@@ -448,35 +452,42 @@ class EngineRequestsMixin:
                         tool_request=tool_parser_request,
                     )
 
-            with self._scheduler_lock:
-                # In multi-host mode, use a deterministic arrival_time so all
-                # hosts agree on preemption/priority ordering.
-                _arrival = float(self._request_counter) if jax.process_count() > 1 else None
-                self.scheduler.add_request(
-                    EngineRequest(
-                        request_id=child_request_id,
-                        prompt_token_ids=token_ids,
-                        sampling_params=sampling_params,
-                        eos_token_id=primary_eos_token_id,
-                        parent_request_id=parent_id,
-                        sample_index=sample_idx,
-                        arrival_time=_arrival,
-                        # Vision-language model data (only for first sample to save memory)
-                        pixel_values=pixel_values if sample_idx == 0 else None,
-                        image_grid_thw=image_grid_thw if sample_idx == 0 else None,
-                        pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
-                        video_grid_thw=video_grid_thw if sample_idx == 0 else None,
-                        # Keep multimodal cache keys for all samples so n>1 can share
-                        # KV-prefix pages via prefix caching without duplicating pixel buffers.
-                        mm_features=mm_features if sample_idx == 0 else mm_features_cache_key_only,
-                    )
+            # In multi-host mode, use a deterministic arrival_time so all
+            # hosts agree on preemption/priority ordering.
+            _arrival = float(self._request_counter) if jax.process_count() > 1 else None
+            scheduler_requests.append(
+                EngineRequest(
+                    request_id=child_request_id,
+                    prompt_token_ids=token_ids,
+                    sampling_params=sampling_params,
+                    eos_token_id=primary_eos_token_id,
+                    parent_request_id=parent_id,
+                    sample_index=sample_idx,
+                    arrival_time=_arrival,
+                    # Vision-language model data (only for first sample to save memory)
+                    pixel_values=pixel_values if sample_idx == 0 else None,
+                    image_grid_thw=image_grid_thw if sample_idx == 0 else None,
+                    pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
+                    video_grid_thw=video_grid_thw if sample_idx == 0 else None,
+                    # Keep multimodal cache keys for all samples so n>1 can share
+                    # KV-prefix pages via prefix caching without duplicating pixel buffers.
+                    mm_features=mm_features if sample_idx == 0 else mm_features_cache_key_only,
                 )
+            )
+
+        if defer_scheduler_enqueue:
+            return scheduler_requests
+
+        with self._scheduler_lock:
+            for scheduler_request in scheduler_requests:
+                self.scheduler.add_request(scheduler_request)
 
         self._info(
             f"Queued request {request_id}: prompt_len={prompt_len}, "
             f"max_tokens={requested_new}, n={n_samples}, reserve={self.reserve_tokens}, "
             f"model_max={max_model_len}, dropped={tokens_dropped}"
         )
+        return None
 
     def _generate_request_id(self) -> str:
         """Allocate a fresh request id under the counter lock.

@@ -366,7 +366,7 @@ class GiddAttention(AttentionModule):
         mask_info: MaskInfo,
         noise_mask: Array,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -594,7 +594,7 @@ class GiddLayer(spx.Module):
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         noise_mask: Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
@@ -720,7 +720,7 @@ class GiddModel(EasyDeLBaseModule):
         )
         self.layers = nn.ModuleList([])
         for _ in range(self.config.num_hidden_layers):
-            with spx.assign_stage(total=self.config.num_hidden_layers, current=_):
+            with self.assign_layer_stage(_, total_layers=self.config.num_hidden_layers):
                 self.layers.append(
                     remat_layer_block(
                         config=config,
@@ -732,7 +732,9 @@ class GiddModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
 
     def forward(
         self,
@@ -743,7 +745,7 @@ class GiddModel(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         log_snr: Array | None = None,
         noise_mask: Array | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -989,7 +991,7 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         log_snr: Array | None = None,
         noise_mask: Array | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
