@@ -29,9 +29,33 @@ import os
 import typing as tp
 from itertools import chain
 from types import ModuleType
+from typing import Any
 
 BACKENDS_T = frozenset[str]
 IMPORT_STRUCTURE_T = dict[BACKENDS_T, dict[str, set[str]]]
+
+
+class DummyObject(type):
+    """Metaclass for lazy placeholders whose optional backends are missing."""
+
+    def _missing_backend_message(cls) -> str:
+        backends = getattr(cls, "_backends", ())
+        if isinstance(backends, str):
+            backend_names = backends
+        else:
+            backend_names = ", ".join(str(backend) for backend in backends)
+        return f"{cls.__name__} requires missing optional backend(s): {backend_names}."
+
+    def __getattribute__(cls, name: str) -> tp.Any:
+        """Raise a clear optional-dependency error on placeholder use."""
+        if name.startswith("_") or name in {"__class__", "__doc__", "__module__", "__name__", "__qualname__"}:
+            return super().__getattribute__(name)
+        raise ImportError(cls._missing_backend_message())
+
+    def __call__(cls, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        """Prevent instantiating placeholders for missing optional backends."""
+        del args, kwargs
+        raise ImportError(cls._missing_backend_message())
 
 
 class LazyModule(ModuleType):
@@ -77,13 +101,13 @@ class LazyModule(ModuleType):
         """
         super().__init__(name)
 
-        self._object_missing_backend = {}
+        self._object_missing_backend: dict[str, tuple[str, ...]] = {}
         if any(isinstance(key, frozenset) for key in import_structure.keys()):
-            self._modules = set()
-            self._class_to_module = {}
+            self._modules = set[str]()
+            self._class_to_module = dict[str, str]()
             self.__all__ = []
 
-            _import_structure = {}
+            _import_structure = dict[str, list[str]]()
 
             for _backends, module in import_structure.items():
                 self._modules = self._modules.union(set(module.keys()))
@@ -111,7 +135,7 @@ class LazyModule(ModuleType):
                 for value in values:
                     self._class_to_module[value] = key
             # Needed for autocompletion in an IDE
-            self.__all__ = list(import_structure.keys()) + list(chain(*import_structure.values()))
+            self.__all__ = list[BACKENDS_T](import_structure.keys()) + list[Any](chain(*import_structure.values()))
             self.__file__ = module_file
             self.__spec__ = module_spec
             self.__path__ = [os.path.dirname(module_file)]
@@ -148,7 +172,7 @@ class LazyModule(ModuleType):
         """
         if name in self._objects:
             return self._objects[name]
-        if name in self._object_missing_backend.keys():
+        if name in self._object_missing_backend:
             missing_backends = self._object_missing_backend[name]
 
             class Placeholder(metaclass=DummyObject):
@@ -162,7 +186,7 @@ class LazyModule(ModuleType):
                 _backends = missing_backends
 
             Placeholder.__name__ = name
-            Placeholder.__module__ = self.__spec__
+            Placeholder.__module__ = self.__name__
 
             value = Placeholder
         elif name in self._class_to_module.keys():

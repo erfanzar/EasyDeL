@@ -40,10 +40,23 @@ def gather_multimodal_kwargs(
 ) -> dict[str, jax.Array]:
     """Build the optional model kwargs threaded through preference forward passes.
 
-    Picks up any vision-tower inputs that happen to be present in *batch*
-    (``pixel_values``, ``pixel_attention_mask``, ``image_sizes``) and adds
-    ``output_router_logits`` when MoE auxiliary loss is requested.  Keys that
-    are absent are silently skipped so this works on text-only batches.
+    Picks up any vision-tower inputs that happen to be present in
+    ``batch`` (``pixel_values``, ``pixel_attention_mask``,
+    ``image_sizes``) and adds ``output_router_logits`` when MoE
+    auxiliary loss is requested. Keys that are absent are silently
+    skipped so this works on text-only batches.
+
+    Args:
+        batch: Mapping that may contain multimodal tensors keyed by
+            ``pixel_values``, ``pixel_attention_mask``, ``image_sizes``.
+        aux_loss_enabled: If True, sets ``output_router_logits=True`` so
+            MoE layers expose router logits to the auxiliary loss path.
+
+    Returns:
+        Dictionary of model kwargs containing only the keys that were
+        present in ``batch`` (plus ``output_router_logits`` when
+        requested). Empty for text-only batches with the auxiliary loss
+        disabled.
     """
     model_kwargs: dict[str, jax.Array] = {}
     if aux_loss_enabled:
@@ -63,9 +76,28 @@ def apply_paired_truncation(
 
     Used by the decoder-only branch of ``concatenated_forward`` to clip
     ``input_ids`` / ``attention_mask`` / ``loss_mask`` (or any number of
-    parallel sequence-aligned tensors) to *max_length*.  When *max_length*
-    is ``None`` the inputs are returned unchanged so callers can apply this
-    unconditionally.
+    parallel sequence-aligned tensors) to ``max_length``. When
+    ``max_length`` is ``None`` the inputs are returned unchanged so
+    callers can apply this unconditionally.
+
+    Args:
+        *arrays: One or more 2D arrays sharing the same sequence axis
+            (axis 1) to be truncated together.
+        max_length: Maximum sequence length to retain. ``None`` disables
+            truncation entirely.
+        truncation_mode: Which side of the sequence to keep when
+            truncation is applied. ``"keep_end"`` retains the trailing
+            ``max_length`` tokens (default, preferred for prompt+answer
+            packing); ``"keep_start"`` retains the leading
+            ``max_length`` tokens.
+
+    Returns:
+        Tuple containing the truncated arrays in the same order as the
+        positional inputs.
+
+    Raises:
+        ValueError: If ``truncation_mode`` is not ``"keep_end"`` or
+            ``"keep_start"``.
     """
     if max_length is None:
         return arrays

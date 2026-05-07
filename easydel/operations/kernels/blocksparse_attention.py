@@ -197,6 +197,15 @@ class BlockSparseAttn(OperationImpl):
         """
 
         def _run_vanilla_fallback() -> AttentionOutput:
+            """Re-run the call against :class:`VanillaAttn` with the same args.
+
+            Used when block-sparse / Splash kernel constraints (head dim,
+            block size, decode mode) cannot be satisfied. Captures the
+            enclosing ``forward_native`` arguments by closure.
+
+            Returns:
+                AttentionOutput: Result produced by the vanilla fallback.
+            """
             vanilla_attn = VanillaAttn(self.metadata)
             return vanilla_attn(
                 query=query,
@@ -216,6 +225,23 @@ class BlockSparseAttn(OperationImpl):
             cfg_obj: tp.Any,
             *field_names: str,
         ) -> int | None:
+            """Read the first int-castable block size from ``cfg_obj``.
+
+            Walks ``field_names`` in order on the supplied config object
+            and returns the first attribute whose value can be coerced to
+            an ``int``. Used to support multiple historical aliases for
+            block-size attributes (e.g. ``q_block_size`` /
+            ``block_size_q`` / ``blocksize_q``).
+
+            Args:
+                cfg_obj: Config-like object or ``None``. Missing attributes
+                    are skipped.
+                *field_names: Attribute names to probe, in priority order.
+
+            Returns:
+                int | None: The first integer found, or ``None`` if none of
+                the names resolved to an int-castable value.
+            """
             if cfg_obj is None:
                 return None
             for field_name in field_names:

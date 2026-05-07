@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for Gemma 2 decoder-only LLMs.
+
+Defines :class:`Gemma2Config` for Google DeepMind's Gemma 2 models. Compared
+to the original Gemma (see :mod:`easydel.modules.gemma`), Gemma 2 introduces:
+
+- Interleaved sliding-window attention (every other layer uses
+  ``sliding_window``-bounded local attention; the rest use full attention).
+- Final-logit and optional attention-logit softcapping
+  (``final_logit_softcapping``, ``attn_logit_softcapping``) for stability.
+- A learned ``query_pre_attn_scalar`` replacing the standard
+  ``1 / sqrt(head_dim)`` scaling.
+- A hybrid KV cache (``cache_implementation = "hybrid"``) holding both full
+  and sliding views per layer.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -115,6 +129,52 @@ class Gemma2Config(EasyDeLBaseConfig):
         attn_logit_softcapping: bool | None = None,
         **kwargs,
     ):
+        """Initialize a :class:`Gemma2Config`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``256000``.
+            hidden_size (int, optional): Decoder hidden dimension. Defaults to ``3072``.
+            intermediate_size (int | None, optional): MLP intermediate width.
+                Defaults to ``24576``.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to ``28``.
+            num_attention_heads (int, optional): Query heads per layer. Defaults to ``16``.
+            num_key_value_heads (int, optional): KV heads (GQA). Defaults to ``16``.
+            head_dim (int, optional): Per-head dimension. Defaults to ``256``.
+            hidden_activation (str, optional): MLP activation. Defaults to
+                ``"gelu_pytorch_tanh"``.
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``8192``.
+            initializer_range (float, optional): Truncated-normal init stddev.
+                Defaults to ``0.02``.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-6``.
+            use_cache (bool, optional): Return KV caches. Defaults to ``True``.
+            pad_token_id (int, optional): Padding id. Defaults to ``0``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``1``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``2``.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to ``True``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            attention_bias (bool, optional): Use bias on attention projections.
+                Defaults to ``False``.
+            attention_dropout (float, optional): Attention dropout. Defaults to ``0.0``.
+            final_logit_softcapping (float, optional): Tanh-softcap value applied to
+                LM head logits. Defaults to ``30.0``.
+            query_pre_attn_scalar (int, optional): Replaces the default
+                ``1/sqrt(head_dim)`` query scaling. Defaults to ``224``.
+            sliding_window (int, optional): Sliding-window length for the
+                ``"sliding_attention"`` layer slots. Defaults to ``4096``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                Checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            layer_types (list[str] | None, optional): Per-layer attention types
+                (``"sliding_attention"`` or ``"full_attention"``). ``None`` defaults
+                to alternating ``sliding`` / ``full`` starting from layer 0.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            scan_layers (bool, optional): Use ``lax.scan`` for shared decoder weights.
+                Defaults to ``False``.
+            attn_logit_softcapping (bool | None, optional): Optional per-attention
+                softcapping value (forwarded to the attention kernel).
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
 

@@ -33,7 +33,8 @@ Example:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, Unpack
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack
 
 from spectrax.common_types import NOT_GIVEN, _Empty
 
@@ -43,10 +44,10 @@ from easydel.typings import typed_config
 if TYPE_CHECKING:
     from easydel.infra.etils import MpMdSchedulers
 else:
-    MpMdSchedulers = object
+    MpMdSchedulers: type[object] = object
 
 LONG_PREFILL_TRS: int = 2048
-PPMicrobatchPolicy = int | Literal["auto"] | None
+PPMicrobatchPolicy: TypeAlias = int | Literal["auto"] | None
 
 
 def _normalize_pp_microbatch_policy(value: Any, *, field_name: str) -> PPMicrobatchPolicy:
@@ -199,12 +200,14 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             an explicit value is provided.
         use_aot_forward: When ``True``, the model forward is lowered and
             compiled ahead of time per ``(num_tokens, padded_num_reqs)``
-            bucket. When ``False``, ``spx.jit`` traces lazily on first use.
-            AOT yields lower per-step host overhead but longer cold-start.
+            bucket. When ``False``, the runner still warms the configured
+            ``spx.jit`` buckets during ``compile()`` and stores those warmed
+            callables. AOT yields lower per-step host overhead but longer
+            cold-start.
         compile_runner: When ``True``, runner-side helper kernels and
             bucketed model executables are pre-compiled at engine start.
-            Setting to ``False`` defers compilation to the first matching
-            request, which trades cold-start time for first-request latency.
+            Setting to ``False`` skips this startup compile; callers must run
+            ``runner.compile()`` before serving buckets that will be requested.
         runner_verbose: Emit per-step runner log lines (perf counters,
             bucket selection, pipeline timings) at INFO instead of DEBUG.
         overlap_execution: When ``True``, the lifecycle loop dispatches the
@@ -767,3 +770,73 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             A validated ``eSurgeDistributedConfig`` instance.
         """
         ...
+
+
+class SchedulerConfig(SimpleNamespace):
+    """Backward-compatible scheduler section for direct Scheduler tests.
+
+    New engine construction uses :class:`eSurgeRuntimeConfig` and
+    :class:`eSurgeCacheRuntimeConfig`; a few direct scheduler call sites still
+    build a small aggregate ``Config`` object. This shim preserves that
+    runtime-facing surface without reintroducing the old monolithic config as
+    the primary API.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_num_seqs: int = 256,
+        max_num_batched_tokens: int | None = None,
+        max_model_len: int = 8192,
+        max_num_seq_buckets: list[int] | None = None,
+        async_scheduling: bool = True,
+        long_prefill_token_threshold: int | None = None,
+        chunked_prefill_enabled: bool = False,
+        token_safety_margin: int | None = None,
+        policy: Literal["priority", "fcfs"] = "fcfs",
+        num_speculative_tokens: int = 0,
+    ) -> None:
+        super().__init__(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
+            max_num_seq_buckets=max_num_seq_buckets,
+            async_scheduling=async_scheduling,
+            long_prefill_token_threshold=long_prefill_token_threshold,
+            chunked_prefill_enabled=chunked_prefill_enabled,
+            token_safety_margin=token_safety_margin,
+            policy=policy,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+
+class CacheConfig(SimpleNamespace):
+    """Backward-compatible cache section for direct Scheduler tests."""
+
+    def __init__(
+        self,
+        *,
+        num_pages: int,
+        page_size: int,
+        enable_prefix_caching: bool = True,
+    ) -> None:
+        super().__init__(
+            num_pages=num_pages,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+
+
+class Config(SimpleNamespace):
+    """Backward-compatible aggregate config for direct Scheduler construction."""
+
+    def __init__(
+        self,
+        *,
+        scheduler_config: SchedulerConfig | None = None,
+        cache_config: CacheConfig | None = None,
+    ) -> None:
+        super().__init__(
+            scheduler_config=scheduler_config or SchedulerConfig(),
+            cache_config=cache_config,
+        )

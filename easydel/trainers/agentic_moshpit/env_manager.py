@@ -315,9 +315,11 @@ class RolloutManager:
 
         inner_envs = [_unwrap(e) for e in envs]
         is_self_play = all(isinstance(e, SelfPlayEnvironment) for e in inner_envs)
+        sp_envs: list[SelfPlayEnvironment] = []
+        generator: tp.Any = None
 
         if is_self_play:
-            sp_envs: list[SelfPlayEnvironment] = inner_envs  # type: ignore[assignment]
+            sp_envs = [tp.cast(SelfPlayEnvironment, env) for env in inner_envs]
             generator = sp_envs[0]._generator
             for sp_env in sp_envs:
                 sp_env._defer_verify = True
@@ -444,6 +446,8 @@ class RolloutManager:
                 next_active.append(idx)
 
             if pending_verify and is_self_play:
+                if generator is None:
+                    raise RuntimeError("Self-play verification requested before generator initialization.")
                 verify_questions = [sp_envs[idx]._question for idx, _ in pending_verify]
                 verify_answers = [ans for _, ans in pending_verify]
                 verify_metas = [sp_envs[idx]._metadata for idx, _ in pending_verify]

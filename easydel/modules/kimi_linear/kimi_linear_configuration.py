@@ -180,6 +180,19 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         max_position_embeddings: int = 2**16,
         **kwargs,
     ):
+        """Initialise a :class:`KimiLinearConfig`.
+
+        See the class docstring for the full parameter table. The constructor
+        validates that, if ``moe_router_activation_func`` is provided, it is
+        one of ``{"softmax", "sigmoid"}``. When ``linear_attn_config`` is
+        supplied it must contain ``kda_layers`` and ``full_attn_layers``.
+        ``layer_types`` is auto-populated from :meth:`get_layer_types` so the
+        shared :class:`HybridCache` machinery can interleave full-attention
+        (MLA) and linear-attention (KDA) layers correctly.
+
+        Args:
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

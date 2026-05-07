@@ -228,6 +228,32 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
         scan_layers: bool = False,
         **kwargs,
     ):
+        """Initialize a :class:`Gemma4TextConfig`.
+
+        See the class docstring for an overview of every field. Highlights:
+
+        - ``num_hidden_layers`` is the count of decoder layers; ``layer_types``
+          (or the default Gemma 4 alternation) selects sliding vs. full per
+          layer, and ``num_kv_shared_layers`` enables the shared-KV trick on
+          the last few layers.
+        - ``num_global_key_value_heads`` / ``global_head_dim`` describe the
+          full-attention layers; ``num_key_value_heads`` / ``head_dim`` cover
+          the sliding ones.
+        - ``enable_moe_block`` (with ``num_experts`` / ``top_k_experts`` /
+          ``moe_intermediate_size``) replaces the standard SwiGLU MLP with a
+          top-K mixture-of-experts. ``use_double_wide_mlp`` provides the
+          dense-but-wider alternative.
+        - ``vocab_size_per_layer_input`` / ``hidden_size_per_layer_input``
+          configure the per-layer input projection used by Gemma 4 in place
+          of plain token embeddings.
+        - ``attention_k_eq_v`` ties K and V to a single projection in select
+          layers to save parameters.
+        - ``activations_in_float32`` / ``float32_gate_logits`` keep specific
+          activations in float32 for stability.
+
+        Args:
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
 
@@ -428,6 +454,18 @@ class Gemma4VisionConfig(EasyDeLBaseConfig):
         bits: int | None = None,
         **kwargs,
     ):
+        """Initialize a :class:`Gemma4VisionConfig`.
+
+        See the class docstring for full parameter semantics. The vision tower
+        consumes ``patch_size``-sized image patches, runs them through
+        ``num_hidden_layers`` GQA transformer blocks (with low-frequency RoPE
+        suited to spatial positions), and applies a ``pooling_kernel_size``
+        average pool to compress the patch grid into Gemma 4's vision token
+        budget.
+
+        Args:
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
 
@@ -522,6 +560,17 @@ class Gemma4Config(EasyDeLBaseConfig):
         tie_word_embeddings: bool = True,
         **kwargs,
     ):
+        """Initialize a :class:`Gemma4Config` (top-level multimodal config).
+
+        Bundles a :class:`Gemma4TextConfig`, an optional
+        :class:`Gemma4VisionConfig`, and the placeholder token ids that the
+        merging logic uses to splice vision/audio embeddings into the text
+        stream. ``audio_config`` is preserved as an opaque dict for HF
+        round-trip compatibility.
+
+        Args:
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         if text_config is None:
             text_config = Gemma4TextConfig()
         elif isinstance(text_config, dict):

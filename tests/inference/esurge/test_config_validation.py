@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.common_types import NOT_GIVEN
 
 from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig

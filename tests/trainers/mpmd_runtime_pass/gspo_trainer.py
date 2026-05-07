@@ -24,6 +24,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import jax
+
 import easydel as ed
 
 if __package__ in {None, ""}:
@@ -61,8 +63,10 @@ def main():
             **mpmd_generation_length_overrides(),
             "num_train_epochs": 1,
             "total_batch_size": 2,
+            "generation_num_return_sequences": 4,
         },
     )
+    trainer_args.generation_num_return_sequences = trainer_args.num_return_sequences
 
     # Verify GSPO-specific defaults are set correctly
     assert trainer_args.importance_sampling_level == "sequence", (
@@ -90,8 +94,10 @@ def main():
         train_dataset=dataset,
         processing_class=tokenizer,
     )
-    trainer.train()
-    logger.info("GSPO run finished.")
+    output = trainer.train()
+    step = int(jax.device_get(output.state.step))
+    assert step >= 1, f"Expected GSPO training to advance, got step={step}"
+    logger.info("GSPO run finished at step=%s.", step)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,9 @@ Coverage:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import jax.numpy as jnp
 import pytest
 
@@ -98,8 +101,9 @@ def _make_pool(num_pages: int = 32, *, enable_caching: bool = True) -> PagePool:
 
 
 def test_single_type_cache_manager_is_abstract():
+    abstract_ctor = cast(Callable[..., object], SingleTypeCacheManager)
     with pytest.raises(TypeError):
-        SingleTypeCacheManager(_full_spec(), _make_pool(), kv_cache_group_id=0)
+        abstract_ctor(_full_spec(), _make_pool(), kv_cache_group_id=0)
 
 
 @pytest.mark.parametrize(

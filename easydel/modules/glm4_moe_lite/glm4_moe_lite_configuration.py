@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the GLM-4-MoE-Lite decoder.
+
+GLM-4-MoE-Lite is a smaller MoE variant of the GLM-4 family that uses
+**Multi-head Latent Attention** (MLA, low-rank Q/KV factorisations) and a
+DeepSeek-style grouped top-k MoE block. The MLP schedule is set per layer:
+the first layer is dense and every later layer is sparse by default.
+"""
+
 import typing
 import typing as tp
 
@@ -23,6 +31,23 @@ def _rope_scaling_from_rope_parameters(
     rope_parameters: dict[str, typing.Any] | None,
     rope_scaling: dict[str, typing.Any] | None,
 ) -> dict[str, typing.Any] | None:
+    """Normalise the HF ``rope_parameters`` block into EasyDeL ``rope_scaling``.
+
+    Hugging Face checkpoints carry a flat ``rope_parameters`` dict while
+    EasyDeL expects an EasyDeL-flavoured ``rope_scaling`` dict that always
+    has a ``rope_type`` key. When both are supplied ``rope_scaling`` wins
+    (only ``type`` is renamed to ``rope_type`` if needed); otherwise the
+    relevant keys are copied out of ``rope_parameters`` into a fresh
+    ``rope_scaling`` mapping.
+
+    Args:
+        rope_parameters: HF-style RoPE parameters mapping or ``None``.
+        rope_scaling: EasyDeL RoPE scaling mapping or ``None``.
+
+    Returns:
+        A normalised ``rope_scaling`` mapping or ``None`` when neither
+        input was supplied.
+    """
     if rope_scaling is not None:
         if "type" in rope_scaling and "rope_type" not in rope_scaling:
             rope_scaling = dict(rope_scaling)
@@ -180,6 +205,60 @@ class Glm4MoeLiteConfig(EasyDeLBaseConfig):
         attention_dropout: float = 0.0,
         **kwargs,
     ):
+        """Initialize a GLM-4-MoE-Lite configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Residual-stream / model dimension.
+            intermediate_size: Inner width of the dense MLP used in dense
+                layers (per ``mlp_layer_types``).
+            moe_intermediate_size: Inner width of each routed expert FFN.
+            num_hidden_layers: Total decoder layers.
+            num_attention_heads: Total query heads per attention layer.
+            num_key_value_heads: KV heads for grouped-query attention.
+            n_shared_experts: Shared experts always applied to every token.
+            n_routed_experts: Total routed experts.
+            routed_scaling_factor: Multiplier on routed expert outputs.
+            kv_lora_rank: Rank of the MLA KV down-projection.
+            q_lora_rank: Rank of the MLA Q down-projection (``None`` skips
+                the Q low-rank step).
+            qk_rope_head_dim: Per-head dim that receives RoPE in MLA.
+            v_head_dim: Value head dim used after Q/K compression.
+            qk_nope_head_dim: Per-head dim left unrotated in MLA.
+            n_group: Expert group count for hierarchical routing.
+            topk_group: Number of expert groups to keep per token.
+            num_experts_per_tok: Routed experts selected per token.
+            norm_topk_prob: Whether to renormalise top-k routing weights.
+            hidden_act: Activation applied to the gate half of MLPs.
+            max_position_embeddings: Context-length bound used for RoPE
+                tables and asserts.
+            initializer_range: Stddev for truncated-normal weight init.
+            rms_norm_eps: Epsilon used by every RMSNorm.
+            use_cache: Whether downstream code should return KV cache.
+            pad_token_id: Padding token id.
+            bos_token_id: Beginning-of-stream token id.
+            eos_token_id: End-of-stream token id.
+            pretraining_tp: Pretraining tensor-parallel factor (kept for
+                checkpoint compatibility).
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            rope_theta: RoPE base frequency. Falls back to
+                ``rope_parameters["rope_theta"]`` and finally ``10000.0``.
+            rope_parameters: HF-style RoPE parameters mapping; merged into
+                ``rope_scaling`` via :func:`_rope_scaling_from_rope_parameters`.
+            rope_scaling: EasyDeL-flavoured RoPE scaling dict.
+            rope_interleave: Whether RoPE uses interleaved (vs. half-split)
+                channel layout.
+            mlp_layer_types: Optional per-layer ``"dense"``/``"sparse"``
+                schedule; defaults to one dense layer followed by all
+                sparse.
+            attention_bias: Whether attention projections carry biases.
+            attention_dropout: Dropout on attention probabilities.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+
+        Raises:
+            ValueError: If ``mlp_layer_types`` length does not match
+                ``num_hidden_layers`` or contains an unknown entry.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

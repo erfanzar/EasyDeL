@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the original Mamba selective state-space model (Mamba-1).
+
+Defines :class:`MambaConfig`, registered under the ``mamba`` model-type.
+Mamba is an attention-free architecture: each block applies a selective
+linear-time recurrence whose ``A``, ``B``, ``C`` projections depend on the
+input, so the cache is a fixed-size SSM state rather than a per-token KV
+table. The config exposes ``state_size`` (``d_state``), ``conv_kernel``,
+``expand``/``intermediate_size``, ``time_step_*`` initialisation knobs, and
+the usual EasyDeL gradient-checkpointing / sharding plumbing.
+"""
 
 import math
 

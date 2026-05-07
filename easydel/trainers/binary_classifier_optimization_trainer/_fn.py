@@ -264,6 +264,8 @@ def concatenated_forward(
                 vocab_chunk_size=logprob_vocab_chunk_size,
             )
         else:
+            if logits is None:
+                raise TypeError(f"{type(model).__name__} did not return logits.")
             logits_shifted = logits[:, :-1, :]
             gathered_logps, _ = compute_token_logps_and_entropies_chunked(
                 logits_shifted,
@@ -694,8 +696,8 @@ def _make_bco_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    training_step,
-    ScheduledLossAdapter(
+    step_fn=training_step,
+    adapter=ScheduledLossAdapter(
         name="bco",
         make_loss=_make_bco_scheduled_loss,
         make_cache_key=_bco_scheduled_loss_cache_key,

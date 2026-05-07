@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for Mistral AI's dense decoder family (Mistral-7B, Ministral, …).
+
+Defines :class:`MistralConfig`, registered under the ``mistral`` model-type.
+Mistral keeps the LLaMA backbone but adds two key features: **grouped-query
+attention** with ``num_key_value_heads`` < ``num_attention_heads`` to shrink
+the KV cache, and **sliding-window attention** (``sliding_window``) that
+bounds each layer's effective receptive field for long-context decoding.
+The config also exports :meth:`MistralConfig.get_mask_details` so the
+attention runtime can attach an :class:`AttnMaskDetail` of type
+``AttnMaskType.SLIDING`` to every layer.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

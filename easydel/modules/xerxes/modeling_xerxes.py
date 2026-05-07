@@ -754,9 +754,15 @@ class XerxesModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids must be provided when inputs_embeds is None.")
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            raise ValueError("inputs_embeds could not be resolved.")
         sequence_length = inputs_embeds.shape[1]
-        inputs_embeds = inputs_embeds * self.embedding_scale
+        embedding_scale = self.embedding_scale
+        if embedding_scale is not None:
+            inputs_embeds = inputs_embeds * embedding_scale
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"

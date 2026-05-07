@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the Llama family of decoder-only language models.
+
+Defines :class:`LlamaConfig` covering Llama-1/2/3-style hyper-parameters: GQA
+head counts, RMSNorm epsilon, RoPE base / scaling, SwiGLU intermediate size,
+optional attention/MLP biases, gradient-checkpointing strategy, and scan-MLP
+chunking. The config is registered with the EasyDeL factory under the
+``llama`` model-type key.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -128,6 +136,17 @@ class LlamaConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialise a :class:`LlamaConfig`.
+
+        See the class docstring for the full description of every keyword.
+        Defaults match Llama-1 7B (32 layers, 4096 hidden, 32 heads). To get
+        Llama-2/3 GQA, set ``num_key_value_heads`` (e.g. 8 for Llama-3 8B).
+        ``layer_types`` defaults to ``["full_attention"] * num_hidden_layers``
+        so :class:`HybridCache` can be initialised uniformly.
+
+        Args:
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.vocab_size = vocab_size

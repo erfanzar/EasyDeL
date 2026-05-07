@@ -253,11 +253,54 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
     ) -> Qwen3VLMoeModelOutputWithPast:
         """Forward pass through the Qwen3.5-MoE multimodal model.
 
-        Encodes image/video inputs via the vision tower, merges them into
-        the text embedding stream, and runs the MoE language model decoder.
+        Encodes image/video inputs via the vision tower, merges them
+        into the text embedding stream at placeholder positions, builds
+        3-D mRoPE indices (from ``mm_token_type_ids`` when supplied or
+        inferred from token IDs otherwise), and runs the Qwen3-Next-based
+        MoE language decoder.
+
+        Args:
+            input_ids: Text token ids ``(batch, seq_len)``; mutually
+                exclusive with ``inputs_embeds``.
+            inputs_embeds: Pre-computed embeddings
+                ``(batch, seq_len, hidden_size)``; mutually exclusive
+                with ``input_ids``.
+            attention_mask: Boolean attention mask ``(batch, seq_len)``.
+            mask_info: Optional pre-built ``MaskInfo``.
+            position_ids: 1-D or 3-D position ids; flattened by
+                :func:`_maybe_flatten_position_ids_for_text` when the
+                text config disables mRoPE.
+            mode: Runtime mode (train/decode); auto-detected if ``None``.
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Cache metadata accompanying ``past_key_values``.
+            output_attentions: Whether to return per-layer attention weights.
+            output_hidden_states: Whether to return per-layer hidden states.
+            visual_pos_masks: Compatibility no-op (Qwen3.5-MoE does not
+                use deepstack mergers).
+            deepstack_visual_embeds: Compatibility no-op.
+            pixel_values: Packed image pixel values for the vision tower.
+            pixel_values_videos: Packed video pixel values for the vision tower.
+            image_grid_thw: Per-image ``(T, H, W)`` grid dimensions.
+            video_grid_thw: Per-video ``(T, H, W)`` grid dimensions.
+            image_max_grid_size: Optional shared upper bound on image
+                grid size (static-shape compilation).
+            video_max_grid_size: Same as above for videos.
+            cache_position: Compatibility no-op.
+            rope_deltas: Compatibility no-op (overwritten internally).
+            mm_token_type_ids: Per-token modality ids
+                (0=text, 1=image, 2=video) used for mRoPE construction.
+            **kwargs: Forward-compatibility sink; ignored.
 
         Returns:
-            Qwen3VLMoeModelOutputWithPast: Model outputs including logits, hidden states, and router logits.
+            Qwen3VLMoeModelOutputWithPast: Decoder outputs with optional
+            hidden states/attentions and the freshly computed
+            ``rope_deltas``. The router logits are routed through the
+            inner Qwen3-Next MoE layers and surface via the wrapping
+            causal-LM module's auxiliary loss.
+
+        Raises:
+            ValueError: If neither or both of ``input_ids`` and
+                ``inputs_embeds`` are provided.
         """
         del rope_deltas, kwargs
         if (input_ids is None) ^ (inputs_embeds is not None):

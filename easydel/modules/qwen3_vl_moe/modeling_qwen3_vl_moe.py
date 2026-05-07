@@ -382,8 +382,22 @@ def rotate_half(x: Array) -> Array:
 def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
     """Apply rotary positional embeddings to vision features.
 
-    RoPE is only applied to the first half of the head dimensions (head_dim_ro = head_dim // 2).
-    The second half of head dimensions remain unchanged.
+    Used by the Qwen3-VL-MoE vision tower: only the first
+    ``head_dim_ro = head_dim // 2`` channels rotate, while the upper
+    half passes through unchanged. Computation runs in float32 for
+    numerical stability and is cast back to the input dtype.
+
+    Args:
+        q: Query tensor with the rotated channels at the front of the
+            last axis (``head_dim``).
+        k: Key tensor matching ``q`` in the trailing dimensions.
+        cos: Per-position cosines of shape ``(..., head_dim_ro)``;
+            broadcast over the head axis.
+        sin: Per-position sines, same shape as ``cos``.
+
+    Returns:
+        ``(q_embed, k_embed)``: rotated tensors with the same shape and
+        dtype as their inputs.
     """
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
@@ -404,7 +418,23 @@ def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> t
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention mask from cumulative sequence lengths.
 
-    Vectorized implementation that works correctly with JAX tracing.
+    Vision-tower utility for the Qwen3-VL-MoE encoder. Turns a packed
+    batch of variable-length segments (described by ``cu_seqlens``)
+    into an additive attention bias where positions only attend within
+    their own segment; the implementation is fully traceable so it
+    works under ``jit`` / ``vmap``.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths
+            ``(num_segments + 1,)``; segment ``i`` covers
+            ``[cu_seqlens[i], cu_seqlens[i + 1])``.
+        seq_length: Total packed-sequence length (``cu_seqlens[-1]``).
+        dtype: Output dtype; ``jnp.finfo(dtype).min`` is used as the
+            mask-out value.
+
+    Returns:
+        Array of shape ``(1, seq_length, seq_length)`` with ``0.0`` for
+        in-segment pairs and ``finfo(dtype).min`` for cross-segment.
     """
     positions = jnp.arange(seq_length)
     starts = cu_seqlens[:-1]
@@ -1731,9 +1761,9 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
-        assert isinstance(
-            config, Qwen3VLMoeTextConfig
-        ), f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
+        assert isinstance(config, Qwen3VLMoeTextConfig), (
+            f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
+        )
         super().__init__(
             config=config,
             dtype=dtype,

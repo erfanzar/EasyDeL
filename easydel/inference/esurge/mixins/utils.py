@@ -918,6 +918,18 @@ class EngineUtilsMixin:
         check_interval = min(1.0, max(self.worker_config.idle_reset_seconds / 4.0, 0.1))
 
         def _idle_loop() -> None:
+            """Background daemon that pause/resumes the engine after long idle periods.
+
+            Wakes on a short interval, exiting when ``_idle_monitor_event``
+            is set. When the engine has been quiet for at least
+            ``worker_config.idle_reset_seconds`` *and* the cooldown gate
+            ``idle_reset_min_interval`` has passed *and* no requests are
+            in flight, calls :meth:`pause` followed by :meth:`resume` to
+            drain runner / cache / pipeline state. Resumed activity
+            (running, pending, or active requests) bumps the activity
+            stamp and the gate restarts. Exceptions during pause/resume
+            are logged without killing the daemon.
+            """
             while not self._idle_monitor_event.wait(check_interval):
                 if not self._scheduler_running:
                     continue
@@ -1054,6 +1066,13 @@ class EngineUtilsMixin:
         callback = self._sampling_params_callback
 
         def _finalize(prepared: SamplingParams) -> SamplingParams:
+            """Apply engine-level stop / generation overrides to a per-request params object.
+
+            Inherits ``ignore_stop_strings_in_reasoning`` from the engine when
+            the per-request value is unset, then layers on extra stop strings
+            and generation-config defaults (top-p, temperature, etc.) via the
+            corresponding ``_apply_*`` helpers.
+            """
             if getattr(prepared, "ignore_stop_strings_in_reasoning", None) is None:
                 prepared.ignore_stop_strings_in_reasoning = bool(
                     getattr(self, "ignore_stop_strings_in_reasoning", False)

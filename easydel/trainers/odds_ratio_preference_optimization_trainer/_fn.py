@@ -227,6 +227,8 @@ def concatenated_forward(
         chosen_nll_loss = -sum_logps[:len_chosen].sum() / jnp.maximum(token_counts[:len_chosen].sum(), 1.0)
         chosen_accuracy = correct_counts[:len_chosen].sum() / jnp.maximum(token_counts[:len_chosen].sum(), 1.0)
     else:
+        if all_logits is None:
+            raise TypeError(f"{type(model).__name__} did not return logits.")
         # Compute negative log likelihood loss and accuracy for the chosen examples.
         chosen_nll_loss, chosen_accuracy = cross_entropy_loss(
             all_logits[:len_chosen],
@@ -709,8 +711,8 @@ def _make_orpo_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    orpo_training_step,
-    ScheduledLossAdapter(
+    step_fn=orpo_training_step,
+    adapter=ScheduledLossAdapter(
         name="orpo",
         make_loss=_make_orpo_scheduled_loss,
         make_cache_key=_orpo_scheduled_loss_cache_key,

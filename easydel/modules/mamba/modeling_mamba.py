@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of the Mamba (selective SSM) language model.
+
+Mamba is an attention-free sequence model: each block runs an input-
+dependent linear-time recurrence ``h_t = A_t h_{t-1} + B_t x_t`` whose
+``A_t`` / ``B_t`` / ``C_t`` are produced by content-dependent projections
+(``selective`` SSM). The KV cache is replaced by a fixed-size SSM state
+plus a small 1-D conv state, exposed via :class:`RecurrentCache` /
+:class:`RecurrentCacheView`. This file contains:
+
+- :class:`MambaMixer`: the selective SSM block (input projection, depth-wise
+  conv, ``A``/``B``/``C``/``D`` projections, output projection).
+- :class:`MambaBlock`: pre-norm wrapper around the mixer.
+- :class:`MambaModel` / :class:`MambaForCausalLM`: backbone and LM head.
+"""
 
 import functools
 import typing as tp
@@ -301,6 +315,12 @@ class MambaMixer(spx.Module):
         elif config.time_step_init_scheme == "random":
 
             def init_kernel_dt(key, shape, dtype):
+                """Random ``dt`` kernel init for the selective SSM time step.
+
+                Samples uniformly in ``[-dt_init_std, +dt_init_std]`` so that
+                the input-dependent ``Δt`` projection starts close to zero,
+                keeping the recurrence stable at the start of training.
+                """
                 return (
                     jax.nn.initializers.uniform(scale=dt_init_std * 2, dtype=param_dtype)(key, shape, dtype)
                     - dt_init_std
@@ -310,6 +330,13 @@ class MambaMixer(spx.Module):
             init_kernel_dt = jax.nn.initializers.normal(config.initializer_range, param_dtype)
 
         def init_bias_dt(key, shape, dtype):
+            """Inverse-softplus bias init for the selective SSM time step.
+
+            Samples ``Δt`` log-uniformly in ``[time_step_min, time_step_max]``
+            (clamped to ``time_step_floor``) and returns its inverse-softplus
+            value, so that after the softplus applied inside the block the
+            initial ``Δt`` lies in the configured range.
+            """
             dt = jax.lax.clamp(
                 config.time_step_floor,
                 jnp.exp(
@@ -778,6 +805,12 @@ class MambaModel(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
 
         def _layer_loop(block, carry):
+            """Run a single :class:`MambaBlock` and update the SSM cache.
+
+            Carry: ``(hidden_states, all_hidden_states, layer_index)``. Reads
+            the layer's :class:`RecurrentCacheView` from ``cache.views[idx]``
+            and writes the updated view back into ``cache[idx]``.
+            """
             hidden_states, all_hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states, cache_view = block(

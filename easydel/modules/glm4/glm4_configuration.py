@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the GLM-4 decoder-only language model.
+
+Defines :class:`Glm4Config`, the EasyDeL configuration object for THUDM's
+GLM-4 family. The defaults match the GLM-4-9B style: 4096 hidden, 40 layers,
+GQA with 32 query / 2 key-value heads, head dim 128, partial RoPE
+(``partial_rotary_factor=0.5``), and a 151,552-token multilingual vocabulary
+with a 131,072-token context window.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -111,6 +119,38 @@ class Glm4Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize a GLM-4 model configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Residual-stream / model dimension.
+            intermediate_size: MLP inner width (the gated MLP uses
+                ``2 * intermediate_size`` for the fused ``gate_up_proj``).
+            num_hidden_layers: Number of stacked decoder blocks.
+            num_attention_heads: Total query heads per attention layer.
+            num_key_value_heads: KV heads for grouped-query attention.
+            partial_rotary_factor: Fraction of each head dimension that
+                receives RoPE; remaining channels are left unrotated.
+            head_dim: Size of each attention head.
+            hidden_act: Activation name applied to the gate half of the MLP.
+            attention_dropout: Dropout on the attention probabilities.
+            max_position_embeddings: Context-length bound used by RoPE
+                frequency tables and sequence-length asserts.
+            initializer_range: Stddev for truncated-normal weight init.
+            rms_norm_eps: Epsilon used by every RMSNorm in the stack.
+            use_cache: Whether downstream code should return KV cache.
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            rope_theta: RoPE base frequency.
+            pad_token_id: Padding token id.
+            eos_token_id: End-of-stream token id(s); defaults to
+                ``[151329, 151336, 151338]``.
+            bos_token_id: Beginning-of-stream token id (optional).
+            attention_bias: Whether Q/K/V projections carry biases (the
+                modeling layer always uses a biasless output projection).
+            layer_types: Optional per-layer attention type list; defaults
+                to ``["full_attention"] * num_hidden_layers``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         if eos_token_id is None:
             eos_token_id = [151329, 151336, 151338]
         self.vocab_size = vocab_size

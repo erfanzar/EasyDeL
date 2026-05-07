@@ -764,9 +764,7 @@ class GPTJModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        hidden_states = (
-            (inputs_embeds + extra_embedding) if extra_embedding is not None else inputs_embeds
-        )  # pyright: ignore[reportOptionalOperand]
+        hidden_states = (inputs_embeds + extra_embedding) if extra_embedding is not None else inputs_embeds  # pyright: ignore[reportOptionalOperand]
 
         if mode is None:
             mode = (
@@ -780,6 +778,12 @@ class GPTJModel(EasyDeLBaseModule):
         hidden_states = self.dropout(inputs_embeds)
 
         def _layer_loop(block, carry):
+            """Run one GPT-J block inside ``self.h.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            layer_index)`` through the scan and accumulates optional
+            collections requested by the outer ``forward``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

@@ -173,12 +173,12 @@ def typed_config(
 
 
 def typed_config(
-    spec: type | None = None,
+    spec: type[S] | None = None,
     *,
     defaults: Mapping[str, tp.Any] | None = None,
     post_init: PostInit | None = None,
     namespace: Mapping[str, tp.Any] | None = None,
-):
+) -> type[S] | tp.Callable[[type[S]], type[S]]:
     """Augment a ``TypedDict`` spec with ``from_dict`` / ``to_dict`` / ``replace``.
 
     The decorated class is **returned unchanged for the type system** — it remains
@@ -215,7 +215,7 @@ def typed_config(
             ) -> "PreTrainedLoading": ...
     """
 
-    def wrap(spec: type) -> type:
+    def wrap(spec: type[S]) -> type[S]:
         """Bind the runtime helpers to ``spec`` and return it.
 
         Args:

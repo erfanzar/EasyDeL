@@ -572,7 +572,11 @@ class GPTNeoXModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids must be provided when inputs_embeds is None.")
             inputs_embeds = self.embed_in(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            raise ValueError("inputs_embeds could not be resolved.")
 
         sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
@@ -589,9 +593,9 @@ class GPTNeoXModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        hidden_states = self.emb_dropout(
-            inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
-        )
+        if extra_embedding is not None:
+            inputs_embeds = inputs_embeds + extra_embedding
+        hidden_states = self.emb_dropout(inputs_embeds)
 
         if mode is None:
             mode = (
@@ -622,6 +626,12 @@ class GPTNeoXModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Run one GPT-NeoX layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)`` through the scan and collects
+            optional intermediate states / attention weights.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

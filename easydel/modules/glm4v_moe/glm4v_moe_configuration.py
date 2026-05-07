@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for the GLM-4V-MoE multimodal model.
+
+GLM-4V-MoE pairs the GLM-4V vision tower with a GLM-4-MoE text decoder
+(grouped top-k routing with shared experts and a dense-to-sparse MLP
+schedule). This module exposes:
+
+- :class:`Glm4vMoeVisionConfig`: vision-tower hyper-params.
+- :class:`Glm4vMoeTextConfig`: text-decoder hyper-params including MoE
+  routing knobs and mRoPE.
+- :class:`Glm4vMoeConfig`: top-level VLM config that composes the two
+  sub-configs and stores image/video special-token ids.
+- :func:`_rope_scaling_from_rope_parameters`: HF-to-EasyDeL RoPE bridge
+  with the GLM-4V mRoPE preset as the default fallback.
+- :func:`_patch_hf_glm4v_moe_router_logits_output`: import-time patch
+  that backfills missing ``router_logits`` and ``num_experts(_per_tok)``
+  attributes on older HF GLM-4V-MoE releases so EasyDeL conversion code
+  can read them uniformly.
+"""
+
 import typing
 from collections.abc import Mapping
 
@@ -37,6 +56,7 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
             # Newer HF versions assign these attributes during __init__. Use a
             # settable property so legacy compatibility patching does not block assignment.
             def _get_num_experts(self):
+                """Return the cached or text-config-derived expert count."""
                 return getattr(
                     self,
                     "_easydel_num_experts",
@@ -44,6 +64,7 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
                 )
 
             def _set_num_experts(self, value):
+                """Store an HF-injected ``num_experts`` on the EasyDeL backing field."""
                 self._easydel_num_experts = value
 
             causal_lm_cls.num_experts = property(_get_num_experts, _set_num_experts)
@@ -54,6 +75,7 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
         ):
 
             def _get_num_experts_per_tok(self):
+                """Return the cached or text-config-derived top-k routing count."""
                 return getattr(
                     self,
                     "_easydel_num_experts_per_tok",
@@ -61,6 +83,7 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
                 )
 
             def _set_num_experts_per_tok(self, value):
+                """Store an HF-injected ``num_experts_per_tok`` on the backing field."""
                 self._easydel_num_experts_per_tok = value
 
             causal_lm_cls.num_experts_per_tok = property(_get_num_experts_per_tok, _set_num_experts_per_tok)
@@ -74,6 +97,14 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
         import torch
 
         def _patched_load_balancing_loss_func(*args, **kwargs):
+            """Coerce HF GLM-4V-MoE's load-balancing loss to a torch tensor.
+
+            The upstream helper occasionally returns the integer ``0`` as
+            a no-op result; downstream EasyDeL code expects a tensor it
+            can sum into the training loss, so we wrap that fall-through
+            into a 0-d tensor on the same device as ``attention_mask`` (or
+            the incoming gate logits).
+            """
             result = load_balancing_loss_func(*args, **kwargs)
             if isinstance(result, int):
                 attention_mask = kwargs.get("attention_mask")
@@ -96,6 +127,23 @@ def _rope_scaling_from_rope_parameters(
     rope_parameters: dict[str, typing.Any] | None,
     rope_scaling: dict[str, typing.Any] | None,
 ) -> dict[str, typing.Any] | None:
+    """Normalise HF ``rope_parameters`` into EasyDeL ``rope_scaling`` for GLM-4V-MoE.
+
+    Mirrors :func:`easydel.modules.glm4v.glm4v_configuration._rope_scaling_from_rope_parameters`:
+    when ``rope_scaling`` is supplied it wins (a stray ``type`` key is
+    aliased to ``rope_type``); otherwise the relevant keys are copied from
+    ``rope_parameters`` including ``mrope_section`` / ``mrope_interleaved``.
+    Falls back to the GLM-4V-MoE mRoPE preset
+    ``{"rope_type": "default", "mrope_section": [8, 12, 12]}`` when both
+    inputs are missing.
+
+    Args:
+        rope_parameters: HF-style RoPE parameters mapping or ``None``.
+        rope_scaling: EasyDeL RoPE scaling mapping or ``None``.
+
+    Returns:
+        A normalised ``rope_scaling`` mapping (never ``None``).
+    """
     if rope_scaling is not None:
         # HF sometimes uses "type" instead of "rope_type"
         if "type" in rope_scaling and "rope_type" not in rope_scaling:
@@ -195,6 +243,28 @@ class Glm4vMoeVisionConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize the GLM-4V-MoE vision-encoder configuration.
+
+        Args:
+            depth: Number of vision-transformer layers.
+            hidden_size: Vision encoder model dim.
+            hidden_act: Activation used in the vision MLPs.
+            attention_bias: Whether vision attention projections carry biases.
+            attention_dropout: Vision attention dropout probability.
+            num_heads: Vision attention heads (also stored as
+                ``num_attention_heads``).
+            in_channels: Input image channel count.
+            image_size: Square input image side length.
+            patch_size: Patch side length for the patch embedder.
+            rms_norm_eps: Vision RMSNorm epsilon.
+            spatial_merge_size: Spatial downsampling factor of the merger.
+            temporal_patch_size: Temporal patch length for video inputs.
+            out_hidden_size: Width to which the merger projects vision
+                features before they enter the text decoder.
+            intermediate_size: Inner width of the vision MLP.
+            initializer_range: Stddev for truncated-normal init.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(**kwargs)
         self.depth = depth
         self.hidden_size = hidden_size
@@ -320,6 +390,48 @@ class Glm4vMoeTextConfig(EasyDeLBaseConfig):
         router_aux_loss_coef: float = 0.0001,
         **kwargs,
     ):
+        """Initialize the GLM-4V-MoE text-decoder configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Decoder model dim.
+            intermediate_size: Inner width of the dense MLP used in dense
+                layers (the first ``first_k_dense_replace`` layers).
+            num_hidden_layers: Total decoder layers (dense + MoE).
+            num_attention_heads: Total query heads per attention layer.
+            num_key_value_heads: KV heads for grouped-query attention.
+            head_dim: Per-head dim; falls back to
+                ``hidden_size // num_attention_heads`` when ``None``.
+            hidden_act: Activation applied to the gate half of MLPs.
+            max_position_embeddings: Context-length bound used for RoPE
+                tables and asserts.
+            initializer_range: Stddev for truncated-normal init.
+            rms_norm_eps: Epsilon for every RMSNorm.
+            use_cache: Whether downstream code should return KV cache.
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            attention_dropout: Attention probability dropout.
+            attention_bias: Whether attention projections carry biases.
+            partial_rotary_factor: Fraction of each head dim that
+                receives RoPE; remaining channels are unrotated.
+            rope_theta: RoPE base frequency. Falls back to
+                ``rope_parameters["rope_theta"]`` and then ``10000.0``.
+            rope_scaling: EasyDeL-flavoured RoPE scaling dict.
+            rope_parameters: HF-style RoPE parameters (merged via
+                :func:`_rope_scaling_from_rope_parameters`).
+            moe_intermediate_size: Inner width of each routed expert FFN.
+            num_experts_per_tok: Routed experts selected per token.
+            n_shared_experts: Shared experts always applied to every token.
+            n_routed_experts: Total routed experts.
+            routed_scaling_factor: Multiplier on routed expert outputs.
+            n_group: Expert group count for hierarchical routing.
+            topk_group: Groups kept per token before per-group top-k.
+            first_k_dense_replace: Leading dense layers before the MoE
+                schedule kicks in.
+            norm_topk_prob: Whether to renormalise top-k routing weights.
+            router_aux_loss_coef: Coefficient for the load-balancing
+                auxiliary loss.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -424,6 +536,29 @@ class Glm4vMoeConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize the top-level GLM-4V-MoE configuration.
+
+        Args:
+            text_config: Mapping or :class:`Glm4vMoeTextConfig` for the
+                MoE text decoder; ``None`` materialises the default text
+                config.
+            vision_config: Mapping or :class:`Glm4vMoeVisionConfig` for the
+                vision encoder; ``None`` materialises the default vision
+                config.
+            image_token_id: Placeholder token id for image patches.
+            video_token_id: Placeholder token id for video patches.
+            image_start_token_id: Token id marking the start of an image
+                sequence in the text stream.
+            image_end_token_id: Token id marking the end of an image
+                sequence.
+            video_start_token_id: Token id marking the start of a video
+                sequence.
+            video_end_token_id: Token id marking the end of a video
+                sequence.
+            tie_word_embeddings: Whether to tie input embeddings with the
+                LM head.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:

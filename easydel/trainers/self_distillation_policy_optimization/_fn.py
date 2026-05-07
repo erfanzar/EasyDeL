@@ -127,7 +127,9 @@ def sdpo_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    state_model = getattr(state, "model", None)
+    state_mesh = getattr(state_model, "mesh", None)
+    batch = with_sharding_constraint(batch, partition_spec, mesh=state_mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the SDPO loss for a single minibatch.
@@ -296,6 +298,7 @@ def sdpo_step(
             distill_weight = jax.lax.stop_gradient(student_logps - target_logps)
             per_token_loss = distill_weight * student_logps
 
+            ref_per_token_logps = None
             if beta != 0.0:
                 ref_per_token_logps = minibatch["ref_per_token_logps"]
                 if ref_per_token_logps.shape[1] != completion_ids.shape[1]:
@@ -331,7 +334,8 @@ def sdpo_step(
 
             if beta != 0.0 and per_token_kl is not None:
                 other_metrics["mean_kl"] = masked_mean(per_token_kl)
-                other_metrics["ref_per_token_logps"] = jnp.mean(ref_per_token_logps)
+                if ref_per_token_logps is not None:
+                    other_metrics["ref_per_token_logps"] = jnp.mean(ref_per_token_logps)
 
         return loss, LossMetrics(
             loss=loss,

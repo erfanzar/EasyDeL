@@ -705,6 +705,14 @@ class FalconModel(EasyDeLBaseModule):
         hidden_states = inputs_embeds
 
         def _layer_loop(layer, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions, idx)``
+            through one Falcon decoder block (parallel or sequential layout
+            depending on ``config.parallel_attn``), passing in the precomputed
+            ALiBi tensor when configured, and updates the layer's cache view
+            in-place on ``past_key_values``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             with self._layer_stage_context(idx, layers=self.h):
                 layer_outputs = layer(

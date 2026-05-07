@@ -408,7 +408,24 @@ def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> t
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention mask from cumulative sequence lengths.
 
-    Vectorized implementation that works correctly with JAX tracing.
+    Vision-tower utility that turns a packed batch of variable-length
+    sequences (described by ``cu_seqlens``) into an additive attention
+    bias where positions only attend within their own segment. Uses a
+    vectorised computation so the result is fully traceable under JAX
+    transformations (``jit``, ``vmap``, etc.).
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths of shape
+            ``(num_segments + 1,)``; segment ``i`` spans the half-open
+            range ``[cu_seqlens[i], cu_seqlens[i + 1])``.
+        seq_length: Total packed-sequence length (``cu_seqlens[-1]``).
+        dtype: Output dtype; ``jnp.finfo(dtype).min`` is used as the
+            mask-out value (additive bias on logits).
+
+    Returns:
+        Array of shape ``(1, seq_length, seq_length)`` containing
+        ``0.0`` for in-segment pairs and ``finfo(dtype).min`` for
+        cross-segment pairs.
     """
     positions = jnp.arange(seq_length)
     starts = cu_seqlens[:-1]

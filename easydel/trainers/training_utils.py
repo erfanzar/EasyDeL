@@ -428,8 +428,8 @@ def register_scheduled_loss_adapter(
 
     The function is intentionally usable as a decorator factory (returns
     ``step_fn`` unchanged) so trainers can write
-    ``register_scheduled_loss_adapter(step_fn, adapter)`` at module import
-    time.
+    ``register_scheduled_loss_adapter(step_fn=step_fn, adapter=adapter)`` at
+    module import time.
 
     Args:
         step_fn (Callable[..., Any]): The trainer's raw, unwrapped step
@@ -1551,6 +1551,8 @@ def _run_scheduled_value_and_grad(
         grad_acc = gradients_i if grad_acc is None else jax.tree_util.tree_map(jnp.add, grad_acc, gradients_i)
 
     inv_steps = jnp.asarray(1.0 / num_accum_steps, dtype=jnp.float32)
+    if loss_acc is None or grad_acc is None:
+        raise ValueError("Gradient accumulation produced no minibatches.")
     return loss_acc * inv_steps, jax.tree_util.tree_map(lambda x: x * inv_steps, grad_acc)
 
 

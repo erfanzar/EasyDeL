@@ -722,6 +722,13 @@ class Gemma2Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            ``carry`` is ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, idx)``. Drives one Gemma 2 decoder layer
+            (interleaved sliding/full attention with logit softcapping) and
+            propagates the corresponding hybrid cache view.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
@@ -967,6 +974,12 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
             return base_fn
 
         def _project(hidden_states):
+            """Apply the base LM head and tanh-softcap the logits.
+
+            ``out = cap * tanh(logits / cap)`` with ``cap =
+            config.final_logit_softcapping``, matching Gemma 2's reference
+            stabiliser on the final logits.
+            """
             logits = base_fn(hidden_states)
             cap = jnp.array(cap_value, dtype=logits.dtype)
             return cap * jax.nn.tanh(logits / cap)

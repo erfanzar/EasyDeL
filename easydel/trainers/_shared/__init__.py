@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cross-trainer helpers shared by preference / RLHF trainers."""
+"""Cross-trainer helpers shared by preference / RLHF trainers.
+
+Exposes the small set of utilities that DPO, CPO, KTO, ORPO, and BCO
+all need but cannot tidily inherit because their config dataclasses
+have their own MRO constraints:
+
+* :func:`normalize_logprob_vocab_chunk_size` -- coerces the
+  ``logprob_vocab_chunk_size`` config field to a positive int or
+  ``None``, used by every preference config's ``__post_init__``.
+* :func:`apply_paired_truncation` -- truncates parallel sequence
+  tensors (``input_ids`` / ``attention_mask`` / ``loss_mask``) along
+  axis 1 with a configurable keep-end / keep-start mode.
+* :func:`gather_multimodal_kwargs` -- collects optional vision-tower
+  inputs (``pixel_values``, ``pixel_attention_mask``, ``image_sizes``)
+  and the MoE auxiliary-loss flag from a batch dict.
+"""
 
 from .preference_config_helpers import normalize_logprob_vocab_chunk_size
 from .preference_forward_helpers import (

@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the GIDD (Generalised Interpolating Discrete Diffusion) model.
+
+Defines :class:`GiddConfig`. GIDD is a non-autoregressive masked-diffusion
+LLM: it shares the standard transformer backbone (RMSNorm, SwiGLU MLP,
+RoPE, optional GQA) but expects bidirectional attention and is trained to
+predict masked tokens. Notable knobs that depart from the usual decoder
+recipe:
+
+- ``resid_scale`` rescales the residual stream to match GIDD's recipe.
+- ``init_scale``, ``emb_init_scale``, ``head_init_scale`` give per-stage
+  weight-init scales used by the original implementation.
+- ``use_qk_norm`` / ``qk_norm_eps`` toggle RMSNorm on Q/K for stability.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -122,6 +135,50 @@ class GiddConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize a :class:`GiddConfig`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``131072``.
+            hidden_size (int, optional): Hidden dimension. Defaults to ``768``.
+            intermediate_size (int, optional): MLP intermediate width. Defaults to ``3072``.
+            num_hidden_layers (int, optional): Number of transformer layers.
+                Defaults to ``12``.
+            num_attention_heads (int, optional): Attention heads per layer. Defaults to ``12``.
+            head_dim (int | None, optional): Per-head dimension. ``None`` derives
+                ``hidden_size // num_attention_heads``.
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``1024``.
+            resid_scale (float, optional): Residual stream rescaling factor used to
+                stabilise GIDD's deeper diffusion training. Defaults to ``4.0``.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-6``.
+            use_qk_norm (bool, optional): Apply RMSNorm to Q/K projections.
+                Defaults to ``True``.
+            qk_norm_eps (float, optional): Epsilon for the Q/K RMSNorm. Defaults to ``1e-6``.
+            init_scale (float, optional): Per-block weight init scale. Defaults to ``0.4``.
+            emb_init_scale (float, optional): Embedding init scale. Defaults to ``0.1``.
+            head_init_scale (float, optional): Output head init scale. Defaults to ``0.0``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``0``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``1``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to ``False``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing
+                policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            rope_scaling (dict | None, optional): RoPE scaling spec. Defaults to ``None``.
+            scan_mlp_chunk_size (int, optional): Chunk size for scan-MLP.
+                Defaults to ``1024``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            pretraining_tp (int, optional): Tensor-parallel degree used during
+                pretraining (kept for HF compatibility). Defaults to ``1``.
+            attention_bias (bool, optional): Use bias on attention projections.
+                Defaults to ``False``.
+            mlp_bias (bool, optional): Use bias on MLP projections. Defaults to ``False``.
+            scan_layers (bool, optional): Use ``lax.scan`` over decoder layers.
+                Defaults to ``False``.
+            layer_types (list[str] | None, optional): Per-layer attention types.
+                ``None`` fills with ``"full_attention"``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
 
         self.hidden_size = hidden_size

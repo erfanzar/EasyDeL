@@ -205,6 +205,23 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
     exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
 
     def expand_one(p: str) -> list[str]:
+        """Expand a single path / pattern argument into concrete file paths.
+
+        Inline closure of :func:`expand_data_files`. Captures
+        ``exts_priority`` from the enclosing scope. Glob meta-characters
+        force a direct :func:`glob_files` call; otherwise the helper
+        first treats ``p`` as a file path with a dataset extension, then
+        as a directory and tries ``"<dir>/**/*<ext>"`` recursive matches
+        in priority order. Returns an empty list when no match is found
+        — :func:`expand_data_files` then aggregates and decides whether
+        to raise :class:`FileNotFoundError`.
+
+        Args:
+            p: Single path/pattern (already converted to ``str``).
+
+        Returns:
+            list[str]: Matching files, possibly empty.
+        """
         p = _fix_missing_dot(p)
         if any(ch in p for ch in ("*", "?", "[")):
             return glob_files(p)

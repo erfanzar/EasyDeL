@@ -469,28 +469,34 @@ class NashMDTrainer(GRPOTrainer):
                 completion_mask = results.completion_mask
             generation_time = generation_time_fn()
 
-            with capture_time() as _mixture_time_fn:
-                mixture_results = self.generate_unified(
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
-                    state=self.ref_state,
-                    apply_chat_template=False,
-                    shard_inputs=False,
-                    all_gather=False,
-                    config_overrides={"num_return_sequences": 1},
-                )
-                jax.block_until_ready(mixture_results.sequences)
-                mixture_completion_ids = mixture_results.completion_ids
-                mixture_completion_mask = mixture_results.completion_mask
-
             # Sample mixture between policy and reference completions per prompt
             mixture_coef = self._current_mixture_coef()
-            step_int = int(jax.device_get(state.step))
-            mix_key = jax.random.PRNGKey(step_int & 0xFFFFFFFF)
-            take_policy = jax.random.uniform(mix_key, (completion_ids.shape[0],)) < mixture_coef
-            take_policy = take_policy[:, None]
-            mixture_completion_ids = jnp.where(take_policy, completion_ids, mixture_completion_ids)
-            mixture_completion_mask = jnp.where(take_policy, completion_mask, mixture_completion_mask)
+            if mixture_coef >= 1.0:
+                mixture_results = results
+                mixture_completion_ids = completion_ids
+                mixture_completion_mask = completion_mask
+                take_policy = jnp.ones((completion_ids.shape[0], 1), dtype=jnp.bool_)
+            else:
+                with capture_time() as _mixture_time_fn:
+                    mixture_results = self.generate_unified(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_mask,
+                        state=self.ref_state,
+                        apply_chat_template=False,
+                        shard_inputs=False,
+                        all_gather=False,
+                        config_overrides={"num_return_sequences": 1},
+                    )
+                    jax.block_until_ready(mixture_results.sequences)
+                    mixture_completion_ids = mixture_results.completion_ids
+                    mixture_completion_mask = mixture_results.completion_mask
+
+                step_int = int(jax.device_get(state.step))
+                mix_key = jax.random.PRNGKey(step_int & 0xFFFFFFFF)
+                take_policy = jax.random.uniform(mix_key, (completion_ids.shape[0],)) < mixture_coef
+                take_policy = take_policy[:, None]
+                mixture_completion_ids = jnp.where(take_policy, completion_ids, mixture_completion_ids)
+                mixture_completion_mask = jnp.where(take_policy, completion_mask, mixture_completion_mask)
 
             prompt_completion_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
             attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)

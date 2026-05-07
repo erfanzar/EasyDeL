@@ -67,8 +67,8 @@ from easydel.infra.sharding import (
     MeshLike,
     RuntimeShardingResolver,
     coerce_runtime_sharding_resolver,
-    mesh_matches,
     mesh_axis_size,
+    mesh_matches,
     resolve_stage_cache_mesh,
 )
 from easydel.utils.helpers import check_bool_flag
@@ -239,9 +239,10 @@ def _select_compatible_v3_kv_cache_dtype(
 
     The v3 ragged-page layout packs combined KV heads into 32-bit storage
     groups. When the configured KV-head sharding does not evenly divide the
-    storage groups, attention can't be split cleanly. This helper picks the
+    storage groups, or when a shard would receive an odd number of combined
+    K/V slots, attention can't be split cleanly. This helper picks the
     smallest larger dtype (bfloat16, then float32) whose packed groups divide
-    by ``kv_head_shards``.
+    by ``kv_head_shards`` and preserve whole K/V pairs on every shard.
 
     Args:
         kvdtype: Requested KV cache dtype.
@@ -256,29 +257,39 @@ def _select_compatible_v3_kv_cache_dtype(
     if kv_head_shards <= 1:
         return kvdtype
 
-    def _storage_groups(dtype: jnp.dtype) -> int:
-        """Return the number of 32-bit storage groups for a candidate dtype.
+    def _layout_stats(dtype: jnp.dtype) -> tuple[int, int]:
+        """Return global storage groups and local combined KV slots.
 
         Args:
             dtype: Candidate KV storage dtype.
 
         Returns:
-            Storage groups (combined heads divided by packing factor).
+            Pair of ``(storage_groups, local_combined_slots)``. The local value
+            is ``0`` when the storage groups do not divide evenly across shards.
         """
-        return _storage_num_combined_kv_heads_for_dtype(num_kv_heads, k_headdim, dtype) // get_dtype_packing(dtype)
+        packing = get_dtype_packing(dtype)
+        storage_groups = _storage_num_combined_kv_heads_for_dtype(num_kv_heads, k_headdim, dtype) // packing
+        if storage_groups % kv_head_shards != 0:
+            return storage_groups, 0
+        return storage_groups, (storage_groups // kv_head_shards) * packing
 
-    storage_groups = _storage_groups(kvdtype)
-    if storage_groups % kv_head_shards == 0:
+    def _can_shard(dtype: jnp.dtype) -> tuple[bool, int, int]:
+        storage_groups, local_combined_slots = _layout_stats(dtype)
+        return local_combined_slots > 0 and local_combined_slots % 2 == 0, storage_groups, local_combined_slots
+
+    can_shard, storage_groups, _local_combined_slots = _can_shard(kvdtype)
+    if can_shard:
         return kvdtype
 
     for candidate_dtype in (jnp.bfloat16, jnp.float32):
         if candidate_dtype == kvdtype:
             continue
-        candidate_groups = _storage_groups(candidate_dtype)
-        if candidate_groups % kv_head_shards == 0:
+        candidate_ok, _candidate_groups, _candidate_local_combined_slots = _can_shard(candidate_dtype)
+        if candidate_ok:
             logger.warning(
                 "Upcasting ragged-page v3 KV cache dtype from %s to %s because "
-                "packed storage groups (%d) do not divide kv_head shards (%d).",
+                "packed storage groups (%d) cannot be split into whole K/V pairs "
+                "across kv_head shards (%d).",
                 _dtype_to_string(kvdtype),
                 _dtype_to_string(candidate_dtype),
                 storage_groups,

@@ -191,6 +191,26 @@ class Gemma4RMSNorm(spx.Module):
         epsilon: float | None = None,
         with_scale: bool = True,
     ):
+        """Initialize the Gemma4 RMSNorm module.
+
+        ``dim`` and ``epsilon`` may be supplied either explicitly or implicitly
+        via ``config`` (which contributes ``hidden_size`` and ``rms_norm_eps``).
+        When ``with_scale=False`` no learnable parameter is created.
+
+        Args:
+            config (Gemma4TextConfig | Gemma4VisionConfig | None): Optional config
+                supplying ``hidden_size`` (for ``dim``) and ``rms_norm_eps``
+                (for ``epsilon``).
+            param_dtype (jnp.dtype, optional): Parameter storage dtype.
+                Defaults to ``jnp.float32``.
+            dim (int | None, optional): Last-axis dimension to normalise.
+                Required when ``config`` is ``None``.
+            epsilon (float | None, optional): Numerical-stability epsilon. ``None``
+                falls back to ``config.rms_norm_eps`` (or ``1e-6`` if ``config`` is
+                ``None``).
+            with_scale (bool, optional): Whether to allocate a learnable scale
+                parameter (``self.weight``). Defaults to ``True``.
+        """
         self.epsilon = (config.rms_norm_eps if config is not None else 1e-6) if epsilon is None else epsilon
         self.param_dtype = param_dtype
         self.with_scale = with_scale
@@ -1125,6 +1145,13 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
         hidden_states = inputs_embeds
 
         def _layer_loop(layer, carry):
+            """Per-layer step body for the Gemma 4 vision encoder.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            idx)`` through one vision-tower transformer block, providing
+            patch-level positions (``pixel_position_ids``) and the precomputed
+            ``MaskInfo``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1483,6 +1510,28 @@ class Gemma4Attention(UnifiedAttention):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize a Gemma 4 attention layer.
+
+        Inspects ``config.layer_types[layer_idx]`` to choose between sliding
+        and full attention, resolves layer-specific head geometry
+        (``head_dim``, ``num_key_value_heads`` vs. ``global_head_dim``,
+        ``num_global_key_value_heads``), wires up the optional ``k_eq_v``
+        projection, and computes the index of the source layer for KV
+        sharing when ``layer_idx`` falls in the shared-KV tail of the stack.
+
+        Args:
+            config (Gemma4TextConfig): Decoder text config.
+            layer_idx (int): Zero-based layer index.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to
+                ``jnp.bfloat16``.
+            precision (str | jax.lax.Precision | None, optional): Matmul precision.
+                Defaults to ``None``.
+            causal (bool, optional): Apply causal masking. Defaults to ``True``.
+            is_cross_attention (bool, optional): Whether this is a cross-attention
+                layer. Defaults to ``False``.
+            rngs (spx.Rngs): Random number generator state for parameter init.
+        """
         self.layer_type = config.layer_types[layer_idx] if config.layer_types else None
         self.is_sliding = self.layer_type == "sliding_attention"
         self.use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
@@ -1557,6 +1606,7 @@ class Gemma4Attention(UnifiedAttention):
 
     @head_dim.setter
     def head_dim(self, value):
+        """Override the resolved per-head dimension stored on the layer."""
         self._head_dim = value
 
     def _resolve_head_dim(self, config: Gemma4TextConfig) -> int:
@@ -2013,6 +2063,20 @@ class Gemma4MLP(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma 4 SwiGLU MLP block.
+
+        When ``layer_idx`` lies in the KV-shared tail of the decoder and
+        ``config.use_double_wide_mlp`` is set, the inner dimension is doubled
+        to recover the capacity lost by sharing KV projections.
+
+        Args:
+            config (Gemma4TextConfig): Decoder text config.
+            layer_idx (int): Zero-based layer index.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (str | jax.lax.Precision | None, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -2141,6 +2205,21 @@ class Gemma4TextMLPStack(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the fused MoE expert bank.
+
+        Allocates one fused gate/up projection and one down projection per
+        expert, sized by ``config.num_experts`` and
+        ``config.moe_intermediate_size``. The shared activation is resolved
+        from ``config.hidden_activation``.
+
+        Args:
+            config (Gemma4TextConfig): Text decoder configuration with MoE knobs.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to
+                ``jnp.bfloat16``.
+            precision (jax.lax.PrecisionLike, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -2257,6 +2336,22 @@ class Gemma4TextRouter(BaseMoeModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize Gemma 4's MoE router.
+
+        Wires up the pre-routing RMSNorm (no learnable scale), the router
+        projection, the per-dimension scale vector, and the per-expert
+        scaling parameters with the HF-compatible attribute names
+        (``norm``, ``proj``, ``weight``, ``per_expert_scale``). Top-K is taken
+        from ``config.top_k_experts``.
+
+        Args:
+            config (Gemma4TextConfig): Decoder text config with ``num_experts``,
+                ``top_k_experts``, ``hidden_size`` and ``rms_norm_eps``.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (jax.lax.PrecisionLike, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_experts,
@@ -2440,6 +2535,21 @@ class Gemma4DecoderLayer(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize a Gemma 4 decoder layer.
+
+        Allocates the self-attention block, the dense MLP, the optional MoE
+        sibling (when ``config.enable_moe_block`` is set), pre/post-norms,
+        the optional per-layer input gate/projection, and the learned
+        per-layer scalar that scales the layer's residual output.
+
+        Args:
+            config (Gemma4TextConfig): Decoder text config.
+            layer_idx (int): Zero-based layer index.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (str | jax.lax.Precision | None, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -2655,6 +2765,19 @@ class Gemma4TextModel(EasyDeLBaseModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma 4 text decoder backbone.
+
+        Allocates token embeddings, the optional per-layer input embedding /
+        projection, the stack of :class:`Gemma4DecoderLayer` blocks (with
+        ``auto_remat`` checkpointing), and the final RMSNorm.
+
+        Args:
+            config (Gemma4TextConfig): Decoder text config.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (jax.lax.PrecisionLike, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -2999,6 +3122,15 @@ class Gemma4TextModel(EasyDeLBaseModule):
         donor_cache_views: dict[int, typing.Any] = {}
 
         def _layer_loop(block, carry):
+            """Per-layer step body for the Gemma 4 text decoder.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            idx)`` through one decoder layer, picking the
+            sliding-vs-full ``MaskInfo`` and the right slice of
+            ``per_layer_inputs``. Implements the KV-sharing rule by reading
+            cached K/V from the donor layer (and reusing its cache view for
+            paged inference) when the layer is in the shared tail.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -3111,6 +3243,19 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize Gemma 4 for causal language modeling.
+
+        Wraps :class:`Gemma4TextModel` with an unbiased linear LM head whose
+        weights are tied to ``embed_tokens`` when
+        ``config.tie_word_embeddings`` is set.
+
+        Args:
+            config (Gemma4TextConfig): Decoder text config.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (jax.lax.PrecisionLike, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Gemma4TextModel,
@@ -3231,6 +3376,12 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
             _attend = self.get_embedding().attend
 
             def _project(hidden_states):
+                """Tied-embedding LM head projection with optional softcap.
+
+                Uses ``Embed.attend`` to read the embedding matrix
+                (trace-safe — bypasses :class:`nn.remat` on the LM head) and
+                then applies ``cap * tanh(logits / cap)`` when configured.
+                """
                 lm_logits = _attend(hidden_states)
                 if cap_value is not None:
                     cap = jnp.array(cap_value, dtype=lm_logits.dtype)
@@ -3244,6 +3395,12 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
                 return base_fn
 
             def _project(hidden_states):
+                """Untied LM head projection with logit softcapping.
+
+                Reuses the base ``make_lm_head_fn`` (which already bypasses
+                ``nn.remat`` on the LM head) and applies
+                ``cap * tanh(logits / cap)``.
+                """
                 logits = base_fn(hidden_states)
                 cap = jnp.array(cap_value, dtype=logits.dtype)
                 return cap * jax.nn.tanh(logits / cap)
@@ -3294,6 +3451,21 @@ class Gemma4MultimodalEmbedder(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the multimodal embedding projector.
+
+        Allocates a scale-free pre-projection RMSNorm followed by an unbiased
+        linear projection from ``multimodal_hidden_size`` to
+        ``text_hidden_size`` so vision tokens can be spliced into the text
+        residual stream.
+
+        Args:
+            multimodal_hidden_size (int): Hidden dim of the vision tower output.
+            text_hidden_size (int): Hidden dim of the text decoder.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-6``.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            rngs (spx.Rngs): Random number generator state.
+        """
         self.embedding_pre_projection_norm = Gemma4RMSNorm(
             dim=multimodal_hidden_size,
             epsilon=rms_norm_eps,
@@ -3357,6 +3529,20 @@ class Gemma4Model(EasyDeLBaseModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the Gemma 4 multimodal backbone.
+
+        Builds the language decoder, optionally instantiates the vision tower
+        when ``config.vision_config`` is set and a backend is registered, and
+        wires up the :class:`Gemma4MultimodalEmbedder` projector from the
+        vision hidden size into the text decoder hidden size.
+
+        Args:
+            config (Gemma4Config): Top-level multimodal config.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (jax.lax.PrecisionLike, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -3613,6 +3799,19 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the multimodal causal-LM head over :class:`Gemma4Model`.
+
+        Wraps the multimodal backbone with a tied LM head when
+        ``config.text_config.tie_word_embeddings`` is set; otherwise allocates
+        an untied unbiased LM head.
+
+        Args:
+            config (Gemma4Config): Top-level multimodal config.
+            dtype (jnp.dtype, optional): Compute dtype. Defaults to ``jnp.bfloat16``.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to ``jnp.bfloat16``.
+            precision (jax.lax.PrecisionLike, optional): Matmul precision.
+            rngs (spx.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Gemma4Model,
@@ -3711,6 +3910,12 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             return base_fn
 
         def _project(hidden_states):
+            """Multimodal LM head projection with text-config softcapping.
+
+            Wraps the base trace-safe LM head projector and applies
+            ``cap * tanh(logits / cap)`` using
+            ``config.text_config.final_logit_softcapping``.
+            """
             logits = base_fn(hidden_states)
             cap = jnp.array(cap_value, dtype=logits.dtype)
             return cap * jax.nn.tanh(logits / cap)

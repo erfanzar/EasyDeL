@@ -56,6 +56,7 @@ from __future__ import annotations
 import collections.abc
 import contextlib
 import gc
+import inspect
 import json
 import os
 import re
@@ -78,14 +79,16 @@ from eformer.paths import ePath, ePathLike
 from huggingface_hub import CommitOperationAdd, create_branch, create_commit, create_repo
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
-from spectrax import PartitionAxis, match_partition_rules, nn
+from spectrax import PartitionAxis, nn
 from spectrax.serialization import Checkpointer, find_latest_checkpoint
 from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers import QuantizationConfig, eLoRA
 from easydel.utils.checkpoint_compat import (
     adapt_legacy_checkpoint_collections as _adapt_legacy_checkpoint_collections,
+)
+from easydel.utils.checkpoint_compat import (
+    materialize_tied_lm_head_from_embeddings as _materialize_tied_lm_head_from_embeddings,
 )
 from easydel.utils.checkpoint_compat import (
     rename_legacy_checkpoint_leaves as _rename_legacy_checkpoint_leaves,
@@ -107,7 +110,7 @@ from easydel.utils.traversals import (
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from ..base_config import download_url as _download_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
-from ..sharding import MeshLike, sanitize_partition_spec_for_shape
+from ..sharding import MeshLike
 
 if tp.TYPE_CHECKING:
     from ..base_module import EasyDeLBaseModule
@@ -323,54 +326,6 @@ def _rebuild_lora_modules_from_checkpoint(
     if rebuilt:
         logger.info("Detected LoRA checkpoint; rebuilt %d LoRA wrapper(s) before parameter merge.", rebuilt)
     return model
-
-
-def _build_safe_checkpoint_partition_rules(
-    *,
-    model: "EasyDeLBaseModule",
-    mesh: MeshLike,
-    partition_rules: tuple[tuple[str, PartitionSpec], ...] | list[tuple[str, PartitionSpec]] | None,
-) -> tuple[tuple[str, PartitionSpec], ...] | None:
-    """Create path-specific override rules for non-divisible shardings.
-
-    The checkpoint loader applies regex partition rules without shape validation.
-    We precompute matched specs against model parameter shapes and prepend exact
-    overrides for only the problematic leaves.
-    """
-    if not partition_rules:
-        return partition_rules
-
-    try:
-        specs_tree = match_partition_rules(list(partition_rules), model.graphtree_parameters_shape, strict=False)
-        flat_specs = flatten_dict(specs_tree)
-        flat_shapes = flatten_dict(model.graphtree_parameters_shape)
-    except Exception:
-        return tuple(partition_rules)
-
-    overrides: list[tuple[str, PartitionSpec]] = []
-    for key, spec in flat_specs.items():
-        if not isinstance(spec, PartitionSpec):
-            continue
-
-        shape_obj = flat_shapes.get(key)
-        shape = tuple(getattr(shape_obj, "shape", ()))
-        if not shape:
-            continue
-
-        safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
-        if safe_spec != spec:
-            path = _tree_key_to_path(key)
-            for variant in _path_match_variants(path):
-                overrides.append((rf"^{re.escape(variant)}$", safe_spec))
-
-    if not overrides:
-        return tuple(partition_rules)
-
-    logger.warning(
-        "Adjusted %d non-divisible parameter sharding specs for checkpoint load.",
-        len(overrides),
-    )
-    return tuple(overrides) + tuple(partition_rules)
 
 
 @dataclass
@@ -741,7 +696,7 @@ class EasyBridgeMixin(PushToHubMixin):
             base_path=str(save_directory),
             save_interval=None,
             step_policies=[],
-        ).save_pytree(tree=state_dict, prefix="model", dtype=float_dtype)
+        ).save_pytree(tree=state_dict, prefix="model", mesh=self.mesh, dtype=float_dtype)
 
         logger.info(f"Model weights saved in {output_model_file}")
 
@@ -1012,6 +967,14 @@ class EasyBridgeMixin(PushToHubMixin):
         quantization_config: QuantizationConfig | None,
         apply_quantization: bool,
         verbose: bool,
+        checkpoint_load_chunk_size: int | None = None,
+        checkpoint_load_concurrent_gb: int = 128,
+        checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_copy_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_cache_gb: int | None = 128,
+        checkpoint_load_tensorstore_assume_metadata: bool = True,
+        checkpoint_load_tensorstore_metadata_workers: int = 256,
+        checkpoint_load_progress: bool | None = None,
     ) -> EasyDeLBaseModule:
         """Loads model weights from a checkpoint file.
 
@@ -1028,6 +991,25 @@ class EasyBridgeMixin(PushToHubMixin):
             apply_quantization (bool): Whether to apply module-level quantization
                 during loading.
             verbose (bool): Whether to print verbose messages during loading.
+            checkpoint_load_chunk_size: Optional TensorStore load batch size.
+                Larger values allow more of JAX's async deserializer to overlap
+                remote reads. ``None`` loads all arrays in one call.
+            checkpoint_load_concurrent_gb: In-flight TensorStore read budget per
+                deserialize call, in decimal gigabytes.
+            checkpoint_load_tensorstore_io_concurrency: TensorStore file I/O
+                concurrency override for TensorStore checkpoints.
+            checkpoint_load_tensorstore_copy_concurrency: TensorStore data-copy
+                concurrency override for TensorStore checkpoints.
+            checkpoint_load_tensorstore_cache_gb: TensorStore cache-pool size in
+                decimal gigabytes for TensorStore checkpoints.
+            checkpoint_load_tensorstore_assume_metadata: If ``True``, prefetch
+                zarr metadata and pass it to TensorStore with
+                ``assume_metadata=True``.
+            checkpoint_load_tensorstore_metadata_workers: Worker count for
+                TensorStore metadata prefetch.
+            checkpoint_load_progress: Whether to show a tqdm-style progress
+                line while TensorStore checkpoint tensors are deserialized.
+                ``None`` follows *verbose*.
 
         Returns:
             EasyDeLBaseModule: The model with loaded parameters.
@@ -1045,6 +1027,27 @@ class EasyBridgeMixin(PushToHubMixin):
                     str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
                 )
                 itwas_tensorstore = True
+                extraargs["chunk_size"] = checkpoint_load_chunk_size
+                extraargs["concurrent_gb"] = checkpoint_load_concurrent_gb
+                extraargs["tensorstore_io_concurrency"] = checkpoint_load_tensorstore_io_concurrency
+                extraargs["tensorstore_copy_concurrency"] = checkpoint_load_tensorstore_copy_concurrency
+                extraargs["tensorstore_cache_gb"] = checkpoint_load_tensorstore_cache_gb
+                extraargs["tensorstore_assume_metadata"] = checkpoint_load_tensorstore_assume_metadata
+                extraargs["tensorstore_metadata_workers"] = checkpoint_load_tensorstore_metadata_workers
+                extraargs["show_progress"] = verbose if checkpoint_load_progress is None else checkpoint_load_progress
+                logger.debug(
+                    "[from_pretrained] TensorStore checkpoint load "
+                    "chunk_size=%s concurrent_gb=%s io_concurrency=%s copy_concurrency=%s "
+                    "cache_gb=%s assume_metadata=%s metadata_workers=%s progress=%s",
+                    checkpoint_load_chunk_size,
+                    checkpoint_load_concurrent_gb,
+                    checkpoint_load_tensorstore_io_concurrency,
+                    checkpoint_load_tensorstore_copy_concurrency,
+                    checkpoint_load_tensorstore_cache_gb,
+                    checkpoint_load_tensorstore_assume_metadata,
+                    checkpoint_load_tensorstore_metadata_workers,
+                    extraargs["show_progress"],
+                )
 
         quantizer_for_modules = None
         if itwas_tensorstore and apply_quantization:
@@ -1109,15 +1112,10 @@ class EasyBridgeMixin(PushToHubMixin):
 
         if resolved_archive_file:
             extraargs["callback"] = callback
-            if itwas_tensorstore and apply_quantization:
-                extraargs["chunk_size"] = 32
-            with _phase_timer("  load: build_safe_checkpoint_partition_rules"):
-                checkpoint_partition_rules = _build_safe_checkpoint_partition_rules(
-                    model=model,
-                    mesh=mesh,
-                    partition_rules=None,
-                )
-                print(checkpoint_partition_rules)
+            resolve_shardings = getattr(model, "resolve_shardings_regex", None)
+            sharding_rules = resolve_shardings() if callable(resolve_shardings) else None
+            load_pytree_params = inspect.signature(Checkpointer.load_pytree).parameters
+            load_pytree_extraargs = {key: value for key, value in extraargs.items() if key in load_pytree_params}
             with _phase_timer("  load: Checkpointer.load_pytree"):
                 state, _ = Checkpointer(
                     base_path=str(resolved_archive_file),
@@ -1126,11 +1124,12 @@ class EasyBridgeMixin(PushToHubMixin):
                 ).load_pytree(
                     mesh=mesh,
                     dtype=param_dtype,  # legacy
-                    sharding_rules=model.resolve_shardings_regex(),
+                    sharding_rules=sharding_rules,
                     prefix="model",
                     discover_latest=False,
                     load_treedef=False,
-                    **extraargs,
+                    can_skip_structure=True,
+                    **load_pytree_extraargs,
                 )
             with _phase_timer("  load: flatten + legacy rename + lora rebuild"):
                 if isinstance(state, spx.State):
@@ -1247,13 +1246,28 @@ class EasyBridgeMixin(PushToHubMixin):
                 # Strip the leading collection segment from checkpoint keys so
                 # they can be compared against the model's parameter paths.
                 required_params: set[tuple[tp.Any, ...]] = set()
+                required_param_leaves: dict[tuple[tp.Any, ...], tp.Any] = {}
                 for c, d in model_state_raw.items():
-                    for path_tuple in flatten_dict(d):
-                        required_params.add((c, *path_tuple))
+                    for path_tuple, leaf in flatten_dict(d).items():
+                        key = (c, *path_tuple)
+                        required_params.add(key)
+                        required_param_leaves[key] = leaf
             with _phase_timer("  load: adapt legacy collections + drop unexpected"):
                 # Old EasyDeL saves either omitted the collection wrapper or used
                 # the legacy `params` collection name; align them to the live model.
                 state = _adapt_legacy_checkpoint_collections(state, required_params)
+                model_config = getattr(model, "config", None)
+                tie_word_embeddings = bool(getattr(model_config, "tie_word_embeddings", False))
+                text_config = getattr(model_config, "text_config", None)
+                if not tie_word_embeddings and text_config is not None:
+                    tie_word_embeddings = bool(getattr(text_config, "tie_word_embeddings", False))
+                lm_head_names = tuple(dict.fromkeys(("lm_head", str(getattr(model, "_lm_head_name", "lm_head")))))
+                state = _materialize_tied_lm_head_from_embeddings(
+                    state,
+                    required_param_leaves,
+                    tie_word_embeddings=tie_word_embeddings,
+                    lm_head_names=lm_head_names,
+                )
                 unexpected_keys = set(state.keys()) - required_params
                 for unexpected_key in unexpected_keys:
                     del state[unexpected_key]
@@ -1328,6 +1342,14 @@ class EasyBridgeMixin(PushToHubMixin):
         auto_shard_model: bool = True,
         verbose: bool = True,
         mismatch_allowed: bool = True,
+        checkpoint_load_chunk_size: int | None = None,
+        checkpoint_load_concurrent_gb: int = 128,
+        checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_copy_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_cache_gb: int | None = 128,
+        checkpoint_load_tensorstore_assume_metadata: bool = True,
+        checkpoint_load_tensorstore_metadata_workers: int = 256,
+        checkpoint_load_progress: bool | None = None,
         *model_args,
         config: EasyDeLBaseConfig | str | os.PathLike | None = None,
         cache_dir: str | os.PathLike | None = None,
@@ -1366,6 +1388,27 @@ class EasyBridgeMixin(PushToHubMixin):
             verbose (bool): Whether to print verbose messages. Defaults to True.
             mismatch_allowed (bool): If True, allows mismatch in parameters while loading.
                 Defaults to True.
+            checkpoint_load_chunk_size: Optional TensorStore checkpoint load batch
+                size. Defaults to ``None`` so TensorStore can schedule the
+                whole checkpoint in one async call.
+            checkpoint_load_concurrent_gb: In-flight TensorStore read budget per
+                deserialize call, in decimal gigabytes. Defaults to ``128``.
+            checkpoint_load_tensorstore_io_concurrency: TensorStore file I/O
+                concurrency override for TensorStore checkpoints. Defaults to
+                ``1024``.
+            checkpoint_load_tensorstore_copy_concurrency: TensorStore data-copy
+                concurrency override for TensorStore checkpoints. Defaults to
+                ``1024``.
+            checkpoint_load_tensorstore_cache_gb: TensorStore cache-pool size in
+                decimal gigabytes for TensorStore checkpoints. Defaults to
+                ``128``.
+            checkpoint_load_tensorstore_assume_metadata: If ``True``, prefetch
+                zarr metadata and pass it to TensorStore with
+                ``assume_metadata=True``. Defaults to ``True``.
+            checkpoint_load_tensorstore_metadata_workers: Worker count for
+                TensorStore metadata prefetch. Defaults to ``256``.
+            checkpoint_load_progress: Whether to show a tqdm-style checkpoint
+                tensor load progress line. ``None`` follows ``verbose``.
             *model_args: Additional positional arguments passed to the model.
             config (EasyDeLBaseConfig | str | PathLike | None): Model configuration or path
                 to configuration file. Defaults to None.
@@ -1466,16 +1509,6 @@ class EasyBridgeMixin(PushToHubMixin):
 
         if commit_hash is None:
             commit_hash = getattr(config, "_commit_hash", None)
-        if auto_shard_model and shard_fns is None:
-            with _phase_timer("AutoShardAndGatherFunctions.from_config", accumulator=timings):
-                shard_fns, _ = AutoShardAndGatherFunctions.from_config(
-                    config=config,
-                    flatten=False,
-                    model_task=cls._model_task,
-                )
-                fns = {"parameters": shard_fns}
-                fns.update(shard_fns)
-                shard_fns = fns
 
         resolved_archive_file = None
         archive_file: ePath | None = None  # pyright: ignore[reportInvalidTypeForm]
@@ -1600,6 +1633,28 @@ class EasyBridgeMixin(PushToHubMixin):
                 logger.debug(f"loading weights file {filename} from cache at {resolved_archive_file}")
         _resolve_phase.__exit__(None, None, None)
 
+        archive_name = filename or os.path.basename(str(resolved_archive_file or ""))
+        resolved_archive_str = str(resolved_archive_file or "")
+        is_tensorstore_checkpoint = archive_name == TENSORSTORE_INDEX_NAME or resolved_archive_str.rstrip("/").endswith(
+            TENSORSTORE_INDEX_NAME
+        )
+        if auto_shard_model and shard_fns is None:
+            if is_tensorstore_checkpoint:
+                logger.debug(
+                    "[from_pretrained] skipping AutoShardAndGatherFunctions.from_config for TensorStore checkpoint; "
+                    "SpectraX will resolve sharding rules during load."
+                )
+            else:
+                with _phase_timer("AutoShardAndGatherFunctions.from_config", accumulator=timings):
+                    shard_fns, _ = AutoShardAndGatherFunctions.from_config(
+                        config=config,
+                        flatten=False,
+                        model_task=cls._model_task,
+                    )
+                    fns = {"parameters": shard_fns}
+                    fns.update(shard_fns)
+                    shard_fns = fns
+
         cls = get_modules_by_type(config.model_type, cls._model_task)[1]
         with _phase_timer("cls.lazy_init", accumulator=timings):
             model = cls.lazy_init(
@@ -1619,6 +1674,14 @@ class EasyBridgeMixin(PushToHubMixin):
                 quantization_config,
                 apply_quantization,
                 verbose,
+                checkpoint_load_chunk_size,
+                checkpoint_load_concurrent_gb,
+                checkpoint_load_tensorstore_io_concurrency,
+                checkpoint_load_tensorstore_copy_concurrency,
+                checkpoint_load_tensorstore_cache_gb,
+                checkpoint_load_tensorstore_assume_metadata,
+                checkpoint_load_tensorstore_metadata_workers,
+                checkpoint_load_progress,
             )
         with _phase_timer("model.quantize", accumulator=timings):
             model = model.quantize(

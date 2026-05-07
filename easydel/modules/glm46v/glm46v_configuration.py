@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the GLM-4.6V vision-language model.
+
+GLM-4.6V is an enhanced multimodal variant of GLM-4V that pairs a vision
+encoder with a text decoder. The configuration is a thin wrapper around
+:class:`Glm4vVisionConfig` and :class:`Glm4vTextConfig` (reused from the
+GLM-4V module) plus the special-token ids that mark image and video spans
+inside the text stream — these ids differ from the GLM-4V defaults to match
+the GLM-4.6 tokenizer.
+"""
+
 import typing
 from collections.abc import Mapping
 
@@ -84,6 +94,29 @@ class Glm46VConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize a GLM-4.6V configuration.
+
+        Args:
+            text_config: Mapping or :class:`Glm4vTextConfig` describing the
+                text decoder. ``None`` falls back to the default GLM-4V text
+                config.
+            vision_config: Mapping or :class:`Glm4vVisionConfig` describing
+                the vision encoder. ``None`` falls back to the default
+                GLM-4V vision config.
+            image_token_id: Placeholder token id used for image patches.
+            video_token_id: Placeholder token id used for video patches.
+            image_start_token_id: Token id marking the start of an image
+                sequence in the text stream.
+            image_end_token_id: Token id marking the end of an image
+                sequence.
+            video_start_token_id: Token id marking the start of a video
+                sequence.
+            video_end_token_id: Token id marking the end of a video
+                sequence.
+            tie_word_embeddings: Whether to tie input embeddings with the
+                LM head.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:

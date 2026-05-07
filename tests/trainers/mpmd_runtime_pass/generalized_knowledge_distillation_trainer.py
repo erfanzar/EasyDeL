@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -43,8 +44,12 @@ def main():
     tokenizer = get_tokenizer()
     student_model = load_causal_lm_model()
     student_state = student_model.to_state()
-    teacher_model = load_causal_lm_model("Qwen/Qwen3-4B")
-    teacher_state = teacher_model.to_state()
+    lightweight = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+    if lightweight:
+        teacher_state = None
+    else:
+        teacher_model = load_causal_lm_model("Qwen/Qwen3-4B")
+        teacher_state = teacher_model.to_state()
 
     trainer_args = make_config(
         ed.GKDConfig,

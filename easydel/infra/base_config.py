@@ -111,64 +111,65 @@ DEFAULT_SHARDING_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", 
 # Model weight file name constants for different frameworks.
 # These are used when loading/saving models in various formats.
 
+# Default filename for PyTorch model weights.
 WEIGHTS_NAME = "pytorch_model.bin"
-"""Default filename for PyTorch model weights."""
 
+# Index file for sharded PyTorch model weights.
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
-"""Index file for sharded PyTorch model weights."""
 
+# Default filename for TensorFlow 2 model weights.
 TF2_WEIGHTS_NAME = "tf_model.h5"
-"""Default filename for TensorFlow 2 model weights."""
 
+# Index file for sharded TensorFlow 2 model weights.
 TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
-"""Index file for sharded TensorFlow 2 model weights."""
 
+# Default filename for TensorFlow 1 model checkpoints.
 TF_WEIGHTS_NAME = "model.ckpt"
-"""Default filename for TensorFlow 1 model checkpoints."""
 
+# Default filename for SafeTensors format model weights.
 SAFE_WEIGHTS_NAME = "model.safetensors"
-"""Default filename for SafeTensors format model weights."""
 
+# Index file for sharded SafeTensors format model weights.
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
-"""Index file for sharded SafeTensors format model weights."""
 
+# Configuration file for feature extractors/preprocessors.
 FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
-"""Configuration file for feature extractors/preprocessors."""
 
+# Alias for feature extractor config (image processors use same file).
 IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
-"""Alias for feature extractor config (image processors use same file)."""
 
+# Configuration file for multi-modal processors.
 PROCESSOR_NAME = "processor_config.json"
-"""Configuration file for multi-modal processors."""
 
+# Configuration file for chat templates.
 CHAT_TEMPLATE_NAME = "chat_template.json"
-"""Configuration file for chat templates."""
 
+# Configuration file for generation parameters.
 GENERATION_CONFIG_NAME = "generation_config.json"
-"""Configuration file for generation parameters."""
 
+# Model card metadata file.
 MODEL_CARD_NAME = "modelcard.json"
-"""Model card metadata file."""
 
+# Default Mixture of Experts implementation method.
 DEFAULT_MOE_METHOD = "fused_moe"
-"""Default Mixture of Experts implementation method."""
 
+# Whether to treat experts as tensor-parallel by default.
 EXPERT_TP_MODE = False
-"""Whether to treat experts as tensor-parallel by default."""
 
+# Whether FSDP axis is folded into expert-parallel axis by default.
 FSDP_IS_EP_BOUND = True
-"""Whether FSDP axis is folded into expert-parallel axis by default."""
 
+# Whether sequence-parallel axis is folded into expert-parallel axis by default.
 SP_IS_EP_BOUND = True
-"""Whether sequence-parallel axis is folded into expert-parallel axis by default."""
 
+# Whether to use ring topology for expert dispatch by default.
 RING_EXPERTS = False
-"""Whether to use ring topology for expert dispatch by default."""
 
 # Environment variable flags for runtime configuration.
+# Flag indicating whether EKernel operations are enabled via EKERNEL_OPS env var.
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
-"""Flag indicating whether EKernel operations are enabled via EKERNEL_OPS environment variable."""
 
+# Config keys intentionally removed from EasyDeL's public base surface.
 _REMOVED_BASE_CONFIG_KEYS = frozenset(
     {
         "hardware_abstraction",
@@ -177,7 +178,6 @@ _REMOVED_BASE_CONFIG_KEYS = frozenset(
         "pallas_n_block_size",
     }
 )
-"""Config keys intentionally removed from EasyDeL's public base surface."""
 
 
 def is_remote_url(url_or_filename: str) -> bool:
@@ -1327,7 +1327,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
 
     @property
-    def mesh(self):
+    def mesh(self) -> spx.SpxMesh:
         """Gets or creates the JAX device mesh for this configuration.
 
         This property lazily constructs a device mesh from the configuration's sharding
@@ -1359,12 +1359,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if self._hidden_mesh is not None:
             return self._hidden_mesh
 
-        mesh = self._build_mesh()
+        mesh = self._as_spx_mesh(self._build_mesh())
         self.set_model_mesh(mesh)
-        return self._hidden_mesh
+        return mesh
 
     @property
-    def explicit_mesh(self):
+    def explicit_mesh(self) -> spx.SpxMesh:
         """Gets or creates the JAX device mesh with explicit axis types.
 
         This property mirrors `mesh`, but requests AxisType.Explicit for all axes.
@@ -1373,12 +1373,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if self._hidden_explicit_mesh is not None:
             return self._hidden_explicit_mesh
 
-        mesh = self._build_mesh(axis_types="explicit")
+        mesh = self._as_spx_mesh(self._build_mesh(axis_types="explicit"))
         self.set_explicit_mesh(mesh)
-        return self._hidden_explicit_mesh
+        return mesh
 
     @property
-    def manual_mesh(self):
+    def manual_mesh(self) -> spx.SpxMesh:
         """Gets or creates the JAX device mesh with manual axis types.
 
         This property mirrors `mesh`, but requests AxisType.Manual for all axes.
@@ -1387,9 +1387,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if self._hidden_manual_mesh is not None:
             return self._hidden_manual_mesh
 
-        mesh = self._build_mesh(axis_types="manual")
+        mesh = self._as_spx_mesh(self._build_mesh(axis_types="manual"))
         self.set_manual_mesh(mesh)
-        return self._hidden_manual_mesh
+        return mesh
 
     def _stage_spmd_devices(self) -> np.ndarray:
         """Return the SPMD device array for the layer's pipeline stage.

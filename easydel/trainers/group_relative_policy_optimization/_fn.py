@@ -46,13 +46,16 @@ from easydel.trainers._logprob_utils import (
 )
 
 from ..training_utils import (
+    ScheduledLossAdapter,
     compact_generation_model_kwargs,
     extract_generation_model_kwargs,
     make_assertions_and_get_sizes,
     minibatch_call,
     normalize_generation_model_kwargs,
     prepare_generation_model_kwargs_for_call,
+    register_scheduled_loss_adapter,
     repeat_prompt_aligned_model_kwargs,
+    scheduled_loss_cache_key,
     slice_prompt_aligned_model_kwargs,
     update_metrics,
     update_state_respectfully,
@@ -152,7 +155,10 @@ def get_per_token_logps(
             return_entropy=False,
         )
         return token_log_probs
-    logits = outputs.logits[:, prompt_length - 1 :]
+    logits = outputs.logits
+    if logits is None:
+        raise TypeError(f"{type(model).__name__} did not return logits.")
+    logits = logits[:, prompt_length - 1 :]
     logits = logits[:, :-1, :]
     token_log_probs, _ = compute_token_logps_and_entropies_chunked(
         logits,
@@ -272,7 +278,10 @@ def get_per_token_logps_and_entropies(
             return_entropy=True,
         )
         return token_log_probs, entropies
-    logits = outputs.logits[:, prompt_length - 1 :]
+    logits = outputs.logits
+    if logits is None:
+        raise TypeError(f"{type(model).__name__} did not return logits.")
+    logits = logits[:, prompt_length - 1 :]
     logits = logits[:, :-1, :]
     token_log_probs, entropies = compute_token_logps_and_entropies_chunked(
         logits,
@@ -695,6 +704,7 @@ def grpo_step(
                 logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             )
 
+        ref_per_token_logps = None
         if beta != 0.0:
             ref_per_token_logps = minibatch["ref_per_token_logps"][:, : completion_ids.shape[1]]
             per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
@@ -801,7 +811,8 @@ def grpo_step(
         if beta != 0.0:
             mean_kl = masked_mean(per_token_kl)
             other_metrics["mean_kl"] = mean_kl
-            other_metrics["ref_per_token_logps"] = jnp.mean(ref_per_token_logps)
+            if ref_per_token_logps is not None:
+                other_metrics["ref_per_token_logps"] = jnp.mean(ref_per_token_logps)
         else:
             mean_kl = None
 
@@ -846,3 +857,89 @@ def grpo_step(
     else:
         _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
         return metrics
+
+
+def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
+    """Build the scheduled-loss cache key for GRPO-family trainers."""
+
+    return scheduled_loss_cache_key(
+        call,
+        value_fields=(
+            "num_generations",
+            "beta",
+            "partition_spec",
+            "gradient_accumulation_steps",
+            "loss_type",
+            "epsilon",
+            "epsilon_high",
+            "delta",
+            "importance_sampling_level",
+            "top_entropy_quantile",
+            "completion_chunk_size",
+            "max_loss_completion_tokens",
+            "logprob_vocab_chunk_size",
+        ),
+        object_fields=("loss_config", "learning_rate_fn", "straight_through_emulator"),
+    )
+
+
+def _make_grpo_scheduled_loss(call):
+    """Create the scalar GRPO loss used by the SpectraX scheduled VJP path."""
+
+    num_generations = call.get("num_generations")
+    beta = call.get("beta")
+    loss_config = call.get("loss_config")
+    learning_rate_fn = call.get("learning_rate_fn")
+    partition_spec = call.get("partition_spec")
+    gradient_accumulation_steps = call.get("gradient_accumulation_steps")
+    loss_type = call.get("loss_type")
+    epsilon = call.get("epsilon")
+    epsilon_high = call.get("epsilon_high")
+    delta = call.get("delta")
+    importance_sampling_level = call.get("importance_sampling_level")
+    top_entropy_quantile = call.get("top_entropy_quantile")
+    completion_chunk_size = call.get("completion_chunk_size")
+    max_loss_completion_tokens = call.get("max_loss_completion_tokens")
+    logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
+    straight_through_emulator = call.get("straight_through_emulator")
+
+    def scheduled_loss(tree, batch):
+        """Return the scalar GRPO loss for one scheduled microbatch."""
+
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        scheduled_state = call.state.replace(graphstate=tree)
+        metrics = grpo_step(
+            scheduled_state,
+            batch,
+            num_generations,
+            beta,
+            loss_config=loss_config,
+            learning_rate_fn=learning_rate_fn,
+            partition_spec=partition_spec,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            is_training=False,
+            loss_type=loss_type,
+            epsilon=epsilon,
+            epsilon_high=epsilon_high,
+            delta=delta,
+            importance_sampling_level=importance_sampling_level,
+            top_entropy_quantile=top_entropy_quantile,
+            completion_chunk_size=completion_chunk_size,
+            max_loss_completion_tokens=max_loss_completion_tokens,
+            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+            straight_through_emulator=None,
+        )
+        return metrics.loss
+
+    return scheduled_loss
+
+
+register_scheduled_loss_adapter(
+    step_fn=grpo_step,
+    adapter=ScheduledLossAdapter(
+        name="grpo",
+        make_loss=_make_grpo_scheduled_loss,
+        make_cache_key=_grpo_scheduled_loss_cache_key,
+    ),
+)

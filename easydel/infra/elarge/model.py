@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.factory import TaskType
+from easydel.utils.instrumentation import phase_timer
 
 from .benchmarking import (
     is_benchmark_config_like,
@@ -1165,7 +1166,8 @@ class eLargeModel:
         if self._model is None or force_rebuild:
             if not self.model_name:
                 raise ValueError("Model name/path must be set before building")
-            self._model = build_model(self._config)
+            with phase_timer("build_model", tag="eLargeModel"):
+                self._model = build_model(self._config)
         return self._model
 
     def build_state(
@@ -1239,8 +1241,9 @@ class eLargeModel:
             load_kwargs = self.get_load_state_kwargs()
             if load_state_overrides:
                 load_kwargs.update(load_state_overrides)
-            self._state = resolved_state_class.load_state(**load_kwargs)
-            self._model = self._state.model
+            with phase_timer("build_state.load_state", tag="eLargeModel"):
+                self._state = resolved_state_class.load_state(**load_kwargs)
+                self._model = self._state.model
         return self._state
 
     def build_tokenizer(self, force_rebuild: bool = False) -> AutoTokenizer:
@@ -1271,7 +1274,8 @@ class eLargeModel:
             tokenizer_kwargs = dict(loader_cfg.get("tokenizer_kwargs", {}) or {})
             tokenizer_kwargs.setdefault("trust_remote_code", bool(loader_cfg.get("trust_remote_code", False)))
             tokenizer_kwargs.setdefault("use_fast", bool(loader_cfg.get("use_fast_tokenizer", True)))
-            self._tokenizer = AutoTokenizer.from_pretrained(tok_path, **tokenizer_kwargs)
+            with phase_timer("build_tokenizer", tag="eLargeModel"):
+                self._tokenizer = AutoTokenizer.from_pretrained(tok_path, **tokenizer_kwargs)
             logger.info(
                 "Loaded tokenizer %s (fast=%s)",
                 self._tokenizer.__class__.__name__,
@@ -1294,8 +1298,10 @@ class eLargeModel:
             >>> # Use engine for batch inference
             >>> results = engine.generate(prompts, max_tokens=100)
         """
-        self.build_model()
-        return build_esurge(self._config, self._model)
+        with phase_timer("build_esurge.total", tag="eLargeModel"):
+            self.build_model()
+            with phase_timer("build_esurge.engine", tag="eLargeModel"):
+                return build_esurge(self._config, self._model)
 
     def build_teacher_model(self) -> EasyDeLBaseModule | None:
         """Build the teacher model for distillation training.
@@ -1717,14 +1723,10 @@ class eLargeModel:
             "show_progress": show_progress,
             "log_process": log_process if log_process is not None else save_cfg.get("log_process", False),
             "transform_batch_size": (
-                transform_batch_size
-                if transform_batch_size is not None
-                else save_cfg.get("transform_batch_size", 16)
+                transform_batch_size if transform_batch_size is not None else save_cfg.get("transform_batch_size", 16)
             ),
             "transform_backend": (
-                transform_backend
-                if transform_backend is not None
-                else save_cfg.get("transform_backend", "thread")
+                transform_backend if transform_backend is not None else save_cfg.get("transform_backend", "thread")
             ),
             "drop_fields": resolved_drop_fields,
             "arrays_only": arrays_only if arrays_only is not None else save_cfg.get("arrays_only", True),
@@ -2130,13 +2132,16 @@ class eLargeModel:
             self.build_tokenizer()
 
         if trainer_class is None:
-            trainer_class = get_trainer_class(trainer_type)
+            with phase_timer(f"build_trainer.resolve_class.{trainer_type}", tag="eLargeModel"):
+                trainer_class = get_trainer_class(trainer_type)
 
-        training_args = self.build_training_arguments(args_class=args_class, **kwargs)
+        with phase_timer("build_trainer.training_arguments", tag="eLargeModel"):
+            training_args = self.build_training_arguments(args_class=args_class, **kwargs)
 
         if train_dataset is None and "mixture" in self._config:
             # Use new get_train_source() which auto-selects based on use_sharded_source
-            train_dataset = self.get_train_source()
+            with phase_timer("build_trainer.get_train_source", tag="eLargeModel"):
+                train_dataset = self.get_train_source()
 
         trainer_kwargs = {}
         model = self._state if self._state is not None else self._model
@@ -2437,7 +2442,8 @@ class eLargeModel:
                 ]:
                     trainer_kwargs[key] = value
 
-        return trainer_class(**trainer_kwargs)
+        with phase_timer(f"build_trainer.init.{trainer_type}", tag="eLargeModel"):
+            return trainer_class(**trainer_kwargs)
 
     def eval(
         self,

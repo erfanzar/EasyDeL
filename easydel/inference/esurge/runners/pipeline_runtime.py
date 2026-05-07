@@ -67,6 +67,23 @@ class PipelineStageRuntime:
     """
 
     def __init__(self, *, plan: PipelineInferencePlan) -> None:
+        """Build the inline / wavefront SpectraX executors for an enabled PP plan.
+
+        Two executors are eagerly constructed so callers do not pay the
+        ``MpmdPipelineExecutor`` setup cost on the dispatch path: an inline
+        executor (``use_workers=False``) for one-microbatch decode steps where
+        worker futures only add a host rendezvous, and a resident-worker
+        executor (``use_workers=True``) for true multi-microbatch wavefronts
+        where each stage needs its own queue to overlap with the others.
+
+        Args:
+            plan: Frozen :class:`PipelineInferencePlan` describing the active
+                stage meshes and topology. Must be enabled — disabled plans
+                indicate SPMD-only execution and are rejected immediately.
+
+        Raises:
+            ValueError: If ``plan.is_enabled`` is ``False``.
+        """
         if not plan.is_enabled:
             raise ValueError("PipelineStageRuntime requires an enabled PipelineInferencePlan.")
         self.plan = plan
@@ -201,17 +218,21 @@ class PipelineStageRuntime:
         donated_by_stage = tuple(state.get("donate_argnums_per_stage", ())) if isinstance(state, dict) else ()
 
         def _arg_span(argnum: int) -> range:
+            """Return the leaf index range that ``argnum`` occupies in the flattened plan.
+
+            Helper used by the audit log to map argument positions
+            (``kv_argnum`` / ``metadata_argnum``) into contiguous index spans
+            inside SpectraX's flattened invar plans, so dynamic-slot counts can
+            be partitioned per logical argument. Returns an empty range when
+            the requested argument index lies outside the recorded offsets.
+            """
             if argnum >= len(arg_offsets) or argnum >= len(arg_leaf_counts):
                 return range(0, 0)
             start = int(arg_offsets[argnum])
             count = int(arg_leaf_counts[argnum])
             return range(start, start + count)
 
-        if (
-            isinstance(prepare_cache_key, tuple)
-            and len(prepare_cache_key) >= 1
-            and prepare_cache_key[0] == "model_step"
-        ):
+        if isinstance(prepare_cache_key, tuple) and len(prepare_cache_key) >= 1 and prepare_cache_key[0] == "model_step":
             kv_argnum = 2
             metadata_argnum = 3
         else:
@@ -249,7 +270,7 @@ class PipelineStageRuntime:
                 key = str(owner)
             kv_outputs_by_stage[key] = kv_outputs_by_stage.get(key, 0) + 1
 
-        logger.info(
+        logger.debug(
             "PP plan audit mode=%s key=%s arg_leaf_counts=%s kv_arg=%d metadata_arg=%d stages=%d "
             "kv_leaves=%d metadata_leaves=%d dynamic/stage=%s dynamic_kv/stage=%s "
             "dynamic_metadata/stage=%s stage_edges/stage=%s prev_edges/stage=%s "

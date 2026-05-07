@@ -159,6 +159,14 @@ class EngineRequestsMixin:
         max_model_len = int(self.runner.max_model_len)
 
         def _get_requested_new(sp):
+            """Read the request's max-new-tokens budget from a :class:`SamplingParams`-like object.
+
+            Honours both legacy (``max_tokens``) and current
+            (``max_new_tokens``) attribute names, returning the int budget or
+            ``None`` when neither is set so the caller can engage the
+            auto-infer path that derives a budget from
+            ``max_model_len`` minus the prompt length.
+            """
             if hasattr(sp, "max_tokens") and sp.max_tokens is not None:
                 return int(sp.max_tokens)
             if hasattr(sp, "max_new_tokens") and sp.max_new_tokens is not None:

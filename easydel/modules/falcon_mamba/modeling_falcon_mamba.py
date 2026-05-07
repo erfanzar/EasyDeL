@@ -357,6 +357,12 @@ class FalconMambaMixer(spx.Module):
         elif config.time_step_init_scheme == "random":
 
             def init_kernel_dt(key, shape, dtype):
+                """Symmetric uniform init for the dt projection kernel.
+
+                Samples in ``[-dt_init_std, +dt_init_std]`` to match the
+                ``time_step_init_scheme="random"`` branch of the HF Falcon-Mamba
+                reference implementation.
+                """
                 return (
                     jax.nn.initializers.uniform(scale=dt_init_std * 2, dtype=param_dtype)(key, shape, dtype)
                     - dt_init_std
@@ -366,6 +372,13 @@ class FalconMambaMixer(spx.Module):
             init_kernel_dt = jax.nn.initializers.normal(config.initializer_range, param_dtype)
 
         def init_bias_dt(key, shape, dtype):
+            """Initializer for the dt projection bias matching HF Falcon-Mamba.
+
+            Samples ``dt`` uniformly in ``[time_step_min, time_step_max]``,
+            clamps to ``time_step_floor``, then inverts a softplus so that
+            ``softplus(bias) == dt``. This produces a stable distribution of
+            discretized SSM time-steps at initialization.
+            """
             # Match HF init: sample dt uniformly in [min, max] then invert softplus.
             dt = jnp.exp(
                 jax.random.uniform(
@@ -498,6 +511,8 @@ class FalconMambaMixer(spx.Module):
         if use_packed_state_updates:
             from easydel.operations.kernels.ssm1 import _single_step_ssm1_fwd
 
+            if packed_num_seqs is None:
+                raise ValueError("packed_num_seqs is required for packed state updates.")
             conv_states = cache_params.conv_state  # [max_seqs, I, d_conv]
             ssm_states = cache_params.recurrent_state.astype(jnp.float32)  # [max_seqs, I, N]
             token_slots = jnp.clip(
@@ -518,6 +533,13 @@ class FalconMambaMixer(spx.Module):
             token_outputs = jnp.zeros((seq_len, self.intermediate_size), dtype=jnp.float32)
 
             def _body(idx, carry):
+                """Per-token Falcon-Mamba decode step.
+
+                ``carry`` is ``(conv_states, ssm_states, token_outputs)``
+                indexed by the per-token ``slot``: rolls the depthwise conv
+                buffer, computes one selective SSM step, and writes the
+                projected output into ``token_outputs[idx]``.
+                """
                 conv_states_c, ssm_states_c, token_outputs_c = carry
                 slot = token_slots[idx]
 
@@ -946,6 +968,14 @@ class FalconMambaModel(EasyDeLBaseModule):
         hidden_states = inputs_embeds
 
         def _layer_loop(block, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, idx)`` through one
+            FalconMamba :class:`FalconMambaBlock` (RMSNorm + Mamba mixer with
+            residual). Optionally records the pre-layer hidden state and
+            propagates the recurrent SSM cache view in-place on
+            ``cache_params``.
+            """
             hidden_states, all_hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states, cache_view = block(

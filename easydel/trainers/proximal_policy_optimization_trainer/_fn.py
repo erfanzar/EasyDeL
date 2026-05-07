@@ -174,7 +174,10 @@ def get_per_token_logps_values_entropies(
             return_entropy=True,
         )
     else:
-        logits = outputs.logits[:, prompt_length - 1 :]
+        logits = outputs.logits
+        if logits is None:
+            raise ValueError("Model outputs do not provide logits for PPO scoring.")
+        logits = logits[:, prompt_length - 1 :]
         logits = logits[:, :-1, :]
         token_log_probs, entropies = compute_token_logps_and_entropies_chunked(
             logits,

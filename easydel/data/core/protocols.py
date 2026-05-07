@@ -720,6 +720,18 @@ class AsyncDataset(ABC, Generic[T]):
         import asyncio
 
         async def _collect():
+            """Inline async helper: drain ``self.__aiter__`` into a list.
+
+            Captures ``self`` from the enclosing :meth:`__iter__` scope
+            and walks the async iterator to completion, accumulating
+            every produced item. Used as the body passed to
+            :meth:`asyncio.AbstractEventLoop.run_until_complete` so the
+            sync wrapper can return a regular iterator.
+
+            Returns:
+                list[T]: All items produced by the async iterator, in
+                yield order.
+            """
             results = []
             async for item in self:
                 results.append(item)

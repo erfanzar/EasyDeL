@@ -341,6 +341,12 @@ class GiddAttention(AttentionModule):
 
         # Function to initialize attention bias
         def init_attention_bias():
+            """Build the additive attention bias from ``attention_mask``.
+
+            Returns ``0.0`` where ``attention_mask > 0`` and the dtype's
+            ``finfo.min`` elsewhere, so the bias added to the logits zeros
+            valid positions and saturates masked ones.
+            """
             return jax.lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -840,6 +846,13 @@ class GiddModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            idx)`` through one GIDD transformer block, propagating the
+            ``noise_mask`` used by the diffusion attention bias and updating
+            the layer's cache view in-place on ``past_key_values``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the OLMo-3 (Open Language Model v3) family.
+
+Defines :class:`Olmo3Config`, registered as ``model_type="olmo3"``. OLMo-3
+extends OLMo-2 with a *hybrid sliding-window + full-attention schedule*: the
+``layer_types`` list assigns each layer either ``"sliding_attention"`` or
+``"full_attention"``, mirroring the local/global pattern used by Llama 4 /
+Mistral-Nemo. QK normalization and post-norm residual layout are inherited
+from OLMo-2.
+"""
 
 import typing
 

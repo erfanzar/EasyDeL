@@ -20,6 +20,7 @@ import numpy as np
 import optax
 import pytest
 import spectrax as spx
+from spectrax.serialization import Checkpointer
 
 import easydel as ed
 from easydel.infra.base_state import RESUME_MODEL_SUBDIR, EasyDeLState, _is_optimizer_template_incompatibility
@@ -63,6 +64,37 @@ def _build_tiny_lora_llama(rng_seed: int = 0):
         )
 
 
+def _to_legacy_optimizer_layout(tree):
+    """Return an old optimizer layout with omitted collection, ``kernel`` leaves, and ``value`` wrappers."""
+    if isinstance(tree, dict):
+        out = {}
+        for key, value in tree.items():
+            legacy_value = _to_legacy_optimizer_layout(value)
+            if key == "parameters":
+                out.update(legacy_value)
+            else:
+                out["kernel" if key == "weight" else key] = legacy_value
+        return out
+    if isinstance(tree, tuple) and hasattr(tree, "_fields"):
+        return type(tree)(*(_to_legacy_optimizer_layout(value) for value in tree))
+    if isinstance(tree, tuple):
+        return tuple(_to_legacy_optimizer_layout(value) for value in tree)
+    if isinstance(tree, list):
+        return [_to_legacy_optimizer_layout(value) for value in tree]
+    if hasattr(tree, "shape") and hasattr(tree, "dtype"):
+        return {"value": tree}
+    return tree
+
+
+def _find_opt_leaf(tree, *needles: str):
+    """Find one optimizer array leaf whose key path contains all requested needles."""
+    for key_path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        key = jax.tree_util.keystr(key_path)
+        if all(needle in key for needle in needles):
+            return leaf
+    raise AssertionError(f"Could not find optimizer leaf containing {needles!r}")
+
+
 def test_load_optimizer_falls_back_to_saved_structure_when_template_init_fails(tmp_path):
     model = _build_tiny_llama(0)
     tx = optax.adam(1e-3)
@@ -91,6 +123,45 @@ def test_load_optimizer_falls_back_to_saved_structure_when_template_init_fails(t
 
     for original, loaded in zip(orig_leaves, restored_leaves, strict=True):
         np.testing.assert_array_equal(np.asarray(jax.device_get(loaded)), np.asarray(jax.device_get(original)))
+
+
+def test_load_optimizer_restores_old_layout_with_current_sharding(tmp_path):
+    model = _build_tiny_llama(0)
+    tx = optax.adam(1e-3)
+    state = EasyDeLState.create(model=model, tx=tx, init_opt_state=True)
+    grads = jax.tree_util.tree_map(jnp.ones_like, state.graphstate)
+    state = state.apply_gradients(grads=grads)
+
+    old_layout_opt_state = _to_legacy_optimizer_layout(state.opt_state)
+    checkpointer = Checkpointer(base_path=tmp_path, save_interval=None, step_policies=[])
+    checkpointer.save_pytree(
+        old_layout_opt_state,
+        prefix="tx",
+        mesh=model.mesh,
+        extras={"step": 13},
+    )
+
+    fresh_state = EasyDeLState.create(model=_build_tiny_llama(1), tx=tx, init_opt_state=False)
+    restored = fresh_state.load_optimizer(
+        tmp_path,
+        checkpointer=checkpointer,
+        tx_template=tx,
+        checkpoint_load_chunk_size=3,
+        checkpoint_load_progress=False,
+    )
+
+    assert restored.opt_state is not None
+    assert int(jax.device_get(restored.step)) == 13
+
+    orig_leaves, orig_treedef = jax.tree_util.tree_flatten(state.opt_state)
+    restored_leaves, restored_treedef = jax.tree_util.tree_flatten(restored.opt_state)
+    assert restored_treedef == orig_treedef
+    for original, loaded in zip(orig_leaves, restored_leaves, strict=True):
+        np.testing.assert_array_equal(np.asarray(jax.device_get(loaded)), np.asarray(jax.device_get(original)))
+
+    model_lm_head = _find_opt_leaf(fresh_state.graphstate, "lm_head", "weight")
+    restored_lm_head = _find_opt_leaf(restored.opt_state, ".mu", "lm_head", "weight")
+    assert restored_lm_head.sharding == model_lm_head.sharding
 
 
 def test_create_model_uses_trainable_selector():

@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the GLM-4-MoE mixture-of-experts decoder.
+
+Defines :class:`Glm4MoeConfig`, the EasyDeL configuration object for THUDM's
+GLM-4 MoE family (defaults follow GLM-4-100B-A10B). The model is a hybrid
+dense-sparse decoder: the first ``first_k_dense_replace`` layers use a dense
+gated MLP, and every later layer uses grouped MoE routing with shared
+experts plus top-k routed experts (organised into ``n_group`` groups, with
+``topk_group`` selected per token). Attention uses GQA, partial RoPE, and
+optional QK-norm.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -174,6 +184,50 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize a GLM-4-MoE model configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Residual-stream dimension.
+            intermediate_size: Inner width of the dense MLP used by the
+                first ``first_k_dense_replace`` layers.
+            num_hidden_layers: Total decoder layers (dense + MoE).
+            num_attention_heads: Total query heads per attention layer.
+            partial_rotary_factor: Fraction of each head dim that receives
+                RoPE; remaining channels are unrotated.
+            num_key_value_heads: KV heads for grouped-query attention.
+            hidden_act: Activation applied to the gate half of dense and
+                expert MLPs.
+            max_position_embeddings: Context-length bound used for RoPE
+                tables and asserts.
+            initializer_range: Stddev for truncated-normal weight init.
+            rms_norm_eps: Epsilon used by every RMSNorm.
+            use_cache: Whether downstream code should return KV cache.
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            rope_theta: RoPE base frequency.
+            rope_scaling: Optional mapping describing one of the
+                ``default``/``linear``/``dynamic``/``yarn``/``longrope``/
+                ``llama3`` RoPE-scaling variants (see class docstring).
+            attention_bias: Whether Q/K/V/O carry bias parameters.
+            attention_dropout: Dropout on the attention probabilities.
+            moe_intermediate_size: Hidden width of each expert FFN.
+            num_experts_per_tok: Routed experts selected per token (top-k).
+            n_shared_experts: Shared experts always applied to every token.
+            n_routed_experts: Total routed experts across all groups.
+            routed_scaling_factor: Multiplier applied to routed expert
+                outputs before they are summed with the shared output.
+            n_group: Number of expert groups for hierarchical routing.
+            topk_group: Groups picked per token before per-group top-k.
+            first_k_dense_replace: How many leading layers stay dense
+                (``embed -> dense * k -> moe -> moe -> ... -> head``).
+            norm_topk_prob: Whether to renormalise the top-k routing
+                weights so they sum to 1.
+            use_qk_norm: Whether to apply RMSNorm to Q and K before the
+                attention dot-product.
+            layer_types: Optional per-layer attention type list; defaults
+                to ``["full_attention"] * num_hidden_layers``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

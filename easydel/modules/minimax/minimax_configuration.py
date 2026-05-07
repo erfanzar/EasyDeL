@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for MiniMax-Text-01 hybrid lightning + softmax MoE decoders.
+
+Defines :class:`MiniMaxConfig`, registered under ``minimax`` /
+``minimax_text_01`` / ``MiniMaxText01``. MiniMax interleaves *lightning
+attention* layers (a linear-attention variant with O(N) memory) with
+standard softmax-attention layers, gated through ``layer_types``. On top of
+that the FFNs are replaced by a Mixture-of-Experts (``num_local_experts``
+routed Top-``num_experts_per_tok`` per token), so this config tracks both
+the attention-mix and the MoE routing knobs alongside the usual sliding-
+window, RoPE and sharding plumbing.
+"""
+
 import typing
 
 from easydel.infra.base_module import EasyDeLBaseConfig

@@ -47,8 +47,28 @@ import spectrax as spx
 from jax.sharding import NamedSharding, PartitionSpec
 from spectrax import make_shard_and_gather_fns
 
-from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.sharding import device_put_if_sharding_mismatch, replicated_named_sharding
+from easydel.utils.instrumentation import phase_timer
 from easydel.utils.traversals import flatten_dict
+
+
+def _tree_is_already_named_sharded(tree: tp.Any) -> bool:
+    """Return whether all array leaves in ``tree`` already carry ``NamedSharding``.
+
+    This is a cheap guard for repeated sharding-normalization calls. Model
+    loading can already materialize parameters on their target sharding; trainer
+    startup then calls the same sharding path again through ``EasyDeLState``.
+    In that case rebuilding regex rules and walking every large parameter leaf
+    is pure overhead.
+    """
+    saw_array = False
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if not hasattr(leaf, "shape"):
+            continue
+        saw_array = True
+        if not isinstance(getattr(leaf, "sharding", None), NamedSharding):
+            return False
+    return saw_array
 
 
 class EasyShardingMixin:
@@ -394,8 +414,14 @@ class EasyShardingMixin:
             Any: The tree with each leaf device-put under the resolved
             NamedSharding (donating the original buffer).
         """
+        if mesh is None and _tree_is_already_named_sharded(tree):
+            return tree
         shardings = self.resolve_sharding_for_tree(tree, mesh=mesh)
-        return jax.tree_util.tree_map(lambda x, s: jax.device_put(x, s, donate=True), tree, shardings)
+        return jax.tree_util.tree_map(
+            lambda x, s: device_put_if_sharding_mismatch(x, s, donate=True),
+            tree,
+            shardings,
+        )
 
     @property
     def runtime_sharding_resolver(self):
@@ -498,13 +524,20 @@ class EasyShardingMixin:
             according to its PartitionSpec. Access to the full parameter
             requires gathering (see gather_model()).
         """
-        mesh = self._get_mesh(mesh)
-        graphdef, graphstate, graphother = self.split_module()
-        graphstate = self.apply_sharding_for_tree(graphstate, mesh=mesh)
-        graphother = self.apply_sharding_for_tree(graphother, mesh=mesh)
-        self = self.merge_module(graphdef, graphstate, graphother)
+        explicit_mesh = mesh is not None
+        resolved_mesh = self._get_mesh(mesh)
+        with phase_timer("shard_model.split_module", tag="EasyShardingMixin"):
+            graphdef, graphstate, graphother = self.split_module()
+        placement_mesh = resolved_mesh if explicit_mesh else None
+        with phase_timer("shard_model.apply_graphstate", tag="EasyShardingMixin"):
+            graphstate = self.apply_sharding_for_tree(graphstate, mesh=placement_mesh)
+        with phase_timer("shard_model.apply_graphother", tag="EasyShardingMixin"):
+            graphother = self.apply_sharding_for_tree(graphother, mesh=placement_mesh)
+        with phase_timer("shard_model.merge_module", tag="EasyShardingMixin"):
+            self = self.merge_module(graphdef, graphstate, graphother)
         if overlay_fns is not None:
-            self = self._apply_sharding_fns(overlay_fns)
+            with phase_timer("shard_model.apply_overlay_fns", tag="EasyShardingMixin"):
+                self = self._apply_sharding_fns(overlay_fns)
         return self
 
     def gather_model(

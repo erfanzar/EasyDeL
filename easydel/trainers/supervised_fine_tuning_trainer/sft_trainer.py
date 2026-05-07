@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Supervised Fine-Tuning (SFT) trainer.
+
+Wires :class:`SFTTrainer`, EasyDeL's standard causal-LM cross-entropy
+trainer.  The module relies on the lazy
+:class:`SFTPreprocessTransform` to render chat templates and tokenise
+text, and optionally on
+:class:`easydel.data.transforms.pack.PackedShardedSource` to pack short
+sequences into fixed-length blocks.  Public entry point is
+:class:`SFTTrainer`.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -329,7 +340,7 @@ class SFTTrainer(Trainer):
             batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
 
             if "labels" not in batch and "input_ids" in batch:
-                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=False)
+                labels = np.asarray(batch["input_ids"]).astype(np.int32, copy=True)
                 labels[completion_mask_np == 0] = -100
                 if attention_mask is not None:
                     labels[np.asarray(attention_mask) == 0] = -100

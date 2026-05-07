@@ -894,14 +894,16 @@ class MetricsHistogram:
 
 
 @ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
-def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str, MetricsHistogram]:
+def compute_weight_stats(params: dict[str, tp.Any] | tp.Any, repattern: str) -> dict[str, MetricsHistogram]:
     """Compute statistics for model weights in a JIT-compatible way.
 
     Analyzes model parameters matching the given pattern and computes
     histograms and statistical measures for monitoring training stability.
 
     Args:
-        params: Model parameters as nested dictionary or PyTree.
+        params: Model parameters as a nested dictionary, or a SpectraX
+            ``State`` object. ``State`` is unwrapped with ``raw()`` before
+            flattening.
         repattern: Regular expression pattern to match parameter paths.
                   Use '.*' to match all parameters.
 
@@ -918,6 +920,9 @@ def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str,
         >>> stats = compute_weight_stats(model.parameter_values(), r'.*dense.*')
         >>> # Gets statistics for all dense layer weights
     """
+    raw = getattr(params, "raw", None)
+    if callable(raw):
+        params = raw()
     stats = {}
     for path, param in traversals.flatten_dict(params).items():
         weight = param.value if hasattr(param, "value") else param

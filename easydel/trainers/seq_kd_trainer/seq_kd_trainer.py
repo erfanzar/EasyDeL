@@ -316,8 +316,9 @@ class SeqKDTrainer(Trainer):
 
             if self.teacher_fn is not None:
                 with capture_time() as generation_time_fn:
+                    host_prompt_ids = np.asarray(prompt_ids)
                     prompt_texts = self.processing_class.batch_decode(
-                        prompt_ids,
+                        host_prompt_ids,
                         skip_special_tokens=True,
                     )
                     generation_factor = int(

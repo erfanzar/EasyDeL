@@ -1604,6 +1604,8 @@ class BaseTrainer(BaseTrainerProtocol):
         num_examples, num_examples_exact, source_label = self._discover_dataset_num_examples(dataset, source=source)
         batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
         num_epochs = self.arguments.num_train_epochs if is_train else 1
+        if batch_size is None:
+            raise ValueError("Batch size must be configured before resolving step count.")
 
         def _steps_from_examples(total_examples: int) -> int:
             """Compute step count from a known number of examples.

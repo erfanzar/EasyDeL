@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for Apple's OpenELM family.
+
+Defines :class:`OpenELMConfig`, registered as ``model_type="openelm"``.
+OpenELM's distinguishing feature is **per-layer non-uniform sizing**: head
+counts (``num_query_heads``/``num_kv_heads``) and FFN multipliers are
+expanded into per-layer lists by linear interpolation between min/max
+values, so different layers in the trunk have different attention head
+counts and FFN widths. The :func:`make_divisible` helper, copied from the
+original MobileNet codebase, rounds the resulting per-layer dimensions to
+multiples of ``model_dim_divisor`` while never rounding down by more than
+10%.
+"""
 
 import typing
 from numbers import Number

@@ -762,13 +762,13 @@ class MambaManager(SingleTypeCacheManager):
         return new_pages
 
 
+# Mapping from cache specification types to their corresponding manager classes.
 spec_manager_map: dict[type[CacheSpec], type[SingleTypeCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
 }
-"""Mapping from cache specification types to their corresponding manager classes."""
 
 
 def get_manager_for_kv_cache_spec(kv_cache_spec: CacheSpec, **kwargs) -> SingleTypeCacheManager:

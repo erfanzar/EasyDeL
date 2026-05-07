@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -47,7 +48,11 @@ def main():
 
     student_module = load_causal_lm_model()
     student_state = student_module.to_state()
-    teacher_state = deepcopy_model(student_state)
+    lightweight = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+    teacher_state = None if lightweight else deepcopy_model(student_state)
+
+    def teacher_fn(prompts, **_):
+        return ["Synthetic teacher completion."] * len(prompts)
 
     trainer_args = make_config(
         ed.SeqKDConfig,
@@ -66,6 +71,7 @@ def main():
         processing_class=tokenizer,
         student_model=student_state,
         teacher_model=teacher_state,
+        teacher_fn=teacher_fn if lightweight else None,
         train_dataset=dataset,
     )
     logger.info("Starting SeqKD fine-tune.")

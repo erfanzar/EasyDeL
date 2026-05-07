@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the OLMo-2 (Open Language Model v2) family.
+
+Defines :class:`Olmo2Config`, registered as ``model_type="olmo2"``. OLMo-2's
+defining architectural change vs. OLMo-1 is **QK normalization** (RMSNorm on
+the query and key projections inside attention) for training stability;
+this is implemented in the modeling code, but the config still inherits the
+LLaMA-style hyperparameters (RoPE ``theta`` and ``rope_scaling``, RMSNorm
+epsilon, GQA via ``num_key_value_heads``). The defaults match the OLMo2-7B
+1124 release.
+"""
 
 import typing
 

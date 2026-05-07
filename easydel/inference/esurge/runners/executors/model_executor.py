@@ -203,14 +203,18 @@ class ModelStepExecutor:
                 graphother_template=graphother_template,
             )
         )
-        self._can_fuse_pipeline_model_step = self._uses_mpmd_mesh() and not self._lm_head_uses_tied_projection
+        self._can_fuse_pipeline_model_step = (
+            self._uses_mpmd_mesh()
+            and not self._lm_head_uses_tied_projection
+            and not self._model_uses_hybrid_linear_attention()
+        )
         self._pipeline_model_step_templates = (kv_pages_template, graphstate_template, graphother_template)
         self._lm_head_fn = self._build_lm_head_fn(
             graphstate_template=graphstate_template,
             graphother_template=graphother_template,
         )
-        # Backbone cache: keyed by (num_tokens, "backbone", mode)
-        self._backbone_cache: OrderedDict[tuple[int, str, str], tp.Any] = OrderedDict()
+        # Backbone cache: keyed by (num_tokens, "backbone", mode, use_pipeline_runtime)
+        self._backbone_cache: OrderedDict[tuple[int, str, str, bool], tp.Any] = OrderedDict()
         # LM-head cache: keyed by (padded_num_reqs, "lm_head", mode)
         self._lm_head_cache: OrderedDict[tuple[int, str, str], tp.Any] = OrderedDict()
         self._pipeline_model_step_fn_cache: OrderedDict[tuple[int, str], tp.Any] = OrderedDict()
@@ -247,8 +251,12 @@ class ModelStepExecutor:
 
         The fused PP model step is intentionally disabled for tied LM-head
         models because the projection weights live with the embedding stage,
-        not the final transformer stage. Callers use this property to avoid
-        repeatedly asking for a fused bucket that cannot exist for the model.
+        not the final transformer stage. It is also disabled for hybrid
+        linear-attention checkpoints because those models currently need the
+        split PP backbone + stage-local LM-head path to keep TPU continuations
+        valid across linear-attention cache updates. Callers use this property
+        to avoid repeatedly asking for a fused bucket that cannot exist for
+        the model.
         """
         return self._can_fuse_pipeline_model_step
 
@@ -268,6 +276,21 @@ class ModelStepExecutor:
         self._lm_head_hidden_sharding_cache.clear()
         if self._pipeline_runtime is not None:
             self._pipeline_runtime.clear_prepare_cache()
+
+    def refresh_kv_pages_template(
+        self,
+        kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
+    ) -> None:
+        """Refresh the cache template held for late-built PP model-step functions.
+
+        MPMD compile warm-ups donate KV/cache buffers just like real decode steps.
+        After the execution manager replaces its warm-up scratch cache with a
+        fresh runtime cache, this method updates the template tuple so any
+        future fused PP function uses live arrays for sharding extraction instead
+        of a donated/deleted warm-up object.
+        """
+        _, graphstate_template, graphother_template = self._pipeline_model_step_templates
+        self._pipeline_model_step_templates = (kv_pages_template, graphstate_template, graphother_template)
 
     def shutdown(self) -> None:
         """Join the resident PP-stage worker threads, if any.
@@ -414,6 +437,40 @@ class ModelStepExecutor:
             for key in ("tie_word_embeddings", "share_input_output_layers"):
                 if hasattr(config, key) and bool(getattr(config, key)):
                     return True
+        return False
+
+    def _model_uses_hybrid_linear_attention(self) -> bool:
+        """Detect checkpoints that mix full attention and linear attention layers.
+
+        Hybrid models such as Qwen3.5 carry a ``layer_types`` list on the text
+        config with entries like ``"full_attention"`` and
+        ``"linear_attention"``. Those models are still valid for true PP
+        inference, but the fused PP model-step executable is too aggressive:
+        it combines the SpectraX stage dispatch, linear-attention state update,
+        row gather, LM head, and sampling boundary into one TPU continuation.
+        Keeping them on the split path preserves the same PP schedule while
+        avoiding the continuator crash seen on real decode traffic.
+
+        Returns:
+            ``True`` if any known config object advertises at least one
+            ``linear_attention`` layer; otherwise ``False``.
+        """
+        configs = [getattr(self.model, "config", None)]
+        config = configs[0]
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            text_config = get_text_config()
+            if text_config is not config:
+                configs.append(text_config)
+        elif hasattr(config, "text_config"):
+            configs.append(config.text_config)
+
+        for cfg in configs:
+            layer_types = getattr(cfg, "layer_types", None)
+            if layer_types is None:
+                continue
+            if any(str(layer_type) == "linear_attention" for layer_type in layer_types):
+                return True
         return False
 
     def _lm_head_hidden_sharding(self, shape: tuple[int, ...]) -> NamedSharding | None:
@@ -614,7 +671,7 @@ class ModelStepExecutor:
           executor's mesh is MPMD, regardless of ``use_aot_forward``).
         * ``"aot"`` — non-PP ahead-of-time compile via
           ``spx.jit(...).lower(...).compile()``.
-        * ``"jit"`` — non-PP lazy JIT compile.
+        * ``"jit"`` — non-PP warmed ``spx.jit`` callables.
 
         Embedded into every backbone / LM-head / sampler cache key so
         a single :class:`ModelStepExecutor` instance can hold compiled
@@ -626,9 +683,11 @@ class ModelStepExecutor:
         return "aot" if self.use_aot_forward else "jit"
 
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
+        """Store a compiled fused-step variant under ``key`` in ``self._cache``."""
         self._cache_store(self._cache, key, value)
 
     def _cache_get(self, key: tuple[int, int, str, str]) -> tp.Any:
+        """Fetch a compiled fused-step variant by ``key`` from ``self._cache``."""
         return self._cache_lookup(self._cache, key)
 
     def cache_keys(self) -> list:
@@ -665,20 +724,37 @@ class ModelStepExecutor:
         mode = key[3] if len(key) == 4 else self._compile_mode()
         if not self._uses_mpmd_mesh():
             return (int(key[0]), int(key[1]), "model_step", mode) in self._cache
-        backbone_key = (key[0], "backbone", mode)
+        backbone_key_runtime = (key[0], "backbone", mode, True)
+        backbone_key_direct = (key[0], "backbone", mode, False)
         lm_head_key = (key[1], "lm_head", mode)
-        return backbone_key in self._backbone_cache and lm_head_key in self._lm_head_cache
+        return (backbone_key_runtime in self._backbone_cache or backbone_key_direct in self._backbone_cache) and (
+            lm_head_key in self._lm_head_cache
+        )
 
     def has_model_step(self, num_tokens: int, padded_num_reqs: int) -> bool:
         """Whether the fused SPMD model-step variant is compiled."""
         mode = self._compile_mode()
         return (int(num_tokens), int(padded_num_reqs), "model_step", mode) in self._cache
 
-    def has_backbone(self, num_tokens: int) -> bool:
+    def _backbone_cache_key(self, num_tokens: int, *, use_pipeline_runtime: bool) -> tuple[int, str, str, bool]:
+        """Build the cache key for a PP backbone variant.
+
+        The token bucket alone is not enough for PP inference: a ``4`` token
+        bucket can mean either one request prefill chunked to four prompt
+        tokens or four one-token decode requests. The resident stage runtime is
+        valid for the decode wavefront, while prefill chunks need the direct
+        SpectraX dispatch. Keeping the mode in the cache key lets both variants
+        coexist.
+        """
+        return (int(num_tokens), "backbone", self._compile_mode(), bool(use_pipeline_runtime))
+
+    def has_backbone(self, num_tokens: int, *, use_pipeline_runtime: bool = True) -> bool:
         """Whether a backbone variant has been compiled for the given token bucket.
 
         Args:
             num_tokens: Token-axis bucket size to look up.
+            use_pipeline_runtime: Whether to look for the resident PP-runtime
+                variant or the direct SpectraX-dispatch variant.
 
         Returns:
             ``True`` if the backbone cache already contains an entry for
@@ -686,8 +762,7 @@ class ModelStepExecutor:
         """
         if not self._uses_mpmd_mesh():
             return any(key[0] == int(num_tokens) and key[2] == "model_step" for key in self._cache)
-        mode = self._compile_mode()
-        return (int(num_tokens), "backbone", mode) in self._backbone_cache
+        return self._backbone_cache_key(num_tokens, use_pipeline_runtime=use_pipeline_runtime) in self._backbone_cache
 
     def has_lm_head(self, padded_num_reqs: int) -> bool:
         """Whether an LM-head variant has been compiled for the given request bucket.
@@ -704,7 +779,13 @@ class ModelStepExecutor:
         mode = self._compile_mode()
         return (int(padded_num_reqs), "lm_head", mode) in self._lm_head_cache
 
-    def get_compiled(self, *, num_tokens: int, padded_num_reqs: int) -> tp.Any:
+    def get_compiled(
+        self,
+        *,
+        num_tokens: int,
+        padded_num_reqs: int,
+        use_pipeline_runtime: bool = True,
+    ) -> tp.Any:
         """Stitch backbone + LM head into a single combined callable.
 
         Looks both compiled halves up under the executor's current compile
@@ -720,6 +801,9 @@ class ModelStepExecutor:
                 variant.
             padded_num_reqs: Request-axis bucket size; selects the LM-head
                 variant.
+            use_pipeline_runtime: Selects the PP backbone runtime mode. Decode
+                wavefronts use the resident stage runtime; prefill chunks use
+                direct SpectraX dispatch.
 
         Returns:
             Callable producing :class:`ModelStepOutputs` from
@@ -734,11 +818,23 @@ class ModelStepExecutor:
         fused_key = (int(num_tokens), int(padded_num_reqs), "model_step", mode)
         if fused_key in self._cache:
             return self._cache_lookup(self._cache, fused_key)
-        backbone_fn = self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
+        backbone_fn = self._cache_lookup(
+            self._backbone_cache,
+            self._backbone_cache_key(num_tokens, use_pipeline_runtime=use_pipeline_runtime),
+        )
         lm_head_fn = self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
         _pnr = int(padded_num_reqs)
 
         def _combined(graphstate_, graphother_, kv_pages_, metadata_):
+            """Stitched ``backbone -> gather -> lm_head`` callable for a window.
+
+            Mirrors the pre-split fused ``model_step`` signature so callers do
+            not have to know whether the backbone and LM head were compiled
+            independently. Performs the ``hidden_states[logits_indices]`` gather
+            on the host trace (outside the compiled LM head) so the LM-head
+            executable always sees ``[padded_num_reqs, hidden_dim]`` regardless
+            of the active token bucket.
+            """
             backbone_out = backbone_fn(graphstate_, graphother_, kv_pages_, metadata_)
             # Gather outside the compiled lm_head so it always sees
             # [padded_num_reqs, hidden_dim] regardless of num_tokens.
@@ -756,7 +852,7 @@ class ModelStepExecutor:
 
         return _combined
 
-    def get_backbone(self, *, num_tokens: int) -> tp.Any:
+    def get_backbone(self, *, num_tokens: int, use_pipeline_runtime: bool = True) -> tp.Any:
         """Look up the compiled backbone for ``num_tokens``.
 
         Args:
@@ -772,8 +868,10 @@ class ModelStepExecutor:
             KeyError: If no backbone has been compiled for that bucket
                 under the current compile mode.
         """
-        mode = self._compile_mode()
-        return self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
+        return self._cache_lookup(
+            self._backbone_cache,
+            self._backbone_cache_key(num_tokens, use_pipeline_runtime=use_pipeline_runtime),
+        )
 
     def get_lm_head(self, *, padded_num_reqs: int) -> tp.Any:
         """Look up the compiled LM head for ``padded_num_reqs``.
@@ -841,8 +939,19 @@ class ModelStepExecutor:
         if logits_sharding is not None:
             jit_kwargs["out_shardings"] = logits_sharding
 
-        @spx.jit(**jit_kwargs)  # pyright: ignore[reportUntypedFunctionDecorator]
+        @jax.jit(**jit_kwargs)
         def _stage_lm_head_from_parts(head_state_, hidden_parts_, index_parts_):
+            """Per-PP-stage compiled LM head consuming microbatch hidden parts.
+
+            The PP backbone produces one ``hidden_parts_[i]`` tensor per
+            microbatch on the final stage; this compiled function gathers the
+            relevant rows via ``index_parts_[i]``, concatenates and pads them
+            to ``padded_num_reqs``, applies the LM head projection (handling
+            tied weights and ``native_forward`` overrides), and applies the
+            optional ``clip_cap`` / ``logit_scale`` / ``soft_cap``
+            post-processing before returning the logits. Runs inside the
+            stage submesh so logits sharding matches the LM-head placement.
+            """
             with mesh_context:
                 with jax.named_scope("easydel/esurge/pp_lm_head_from_parts"):
                     with jax.named_scope("easydel/esurge/pp_lm_head_from_parts/gather_hidden_rows"):
@@ -885,6 +994,13 @@ class ModelStepExecutor:
         _ = _stage_lm_head_from_parts(lm_head_state, tuple(dummy_parts), tuple(dummy_indices))
 
         def wrapped_lm_head_from_parts(graphstate_, graphother_, hidden_parts_, index_parts_):
+            """Trace-friendly wrapper that re-binds the live LM-head state.
+
+            ``graphstate_`` / ``graphother_`` are captured here only for API
+            compatibility — the compiled inner closure (``_stage_lm_head_from_parts``)
+            instead reads ``self._lm_head_state`` directly so weight hot-swaps
+            via :meth:`update_graphs` take effect without recompilation.
+            """
             _ = (graphstate_, graphother_)
             if self._lm_head_state is None:
                 raise ValueError("eSurge PP lm_head state was not initialized.")
@@ -924,7 +1040,7 @@ class ModelStepExecutor:
 
         Returns:
             :class:`BackboneOutputs` produced by the eager pre-touch when
-            the backbone path is JIT (lazy) — useful for warming caches.
+            the backbone path uses warmed ``spx.jit`` callables.
             ``None`` if either half was already compiled or when the AOT
             path is taken (no eager call is made).
         """
@@ -999,6 +1115,13 @@ class ModelStepExecutor:
             return None
 
         def wrapped_model_step(graphstate_, graphother_, kv_pages_, metadata_):
+            """JIT-mode SPMD model-step wrapper that re-injects the live ``graphdef``.
+
+            Captures ``self`` so the AOT-bypass path always traces against the
+            most recent graphdef set by :meth:`update_graphs`, while keeping
+            the wrapper's ``(graphstate, graphother, kv_pages, metadata)``
+            signature symmetric with the AOT-compiled variant.
+            """
             return self._model_step_fn(
                 self.graphdef,
                 graphstate_,
@@ -1052,6 +1175,14 @@ class ModelStepExecutor:
         pipeline_model_step_fn = self._get_pipeline_model_step_fn(pnr, graphdef=self.graphdef)
 
         def wrapped_pipeline_model_step(graphstate_, graphother_, kv_pages_, metadata_):
+            """Dispatch the fused PP backbone+LM-head plan for one decode step.
+
+            Forwards to :meth:`_dispatch_pipeline_model_step`, which routes the
+            call through the resident :class:`PipelineStageRuntime` when one is
+            configured. The closure binds ``padded_num_reqs`` and the prepared
+            ``pipeline_model_step_fn`` so the SpectraX prepare cache stays
+            stable across decode steps with the same window shape.
+            """
             return self._dispatch_pipeline_model_step(
                 pipeline_model_step_fn,
                 graphstate_,
@@ -1073,6 +1204,7 @@ class ModelStepExecutor:
         graphstate: tp.Any,
         graphother: tp.Any,
         inputs: StepFunctionInputs,
+        use_pipeline_runtime: bool = True,
     ) -> BackboneOutputs | None:
         """Compile the transformer forward for one token bucket.
 
@@ -1086,8 +1218,7 @@ class ModelStepExecutor:
         * **AOT** — lowers and compiles the backbone jit through
           ``spx.jit(...).lower(...).compile()`` with graphstate / graphother
           as normal dynamic inputs.
-        * **JIT** — stores a closure around the lazy ``spx.jit`` so the
-          first dispatch traces.
+        * **JIT** — stores a closure around the warmed ``spx.jit`` callable.
 
         Caches the resulting callable in ``self._backbone_cache`` keyed
         by ``(num_tokens, "backbone", mode)``.
@@ -1098,6 +1229,10 @@ class ModelStepExecutor:
             graphstate, graphother: Trace templates / capture constants.
             inputs: Dummy ``StepFunctionInputs`` providing concrete shapes
                 for the lower step.
+            use_pipeline_runtime: If true, route the MPMD wrapper through the
+                resident PP stage runtime. Prefill-shaped split buckets pass
+                false because the resident continuator is only valid for the
+                decode/carry wavefront path.
 
         Returns:
             :class:`BackboneOutputs` from the eager warm-up call when the
@@ -1105,17 +1240,20 @@ class ModelStepExecutor:
             paths (no eager call) and when the bucket was already cached.
         """
         self.graphdef = graphdef
-        mode = self._compile_mode()
-        key = (int(num_tokens), "backbone", mode)
+        key = self._backbone_cache_key(num_tokens, use_pipeline_runtime=use_pipeline_runtime)
         if key in self._backbone_cache:
             return None
 
         if self._uses_mpmd_mesh():
 
             def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
-                return self._dispatch_pipeline_backbone(graphstate_, graphother_, kv_pages_, metadata_)
+                """MPMD backbone wrapper using resident PP or direct sxjit dispatch."""
+                if use_pipeline_runtime:
+                    return self._dispatch_pipeline_backbone(graphstate_, graphother_, kv_pages_, metadata_)
+                return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
             out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+            jax.block_until_ready(out.hidden_states)
             self._cache_store(self._backbone_cache, key, wrapped_backbone)
             return out
 
@@ -1127,6 +1265,12 @@ class ModelStepExecutor:
             return None
 
         def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
+            """JIT-mode backbone wrapper that re-injects the live ``graphdef``.
+
+            Lets weight hot-swaps (via :meth:`update_graphs`) take effect on
+            the next call without recompiling, by reading ``self.graphdef``
+            inside the closure each call.
+            """
             return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
         out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
@@ -1280,7 +1424,11 @@ class ModelStepExecutor:
         if len(input_batches) == 0:
             return []
         if not self._uses_mpmd_mesh() or self._pipeline_runtime is None or len(input_batches) == 1:
-            model_fn = self.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
+            model_fn = self.get_compiled(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                use_pipeline_runtime=False,
+            )
             return [model_fn(*batch) for batch in input_batches]
 
         backbone_outputs = self.execute_backbones_many(num_tokens=num_tokens, input_batches=input_batches)
@@ -1403,15 +1551,13 @@ class ModelStepExecutor:
         slice of work: a gather-then-matmul over the ``padded_num_reqs``
         sampled rows. Three branches are taken based on the compile mode:
 
-        * **MPMD** — refreshes the stage-local LM-head state, places dummy
-          hidden states on the LM-head stage submesh, and compiles a
-          dedicated ``_stage_lm_head`` jit that runs ``projection(...)``
-          (or the tied-embedding ``attend``) plus any logit clip / scale
-          / soft-cap post-processing on the final-stage submesh.
+        * **MPMD** — exports only the LM-head module, projects its state to
+          the head stage, and caches a tiny stage-local ``jax.jit`` wrapper.
+          That keeps the split PP projection true-stage-local while avoiding
+          a second SpectraX schedule for a one-stage matmul.
         * **AOT** — lowers and compiles ``self._lm_head_fn`` with graphstate /
           graphother as normal dynamic inputs.
-        * **JIT** — caches a closure around the lazy ``spx.jit`` form for
-          on-demand tracing.
+        * **JIT** — caches a closure around the warmed ``spx.jit`` callable.
 
         Stores the resulting callable in ``self._lm_head_cache`` keyed by
         ``(padded_num_reqs, "lm_head", mode)``. Idempotent.
@@ -1449,8 +1595,6 @@ class ModelStepExecutor:
                 raise ValueError("eSurge PP lm_head state was not initialized.")
             stage_mesh = self._lm_head_stage_mesh()
             hidden_sharding = self._lm_head_hidden_sharding(tuple(dummy_hs.shape))
-            if hidden_sharding is not None:
-                dummy_hs = jax.device_put(dummy_hs, hidden_sharding)
             logits_sharding = self._lm_head_replicated_sharding()
             lm_head_state = self._lm_head_state
             lm_head_state_sharding = spx.extract_sharding_structure(
@@ -1472,8 +1616,9 @@ class ModelStepExecutor:
             soft_cap = self._lm_head_soft_cap
             uses_tied_projection = self._lm_head_uses_tied_projection
 
-            @spx.jit(**jit_kwargs)  # pyright: ignore[reportUntypedFunctionDecorator]
+            @jax.jit(**jit_kwargs)
             def _stage_lm_head(head_state_, hs_):
+                """Run the exported LM-head projection on its owning PP stage."""
                 with mesh_context:
                     with jax.named_scope("easydel/esurge/pp_lm_head"):
                         with jax.named_scope("easydel/esurge/pp_lm_head/project"):
@@ -1502,9 +1647,12 @@ class ModelStepExecutor:
                                 logits = cap * jax.nn.tanh(logits / cap)
                         return logits
 
-            _ = _stage_lm_head(lm_head_state, dummy_hs)
+            if hidden_sharding is not None:
+                dummy_hs = jax.device_put(dummy_hs, hidden_sharding)
+            jax.block_until_ready(_stage_lm_head(lm_head_state, dummy_hs))
 
             def wrapped_lm_head(graphstate_, graphother_, hs_):
+                """Stage-local MPMD LM-head wrapper using the live projected state."""
                 del graphstate_, graphother_
                 if self._lm_head_state is None:
                     raise ValueError("eSurge PP lm_head state was not initialized.")
@@ -1521,6 +1669,7 @@ class ModelStepExecutor:
             return
 
         def wrapped_lm_head(graphstate_, graphother_, hs_):
+            """SPMD JIT-mode LM-head wrapper that injects the live ``graphdef``."""
             return self._lm_head_fn(self.graphdef, graphstate_, graphother_, hs_)
 
         _ = wrapped_lm_head(graphstate, graphother, dummy_hs)
@@ -1619,6 +1768,16 @@ class ModelStepExecutor:
             kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
             metadata: BatchMetadata,
         ) -> BackboneOutputs:
+            """JIT/AOT backbone step (transformer forward without LM head).
+
+            Binds ``graphdef`` to the captured ``graphstate``/``graphother``,
+            constructs the per-step :class:`RaggedPagesMetadata` from the
+            packed batch metadata, dispatches optional VLM and DeepStack
+            external inputs, and runs the transformer forward with
+            ``apply_lm_head=False``. Returns the squeezed last-layer hidden
+            states paired with the updated KV pages — the LM head is compiled
+            and run separately so it can be keyed by ``padded_num_reqs``.
+            """
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/backbone_step"):
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
@@ -1785,6 +1944,15 @@ class ModelStepExecutor:
             kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
             metadata: BatchMetadata,
         ) -> ModelStepOutputs:
+            """Fused PP backbone + final-stage LM-head step for one request bucket.
+
+            Compiled with ``spx.jit(mesh=self.mesh)`` so SpectraX still partitions
+            transformer layers across physical PP stages, but the sampled-row
+            gather and LM-head projection follow the transformer forward in the
+            final logical stage. Used only for untied LM-head models; tied
+            projection models keep the split path because the embedding-stage
+            weights would otherwise need to cross the PP boundary on every step.
+            """
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/pp_model_step"):
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
@@ -1933,6 +2101,15 @@ class ModelStepExecutor:
             metadata: BatchMetadata,
             padded_num_reqs: int,
         ) -> ModelStepOutputs:
+            """Fused SPMD backbone + LM-head step compiled per token/request bucket.
+
+            The same transformer forward as :func:`_backbone_step`, but instead
+            of returning the raw hidden states it gathers the per-request last-
+            token rows via ``metadata.logits_indices[:padded_num_reqs]`` and
+            applies the LM head inline. Keeping the gather and projection in
+            one SPMD executable removes the per-token dispatch / host
+            materialization that a split path would incur.
+            """
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/spmd_model_step"):
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
@@ -2059,6 +2236,14 @@ class ModelStepExecutor:
             graphother,
             gathered_hidden_states: jax.Array,
         ) -> jax.Array:
+            """JIT/AOT LM-head step over already-gathered ``[padded_num_reqs, hidden]`` rows.
+
+            Operates on the per-request last-token hidden states the runner
+            (or the upstream backbone wrapper) has already gathered, so the
+            compiled executable is keyed only by the request-axis bucket.
+            Binds ``graphdef`` / ``graphstate`` / ``graphother`` to materialize
+            the model module and delegates to :meth:`apply_lm_head`.
+            """
             with self.model.mesh:
                 # spx.bind only runs at trace/compile time (inside @spx.jit),
                 # not at inference runtime; XLA sees through it.

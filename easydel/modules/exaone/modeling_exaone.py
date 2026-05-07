@@ -638,6 +638,13 @@ class ExaoneModel(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.h))
 
         def _layer_loop(layer, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions, idx)``
+            through one decoder block, optionally collecting per-layer hidden
+            states / attention weights and updating the layer's KV cache view
+            in-place on ``past_key_values``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

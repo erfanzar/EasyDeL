@@ -4173,7 +4173,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            with self._layer_stage_context(idx, layers=self.layers):
+            with self._layer_stage_context(layer_idx, layers=self.layers):
                 layer_outputs = layer(
                     hidden_states=hidden_states,
                     mask_info=mask_info,
@@ -4183,7 +4183,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                     cache_view=past_key_values.views[layer_idx] if past_key_values is not None else None,
                     cache_metadata=cache_metadata,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, layer_idx, layers=self.layers)
 
             if output_attentions:
                 all_self_attentions += (layer_outputs.attentions,)
@@ -5239,8 +5239,46 @@ class Qwen3OmniMoeForConditionalGeneration(
     ) -> MoeCausalLMOutput:
         """Forward pass through the Thinker component.
 
-        For text generation, use this method. For audio output,
-        use the talker and code2wav components separately.
+        For text generation use this method directly. For end-to-end
+        audio output, pair the Thinker logits with the Talker and the
+        Code2Wav (token-to-waveform) components, which the surrounding
+        Qwen3-Omni wrapper exposes separately.
+
+        Args:
+            input_ids: Token ids ``(batch, seq_len)``; mutually exclusive
+                with ``inputs_embeds``.
+            inputs_embeds: Pre-computed embeddings
+                ``(batch, seq_len, hidden_size)``.
+            attention_mask: Boolean mask ``(batch, seq_len)``.
+            mask_info: Optional pre-built ``MaskInfo`` carrying
+                causal/sliding masks.
+            position_ids: 1-D or 3-D position ids; the Thinker chooses
+                the layout based on whether mRoPE is enabled.
+            input_features: Mel-spectrogram features
+                ``(batch, mel_bins, time)`` for the audio encoder.
+            pixel_values: Packed image pixel values for the vision tower.
+            image_grid_thw: Per-image ``(T, H, W)`` grids.
+            pixel_values_videos: Packed video pixel values for the vision
+                tower.
+            video_grid_thw: Per-video ``(T, H, W)`` grids.
+            output_attentions: Whether to return per-layer attention
+                weights.
+            output_hidden_states: Whether to return per-layer hidden
+                states.
+            output_router_logits: Whether to return MoE router logits
+                (used for the auxiliary load-balancing loss).
+            mode: Runtime mode (train/decode); auto-detected if ``None``.
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata accompanying ``past_key_values``.
+            apply_lm_head: When ``True`` (default) project the final
+                hidden states through the LM head; when ``False`` return
+                the hidden states only.
+
+        Returns:
+            MoeCausalLMOutput: ``logits`` (or hidden states when
+            ``apply_lm_head=False``), updated KV cache, optional hidden
+            states / attentions, and router logits / aux loss when MoE
+            tracing is enabled.
         """
         return self.thinker(
             input_ids=input_ids,

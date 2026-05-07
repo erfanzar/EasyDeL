@@ -140,6 +140,7 @@ class ToolCallingMixin:
             return tool_parsers
 
         for model_name, processor in model_processors.items():
+            parser_name: str | None = None
             try:
                 parser_name = (
                     tool_parser_name.get(model_name) if isinstance(tool_parser_name, dict) else tool_parser_name

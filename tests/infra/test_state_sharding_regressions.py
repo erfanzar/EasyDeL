@@ -24,6 +24,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 import easydel as ed
 import easydel.infra.base_state as base_state_module
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import sharding_matches
 
 
 @pytest.fixture(scope="module")
@@ -98,23 +99,24 @@ def test_optimizer_gather_works_without_mesh_context_and_create_validation(tiny_
         EasyDeLState.create(graphdef=gdef, graphstate=gstate, graphother=None)
 
 
-def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
-    import spectrax as spx
+def test_init_tx_places_optimizer_value_slots_with_named_sharding(tiny_sharded_llama):
+    state = EasyDeLState.create(model=tiny_sharded_llama).init_tx(optax.adam(1e-3))
 
-    state = EasyDeLState.create(model=tiny_sharded_llama)
-    rules = state.model.resolve_shardings_regex()
-    eval_opt_state = jax.eval_shape(lambda: optax.adam(1e-3).init(state.graphstate))
-    partition_specs = spx.match_partition_rules(rules, eval_opt_state)
-
-    def _has_sharded_axis(spec: jax.sharding.PartitionSpec) -> bool:
+    def _has_sharded_axis(spec: PartitionSpec) -> bool:
         return any(axis_spec is not None for axis_spec in tuple(spec))
 
-    spec_leaves = [
-        spec for spec in jax.tree_util.tree_leaves(partition_specs) if isinstance(spec, jax.sharding.PartitionSpec)
-    ]
-    assert spec_leaves, "Expected optimizer partition-spec leaves."
-    assert any(_has_sharded_axis(spec) for spec in spec_leaves), (
-        "Optimizer partition specs unexpectedly collapsed to replicated-only specs."
+    slot_shardings = []
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state.opt_state):
+        path_names = {getattr(key, "name", None) for key in path}
+        if not ({"mu", "nu"} & path_names) or not hasattr(leaf, "shape"):
+            continue
+        sharding = getattr(leaf, "sharding", None)
+        assert isinstance(sharding, NamedSharding)
+        slot_shardings.append(sharding)
+
+    assert slot_shardings, "Expected Adam optimizer slot shardings."
+    assert any(_has_sharded_axis(sharding.spec) for sharding in slot_shardings), (
+        "Optimizer value slots unexpectedly collapsed to replicated-only shardings."
     )
 
 
@@ -129,60 +131,22 @@ def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):
     assert re.search(target_pattern, "0/mu/model/norm/kernel/value/extra")
 
 
-def test_init_tx_builds_corrected_explicit_output_shardings(monkeypatch, tiny_sharded_llama):
-    import spectrax as spx
-
+def test_init_tx_skips_redundant_device_put_for_already_sharded_slots(monkeypatch, tiny_sharded_llama):
     state = EasyDeLState.create(model=tiny_sharded_llama)
-    compile_calls = {"count": 0}
-    captured: dict[str, object] = {}
+    original_fastpath = base_state_module.device_put_if_sharding_mismatch
+    calls = {"matched": 0, "placed": 0}
 
-    def fake_ejit(fn, **kwargs):
-        compile_calls["count"] += 1
-        captured.update(kwargs)
+    def counting_fastpath(leaf, sharding, *, donate=False):
+        if sharding_matches(leaf, sharding):
+            calls["matched"] += 1
+        else:
+            calls["placed"] += 1
+        return original_fastpath(leaf, sharding, donate=donate)
 
-        def wrapped(graphstate):
-            del graphstate
-            return {"ok": True}
-
-        return wrapped
-
-    def fake_match_partition_rules(_rules, tree, *args, **kwargs):
-        del _rules, args, kwargs
-        return jax.tree_util.tree_map(
-            lambda leaf: (
-                jax.sharding.PartitionSpec("does_not_exist")
-                if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) > 0
-                else jax.sharding.PartitionSpec()
-            ),
-            tree,
-        )
-
-    monkeypatch.setattr(base_state_module, "ejit", fake_ejit)
-    monkeypatch.setattr(spx, "match_partition_rules", fake_match_partition_rules)
+    monkeypatch.setattr(base_state_module, "device_put_if_sharding_mismatch", counting_fastpath)
     updated = state.init_tx(optax.adam(1e-3))
 
-    assert compile_calls["count"] == 1
     assert updated.tx is not None
-    assert updated.opt_state == {"ok": True}
-
-    out_shardings = captured.get("out_shardings")
-    assert out_shardings is not None
-
-    mesh_axis_names = set(state.mesh.axis_names)
-
-    def _iter_axis_names(spec):
-        for axis_spec in tuple(spec):
-            if axis_spec is None:
-                continue
-            if isinstance(axis_spec, tuple):
-                yield from axis_spec
-            else:
-                yield axis_spec
-
-    for leaf in jax.tree_util.tree_leaves(out_shardings):
-        if leaf is None:
-            continue
-        assert isinstance(leaf, jax.sharding.NamedSharding)
-        axis_names = set(_iter_axis_names(leaf.spec))
-        assert "does_not_exist" not in axis_names
-        assert axis_names.issubset(mesh_axis_names)
+    assert updated.opt_state is not None
+    assert calls["matched"] > 0
+    assert calls["placed"] > 0

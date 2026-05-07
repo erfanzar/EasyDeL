@@ -133,11 +133,12 @@ class Scheduler(SchedulerInterface):
         self,
         *,
         kv_cache_config: CacheGroupsConfig,
-        max_num_seqs: int,
-        max_num_batched_tokens: int | None,
-        max_model_len: int,
-        num_pages: int,
-        page_size: int,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
+        max_model_len: int | None = None,
+        num_pages: int | None = None,
+        page_size: int | None = None,
+        config: object | None = None,
         enable_prefix_caching: bool = True,
         max_num_seq_buckets: list[int] | None = None,
         async_scheduling: bool = True,
@@ -177,20 +178,58 @@ class Scheduler(SchedulerInterface):
         Raises:
             ValueError: For unknown scheduling policy or non-positive num_pages.
         """
+        if config is not None:
+            scheduler_config = getattr(config, "scheduler_config", None)
+            cache_config = getattr(config, "cache_config", None)
+            if scheduler_config is not None:
+                max_num_seqs = max_num_seqs if max_num_seqs is not None else scheduler_config.max_num_seqs
+                max_num_batched_tokens = (
+                    max_num_batched_tokens
+                    if max_num_batched_tokens is not None
+                    else scheduler_config.max_num_batched_tokens
+                )
+                max_model_len = max_model_len if max_model_len is not None else scheduler_config.max_model_len
+                max_num_seq_buckets = (
+                    max_num_seq_buckets if max_num_seq_buckets is not None else scheduler_config.max_num_seq_buckets
+                )
+                async_scheduling = scheduler_config.async_scheduling
+                long_prefill_token_threshold = scheduler_config.long_prefill_token_threshold
+                chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
+                token_safety_margin = scheduler_config.token_safety_margin
+                policy = scheduler_config.policy
+                num_speculative_tokens = scheduler_config.num_speculative_tokens
+            if cache_config is not None:
+                num_pages = num_pages if num_pages is not None else cache_config.num_pages
+                page_size = page_size if page_size is not None else cache_config.page_size
+                enable_prefix_caching = cache_config.enable_prefix_caching
+
+        missing = [
+            name
+            for name, value in (
+                ("max_num_seqs", max_num_seqs),
+                ("max_model_len", max_model_len),
+                ("num_pages", num_pages),
+                ("page_size", page_size),
+            )
+            if value is None
+        ]
+        if missing:
+            raise TypeError(f"Missing required scheduler arguments: {', '.join(missing)}")
+
         self.kv_cache_config = kv_cache_config
 
         self.finished_req_ids_dict: dict[int, set[str]] | None = defaultdict(set) if include_finished_set else None
 
-        self.max_num_running_reqs = max_num_seqs
+        self.max_num_running_reqs = int(max_num_seqs)
         # Unset budget falls back to model context length (matches engine docs).
         self.max_num_scheduled_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else max_model_len
-        self.max_model_len = max_model_len
+        self.max_model_len = int(max_model_len)
         self.data_parallel_size = 1
 
-        if num_pages is None or num_pages <= 0:
+        if int(num_pages) <= 0:
             raise ValueError(f"num_pages must be a positive integer, got {num_pages}")
-        self.num_pages = num_pages
-        self.page_size = page_size
+        self.num_pages = int(num_pages)
+        self.page_size = int(page_size)
         self.enable_prefix_caching = enable_prefix_caching
         self.async_scheduling = async_scheduling
         self.long_prefill_token_threshold = long_prefill_token_threshold

@@ -85,6 +85,61 @@ _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
 )
 
 
+def sharding_matches(value: tp.Any, sharding: tp.Any) -> bool:
+    """Return whether ``value`` is already placed with ``sharding``.
+
+    The fast path is intentionally conservative for ``NamedSharding``: the
+    mesh object must be identical, not just structurally equal. SpectraX MPMD
+    code uses concrete mesh identity to keep per-stage placements distinct, so
+    a value on an equal-but-different mesh should still be re-placed.
+
+    Args:
+        value: Candidate leaf, usually a ``jax.Array``.
+        sharding: Desired sharding for that leaf.
+
+    Returns:
+        ``True`` when a follow-up ``jax.device_put(value, sharding)`` would be
+        redundant for placement purposes.
+    """
+    current = getattr(value, "sharding", None)
+    if current is None:
+        return False
+    if current is sharding:
+        return True
+    if isinstance(current, NamedSharding) and isinstance(sharding, NamedSharding):
+        return (
+            current.mesh is sharding.mesh
+            and current.spec == sharding.spec
+            and getattr(current, "memory_kind", None) == getattr(sharding, "memory_kind", None)
+        )
+    return current == sharding
+
+
+def device_put_if_sharding_mismatch(value: tp.Any, sharding: tp.Any, *, donate: bool = False) -> tp.Any:
+    """Place ``value`` only when its current sharding differs from ``sharding``.
+
+    Large training states often pass through several sharding-normalization
+    layers during setup. For already-sharded arrays, repeating ``device_put``
+    over every parameter and optimizer slot can dominate startup time. This
+    helper preserves correctness by falling back to ``jax.device_put`` whenever
+    the leaf has no sharding or the sharding does not exactly match.
+
+    Args:
+        value: Pytree leaf to place.
+        sharding: Desired JAX sharding object. ``None`` leaves the value as-is.
+        donate: Forwarded to ``jax.device_put`` when placement is required.
+
+    Returns:
+        The original value if already correctly placed, otherwise the result of
+        ``jax.device_put``.
+    """
+    if sharding is None or not hasattr(value, "shape"):
+        return value
+    if sharding_matches(value, sharding):
+        return value
+    return jax.device_put(value, sharding, donate=donate)
+
+
 def _coerce_partition_axis(value: AxisPolicy | PartitionAxis | dict[str, tp.Any] | None) -> PartitionAxis:
     """Coerce *value* into a :class:`PartitionAxis` instance.
 

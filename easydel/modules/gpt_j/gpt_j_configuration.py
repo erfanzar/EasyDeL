@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for EleutherAI's GPT-J decoder-only language model.
+
+Defines :class:`GPTJConfig`, the EasyDeL configuration object for GPT-J 6B
+and family. GPT-J is a 28-layer decoder with rotary position embeddings
+applied to a configurable ``rotary_dim`` slice of each head, parallel
+attention/MLP residual paths (the GPT-J "parallel residual" trick), and a
+50,400-token BPE vocabulary.
+"""
 
 import typing
 

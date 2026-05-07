@@ -583,6 +583,8 @@ def _apply_qwen3_next_packed_updates_unified(
             single_output = gdr_single.attention_outputs
             single_recurrent = gdr_single.recurrent_state
 
+        if single_output is None:
+            raise RuntimeError("Grouped delta rule did not return attention outputs.")
         conv_states_i = jnp.where(single_slot_mask[:, None, None], shifted_conv_states, conv_states_i)
         recurrent_states_i = jnp.where(
             single_slot_mask[:, None, None, None],
@@ -605,9 +607,7 @@ def _apply_qwen3_next_packed_updates_unified(
         multi_slot_mask,
         size=num_prefill_chunks * prefill_chunk_size,
         fill_value=0,
-    )[
-        0
-    ].reshape(num_prefill_chunks, prefill_chunk_size)
+    )[0].reshape(num_prefill_chunks, prefill_chunk_size)
     packed_valid = (
         jnp.arange(num_prefill_chunks * prefill_chunk_size, dtype=jnp.int32) < jnp.sum(multi_slot_mask.astype(jnp.int32))
     ).reshape(num_prefill_chunks, prefill_chunk_size)
@@ -1463,9 +1463,11 @@ class Qwen3NextSparseMoeBlock(BaseMoeModule):
             act_fn=self.experts.act_fn,
         )
 
-        shared_out = self.shared_expert(hidden_states)
+        stage_mesh = resolve_stage_mesh(self.config.mesh, arr=hidden_states)
+        with spx.use_mesh(stage_mesh):
+            shared_out = self.shared_expert(hidden_states)
+            gate_input = self.shared_expert_gate(hidden_states)
         needs_upcast = self.dtype in lowfloats
-        gate_input = self.shared_expert_gate(hidden_states)
         if needs_upcast:
             gate = jax.nn.sigmoid(gate_input.astype(jnp.float32))
             shared_out = shared_out.astype(jnp.float32) * gate
@@ -2077,6 +2079,8 @@ class Qwen3NextLinearAttention(spx.Module):
             and packed_num_seqs is not None
         )
 
+        output: jax.Array | None = None
+        new_cache_view = None
         if use_packed_state_updates:
             conv_states = cache_view.conv_state
             recurrent_states = cache_view.recurrent_state
@@ -2120,7 +2124,16 @@ class Qwen3NextLinearAttention(spx.Module):
                 recurrent_state=recurrent_states,
             )
 
-        elif cache_view is not None:
+        if use_packed_state_updates:
+            if output is None or new_cache_view is None:
+                raise RuntimeError("Packed state update did not produce output/cache state.")
+            output = self.norm(output, z)
+            output = output.reshape(batch_size, seq_len, -1)
+            output = self.out_proj(output)
+
+            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
+
+        if cache_view is not None:
             conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
             conv_output, new_conv_state = apply_conv_with_state(
                 conv_input,
@@ -2137,13 +2150,6 @@ class Qwen3NextLinearAttention(spx.Module):
                 conv_output = jax.nn.silu(self.conv1d(conv_input))
             else:
                 conv_output = jax.nn.silu(self._stage_replicated_depthwise_conv(conv_input))
-
-        if use_packed_state_updates:
-            output = self.norm(output, z)
-            output = output.reshape(batch_size, seq_len, -1)
-            output = self.out_proj(output)
-
-            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
 
         conv_query = conv_output[:, :, : self.key_dim]
         conv_key = conv_output[:, :, self.key_dim : self.key_dim * 2]
@@ -2182,34 +2188,35 @@ class Qwen3NextLinearAttention(spx.Module):
             query = jnp.repeat(query, expand_ratio, axis=2)
             key = jnp.repeat(key, expand_ratio, axis=2)
 
-        if not use_packed_state_updates:
-            if grouped_decode:
-                output, new_recurrent_state = apply_grouped_single_step_gdr(
-                    query=query,
-                    key=key,
-                    value=value,
-                    beta=beta,
-                    decay=decay,
-                    recurrent_state=recurrent_state,
-                    gdr_op=self.gdr_op,
-                )
-                new_recurrent_state = _preserve_array_sharding(
-                    new_recurrent_state,
-                    partition_manager=self.config.runtime_sharding_resolver,
-                    partition_axis=self.config.partition_axis,
-                )
-            else:
-                gdr_output: GatedDeltaRuleOutput = self.gdr_op(
-                    query=query,
-                    key=key,
-                    value=value,
-                    beta=beta,
-                    decay=decay,
-                    conv_state=None,  # conv_state is handled separately above
-                    recurrent_state=recurrent_state,
-                )
-                output = gdr_output.attention_outputs
-                new_recurrent_state = gdr_output.recurrent_state
+        if grouped_decode:
+            output, new_recurrent_state = apply_grouped_single_step_gdr(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=recurrent_state,
+                gdr_op=self.gdr_op,
+            )
+            new_recurrent_state = _preserve_array_sharding(
+                new_recurrent_state,
+                partition_manager=self.config.runtime_sharding_resolver,
+                partition_axis=self.config.partition_axis,
+            )
+        else:
+            gdr_output: GatedDeltaRuleOutput = self.gdr_op(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                conv_state=None,  # conv_state is handled separately above
+                recurrent_state=recurrent_state,
+            )
+            output = gdr_output.attention_outputs
+            new_recurrent_state = gdr_output.recurrent_state
+        if output is None:
+            raise RuntimeError("Grouped delta rule did not return attention outputs.")
 
         z = apply_logical_sharding(
             z,

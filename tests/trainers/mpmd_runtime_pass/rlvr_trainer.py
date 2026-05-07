@@ -29,6 +29,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import jax
 from datasets import load_dataset
 
 import easydel as ed
@@ -67,6 +68,7 @@ def main():
         overrides={
             **mpmd_generation_length_overrides(),
             "num_return_sequences": 4,
+            "generation_num_return_sequences": 4,
             "answer_key": "answer",
             "format_pattern": r"\\boxed\{.+\}",
             "format_reward_weight": 0.1,
@@ -76,6 +78,7 @@ def main():
             "scale_rewards": "group",
         },
     )
+    trainer_args.generation_num_return_sequences = trainer_args.num_return_sequences
 
     def format_gsm8k(example):
         return {
@@ -92,8 +95,10 @@ def main():
         train_dataset=train_dataset,
         processing_class=tokenizer,
     )
-    trainer.train()
-    logger.info("RLVR GSM8K run finished.")
+    output = trainer.train()
+    step = int(jax.device_get(output.state.step))
+    assert step >= 1, f"Expected RLVR training to advance, got step={step}"
+    logger.info("RLVR GSM8K run finished at step=%s.", step)
 
 
 if __name__ == "__main__":

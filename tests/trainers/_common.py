@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Iterable
 from functools import lru_cache
 from pathlib import Path
@@ -29,10 +30,13 @@ from transformers import AutoTokenizer
 
 import easydel as ed
 
-MODEL_REPO: str = "Qwen/Qwen3-4B" if jax.default_backend() == "tpu" else "Qwen/Qwen2.5-0.5B-Instruct"
+_DEFAULT_MODEL_REPO = "Qwen/Qwen3-4B" if jax.default_backend() == "tpu" else "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_REPO: str = os.environ.get("EASYDEL_RUNTIME_MODEL_REPO", _DEFAULT_MODEL_REPO)
 
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
-PREFERENCE_SPLIT = "train[:50%]"
+PREFERENCE_SPLIT = os.environ.get("EASYDEL_RUNTIME_DATASET_SPLIT") or (
+    "train[:32]" if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"} else "train[:50%]"
+)
 MAX_PROMPT_LENGTH = 256
 MAX_COMPLETION_LENGTH = 256
 MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH  # 512, divisible by 128
@@ -73,6 +77,7 @@ def get_tokenizer(model_repo: str = MODEL_REPO):
 
 
 def _load_model_kwargs() -> dict[str, Any]:
+    lightweight = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
     return dict(
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
@@ -82,7 +87,7 @@ def _load_model_kwargs() -> dict[str, Any]:
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=MAX_TOTAL_LENGTH,
             mask_max_position_embeddings=MAX_TOTAL_LENGTH,
-            attn_mechanism=ed.AttentionMechanisms.AUTO,
+            attn_mechanism=ed.AttentionMechanisms.VANILLA if lightweight else ed.AttentionMechanisms.AUTO,
             attn_dtype=jnp.bfloat16,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
             use_expert_tensor_mode=False,
@@ -95,7 +100,10 @@ def _load_model_kwargs() -> dict[str, Any]:
 def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelForCausalLM:
     repo = model_repo or MODEL_REPO
     tokenizer = get_tokenizer(repo)
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(repo, **_load_model_kwargs())
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=repo,
+        **_load_model_kwargs(),
+    )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model  # pyright: ignore[reportReturnType]
 
@@ -105,7 +113,12 @@ def load_sequence_classifier_model(
 ) -> ed.AutoEasyDeLModelForSequenceClassification:
     repo = model_repo or MODEL_REPO
     tokenizer = get_tokenizer(repo)
-    model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(repo, num_labels=1, **_load_model_kwargs())
+    kwargs = _load_model_kwargs()
+    kwargs["config_kwargs"]["num_labels"] = 1
+    model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
+        pretrained_model_name_or_path=repo,
+        **kwargs,
+    )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model  # pyright: ignore[reportReturnType]
 
@@ -188,6 +201,32 @@ def make_config(
 
     if overrides:
         base_args.update(overrides)
+    runtime_steps = os.environ.get("EASYDEL_RUNTIME_MAX_TRAINING_STEPS")
+    if runtime_steps:
+        base_args["max_training_steps"] = int(runtime_steps)
+    if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}:
+        base_args.update(
+            {
+                "total_batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "max_prompt_length": 32,
+                "max_completion_length": 8,
+                "max_length": 40,
+                "generation_num_return_sequences": 1,
+                "generation_interval": 1_000_000,
+                "num_return_sequences": 1,
+                "num_generations": 3,
+                "num_remains_in_group": 2,
+                "group_size": 1,
+                "num_env_groups": 1,
+                "max_steps": 1,
+                "use_wandb": False,
+                "do_last_save": False,
+                "save_optimizer_state": False,
+                "save_steps": None,
+                "generation_log_to_wandb": False,
+            }
+        )
 
     field_names = set(getattr(config_cls, "__dataclass_fields__", {}).keys())
     filtered = {key: value for key, value in base_args.items() if key in field_names}
@@ -219,12 +258,13 @@ def run_trainer(
 
 
 def build_reward_dataset(split: str = PREFERENCE_SPLIT):
-    dataset = load_preference_dataset(split)
-    required = {"prompt", "chosen", "rejected"}
-    missing = required - set(dataset.column_names)
-    if missing:
-        raise ValueError(f"Dataset split {split} missing columns: {missing}")
-    return dataset
+    """Load paired preference data for reward-model runtime smoke tests.
+
+    The reward trainer can derive the prompt from chat-style chosen/rejected
+    records, so the helper accepts the UltraFeedback layout used by the other
+    runtime scripts instead of requiring a separate ``prompt`` column.
+    """
+    return load_preference_dataset(split)
 
 
 def dummy_reward_fn(*, prompts: Iterable[Any] | None = None, completions: Iterable[Any] | None = None, **_: Any):

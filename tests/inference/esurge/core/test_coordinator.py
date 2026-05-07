@@ -32,6 +32,9 @@ unified API. Tests focus on:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import jax.numpy as jnp
 import pytest
 
@@ -126,8 +129,9 @@ def test_factory_returns_no_prefix_for_zero_groups_when_caching_disabled():
 
 def test_cache_coordinator_is_abstract():
     """Cannot instantiate ``CacheCoordinator`` directly -- has abstract method."""
+    abstract_ctor = cast(Callable[..., object], CacheCoordinator)
     with pytest.raises(TypeError):
-        CacheCoordinator(
+        abstract_ctor(
             num_pages=10,
             kv_cache_groups=[],
             max_model_len=64,

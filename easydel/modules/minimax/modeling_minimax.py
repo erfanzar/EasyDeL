@@ -633,6 +633,13 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
         )
 
         def _normalize_weights(weights: Array) -> Array:
+            """Renormalise top-k expert gates to sum to 1 along the last axis.
+
+            Plugged into ``moe_hooks.refine_weights_hook`` so MiniMax routes
+            tokens by *softmax-then-renormalise-after-top-k*, matching the
+            reference HF implementation. The ``1e-8`` floor avoids division
+            by zero when all gates collapse to the same expert under fp16.
+            """
             return weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-8)
 
         self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=_normalize_weights)
@@ -1096,6 +1103,15 @@ class MiniMaxModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Body of the MiniMax decoder scan over hybrid attention layers.
+
+            Carry: ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, layer_index)``. ``block`` may be either a
+            *lightning* (linear-attention) layer or a softmax-attention
+            layer; the shared :class:`HybridCache` view at ``idx`` decides
+            which kernel to use. ``attention_mask`` is forwarded raw so
+            lightning attention can apply its window-free padding correction.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

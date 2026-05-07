@@ -17,6 +17,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import jax
+
 import easydel as ed
 
 if __package__ in {None, ""}:
@@ -53,8 +55,10 @@ def main():
         overrides={
             **mpmd_generation_length_overrides(),
             "num_return_sequences": 4,
+            "generation_num_return_sequences": 4,
         },
     )
+    trainer_args.generation_num_return_sequences = trainer_args.num_return_sequences
 
     dataset = load_preference_dataset()
 
@@ -66,8 +70,10 @@ def main():
         train_dataset=dataset,
         processing_class=tokenizer,
     )
-    trainer.train()
-    logger.info("GRPO run finished.")
+    output = trainer.train()
+    step = int(jax.device_get(output.state.step))
+    assert step >= 1, f"Expected GRPO training to advance, got step={step}"
+    logger.info("GRPO run finished at step=%s.", step)
 
 
 if __name__ == "__main__":

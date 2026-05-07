@@ -28,6 +28,12 @@ Classes:
     Phi3LongRoPEScaledRotaryEmbedding: RoPE with Phi-3 LongRoPE scaling.
     Llama3RotaryEmbedding: RoPE with Llama-3 wavelength-based scaling.
 
+Module-level variables:
+    AVAILABLE_ROPE_TYPES: Registry mapping rope-type identifiers (strings)
+        to their concrete :class:`spx.Module` classes. Populated by the
+        ``rope_wrapper`` decorator at import time so that
+        :func:`get_rope` / :func:`get_frequencies` can dispatch by name.
+
 The `rope_wrapper` decorator registers each class in `AVAILABLE_ROPE_TYPES`
 for dynamic lookup by rope type name.
 
@@ -75,7 +81,6 @@ from ._compute_fns import (
 from ._utils import _rotate_gptj, _rotate_neox
 
 AVAILABLE_ROPE_TYPES = {}
-"""A dictionary to store registered RoPE (Rotary Position Embedding) types and their configurations."""
 
 
 _T = tp.TypeVar("_T")

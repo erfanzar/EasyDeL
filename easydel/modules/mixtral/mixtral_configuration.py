@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for Mistral AI's Mixtral sparse-MoE decoder family.
+
+Defines :class:`MixtralConfig`, registered under the ``mixtral`` model-type.
+Mixtral replaces every FFN with a softmax-routed
+Top-``num_experts_per_tok``-of-``num_local_experts`` Mixture-of-Experts
+(8-of-2 in the reference 8x7B). It keeps Mistral's grouped-query attention
+and **sliding-window attention** (``sliding_window``), and the config
+surfaces ``router_aux_loss_coef`` / ``router_jitter_noise`` for load
+balancing during training. :meth:`MixtralConfig.get_mask_details` registers
+an ``AttnMaskType.SLIDING`` detail on every layer so the attention runtime
+applies the window during decoding.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

@@ -132,6 +132,7 @@ def partial_kl_distillation_loss(
         normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
         kl_loss = jnp.sum(per_token_partial_kl * mask) / normalizer
     else:
+        normalizer = jnp.array(1.0, dtype=dtype)
         kl_loss = jnp.mean(per_token_partial_kl)
     kl_loss = kl_loss * temp_sq
 

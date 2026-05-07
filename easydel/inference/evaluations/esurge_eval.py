@@ -1550,7 +1550,10 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         if mesh is None:
             mesh = getattr(scoring_model, "mesh", None)
 
-        mesh_ctx = mesh if hasattr(mesh, "__enter__") and hasattr(mesh, "__exit__") else nullcontext()
+        if mesh is not None and hasattr(mesh, "__enter__") and hasattr(mesh, "__exit__"):
+            mesh_ctx = mesh
+        else:
+            mesh_ctx = nullcontext()
         with mesh_ctx:
             logits = scoring_logits_fn(input_ids_jax, attention_mask_jax)
         if logits is None:

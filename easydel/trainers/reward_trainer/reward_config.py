@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the reward-model trainer.
+
+Defines :class:`RewardConfig`, which extends :class:`TrainingArguments`
+with reward-model-specific knobs: maximum sequence length, an optional
+reward-centring penalty (so the predicted scalar score has zero mean),
+dropout disabling, and the dataset preprocessing worker count.
+"""
+
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry

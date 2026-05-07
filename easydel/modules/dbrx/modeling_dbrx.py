@@ -99,6 +99,14 @@ def _patch_hf_dbrx_aux_loss_return_type() -> None:
         return
 
     def _patched_load_balancing_loss_func(*args, **kwargs):
+        """Wrap HF's DBRX MoE load-balancing loss to always return a tensor.
+
+        Older HF builds occasionally return a Python scalar from
+        ``load_balancing_loss_func`` instead of a ``torch.Tensor``, which
+        breaks downstream code that calls ``.to(...)``. This patch normalizes
+        the return value to a ``torch.Tensor`` placed on the gate logits'
+        device.
+        """
         out = base_fn(*args, **kwargs)
         if hasattr(out, "to"):
             return out
@@ -116,6 +124,14 @@ _patch_hf_dbrx_aux_loss_return_type()
 
 
 def _config_uses_mpmd(config) -> bool:
+    """Return ``True`` when the resolved mesh is MPMD (pipeline-parallel).
+
+    Checks the live mesh first via :func:`is_mpmd_mesh` or a ``pp`` axis
+    size greater than 1. Falls back to inspecting the declared
+    ``sharding_axis_names`` / ``sharding_axis_dims`` on ``config`` for the
+    pre-mesh planning phase, so MoE-routing code can pick the correct
+    expert-parallel implementation before the mesh is built.
+    """
     mesh = getattr(config, "_hidden_mesh", None) or getattr(config, "mesh", None)
     if is_mpmd_mesh(mesh) or int(getattr(mesh, "shape", {}).get("pp", 1)) > 1:
         return True
@@ -1223,6 +1239,15 @@ class DbrxModel(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.blocks))
 
         def _layer_loop(block, carry):
+            """Per-block body for the DBRX decoder ``scan``.
+
+            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, idx)``. Records the input hidden state when
+            requested, runs one DBRX decoder block at the corresponding
+            pipeline stage, optionally accumulates attention weights and the
+            block's MoE router logits, updates the per-block KV cache slot,
+            and returns the next carry.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

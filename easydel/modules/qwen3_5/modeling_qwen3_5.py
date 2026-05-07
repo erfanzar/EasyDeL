@@ -360,10 +360,59 @@ class Qwen3_5Model(Qwen3VLModel):
         """Forward pass through the Qwen3.5 multimodal model.
 
         Encodes image/video inputs via the vision tower, merges them into
-        the text embedding stream, and runs the language model decoder.
+        the text embedding stream at placeholder token positions, derives
+        3-D mRoPE indices (from explicit ``mm_token_type_ids`` or by
+        inferring spans from token IDs), then runs the Qwen3-Next-based
+        language decoder.
+
+        Args:
+            input_ids: Text token ids of shape ``(batch, seq_len)``.
+                Mutually exclusive with ``inputs_embeds``.
+            inputs_embeds: Pre-computed input embeddings of shape
+                ``(batch, seq_len, hidden_size)``. Mutually exclusive
+                with ``input_ids``.
+            attention_mask: Boolean mask ``(batch, seq_len)`` marking
+                non-padding positions.
+            mask_info: Optional pre-built ``MaskInfo`` carrying causal
+                / sliding masks; constructed automatically when omitted.
+            position_ids: Position indices. May be ``(batch, seq_len)``
+                for 1-D RoPE or ``(3, batch, seq_len)`` for 3-D mRoPE
+                (text/height/width); flattened by
+                :func:`_maybe_flatten_position_ids_for_text` when the
+                text config disables mRoPE.
+            mode: Runtime mode (train/decode). Auto-detected if ``None``.
+            past_key_values: KV cache used for autoregressive decoding.
+                One of ``TransformerCache``, ``RaggedPagesCache``, or
+                ``HybridCache``.
+            cache_metadata: Cache metadata accompanying ``past_key_values``.
+            output_attentions: Whether to return per-layer attention weights.
+            output_hidden_states: Whether to return per-layer hidden states.
+            visual_pos_masks: Compatibility no-op accepted for parity
+                with sibling Qwen3-VL forwards.
+            deepstack_visual_embeds: Compatibility no-op (Qwen3.5 does
+                not use deepstack mergers).
+            pixel_values: Packed image pixel values for the vision tower.
+            pixel_values_videos: Packed video pixel values for the vision tower.
+            image_grid_thw: Per-image ``(T, H, W)`` grid dimensions.
+            video_grid_thw: Per-video ``(T, H, W)`` grid dimensions.
+            image_max_grid_size: Optional shared maximum grid size for
+                static-shape compilation of image batches.
+            video_max_grid_size: Same as above for videos.
+            cache_position: Compatibility no-op.
+            rope_deltas: Compatibility no-op (overwritten internally).
+            mm_token_type_ids: Per-token modality ids
+                (0=text, 1=image, 2=video) used to build mRoPE indices
+                when ``position_ids`` is omitted.
+            **kwargs: Forward-compatibility sink; ignored.
 
         Returns:
-            Qwen3VLModelOutputWithPast: Model outputs including logits and hidden states.
+            Qwen3VLModelOutputWithPast: ``last_hidden_state``,
+            ``past_key_values``, optional ``hidden_states`` /
+            ``attentions``, and computed ``rope_deltas``.
+
+        Raises:
+            ValueError: If both ``input_ids`` and ``inputs_embeds`` are
+                provided, or both are ``None``.
         """
         del rope_deltas, kwargs
         if (input_ids is None) ^ (inputs_embeds is not None):

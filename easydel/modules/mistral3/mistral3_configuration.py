@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the Mistral-3 / Pixtral vision-language family.
+
+Defines :class:`Mistral3Config`, a composite config that bundles a Pixtral
+vision tower (``vision_config``) with a Mistral-Nemo / Mistral-Small text
+decoder (``text_config``). The projector folds each
+``spatial_merge_size``×``spatial_merge_size`` patch group into a single
+token before projecting into the LM embedding space, and image tokens are
+spliced into the text stream at the position of ``image_token_index``.
+"""
 
 import typing as tp
 

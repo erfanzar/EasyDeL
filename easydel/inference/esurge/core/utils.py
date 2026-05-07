@@ -381,8 +381,8 @@ class FreeCachePageQueue:
         return ret
 
 
+# Global hash value used as the parent hash for the first page in a sequence.
 none_hash: int
-"""Global hash value used as the parent hash for the first page in a sequence."""
 
 
 def init_none_hash() -> None:

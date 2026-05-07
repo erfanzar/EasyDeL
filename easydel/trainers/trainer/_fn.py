@@ -288,8 +288,8 @@ def _make_base_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    training_step,
-    ScheduledLossAdapter(
+    step_fn=training_step,
+    adapter=ScheduledLossAdapter(
         name="base",
         make_loss=_make_base_scheduled_loss,
         make_cache_key=_base_scheduled_loss_cache_key,

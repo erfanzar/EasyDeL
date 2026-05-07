@@ -101,22 +101,17 @@ def sample_top_p_efficient(
     return jnp.take_along_axis(top_k_indices, jnp.expand_dims(sampled_k_index, axis=-1), axis=-1).squeeze(-1)
 
 
+# vmaped_sample_top_p_efficient: Vectorized version of sample_top_p_efficient
+# for batch processing. Maps the sampling function over batches with
+# independent top_p and temperature values per sample while sharing the random
+# key. Inputs:
+#   logits: Batched logits of shape (batch_size, vocab_size).
+#   top_p: Per-sample top_p values of shape (batch_size,).
+#   temperature: Per-sample temperatures of shape (batch_size,).
+#   rng: Shared random key.
+#   top_k_for_computation: Number of top tokens to consider.
+# Returns sampled tokens of shape (batch_size,).
 vmaped_sample_top_p_efficient = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)
-"""Vectorized version of sample_top_p_efficient for batch processing.
-
-Maps the sampling function over batches with independent top_p and
-temperature values per sample while sharing the random key.
-
-Args:
-    logits: Batched logits of shape (batch_size, vocab_size).
-    top_p: Per-sample top_p values of shape (batch_size,).
-    temperature: Per-sample temperatures of shape (batch_size,).
-    rng: Shared random key.
-    top_k_for_computation: Number of top tokens to consider.
-
-Returns:
-    Sampled tokens of shape (batch_size,).
-"""
 
 
 @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=(0))

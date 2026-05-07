@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -45,16 +46,20 @@ def main():
     tokenizer = get_tokenizer()
     policy_model = load_causal_lm_model()
 
+    overrides = {
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "max_length": 768,
+        "num_train_epochs": 1,
+        "total_batch_size": 2,
+    }
+    if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}:
+        overrides.update({"alpha": 0.0, "beta": 0.0})
+
     trainer_args = make_config(
         ed.XPOConfig,
         "xpo",
-        overrides={
-            "max_prompt_length": 512,
-            "max_completion_length": 256,
-            "max_length": 768,
-            "num_train_epochs": 1,
-            "total_batch_size": 2,
-        },
+        overrides=overrides,
     )
 
     dataset = load_preference_dataset()

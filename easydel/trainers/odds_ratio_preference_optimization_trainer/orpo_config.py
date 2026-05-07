@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the ORPO trainer.
+
+Defines :class:`ORPOConfig`, which exposes the ORPO-specific knobs
+(``beta`` strength, length budgets, label padding) on top of the
+shared :class:`TrainingArguments` surface.  ORPO is reference-free, so
+the configuration intentionally omits any reference-model fields.
+"""
 
 from dataclasses import dataclass, field
 

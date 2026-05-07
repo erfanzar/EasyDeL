@@ -564,6 +564,25 @@ class OlmoModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Apply a single decoder block while threading scan-friendly state.
+
+            Used as the body of :meth:`spx.nn.ModuleList.scan` so that the same
+            closure handles both the eager Python loop (when ``scan_layers`` is
+            off) and the scanned/pipelined path. The ``carry`` tuple bundles
+            everything that has to flow between layers; intermediate
+            collections (hidden states, attentions) are appended only when the
+            corresponding ``output_*`` flag is set.
+
+            Args:
+                block: The :class:`OlmoDecoderLayer` (or its remat-wrapped
+                    variant) to invoke at this step.
+                carry: ``(hidden_states, cache_views, all_hidden_states,
+                    all_attentions, layer_idx)`` carried from the previous step.
+
+            Returns:
+                tuple: Updated carry with the layer's hidden state, cache, and
+                optional collected outputs, plus an incremented ``layer_idx``.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

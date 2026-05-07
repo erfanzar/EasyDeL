@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from spectrax import PartitionAxis, PartitionManager
+from spectrax import PartitionAxis, PartitionManager, SpxMesh
 
 import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
@@ -404,14 +404,14 @@ def _make_tp_grouped_decode_inputs(dtype=jnp.bfloat16, batch: int = 8):
     return query, key, value, beta, decay, recurrent_state
 
 
-def _make_runtime_mesh(axis_dims: tuple[int, ...] = (1, 1, -1, 1, 1, 1)) -> Mesh:
+def _make_runtime_mesh(axis_dims: tuple[int, ...] = (1, 1, -1, 1, 1, 1)) -> SpxMesh:
     return Qwen3NextConfig(
         sharding_axis_dims=axis_dims,
         backend=jax.default_backend(),
     ).mesh
 
 
-def _make_gdr_op(mesh: Mesh, runtime_dtype=jnp.bfloat16, axis_dims: tuple[int, ...] = (1, 1, -1, 1, 1, 1)):
+def _make_gdr_op(mesh: SpxMesh, runtime_dtype=jnp.bfloat16, axis_dims: tuple[int, ...] = (1, 1, -1, 1, 1, 1)):
     base_config = Qwen3NextConfig(
         sharding_axis_dims=axis_dims,
         backend=jax.default_backend(),

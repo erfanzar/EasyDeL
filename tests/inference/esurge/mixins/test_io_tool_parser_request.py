@@ -340,8 +340,10 @@ def test_build_tool_parser_request_skips_non_dict_tools():
         ],
     )
     assert result is not None
-    assert len(result.tools) == 1
-    assert result.tools[0].function.name == "valid_func"
+    tools = result.tools
+    assert tools is not None
+    assert len(tools) == 1
+    assert tools[0].function.name == "valid_func"
 
 
 def test_build_tool_parser_request_normalizes_nested_function():
@@ -358,7 +360,9 @@ def test_build_tool_parser_request_normalizes_nested_function():
         ],
     )
     assert result is not None
-    assert result.tools[0].function.name == "search"
+    tools = result.tools
+    assert tools is not None
+    assert tools[0].function.name == "search"
 
 
 def test_run_output_parsers_no_delegating_parser():

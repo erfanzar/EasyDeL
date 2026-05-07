@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Spectrax implementation of Meta's Llama family decoder language model.
+
+Provides the canonical Llama-1/Llama-2/Llama-3 decoder-only transformer with
+grouped-query attention (GQA), rotary positional embeddings (configurable
+``rope_theta`` plus optional NTK / linear / dynamic scaling), RMSNorm
+pre-normalisation, and a SiLU-gated SwiGLU MLP.
+
+Module exports:
+    - :class:`LlamaAttention`: GQA self-attention with RoPE.
+    - :class:`LlamaMLP`: SwiGLU feed-forward block.
+    - :class:`LlamaBlock`: Pre-norm decoder layer.
+    - :class:`LlamaModel`: Bare backbone returning hidden states.
+    - :class:`LlamaForCausalLM`: Decoder LM with optional tied LM head.
+    - :class:`LlamaForSequenceClassification`: Pooled classification head.
+"""
 
 from functools import partial
 
@@ -474,6 +489,15 @@ class LlamaModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Run a single decoder ``block`` and update the scan ``carry``.
+
+            Carry layout: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)``.
+
+            Optionally appends pre-block hidden states / attention weights to
+            the auxiliary tuples and threads cache views through
+            :meth:`_layer_cache_view_at` / :meth:`_layer_cache_view_update`.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

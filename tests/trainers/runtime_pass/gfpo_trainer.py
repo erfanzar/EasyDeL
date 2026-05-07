@@ -21,6 +21,7 @@ response length inflation while maintaining accuracy.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -68,9 +69,15 @@ def main():
         },
     )
 
-    # Verify GFPO-specific parameters
-    assert trainer_args.num_generations == 8, f"Expected 8, got {trainer_args.num_generations}"
-    assert trainer_args.num_remains_in_group == 4, f"Expected 4, got {trainer_args.num_remains_in_group}"
+    lightweight = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+    expected_generations = 3 if lightweight else 8
+    expected_remains = 2 if lightweight else 4
+    assert trainer_args.num_generations == expected_generations, (
+        f"Expected {expected_generations}, got {trainer_args.num_generations}"
+    )
+    assert trainer_args.num_remains_in_group == expected_remains, (
+        f"Expected {expected_remains}, got {trainer_args.num_remains_in_group}"
+    )
     assert trainer_args.filter_by_length is True
     assert trainer_args.filter_by_efficiency is True
 

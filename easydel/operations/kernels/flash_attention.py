@@ -200,6 +200,33 @@ class FlashAttn(OperationImpl):
             warning_message: str | None = None,
             preserve_varlen_semantics: bool = False,
         ) -> AttentionOutput:
+            """Run a non-Flash attention path when FlashAttention cannot be used.
+
+            Captures the enclosing ``forward_native`` arguments by closure
+            and re-invokes either :class:`ScaledDotProductAttn` (when
+            variable-length packing must be preserved) or
+            :class:`VanillaAttn` (otherwise). Validates feature support
+            before delegating so that unsupported combinations fail with a
+            clear ``ValueError`` rather than silently dropping inputs.
+
+            Args:
+                warning_message: Optional warning to log once before the
+                    fallback runs.
+                preserve_varlen_semantics: When ``True`` the variable-length
+                    cumulative-sequence-length arrays must be honored, so
+                    the SDPA path is used and ``softmax_aux`` /
+                    ``logits_soft_cap`` / ``dropout_prob`` /
+                    ``normalize_output`` are validated against SDPA's
+                    capabilities.
+
+            Returns:
+                AttentionOutput: Result produced by the chosen fallback.
+
+            Raises:
+                ValueError: When the fallback cannot honor the requested
+                    feature set (e.g. packed attention with mismatched head
+                    dimensions, or SDPA with unsupported features).
+            """
             if not preserve_varlen_semantics and (cum_seqlens_q is not None or cum_seqlens_k is not None):
                 raise ValueError(
                     "FLASH_ATTN2 cannot fall back to VANILLA on multi-host TPU for packed attention "

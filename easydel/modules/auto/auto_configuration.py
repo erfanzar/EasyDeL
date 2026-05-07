@@ -435,23 +435,78 @@ def _shard_gather_fns_from_named_shardings(
     replicated = replicated_named_sharding(mesh)
 
     def _resolve_target(ns):
+        """Pick the placement to use for one leaf of the sharding tree.
+
+        Args:
+            ns: The leaf entry from the input ``named_shardings`` tree —
+                typically a ``jax.sharding.NamedSharding``, ``None``, or a
+                ``SingleDeviceSharding``.
+
+        Returns:
+            jax.sharding.NamedSharding: ``ns`` unchanged when it is already a
+            ``NamedSharding`` (preserves any PP-stage submesh placement);
+            otherwise a fully replicated sharding over ``mesh``.
+        """
         # NamedSharding -> trust it (PP-stage submesh preserved).
         # None / SingleDeviceSharding / anything else -> replicate to the mesh.
         return ns if isinstance(ns, jax.sharding.NamedSharding) else replicated
 
     def _make_shard(ns):
+        """Build a per-leaf shard closure that ``device_put``s to ``ns``.
+
+        Args:
+            ns: The leaf entry from the sharding tree, forwarded to
+                :func:`_resolve_target` to derive the actual placement.
+
+        Returns:
+            Callable[[Any], Any]: A function ``_shard(x)`` that calls
+            ``jax.device_put(x, target)`` when ``x`` looks like an array
+            (has a ``shape`` attribute) and returns ``x`` unchanged
+            otherwise.
+        """
         target = _resolve_target(ns)
 
         def _shard(x, _ns=target):
+            """Shard one parameter onto the resolved target placement.
+
+            Args:
+                x: A parameter leaf (array or anything else).
+                _ns: Bound default — the resolved target NamedSharding.
+
+            Returns:
+                The array placed on ``_ns``, or ``x`` unchanged if it is
+                not array-like (no ``shape`` attribute).
+            """
             return jax.device_put(x, _ns) if hasattr(x, "shape") else x
 
         return _shard
 
     def _make_gather(ns):
+        """Build a per-leaf gather closure that replicates onto the full mesh.
+
+        Args:
+            ns: The leaf entry from the sharding tree (ignored — every gather
+                replicates to the full mesh).
+
+        Returns:
+            Callable[[Any], Any]: A function ``_gather(x)`` that calls
+            ``jax.device_put(x, replicated)`` for array-like inputs and
+            returns ``x`` unchanged otherwise.
+        """
         # Always replicate to the full mesh on gather, regardless of input sharding.
         del ns
 
         def _gather(x, _r=replicated):
+            """Gather one parameter back to the fully replicated mesh sharding.
+
+            Args:
+                x: A parameter leaf (array or anything else).
+                _r: Bound default — the fully replicated NamedSharding.
+
+            Returns:
+                The array placed on ``_r``, or ``x`` unchanged if it is
+                not array-like (no ``shape`` attribute).
+            """
             return jax.device_put(x, _r) if hasattr(x, "shape") else x
 
         return _gather

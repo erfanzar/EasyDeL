@@ -631,7 +631,5 @@ class MemoryMonitorClient:
             logger.error(f"Error sending stats to server: {e}")
 
 
-
-
 if __name__ == "__main__":
     print(SMPMemoryMonitor().check_all_devices())

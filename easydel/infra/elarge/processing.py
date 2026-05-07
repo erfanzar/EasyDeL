@@ -346,6 +346,22 @@ def coerce_precision(p: PrecisionLike) -> jax.lax.Precision | None:
     }.get(str(p).upper(), jax.lax.Precision.DEFAULT)
 
 
+# Mapping of task type string aliases to TaskType enum values.
+#
+# This dictionary provides case-insensitive lookup for common task type
+# names and their abbreviations, enabling flexible task specification
+# in configuration files and APIs.
+#
+# Keys use underscores and lowercase for normalized lookup. Supported
+# aliases include:
+#     - "causal_lm", "lm": Causal language modeling
+#     - "seq2seq", "sequence_to_sequence": Sequence-to-sequence tasks
+#     - "speech_seq2seq": Speech-to-text sequence tasks
+#     - "image_text_to_text": Vision-language tasks
+#     - "zero_shot_image_classification": Zero-shot image classification
+#     - "diffusion_lm": Diffusion-based language models
+#     - "sequence_classification": Text classification tasks
+#     - "base": Base module without task-specific heads
 TASK_ALIASES: dict[str, TaskType] = {
     "causal_lm": TaskType.CAUSAL_LM,
     "lm": TaskType.CAUSAL_LM,
@@ -358,23 +374,6 @@ TASK_ALIASES: dict[str, TaskType] = {
     "sequence_classification": TaskType.SEQUENCE_CLASSIFICATION,
     "base": TaskType.BASE_MODULE,
 }
-"""Mapping of task type string aliases to TaskType enum values.
-
-This dictionary provides case-insensitive lookup for common task type
-names and their abbreviations, enabling flexible task specification
-in configuration files and APIs.
-
-Keys use underscores and lowercase for normalized lookup. Supported
-aliases include:
-    - "causal_lm", "lm": Causal language modeling
-    - "seq2seq", "sequence_to_sequence": Sequence-to-sequence tasks
-    - "speech_seq2seq": Speech-to-text sequence tasks
-    - "image_text_to_text": Vision-language tasks
-    - "zero_shot_image_classification": Zero-shot image classification
-    - "diffusion_lm": Diffusion-based language models
-    - "sequence_classification": Text classification tasks
-    - "base": Base module without task-specific heads
-"""
 
 
 def normalize_task(t: TaskType | str | None) -> TaskType | None:
@@ -600,7 +599,8 @@ def override_lm_eval_code_exec(
     patched: list[tuple[Any, str, Any]] = []
     patched_code_eval_modules: set[tuple[str, str]] = set()
     try:
-        import evaluate as hf_evaluate
+        # Optional lm-eval dependency; EasyDeL can run without it installed.
+        import evaluate as hf_evaluate  # pyright: ignore[reportMissingImports]
     except Exception:
         hf_evaluate = None
 

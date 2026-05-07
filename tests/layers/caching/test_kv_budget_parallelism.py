@@ -100,6 +100,33 @@ def test_ragged_page_budget_replicates_kv_cache_when_tp_head_sharding_is_incompa
     assert axes[2] == ragged_cache_mod.common_types.EMPTY
 
 
+def test_ragged_page_budget_replicates_when_tp_would_split_kv_pairs(monkeypatch):
+    monkeypatch.setattr(
+        ragged_cache_mod,
+        "per_device_hbm_budget_bytes",
+        lambda *_args, **_kwargs: 1 << 24,
+    )
+
+    cfg = ragged_cache_mod.RaggedPagesCacheConfig.create(
+        mesh=_FakeMesh({"dp": 1, "tp": 4}),
+        runtime_sharding_resolver=_partition_manager(),
+        kvdtype=jnp.bfloat16,
+        num_hidden_layers=1,
+        num_kv_heads=2,
+        max_model_length=32,
+        kv_head_dim_size=128,
+        hbm_utilization=0.9,
+        page_size=1,
+        version="v3",
+    )
+
+    shape, axes = cfg.get_shape_and_axes()
+
+    assert cfg.kv_head_shards == 1
+    assert shape[2] * shape[3] >= cfg.num_kv_heads * 2
+    assert axes[2] == ragged_cache_mod.common_types.EMPTY
+
+
 def test_ragged_v3_storage_keeps_combined_kv_heads_for_small_head_dim(monkeypatch):
     monkeypatch.setattr(
         ragged_cache_mod,

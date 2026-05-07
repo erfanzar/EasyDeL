@@ -264,6 +264,18 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             )
 
         def _build_lm_head():
+            """Construct the LM head module on the current PP/sharding stage.
+
+            Closure factory used by :meth:`_create_task_head_on_last_stage`
+            to defer instantiation until the final decoder stage's mesh
+            context is active. Captures the surrounding ``lm_head_class``,
+            config dimensions, dtypes, bias flag, kernel initializer,
+            precision, and ``rngs`` from the enclosing ``__init__`` scope.
+
+            Returns:
+                spx.Module: A freshly built LM head projecting
+                ``config.hidden_size`` to ``config.vocab_size``.
+            """
             return lm_head_class(
                 config.hidden_size,
                 config.vocab_size,

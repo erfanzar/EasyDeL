@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core.config import SaveStageConfig
@@ -42,7 +42,26 @@ _JSON_ENCODED_ARROW_COLUMNS = frozenset({"tools"})
 
 
 def _json_default(value: tp.Any) -> tp.Any:
-    """Best-effort conversion for JSON metadata stored beside token arrays."""
+    """Fallback ``default`` hook for :func:`json.dumps` over pretokenized rows.
+
+    Bridges the small set of non-builtin types that pretokenization
+    transforms tend to leave on rows: ``bytes``/``bytearray`` payloads
+    (decoded as UTF-8 with replacement) and any object exposing a
+    NumPy-style ``tolist`` method. Anything else still raises
+    :class:`TypeError` so unexpected payloads fail loudly.
+
+    Args:
+        value: Object encountered by :func:`json.dumps` that the encoder
+            cannot natively serialise.
+
+    Returns:
+        Any: A JSON-friendly replacement (``str`` for byte buffers, the
+        result of ``value.tolist()`` for array-likes).
+
+    Raises:
+        TypeError: When ``value`` is neither a bytes-like nor exposes
+            ``tolist``.
+    """
     if isinstance(value, bytes | bytearray):
         return bytes(value).decode("utf-8", errors="replace")
     tolist = getattr(value, "tolist", None)
@@ -52,7 +71,22 @@ def _json_default(value: tp.Any) -> tp.Any:
 
 
 def _json_encode_metadata_value(value: tp.Any) -> str | None:
-    """Encode sideband metadata as JSON text for Arrow/Parquet storage."""
+    """Encode a sideband metadata value as JSON text for storage in Arrow/Parquet.
+
+    Used by :func:`_rows_to_arrow_table` to flatten heterogeneous
+    metadata columns (e.g. ``tools``) into a single string column so
+    PyArrow can settle on a stable schema across shards. Strings are
+    passed through unchanged; ``None`` propagates as ``None`` (Arrow
+    null).
+
+    Args:
+        value: Arbitrary metadata payload (``None``, string, dict,
+            list, …) attached to a single row's column.
+
+    Returns:
+        str | None: ``None`` for null values, the original string when
+        already a string, or the :func:`json.dumps` encoding otherwise.
+    """
     if value is None:
         return None
     if isinstance(value, str):
@@ -61,7 +95,21 @@ def _json_encode_metadata_value(value: tp.Any) -> str | None:
 
 
 def _contains_nested_metadata(values: tp.Iterable[tp.Any]) -> bool:
-    """Return whether values look like JSON-style sideband metadata."""
+    """Return whether ``values`` looks like a column of nested JSON metadata.
+
+    Heuristic used by :func:`_rows_to_arrow_table` to decide whether to
+    fall back to the JSON-text path after a direct
+    :func:`pyarrow.array` build fails. Returns ``True`` for columns
+    containing dicts, or lists/tuples whose entries are themselves
+    nested.
+
+    Args:
+        values: Iterable of column values.
+
+    Returns:
+        bool: ``True`` if at least one entry suggests nested-metadata
+        shape.
+    """
     for value in values:
         if isinstance(value, dict):
             return True
@@ -71,7 +119,21 @@ def _contains_nested_metadata(values: tp.Iterable[tp.Any]) -> bool:
 
 
 def _row_keys(rows: list[dict[str, tp.Any]]) -> list[str]:
-    """Collect row keys in first-seen order, including keys absent from row zero."""
+    """Collect column keys across ``rows`` preserving first-seen order.
+
+    Tolerant of rows that do not all share the same key set —
+    important because pretokenization transforms can produce optional
+    fields (e.g. ``segment_ids`` only on packed rows). The ``rows[0]``
+    keys come first; later rows contribute their unique keys at the
+    end of the list.
+
+    Args:
+        rows: Buffer of row dicts to be written as a single Arrow
+            table.
+
+    Returns:
+        list[str]: Deduplicated column names in deterministic order.
+    """
     keys: list[str] = []
     seen: set[str] = set()
     for row in rows:
@@ -85,10 +147,24 @@ def _row_keys(rows: list[dict[str, tp.Any]]) -> list[str]:
 def _rows_to_arrow_table(rows: list[dict[str, tp.Any]], pa: tp.Any) -> tp.Any:
     """Build an Arrow table while keeping token arrays typed and metadata stable.
 
-    PyArrow cannot infer a nested schema for tool/function metadata when one
-    shard contains mixed JSON scalar types, such as ``20`` in one row and
-    ``"20"`` in another. Store known sideband metadata columns as JSON text so
-    tokenized Parquet shards stay writable and have a stable cross-shard schema.
+    PyArrow cannot infer a nested schema for tool/function metadata
+    when one shard contains mixed JSON scalar types, such as ``20`` in
+    one row and ``"20"`` in another. Known sideband metadata columns
+    (:data:`_JSON_ENCODED_ARROW_COLUMNS`) are stored as JSON text so
+    tokenized Parquet shards stay writable and have a stable
+    cross-shard schema. Numeric token arrays of equal length get the
+    fixed-size-list fast path via
+    :func:`_try_fixed_size_numeric_list`.
+
+    Args:
+        rows: Buffer of row dicts collected by the writer.
+        pa: ``pyarrow`` module reference; passed in instead of imported
+            so the helper does not depend on the caller's import path.
+
+    Returns:
+        pyarrow.Table: Table whose columns mirror :func:`_row_keys`,
+        with mixed/nested columns coerced to JSON-text columns when
+        direct array construction fails.
     """
     columns = {}
     for key in _row_keys(rows):
@@ -116,7 +192,25 @@ def _rows_to_arrow_table(rows: list[dict[str, tp.Any]], pa: tp.Any) -> tp.Any:
 
 
 def _try_fixed_size_numeric_list(values: list[tp.Any], pa: tp.Any) -> tp.Any | None:
-    """Build a zero-copy-ish fixed-size Arrow list from equal-shaped arrays."""
+    """Build a fixed-size Arrow list when every element shares a 1-D shape and dtype.
+
+    Promotes equal-length numeric arrays to a typed
+    :class:`pyarrow.FixedSizeListArray` for compact, schema-stable
+    output. Falls back gracefully (returns ``None``) when shapes
+    mismatch, dtypes are non-numeric, or NumPy is unavailable —
+    callers then take the generic :func:`pyarrow.array` path. Large
+    integer dtypes are downcast to ``int32`` to keep token id arrays
+    compact.
+
+    Args:
+        values: Column values for one row buffer key.
+        pa: ``pyarrow`` module reference, supplied by the caller.
+
+    Returns:
+        pyarrow.FixedSizeListArray | None: The constructed array on
+        success, or ``None`` when the column does not qualify and the
+        caller should take a different path.
+    """
     try:
         import numpy as np
 
@@ -141,7 +235,23 @@ def _try_fixed_size_numeric_list(values: list[tp.Any], pa: tp.Any) -> tp.Any | N
 
 
 def estimate_row_size(value: tp.Any) -> int:
-    """Cheap approximate serialized size without stringifying large token lists."""
+    """Approximate the serialized footprint of a row value cheaply.
+
+    Used by the writers to decide when to roll over a shard without
+    paying the cost of fully serialising the buffer (which would
+    defeat the purpose of buffering). Recognises the common shapes —
+    ``str``/``bytes`` (length), bool/int/float (constant), nested
+    dict/list/tuple (recursion), numeric Python lists (length × 8),
+    and NumPy arrays (``nbytes``) — and falls back to ``len(str(value))``
+    for anything else.
+
+    Args:
+        value: Row value (or sub-value when recursing) to estimate.
+
+    Returns:
+        int: Approximate size in bytes; intentionally rough so
+        thread-safe and allocation-free for typical token-id payloads.
+    """
     if value is None:
         return 0
     if isinstance(value, str | bytes | bytearray):
@@ -234,27 +344,14 @@ class WriteStats:
         total_bytes (int): Sum of file sizes across :attr:`output_paths`
             in bytes; queried via the writer's filesystem after each
             shard is flushed.
-        output_paths (list[str] | None): Filesystem (or fsspec URI)
-            paths of the produced shards in write order. Defaulted to
-            an empty list by ``__post_init__`` so callers can iterate
-            without a None-check.
+        output_paths (list[str]): Filesystem (or fsspec URI) paths
+            of the produced shards in write order.
     """
 
     num_examples: int = 0
     num_shards: int = 0
     total_bytes: int = 0
-    output_paths: list[str] | None = None
-
-    def __post_init__(self):
-        """Replace a ``None`` :attr:`output_paths` with an empty list.
-
-        Mutable default arguments are unsafe to declare directly on a
-        dataclass; this hook keeps the field always non-``None`` for
-        callers while still allowing explicit construction with a
-        non-default list.
-        """
-        if self.output_paths is None:
-            self.output_paths = []
+    output_paths: list[str] = field(default_factory=list)
 
 
 class DatasetWriter:

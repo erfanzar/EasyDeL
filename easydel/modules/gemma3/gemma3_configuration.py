@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for Gemma 3 (text + multimodal) models.
+
+Defines :class:`Gemma3TextConfig` for the decoder, plus :class:`Gemma3Config`
+which composes the text decoder with a SigLIP vision tower for the
+multimodal Gemma 3 variants. Compared to Gemma 2 (see
+:mod:`easydel.modules.gemma2`), Gemma 3 introduces:
+
+- Local/global RoPE split: ``rope_local_base_freq`` for sliding layers and
+  ``rope_theta`` for full-attention layers, both with optional
+  ``rope_scaling``.
+- Per-block sliding/full pattern controlled by ``sliding_window`` and
+  ``sliding_window_pattern`` (a full-attention layer every Nth position).
+- ``query_pre_attn_scalar`` and (optional) ``attn_logit_softcapping`` carried
+  over from Gemma 2.
+- Vision-language fusion via :class:`Gemma3Config` exposing
+  ``vision_config`` (SigLIP), an ``mm_tokens_per_image`` budget, and an
+  ``image_token_id`` placeholder used to splice image embeddings into the
+  text stream.
+"""
 
 import typing
 

@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generalized Knowledge Distillation trainer."""
+"""Generalized Knowledge Distillation (GKD) trainer.
+
+Implements :class:`GKDTrainer`, an :class:`SFTTrainer` subclass that
+mixes ground-truth supervised fine-tuning with on-policy distillation
+from a frozen teacher model. Each training step is one of two modes
+selected stochastically per batch:
+
+* **Supervised step** (probability ``1 - lmbda``) -- standard SFT loss
+  on the dataset reference answers.
+* **On-policy distillation step** (probability ``lmbda``) -- the
+  student samples completions from its own policy, then the teacher
+  scores those samples and the student is trained to match the
+  teacher's distribution under a generalized JSD divergence with
+  parameter ``beta`` (``0`` recovers reverse KL, ``1`` recovers forward
+  KL, ``0.5`` recovers symmetric JSD).
+
+The trainer keeps a frozen teacher state alongside the trainable
+student state, builds a generation harness for on-policy sampling, and
+delegates the actual loss/gradient computation to :func:`gkd_step` in
+``_fn.py``.
+"""
 
 from __future__ import annotations
 

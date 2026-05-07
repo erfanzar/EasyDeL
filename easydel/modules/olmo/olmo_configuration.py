@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the OLMo (Open Language Model v1) family.
+
+Defines :class:`OlmoConfig`, a ``model_type="olmo"`` config that mirrors the
+upstream HuggingFace ``OlmoConfig`` while exposing EasyDeL-specific knobs
+(gradient checkpointing strategy, scanned MLP, quantization bits, per-layer
+attention type list). The hyperparameter defaults match AI2's OLMo-7B
+checkpoint: 32 layers, 4096 hidden, 11008 FFN, 50304 vocab, RoPE ``theta=10k``.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

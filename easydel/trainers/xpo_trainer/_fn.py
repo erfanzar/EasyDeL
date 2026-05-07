@@ -601,8 +601,8 @@ def _make_xpo_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    xpo_step,
-    ScheduledLossAdapter(
+    step_fn=xpo_step,
+    adapter=ScheduledLossAdapter(
         name="xpo",
         make_loss=_make_xpo_scheduled_loss,
         make_cache_key=_xpo_scheduled_loss_cache_key,

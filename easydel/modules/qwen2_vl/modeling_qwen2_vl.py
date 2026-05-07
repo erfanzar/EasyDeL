@@ -236,9 +236,7 @@ def get_rope_index(
             position_ids = jnp.arange(seq_length).reshape(1, 1, -1).repeat(3, axis=0).repeat(batch_size, axis=1)
             mrope_position_deltas = jnp.zeros((batch_size,), dtype=input_ids.dtype)
 
-    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(
-        -1, 1
-    )  # pyright: ignore[reportReturnType]
+    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)  # pyright: ignore[reportReturnType]
 
 
 @auto_pytree
@@ -1290,9 +1288,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         Raises:
             AssertionError: If config is not a Qwen2VLVisionConfig instance.
         """
-        assert isinstance(
-            config, Qwen2VLVisionConfig
-        ), "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
+        assert isinstance(config, Qwen2VLVisionConfig), (
+            "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
+        )
         super().__init__(
             config=config,
             dtype=dtype,

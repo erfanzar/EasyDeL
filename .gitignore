@@ -31,6 +31,8 @@ tmp-files
 # triton_gqa_flash_attention_2.py
 # Distribution / packaging
 *.json
+!.basedpyright/
+!.basedpyright/baseline.json
 .Python
 EasyDeL-Checkpoints
 easydel-Checkpoints
@@ -164,3 +166,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 *.bin
+.basedpyright/*
+debug/*
+model-files/*

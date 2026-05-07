@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contrastive loss functions and training step for EmbeddingTrainer."""
+"""Contrastive loss functions and training step for :class:`EmbeddingTrainer`.
+
+Provides the JIT-compatible building blocks consumed by the embedding
+trainer: pooled-embedding extraction, the three supported losses
+(InfoNCE / MNRL / triplet) including their Matryoshka variants, and
+the per-step gradient/optimizer update wired through
+:func:`easydel.trainers.training_utils.minibatch_call`.
+
+These functions are intentionally framework-pure (operate on
+:class:`EasyDeLState` plus a batch dictionary) so they can be compiled
+once and reused across hosts; the trainer wires them up via
+``compile_trainer_step``.
+"""
 
 from __future__ import annotations
 
@@ -290,7 +302,6 @@ def embedding_training_step(
             recorded in ``metrics.accuracy``.
         """
         module = state.merge(tree)
-        module.eval()
 
         q_embeds = _embed_batch(
             module,
@@ -505,8 +516,8 @@ def _make_embedding_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    embedding_training_step,
-    ScheduledLossAdapter(
+    step_fn=embedding_training_step,
+    adapter=ScheduledLossAdapter(
         name="embedding",
         make_loss=_make_embedding_scheduled_loss,
         make_cache_key=_embedding_scheduled_loss_cache_key,

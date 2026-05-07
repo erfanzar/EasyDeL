@@ -45,6 +45,11 @@ import typing as tp
 
 from .abstract_reasoning import ReasoningParserManager, ReasoningParserName
 
+# MODEL_TYPE_TO_REASONING_PARSER: Mapping from ``config.model_type`` to the
+# canonical reasoning parser name. The keys are matched as prefixes
+# (case-insensitive) against the model's ``model_type`` string, so ``"qwen3"``
+# matches both ``"qwen3"`` and ``"qwen3_moe"``. Longer prefixes are tried first
+# to avoid false matches (e.g. ``"deepseek_v3"`` before ``"deepseek"``).
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, ReasoningParserName] = {
     "qwen3_5_moe": "qwen3",
     "qwen3_5": "qwen3",
@@ -111,14 +116,9 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, ReasoningParserName] = {
     "stablelm": "deepseek_r1",
     "starcoder": "deepseek_r1",
 }
-"""Mapping from ``config.model_type`` to the canonical reasoning parser name.
 
-The keys are matched as prefixes (case-insensitive) against the model's
-``model_type`` string, so ``"qwen3"`` matches both ``"qwen3"`` and
-``"qwen3_moe"``.  Longer prefixes are tried first to avoid false matches
-(e.g. ``"deepseek_v3"`` before ``"deepseek"``).
-"""
-
+# _TEMPLATE_HINTS: chat-template substrings mapped to reasoning parser names.
+# Checked in order; the first match wins.
 _TEMPLATE_HINTS: list[tuple[str, ReasoningParserName]] = [
     ("[THINK]", "mistral"),
     ("Here's my thought process:", "granite"),
@@ -128,22 +128,19 @@ _TEMPLATE_HINTS: list[tuple[str, ReasoningParserName]] = [
     ("<seed:think>", "seed_oss"),
     ("<think>", "deepseek_r1"),
 ]
-"""Chat-template substrings mapped to reasoning parser names.
 
-Checked in order; the first match wins.
-"""
-
+# _VOCAB_HINTS: special tokens to look for in the tokenizer vocabulary.
 _VOCAB_HINTS: list[tuple[str, ReasoningParserName]] = [
     ("[THINK]", "mistral"),
     ("<|channel>", "gemma4"),
     ("<|channel|>", "gptoss"),
     ("<think>", "deepseek_r1"),
 ]
-"""Special tokens to look for in the tokenizer vocabulary."""
 
+# _DEFAULT_PARSER: fallback parser name when no signal is found.
+# ``<think>``/``</think>`` is by far the most common reasoning format
+# (Qwen3, DeepSeek-R1, OLMo-3, ERNIE, etc.).
 _DEFAULT_PARSER: ReasoningParserName = "deepseek_r1"
-"""Fallback when no signal is found.  ``<think>``/``</think>`` is by far the
-most common reasoning format (Qwen3, DeepSeek-R1, OLMo-3, ERNIE, etc.)."""
 
 
 def detect_reasoning_parser(

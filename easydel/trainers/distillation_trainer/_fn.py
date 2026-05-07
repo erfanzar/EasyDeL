@@ -820,11 +820,10 @@ def distillation_step(
         call_kwargs.pop("labels", None)
         call_kwargs.pop("completion_mask", None)
         call_kwargs.pop("assistant_masks", None)
+        teacher_hidden_for_kl = teacher_outputs["hidden_for_kl"] if use_chunked else None
+        teacher_logits = teacher_outputs["logits"] if not use_chunked else None
         if use_chunked:
-            teacher_hidden_for_kl = teacher_outputs["hidden_for_kl"]
             call_kwargs["apply_lm_head"] = False
-        else:
-            teacher_logits = teacher_outputs["logits"]
         teacher_hiddens = teacher_outputs.get("hidden_states")
         teacher_attns = teacher_outputs.get("attentions")
         if request_hidden_states:
@@ -839,7 +838,7 @@ def distillation_step(
         completion_mask = minibatch.get("completion_mask", None)
 
         if use_chunked:
-            total_loss, _loss_components = chunked_distillation_loss(
+            total_loss, loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs.last_hidden_state,
                 teacher_hidden=teacher_hidden_for_kl,
                 student_lm_head_fn=module.make_lm_head_fn(),
@@ -1163,8 +1162,8 @@ def _make_distillation_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    distillation_step,
-    ScheduledLossAdapter(
+    step_fn=distillation_step,
+    adapter=ScheduledLossAdapter(
         name="distillation",
         make_loss=_make_distillation_scheduled_loss,
         make_cache_key=_distillation_scheduled_loss_cache_key,

@@ -761,6 +761,15 @@ class MixtralModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Body of the Mixtral decoder scan with sparse-MoE FFNs.
+
+            Carry: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, all_router_logits, layer_index)``. Threads the
+            per-layer top-k softmax router logits (when
+            ``output_router_logits`` is set) so that the load-balancing
+            auxiliary loss can be computed downstream, alongside the usual
+            sliding-window-aware GQA attention path.
+            """
             hs, cv, ah, aa, ar, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

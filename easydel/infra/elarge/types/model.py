@@ -122,6 +122,23 @@ class LoaderCfg(TypedDict, total=False):
             detection.
         trust_remote_code: Allow executing remote code from HuggingFace Hub
             model repositories.
+        checkpoint_load_chunk_size: Optional TensorStore array batch size.
+            ``None`` lets TensorStore schedule the whole checkpoint in one
+            async call.
+        checkpoint_load_concurrent_gb: In-flight TensorStore read budget in
+            decimal gigabytes.
+        checkpoint_load_tensorstore_io_concurrency: TensorStore file I/O
+            concurrency override.
+        checkpoint_load_tensorstore_copy_concurrency: TensorStore data-copy
+            concurrency override.
+        checkpoint_load_tensorstore_cache_gb: TensorStore cache-pool size in
+            decimal gigabytes.
+        checkpoint_load_tensorstore_assume_metadata: Prefetch zarr metadata and
+            pass it to TensorStore with ``assume_metadata=True``.
+        checkpoint_load_tensorstore_metadata_workers: Worker count for zarr
+            metadata prefetch.
+        checkpoint_load_progress: Optional override for checkpoint tensor-load
+            progress display. ``None`` follows ``verbose``.
     """
 
     device: NotRequired[Any]
@@ -129,5 +146,13 @@ class LoaderCfg(TypedDict, total=False):
     param_dtype: NotRequired[DTypeLike]
     precision: NotRequired[PrecisionLike]
     verbose: NotRequired[bool]
+    checkpoint_load_chunk_size: NotRequired[int | None]
+    checkpoint_load_concurrent_gb: NotRequired[int]
+    checkpoint_load_tensorstore_io_concurrency: NotRequired[int | None]
+    checkpoint_load_tensorstore_copy_concurrency: NotRequired[int | None]
+    checkpoint_load_tensorstore_cache_gb: NotRequired[int | None]
+    checkpoint_load_tensorstore_assume_metadata: NotRequired[bool]
+    checkpoint_load_tensorstore_metadata_workers: NotRequired[int]
+    checkpoint_load_progress: NotRequired[bool | None]
     from_torch: NotRequired[bool | None]
     trust_remote_code: NotRequired[bool]

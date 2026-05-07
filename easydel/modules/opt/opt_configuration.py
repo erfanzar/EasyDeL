@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for Meta's OPT (Open Pre-trained Transformer) family.
+
+Defines :class:`OPTConfig`, registered as ``model_type="opt"``. OPT predates
+RoPE — positions come from a *learned* positional embedding offset by 2 (to
+preserve indices 0/1 for ``<pad>``/``<bos>``) and capped at
+``max_position_embeddings + 2``. Unlike modern LLaMA-style models, OPT keeps
+ReLU MLPs by default, optional pre/post LayerNorm via
+``do_layer_norm_before``, and bias terms across attention and MLP linears.
+"""
 
 import typing
 

@@ -1587,6 +1587,16 @@ class KimiLinearModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Body of the hybrid attention scan over Kimi-Linear layers.
+
+            Each ``block`` may be either an MLA full-attention or a KDA
+            linear-attention decoder layer; the per-layer cache view returned
+            by :meth:`_layer_cache_view_at` adapts to the layer kind via
+            :class:`HybridCache`. The carry threads hidden states, optional
+            ``all_hidden_states`` / ``all_attentions`` tuples, MoE router
+            logits (when ``output_router_logits`` is set), and the layer
+            index. Returns the updated carry for the next iteration.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

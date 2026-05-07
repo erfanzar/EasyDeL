@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for the GLM-4V vision-language model.
+
+This module exposes three :class:`EasyDeLBaseConfig` subclasses and one
+helper:
+
+- :class:`Glm4vVisionConfig`: vision-tower hyper-params (patch size,
+  spatial / temporal merge factors, projector width).
+- :class:`Glm4vTextConfig`: text-decoder hyper-params (GQA, partial RoPE,
+  multi-dimensional RoPE sections).
+- :class:`Glm4vConfig`: top-level VLM config that composes the two
+  sub-configs and stores the special-token ids that mark image and video
+  spans inside the text stream.
+- :func:`_rope_scaling_from_rope_parameters`: normalises HF ``rope_parameters``
+  into EasyDeL ``rope_scaling`` mappings, defaulting to GLM-4V's mRoPE
+  ``[8, 12, 12]`` sections.
+"""
+
 import typing
 from collections.abc import Mapping
 
@@ -23,6 +40,23 @@ def _rope_scaling_from_rope_parameters(
     rope_parameters: dict[str, typing.Any] | None,
     rope_scaling: dict[str, typing.Any] | None,
 ) -> dict[str, typing.Any] | None:
+    """Normalise HF ``rope_parameters`` into EasyDeL ``rope_scaling`` for GLM-4V.
+
+    When ``rope_scaling`` is supplied it wins (a stray ``type`` key is
+    aliased to ``rope_type``). Otherwise the relevant subset of
+    ``rope_parameters`` is copied out, including the GLM-4V-specific
+    ``mrope_section`` and ``mrope_interleaved`` fields. When neither is
+    supplied, defaults to the GLM-4V mRoPE preset
+    ``{"rope_type": "default", "mrope_section": [8, 12, 12]}``.
+
+    Args:
+        rope_parameters: HF-style RoPE parameters mapping or ``None``.
+        rope_scaling: EasyDeL RoPE scaling mapping or ``None``.
+
+    Returns:
+        A normalised ``rope_scaling`` mapping (never ``None`` for GLM-4V
+        since a default is always emitted when both inputs are missing).
+    """
     if rope_scaling is not None:
         # HF sometimes uses "type" instead of "rope_type"
         if "type" in rope_scaling and "rope_type" not in rope_scaling:
@@ -122,6 +156,27 @@ class Glm4vVisionConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize the GLM-4V vision encoder configuration.
+
+        Args:
+            depth: Number of vision-transformer layers.
+            hidden_size: Vision encoder model dim.
+            hidden_act: Activation used inside the vision MLPs.
+            attention_bias: Whether vision attention projections carry biases.
+            attention_dropout: Vision attention dropout probability.
+            num_heads: Vision attention heads (also used for ``num_attention_heads``).
+            in_channels: Input image channel count (3 for RGB).
+            image_size: Square input image side length in pixels.
+            patch_size: Patch side length used by the patch embedder.
+            rms_norm_eps: Vision RMSNorm epsilon.
+            spatial_merge_size: Spatial downsampling factor of the merger.
+            temporal_patch_size: Temporal patch length for video inputs.
+            out_hidden_size: Width to which the merger projects features
+                before they are concatenated into the text stream.
+            intermediate_size: Inner width of the vision MLP.
+            initializer_range: Stddev for truncated-normal init.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         super().__init__(**kwargs)
         self.depth = depth
         self.hidden_size = hidden_size
@@ -217,6 +272,36 @@ class Glm4vTextConfig(EasyDeLBaseConfig):
         rope_parameters: dict[str, typing.Any] | None = None,
         **kwargs,
     ):
+        """Initialize the GLM-4V text-decoder configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Decoder model dim.
+            intermediate_size: Inner width of the gated MLP.
+            num_hidden_layers: Decoder block count.
+            num_attention_heads: Total query heads per attention layer.
+            num_key_value_heads: KV heads for grouped-query attention;
+                falls back to ``num_attention_heads`` when ``None``.
+            head_dim: Per-head dim; falls back to ``hidden_size //
+                num_attention_heads`` when ``None``.
+            hidden_act: Activation applied to the gate half of the MLP.
+            max_position_embeddings: Context-length bound used for RoPE
+                tables and asserts.
+            initializer_range: Stddev for truncated-normal weight init.
+            rms_norm_eps: Epsilon for every RMSNorm.
+            use_cache: Whether downstream code should return KV cache.
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            attention_dropout: Attention probability dropout.
+            attention_bias: Whether attention projections carry biases.
+            partial_rotary_factor: Fraction of each head dim that
+                receives RoPE; remaining channels are unrotated.
+            rope_theta: RoPE base frequency. Falls back to
+                ``rope_parameters["rope_theta"]`` and finally ``10000.0``.
+            rope_scaling: EasyDeL-flavoured RoPE scaling dict.
+            rope_parameters: HF-style RoPE parameters (merged via
+                :func:`_rope_scaling_from_rope_parameters`).
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -312,6 +397,28 @@ class Glm4vConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize the top-level GLM-4V configuration.
+
+        Args:
+            text_config: Mapping or :class:`Glm4vTextConfig` for the text
+                decoder; ``None`` materialises the default text config.
+            vision_config: Mapping or :class:`Glm4vVisionConfig` for the
+                vision encoder; ``None`` materialises the default vision
+                config.
+            image_token_id: Placeholder token id used for image patches.
+            video_token_id: Placeholder token id used for video patches.
+            image_start_token_id: Token id marking the start of an image
+                sequence in the text stream.
+            image_end_token_id: Token id marking the end of an image
+                sequence.
+            video_start_token_id: Token id marking the start of a video
+                sequence.
+            video_end_token_id: Token id marking the end of a video
+                sequence.
+            tie_word_embeddings: Whether to tie input embeddings with the
+                LM head.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         if isinstance(vision_config, dict):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:

@@ -557,6 +557,14 @@ class MistralModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Body of the Mistral decoder scan with sliding-window attention.
+
+            Carry: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)``. Each layer applies GQA
+            self-attention bounded by ``config.sliding_window`` (when set);
+            cache views are routed through :meth:`_layer_cache_view_at` so
+            the runtime can pick a windowed cache layout if appropriate.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

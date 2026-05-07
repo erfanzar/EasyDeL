@@ -532,8 +532,8 @@ def _make_kto_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    training_step,
-    ScheduledLossAdapter(
+    step_fn=training_step,
+    adapter=ScheduledLossAdapter(
         name="kto",
         make_loss=_make_kto_scheduled_loss,
         make_cache_key=_kto_scheduled_loss_cache_key,

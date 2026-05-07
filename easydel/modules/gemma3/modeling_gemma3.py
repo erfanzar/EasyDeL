@@ -798,6 +798,14 @@ class Gemma3TextModel(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
 
         def _layer_loop(block, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            idx)`` through one Gemma 3 decoder layer. Selects the appropriate
+            ``MaskInfo`` (sliding vs full) and frequency tensor (local vs
+            global RoPE) based on ``config.layer_types[idx]`` before
+            dispatching the layer.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1035,6 +1043,12 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
             return base_fn
 
         def _project(hidden_states):
+            """Apply the base LM head and tanh-softcap the logits.
+
+            ``out = cap * tanh(logits / cap)`` with ``cap =
+            config.final_logit_softcapping``, matching Gemma 3's reference
+            stabiliser on the final logits.
+            """
             logits = base_fn(hidden_states)
             cap = jnp.array(cap_value, dtype=logits.dtype)
             return cap * jax.nn.tanh(logits / cap)
@@ -1612,9 +1626,7 @@ class Gemma3Model(EasyDeLBaseModule):
         Returns:
             TransformerCache: Initialized cache for the language model.
         """
-        return self.language_model.init_cache(
-            batch_size, max_length, starts, shardings, pad_token_id
-        )  # pyright: ignore[reportReturnType]
+        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)  # pyright: ignore[reportReturnType]
 
     def prepare_inputs_for_generation(
         self,
@@ -1908,6 +1920,12 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         _cap = self.apply_logit_cap
 
         def _project(hidden_states):
+            """Project hidden states with LM head and apply VLM logit softcap.
+
+            Bypasses :class:`nn.remat` on the LM head (uses ``native_forward``)
+            so that the wrapper is trace-safe, then layers the
+            text-config-controlled tanh-softcap on top.
+            """
             lm_logits = _cap(_native(hidden_states))
             if cap_value is not None:
                 cap = jnp.array(cap_value, dtype=lm_logits.dtype)

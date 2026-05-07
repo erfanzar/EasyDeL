@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Embedding trainer for contrastive learning of dense text representations."""
+"""Embedding trainer for contrastive learning of dense text representations.
+
+Re-exports the public surface of the embedding trainer:
+
+* :class:`EmbeddingConfig` -- dataclass configuration covering loss
+  selection (InfoNCE / triplet / MNRL), temperature, pooling strategy,
+  optional Matryoshka representation learning, and the column names
+  used to read query/positive/negative pairs from the dataset.
+* :class:`EmbeddingTrainer` -- :class:`Trainer` subclass wiring those
+  options into a JIT-compiled contrastive training step.
+"""
 
 from .embedding_config import EmbeddingConfig
 from .embedding_trainer import EmbeddingTrainer

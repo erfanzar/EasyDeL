@@ -22,6 +22,7 @@ Runs a tiny PPO training loop (1 step) to exercise:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def main() -> None:
     reward_tokenizer = get_tokenizer(REWARD_MODEL_REPO)
     reward_tokenizer.padding_side = "right"
     reward_model = load_sequence_classifier_model(REWARD_MODEL_REPO)
-    max_training_steps = 1024
+    max_training_steps = int(os.environ.get("EASYDEL_RUNTIME_MAX_TRAINING_STEPS", "1"))
     dataset = load_preference_dataset()
     args = make_config(
         ed.PPOConfig,

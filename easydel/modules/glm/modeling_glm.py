@@ -545,6 +545,14 @@ class GlmModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Run one decoder layer inside ``self.layers.scan``.
+
+            Captures the surrounding closure for masks/positions/mode/cache
+            metadata. The carry threads ``(hidden_states, cache_views,
+            all_hidden_states, all_attentions, layer_index)`` through the
+            scan, optionally appending intermediate hidden states and
+            attention weights when requested by the outer ``forward``.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

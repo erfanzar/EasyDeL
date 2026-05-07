@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for the EmbeddingTrainer."""
+"""Configuration dataclass for :class:`EmbeddingTrainer`.
+
+Defines :class:`EmbeddingConfig`, a :class:`TrainingArguments` subclass
+that exposes the contrastive-objective knobs (``loss_type``,
+``temperature``, hard-negative options, Matryoshka dimensions, pooling
+strategy) plus the dataset column names for query/positive/negative
+text pairs. The class is registered in the EasyDeL trainer-arguments
+registry so it can be instantiated by name.
+"""
 
 from dataclasses import dataclass, field
 from typing import Literal

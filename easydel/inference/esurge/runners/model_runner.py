@@ -1024,6 +1024,8 @@ class eSurgeRunner:
         stale cache hits on mismatched row layouts.
         """
         row_count = max(0, int(row_count))
+        start_index = max(0, int(start_index))
+        end_index = start_index + row_count
         if row_indices is not None:
             row_indices = np.asarray(row_indices, dtype=np.int32)
             token_ids_window_cpu = self.sequence_buffer.token_ids[row_indices]
@@ -1032,9 +1034,6 @@ class eSurgeRunner:
             start_index = int(row_indices[0]) if row_indices.size else 0
             packed_rows = True
         else:
-            start_index = max(0, int(start_index))
-            end_index = start_index + row_count
-
             token_ids_window_cpu = self.sequence_buffer.token_ids[start_index:end_index]
             num_computed_tokens_window_cpu = self.sequence_buffer.num_computed_tokens[start_index:end_index]
             page_table_window_cpu = page_table_cpu[start_index:end_index]
@@ -1522,9 +1521,10 @@ class eSurgeRunner:
                 mask_host = mask_host[0]
             req_state.prefill_visual_pos_masks = mask_host.astype(bool, copy=False)
 
-        if getattr(info, "deepstack_visual_embeds", None) is not None:
+        deepstack_visual_embeds = getattr(info, "deepstack_visual_embeds", None)
+        if deepstack_visual_embeds is not None:
             ds_list = []
-            for arr in info.deepstack_visual_embeds:
+            for arr in deepstack_visual_embeds:
                 ds_list.append(np.asarray(jax.device_get(arr)))
             req_state.prefill_deepstack_visual_embeds = ds_list
 
@@ -1706,6 +1706,15 @@ class eSurgeRunner:
         removed_pool = set(removed_req_indices)
 
         def _find_reuse_index_in_shard(shard_idx: int) -> int | None:
+            """Locate a row index inside ``shard_idx`` safe to reuse for a new request.
+
+            Under DP-local page sharding, each request must occupy a row whose
+            shard matches the shard that owns its allocated KV pages. This
+            helper first prefers rows being vacated this step (``removed_pool``
+            membership) at the highest available index, then falls back to any
+            currently empty slot inside the shard. Returns ``None`` when DP-local
+            row enforcement is disabled or no candidate exists in the shard.
+            """
             if not use_dp_local_rows:
                 return None
             lo = int(shard_idx) * rows_per_shard
@@ -1933,6 +1942,8 @@ class eSurgeRunner:
             return False
         if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
             return False
+        if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
+            return False
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
             return False
         if self._model_uses_vlm_inputs():
@@ -2053,7 +2064,10 @@ class eSurgeRunner:
             token_ids = pre_results.windows[patch_sources[0][0]].sampled_token_ids
         else:
             token_ids = jnp.stack(
-                [jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32) for sampled_tokens, row_pos in patch_token_sources]
+                [
+                    jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32)
+                    for sampled_tokens, row_pos in patch_token_sources
+                ]
             )
             if token_ids.shape[0] < max_handoff:
                 token_ids = jnp.pad(token_ids, ((0, max_handoff - int(token_ids.shape[0])),))
@@ -2337,7 +2351,10 @@ class eSurgeRunner:
                 num_nans_in_logits=None,
             )
 
-        needs_async_output = return_async_output or scheduler_output.async_scheduling
+        can_defer_async_output = bool(scheduler_output.async_scheduling) and self.can_dispatch_next_before_async_drain(
+            scheduler_output
+        )
+        needs_async_output = return_async_output or can_defer_async_output
         start_index = 0
         total_step_time = 0.0
         total_post_proc_time = 0.0
@@ -2428,6 +2445,8 @@ class eSurgeRunner:
 
             scheduled_full_cpu = self._scheduled_full_cpu
             active_mask_full_cpu = self._active_mask_full_cpu
+            req_num_tokens_np = self._req_num_tokens_cpu
+            window_row_indices_cpu = self._window_row_indices_cpu
             if num_reqs > 0:
                 # Keep scheduled and active_mask as CPU arrays
                 scheduled_full_cpu = self._scheduled_full_cpu
@@ -2436,7 +2455,6 @@ class eSurgeRunner:
 
                 # Packed view of the per-request target lengths for the current window.
                 # Avoid per-step dict lookups; SequenceBuffer keeps this aligned with its ordering.
-                req_num_tokens_np = self._req_num_tokens_cpu
                 req_num_tokens_np.fill(0)
                 req_num_tokens_np[:num_reqs] = self.sequence_buffer.num_tokens[window_row_indices]
 
@@ -2446,7 +2464,6 @@ class eSurgeRunner:
                     if rid is not None:
                         active_mask_full_cpu[i] = True
 
-                window_row_indices_cpu = self._window_row_indices_cpu
                 window_row_indices_cpu.fill(0)
                 window_row_indices_cpu[:num_reqs] = window_row_indices
 
@@ -2868,6 +2885,17 @@ class eSurgeRunner:
                 async_pre_results = None
 
             def _finalize_sync_runner_state(sampled_token_ids: list[list[int]]) -> None:
+                """Apply sampled tokens to host buffers for the synchronous overlap path.
+
+                Mirrors what the async finalizer does, but for the case where the
+                runner produced sampled tokens synchronously (no
+                :class:`AsyncPreResults` to consume on the next step). Walks
+                ``sync_finalize_entries`` in lockstep with the per-request
+                sampled-id lists and writes the last sampled token id into both
+                the device-side ``sequence_buffer.token_ids`` row and the host
+                ``output_token_ids`` queue of the corresponding
+                :class:`CachedRequestState`.
+                """
                 for sampled_ids, entry in zip(sampled_token_ids, sync_finalize_entries, strict=False):
                     req_state, req_idx, seq_len = entry
                     if not sampled_ids or req_state is None or seq_len is None:
@@ -2950,6 +2978,13 @@ class eSurgeRunner:
             self._perf_tps_ema = self._perf_alpha * agg_tps + (1.0 - self._perf_alpha) * self._perf_tps_ema
 
         def _fmt_bucket(values: set[int]) -> str:
+            """Format a set of compile-bucket sizes as a compact log string.
+
+            Returns ``"?"`` for empty sets, the lone value as-is for singletons,
+            and ``"min-max"`` for multi-value sets, used purely for human-readable
+            performance log lines so wide windows do not spam every distinct
+            bucket count.
+            """
             if not values:
                 return "?"
             if len(values) == 1:

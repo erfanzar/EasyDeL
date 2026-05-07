@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for OpenAI's GPT-2 decoder-only language model.
+
+Defines :class:`GPT2Config`, the EasyDeL configuration object for OpenAI's
+original GPT-2 family. The defaults match GPT-2 small: 1024-token context,
+768 hidden, 12 layers, 12 attention heads, learned absolute position
+embeddings, and a 50,257-token byte-pair-encoded vocabulary.
+"""
 
 import typing
 

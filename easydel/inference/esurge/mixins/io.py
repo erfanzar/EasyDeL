@@ -479,7 +479,7 @@ class EngineIOMixin:
                 with self._output_lock:
                     ro = self._request_outputs.get(request_id)
                     if ro is None:
-                        break
+                        continue
 
                     if ro.update_seq != last_update_seq:
                         # Snapshot without holding the lock during yield
@@ -551,6 +551,15 @@ class EngineIOMixin:
                         last_accumulated_reasoning = ro.reasoning_content or ""
 
                 if snapshot is not None:
+                    if (
+                        not snapshot.finished
+                        and snapshot.num_generated_tokens == 0
+                        and not snapshot.delta_text
+                        and not snapshot.raw_delta_text
+                        and not snapshot.delta_reasoning_content
+                        and not snapshot.delta_tool_calls
+                    ):
+                        continue
                     yield snapshot
                     if snapshot.finished:
                         break
@@ -583,7 +592,9 @@ class EngineIOMixin:
         stream: Literal[False] = ...,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> RequestOutput: ...
+    ) -> RequestOutput:
+        """Overload: blocking chat call returning a single :class:`RequestOutput`."""
+        ...
 
     @overload
     def chat(
@@ -597,7 +608,9 @@ class EngineIOMixin:
         stream: Literal[True],
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> Iterator[RequestOutput]: ...
+    ) -> Iterator[RequestOutput]:
+        """Overload: streaming chat call yielding incremental :class:`RequestOutput`s."""
+        ...
 
     def chat(
         self,
@@ -1040,7 +1053,7 @@ class EngineIOMixin:
                 with self._output_lock:
                     ro = self._request_outputs.get(request_id)
                     if ro is None:
-                        break
+                        continue
 
                     if ro.update_seq != last_update_seq:
                         finished_snapshot = bool(ro.finished)
@@ -1111,6 +1124,15 @@ class EngineIOMixin:
                         last_accumulated_reasoning = ro.reasoning_content or ""
 
                 if snapshot is not None:
+                    if (
+                        not snapshot.finished
+                        and snapshot.num_generated_tokens == 0
+                        and not snapshot.delta_text
+                        and not snapshot.raw_delta_text
+                        and not snapshot.delta_reasoning_content
+                        and not snapshot.delta_tool_calls
+                    ):
+                        continue
                     yield snapshot
                     if snapshot.finished:
                         break

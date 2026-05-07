@@ -587,9 +587,7 @@ class ArcticMoeBlock(BaseMoeModule):
                 wd_kernel=self.experts.w2.weight.value,
                 act_fn=self.experts.act_fn,
             )
-            return checkpoint_name(out, "moe_expert_output"), checkpoint_name(
-                router_logits, "moe_router_logits"
-            )  # pyright: ignore[reportReturnType]
+            return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
         return self.mlp(hidden_states), None  # pyright: ignore[reportReturnType]
 
 
@@ -965,6 +963,16 @@ class ArcticModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(layer, carry):
+            """Per-layer body for the Arctic decoder ``scan``.
+
+            Carry layout: ``(hidden_states, all_hidden_states, all_self_attns,
+            all_router_logits, idx)``. Optionally records the input hidden
+            state, runs one :class:`ArcticDecoderLayer` (dense or MoE
+            depending on ``moe_layer_frequency``) at the assigned pipeline
+            stage, accumulates attention weights and MoE router logits when
+            requested, updates the per-layer KV cache slot, and returns the
+            next carry.
+            """
             hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

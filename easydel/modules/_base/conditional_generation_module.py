@@ -231,6 +231,20 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             text_config = config.get_text_config()
 
             def _build_lm_head():
+                """Construct the LM head module on the current PP/sharding stage.
+
+                Closure factory used by
+                :meth:`_create_task_head_on_last_stage` to defer instantiation
+                until the final decoder stage's mesh context is active.
+                Captures the enclosing ``head_block``, the text-side config
+                dimensions, dtypes, bias flag, kernel initializer,
+                precision, and ``rngs`` from the surrounding ``__init__``
+                scope.
+
+                Returns:
+                    spx.Module: A freshly built LM head projecting
+                    ``text_config.hidden_size`` to ``text_config.vocab_size``.
+                """
                 return head_block(
                     text_config.hidden_size,
                     text_config.vocab_size,

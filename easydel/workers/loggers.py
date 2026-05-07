@@ -30,7 +30,6 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-import time
 import typing as tp
 from functools import wraps
 
@@ -204,6 +203,27 @@ class eLogger:
 
             @wraps(getattr(logging.Logger, name))
             def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+                """Lazily initialise the logger and forward to the named log method.
+
+                Inline closure built by :meth:`eLogger.__getattr__`.
+                Captures ``self`` and the level method ``name`` from the
+                enclosing scope; calls :meth:`_ensure_initialized` on the
+                first invocation so handlers are only installed when the
+                logger is actually used, then delegates to the underlying
+                :class:`logging.Logger` method.
+
+                Args:
+                    *args: Positional arguments forwarded to the logging
+                        method (typically a format string and inline
+                        values).
+                    **kwargs: Keyword arguments forwarded to the logging
+                        method (e.g. ``exc_info``, ``stack_info``,
+                        ``extra``).
+
+                Returns:
+                    Any: Whatever the underlying logging call returns
+                    (usually ``None``).
+                """
                 self._ensure_initialized()
                 return getattr(self._logger, name)(*args, **kwargs)
 
@@ -236,5 +256,3 @@ def get_logger(name: str, level: int | None = None) -> eLogger:
         handler on first use.
     """
     return eLogger(name, level)
-
-

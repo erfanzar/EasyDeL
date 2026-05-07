@@ -169,10 +169,12 @@ class PPOTrainer(Trainer):
         if isinstance(model, EasyDeLState):
             module = model.model
             if not hasattr(module, "value_head"):
-                model = CausalLMWithValueHead(module).to_state(trainable_selector=arguments.trainable_selector)
+                model = CausalLMWithValueHead(module, rngs=spx.Rngs(0)).to_state(
+                    trainable_selector=arguments.trainable_selector
+                )
         else:
             if not hasattr(model, "value_head"):
-                model = CausalLMWithValueHead(model)
+                model = CausalLMWithValueHead(model, rngs=spx.Rngs(0))
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.ref_state = deepcopy_model(model=model)
@@ -526,7 +528,10 @@ class PPOTrainer(Trainer):
                         return_entropy=False,
                     )
                     return token_log_probs
-                logits = outputs.logits[:, prompt_length - 1 :]
+                logits = outputs.logits
+                if logits is None:
+                    raise ValueError("Reference model outputs do not provide logits for PPO scoring.")
+                logits = logits[:, prompt_length - 1 :]
                 logits = logits[:, :-1, :]
                 token_log_probs, _ = compute_token_logps_and_entropies_chunked(
                     logits,
@@ -614,7 +619,10 @@ class PPOTrainer(Trainer):
                         return_entropy=False,
                     )
                 else:
-                    logits = outputs.logits[:, prompt_length - 1 :]
+                    logits = outputs.logits
+                    if logits is None:
+                        raise ValueError("Model outputs do not provide logits for PPO scoring.")
+                    logits = logits[:, prompt_length - 1 :]
                     logits = logits[:, :-1, :]
                     token_log_probs, _ = compute_token_logps_and_entropies_chunked(
                         logits,

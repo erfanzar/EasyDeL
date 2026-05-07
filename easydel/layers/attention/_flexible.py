@@ -28,8 +28,11 @@ Functions:
     get_optimal_config: Determine best attention mechanism for hardware
     _get_jax_dtype_from_string: Convert string to JAX dtype
 
-Constants:
-    DEFAULT_ATTENTION_MECHANISM: Default attention mechanism ("auto")
+Module-level constants:
+    DEFAULT_ATTENTION_MECHANISM: Default attention mechanism (``"auto"``).
+    Cfg: Type variable bound to :class:`EasyDeLBaseConfig`, used by
+        :class:`AttentionModule` so that subclasses can preserve their
+        precise config type.
 
 Example:
     >>> from easydel.layers.attention import FlexibleAttentionModule
@@ -503,6 +506,17 @@ class FlexibleAttentionModule(spx.Module):
             policy_computed = policy
 
         def _get_impl_names(impl: tp.Any) -> set[str]:
+            """Return the registry name(s) of an attention-implementation object.
+
+            Args:
+                impl: Anything that may expose ``get_impl_name`` returning
+                    a single string or a tuple of strings (typically a
+                    concrete :class:`OperationImpl` instance).
+
+            Returns:
+                set[str]: Set of registered names, or the empty set when
+                the object does not advertise an implementation name.
+            """
             impl_name = getattr(impl, "get_impl_name", lambda: None)()
             if isinstance(impl_name, tuple):
                 return {str(name) for name in impl_name}
@@ -511,6 +525,30 @@ class FlexibleAttentionModule(spx.Module):
             return {str(impl_name)}
 
         def _maybe_route_varlen_multihost_tpu_attention(callable_attn: tp.Any) -> tp.Any:
+            """Reroute variable-length attention to SDPA on multi-host TPU.
+
+            Vanilla attention does not implement
+            ``cum_seqlens_q``/``cum_seqlens_k`` correctly on multi-host
+            TPU; this helper substitutes :class:`ScaledDotProductAttn`
+            when (a) the runtime is multi-host TPU, (b) variable-length
+            metadata is present, and (c) ``callable_attn`` is the vanilla
+            implementation. Validates that SDPA can preserve the requested
+            feature set before rerouting.
+
+            Args:
+                callable_attn: The attention implementation that would
+                    otherwise be used.
+
+            Returns:
+                tp.Any: ``callable_attn`` itself when no rerouting is
+                needed, otherwise an :class:`ScaledDotProductAttn`
+                instance constructed against ``self.metadata``.
+
+            Raises:
+                ValueError: When the request cannot be honoured by SDPA
+                    (e.g. mismatched head dimensions or unsupported
+                    softmax features).
+            """
             if jax.default_backend() != "tpu" or jax.process_count() <= 1:
                 return callable_attn
             if cum_seqlens_q is None and cum_seqlens_k is None:
@@ -585,6 +623,18 @@ class FlexibleAttentionModule(spx.Module):
         target_dtype: jnp.dtype = self.impl.metadata.runtime_dtype
 
         def cast_to_dtype(x: tp.Any) -> tp.Any:
+            """Cast ``x`` to the resolved attention runtime dtype.
+
+            Used as a leaf function for ``jax.tree_util.tree_map`` so the
+            cast applies to every array in the attention output pytree.
+
+            Args:
+                x: Array (or pytree leaf) produced by the attention
+                    implementation.
+
+            Returns:
+                tp.Any: ``x`` cast to ``target_dtype``.
+            """
             return x.astype(target_dtype)
 
         # Only cast attention_outputs and attention_weights — leave cache_view
@@ -669,7 +719,6 @@ class FlexibleAttentionModule(spx.Module):
 
 
 Cfg = tp.TypeVar("Cfg", bound=EasyDeLBaseConfig)
-"""Type variable for configuration objects."""
 
 
 class AttentionModule(spx.Module, tp.Generic[Cfg]):
@@ -929,6 +978,15 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         """
 
         def transpose_array(x: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch heads seq dim"]:
+            """Swap the sequence and head axes of an attention tensor.
+
+            Args:
+                x: Tensor in BTHD layout, shape ``(batch, seq, heads, dim)``.
+
+            Returns:
+                jax.Array: Same tensor reshaped to BHTD layout,
+                ``(batch, heads, seq, dim)``.
+            """
             transposed: Float[JArray, "batch heads seq dim"] = jnp.transpose(x, (0, 2, 1, 3))
             return transposed
 
@@ -1067,6 +1125,28 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
 
         @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
         def _select_slices(ikey, ival, imsk, offset, index, mode_):
+            """Per-batch sliding-window selection of K, V and the attention mask.
+
+            Vmapped over the batch axis: builds the window of valid
+            ``(query_row, key_col)`` pairs around the current decode/prefill
+            position, masks the attention mask accordingly, and slices
+            the KV tensors along the K axis when the window is shorter
+            than the full cache.
+
+            Args:
+                ikey: Per-batch key tensor.
+                ival: Per-batch value tensor.
+                imsk: Per-batch attention mask of shape ``(H, Q, K)``.
+                offset: Query-row base offset for this batch element.
+                index: Current cache length (post-update, decode mode) or
+                    last valid query row (prefill mode).
+                mode_: Runtime mode (``MODE_DECODE`` / ``MODE_PREFILL`` /
+                    other), used as a static branch selector.
+
+            Returns:
+                tuple: ``(sliced_key, sliced_value, masked_mask)`` for
+                this batch element.
+            """
             base_row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
             if mode_ == common_types.MODE_DECODE:
                 # `index` is the post-update cache length, so the active query rows
@@ -1197,6 +1277,18 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             dtype_for_bias: jnp.dtype = self.dtype
 
             def init_attention_bias() -> Float[JArray, "batch 1 query_length initial_key_length"]:
+                """Lazy zero bias for the ragged-cache path.
+
+                The ragged page / unified caches do not need an explicit
+                attention bias; this stub is kept so callers that expect a
+                zero-initialized bias closure receive the correct shape and
+                dtype on demand.
+
+                Returns:
+                    jax.Array: A zero-filled bias of shape
+                    ``(batch, 1, query_length, initial_key_length)`` and
+                    dtype ``self.dtype``.
+                """
                 bias: Float[JArray, "batch 1 query_length initial_key_length"] = jnp.zeros(
                     (batch_size, 1, query_length, initial_key_length), dtype=dtype_for_bias
                 )
@@ -1272,6 +1364,17 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         dtype_self: jnp.dtype = self.dtype
 
         def init_attention_bias() -> Array:
+            """Materialize the additive attention bias from ``mask_info``.
+
+            Lazy so the bias is only built when downstream code asks for
+            it (e.g. for kernels that accept an explicit float bias);
+            kernels that consume :class:`MaskInfo` directly skip this
+            entirely.
+
+            Returns:
+                jax.Array: Bias broadcastable over ``(batch, heads,
+                query, key)``, in ``self.dtype``.
+            """
             bias: Array = mask_info.create_bias(dtype_self)
             return bias
 

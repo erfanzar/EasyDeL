@@ -788,6 +788,14 @@ class OPTDecoder(EasyDeLBaseModule):
         )
 
         def _layer_loop(decoder_layer, carry):
+            """Run one OPT decoder layer inside the scanned trunk.
+
+            OPT predates rotary embeddings — positional information was
+            already added at the input via the learned ``OPTLearnedPositionalEmbedding``
+            and per-layer biases; this closure therefore does not pass any
+            ``frequencies`` and just threads ``hidden_states`` and the per-
+            layer cache view through the scan.
+            """
             hidden_states, all_hidden_states, all_self_attns, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the original Gemma decoder-only LLM.
+
+Defines :class:`GemmaConfig` for Google DeepMind's first-generation Gemma
+models. The config keeps the upstream HF parameter shape: large 256k SentencePiece
+vocab, ``head_dim=256`` decoupled from ``hidden_size``, GeLU-tanh hidden
+activation, RMSNorm with ``rms_norm_eps``, and tied input/output embeddings
+by default. Position handling is plain RoPE (no scaling, no sliding window).
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -107,6 +115,48 @@ class GemmaConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize a :class:`GemmaConfig`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``256000``.
+            hidden_size (int, optional): Decoder hidden dimension. Defaults to ``3072``.
+            intermediate_size (int | None, optional): SwiGLU MLP intermediate width.
+                Defaults to ``24576``.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to ``28``.
+            num_attention_heads (int, optional): Query heads per layer. Defaults to ``16``.
+            num_key_value_heads (int, optional): KV heads (GQA when smaller than
+                ``num_attention_heads``). Defaults to ``16``.
+            head_dim (int, optional): Per-head attention dimension; decoupled from
+                ``hidden_size``. Defaults to ``256``.
+            hidden_act (str, optional): Name of the MLP activation. Defaults to
+                ``"gelu_pytorch_tanh"`` (GeLU with PyTorch's tanh approximation).
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``8192``.
+            initializer_range (float, optional): Truncated-normal init stddev.
+                Defaults to ``0.02``.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-6``.
+            use_cache (bool, optional): Return KV caches during forward. Defaults to ``True``.
+            pad_token_id (int, optional): Padding token id. Defaults to ``0``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``1``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``2``.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to ``True``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            attention_bias (bool, optional): Use bias on QKV/output projections.
+                Defaults to ``False``.
+            attention_dropout (float, optional): Attention probability dropout.
+                Defaults to ``0.0``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing
+                policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            scan_layers (bool, optional): Use ``lax.scan`` to share decoder weights and
+                shrink the trace. Defaults to ``False``.
+            hidden_activation (str | None, optional): Optional explicit activation name
+                taking precedence over ``hidden_act``. Defaults to ``"gelu_pytorch_tanh"``.
+            layer_types (list[str] | None, optional): Per-layer attention types.
+                ``None`` fills with ``"full_attention"``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.vocab_size = vocab_size

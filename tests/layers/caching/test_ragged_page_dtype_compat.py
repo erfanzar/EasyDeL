@@ -53,6 +53,15 @@ def test_select_compatible_upcasts_when_groups_not_divisible():
     assert result != _canonicalize_dtype(jnp.float8_e4m3fn)
 
 
+def test_select_compatible_rejects_odd_local_combined_kv_slots():
+    # 2 KV heads over 4 KV-head shards is globally divisible after fp32
+    # upcasting, but each shard would see one combined K/V slot. That splits
+    # K/V pairs and the v3 kernel rejects it, so the cache resolver must fall
+    # back to replication instead of choosing fp32.
+    with pytest.raises(ValueError, match="incompatible"):
+        _select_compatible_v3_kv_cache_dtype(jnp.bfloat16, num_kv_heads=2, k_headdim=128, kv_head_shards=4)
+
+
 def test_select_compatible_raises_when_nothing_works():
     # 1 kv head, headdim=128 -> combined heads always small.
     # With kv_head_shards very large, nothing divides.

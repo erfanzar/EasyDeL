@@ -355,6 +355,15 @@ class GptOssMLP(BaseMoeModule):
         )
 
         def _scatter_topk_probs(logits: jax.Array) -> jax.Array:
+            """Softmax over the top-k logits and scatter back into a dense matrix.
+
+            GPT-OSS routes through a sparse softmax: only the top
+            ``num_experts_per_tok`` logits are exponentiated and
+            normalised, with all other entries left at zero. This hook
+            runs after the router gate and produces the dense
+            ``(num_tokens, num_experts)`` weight matrix consumed by
+            ``moe_call``.
+            """
             top_vals, top_idx = jax.lax.top_k(logits, k=self.num_experts_per_tok)
             top_probs = jax.nn.softmax(top_vals, axis=-1)
             out = jnp.zeros_like(logits)
@@ -362,6 +371,12 @@ class GptOssMLP(BaseMoeModule):
             return out.at[row_idx, top_idx].set(top_probs)
 
         def _softmax_topk_weights(weights: jax.Array) -> jax.Array:
+            """Re-normalise the gathered top-k weights with a final softmax.
+
+            Hook used by :class:`BaseMoeModule` to refine the
+            already-gathered top-k routing weights before they are used
+            to combine expert outputs.
+            """
             return jax.nn.softmax(weights, axis=-1)
 
         self.moe_hooks = self.moe_hooks.replace(
@@ -393,6 +408,14 @@ class GptOssMLP(BaseMoeModule):
         del training
 
         def ffn_activation(w0, w1):
+            """GPT-OSS expert non-linearity with clipped GLU and shifted up-proj.
+
+            Combines a Swish/SiLU-style gated activation with the
+            ``experts.alpha`` learnable scalar — ``glu = w0 * sigmoid(w0 * alpha)``
+            — multiplied by ``(w1 + 1.0)``. Inputs are clipped to
+            ``mlp_activations_limit`` (default 7.0) on each side to keep
+            the gate values in a stable range.
+            """
             w0 = jnp.clip(w0, min=None, max=7.0)
             w1 = jnp.clip(w1, min=-7.0, max=7.0)
             glu = w0 * jax.nn.sigmoid(w0 * self.experts.alpha)
@@ -856,6 +879,14 @@ class GptOssModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Run one GPT-OSS decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_self_attns,
+            all_router_logits, layer_index)`` through the scan and
+            collects optional intermediate hidden states, attention
+            weights, and per-layer router logits when the outer
+            ``forward`` enabled them.
+            """
             hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

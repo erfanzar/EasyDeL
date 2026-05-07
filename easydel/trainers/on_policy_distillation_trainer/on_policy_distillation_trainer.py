@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""On-policy knowledge distillation trainer.
+
+Wires :class:`OnPolicyDistillationTrainer`, an extension of
+:class:`Trainer` that rolls out the *student's* (or, optionally, the
+teacher's) own completions during training and applies a temperature-
+softened KL-divergence distillation loss on the generated tokens.
+Compared to offline distillation this keeps the training distribution
+on-policy and avoids stale teacher caches.
+"""
+
 from __future__ import annotations
 
 import typing as tp

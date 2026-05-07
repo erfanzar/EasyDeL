@@ -67,16 +67,15 @@ from .eval import BenchmarkConfig
 if TYPE_CHECKING:
     from easydel.infra.etils import MpMdSchedulers
 
+# Mapping of trainer type aliases to their canonical forms.
+#
+# This dictionary allows alternative naming conventions (e.g., underscore vs
+# hyphen) to be transparently normalized to canonical trainer type identifiers.
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
     "agentic_moshpit": "agentic-moshpit",
     "rlvr_trainer": "rlvr",
 }
-"""Mapping of trainer type aliases to their canonical forms.
-
-This dictionary allows alternative naming conventions (e.g., underscore vs hyphen)
-to be transparently normalized to canonical trainer type identifiers.
-"""
 
 
 def _normalize_trainer_type(trainer_type: str) -> str:
@@ -1609,16 +1608,17 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "esurge_overlap_execution": None,
     "esurge_max_num_seq_buckets": None,
 }
-"""Default configuration values shared across all trainer types.
-
-This dictionary provides sensible defaults for the BaseTrainerCfg parameters.
-These values are applied first, then overridden by trainer-specific defaults
-from TRAINER_SPECIFIC_DEFAULTS, and finally by user-provided configuration.
-
-The defaults are designed to work well for most fine-tuning scenarios on
-modern hardware, with conservative batch sizes and standard optimization
-settings.
-"""
+# BASE_TRAINER_DEFAULTS: Default configuration values shared across all
+# trainer types.
+#
+# This dictionary provides sensible defaults for the BaseTrainerCfg
+# parameters. These values are applied first, then overridden by
+# trainer-specific defaults from TRAINER_SPECIFIC_DEFAULTS, and finally by
+# user-provided configuration.
+#
+# The defaults are designed to work well for most fine-tuning scenarios on
+# modern hardware, with conservative batch sizes and standard optimization
+# settings.
 
 # Trainer-specific defaults (only overrides, not full configs)
 TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
@@ -2017,23 +2017,23 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "remove_unused_columns": False,
     },
 }
-"""Trainer-specific default configuration overrides.
+# TRAINER_SPECIFIC_DEFAULTS: Trainer-specific default configuration overrides.
+#
+# This dictionary maps trainer type identifiers to their specific default
+# values. These defaults override BASE_TRAINER_DEFAULTS for the
+# corresponding trainer type. Only parameters that differ from base defaults
+# need to be specified.
+#
+# New trainer types can be registered dynamically via
+# register_trainer_defaults().
 
-This dictionary maps trainer type identifiers to their specific default values.
-These defaults override BASE_TRAINER_DEFAULTS for the corresponding trainer type.
-Only parameters that differ from base defaults need to be specified.
-
-New trainer types can be registered dynamically using register_trainer_defaults().
-"""
-
-# Trainers that need max_completion_length auto-computed
+# Set of trainer types that support automatic max_completion_length
+# computation.
+#
+# For these trainers, if max_completion_length is not explicitly set but
+# max_length and max_prompt_length are provided, max_completion_length is
+# computed as: max_length - max_prompt_length.
 _TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo", "ppo", "sdpo"})
-"""Set of trainer types that support automatic max_completion_length computation.
-
-For these trainers, if max_completion_length is not explicitly set but max_length
-and max_prompt_length are provided, max_completion_length will be automatically
-computed as: max_length - max_prompt_length.
-"""
 
 
 def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> None:

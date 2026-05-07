@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the on-policy distillation trainer.
+
+Defines :class:`OnPolicyDistillationConfig`, which extends
+:class:`DistillationConfig` with the online-generation knobs
+(prompt/completion lengths, sampling temperatures, top-k/top-p,
+penalties) used to roll out student (or teacher) sequences during
+training.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

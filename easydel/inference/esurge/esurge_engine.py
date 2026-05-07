@@ -1079,12 +1079,20 @@ class eSurge(
             # the scheduler will only ever emit smaller batches (e.g. 512/2048).
             self.runner.compile(max_num_batched_tokens=max_num_batched_tokens)
 
+        long_prefill_token_threshold = self.runtime_config.long_prefill_token_threshold
+        if long_prefill_token_threshold is None and self.runner.pipeline_plan.is_enabled:
+            long_prefill_token_threshold = int(self.runtime_config.min_input_pad)
+            logger.debug(
+                "PP inference enabled; defaulting long_prefill_token_threshold to min_input_pad=%d.",
+                long_prefill_token_threshold,
+            )
+
         self.scheduler = Scheduler.from_runner(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             async_scheduling=bool(self.runtime_config.async_scheduling),
-            long_prefill_token_threshold=self.runtime_config.long_prefill_token_threshold,
+            long_prefill_token_threshold=long_prefill_token_threshold,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
 

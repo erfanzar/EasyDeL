@@ -105,6 +105,20 @@ class Conv1D(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize a GPT-2 :class:`Conv1D` projection.
+
+        Args:
+            in_features: Input feature dim.
+            out_features: Output feature dim.
+            use_bias: Whether to allocate a bias vector.
+            dtype: Computation dtype the inputs are cast to.
+            param_dtype: Storage dtype for ``weight`` / ``bias``.
+            precision: JAX matmul precision.
+            dot_general: Optional matmul override (used by quantisation
+                shims); falls back to ``jax.lax.dot_general``.
+            sharding_axis: Optional axis name driving tensor parallelism.
+            rngs: Random number generator collection.
+        """
         self.weight = ArrayParam.bound(
             shape=(out_features, in_features),
             dtype=param_dtype,
@@ -208,6 +222,20 @@ class GPT2Attention(UnifiedAttention):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize a GPT-2 attention block.
+
+        Args:
+            config: Model configuration.
+            layer_idx: Index of this layer in the decoder stack.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            causal: Whether to apply the lower-triangular causal mask.
+            is_cross_attention: Whether the block is the encoder/decoder
+                cross-attention variant (queries come from the decoder
+                hidden state and K/V come from the encoder output).
+            rngs: Random number generator collection.
+        """
         self.is_cross_attention = is_cross_attention
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -289,6 +317,15 @@ class GPT2Attention(UnifiedAttention):
         )
 
     def _split_heads(self, hidden_states):
+        """Reshape ``[batch, seq, embed]`` into ``[batch, seq, heads, head_dim]``.
+
+        Args:
+            hidden_states: Tensor with the per-token embedding axis last.
+
+        Returns:
+            View of the input with the last axis split into
+            ``(num_heads, head_dim)``.
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
@@ -421,6 +458,17 @@ class GPT2MLP(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the GPT-2 MLP block.
+
+        Args:
+            config: Model configuration.
+            intermediate_size: Width of the up/down projections (commonly
+                ``4 * hidden_size`` for GPT-2).
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__()
         self.config = config
         self.precision = precision
@@ -501,6 +549,18 @@ class GPT2Block(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize a GPT-2 transformer block.
+
+        Args:
+            config: Model configuration. ``add_cross_attention`` toggles a
+                cross-attention sub-block; ``n_inner`` overrides the MLP
+                inner width (defaults to ``4 * hidden_size``).
+            layer_idx: Index of this layer in the decoder stack.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -681,6 +741,19 @@ class GPT2Model(EasyDeLBaseModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the GPT-2 backbone.
+
+        Builds the token embedding (``wte``), the learned absolute
+        position embedding (``wpe``), the dropout layer, the stack of
+        :class:`GPT2Block` layers (``h``), and the final layer norm.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -833,6 +906,14 @@ class GPT2Model(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.h))
 
         def _layer_loop(block, carry):
+            """Run one GPT-2 block inside ``self.h.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            all_cross_attentions, layer_index)`` through the scan and
+            collects optional intermediate states / self-attention /
+            cross-attention weights when the outer ``forward`` enabled
+            them.
+            """
             hidden_states, all_hidden_states, all_attentions, all_cross_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -941,6 +1022,15 @@ class GPT2LMHeadModel(BaseCausalLMModule[GPT2Model, GPT2Config]):  # type: ignor
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the causal-LM wrapper around :class:`GPT2Model`.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__(
             config=config,
             base_model_class=GPT2Model,

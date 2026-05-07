@@ -293,8 +293,8 @@ def _make_nash_md_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    nash_md_step,
-    ScheduledLossAdapter(
+    step_fn=nash_md_step,
+    adapter=ScheduledLossAdapter(
         name="nash_md",
         make_loss=_make_nash_md_scheduled_loss,
         make_cache_key=_nash_md_scheduled_loss_cache_key,

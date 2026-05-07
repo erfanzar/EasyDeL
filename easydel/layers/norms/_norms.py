@@ -18,10 +18,22 @@ Provides efficient normalization layers optimized for JAX/spectrax,
 with support for mixed precision and float8 data types.
 
 Classes:
-    RMSNorm: Root Mean Square normalization layer
+    RMSNorm: Root Mean Square normalization layer.
+    RMSNormGated: RMSNorm variant with a sigmoid-gated input branch
+        (Mamba-style "RMSNormGated").
+    LayerNorm: Standard mean-and-variance layer normalization.
+    BatchNorm: Batch normalization with optional running statistics.
 
-Constants:
-    lowfloats: List of supported float8 data types
+Module-level constants:
+    lowfloats: List of supported low-precision floating-point dtypes that
+        the normalization layers promote to ``float32`` before computing
+        statistics for numerical stability. Includes ``jnp.float4_e2m1fn``,
+        the ``float8_e4m3*`` family (``e4m3b11fnuz``, ``e4m3fn``,
+        ``e4m3fnuz``, ``e4m3``), the ``float8_e5m2*`` family
+        (``e5m2``, ``e5m2fnuz``), ``float8_e3m4`` and ``float8_e8m0fnu``
+        (microscaling-style scale dtype). These dtypes are commonly used
+        for quantized training/inference; the layers automatically detect
+        them and run reductions in float32.
 
 Key Features:
     - Efficient RMS normalization
@@ -241,28 +253,6 @@ lowfloats = [
     jnp.float8_e4m3,
     jnp.float8_e8m0fnu,
 ]
-"""List of supported low-precision floating point data types.
-
-This list contains float8 and float4 data types that require special handling
-during normalization operations. When input or parameter dtypes are in this list,
-computations are promoted to float32 to maintain numerical stability.
-
-Types included:
-    - jnp.float4_e2m1fn: 4-bit float with 2 exponent and 1 mantissa bit
-    - jnp.float8_e4m3b11fnuz: 8-bit float with 4 exponent and 3 mantissa bits (brain float variant)
-    - jnp.float8_e4m3fn: 8-bit float with 4 exponent and 3 mantissa bits (FP8 E4M3)
-    - jnp.float8_e4m3fnuz: 8-bit float with 4 exponent and 3 mantissa bits (unsigned zero)
-    - jnp.float8_e5m2fnuz: 8-bit float with 5 exponent and 2 mantissa bits (unsigned zero)
-    - jnp.float8_e5m2: 8-bit float with 5 exponent and 2 mantissa bits (FP8 E5M2)
-    - jnp.float8_e3m4: 8-bit float with 3 exponent and 4 mantissa bits
-    - jnp.float8_e4m3: 8-bit float with 4 exponent and 3 mantissa bits
-    - jnp.float8_e8m0fnu: 8-bit float with 8 exponent bits (scaling factor format)
-
-Note:
-    These dtypes are commonly used in quantized training and inference for
-    memory efficiency. The normalization layer automatically handles promotion
-    to float32 when these types are detected.
-"""
 
 
 class RMSNorm(spx.Module):
@@ -638,7 +628,7 @@ class BatchNorm(spx.Module):
         self.mean = spx.Parameter(jnp.zeros(feature_shape, jnp.float32), sharding=replicated_sharding)
         self.var = spx.Parameter(jnp.ones(feature_shape, jnp.float32), sharding=replicated_sharding)
 
-        self.weight: spx.Parameter[jax.Array] | None
+        self.weight: spx.Parameter | None
         if use_scale:
             key = rngs.parameters
             self.weight = spx.Parameter(
@@ -648,7 +638,7 @@ class BatchNorm(spx.Module):
         else:
             self.weight = None
 
-        self.bias: spx.Parameter[jax.Array] | None
+        self.bias: spx.Parameter | None
         if use_bias:
             key = rngs.parameters
             self.bias = spx.Parameter(
@@ -849,7 +839,7 @@ class LayerNorm(spx.Module):
         feature_shape = (num_features,)
         replicated_sharding = sharding_for_layout(Replicated)
 
-        self.weight: spx.Parameter[jax.Array] | None
+        self.weight: spx.Parameter | None
         if use_scale:
             key = rngs.parameters
             self.weight = spx.Parameter(
@@ -859,7 +849,7 @@ class LayerNorm(spx.Module):
         else:
             self.weight = None
 
-        self.bias: spx.Parameter[jax.Array] | None
+        self.bias: spx.Parameter | None
         if use_bias:
             key = rngs.parameters
             self.bias = spx.Parameter(

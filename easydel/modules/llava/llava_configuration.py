@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the LLaVA family of vision-language conditional generators.
+
+Defines :class:`LlavaConfig`, a composite config that wraps a vision tower
+config and a text-decoder config plus the multimodal projector parameters
+(``mm_*`` fields). The text/vision configs are auto-resolved from the HF
+sub-configs via :class:`AutoEasyDeLConfig`, so any registered EasyDeL
+backbone (LLaMA, Mistral, …) can serve as the language model.
+"""
 
 import typing
 

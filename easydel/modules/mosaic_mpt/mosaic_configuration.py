@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for MosaicML's MPT decoder language models.
+
+Defines two registered configs used by MPT:
+
+- :class:`MptAttentionConfig` — sub-config carrying the attention-only knobs
+  (``attn_type``, ALiBi, clip_qkv, soft-cap, …); chosen between standard
+  ``"multihead_attention"`` and key/value-shared ``"multiquery_attention"``.
+- :class:`MptConfig` — the full model config (registered as ``mpt``) which
+  composes an :class:`MptAttentionConfig` via ``attn_config`` and adds the
+  rest of the transformer hyper-parameters plus EasyDeL-specific sharding /
+  gradient-checkpointing controls.
+"""
 
 import typing
 

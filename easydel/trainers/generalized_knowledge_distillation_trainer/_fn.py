@@ -26,6 +26,7 @@ import functools
 import typing as tp
 
 import jax
+import numpy as np
 import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -37,7 +38,6 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 from ..training_utils import (
     ScheduledLossAdapter,
     bind_scheduled_module,
-    cached_scheduled_auxiliary,
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
@@ -397,8 +397,17 @@ def _prepare_gkd_scheduled_batch(call) -> dict[str, tp.Any]:
     teacher_model.eval()
     sync_module_schedule_config(teacher_model, call.schedule)
     constrained_batch = constrain_scheduled_batch(teacher_model, batch, call.get("partition_spec"))
-    teacher_forward = cached_scheduled_auxiliary(_gkd_forward_logits, teacher_model.mesh)
-    batch["teacher_logits"] = stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))
+    teacher_forward = spx.jit(
+        _gkd_forward_logits,
+        mesh=teacher_model.mesh,
+        schedule=call.schedule,
+        batch_argnums=1,
+    )
+    teacher_logits = np.asarray(jax.device_get(stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))))
+    if isinstance(call.bound_arguments, dict):
+        call.bound_arguments["_gkd_teacher_logits"] = teacher_logits
+    else:  # pragma: no cover - ScheduledStepCall currently stores a dict.
+        batch["teacher_logits"] = teacher_logits
     return batch
 
 
@@ -439,16 +448,27 @@ def _make_gkd_scheduled_loss(call):
 
         Args:
             tree: Student graphstate to differentiate against.
-            batch: Minibatch dict with precomputed ``teacher_logits``.
+            batch: Minibatch dict. Teacher logits are captured from
+                the auxiliary frozen-teacher forward as a host array so
+                the scheduled graph does not close over a full-mesh
+                sharded device constant.
 
         Returns:
             The generalized JSD loss scalar.
         """
         module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        model_batch = dict(batch)
+        teacher_logits = call.get("_gkd_teacher_logits")
+        if teacher_logits is None:
+            teacher_logits = model_batch.get("teacher_logits")
+        if teacher_logits is None:
+            raise RuntimeError("GKD scheduled MPMD loss requires precomputed teacher_logits.")
+        model_batch.pop("teacher_logits", None)
+        call_batch = constrain_scheduled_batch(module, model_batch, partition_spec)
         labels = call_batch.get("labels")
-        teacher_logits = jax.lax.stop_gradient(call_batch["teacher_logits"])
         student_logits = _gkd_forward_logits(module, call_batch)
+        teacher_logits = jnp.asarray(teacher_logits)
+        teacher_logits = jax.lax.stop_gradient(teacher_logits)
         completion_mask = call_batch.get("completion_mask")
         attention_mask = call_batch.get("attention_mask")
         mask = completion_mask if completion_mask is not None else attention_mask
@@ -465,8 +485,8 @@ def _make_gkd_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    gkd_step,
-    ScheduledLossAdapter(
+    step_fn=gkd_step,
+    adapter=ScheduledLossAdapter(
         name="gkd",
         make_loss=_make_gkd_scheduled_loss,
         make_cache_key=_gkd_scheduled_loss_cache_key,

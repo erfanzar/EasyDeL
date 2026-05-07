@@ -861,9 +861,9 @@ class OpenELMModel(EasyDeLBaseModule):
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
         sequence_length = inputs_embeds.shape[1]
 
-        assert (
-            sequence_length <= self.config.max_context_length
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
+        assert sequence_length <= self.config.max_context_length, (
+            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
+        )
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -890,6 +890,15 @@ class OpenELMModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(layer, carry):
+            """Run one OpenELM decoder block through the layer-scan loop.
+
+            OpenELM lays out a *layer-wise heterogeneous* trunk — every layer
+            can have its own ``num_query_heads``, ``num_kv_heads`` and
+            ``ffn_multiplier`` — so the per-layer ``layer`` callable already
+            owns those shapes; this closure only threads the carry tuple
+            (hidden state, optional accumulators, current index) and updates
+            the matching cache view in place.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

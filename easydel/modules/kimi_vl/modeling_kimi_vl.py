@@ -114,10 +114,21 @@ def _apply_rope(
     freqs_cis = freqs_cis[..., None, :]  # (..., 1, head_dim/2)
 
     def _to_complex(x: Array) -> Array:
+        """Pack the last dim into ``complex64`` pairs (re, im).
+
+        The input must have an even-sized last axis; pairs of consecutive
+        floats become a single complex value, ready for elementwise
+        multiplication by the precomputed RoPE ``freqs_cis``.
+        """
         x = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, 2)
         return jax.lax.complex(x[..., 0], x[..., 1])
 
     def _to_real(x: Array, dtype: jnp.dtype) -> Array:
+        """Unpack a complex tensor back into interleaved real floats.
+
+        Inverse of :func:`_to_complex`. Casts the result to ``dtype`` so the
+        rotated queries / keys retain their original compute precision.
+        """
         x = jnp.stack([jnp.real(x), jnp.imag(x)], axis=-1)
         return x.reshape(*x.shape[:-2], -1).astype(dtype)
 
@@ -672,6 +683,7 @@ class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
         self.rope_2d = Rope2DPosEmb(hidden_dim // num_heads, 512, 512)
 
         def activation(x):
+            """Approximate GELU activation used inside MoonViT MLP blocks."""
             return jax.nn.gelu(x, approximate=True)
 
         remat_layer_block = auto_remat(
@@ -727,6 +739,12 @@ class MoonVitEncoder(EasyDeLLayerStackMixin, spx.Module):
         cu_seqlens = jnp.cumsum(lengths, axis=0)
 
         def _layer_loop(block, carry):
+            """Run one ViT encoder block under the MPMD layer-stage context.
+
+            ``carry = (hidden_states, layer_index)``; uses the precomputed
+            ``cu_seqlens`` / ``rope_freqs_cis`` from the enclosing scope to
+            apply block-diagonal attention with 2D RoPE.
+            """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)

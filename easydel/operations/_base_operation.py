@@ -289,6 +289,15 @@ class BaseOperation(ABC):
 
     @functools.cached_property
     def EasyDeLBackends(self):
+        """Lazy import of :class:`easydel.infra.etils.EasyDeLBackends`.
+
+        Cached on the instance to avoid the import cost on every dispatch
+        through :meth:`__call__`. Used by ``match`` arms to compare
+        ``self.metadata.backend`` against the canonical backend enum.
+
+        Returns:
+            type: The ``EasyDeLBackends`` enum class.
+        """
         from easydel.infra.etils import EasyDeLBackends
 
         return EasyDeLBackends

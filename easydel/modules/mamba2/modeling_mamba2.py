@@ -11,6 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Spectrax implementation of the Mamba-2 (SSD) language model.
+
+Mamba-2 generalises Mamba's selective recurrence to a *grouped* structured
+state-space dual (SSD) form: heads are arranged as ``num_heads`` x
+``head_dim``, ``B``/``C`` are shared across ``n_groups`` head-groups, and
+the recurrence is computed in chunks of ``chunk_size``, which makes the
+update mathematically equivalent to a structured masked attention. The
+fixed-size SSM state is exposed via :class:`RecurrentCache` /
+:class:`RecurrentCacheView`. Module exports include the SSD mixer
+(:class:`Mamba2Mixer`), the pre-norm decoder block, and the
+:class:`Mamba2Model` / :class:`Mamba2ForCausalLM` task heads.
+"""
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -802,6 +815,13 @@ class Mamba2Model(EasyDeLBaseModule):
         hidden_states = inputs_embeds
 
         def _layer_loop(block, carry):
+            """Run a single Mamba-2 SSD block and update its recurrent cache.
+
+            Carry: ``(hidden_states, all_hidden_states, layer_index)``. The
+            per-layer :class:`RecurrentCacheView` is read from
+            ``cache_params.views[idx]`` and the updated view is written back
+            into ``cache_params[idx]``.
+            """
             hidden_states, all_hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states, cache_view = block(

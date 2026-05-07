@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for the GLM-MoE-DSA decoder.
+
+GLM-MoE-DSA is a decoder-only LLM that combines:
+
+- DeepSeek-style **Multi-head Latent Attention** (MLA) — low-rank Q/KV
+  factorisations with split-RoPE heads.
+- **Dynamic Sparse Attention** (DSA): a learned sparse-attention indexer
+  selects, per query, the ``index_topk`` most relevant cached tokens to
+  attend to instead of attending to the full prefix.
+- A grouped top-k Mixture-of-Experts FFN with shared experts following a
+  dense-to-sparse layer schedule (``mlp_layer_types``).
+
+This module exposes :class:`GlmMoeDsaConfig` and a
+:func:`_rope_scaling_from_rope_parameters` helper for normalising HF
+RoPE configuration mappings.
+"""
+
 import typing
 import typing as tp
 
@@ -192,6 +209,67 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         attention_dropout: float = 0.0,
         **kwargs,
     ):
+        """Initialize a GLM-MoE-DSA configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Residual-stream dimension.
+            intermediate_size: Inner width of the dense MLP.
+            moe_intermediate_size: Inner width of each routed expert FFN.
+            num_hidden_layers: Total decoder layers (dense + MoE per
+                ``mlp_layer_types``).
+            num_attention_heads: Total query heads for MLA.
+            num_key_value_heads: KV heads for MLA (typically equal to
+                ``num_attention_heads``).
+            n_shared_experts: Shared experts always applied to every token.
+            n_routed_experts: Total routed experts in MoE layers.
+            routed_scaling_factor: Multiplier on routed expert weights.
+            kv_lora_rank: Rank of the MLA KV down-projection.
+            q_lora_rank: Rank of the MLA Q down-projection (``None``
+                disables the low-rank Q step).
+            qk_rope_head_dim: RoPE-rotated portion of the Q/K head dim.
+            qk_nope_head_dim: Unrotated portion of the Q/K head dim.
+            v_head_dim: Value head dim.
+            n_group: Number of expert groups for grouped routing.
+            topk_group: Groups kept per token before per-group top-k.
+            num_experts_per_tok: Routed experts selected per token.
+            norm_topk_prob: Whether to renormalise top-k routing weights.
+            hidden_act: Activation applied to the gate half of MLPs.
+            max_position_embeddings: Context-length bound used by RoPE.
+            initializer_range: Stddev for truncated-normal init.
+            rms_norm_eps: Epsilon for every RMSNorm.
+            use_cache: Whether downstream code should return KV cache.
+            pad_token_id: Padding token id.
+            bos_token_id: Beginning-of-stream token id.
+            eos_token_id: End-of-stream token id.
+            pretraining_tp: Pretraining tensor-parallel factor (kept for
+                checkpoint compatibility).
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            rope_theta: RoPE base frequency. Falls back to
+                ``rope_parameters["rope_theta"]`` and finally ``10000.0``.
+            rope_parameters: HF-style RoPE parameters (merged via
+                :func:`_rope_scaling_from_rope_parameters`).
+            rope_scaling: EasyDeL-flavoured RoPE scaling dict.
+            rope_interleave: Whether main attention uses interleaved RoPE.
+            index_topk: Number of cached tokens the DSA indexer selects
+                per query.
+            index_head_dim: Per-head dim of the DSA indexer.
+            index_n_heads: Number of heads in the DSA indexer; defaults
+                to ``num_attention_heads // 2`` when ``None``.
+            indexer_rope_interleave: Whether the DSA indexer uses
+                interleaved RoPE.
+            mlp_layer_types: Optional per-layer ``"dense"``/``"sparse"``
+                schedule; defaults to the first three layers dense and
+                the remainder sparse.
+            attention_bias: Whether attention projections carry biases.
+            attention_dropout: Dropout on the attention probabilities.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+
+        Raises:
+            ValueError: If ``n_routed_experts`` is not divisible by
+                ``n_group``, if ``mlp_layer_types`` length disagrees with
+                ``num_hidden_layers``, or if it contains an unknown entry.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

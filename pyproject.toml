@@ -33,7 +33,7 @@ dependencies = [
 	"jaxlib>=0.10.0",
 	"eformer==0.0.100",
 	"ejkernel==0.0.79",
-	"spectrax-lib==0.0.7",
+	"spectrax-lib==0.1.2",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
 	"transformers~=5.5.0",
@@ -126,9 +126,12 @@ ignore_missing_imports = true
 exclude = ["easydel/"]
 
 [tool.basedpyright]
+# Keep the linter useful: correctness diagnostics stay enabled, while the
+# dynamic JAX/SpectraX/model-registry noise is muted below.
 reportAssignmentType = "none"
 reportUnknownVariableType = "none"
 reportPrivateUsage = "none"
+reportPrivateLocalImportUsage = "none"
 reportOptionalCall = "none"
 reportUnknownMemberType = "none"
 reportGeneralTypeIssues = "none"
@@ -140,6 +143,43 @@ reportAny = "none"
 reportCallIssue = "none"
 reportUnknownArgumentType = "none"
 reportRedeclaration = "none"
+reportCallInDefaultInitializer = "none"
+reportConstantRedefinition = "none"
+reportDeprecated = "none"
+reportFunctionMemberAccess = "none"
+reportImportCycles = "none"
+reportImplicitRelativeImport = "none"
+reportInconsistentConstructor = "none"
+reportInconsistentOverload = "error"
+reportInvalidCast = "none"
+reportInvalidTypeArguments = "error"
+reportInvalidTypeForm = "none"
+reportInvalidTypeVarUse = "none"
+reportMissingImports = "error"
+reportMissingSuperCall = "none"
+reportMissingTypeStubs = "none"
+reportOptionalContextManager = "error"
+reportOptionalIterable = "error"
+reportOptionalOperand = "error"
+reportOptionalSubscript = "error"
+reportPossiblyUnboundVariable = "error"
+reportPropertyTypeMismatch = "none"
+# Existing return-type debt is tracked in .basedpyright/baseline.json so
+# newly introduced mismatches still fail CI instead of being hidden globally.
+reportReturnType = "error"
+reportTypedDictNotRequiredAccess = "none"
+reportUnsupportedDunderAll = "none"
+reportUnnecessaryCast = "none"
+reportUnhashable = "error"
+reportUnnecessaryComparison = "none"
+reportUnnecessaryContains = "none"
+reportUnnecessaryTypeIgnoreComment = "none"
+reportUntypedBaseClass = "none"
+reportUntypedFunctionDecorator = "none"
+reportUnusedClass = "none"
+reportUnusedFunction = "none"
+reportUnusedImport = "none"
+reportUnusedVariable = "none"
 reportIgnoreCommentWithoutRule = "none"
 reportUnnecessaryIsInstance = "none"
 reportUnusedCallResult = "none"

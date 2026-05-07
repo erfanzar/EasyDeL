@@ -863,6 +863,13 @@ class Grok1Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Run one Grok-1 decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, all_router_logits, layer_index)`` through
+            the scan and accumulates optional collections requested by
+            the outer ``forward``.
+            """
             hs, cv, ah, aa, ar, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)
@@ -1096,6 +1103,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         scale = self.output_multiplier_scale
 
         def _project(hidden_states):
+            """Apply the LM head and multiply by Grok-1's output scale."""
             return base_fn(hidden_states) * scale
 
         return _project

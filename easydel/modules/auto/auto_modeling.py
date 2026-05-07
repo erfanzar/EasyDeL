@@ -105,6 +105,14 @@ def _normalize_pretrained_loading(self) -> None:
         "quantization_config": None,
         "apply_quantization": False,
         "verbose": True,
+        "checkpoint_load_chunk_size": None,
+        "checkpoint_load_concurrent_gb": 128,
+        "checkpoint_load_tensorstore_io_concurrency": 1024,
+        "checkpoint_load_tensorstore_copy_concurrency": 1024,
+        "checkpoint_load_tensorstore_cache_gb": 128,
+        "checkpoint_load_tensorstore_assume_metadata": True,
+        "checkpoint_load_tensorstore_metadata_workers": 256,
+        "checkpoint_load_progress": None,
         "from_torch": None,
     },
     post_init=_normalize_pretrained_loading,
@@ -146,6 +154,14 @@ class PreTrainedLoading(TypedDict, total=False):
     quantization_config: NotRequired[QuantizationConfig | None]
     apply_quantization: NotRequired[bool]
     verbose: NotRequired[bool]
+    checkpoint_load_chunk_size: NotRequired[int | None]
+    checkpoint_load_concurrent_gb: NotRequired[int]
+    checkpoint_load_tensorstore_io_concurrency: NotRequired[int | None]
+    checkpoint_load_tensorstore_copy_concurrency: NotRequired[int | None]
+    checkpoint_load_tensorstore_cache_gb: NotRequired[int | None]
+    checkpoint_load_tensorstore_assume_metadata: NotRequired[bool]
+    checkpoint_load_tensorstore_metadata_workers: NotRequired[int]
+    checkpoint_load_progress: NotRequired[bool | None]
     from_torch: NotRequired[bool | None]
     # Hugging Face Hub options forwarded to ``EasyDeLBaseModule.from_pretrained``.
     trust_remote_code: NotRequired[bool]
@@ -307,6 +323,16 @@ class BaseAutoEasyModel:
         "tokenizer",
         "processor",
     )
+    _TORCH_LOADER_DROP: tuple[str, ...] = (
+        "checkpoint_load_chunk_size",
+        "checkpoint_load_concurrent_gb",
+        "checkpoint_load_tensorstore_io_concurrency",
+        "checkpoint_load_tensorstore_copy_concurrency",
+        "checkpoint_load_tensorstore_cache_gb",
+        "checkpoint_load_tensorstore_assume_metadata",
+        "checkpoint_load_tensorstore_metadata_workers",
+        "checkpoint_load_progress",
+    )
 
     @classmethod
     def _loader_kwargs(cls, config: PreTrainedLoading) -> dict[str, Any]:
@@ -329,10 +355,31 @@ class BaseAutoEasyModel:
         return data
 
     @classmethod
+    def _torch_loader_kwargs(cls, config: PreTrainedLoading) -> dict[str, Any]:
+        """Convert auto-loader config to kwargs accepted by the PyTorch import path.
+
+        The ``checkpoint_load_*`` options tune SpectraX/TensorStore loading of
+        native EasyDeL checkpoints. They are intentionally removed here because
+        the torch import path forwards residual kwargs to Transformers'
+        ``from_pretrained`` implementation.
+        """
+        data = cls._loader_kwargs(config)
+        for key in cls._TORCH_LOADER_DROP:
+            data.pop(key, None)
+        return data
+
+    @classmethod
     def _from_easydel_params(cls, config: PreTrainedLoading) -> EasyDeLBaseModule:
         """Load a model from EasyDeL-saved parameters using the resolved config."""
 
         class Base(EasyDeLBaseModule):
+            """Anonymous :class:`EasyDeLBaseModule` subclass bound to ``cls.model_task``.
+
+            Defined inside the ``classmethod`` so the inherited
+            ``from_pretrained`` reads the correct ``_model_task`` when
+            looking up a registered module for the auto-loader's task.
+            """
+
             _model_task = cls.model_task
 
         return Base.from_pretrained(**cls._loader_kwargs(config))
@@ -342,9 +389,17 @@ class BaseAutoEasyModel:
         """Load a model from PyTorch weights using the resolved config."""
 
         class Base(EasyDeLBaseModule):
+            """Anonymous :class:`EasyDeLBaseModule` subclass bound to ``cls.model_task``.
+
+            Mirrors the helper used in :meth:`_from_easydel_params` but is
+            scoped to the PyTorch-import path so
+            ``Base._from_torch_pretrained`` resolves the right registered
+            module for the auto-loader's task.
+            """
+
             _model_task = cls.model_task
 
-        return Base._from_torch_pretrained(**cls._loader_kwargs(config))
+        return Base._from_torch_pretrained(**cls._torch_loader_kwargs(config))
 
     @classmethod
     def _is_easydel(

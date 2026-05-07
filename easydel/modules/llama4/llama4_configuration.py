@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for Meta's Llama4 multi-modal architecture.
+
+Defines the three configs used by Llama4:
+
+- :class:`Llama4VisionConfig` for the ViT-style image encoder and the
+  pixel-shuffle multi-modal projector;
+- :class:`Llama4TextConfig` for the decoder language model with mixed
+  full-attention / chunked-attention layers, MoE, and RoPE / NoPE layers;
+- :class:`Llama4Config` aggregating both for the conditional-generation
+  variant.
+
+Also installs an HF-compat monkey-patch so that the upstream
+``Llama4ForConditionalGeneration.get_image_features`` always exposes a
+``pooler_output`` attribute.
+"""
 
 import typing
 
@@ -51,6 +66,14 @@ def _patch_hf_llama4_pooler_output() -> None:
         return
 
     def _patched_get_image_features(self, *args, **kwargs):
+        """Wrapper that ensures ``pooler_output`` is present.
+
+        Calls the original ``get_image_features`` and, if the result lacks a
+        ``pooler_output`` attribute, repackages it as a
+        :class:`BaseModelOutputWithPooling` whose ``pooler_output`` mirrors
+        ``last_hidden_state`` (so EasyDeL projector code can rely on the
+        attribute regardless of upstream HF version).
+        """
         outputs = original_get_image_features(self, *args, **kwargs)
         if hasattr(outputs, "pooler_output"):
             return outputs

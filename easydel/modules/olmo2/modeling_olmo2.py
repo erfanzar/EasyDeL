@@ -644,6 +644,24 @@ class Olmo2Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Run one OLMo-2 decoder block under :meth:`ModuleList.scan`.
+
+            The closure is reused for both eager iteration and the scanned/
+            pipeline-parallel path; ``carry`` packs every value that must
+            survive layer-to-layer (hidden state, per-layer cache views and
+            optional output collections) so JAX can lower the body to either.
+
+            Args:
+                block: The decoder layer (post-norm Olmo-2 block, possibly
+                    remat-wrapped) to invoke at this step.
+                carry: ``(hidden_states, cache_views, all_hidden_states,
+                    all_attentions, layer_idx)`` from the prior iteration.
+
+            Returns:
+                tuple: New carry tuple with the layer's hidden state, updated
+                cache, optionally extended hidden-state and attention
+                collections, and ``layer_idx + 1``.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Odds Ratio Preference Optimization (ORPO) trainer.
+
+ORPO -- Hong et al. (2024) -- merges supervised fine-tuning with a
+log-odds preference term, removing the need for an external reference
+model.  This module wires :class:`ORPOTrainer` against the shared
+preference-pair data collators and the JIT-compiled step in ``_fn``.
+"""
+
 from __future__ import annotations
 
 import typing as tp

@@ -153,42 +153,50 @@ class TestNormalizeChatTemplateTools:
     def test_valid_tool_normalized(self):
         tools = [{"name": "foo", "parameters": {"type": "object", "properties": {}}}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert len(result) == 1
         assert result[0]["name"] == "foo"
 
     def test_function_wrapper_unwrapped(self):
         tools = [{"function": {"name": "bar", "parameters": {"type": "object"}}}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert result[0]["name"] == "bar"
 
     def test_string_parameters_parsed(self):
         tools = [{"name": "foo", "parameters": '{"type": "object"}'}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert isinstance(result[0]["parameters"], dict)
 
     def test_invalid_string_parameters_default_to_empty(self):
         tools = [{"name": "foo", "parameters": "not json"}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert result[0]["parameters"] == {}
 
     def test_string_properties_parsed(self):
         tools = [{"name": "foo", "parameters": {"properties": '{"a": {"type": "string"}}'}}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert isinstance(result[0]["parameters"]["properties"], dict)
 
     def test_string_required_wrapped_in_list(self):
         tools = [{"name": "foo", "parameters": {"required": "param1"}}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert result[0]["parameters"]["required"] == ["param1"]
 
     def test_non_list_required_defaults_to_empty(self):
         tools = [{"name": "foo", "parameters": {"required": 42}}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert result[0]["parameters"]["required"] == []
 
     def test_empty_name_skipped(self):
         tools = [{"name": ""}, {"name": "valid"}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert len(result) == 1
         assert result[0]["name"] == "valid"
 
@@ -199,11 +207,13 @@ class TestNormalizeChatTemplateTools:
     def test_non_string_description_coerced(self):
         tools = [{"name": "foo", "description": 42}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert result[0]["description"] == "42"
 
     def test_missing_parameters_default_to_empty(self):
         tools = [{"name": "foo"}]
         result = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        assert result is not None
         assert result[0]["parameters"] == {}
 
 

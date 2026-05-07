@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for xAI's Grok-1 mixture-of-experts decoder.
+
+Defines :class:`Grok1Config`, the EasyDeL configuration object for xAI's
+Grok-1 model. Grok-1 is a 64-layer decoder with grouped-query attention
+(48 query / 8 KV heads), rotary position embeddings, a 132,608-token
+vocabulary, and a sparse MoE FFN with 8 experts and top-2 routing.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

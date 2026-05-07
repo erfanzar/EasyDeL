@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the supervised fine-tuning (SFT) trainer.
+
+Defines :class:`SFTConfig` and the SFT-specific knobs layered on top of
+:class:`TrainingArguments`: dataset text field selection, optional
+sequence packing (``bfd`` / ``wrapped``), assistant-only loss masking,
+and dataset-preprocessing worker controls.
+"""
+
 import typing as tp
 from dataclasses import dataclass, field
 

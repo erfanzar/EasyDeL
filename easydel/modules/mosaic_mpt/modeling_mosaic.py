@@ -788,6 +788,13 @@ class MptModel(EasyDeLBaseModule):
             past_key_values = TransformerCache.init_empty(len(self.blocks))
 
         def _layer_loop(block, carry):
+            """Body of the MPT decoder scan with ALiBi attention bias.
+
+            Carry: ``(hidden_states, all_hidden_states, all_attentions,
+            layer_index)``. MPT uses no rotary embeddings — positional
+            information is injected via the ALiBi slope tensor stored as
+            ``self.alibi`` and forwarded as ``position_bias``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 layer_outputs = block(

@@ -3813,6 +3813,8 @@ class EasyGenerationMixin:
                 )
             generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
         else:  # by default let's always generate 10 new tokens
+            if generation_config.max_length is None:
+                generation_config.max_length = GenerationConfig().max_length
             if generation_config.max_length == GenerationConfig().max_length:
                 generation_config.max_length = generation_config.max_length + input_ids_seq_length
                 max_position_embeddings = getattr(self.config, "max_position_embeddings", None)
@@ -4011,8 +4013,9 @@ class EasyGenerationMixin:
             if generation_config.forced_decoder_ids is not None and len(generation_config.forced_decoder_ids) > 0:
                 begin_index += generation_config.forced_decoder_ids[-1][0]
             processors.append(SuppressTokensAtBeginLogitsProcessor(generation_config.begin_suppress_tokens, begin_index))
-        if getattr(generation_config, "forced_decoder_ids", None) is not None:
-            forced_decoder_ids = [[input_ids_seq_length + i[0] - 1, i[1]] for i in generation_config.forced_decoder_ids]
+        forced_decoder_ids_config = getattr(generation_config, "forced_decoder_ids", None)
+        if forced_decoder_ids_config is not None:
+            forced_decoder_ids = [[input_ids_seq_length + i[0] - 1, i[1]] for i in forced_decoder_ids_config]
             processors.append(ForceTokensLogitsProcessor(forced_decoder_ids))
         if generation_config.no_repeat_ngram_size is not None and generation_config.no_repeat_ngram_size > 0:
             processors.append(NoRepeatNGramLogitsProcessor(generation_config.no_repeat_ngram_size))

@@ -523,6 +523,33 @@ class Glm4MoeMoE(BaseMoeModule):
         norm_topk_prob: bool,
         routed_scaling_factor: float,
     ) -> tuple[Array, Array]:
+        """Select top-k experts under grouped routing and return their weights.
+
+        Implements the GLM-4-MoE/DeepSeek-style routing pipeline described in
+        :class:`Glm4MoeTopKRouter`: scores are obtained from a sigmoid over
+        ``gate_logits``, the experts are partitioned into ``n_group`` equal
+        groups and the ``topk_group`` groups with the largest sum of their
+        top-``group_topk_k`` scores survive; experts outside the surviving
+        groups are masked to zero before a flat ``top_k=k`` selection. The
+        per-token weights are optionally renormalised
+        (``norm_topk_prob``) and rescaled by ``routed_scaling_factor``.
+
+        Args:
+            gate_logits: Pre-sigmoid router logits, shape
+                ``(num_tokens, n_routed_experts)``.
+            pre_bias_logits: Unused; kept for hook signature compatibility.
+            k: Number of experts to select per token (``num_experts_per_tok``).
+            n_routed_experts: Total number of routed experts.
+            n_group: Number of equal-sized expert groups.
+            topk_group: Number of groups to keep per token.
+            group_topk_k: Within-group top-k whose sum scores each group.
+            norm_topk_prob: Whether to renormalise the selected weights.
+            routed_scaling_factor: Final multiplier on the selected weights.
+
+        Returns:
+            Tuple ``(topk_weights, topk_indices)`` of shape
+            ``(num_tokens, k)`` each.
+        """
         del pre_bias_logits
         scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
         scores_for_choice = scores
@@ -941,6 +968,13 @@ class Glm4MoeModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Run one decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, layer_index)`` through the scan, collecting
+            intermediate hidden states, attention weights, and per-layer
+            router logits when the outer ``forward`` enabled them.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

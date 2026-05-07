@@ -631,6 +631,14 @@ class Cohere2Model(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Per-layer body for the Cohere2 decoder ``scan``.
+
+            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
+            idx)``. Optionally records the input hidden state, runs one
+            decoder block at its assigned pipeline stage, captures the
+            attention weights when requested, and writes the updated KV cache
+            slot before returning the next carry.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             stage_idx = getattr(block, "layer_idx", idx)
             if output_hidden_states:
@@ -852,6 +860,7 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
         scale = self.logit_scale
 
         def _project(hidden_states):
+            """Apply the LM head and Cohere2's optional ``logit_scale``."""
             logits = base_fn(hidden_states)
             if scale is not None:
                 logits = logits * scale

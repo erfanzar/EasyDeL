@@ -23,11 +23,12 @@ from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 if TYPE_CHECKING:
     from easydel.inference.sampling_params import SamplingParams
 
+# A single benchmark task specification: a task name string, a task config
+# dict, or an lm-eval task object.
 BenchmarkTask = str | dict[str, Any] | Any
-"""A single benchmark task specification: a task name string, a task config dict, or an lm-eval task object."""
 
+# One or more benchmark task specifications.
 BenchmarkTasks = BenchmarkTask | collections.abc.Sequence[BenchmarkTask]
-"""One or more benchmark task specifications."""
 
 
 class EvalKwargs(TypedDict, total=False):

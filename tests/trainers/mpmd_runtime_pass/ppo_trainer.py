@@ -30,7 +30,7 @@ import jax
 
 import easydel as ed
 
-REWARD_MODEL_REPO = "Ray2333/Gemma-2B-rewardmodel-baseline"
+REWARD_MODEL_REPO = os.environ.get("EASYDEL_RUNTIME_REWARD_MODEL_REPO", "Ray2333/Gemma-2B-rewardmodel-baseline")
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
@@ -71,7 +71,7 @@ def main() -> None:
             **mpmd_generation_length_overrides(prompt=64, completion=32),
             "num_return_sequences": 2,
             "generation_num_return_sequences": 2,
-            "use_esurge_generation": True,
+            "use_esurge_generation": False,
             "esurge_max_num_seqs": 2,
             "esurge_max_num_seq_buckets": [1, 2],
             "esurge_min_input_pad": 1,

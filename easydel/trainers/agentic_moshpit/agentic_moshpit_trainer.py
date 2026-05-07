@@ -495,7 +495,9 @@ class AgenticMoshPitTrainer(GRPOTrainer):
 
         for idx in active_reward_indices:
             reward_func = self.reward_funcs[idx]
-            reward_processing_class = self.reward_processing_classes[idx]
+            reward_processing_class = (
+                self.reward_processing_classes[idx] if self.reward_processing_classes is not None else None
+            )
             name = self.reward_func_names[idx]
 
             if isinstance(reward_func, EasyDeLState):

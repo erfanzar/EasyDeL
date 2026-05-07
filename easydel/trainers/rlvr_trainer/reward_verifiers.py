@@ -46,7 +46,20 @@ _HASH_ANSWER_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
 
 
 def _normalize_number(text: str) -> str | None:
-    """Strip formatting and return a canonical number string."""
+    """Strip formatting and return a canonical number string.
+
+    Removes whitespace and thousands-separator commas, then tries to
+    parse the result as a ``float`` and serialise it back to ``str`` so
+    that lexically distinct but numerically equal answers (``"1,000"``
+    vs ``"1000.0"``) compare equal.
+
+    Args:
+        text: Free-form input that should represent a number.
+
+    Returns:
+        A canonical ``str(float(...))`` representation, or ``None``
+        when the input does not parse as a number.
+    """
     text = text.strip().replace(",", "").replace(" ", "")
     try:
         return str(float(text))
@@ -57,8 +70,17 @@ def _normalize_number(text: str) -> str | None:
 def _extract_answer(text: str) -> str | None:
     """Extract a numeric answer from model output.
 
-    Checks for ``\\boxed{...}`` first, then ``#### ...``, then the
-    last number in the text.
+    Tries three strategies in order: ``\\boxed{...}`` (LaTeX), the
+    GSM8K-style ``#### <number>`` marker, and finally the *last* number
+    that appears anywhere in the text. Each candidate is normalised via
+    :func:`_normalize_number` before being returned.
+
+    Args:
+        text: Raw model completion to scan.
+
+    Returns:
+        The extracted canonical number string, or ``None`` if no
+        candidate matched.
     """
     match = _BOXED_RE.search(text)
     if match:
@@ -250,7 +272,20 @@ class CodeVerifier:
 
     @staticmethod
     def _extract_code(text: str) -> str | None:
-        """Extract code from markdown or XML code blocks."""
+        """Extract code from markdown or XML code blocks.
+
+        Searches for a fenced markdown block (``\\`\\`\\`python`` or
+        plain ``\\`\\`\\```) first, then a ``<code>...</code>`` tag.
+        The first match wins and the inner content is returned with
+        leading / trailing whitespace stripped.
+
+        Args:
+            text: Raw completion text to scan.
+
+        Returns:
+            Extracted code string, or ``None`` if neither a markdown
+            block nor a ``<code>`` tag is found.
+        """
         match = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
         if match:
             return match.group(1).strip()

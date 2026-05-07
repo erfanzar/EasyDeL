@@ -188,6 +188,7 @@ class GFPOTrainer(GRPOTrainer):
                 self.top_entropy_quantile,
                 self.arguments.completion_chunk_size,
                 self.arguments.max_loss_completion_tokens,
+                self.arguments.logprob_vocab_chunk_size,
                 straight_through_emulator,
             )
 
@@ -207,6 +208,7 @@ class GFPOTrainer(GRPOTrainer):
                 self.top_entropy_quantile,
                 self.arguments.completion_chunk_size,
                 self.arguments.max_loss_completion_tokens,
+                self.arguments.logprob_vocab_chunk_size,
                 straight_through_emulator,
             )
 

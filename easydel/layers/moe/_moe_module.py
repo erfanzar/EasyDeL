@@ -57,6 +57,7 @@ import typing as tp
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import partial
+from typing import Any
 
 import jax
 import spectrax as spx
@@ -64,6 +65,7 @@ from eformer.loggings import get_logger
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import shard_map
+from jax._src.mesh import AxisType, MeshAxisName
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
@@ -195,17 +197,20 @@ class BaseMoeModule(spx.Module, ABC):
         axis_types: tuple[jax.sharding.AxisType, ...],
         arr: jax.Array | None = None,
     ) -> spx.SpxMesh:
-        """Collapse the 5D model mesh into the 3D ``(dp, expert, tp)`` MoE mesh.
+        """Return the active stage-local mesh used by fused MoE kernels.
 
-        The model-level mesh has axes ``(dp, fsdp, ep, tp, sp)``; grouped-matmul
-        / shard-map kernels for MoE want a single ``expert`` axis whose size
-        equals ``ep * (fsdp if fsdp_is_ep_bound else 1) * (sp if sp_is_ep_bound
-        else 1)``. This method walks the runtime sharding resolver, assigns
-        each physical axis to one of the three groups (``dp``, ``ep``, ``tp``),
-        flattens the device array accordingly, and returns a fresh
-        :class:`spx.SpxMesh` with the requested ``axis_types``. When the active
-        stage has no resolvable mesh (e.g. fully replicated single-host), the
-        pre-computed ``self.auto_expert_mesh`` is returned as a fallback.
+        In an MPMD stage, the safest layout is the stage submesh itself:
+        ``(dp, fsdp, ep, tp, sp)`` with the pipeline axis already removed.
+        The shard-map then marks only ``dp``/``ep``/``tp`` as manual axes.
+        This avoids lowering a separate 3D concrete mesh inside the stage HLO,
+        which can confuse TPU enhanced-barrier validation when other stage
+        work is compiled in the same executable.
+
+        If a production config binds a non-size-one ``fsdp`` or ``sp`` axis
+        into expert parallelism, we still fall back to the historical folded
+        3D ``(dp, ep, tp)`` mesh so that the expert axis keeps the requested
+        size. When the active stage has no resolvable mesh, the pre-computed
+        ``self.auto_expert_mesh`` is returned as a fallback.
 
         Args:
             axis_types: Three :class:`jax.sharding.AxisType` values, one per
@@ -217,27 +222,68 @@ class BaseMoeModule(spx.Module, ABC):
                 explicitly.
 
         Returns:
-            A new :class:`spx.SpxMesh` of shape ``(dp_size, ep_size, tp_size)``
-            ready to be used as a target for sharding constraints inside MoE
-            kernels, or ``self.auto_expert_mesh`` when no stage-local mesh is
-            available.
+            A stage-local :class:`spx.SpxMesh`, either the 5D stage submesh or
+            the folded 3D expert mesh when bound axes require folding.
         """
         mesh = resolve_stage_mesh(self._mesh, arr=arr)
         if mesh is None:
             return self.auto_expert_mesh
 
         runtime_sharding_resolver = self.runtime_sharding_resolver
-        dpname = resolve_eformer_axis(DP, runtime_sharding_resolver)
-        fsdpname = resolve_eformer_axis(FSDP, runtime_sharding_resolver)
-        epname = resolve_eformer_axis(EP, runtime_sharding_resolver)
-        tpname = resolve_eformer_axis(TP, runtime_sharding_resolver)
-        spname = resolve_eformer_axis(SP, runtime_sharding_resolver)
+        dpname = typing.cast(str, resolve_eformer_axis(DP, runtime_sharding_resolver))
+        fsdpname = typing.cast(str, resolve_eformer_axis(FSDP, runtime_sharding_resolver))
+        epname = typing.cast(str, resolve_eformer_axis(EP, runtime_sharding_resolver))
+        tpname = typing.cast(str, resolve_eformer_axis(TP, runtime_sharding_resolver))
+        spname = typing.cast(str, resolve_eformer_axis(SP, runtime_sharding_resolver))
 
-        axis_sizes = mesh.shape
+        axis_sizes = dict[MeshAxisName, Any](mesh.shape)
+        axis_names = tuple(mesh.axis_names)
+        mesh_devices = mesh.devices
+        pp_size = int(axis_sizes.get("pp", 1)) if "pp" in axis_names else 1
+        fsdp_size = int(axis_sizes.get(fsdpname, 1)) if fsdpname is not None else 1
+        sp_size = int(axis_sizes.get(spname, 1)) if spname is not None else 1
+        can_use_stage_mesh = (
+            pp_size == 1
+            and dpname in axis_names
+            and epname in axis_names
+            and tpname in axis_names
+            and (not self.config.fsdp_is_ep_bound or fsdp_size == 1)
+            and (not self.config.sp_is_ep_bound or sp_size == 1)
+        )
+        if can_use_stage_mesh:
+            stage_axis_names = tuple(axis_name for axis_name in axis_names if axis_name != "pp")
+            stage_devices = mesh_devices.reshape(tuple(axis_sizes[axis_name] for axis_name in stage_axis_names))
+            manual_axis_types = {
+                dpname: axis_types[0],
+                epname: axis_types[1],
+                tpname: axis_types[2],
+            }
+            stage_mesh = jax.sharding.Mesh(
+                stage_devices,
+                axis_names=stage_axis_names,
+                axis_types=tuple[AxisType, ...](
+                    manual_axis_types.get(axis_name, jax.sharding.AxisType.Auto) for axis_name in stage_axis_names
+                ),
+            )
+            return spx.SpxMesh(jax_mesh=stage_mesh, mpmd_axis=None)
+
         assigned_axes: dict[str, str] = {}
         size_by_group = {"dp": 1, "ep": 1, "tp": 1}
 
         def assign_axis(axis_name: str | None, group: str) -> None:
+            """Bucket a physical mesh axis into one of the three MoE groups.
+
+            Updates the enclosing ``assigned_axes`` and ``size_by_group``
+            tables in place: a previously unseen axis is recorded under
+            ``group`` and its size is multiplied into the running product
+            for that group. ``None`` and already-assigned axes are skipped.
+
+            Args:
+                axis_name: Physical mesh axis name as resolved from the
+                    runtime sharding resolver (or ``None`` when the logical
+                    axis does not exist).
+                group: Target bucket — one of ``"dp"``, ``"ep"`` or ``"tp"``.
+            """
             if axis_name is None or axis_name in assigned_axes:
                 return
             assigned_axes[axis_name] = group
@@ -249,10 +295,9 @@ class BaseMoeModule(spx.Module, ABC):
         assign_axis(fsdpname, "ep" if self.config.fsdp_is_ep_bound else "dp")
         assign_axis(spname, "ep" if self.config.sp_is_ep_bound else "dp")
 
-        devices = mesh.devices.flatten()
         return spx.SpxMesh(
             jax_mesh=jax.sharding.Mesh(
-                devices.reshape(size_by_group["dp"], size_by_group["ep"], size_by_group["tp"]),
+                mesh_devices.flatten().reshape(size_by_group["dp"], size_by_group["ep"], size_by_group["tp"]),
                 axis_names=(dpname, epname, tpname),
                 axis_types=axis_types,
             ),
@@ -260,6 +305,24 @@ class BaseMoeModule(spx.Module, ABC):
         )
 
     def _active_auto_expert_mesh(self, arr: jax.Array | None = None) -> spx.SpxMesh:
+        """Build the stage-local 3-D MoE mesh in auto-resharding mode.
+
+        Thin wrapper over :meth:`_build_active_expert_mesh` that pins all
+        three axes to ``jax.sharding.AxisType.Auto`` so that Spectrax/JAX may
+        re-distribute tensors transparently when the user takes the
+        auto-resharding code path (as opposed to the manual ``shard_map``
+        path used by the fused kernels).
+
+        Args:
+            arr: Optional sample array used by :func:`resolve_stage_mesh` to
+                infer the active MPMD stage. ``None`` falls back to the
+                module's stored mesh.
+
+        Returns:
+            A new :class:`spx.SpxMesh` of shape ``(dp_size, ep_size,
+            tp_size)`` with all axes typed ``Auto``, suitable for sharding
+            constraints in the auto-resharding MoE call paths.
+        """
         return self._build_active_expert_mesh(
             axis_types=(
                 jax.sharding.AxisType.Auto,
@@ -1064,8 +1127,10 @@ class BaseMoeModule(spx.Module, ABC):
         if hooks is not None and hooks.before_topk is not None:
             gate_logits = hooks.before_topk(gate_logits)
 
-        # Use expert_mesh (3D: dp, ep, tp) for cleaner sharding
-        expert_mesh = self._active_auto_expert_mesh(hidden_state)
+        expert_mesh: spx.SpxMesh = self._build_active_expert_mesh(
+            axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
+            arr=hidden_state,
+        )
         runtime_sharding_resolver = self.runtime_sharding_resolver
 
         # Resolve axis names from the runtime sharding resolver rather than the mesh directly.
@@ -1089,7 +1154,8 @@ class BaseMoeModule(spx.Module, ABC):
                 f"dropped from compute."
             )
 
-        # Simplified partition specs using 3D expert_mesh
+        # Partition specs over the active expert layout. On MPMD stages this
+        # is usually the 5D stage mesh with only dp/ep/tp used by these specs.
         input_ps = jax.sharding.PartitionSpec(dp_axis_name, None, None)
         glps = jax.sharding.PartitionSpec(dp_axis_name, None)
 
@@ -1101,6 +1167,15 @@ class BaseMoeModule(spx.Module, ABC):
         if ffn_activation is None:
 
             def ffn_activation(x0: jax.Array, x1: jax.Array) -> jax.Array:
+                """Default SwiGLU-style FFN activation: ``act_fn(x0) * x1``.
+
+                Args:
+                    x0: Gate-projection output.
+                    x1: Up-projection output.
+
+                Returns:
+                    Element-wise ``act_fn(x0) * x1``, same shape as inputs.
+                """
                 return act_fn(x0) * x1
 
         # Generate weight sharding specs using helper function
@@ -1119,7 +1194,7 @@ class BaseMoeModule(spx.Module, ABC):
             preferred_element_type = jnp.float32
         gmm_kws = {"preferred_element_type": preferred_element_type}
         if self.config.moe_force_xla_gmm:
-            gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
+            gmm_kws.update(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True))
         else:
             if jax.default_backend() == "tpu":
                 moe_block_m = int(getattr(self.config, "moe_tiling_size_batch", 1024))
@@ -1158,6 +1233,29 @@ class BaseMoeModule(spx.Module, ABC):
             wu_bias: jax.Array | None,
             wd_bias: jax.Array | None,
         ):
+            """Per-shard fused-MoE body executed under :func:`jax.shard_map`.
+
+            Permutes tokens by expert assignment, runs the three grouped
+            matmuls (gate / up / down) with ``ffn_activation`` in between,
+            handles inter-shard token redistribution (ring-of-experts or
+            ragged all-to-all), and unpermutes the expert outputs back into
+            the original token order on each device.
+
+            Args:
+                x: Local hidden-state slice of shape ``[B_local, S, H]``.
+                gate_logits: Local router logits of shape ``[B_local*S, E]``.
+                wi_kernel: Gate kernel of shape ``[E, H, M]``.
+                wu_kernel: Up kernel of shape ``[E, H, M]``.
+                wd_kernel: Down kernel of shape ``[E, M, H]``.
+                wi_bias: Optional gate bias ``[E, H]`` or ``None``.
+                wu_bias: Optional up bias ``[E, H]`` or ``None``.
+                wd_bias: Optional down bias ``[E, M]`` or ``None``.
+
+            Returns:
+                Per-shard MoE output sharded according to ``output_ps``;
+                shape matches the input ``x`` modulo the chosen output
+                partition spec.
+            """
             batch_size, sequence_length, _ = x.shape
             expert_shard_id = jax.lax.axis_index(expert_axis_name)
             reshaped_group_sizes: jax.Array | None = None
@@ -1579,6 +1677,15 @@ class BaseMoeModule(spx.Module, ABC):
         if ffn_activation is None:
 
             def ffn_activation(x0: jax.Array, x1: jax.Array) -> jax.Array:
+                """Default SwiGLU-style FFN activation: ``act_fn(x0) * x1``.
+
+                Args:
+                    x0: Gate-projection output.
+                    x1: Up-projection output.
+
+                Returns:
+                    Element-wise ``act_fn(x0) * x1``, same shape as inputs.
+                """
                 return act_fn(x0) * x1
 
         precision = getattr(self, "precision", None)

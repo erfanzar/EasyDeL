@@ -19,11 +19,7 @@ that were sprinkled across ``mixins/bridge.py`` and ``modules/auto`` during
 the spectrax migration.  A single ``phase_timer`` factory now serves both
 ``from_pretrained`` (tag ``"from_pretrained"``) and ``AutoShardAndGatherFunctions``
 (tag ``"AutoShardAndGatherFunctions"``), accumulating into an optional dict
-and emitting one INFO line per phase.
-
-Set the environment variable ``EASYDEL_PHASE_TIMING=0`` to silence the
-per-phase log lines without touching the call sites; the timing context still
-runs (and still updates accumulators) so summaries remain accurate.
+and emitting debug-level timing lines for developers.
 """
 
 from __future__ import annotations

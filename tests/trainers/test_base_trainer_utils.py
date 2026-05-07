@@ -14,9 +14,9 @@
 
 import json
 import os
-from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import patch
 
 import jax
@@ -156,7 +156,9 @@ class _MeshCtx:
         return False
 
 
-_CountState = namedtuple("_CountState", ["count", "payload"])
+class _CountState(NamedTuple):
+    count: object
+    payload: dict[str, object]
 
 
 class _StateStub:
@@ -430,8 +432,10 @@ def test_configure_state_seeds_opt_state_counts_from_step_start_point():
     BaseTrainer._configure_state(trainer)
 
     assert trainer.model_state.init_tx_calls == ["tx-object"]
-    assert int(trainer.model_state.opt_state[0].count) == 13
-    assert int(trainer.model_state.opt_state[1]["count"]) == 13
+    opt_state = trainer.model_state.opt_state
+    assert opt_state is not None
+    assert int(opt_state[0].count) == 13
+    assert int(opt_state[1]["count"]) == 13
 
 
 def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
@@ -454,8 +458,10 @@ def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
 
     assert trainer.model_state.init_tx_calls == []
     assert {"tx": "new-tx"} in trainer.model_state.replace_calls
-    assert int(trainer.model_state.opt_state[0].count) == 13
-    assert int(trainer.model_state.opt_state[1]["count"]) == 13
+    opt_state = trainer.model_state.opt_state
+    assert opt_state is not None
+    assert int(opt_state[0].count) == 13
+    assert int(opt_state[1]["count"]) == 13
 
 
 def test_configure_state_force_seeds_opt_state_counts_from_loaded_nonzero_step():
@@ -478,8 +484,10 @@ def test_configure_state_force_seeds_opt_state_counts_from_loaded_nonzero_step()
     BaseTrainer._configure_state(trainer)
 
     assert int(trainer.model_state.step) == 13
-    assert int(trainer.model_state.opt_state[0].count) == 13
-    assert int(trainer.model_state.opt_state[1]["count"]) == 13
+    opt_state = trainer.model_state.opt_state
+    assert opt_state is not None
+    assert int(opt_state[0].count) == 13
+    assert int(opt_state[1]["count"]) == 13
 
 
 def test_save_checkpoint_for_step_updates_checkpointer_bookkeeping_for_callback_saves():
@@ -1991,7 +1999,9 @@ def test_generate_unified_esurge_propagates_generation_penalties():
         },
     )
 
-    sampling_params = model.call_esurge_engine_kwargs["sampling_params"]
+    call_kwargs = model.call_esurge_engine_kwargs
+    assert call_kwargs is not None
+    sampling_params = call_kwargs["sampling_params"]
     assert sampling_params.presence_penalty == pytest.approx(0.6)
     assert sampling_params.frequency_penalty == pytest.approx(0.3)
     assert sampling_params.repetition_penalty == pytest.approx(1.4)

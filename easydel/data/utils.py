@@ -355,5 +355,3 @@ def align_columns_intersection(datasets: list):
     if not common:
         return datasets
     return [ds.remove_columns([c for c in ds.column_names if c not in common]) for ds in datasets]
-
-

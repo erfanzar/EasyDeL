@@ -112,6 +112,17 @@ class GlmMoeDsaMLP(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the dense MLP block.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            hidden_size: Optional override for the input/output dim.
+            intermediate_size: Optional override for the inner MLP width.
+            rngs: Random number generator collection.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -186,6 +197,16 @@ class GlmMoeDsaLayerNorm(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize a LayerNorm with HF-compatible ``weight``/``bias`` names.
+
+        Args:
+            hidden_size: Feature dim to normalise over.
+            eps: Numerical stability epsilon.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            rngs: Random number generator collection (unused but kept for
+                signature compatibility with sibling modules).
+        """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -194,6 +215,14 @@ class GlmMoeDsaLayerNorm(spx.Module):
         self.bias = spx.Parameter(jnp.zeros((hidden_size,), dtype=param_dtype))
 
     def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
+        """Apply LayerNorm in fp32 and return in the input dtype.
+
+        Args:
+            hidden_states: Tensor whose last axis has length ``hidden_size``.
+
+        Returns:
+            Normalised tensor with the same shape and dtype as the input.
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
         mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
@@ -249,6 +278,16 @@ class GlmMoeDsaMLPStack(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the routed-expert MLP stack.
+
+        Args:
+            config: Model configuration carrying ``n_routed_experts`` and
+                ``moe_intermediate_size``.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -352,6 +391,16 @@ class GlmMoeDsaTopKRouter(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the GLM-MoE-DSA top-k routing gate.
+
+        Args:
+            config: Model configuration carrying ``n_routed_experts``.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype (the router matmul itself runs in
+                fp32 regardless).
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -406,6 +455,15 @@ class GlmMoeDsaMoE(BaseMoeModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the GLM-MoE-DSA sparse FFN.
+
+        Args:
+            config: Model configuration carrying every routing knob.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.n_routed_experts,
@@ -478,6 +536,31 @@ class GlmMoeDsaMoE(BaseMoeModule):
         norm_topk_prob: bool,
         routed_scaling_factor: float,
     ) -> tuple[Array, Array]:
+        """Run the GLM-MoE-DSA grouped sigmoid top-k expert selection.
+
+        Same algorithm as :meth:`Glm4MoeMoE._select_experts_static`:
+        sigmoid the router logits, score each of ``n_group`` groups by
+        their top-``group_topk_k`` summed scores, keep the
+        ``topk_group`` winning groups, mask the rest, then take a flat
+        top-``k`` over the survivors. Optionally renormalise weights and
+        scale by ``routed_scaling_factor``.
+
+        Args:
+            gate_logits: Pre-sigmoid router logits ``(num_tokens,
+                n_routed_experts)``.
+            pre_bias_logits: Unused; kept for hook signature compatibility.
+            k: Routed experts selected per token.
+            n_routed_experts: Total experts.
+            n_group: Number of equal-sized expert groups.
+            topk_group: Groups kept per token before flat top-k.
+            group_topk_k: Within-group top-k whose sum scores each group.
+            norm_topk_prob: Whether to renormalise the selected weights.
+            routed_scaling_factor: Final multiplier on the selected weights.
+
+        Returns:
+            Tuple ``(topk_weights, topk_indices)`` of shape
+            ``(num_tokens, k)``.
+        """
         del pre_bias_logits
         scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
         scores_for_choice = scores
@@ -578,6 +661,17 @@ class GlmMoeDsaIndexer(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the DSA per-query top-k key indexer.
+
+        Args:
+            config: Model configuration carrying the indexer hyper-params
+                (``index_n_heads``, ``index_head_dim``, ``index_topk``,
+                ``indexer_rope_interleave``, ``q_lora_rank``).
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -644,6 +738,29 @@ class GlmMoeDsaIndexer(spx.Module):
         cached_keys: Float[Array, "batch cached_seq head_dim"] | None = None,
         use_cache: bool = False,
     ) -> GlmMoeDsaIndexerOutput:
+        """Score every (query, key) pair and select the top ``index_topk`` keys.
+
+        Args:
+            hidden_states: Token activations
+                ``(batch, seq, hidden_size)`` providing the K side of the
+                index.
+            q_resid: MLA Q low-rank residual
+                ``(batch, seq, q_lora_rank)``; falls back to
+                ``hidden_states`` when ``q_lora_rank`` is disabled.
+            position_ids: Position indices used by RoPE.
+            frequencies: Optional pre-computed RoPE table shared with the
+                main attention.
+            attention_mask: Optional bidirectional mask threaded into the
+                fused indexer kernel.
+            cached_keys: Optional indexer K cache
+                ``(batch, cached_seq, index_head_dim)`` for autoregressive
+                decoding.
+            use_cache: Whether to update / read the indexer's own KV cache.
+
+        Returns:
+            :class:`GlmMoeDsaIndexerOutput` with the top-k key indices
+            and the gathered scores consumed by the main MLA attention.
+        """
         q_input = q_resid if q_resid is not None else hidden_states
         query_states = self.wq_b(q_input).reshape(
             hidden_states.shape[0],
@@ -732,6 +849,17 @@ class GlmMoeDsaAttention(UnifiedAttention):
         rngs: spx.Rngs,
         layer_idx: int,
     ):
+        """Initialize the MLA + DSA attention block.
+
+        Args:
+            config: Model configuration carrying every MLA hyper-param
+                plus the DSA indexer settings.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+            layer_idx: Index of this layer in the decoder stack.
+        """
         self.config = config
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -896,6 +1024,19 @@ class GlmMoeDsaAttention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config, rngs):
+        """Construct the flexible attention kernel with YaRN-aware scaling.
+
+        Multiplies ``softmax_scale`` by ``mscale**2`` when long-context
+        RoPE scaling is configured so the effective attention temperature
+        matches the rescaled RoPE frequencies.
+
+        Args:
+            config: Model configuration.
+            rngs: Random number generator collection.
+
+        Returns:
+            A :class:`FlexibleAttentionModule` configured for MLA + DSA.
+        """
         softmax_scale = self.q_head_dim**-0.5
         rope_scaling = getattr(self.config, "rope_scaling", None)
         if rope_scaling is not None:
@@ -913,6 +1054,17 @@ class GlmMoeDsaAttention(UnifiedAttention):
 
     @staticmethod
     def _apply_rope_interleaved(x: Array, cos: Array, sin: Array) -> Array:
+        """Apply RoPE in the interleaved (DeepSeek) layout.
+
+        Args:
+            x: Tensor whose last axis carries the rotated channels with
+                even/odd interleaving.
+            cos: Per-position cosines broadcastable to ``x``.
+            sin: Per-position sines broadcastable to ``x``.
+
+        Returns:
+            Rotated tensor with the same shape as ``x``.
+        """
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
         o1 = x1 * cos - x2 * sin
@@ -931,6 +1083,33 @@ class GlmMoeDsaAttention(UnifiedAttention):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ):
+        """Run the MLA + DSA attention forward pass.
+
+        Builds Q (optionally via the LoRA chain), projects the compressed
+        KV latent, applies split-RoPE, and dispatches to the attention
+        performer with the DSA indexer's per-query top-k key gating
+        layered in. When the cache is an MLA paged cache, the kv-up
+        projection is **absorbed** into the queries and the cache stores
+        only the layer-normed compressed latent — the kernel then
+        operates on the latent dim directly.
+
+        Args:
+            hidden_states: Residual ``(batch, seq_len, hidden_size)``.
+            mask_info: Pre-computed attention mask metadata.
+            position_ids: Position indices for RoPE.
+            mode: Runtime mode propagated to the kernel.
+            cache_view: KV cache view (regular, MLA-paged, or hybrid).
+            cache_metadata: Cache metadata for paged attention.
+            output_attentions: If ``True``, return attention weights.
+            frequencies: Pre-computed RoPE table sized to
+                ``qk_rope_head_dim``.
+            alibi: Unused; kept for signature compatibility.
+
+        Returns:
+            :class:`AttentionLayerOutput` with the projected attention
+            output, optional attention weights, and the (possibly
+            updated) cache view.
+        """
         bsz, q_len, _ = hidden_states.shape
         _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView) or (
             isinstance(cache_view, ParallelHybridCacheView)
@@ -1200,6 +1379,20 @@ class GlmMoeDsaDecoderLayer(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize one MLA + DSA decoder block.
+
+        Picks :class:`GlmMoeDsaMoE` for layers marked ``"sparse"`` in
+        ``config.mlp_layer_types`` (and only when MoE is fully configured)
+        and :class:`GlmMoeDsaMLP` otherwise.
+
+        Args:
+            config: Model configuration.
+            layer_idx: Index of this layer in the decoder stack.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1265,6 +1458,27 @@ class GlmMoeDsaDecoderLayer(spx.Module):
         output_attentions: bool = False,
         frequencies: tuple[Array, Array] | None = None,
     ) -> DecoderLayerOutput:
+        """Pre-norm decoder block: ``x + attn(norm(x))`` then ``x + ffn(norm(x))``.
+
+        The feedforward branch returns a ``(out, router_logits)`` tuple
+        for sparse layers and a plain tensor for dense layers; router
+        logits are forwarded only for sparse layers.
+
+        Args:
+            hidden_states: Residual ``(batch, seq_len, hidden_size)``.
+            mask_info: Attention mask metadata.
+            position_ids: Position indices for RoPE.
+            mode: Runtime mode propagated to attention.
+            cache_view: KV cache view, if any.
+            cache_metadata: Cache metadata, if any.
+            output_attentions: Whether to expose attention weights.
+            frequencies: Optional pre-computed RoPE table.
+
+        Returns:
+            :class:`DecoderLayerOutput` carrying hidden states, optional
+            attention weights, the (possibly updated) cache view, and
+            optional router logits for MoE layers.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = apply_logical_sharding(
@@ -1332,6 +1546,15 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the GLM-MoE-DSA backbone.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1405,6 +1628,37 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeModelOutput:
+        """Run the GLM-MoE-DSA backbone.
+
+        Args:
+            input_ids: Token ids ``(batch, seq_len)``. Mutually exclusive
+                with ``inputs_embeds``.
+            inputs_embeds: Pre-computed embeddings ``(batch, seq_len,
+                hidden_size)``.
+            attention_mask: Optional ``(batch, seq_len)`` boolean padding
+                mask.
+            mask_info: Optional pre-computed attention mask metadata.
+            position_ids: Optional ``(batch, seq_len)`` RoPE positions.
+            mode: Runtime mode; defaults to MODE_DECODE when seq_len==1
+                and a cache is provided, otherwise MODE_TRAIN.
+            past_key_values: Existing KV cache to update.
+            cache_metadata: Cache metadata for paged attention.
+            output_attentions: Whether to collect attention weights.
+            output_hidden_states: Whether to collect intermediate hidden
+                states.
+            output_router_logits: Whether to collect router logits from
+                MoE layers.
+
+        Returns:
+            :class:`MoeModelOutput` with the final hidden state, optional
+            collections of intermediate states/attentions/router logits,
+            and the (updated) KV cache.
+
+        Raises:
+            ValueError: If neither/both of ``input_ids``/``inputs_embeds``
+                are provided, or if the sequence exceeds
+                ``max_position_embeddings``.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1450,6 +1704,12 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Run one MLA + DSA decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, layer_index)`` through the scan and
+            collects optional outputs requested by the outer ``forward``.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1525,6 +1785,15 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
         *,
         rngs: spx.Rngs,
     ):
+        """Initialize the causal-LM wrapper around :class:`GlmMoeDsaModel`.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
         super().__init__(
             config=config,
             base_model_class=GlmMoeDsaModel,

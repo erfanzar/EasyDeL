@@ -95,10 +95,16 @@ from spectrax import PartitionAxis, make_shard_and_gather_fns
 from spectrax.serialization import AsyncCheckpointManager, Checkpointer
 
 from easydel.infra.factory import TaskType
+from easydel.utils.checkpoint_compat import legacy_checkpoint_key_aliases
 from easydel.utils.helpers import is_remote_path
 from easydel.utils.traversals import deepcopy_model
 
-from .sharding import MeshLike, replicated_named_sharding, sanitize_partition_specs_for_shape_tree
+from .sharding import (
+    MeshLike,
+    device_put_if_sharding_mismatch,
+    replicated_named_sharding,
+    sanitize_partition_specs_for_shape_tree,
+)
 from .utils import device_put_or_shard_abstract, materialize_meta_leaves
 
 
@@ -219,23 +225,23 @@ if tp.TYPE_CHECKING:
 
     from .base_module import EasyDeLBaseModule
 
+# Alias for AsyncCheckpointManager for convenient access.
 AM = AsyncCheckpointManager
-"""Alias for AsyncCheckpointManager for convenient access."""
 
+# Default filename for saving model parameters.
 WEIGHTS_NAME = "easydel-model.parameters"
-"""Default filename for saving model parameters."""
 
+# Default filename for saving optimizer state tensors.
 OPTIMIZER_NAME = "easydel-optstate.parameters"
-"""Default filename for saving optimizer state tensors."""
 
+# Default filename for saving optimizer state structure (pickle format).
 OPTIMIZER_STRUCT_NAME = "easydel-optstate.structure"
-"""Default filename for saving optimizer state structure (pickle format)."""
 
+# Filename for optimizer transformation structure in JSON format.
 TX_STRUCT_JSON = "tx_structure.json"
-"""Filename for optimizer transformation structure in JSON format."""
 
+# Subdirectory used for LoRA-preserving model copy inside merged state checkpoints.
 RESUME_MODEL_SUBDIR = "_resume_model"
-"""Subdirectory used for the LoRA-preserving model copy inside merged state checkpoints."""
 
 logger = get_logger(__name__)
 
@@ -763,33 +769,30 @@ class EasyDeLState(_PyTreeNode):
         # 1. Per-leaf NamedShardings -- MPMD-aware (per-stage submesh preserved).
         param_shardings = spx.extract_sharding_structure(self.graphstate, mesh=mesh)
 
-        eval_opt_state = jax.eval_shape(lambda: tx.init(self.graphstate))
+        opt_state = tx.init(self.graphstate)
 
         # 2. Mirror each param's NamedSharding onto its matching opt-state slot.
         if hasattr(optax, "tree_map_params"):
             out_shardings = optax.tree_map_params(
                 tx,
                 lambda _param, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
-                eval_opt_state,
+                opt_state,
                 param_shardings,
                 transform_non_params=lambda _: replicated,
                 is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
             )
         else:
-            out_shardings = eval_opt_state
+            out_shardings = opt_state
 
         # 3. Materialise via per-leaf device_put against the resolved
         #    NamedShardings.  Equivalent to what ``make_shard_and_gather_fns``
         #    does internally, but we already have NamedShardings so we don't
         #    need to round-trip through PartitionSpec.
-        opt_state_unplaced = tx.init(self.graphstate)
         opt_state = jax.tree_util.tree_map(
             lambda leaf, ns: (
-                jax.device_put(leaf, ns)
-                if isinstance(ns, jax.sharding.NamedSharding) and hasattr(leaf, "shape")
-                else leaf
+                device_put_if_sharding_mismatch(leaf, ns) if isinstance(ns, jax.sharding.NamedSharding) else leaf
             ),
-            opt_state_unplaced,
+            opt_state,
             out_shardings,
             is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
         )
@@ -1047,6 +1050,15 @@ class EasyDeLState(_PyTreeNode):
         load_directory: str | ePathLike,
         checkpointer: Checkpointer | None = None,
         tx_template: None | optax.GradientTransformation = None,
+        checkpoint_load_chunk_size: int | None = None,
+        checkpoint_load_concurrent_gb: int = 128,
+        checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_copy_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_cache_gb: int | None = 128,
+        checkpoint_load_tensorstore_assume_metadata: bool = True,
+        checkpoint_load_tensorstore_metadata_workers: int = 256,
+        checkpoint_load_progress: bool | None = None,
+        verbose: bool = True,
     ) -> Self:
         """Load optimizer state from saved checkpoint files.
 
@@ -1068,6 +1080,25 @@ class EasyDeLState(_PyTreeNode):
                 transformation used to infer the structure of the optimizer state.
                 If None, uses `self.tx`. Required if the checkpoint format needs
                 structure inference. Defaults to None.
+            checkpoint_load_chunk_size: Optional TensorStore array batch size.
+                Uses the same policy as model loading: ``None`` loads the
+                checkpoint in one TensorStore wave, while an integer loads
+                arrays in chunks of that size.
+            checkpoint_load_concurrent_gb: In-flight TensorStore read budget per
+                deserialize call.
+            checkpoint_load_tensorstore_io_concurrency: TensorStore file I/O
+                concurrency for optimizer restores.
+            checkpoint_load_tensorstore_copy_concurrency: TensorStore data-copy
+                concurrency for optimizer restores.
+            checkpoint_load_tensorstore_cache_gb: TensorStore cache-pool size in
+                GiB, or ``None`` to leave TensorStore defaults.
+            checkpoint_load_tensorstore_assume_metadata: Whether SpectraX may
+                prefetch zarr metadata and pass it as trusted TensorStore metadata.
+            checkpoint_load_tensorstore_metadata_workers: Worker count for zarr
+                metadata prefetch.
+            checkpoint_load_progress: Whether to show tensor load progress. When
+                ``None``, follows ``verbose``.
+            verbose: Whether restore progress should be shown by default.
 
         Returns:
             Self: A new EasyDeLState instance with:
@@ -1118,6 +1149,9 @@ class EasyDeLState(_PyTreeNode):
 
         tx_template = tx_template if tx_template is not None else self.tx
 
+        optimizer_chunk_size = checkpoint_load_chunk_size
+        optimizer_concurrent_gb = checkpoint_load_concurrent_gb
+
         def _load_tensorstore(template):
             """Restore optimizer state from a TensorStore-format checkpoint.
 
@@ -1136,7 +1170,16 @@ class EasyDeLState(_PyTreeNode):
                 load_treedef=True,
                 discover_latest=False,
                 template=template,
+                key_aliases=legacy_checkpoint_key_aliases,
                 sharding_rules=self.model.resolve_shardings_regex(),
+                chunk_size=optimizer_chunk_size,
+                concurrent_gb=optimizer_concurrent_gb,
+                tensorstore_io_concurrency=checkpoint_load_tensorstore_io_concurrency,
+                tensorstore_copy_concurrency=checkpoint_load_tensorstore_copy_concurrency,
+                tensorstore_cache_gb=checkpoint_load_tensorstore_cache_gb,
+                tensorstore_assume_metadata=checkpoint_load_tensorstore_assume_metadata,
+                tensorstore_metadata_workers=checkpoint_load_tensorstore_metadata_workers,
+                show_progress=verbose if checkpoint_load_progress is None else checkpoint_load_progress,
             )
 
         template = None
@@ -1402,6 +1445,14 @@ class EasyDeLState(_PyTreeNode):
         apply_quantization: bool = False,
         verbose: bool = True,
         tx_template: optax.GradientTransformation | None = None,
+        checkpoint_load_chunk_size: int | None = None,
+        checkpoint_load_concurrent_gb: int = 128,
+        checkpoint_load_tensorstore_io_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_copy_concurrency: int | None = 1024,
+        checkpoint_load_tensorstore_cache_gb: int | None = 128,
+        checkpoint_load_tensorstore_assume_metadata: bool = True,
+        checkpoint_load_tensorstore_metadata_workers: int = 256,
+        checkpoint_load_progress: bool | None = None,
         **kwargs,
     ) -> Self:
         """Load an EasyDeLState from a saved checkpoint directory.
@@ -1580,6 +1631,14 @@ class EasyDeLState(_PyTreeNode):
             quantization_config=quantization_config,
             apply_quantization=apply_quantization,
             verbose=verbose,
+            checkpoint_load_chunk_size=checkpoint_load_chunk_size,
+            checkpoint_load_concurrent_gb=checkpoint_load_concurrent_gb,
+            checkpoint_load_tensorstore_io_concurrency=checkpoint_load_tensorstore_io_concurrency,
+            checkpoint_load_tensorstore_copy_concurrency=checkpoint_load_tensorstore_copy_concurrency,
+            checkpoint_load_tensorstore_cache_gb=checkpoint_load_tensorstore_cache_gb,
+            checkpoint_load_tensorstore_assume_metadata=checkpoint_load_tensorstore_assume_metadata,
+            checkpoint_load_tensorstore_metadata_workers=checkpoint_load_tensorstore_metadata_workers,
+            checkpoint_load_progress=checkpoint_load_progress,
             **kwargs,
         )
 
@@ -1591,9 +1650,26 @@ class EasyDeLState(_PyTreeNode):
             try:
                 cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
                 with cmg:
-                    state = state.load_optimizer(load_directory=load_directory, tx_template=tx_template)
-            except Exception:
-                logger.info("EasyDeLState couldn't restore the optimizer/tx (maybe there wasn't any!).")
+                    state = state.load_optimizer(
+                        load_directory=load_directory,
+                        tx_template=tx_template,
+                        checkpoint_load_chunk_size=checkpoint_load_chunk_size,
+                        checkpoint_load_concurrent_gb=checkpoint_load_concurrent_gb,
+                        checkpoint_load_tensorstore_io_concurrency=checkpoint_load_tensorstore_io_concurrency,
+                        checkpoint_load_tensorstore_copy_concurrency=checkpoint_load_tensorstore_copy_concurrency,
+                        checkpoint_load_tensorstore_cache_gb=checkpoint_load_tensorstore_cache_gb,
+                        checkpoint_load_tensorstore_assume_metadata=checkpoint_load_tensorstore_assume_metadata,
+                        checkpoint_load_tensorstore_metadata_workers=checkpoint_load_tensorstore_metadata_workers,
+                        checkpoint_load_progress=checkpoint_load_progress,
+                        verbose=verbose,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "EasyDeLState couldn't restore the optimizer/tx: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
         else:
             logger.info("Checkpoint %s does not contain optimizer state; skipping optimizer restore.", load_directory)
         if auto_shard_model:
@@ -1722,9 +1798,7 @@ class EasyDeLState(_PyTreeNode):
             )
             opt_state = jax.tree_util.tree_map(
                 lambda leaf, ns: (
-                    jax.device_put(leaf, ns)
-                    if isinstance(ns, jax.sharding.NamedSharding) and hasattr(leaf, "shape")
-                    else leaf
+                    device_put_if_sharding_mismatch(leaf, ns) if isinstance(ns, jax.sharding.NamedSharding) else leaf
                 ),
                 opt_state,
                 opt_shardings,

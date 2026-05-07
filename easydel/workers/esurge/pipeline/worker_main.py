@@ -342,6 +342,8 @@ def _detokenizer_worker(
                     if decoder.context_window:
                         if emitted_index == 0 and state.get("prompt_context"):
                             pc = state["prompt_context"]
+                            if not isinstance(pc, list | tuple):
+                                pc = []
                             context_tokens = pc[-decoder.context_window :]
                         else:
                             context_start = max(0, emitted_index - decoder.context_window)

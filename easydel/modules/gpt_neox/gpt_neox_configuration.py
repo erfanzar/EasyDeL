@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for EleutherAI's GPT-NeoX decoder-only language model.
+
+Defines :class:`GPTNeoXConfig`, the EasyDeL configuration object for the
+GPT-NeoX family (e.g. Pythia, GPT-NeoX-20B). GPT-NeoX is a 44-layer
+decoder with rotary position embeddings applied to a configurable
+``rotary_pct`` slice, parallel attention/MLP residual paths, and a
+50,432-token BPE vocabulary.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

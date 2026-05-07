@@ -47,6 +47,62 @@ LEGACY_LEAF_RENAMES: dict[str, str] = {"kernel": "weight", "embedding": "weight"
 LEGACY_COLLECTION_RENAMES: dict[str, str] = {"params": "parameters"}
 
 
+def legacy_checkpoint_key_aliases(key: str) -> tuple[str, ...]:
+    """Return old EasyDeL checkpoint key aliases for a current dotted key.
+
+    This is used when restoring pre-SpectraX optimizer TensorStore checkpoints
+    into a current optimizer template. Those checkpoints may differ from current
+    keys in three ways:
+
+    1. The trainable collection may be ``params`` or omitted instead of
+       ``parameters``.
+    2. Parameter leaves may end in ``kernel``, ``embedding`` or ``scale``
+       instead of the current unified ``weight`` suffix.
+    3. Optimizer wrapper leaves were saved with a trailing ``.value`` suffix.
+
+    Args:
+        key: Current dotted template key, for example
+            ``"tx.1.mu.parameters.lm_head.weight"`` or
+            ``"1.mu.parameters.lm_head.weight"``.
+
+    Returns:
+        Ordered alternate checkpoint keys to try. The input key itself is not
+        included.
+    """
+    parts = tuple(part for part in key.split(".") if part)
+    if not parts:
+        return ()
+
+    collection_variants: set[tuple[str, ...]] = {parts}
+    for idx, part in enumerate(parts):
+        if part == "parameters":
+            collection_variants.add(parts[:idx] + parts[idx + 1 :])
+            collection_variants.add((*parts[:idx], "params", *parts[idx + 1 :]))
+        elif part == "params":
+            collection_variants.add((*parts[:idx], "parameters", *parts[idx + 1 :]))
+
+    def with_value_suffix(candidate: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        if candidate and candidate[-1] == "value":
+            return (candidate,)
+        return (candidate, (*candidate, "value"))
+
+    aliases: list[tuple[str, ...]] = []
+    for variant in collection_variants:
+        aliases.extend(with_value_suffix(variant))
+        for idx, part in enumerate(variant):
+            if part == "weight":
+                for legacy_leaf in LEGACY_LEAF_RENAMES:
+                    aliases.extend(with_value_suffix((*variant[:idx], legacy_leaf, *variant[idx + 1 :])))
+
+    ordered: dict[str, None] = {}
+    original = ".".join(parts)
+    for alias_parts in aliases:
+        alias = ".".join(alias_parts)
+        if alias and alias != original:
+            ordered.setdefault(alias, None)
+    return tuple(ordered)
+
+
 def adapt_legacy_checkpoint_collections(
     flat_state: dict[tuple[tp.Any, ...], tp.Any], required_keys: set[tuple[tp.Any, ...]]
 ) -> dict[tuple[tp.Any, ...], tp.Any]:
@@ -161,9 +217,140 @@ def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]
     return renamed
 
 
+def _leaf_shape(leaf: tp.Any) -> tuple[int, ...] | None:
+    """Return a tuple shape for array-like leaves and state wrappers."""
+    shape = getattr(leaf, "shape", None)
+    if shape is None and hasattr(leaf, "value"):
+        shape = getattr(leaf.value, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _is_lm_head_weight_key(key: tuple[tp.Any, ...], lm_head_names: tuple[str, ...]) -> bool:
+    """Check whether a flat state key names an lm-head weight leaf."""
+    return len(key) >= 3 and str(key[0]) == "parameters" and str(key[-1]) == "weight" and str(key[-2]) in lm_head_names
+
+
+def _embedding_candidate_score(key: tuple[tp.Any, ...]) -> int:
+    """Rank likely token embedding leaves over unrelated vision/projector embeddings."""
+    parts = tuple(str(part).lower() for part in key)
+    joined = "/".join(parts)
+    score = 0
+    preferred_terms = (
+        "embed_tokens",
+        "token_embedding",
+        "word_embeddings",
+        "wte",
+        "language_model/embed",
+        "text_model/embed",
+    )
+    for term in preferred_terms:
+        if term in joined:
+            score += 8
+    if "embed" in joined or "embedding" in joined:
+        score += 2
+    if "vision" in joined or "image" in joined or "patch" in joined:
+        score -= 6
+    return score
+
+
+def materialize_tied_lm_head_from_embeddings(
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+    required_leaves: dict[tuple[tp.Any, ...], tp.Any],
+    *,
+    tie_word_embeddings: bool,
+    lm_head_names: tuple[str, ...] = ("lm_head",),
+) -> dict[tuple[tp.Any, ...], tp.Any]:
+    """Fill missing tied lm-head weights from the saved token embedding table.
+
+    Hugging Face-style tied checkpoints commonly store only the input token
+    embedding table when ``tie_word_embeddings=True``. EasyDeL still
+    materializes an ``lm_head.weight`` parameter leaf so the runtime can use
+    one model structure for tied and untied modules. For index-only legacy
+    tensorstore checkpoints this means the live model expects
+    ``parameters/.../lm_head/weight`` while the checkpoint only contains an
+    embedding leaf such as ``parameters/model/language_model/embed_tokens``.
+
+    This adapter keeps the load strict: it only creates missing lm-head leaves
+    when the config explicitly says embeddings are tied and when a checkpoint
+    embedding has exactly the required shape (or the required transposed
+    shape). All other missing leaves are left alone for the materialization
+    assertion to catch.
+
+    Args:
+        flat_state: Flat checkpoint state after legacy collection and leaf-name
+            normalization.
+        required_leaves: Flat live model leaves keyed by ``(collection, *path)``.
+            The leaf shape is used to validate a tied-source candidate.
+        tie_word_embeddings: Whether the model config declares tied input and
+            output embeddings.
+        lm_head_names: Module names that should be treated as lm-head modules.
+
+    Returns:
+        ``flat_state`` when no tied leaf is missing, otherwise a shallow copy
+        with the missing lm-head weight leaf/leaves materialized.
+    """
+    if not tie_word_embeddings or not flat_state or not required_leaves:
+        return flat_state
+
+    missing_targets: list[tuple[tp.Any, ...]] = [
+        key for key in required_leaves if _is_lm_head_weight_key(key, lm_head_names) and key not in flat_state
+    ]
+    if not missing_targets:
+        return flat_state
+
+    candidates: list[tuple[int, tuple[tp.Any, ...], tp.Any, tuple[int, ...]]] = []
+    for key, value in flat_state.items():
+        if not isinstance(key, tuple) or len(key) < 3 or str(key[0]) != "parameters" or str(key[-1]) != "weight":
+            continue
+        score = _embedding_candidate_score(key)
+        if score <= 0:
+            continue
+        shape = _leaf_shape(value)
+        if shape is not None:
+            candidates.append((score, key, value, shape))
+
+    if not candidates:
+        return flat_state
+
+    materialized = dict(flat_state)
+    filled: list[tuple[tuple[tp.Any, ...], tuple[tp.Any, ...], bool]] = []
+    for target_key in missing_targets:
+        target_shape = _leaf_shape(required_leaves[target_key])
+        if target_shape is None or len(target_shape) != 2:
+            continue
+
+        ranked_matches: list[tuple[int, tuple[tp.Any, ...], tp.Any, bool]] = []
+        for score, source_key, source_value, source_shape in candidates:
+            if source_shape == target_shape:
+                ranked_matches.append((score, source_key, source_value, False))
+            elif source_shape == tuple(reversed(target_shape)):
+                ranked_matches.append((score, source_key, source_value, True))
+        if not ranked_matches:
+            continue
+
+        _score, source_key, source_value, needs_transpose = max(ranked_matches, key=lambda item: item[0])
+        materialized[target_key] = source_value.T if needs_transpose else source_value
+        filled.append((target_key, source_key, needs_transpose))
+
+    if filled:
+        preview = ", ".join(
+            f"{'/'.join(str(p) for p in target)} <- {'/'.join(str(p) for p in source)}{'.T' if transposed else ''}"
+            for target, source, transposed in filled[:3]
+        )
+        suffix = f" (+{len(filled) - 3} more)" if len(filled) > 3 else ""
+        logger.info(f"Materialized {len(filled)} tied lm_head weight leaf/leaves from embeddings: {preview}{suffix}.")
+        return materialized
+
+    return flat_state
+
+
 __all__ = [
     "LEGACY_COLLECTION_RENAMES",
     "LEGACY_LEAF_RENAMES",
     "adapt_legacy_checkpoint_collections",
+    "legacy_checkpoint_key_aliases",
+    "materialize_tied_lm_head_from_embeddings",
     "rename_legacy_checkpoint_leaves",
 ]

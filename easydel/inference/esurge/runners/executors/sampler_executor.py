@@ -332,6 +332,20 @@ class SamplerExecutor:
             rng_key: jax.Array,
             token_counts_full: jax.Array,
         ):
+            """Compiled sampler core consuming packed sampler-side metadata.
+
+            Unpacks the packed float (temperature / top-p / min-p /
+            frequency / presence / repetition) and int (sampling seeds /
+            scheduled / seq lens / window row indices / active mask /
+            top-k / req_num_tokens) metadata rows, applies repetition /
+            presence / frequency penalties from the live token-count buffer,
+            runs ``sample_tokens_fn`` over the configured sampling
+            distribution, and computes the per-row ``valid_mask`` (request
+            actually emits a token this step). The token-count buffer is
+            updated for sampled tokens, and the rng key is folded with the
+            window's ``total_tokens`` so step-level randomness stays
+            deterministic and unique per window.
+            """
             with jax.named_scope("easydel/esurge/sampler_step"):
                 batch_size = logits.shape[0]
                 i_reqs = jnp.arange(batch_size, dtype=jnp.int32)

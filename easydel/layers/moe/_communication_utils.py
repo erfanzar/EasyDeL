@@ -633,6 +633,31 @@ def get_all_to_all_params(
     """
 
     def transform(inp, shard_id, strategy, is_batch_sharded):
+        """Compute one of four ragged-all-to-all parameter vectors.
+
+        Selects between sharded-batch and replicated-batch layouts and emits
+        the offsets/sizes for the requested ``strategy`` (one of the
+        :class:`_Transform` members).
+
+        Args:
+            inp: Group-size table. ``int[num_batch_shards, num_experts]`` when
+                ``is_batch_sharded`` is ``True``, otherwise
+                ``int[num_experts]``.
+            shard_id: Index of the local shard along the EP axis.
+            strategy: Which parameter to compute (input offsets, send sizes,
+                output offsets, or receive sizes).
+            is_batch_sharded: Whether the batch axis is also sharded across
+                devices (controls the layout of ``inp``).
+
+        Returns:
+            Array with the requested offsets/sizes, sized for the local
+            shard's view of the all-to-all communication.
+
+        Raises:
+            ValueError: When ``strategy`` falls through both branches without
+                matching any case (defensive guard, should not happen for
+                valid :class:`_Transform` values).
+        """
         if is_batch_sharded:
             if strategy == _Transform.INPUT_OFFSET:
                 local = inp[shard_id]

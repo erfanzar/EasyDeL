@@ -215,6 +215,21 @@ def _recurrent_kda_fwd(
     b_seq = beta.transpose(2, 0, 1)  # (L, B, H)
 
     def step_fn(state, inputs):
+        """Single-token KDA recurrence step used by ``lax.scan``.
+
+        Updates the running ``state`` with the per-token gated delta rule
+        and produces one output row.
+
+        Args:
+            state: Recurrent state of shape ``(B, H, K, V)``.
+            inputs: Tuple ``(q_t, k_t, v_t, g_t, beta_t)`` for the current
+                time step, with shapes ``(B, H, K)``, ``(B, H, K)``,
+                ``(B, H, V)``, ``(B, H)`` and ``(B, H)`` respectively.
+
+        Returns:
+            tuple: ``(new_state, output)`` where ``new_state`` has the same
+            shape as ``state`` and ``output`` has shape ``(B, H, V)``.
+        """
         q_t, k_t, v_t, g_t, beta_t = inputs
         g_exp = jnp.exp(g_t)[:, :, None, None]
         beta_scaled = beta_t[:, :, None]
@@ -337,6 +352,23 @@ def _chunk_kda_fwd(
     attn = jnp.where(mask_triu, 0.0, attn)
 
     def resolve_intra_chunk_row(attn_chunk, i):
+        """Resolve the i-th row of an intra-chunk attention block in place.
+
+        Implements the partial-sum update used by the KDA chunked
+        algorithm: each row is augmented with contributions from earlier
+        rows so the final ``(I + L)`` lower-triangular system is solved
+        iteratively without an explicit triangular solve.
+
+        Args:
+            attn_chunk: ``(chunk_size, chunk_size)`` float matrix being
+                resolved row-by-row inside :func:`lax.scan`.
+            i: Current row index (scalar tracer fed by ``lax.scan``).
+
+        Returns:
+            tuple: ``(updated_attn_chunk, None)`` where the carry is the
+            chunk after the i-th row has been updated and the scan output
+            is unused.
+        """
         row = attn_chunk[i, :]
         idx = jnp.arange(chunk_size)
         mask_lt_i = idx < i
@@ -348,6 +380,15 @@ def _chunk_kda_fwd(
         return attn_chunk.at[i].set(new_row), None
 
     def resolve_single_chunk(attn_single):
+        """Run :func:`resolve_intra_chunk_row` over every row of one chunk.
+
+        Args:
+            attn_single: ``(chunk_size, chunk_size)`` matrix for a single
+                ``(batch, head, chunk)`` triple.
+
+        Returns:
+            jax.Array: Same-shaped matrix after all rows have been resolved.
+        """
         resolved, _ = lax.scan(resolve_intra_chunk_row, attn_single, jnp.arange(chunk_size))
         return resolved
 
@@ -378,6 +419,24 @@ def _chunk_kda_fwd(
     }
 
     def chunk_step(state, inputs):
+        """Inter-chunk KDA recurrence step driven by ``lax.scan``.
+
+        Computes the per-chunk output by combining the carried-over
+        recurrent ``state`` with the local intra-chunk attention pattern,
+        then advances the state through the chunk by applying the
+        accumulated gated decay.
+
+        Args:
+            state: Recurrent state of shape ``(B, H, K_dim, V_dim)``.
+            inputs: Dict with ``query``, ``key``, ``value``, ``k_cumdecay``,
+                ``g_cumsum`` and ``decay_mask`` entries for the current
+                chunk (see the surrounding ``xs`` construction for shapes).
+
+        Returns:
+            tuple: ``(new_state, core_out)``. ``new_state`` carries the
+            recurrent buffer to the next chunk; ``core_out`` is the
+            chunk's output of shape ``(B, H, chunk_size, V_dim)``.
+        """
         q_i = inputs["query"]  # (B, H, cs, K)
         k_i = inputs["key"]  # (B, H, cs, K)
         v_i = inputs["value"]  # (B, H, cs, V)

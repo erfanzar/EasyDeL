@@ -114,6 +114,10 @@ def quick_gelu(x):
     return x * jax.nn.sigmoid(1.702 * x)
 
 
+# Registry of activation functions by name.
+#
+# Maps activation function names to their implementations.
+# Supports common activations used in neural networks.
 ACT2FN = {
     "gelu": partial(jax.nn.gelu, approximate=False),
     "relu": jax.nn.relu,
@@ -129,11 +133,6 @@ ACT2FN = {
     "softmax": jax.nn.softmax,
     "quick_gelu": quick_gelu,
 }
-"""Registry of activation functions by name.
-
-Maps activation function names to their implementations.
-Supports common activations used in neural networks.
-"""
 
 ROPE_TYPES = tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"] | None
 

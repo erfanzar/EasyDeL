@@ -673,6 +673,25 @@ class Olmo3Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Drive one OLMo-3 decoder layer through the scanned trunk.
+
+            OLMo-3's twist over OLMo-2 is interleaved sliding-window vs.
+            full-attention layers (governed by ``config.layer_types``); the
+            per-layer attention type is already baked into ``block`` at
+            construction time, so the carry / scan plumbing here is identical
+            to the OLMo-2 trunk.
+
+            Args:
+                block: The OLMo-3 decoder block to run at this step (full or
+                    sliding attention as configured).
+                carry: ``(hidden_states, cache_views, all_hidden_states,
+                    all_attentions, layer_idx)`` carried from the previous step.
+
+            Returns:
+                tuple: Updated carry with the layer's hidden state, possibly-
+                extended cache views and output collections, and an
+                incremented layer index.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

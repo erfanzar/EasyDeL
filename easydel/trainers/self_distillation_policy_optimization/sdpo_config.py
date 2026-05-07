@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the SDPO trainer.
+
+Defines :class:`SDPOConfig`, which extends :class:`GRPOConfig` with
+the self-distillation knobs: feedback-length budget, KL/JSD loss
+selection, and an inherited (defaulted-to-zero) ``beta`` for the
+optional reference KL penalty.
+"""
 
 from dataclasses import dataclass, field
 
@@ -129,8 +136,10 @@ class SDPOConfig(GRPOConfig):
         # must fit within max_length.  Rather than growing max_length (which
         # would break even-sized allocations), shrink max_completion_length so
         # that prompt + feedback + completion == max_length.
+        if self.max_prompt_length is None or self.max_feedback_length is None or self.max_completion_length is None:
+            return
         teacher_total = self.max_prompt_length + self.max_feedback_length + self.max_completion_length
-        if teacher_total > self.max_length:
+        if self.max_length is not None and teacher_total > self.max_length:
             self.max_completion_length = self.max_length - self.max_prompt_length - self.max_feedback_length
 
     __hash__ = hash_fn

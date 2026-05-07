@@ -325,6 +325,15 @@ class EngineLifecycleMixin:
         """
 
         def _dump_state(signum, frame):
+            """Signal handler that logs engine state and re-raises with the default handler.
+
+            Captures running/pending request counts and the last scheduler
+            heartbeat age into a CRITICAL log line so post-mortem diagnosis
+            of OOM-kills and external SIGTERMs has actionable context. After
+            logging it restores the default signal handler and re-sends the
+            signal so the process actually terminates instead of swallowing
+            the kill.
+            """
             sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
             try:
                 running = getattr(self, "num_running_requests", "?")
@@ -444,6 +453,17 @@ class EngineLifecycleMixin:
             return
 
         def _output_loop() -> None:
+            """Background loop draining engine outputs into the parser pipeline.
+
+            Pulls bundles from ``_engine_output_queue`` and feeds them to
+            :meth:`_process_engine_outputs` (detokenization, parser updates,
+            request-event wakeups). A ``None`` sentinel terminates the loop.
+            On any exception the worker records the exception on
+            ``self._scheduler_exception``, flips ``_scheduler_running`` off,
+            wakes every blocked request event, and signals
+            ``_output_event`` so generate/stream callers exit their wait
+            loops with the captured traceback rather than hanging.
+            """
             while True:
                 engine_outputs = output_queue.get()
                 try:
@@ -575,6 +595,31 @@ class EngineLifecycleMixin:
                 pass
 
             def _scheduler_loop():
+                """Background scheduler thread driving inference iterations.
+
+                Two implementations live inside the same closure, selected by
+                ``_overlap_loop_enabled()``:
+
+                * **Synchronous loop** — calls ``schedule()``, executes the
+                  model, applies ``update_from_output()``, and forwards
+                  engine outputs to the parser worker. Errors are absorbed
+                  up to ``MAX_CONSECUTIVE_SCHEDULER_ERRORS`` retries; some
+                  invariant violations (see
+                  :meth:`_is_nonrecoverable_scheduler_error`) abort
+                  immediately.
+                * **Async-overlap loop** — uses async runner handles to
+                  prefetch the next ``schedule()`` while the previous step's
+                  device tokens are still in flight, with
+                  :meth:`_can_dispatch_next_before_drain` and
+                  :meth:`_can_prefetch_scheduler_output` gating when this
+                  is safe. CPU bookkeeping still runs in scheduler order
+                  when the older handle is drained.
+
+                Both branches publish heartbeats via
+                :meth:`_update_scheduler_heartbeat` and forward outputs
+                through :meth:`_enqueue_engine_outputs` so the per-token
+                detokenize/parse path stays off the scheduler thread.
+                """
                 self._info("Starting background scheduler loop")
                 consecutive_errors = 0
                 max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
@@ -582,6 +627,7 @@ class EngineLifecycleMixin:
 
                 _diag_iter = 0
                 _diag_last_log = time.time()
+
                 def _overlap_loop_enabled() -> bool:
                     """Return whether the lifecycle loop should use async handles.
 
@@ -603,12 +649,25 @@ class EngineLifecycleMixin:
                 use_overlap_loop = _overlap_loop_enabled()
                 if getattr(self.runtime_config, "runner_verbose", False):
                     logger.info(
-                        "Using %s eSurge scheduler lifecycle "
-                        "(async_scheduling=%s, overlap_execution=%s)",
+                        "Using %s eSurge scheduler lifecycle (async_scheduling=%s, overlap_execution=%s)",
                         "async-overlap" if use_overlap_loop else "synchronous",
                         bool(self.runtime_config.async_scheduling),
                         bool(self.runtime_config.overlap_execution),
                     )
+
+                def _zero_schedule_needs_update(scheduler_output: SchedulerOutput) -> bool:
+                    """Return whether a zero-token schedule still has bookkeeping to flush."""
+                    return bool(
+                        scheduler_output.finished_req_ids
+                        or scheduler_output.preempted_req_ids
+                        or scheduler_output.scheduled_new_reqs
+                        or scheduler_output.scheduled_cached_reqs.num_reqs
+                    )
+
+                def _idle_scheduler_tick() -> None:
+                    """Back off the background scheduler when there is no executable work."""
+                    time.sleep(0.001)
+
                 if not use_overlap_loop:
                     while self._scheduler_running:
                         try:
@@ -632,6 +691,12 @@ class EngineLifecycleMixin:
                                 _diag_last_log = _now
                             self._update_scheduler_heartbeat()
                             dispatch = None
+                            if scheduler_output.total_num_scheduled_tokens == 0 and not _zero_schedule_needs_update(
+                                scheduler_output
+                            ):
+                                _idle_scheduler_tick()
+                                consecutive_errors = 0
+                                continue
                             if distributed_controller is not None and distributed_controller.has_remote_workers:
                                 prof_phase = time.perf_counter()
                                 dispatch = distributed_controller.dispatch_step(scheduler_output)
@@ -729,22 +794,73 @@ class EngineLifecycleMixin:
                         return False
 
                 def _can_prefetch_next(current: SchedulerOutput) -> bool:
-                    # Async scheduling uses optimistic output placeholders and
-                    # runner-side deferred sampled-token state. Advancing the
-                    # scheduler before the previous async result is drained can
-                    # make those two state machines observe different request
-                    # lengths. Plain overlap remains enabled for non-async
-                    # scheduler outputs.
+                    """Whether the *plain* overlap path may run ``schedule()`` early.
+
+                    Async scheduling uses optimistic output placeholders and
+                    runner-side deferred sampled-token state. Advancing the
+                    scheduler before the previous async result is drained can
+                    make those two state machines observe different request
+                    lengths. Plain overlap remains enabled for non-async
+                    scheduler outputs by delegating to
+                    :meth:`_can_prefetch_scheduler_output`.
+                    """
                     if current.async_scheduling:
                         return False
                     return self._can_prefetch_scheduler_output(self.scheduler, current)
 
                 def _execute_zero_token_schedule(scheduler_output: SchedulerOutput) -> None:
+                    """Run a zero-token schedule synchronously through the runner.
+
+                    Some scheduler outputs do not actually generate tokens
+                    (e.g. parser-driven termination housekeeping). The
+                    overlap path falls back to a synchronous
+                    ``execute_model`` for those so the bookkeeping still
+                    passes through ``update_from_output`` and the parser
+                    pipeline without disturbing the async pipeline carry.
+                    """
+                    if getattr(self.runtime_config, "runner_verbose", False) and _zero_schedule_needs_update(
+                        scheduler_output
+                    ):
+                        logger.info("[esurge-loop] executing zero-token scheduler output")
                     model_output = self.runner.execute_model(scheduler_output)
                     with self._scheduler_lock:
                         engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
                     self._enqueue_engine_outputs(engine_outputs)
                     self._handle_profiling_step()
+
+                def _execute_positive_schedule(
+                    scheduler_output: SchedulerOutput,
+                ) -> tuple[typing.Any, SchedulerOutput] | None:
+                    """Dispatch decode asynchronously and prefill synchronously.
+
+                    The async-overlap path defers sampled-token materialization
+                    so decode step ``N+1`` can consume step ``N``'s sampled
+                    token through device-side handoff. That contract only holds
+                    for one-token decode windows. Chunked prefill windows do
+                    not produce a client-visible sampled token, so running them
+                    through an async handle only adds a deferred host copy that
+                    the scheduler cannot use. Execute those synchronously and
+                    return ``None``; return a pending async handle only for
+                    decode-shaped schedules.
+                    """
+                    defer_safe = self.runner.can_dispatch_next_before_async_drain(scheduler_output)
+                    if getattr(self.runtime_config, "runner_verbose", False):
+                        logger.info(
+                            "[esurge-loop] dispatch tok=%d reqs=%d async=%s defer_safe=%s",
+                            int(scheduler_output.total_num_scheduled_tokens or 0),
+                            len(scheduler_output.num_scheduled_tokens),
+                            bool(scheduler_output.async_scheduling),
+                            bool(defer_safe),
+                        )
+                    if defer_safe:
+                        return self.runner.execute_model_async(scheduler_output), scheduler_output
+
+                    model_output = self.runner.execute_model(scheduler_output)
+                    with self._scheduler_lock:
+                        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                    self._enqueue_engine_outputs(engine_outputs)
+                    self._handle_profiling_step()
+                    return None
 
                 while self._scheduler_running:
                     try:
@@ -758,7 +874,9 @@ class EngineLifecycleMixin:
                                 self._update_scheduler_heartbeat()
 
                                 if next_sched_out.total_num_scheduled_tokens > 0:
-                                    next_future = self.runner.execute_model_async(next_sched_out)
+                                    next_pending: tuple[typing.Any, SchedulerOutput] | None = None
+                                    if self.runner.can_dispatch_next_before_async_drain(next_sched_out):
+                                        next_pending = (self.runner.execute_model_async(next_sched_out), next_sched_out)
                                     try:
                                         self._drain_runner_future(future, prev_sched_out)
                                     except Exception as e:
@@ -770,14 +888,17 @@ class EngineLifecycleMixin:
                                         )
                                         self._abort_scheduler_due_to_error(e)
                                         break
-                                    pending_execution = (next_future, next_sched_out)
+                                    if next_pending is None:
+                                        next_pending = _execute_positive_schedule(next_sched_out)
+                                    pending_execution = next_pending
                                     consecutive_errors = 0
                                     self._update_scheduler_heartbeat()
                                     continue
 
                                 try:
                                     self._drain_runner_future(future, prev_sched_out)
-                                    _execute_zero_token_schedule(next_sched_out)
+                                    if _zero_schedule_needs_update(next_sched_out):
+                                        _execute_zero_token_schedule(next_sched_out)
                                 except Exception as e:
                                     pending_execution = None
                                     prefetched_schedule = None
@@ -819,13 +940,28 @@ class EngineLifecycleMixin:
                             with self._scheduler_lock:
                                 self._drain_parser_stop_requests_locked()
                                 scheduler_output = self.scheduler.schedule()
+                        if getattr(self.runtime_config, "runner_verbose", False) and (
+                            scheduler_output.total_num_scheduled_tokens > 0
+                            or _zero_schedule_needs_update(scheduler_output)
+                        ):
+                            logger.info(
+                                "[esurge-loop] scheduled tok=%d reqs=%d running=%d waiting=%d async=%s",
+                                int(scheduler_output.total_num_scheduled_tokens or 0),
+                                len(scheduler_output.num_scheduled_tokens),
+                                len(self.scheduler.running),
+                                len(self.scheduler.waiting),
+                                bool(scheduler_output.async_scheduling),
+                            )
                         self._update_scheduler_heartbeat()
 
                         if scheduler_output.total_num_scheduled_tokens == 0:
-                            _execute_zero_token_schedule(scheduler_output)
+                            if _zero_schedule_needs_update(scheduler_output):
+                                _execute_zero_token_schedule(scheduler_output)
+                            else:
+                                _idle_scheduler_tick()
+                                pending_execution = None
                         else:
-                            future = self.runner.execute_model_async(scheduler_output)
-                            pending_execution = (future, scheduler_output)
+                            pending_execution = _execute_positive_schedule(scheduler_output)
 
                         # Reset error counter on success
                         consecutive_errors = 0

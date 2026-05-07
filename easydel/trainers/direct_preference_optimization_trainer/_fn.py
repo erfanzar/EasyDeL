@@ -974,6 +974,7 @@ def concatenated_forward(
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
     completion_input_ids = concatenated_batch["completion_input_ids"]
     completion_attention_mask = concatenated_batch["completion_attention_mask"]
+    lmhead_chunksize = None
 
     if is_encoder_decoder:
         # For encoder-decoder models, use completion inputs as labels.
@@ -1058,6 +1059,8 @@ def concatenated_forward(
             loss_type=loss_type,
         )
     else:
+        if logits is None:
+            raise TypeError(f"{type(model).__name__} did not return logits.")
         gathered_logps = _compute_token_logps_chunked(
             logits,
             labels,
@@ -1181,7 +1184,6 @@ def training_step(
         ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
         if ref_chosen_logps is None or ref_rejected_logps is None:
             rfm = reference_state.model
-            rfm.eval()
             ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
             ref_chosen_logps = ref_out["chosen_logps"]
             ref_rejected_logps = ref_out["rejected_logps"]
@@ -1404,8 +1406,8 @@ def _make_dpo_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    training_step,
-    ScheduledLossAdapter(
+    step_fn=training_step,
+    adapter=ScheduledLossAdapter(
         name="dpo",
         make_loss=_make_dpo_scheduled_loss,
         make_cache_key=_dpo_scheduled_loss_cache_key,

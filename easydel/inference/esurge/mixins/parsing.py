@@ -28,8 +28,8 @@ Exposes :class:`EngineParsingMixin`, mixed into :class:`eSurge`.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import time
+from collections.abc import Sequence
 
 from ...stream_protocol import compute_stream_delta_text
 from ..engine_types import EngineCoreOutputs
@@ -47,16 +47,25 @@ class _TokenPrefixView(Sequence[int]):
     iteration, indexing, and membership checks.
     """
 
-    __slots__ = ("_tokens", "_length")
+    __slots__ = ("_length", "_tokens")
 
     def __init__(self, tokens: list[int], length: int):
+        """Bind this view to the live ``tokens`` list at the given prefix ``length``."""
         self._tokens = tokens
         self._length = int(length)
 
     def __len__(self) -> int:
+        """Return the prefix length captured at view construction."""
         return self._length
 
     def __getitem__(self, index):
+        """Index into the live token list, bounded by the captured prefix length.
+
+        Slices are materialized into a fresh list (matching the historical
+        ``list[int]`` behaviour parsers rely on); integer indices honour
+        negative indexing relative to the prefix length and raise
+        :class:`IndexError` if they fall outside ``[0, length)``.
+        """
         if isinstance(index, slice):
             start, stop, step = index.indices(self._length)
             return [self._tokens[idx] for idx in range(start, stop, step)]
@@ -67,6 +76,7 @@ class _TokenPrefixView(Sequence[int]):
         return self._tokens[index]
 
     def __contains__(self, value: object) -> bool:
+        """Return whether ``value`` appears in the prefix window."""
         for idx in range(self._length):
             if self._tokens[idx] == value:
                 return True

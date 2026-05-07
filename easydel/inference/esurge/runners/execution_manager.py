@@ -71,9 +71,9 @@ Example:
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
-import threading
 import time
 import typing
 import typing as tp
@@ -87,6 +87,7 @@ from eformer.pytree import key_path_to_str
 from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
+from numpy.typing import DTypeLike
 
 from easydel.caching import (
     HybridCache,
@@ -200,6 +201,32 @@ def _combine_pipeline_hidden_parts(
     *,
     padded_num_reqs: int,
 ) -> jax.Array:
+    """Scatter per-microbatch backbone hidden states back into a single window.
+
+    Used by the pipeline-parallel decode path, where the active decode rows of a
+    scheduler window are split across multiple PP microbatches. Each microbatch
+    runs the backbone and produces its own ``hidden_parts[i]`` plus the
+    ``logits_index_parts[i]`` (the index of the last token per row inside that
+    microbatch's packed token buffer) and the ``position_parts[i]`` (the row
+    indices in the full window where those rows belong). This helper scatters
+    the gathered ``hidden_parts[i][logits_index_parts[i]]`` slices into a
+    ``[padded_num_reqs, hidden_dim]`` output so the LM head can be run once on
+    the combined window instead of per-microbatch.
+
+    Args:
+        hidden_parts: Tuple of per-microbatch hidden-state tensors, one per
+            microbatch, with shape ``[num_tokens_i, hidden_dim]``.
+        logits_index_parts: Tuple of per-microbatch logits indices selecting
+            the last token row from each microbatch's hidden tensor.
+        position_parts: Tuple of window-row indices marking where each
+            microbatch's rows land in the combined output.
+        padded_num_reqs: Padded request count for the current window; defines
+            the row dimension of the returned tensor.
+
+    Returns:
+        A ``[padded_num_reqs, hidden_dim]`` array with each microbatch's last
+        token hidden states placed at its corresponding window row position.
+    """
     with jax.named_scope("easydel/esurge/pp_hidden_parts/combine"):
         hidden = hidden_parts[0]
         combined = jnp.zeros((int(padded_num_reqs), int(hidden.shape[-1])), dtype=hidden.dtype)
@@ -232,6 +259,7 @@ def _tree_hash(tree):
     """
 
     def _map(p, x):
+        """Hash a single PyTree leaf into a stable string for diffing."""
         p = key_path_to_str(p)
         maybe_info = (
             f"-{type(x)}"
@@ -282,6 +310,7 @@ def _tree_hash_diff(orgin, new):
     """
 
     def _map(p, t1, t2):
+        """Compare two leaf hashes and report mismatches by path."""
         p = key_path_to_str(p)
         oo = t1 == t2
         if not oo:
@@ -448,12 +477,14 @@ class ExecutionManager:
         kv_quant_cfg = text_config.kv_cache_quantization_config
         _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
         quantizer = model._quant_class(quantization_config=None if _is_turboquant else kv_quant_cfg)
+        self._cache_quantizer = quantizer
+        self._cache_masking_details = getattr(text_config, "get_mask_details", lambda: None)()
 
         # Prefer HybridCache (per-operation cache views) as the universal container.
         # Keep paged-cache parameters consistent with the scheduler config.
         self.kv_pages = self._init_operations_cache_with_retry(
-            quantizer=quantizer,
-            masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
+            quantizer=self._cache_quantizer,
+            masking_details=self._cache_masking_details,
         )
 
         self.graphdef, self.graphstate, self.graphother = model.split_module()
@@ -467,10 +498,6 @@ class ExecutionManager:
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._sampler_sharding)
 
         self._debug_baselines = {}
-        self._runtime_compile_lock = threading.RLock()
-        self._runtime_compile_metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None
-        self._runtime_compile_max_num_reqs: int | None = None
-        self._runtime_lazy_compile = True
 
         self._batch_preparer = BatchMetadataPreparer(
             metadata=self.metadata,
@@ -548,6 +575,23 @@ class ExecutionManager:
 
         @jax.jit
         def _rebuild_penalty_counts(token_history: jax.Array, seq_lens: jax.Array) -> jax.Array:
+            """Rebuild per-request token-frequency counts for sampling penalties.
+
+            Closes over ``self._sampler_vocab_size`` and runs the JIT-compiled
+            :func:`build_history_token_counts` over a ``[max_num_reqs,
+            max_model_len]`` token-history buffer, treating only rows with
+            ``seq_lens > 0`` as active. Used to refresh the device-side counts
+            after a state mutation (request adds/removes, sequence drops) so
+            frequency / presence / repetition penalties stay correct.
+
+            Args:
+                token_history: Token-id buffer ``[max_num_reqs, max_model_len]``.
+                seq_lens: Active token counts per request ``[max_num_reqs]``.
+
+            Returns:
+                Count tensor ``[max_num_reqs, vocab_size]`` with frequency
+                of each token id seen in each request's history.
+            """
             with jax.named_scope("easydel/esurge/sampler/rebuild_penalty_counts"):
                 return build_history_token_counts(
                     token_history=token_history,
@@ -565,6 +609,24 @@ class ExecutionManager:
             scatter_positions: jax.Array,
             padded_num_reqs: int,
         ) -> tuple[jax.Array, jax.Array]:
+            """Scatter compact sampler outputs back to the padded window layout.
+
+            The sampler runs on a compacted slice of the active window; this
+            scatter inverts the gather by writing the compact ``sampled_tokens``
+            and ``valid_mask`` into a full ``[padded_num_reqs]`` view at
+            ``scatter_positions``. Out-of-range or padded positions stay
+            ``-1`` / ``False`` to mark them invalid.
+
+            Args:
+                sampled_tokens: Compact sampled token ids ``[num_compact]``.
+                valid_mask: Compact validity flags ``[num_compact]``.
+                scatter_positions: Window-row indices for each compact entry.
+                padded_num_reqs: Window padding size used for the output.
+
+            Returns:
+                Tuple ``(full_tokens, full_valid)`` of shape
+                ``[padded_num_reqs]`` covering every window row.
+            """
             with jax.named_scope("easydel/esurge/sampler/scatter_outputs"):
                 spill = int(scatter_positions.shape[0])
                 full_tokens = jnp.full((int(padded_num_reqs) + spill,), -1, dtype=sampled_tokens.dtype)
@@ -607,6 +669,7 @@ class ExecutionManager:
         """
 
         def _allocate() -> tp.Any:
+            """Single attempt at building the operations cache via the model API."""
             return self.model.init_operations_cache(
                 batch_size=int(self.max_num_reqs),
                 max_length=int(self.max_model_len),
@@ -747,8 +810,27 @@ class ExecutionManager:
         avoids burning top-k/top-p work on zero-token rows.
         """
         padded_num_reqs = int(padded_num_reqs)
-        scheduled_window = numpy.asarray(scheduled_full_cpu[:padded_num_reqs], dtype=numpy.int32)
-        active_window = numpy.asarray(active_mask_full_cpu[:padded_num_reqs], dtype=numpy.bool_)
+        scheduled_window = self._padded_cpu_window(
+            scheduled_full_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.int32,
+            fill_value=0,
+        )
+        active_window = self._padded_cpu_window(
+            active_mask_full_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.bool_,
+            fill_value=False,
+        )
+        available_count = min(
+            padded_num_reqs,
+            self._cpu_vector_size(scheduled_full_cpu),
+            self._cpu_vector_size(active_mask_full_cpu),
+            self._cpu_vector_size(window_row_indices_cpu),
+            self._cpu_vector_size(num_computed_tokens_cpu),
+        )
+        if available_count < padded_num_reqs:
+            active_window[available_count:] = False
         sample_positions = numpy.flatnonzero(active_window & (scheduled_window > 0))
         sample_count = int(sample_positions.size)
         if sample_count <= 0:
@@ -757,7 +839,7 @@ class ExecutionManager:
         sampler_padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             sample_count,
             upper_limit=padded_num_reqs,
-            min_input_pad=int(self._sampler_min_input_pad),
+            min_input_pad=int(getattr(self, "_sampler_min_input_pad", 1)),
         )
 
         gather_positions = self._sampler_gather_positions_cpu
@@ -795,31 +877,224 @@ class ExecutionManager:
         gather_positions[:sample_count] = sample_positions
         sampling_seeds[:sample_count] = sample_positions
         scatter_positions[:sample_count] = sample_positions
-        window_rows[:sample_count] = window_row_indices_cpu[sample_positions]
+        window_rows[:sample_count] = self._padded_cpu_window(
+            window_row_indices_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.int32,
+            fill_value=0,
+        )[sample_positions]
         scheduled_out[:sample_count] = scheduled_window[sample_positions]
-        seq_lens_out[:sample_count] = (
-            numpy.asarray(num_computed_tokens_cpu[:padded_num_reqs], dtype=numpy.int32)[sample_positions]
-            + scheduled_window[sample_positions]
+        computed_window = self._padded_cpu_window(
+            num_computed_tokens_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.int32,
+            fill_value=0,
         )
+        seq_lens_out[:sample_count] = computed_window[sample_positions] + scheduled_window[sample_positions]
         active_out[:sample_count] = True
-        temperature_out[:sample_count] = numpy.asarray(temperature_cpu[:padded_num_reqs], dtype=numpy.float32)[
-            sample_positions
-        ]
-        top_p_out[:sample_count] = numpy.asarray(top_p_cpu[:padded_num_reqs], dtype=numpy.float32)[sample_positions]
-        top_k_out[:sample_count] = numpy.asarray(top_k_cpu[:padded_num_reqs], dtype=numpy.int32)[sample_positions]
-        min_p_out[:sample_count] = numpy.asarray(min_p_cpu[:padded_num_reqs], dtype=numpy.float32)[sample_positions]
-        frequency_out[:sample_count] = numpy.asarray(frequency_penalties_cpu[:padded_num_reqs], dtype=numpy.float32)[
-            sample_positions
-        ]
-        presence_out[:sample_count] = numpy.asarray(presence_penalties_cpu[:padded_num_reqs], dtype=numpy.float32)[
-            sample_positions
-        ]
-        repetition_out[:sample_count] = numpy.asarray(
-            repetition_penalties_cpu[:padded_num_reqs],
+        temperature_out[:sample_count] = self._padded_cpu_window(
+            temperature_cpu,
+            padded_num_reqs=padded_num_reqs,
             dtype=numpy.float32,
+            fill_value=1.0,
+        )[sample_positions]
+        top_p_out[:sample_count] = self._padded_cpu_window(
+            top_p_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.float32,
+            fill_value=1.0,
+        )[sample_positions]
+        top_k_out[:sample_count] = self._padded_cpu_window(
+            top_k_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.int32,
+            fill_value=0,
+        )[sample_positions]
+        min_p_out[:sample_count] = self._padded_cpu_window(
+            min_p_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.float32,
+            fill_value=0.0,
+        )[sample_positions]
+        frequency_out[:sample_count] = self._padded_cpu_window(
+            frequency_penalties_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.float32,
+            fill_value=0.0,
+        )[sample_positions]
+        presence_out[:sample_count] = self._padded_cpu_window(
+            presence_penalties_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.float32,
+            fill_value=0.0,
+        )[sample_positions]
+        repetition_out[:sample_count] = self._padded_cpu_window(
+            repetition_penalties_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.float32,
+            fill_value=1.0,
         )[sample_positions]
         total_tokens = int(scheduled_out[:sample_count].sum())
         return sample_count, sampler_padded_num_reqs, total_tokens
+
+    @staticmethod
+    def _cpu_vector_size(values: numpy.ndarray) -> int:
+        """Return the first-dimension size of a CPU scheduler vector."""
+        return int(numpy.asarray(values).shape[0])
+
+    @staticmethod
+    def _padded_cpu_window(
+        values: numpy.ndarray,
+        *,
+        padded_num_reqs: int,
+        dtype: DTypeLike,
+        fill_value: int | float | bool,
+    ) -> numpy.ndarray:
+        """Return a one-dimensional CPU request vector padded to ``padded_num_reqs``.
+
+        Scheduler payloads are sometimes active-row sized while the compiled
+        model bucket is padded. Host-side predicates and sampler compaction must
+        do their NumPy math on arrays with the same length, but padded rows must
+        remain neutral.
+        """
+        pnr = int(padded_num_reqs)
+        array = numpy.asarray(values, dtype=dtype).reshape(-1)
+        if array.shape[0] >= pnr:
+            return array[:pnr]
+        out = numpy.full((pnr,), fill_value, dtype=dtype)
+        out[: array.shape[0]] = array
+        return out
+
+    def _pipeline_model_logits_bucket(
+        self,
+        *,
+        padded_num_reqs: int,
+        sampler_padded_num_reqs: int,
+    ) -> int:
+        """Return the fused PP model-step request bucket for compact logits.
+
+        Sampler compaction can use tiny request buckets because top-k/top-p only
+        needs rows that can emit a token. The fused PP model step belongs to the
+        model request-bucket family, so it must still honor ``min_input_pad``.
+        Without this floor, a one-row sampler window can select dead fused PP
+        model variants such as ``8 tokens / 1 req`` even when the runner was
+        configured with ``min_input_pad=4``.
+        """
+        padded_num_reqs = int(padded_num_reqs)
+        sampler_padded_num_reqs = int(sampler_padded_num_reqs)
+        if padded_num_reqs <= 0:
+            return 0
+        min_model_bucket = min(max(1, int(self.min_input_pad)), padded_num_reqs)
+        return min(max(sampler_padded_num_reqs, min_model_bucket), padded_num_reqs)
+
+    def _should_use_fused_pipeline_model_step(self, *, num_tokens: int, padded_num_reqs: int) -> bool:
+        """Return whether a bucket should use the fused PP model-step executable.
+
+        The fused PP path is a decode-latency optimization: it keeps the
+        pipeline-parallel backbone, sampled hidden-row gather, and final-stage
+        LM head in one SpectraX plan. It is only a good fit for decode-shaped
+        windows where the token bucket is no wider than the request bucket
+        (usually one new token per active request). Prefill-shaped windows such
+        as ``16 tokens / 4 reqs`` carry multiple prompt tokens per request; those
+        should use the split true-PP backbone plus the final-stage LM-head
+        executable to avoid compiling a large fused prefill+projection graph.
+        """
+        if not self.model.mesh.is_mpmd:
+            return False
+        if not self._model_executor.supports_pipeline_model_step:
+            return False
+        return int(num_tokens) <= int(padded_num_reqs)
+
+    @staticmethod
+    def _is_decode_only_window(
+        *,
+        scheduled_full_cpu: numpy.ndarray,
+        active_mask_full_cpu: numpy.ndarray,
+        padded_num_reqs: int,
+    ) -> bool:
+        """Return whether every active scheduled row is a one-token decode row.
+
+        Padding can make a prompt chunk look like a decode bucket: one request
+        with four scheduled prompt tokens is represented as ``4 tokens / 4
+        padded requests``. The resident PP runtime is only valid for the true
+        decode case, where every active scheduled row contributes exactly one
+        token. This predicate looks at the unpadded scheduler payload rather
+        than the compile bucket.
+        """
+        padded_num_reqs = int(padded_num_reqs)
+        scheduled_window = ExecutionManager._padded_cpu_window(
+            scheduled_full_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.int32,
+            fill_value=0,
+        )
+        active_window = ExecutionManager._padded_cpu_window(
+            active_mask_full_cpu,
+            padded_num_reqs=padded_num_reqs,
+            dtype=numpy.bool_,
+            fill_value=False,
+        )
+        active_scheduled = scheduled_window[active_window & (scheduled_window > 0)]
+        return bool(active_scheduled.size > 0 and numpy.all(active_scheduled == 1))
+
+    @staticmethod
+    def _window_emits_token(
+        *,
+        scheduled_full_cpu: numpy.ndarray,
+        active_mask_full_cpu: numpy.ndarray,
+        req_num_tokens_full_cpu: numpy.ndarray,
+        num_computed_tokens_cpu: numpy.ndarray,
+        padded_num_reqs: int,
+    ) -> bool:
+        """Return whether this scheduler window can produce a sampled token.
+
+        Chunked prefill schedules prompt tokens before a request reaches its
+        prompt target length. Intermediate chunks only need the backbone/cache
+        update; projecting vocabulary logits and sampling them is wasted work.
+        This mirrors the sampler's device-side validity condition:
+        ``num_computed + scheduled >= req_num_tokens``.
+        """
+        pnr = int(padded_num_reqs)
+        scheduled_window = ExecutionManager._padded_cpu_window(
+            scheduled_full_cpu,
+            padded_num_reqs=pnr,
+            dtype=numpy.int32,
+            fill_value=0,
+        )
+        active_window = ExecutionManager._padded_cpu_window(
+            active_mask_full_cpu,
+            padded_num_reqs=pnr,
+            dtype=numpy.bool_,
+            fill_value=False,
+        )
+        available_count = min(
+            pnr,
+            ExecutionManager._cpu_vector_size(scheduled_full_cpu),
+            ExecutionManager._cpu_vector_size(active_mask_full_cpu),
+            ExecutionManager._cpu_vector_size(req_num_tokens_full_cpu),
+            ExecutionManager._cpu_vector_size(num_computed_tokens_cpu),
+        )
+        if available_count < pnr:
+            active_window[available_count:] = False
+        active_scheduled = active_window & (scheduled_window > 0)
+        if not bool(numpy.any(active_scheduled)):
+            return False
+        seq_lens_now = (
+            ExecutionManager._padded_cpu_window(
+                num_computed_tokens_cpu,
+                padded_num_reqs=pnr,
+                dtype=numpy.int32,
+                fill_value=0,
+            )
+            + scheduled_window
+        )
+        target_lens = ExecutionManager._padded_cpu_window(
+            req_num_tokens_full_cpu,
+            padded_num_reqs=pnr,
+            dtype=numpy.int32,
+            fill_value=numpy.iinfo(numpy.int32).max,
+        )
+        return bool(numpy.any(seq_lens_now[active_scheduled] >= target_lens[active_scheduled]))
 
     def has_compiled_variants(self) -> bool:
         """Check whether both model and sampler executors have compiled variants.
@@ -829,6 +1104,18 @@ class ExecutionManager:
             least one cached compiled function, False otherwise.
         """
         return bool(self._model_executor.cache_keys()) and bool(self._sampler_executor.cache_keys())
+
+    def _has_backbone_variant(self, num_tokens: int, *, use_pipeline_runtime: bool = True) -> bool:
+        """Compatibility wrapper for checking a compiled backbone bucket."""
+        try:
+            return bool(
+                self._model_executor.has_backbone(
+                    int(num_tokens),
+                    use_pipeline_runtime=bool(use_pipeline_runtime),
+                )
+            )
+        except TypeError:
+            return bool(self._model_executor.has_backbone(int(num_tokens)))
 
     def update_graphs(
         self,
@@ -944,7 +1231,7 @@ class ExecutionManager:
         jax.Array,
         jax.Array,
         jax.Array,
-        jax.Array,
+        jax.Array | None,
         dict[str, float | int],
     ]:
         """Execute a single fused inference step.
@@ -976,7 +1263,8 @@ class ExecutionManager:
                 - input_ids_buf: Updated input buffer (may contain new tokens).
                 - position_ids_buf: Updated position buffer.
                 - hidden_states: Last layer hidden states [num_tokens, hidden_dim].
-                - logits: Output logits [padded_num_reqs, vocab_size].
+                - logits: Output logits [padded_num_reqs, vocab_size], or ``None``
+                  for prefill-only steps that do not sample.
                 - metrics: Execution timing + bucket info.
 
         Raises:
@@ -1002,6 +1290,13 @@ class ExecutionManager:
             ... )
             >>> new_state, tokens, valid, *rest = results
         """
+        if self._verbose and num_tokens > 0:
+            logger.info(
+                "[esurge-prof-exec] enter tok=%d reqs=%d wait=%s",
+                int(num_tokens),
+                int(padded_num_reqs),
+                bool(wait_for_outputs),
+            )
         microbatch_result = self._try_execute_pipeline_microbatches(
             num_tokens=num_tokens,
             scheduled_full_cpu=scheduled_full_cpu,
@@ -1034,6 +1329,8 @@ class ExecutionManager:
             wait_for_outputs=wait_for_outputs,
         )
         if microbatch_result is not None:
+            if self._verbose and num_tokens > 0:
+                logger.info("[esurge-prof-exec] microbatch path returned tok=%d", int(num_tokens))
             return microbatch_result
 
         start_prep = time.time()
@@ -1074,12 +1371,118 @@ class ExecutionManager:
             video_grid_thw=video_grid_thw,
         )
         prep_batch_metadata_took = time.time() - prep_phase_start
+        if self._verbose and num_tokens > 0:
+            logger.info("[esurge-prof-exec] prepared metadata tok=%d", int(num_tokens))
         prep_handoff_took = 0.0
         if device_token_handoff is not None:
             prep_phase_start = time.time()
             batch_metadata = self._apply_device_token_handoff(batch_metadata, device_token_handoff)
             input_ids_buf = batch_metadata.input_ids_buf
             prep_handoff_took = time.time() - prep_phase_start
+
+        window_emits_token = self._window_emits_token(
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            req_num_tokens_full_cpu=req_num_tokens_full_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            padded_num_reqs=padded_num_reqs,
+        )
+        use_pipeline_runtime_for_window = bool(
+            self.model.mesh.is_mpmd
+            and self._model_executor.pipeline_runtime is not None
+            and self._is_decode_only_window(
+                scheduled_full_cpu=scheduled_full_cpu,
+                active_mask_full_cpu=active_mask_full_cpu,
+                padded_num_reqs=padded_num_reqs,
+            )
+        )
+        if self.model.mesh.is_mpmd and not window_emits_token:
+            prep_ensure_variants_took = 0.0
+            if not self._has_backbone_variant(
+                int(num_tokens),
+                use_pipeline_runtime=bool(use_pipeline_runtime_for_window),
+            ):
+                raise RuntimeError(
+                    "Missing precompiled MPMD prefill backbone bucket "
+                    f"num_tokens={int(num_tokens)} use_pipeline_runtime={bool(use_pipeline_runtime_for_window)}. "
+                    "Runtime compilation is disabled; include this bucket in compile()."
+                )
+            if self._verbose and num_tokens > 0:
+                logger.info(
+                    "[esurge-prof-exec] prefill-only backbone ready tok=%d pp_runtime=%s",
+                    int(num_tokens),
+                    bool(use_pipeline_runtime_for_window),
+                )
+
+            prep_phase_start = time.time()
+            inputs = StepFunctionInputs(
+                kv_pages=self.kv_pages,
+                scheduled_full=scheduled_full,
+                req_num_tokens_full=self._req_num_tokens_placeholder,
+                active_mask_full=active_mask_full,
+                rng_key=self.rng_key,
+                batch_metadata=batch_metadata,
+            )
+            if self._verbose and SYNC_INPUTS_FOR_TIMING:
+                inputs = jax.block_until_ready(inputs)
+            prep_pack_inputs_took = time.time() - prep_phase_start
+            prep_took = time.time() - start_prep
+
+            start_exec = time.time()
+            if self._verbose and num_tokens > 0:
+                logger.info("[esurge-prof-exec] launching prefill-only backbone tok=%d", int(num_tokens))
+            backbone_fn = self._model_executor.get_backbone(
+                num_tokens=num_tokens,
+                use_pipeline_runtime=use_pipeline_runtime_for_window,
+            )
+            with forward_autotune_only():
+                backbone_outputs = backbone_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
+            self.kv_pages = backbone_outputs.kv_pages
+            if wait_for_outputs:
+                if self._verbose and num_tokens > 0:
+                    logger.info("[esurge-prof-exec] waiting prefill-only backbone tok=%d", int(num_tokens))
+                jax.block_until_ready(backbone_outputs.hidden_states)
+            exec_took = time.time() - start_exec
+            sample_took = 0.0
+            execute_total_took = time.time() - start_prep
+            execute_overhead_took = max(0.0, float(execute_total_took - (prep_took + exec_took + sample_took)))
+            out_tokens_full = jax.device_put(
+                numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+                self._empty_sharding,
+            )
+            valid_mask_full = jax.device_put(
+                numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
+                self._empty_sharding,
+            )
+            metrics = {
+                "exec_time": exec_took,
+                "sample_time": sample_took,
+                "prep_time": prep_took,
+                "prep_batch_metadata_time": prep_batch_metadata_took,
+                "prep_handoff_time": prep_handoff_took,
+                "prep_sampler_window_time": 0.0,
+                "prep_ensure_variants_time": prep_ensure_variants_took,
+                "prep_pack_inputs_time": prep_pack_inputs_took,
+                "execute_overhead_time": execute_overhead_took,
+                "buckets_processed": int(batch_metadata.input_ids_buf.shape[-1]),
+                "token_bucket": int(num_tokens),
+                "padded_num_reqs": int(padded_num_reqs),
+                "sampler_padded_num_reqs": 0,
+                "sampler_num_reqs": 0,
+                "prefill_only": 1,
+            }
+            metrics.update(self._model_executor.last_pipeline_stats())
+            metrics.update(self._batch_preparer.last_prep_stats)
+            return (
+                out_tokens_full,
+                valid_mask_full,
+                input_ids_buf,
+                position_ids_buf,
+                backbone_outputs.hidden_states,
+                None,
+                metrics,
+            )
+
         prep_phase_start = time.time()
         sampler_num_reqs, sampler_padded_num_reqs, sampler_total_tokens = self._prepare_compact_sampler_window(
             padded_num_reqs=padded_num_reqs,
@@ -1106,14 +1509,26 @@ class ExecutionManager:
                 self._sampler_gather_positions_cpu[: int(sampler_padded_num_reqs)],
                 sampler_prefix,
             ):
-                model_logits_padded_num_reqs = int(sampler_padded_num_reqs)
+                model_logits_padded_num_reqs = self._pipeline_model_logits_bucket(
+                    padded_num_reqs=padded_num_reqs,
+                    sampler_padded_num_reqs=sampler_padded_num_reqs,
+                )
         prep_phase_start = time.time()
-        self._ensure_runtime_variants(
+        self._require_precompiled_variants(
             num_tokens=num_tokens,
             padded_num_reqs=model_logits_padded_num_reqs,
             sampler_padded_num_reqs=sampler_padded_num_reqs,
+            use_pipeline_runtime=use_pipeline_runtime_for_window,
         )
         prep_ensure_variants_took = time.time() - prep_phase_start
+        if self._verbose and num_tokens > 0:
+            logger.info(
+                "[esurge-prof-exec] variants ready tok=%d model_reqs=%d sampler_reqs=%d pp_runtime=%s",
+                int(num_tokens),
+                int(model_logits_padded_num_reqs),
+                int(sampler_padded_num_reqs),
+                bool(use_pipeline_runtime_for_window),
+            )
 
         prep_phase_start = time.time()
         inputs = StepFunctionInputs(
@@ -1136,11 +1551,16 @@ class ExecutionManager:
             _tree_hash_diff(model_hash_baseline, model_hash)
 
         start_exec = time.time()
+        if self._verbose and num_tokens > 0:
+            logger.info("[esurge-prof-exec] launching model tok=%d", int(num_tokens))
         model_outputs = self.execute_model(
             num_tokens=num_tokens,
             padded_num_reqs=model_logits_padded_num_reqs,
             inputs=inputs,
+            use_pipeline_runtime=use_pipeline_runtime_for_window,
         )
+        if self._verbose and num_tokens > 0:
+            logger.info("[esurge-prof-exec] model launched tok=%d", int(num_tokens))
 
         sampler_inputs = (
             sampler_padded_num_reqs,
@@ -1199,14 +1619,20 @@ class ExecutionManager:
                 or numpy.any(repetition_penalties_cpu != 1.0)
             ),
         )
+        if self._verbose and num_tokens > 0:
+            logger.info("[esurge-prof-exec] sampler launched tok=%d", int(num_tokens))
         rng_key_out, out_tokens_full, valid_mask_full, token_counts_out = sampler_out
         self.rng_key = rng_key_out
         self._sampler_token_counts = token_counts_out
         if wait_for_outputs:
+            if self._verbose and num_tokens > 0:
+                logger.info("[esurge-prof-exec] waiting model logits tok=%d", int(num_tokens))
             jax.block_until_ready(model_outputs.logits)
             exec_took = time.time() - start_exec
 
             start_sample = time.time()
+            if self._verbose and num_tokens > 0:
+                logger.info("[esurge-prof-exec] waiting sampler tok=%d", int(num_tokens))
             jax.block_until_ready(out_tokens_full)
             sample_took = time.time() - start_sample
         else:
@@ -1381,6 +1807,15 @@ class ExecutionManager:
             self._pipeline_microbatch_scratch_signature = signature
 
         def _new_slot() -> _PipelineMicrobatchScratchSlot:
+            """Allocate one zero-initialized scratch slot for a PP microbatch.
+
+            Each slot mirrors the per-request CPU buffers required to assemble
+            a microbatch (scheduled tokens, active mask, token ids, computed
+            tokens, sampling parameters, page table) plus a ``prev_count`` sentinel
+            used by repopulation logic. Buffers are sized like the corresponding
+            window-level CPU arrays so repeated microbatches can write into them
+            without reallocating.
+            """
             return {
                 "scheduled": numpy.zeros_like(scheduled_full_cpu),
                 "active": numpy.zeros_like(active_mask_full_cpu),
@@ -1560,7 +1995,16 @@ class ExecutionManager:
         Returns ``(microbatch_count, rows_per_microbatch)``. ``None`` means the
         user disabled PP microbatch wavefronting for this runner.
         """
+
         def _policy_value(value: int | str | None) -> int | str | None:
+            """Normalize a microbatch policy knob to ``"auto"`` / ``int`` / ``None``.
+
+            Accepts the public surface (``"auto"``, ``"none"``/``"off"``,
+            integer strings, plain ints, ``None``) and collapses it to the
+            three internal forms used by :meth:`_resolve_pipeline_microbatch_shape`.
+            Zero is folded to ``None`` (disabled), and unknown strings raise
+            via the inner ``int(...)`` cast.
+            """
             if value is None:
                 return None
             if isinstance(value, str):
@@ -1713,24 +2157,13 @@ class ExecutionManager:
             microbatch_num_tokens = min(candidates)
         else:
             microbatch_num_tokens = max(int(num_tokens), int(microbatch_req_count), int(self.min_input_pad))
-        if not self._model_executor.has((microbatch_num_tokens, microbatch_padded_reqs, "model_step", "mpmd")):
-            if self._runtime_lazy_compile:
-                self._ensure_runtime_variants(
-                    num_tokens=microbatch_num_tokens,
-                    padded_num_reqs=padded_num_reqs,
-                    sampler_padded_num_reqs=padded_num_reqs,
-                    compile_split_pp_path=True,
-                )
-            if not self._model_executor.has_backbone(microbatch_num_tokens):
-                return None
+        if not self._has_backbone_variant(microbatch_num_tokens, use_pipeline_runtime=True):
+            return None
         if not self._model_executor.has_lm_head(padded_num_reqs):
             return None
 
         start_prep = time.time()
-        chunks = [
-            active_positions[i : i + microbatch_req_count]
-            for i in range(0, active_count, microbatch_req_count)
-        ]
+        chunks = [active_positions[i : i + microbatch_req_count] for i in range(0, active_count, microbatch_req_count)]
         if len(chunks) < 2:
             return None
         if device_token_handoff is not None and int(device_token_handoff.token_ids.shape[0]) < active_count:
@@ -1874,11 +2307,11 @@ class ExecutionManager:
             or numpy.any(repetition_penalties_cpu[:padded_num_reqs] != 1.0)
         )
         ensure_start = time.time()
-        self._ensure_runtime_variants(
+        self._require_precompiled_variants(
             num_tokens=microbatch_num_tokens,
             padded_num_reqs=padded_num_reqs,
             sampler_padded_num_reqs=sampler_padded_num_reqs,
-            compile_split_pp_path=True,
+            use_pipeline_runtime=True,
         )
         ensure_variants_time += time.time() - ensure_start
 
@@ -1917,7 +2350,9 @@ class ExecutionManager:
             hidden_parts.append(backbone_out.hidden_states)
             logits_index_parts.append(logits_indices)
             if not positions_are_prefix:
-                scatter_idx = replicate_on_array_mesh(jnp.asarray(positions, dtype=jnp.int32), backbone_out.hidden_states)
+                scatter_idx = replicate_on_array_mesh(
+                    jnp.asarray(positions, dtype=jnp.int32), backbone_out.hidden_states
+                )
                 position_parts.append(scatter_idx)
 
         if positions_are_prefix:
@@ -1951,7 +2386,7 @@ class ExecutionManager:
             sampler_padded_num_reqs=sampler_padded_num_reqs,
             sampler_num_reqs=sampler_num_reqs,
             sampler_total_tokens=sampler_total_tokens,
-                req_num_tokens_full_cpu=req_num_tokens_full_cpu,
+            req_num_tokens_full_cpu=req_num_tokens_full_cpu,
             logits=logits,
             rng_key=self.rng_key,
             gather_positions_cpu=gather_positions_cpu,
@@ -2022,6 +2457,7 @@ class ExecutionManager:
         num_tokens: int,
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
+        use_pipeline_runtime: bool = True,
     ) -> ModelStepOutputs:
         """Run the compiled model forward step and update self.kv_pages.
 
@@ -2033,6 +2469,9 @@ class ExecutionManager:
             padded_num_reqs: Padded request count for bucket selection.
             inputs: Consolidated step function inputs containing kv_pages,
                 batch_metadata, and other required tensors.
+            use_pipeline_runtime: Select the resident PP-runtime backbone
+                variant for true decode wavefronts, or the direct SpectraX
+                variant for prompt prefill chunks.
 
         Returns:
             ModelStepOutputs containing updated kv_pages, hidden_states, and
@@ -2044,7 +2483,11 @@ class ExecutionManager:
             not block on completion, allowing the caller to pipeline work like
             enqueuing sampling before synchronizing.
         """
-        model_fn = self._model_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
+        model_fn = self._model_executor.get_compiled(
+            num_tokens=num_tokens,
+            padded_num_reqs=padded_num_reqs,
+            use_pipeline_runtime=use_pipeline_runtime,
+        )
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
         with forward_autotune_only():
@@ -2104,8 +2547,11 @@ class ExecutionManager:
             new_rec = rec.recurrent_state
             slot_arr = jnp.array(slot_indices, dtype=jnp.int32)
             # Build mask once — conv_state and recurrent_state share the batch dim.
-            n_slots = new_conv.shape[0] if new_conv is not None else (new_rec.shape[0] if new_rec is not None else 0)
-            if n_slots == 0:
+            if new_conv is not None:
+                n_slots = typing.cast(jax.Array, new_conv).shape[0]
+            elif new_rec is not None:
+                n_slots = typing.cast(jax.Array, new_rec).shape[0]
+            else:
                 continue
             keep_mask = jnp.ones(n_slots, dtype=jnp.bool_).at[slot_arr].set(False)
             if new_conv is not None:
@@ -2349,9 +2795,6 @@ class ExecutionManager:
             ... )
         """
 
-        self._runtime_compile_metadata = metadata
-        self._runtime_compile_max_num_reqs = int(max_num_reqs)
-
         if self.use_aot_forward:
             self.clear_cache()
         if num_reqs_paddings:
@@ -2363,7 +2806,7 @@ class ExecutionManager:
             reqs_padds = [max_num_reqs]
         sampler_ufn = partial(
             _get_padded_num_reqs_with_upper_limit,
-            min_input_pad=int(self._sampler_min_input_pad),
+            min_input_pad=int(getattr(self, "_sampler_min_input_pad", 1)),
         )
         sampler_reqs_padds = sorted(
             {
@@ -2385,27 +2828,19 @@ class ExecutionManager:
         all_reqs_padds = sorted({int(r) for _, r in sampler_compile_pairs})
         sampler_reqs_padds_to_compile = all_reqs_padds
         if self.model.mesh.is_mpmd:
-            if self._runtime_lazy_compile:
-                logger.info(
-                    "MPMD lazy compilation enabled: warming a minimal decode set; "
-                    "additional buckets compile on first use."
-                )
-                model_tokens_to_compile = [model_tokens[0]]
-                reqs_to_compile = [reqs_padds[0]]
-                sampler_reqs_padds_to_compile = [
-                    sampler_reqs_padds_to_compile[0]
-                ] if sampler_reqs_padds_to_compile else reqs_to_compile
-            else:
-                model_tokens_to_compile = model_tokens
-                reqs_to_compile = all_reqs_padds
+            model_tokens_to_compile = model_tokens
+            reqs_to_compile = reqs_padds
 
             if self._model_executor.supports_pipeline_model_step:
-                pp_model_reqs_to_compile = sorted({*reqs_to_compile, *sampler_reqs_padds_to_compile})
+                pp_model_reqs_to_compile = reqs_to_compile
                 pp_model_pairs = [
                     (int(num_tokens), int(reqs_padd))
                     for num_tokens in model_tokens_to_compile
                     for reqs_padd in pp_model_reqs_to_compile
-                    if int(reqs_padd) <= int(num_tokens)
+                    if self._should_use_fused_pipeline_model_step(
+                        num_tokens=int(num_tokens),
+                        padded_num_reqs=int(reqs_padd),
+                    )
                 ]
                 pp_model_progress = ProgressLogger("eSurge-pp-model-step", logger)
                 for idx, (num_tokens, reqs_padd) in enumerate(pp_model_pairs):
@@ -2420,29 +2855,32 @@ class ExecutionManager:
                         max_num_reqs=max_num_reqs,
                         metadata=metadata,
                     )
-                pp_model_progress.complete(
-                    f"All {len(pp_model_pairs)} fused PP model-step compilations completed"
-                )
-            compile_split_pp_path = (not self._model_executor.supports_pipeline_model_step) or (
-                not self._runtime_lazy_compile
-            )
-            if compile_split_pp_path:
-                backbone_progress = ProgressLogger("eSurge-backbone", logger)
-                for idx, num_tokens in enumerate(model_tokens_to_compile):
+                pp_model_progress.complete(f"All {len(pp_model_pairs)} fused PP model-step compilations completed")
+            backbone_variants = [False]
+            if getattr(self._model_executor, "pipeline_runtime", None) is not None:
+                backbone_variants.append(True)
+            backbone_total = len(model_tokens_to_compile) * len(backbone_variants)
+            backbone_progress = ProgressLogger("eSurge-backbone", logger)
+            backbone_idx = 0
+            for num_tokens in model_tokens_to_compile:
+                for use_pipeline_runtime in backbone_variants:
+                    mode_name = "runtime" if use_pipeline_runtime else "direct"
                     backbone_progress.update(
-                        idx,
-                        len(model_tokens_to_compile),
-                        f"Compiling [{idx + 1}/{len(model_tokens_to_compile)}]: {num_tokens:5d} tokens",
+                        backbone_idx,
+                        backbone_total,
+                        f"Compiling [{backbone_idx + 1}/{backbone_total}]: {num_tokens:5d} tokens ({mode_name})",
                     )
                     self._compile_backbone_variant(
                         num_tokens=num_tokens,
                         max_num_reqs=max_num_reqs,
                         metadata=metadata,
+                        use_pipeline_runtime=use_pipeline_runtime,
                     )
-                backbone_progress.complete(f"All {len(model_tokens_to_compile)} backbone compilations completed")
+                    backbone_idx += 1
+            backbone_progress.complete(f"All {backbone_total} backbone compilations completed")
 
             lm_head_progress = ProgressLogger("eSurge-head-sampler", logger)
-            lm_head_reqs_to_compile = reqs_to_compile if compile_split_pp_path else []
+            lm_head_reqs_to_compile = reqs_to_compile
             total_phase2 = len(lm_head_reqs_to_compile) + len(sampler_reqs_padds_to_compile)
             phase2_idx = 0
             for reqs_padd in lm_head_reqs_to_compile:
@@ -2457,16 +2895,10 @@ class ExecutionManager:
                     metadata=metadata,
                 )
                 phase2_idx += 1
+            self._reset_kv_pages_after_compile_warmup()
         else:
             reqs_to_compile = all_reqs_padds
             model_compile_pairs = self._get_feasible_compile_pairs(model_tokens, reqs_padds)
-            if self._runtime_lazy_compile:
-                logger.info(
-                    "SPMD lazy compilation enabled: warming a minimal decode set; "
-                    "additional buckets compile on first use."
-                )
-                model_compile_pairs = model_compile_pairs[:1]
-                sampler_reqs_padds_to_compile = sampler_reqs_padds_to_compile[:1]
             model_step_progress = ProgressLogger("eSurge-model-step", logger)
             for idx, (num_tokens, reqs_padd) in enumerate(model_compile_pairs):
                 model_step_progress.update(
@@ -2505,85 +2937,50 @@ class ExecutionManager:
         else:
             lm_head_progress.complete(f"All {total_phase2} sampler compilations completed")
 
-    def _ensure_runtime_variants(
+    def _require_precompiled_variants(
         self,
         *,
         num_tokens: int,
         padded_num_reqs: int,
         sampler_padded_num_reqs: int,
-        compile_split_pp_path: bool = False,
+        use_pipeline_runtime: bool = True,
     ) -> None:
-        """Compile missing buckets exactly when the scheduler reaches them.
-
-        Full eager warmup is expensive on TPU: it asks XLA/SpectraX to
-        materialize every token bucket before the first request, which can push
-        large runs into long startup stalls or native runtime failures. The
-        runtime already knows the exact bucket it is about to execute, so
-        compile startup warms a small decode bucket and fills the remaining
-        cache on first use.
-        """
-        if not self._runtime_lazy_compile:
-            return
-        metadata = self._runtime_compile_metadata
-        max_num_reqs = self._runtime_compile_max_num_reqs
-        if metadata is None or max_num_reqs is None:
-            return
-
-        with self._runtime_compile_lock:
-            if not self.model.mesh.is_mpmd:
-                if not self._model_executor.has_model_step(int(num_tokens), int(padded_num_reqs)):
-                    logger.info(
-                        "Lazy-compiling SPMD fused model-step bucket: %s tokens / %s requests",
-                        int(num_tokens),
-                        int(padded_num_reqs),
-                    )
-                    self._compile_model_step_variant(
-                        num_tokens=int(num_tokens),
-                        padded_num_reqs=int(padded_num_reqs),
-                        max_num_reqs=max_num_reqs,
-                        metadata=metadata,
-                    )
-            elif self._model_executor.supports_pipeline_model_step and not self._model_executor.has_model_step(
-                int(num_tokens),
-                int(padded_num_reqs),
-            ):
-                logger.info(
-                    "Lazy-compiling MPMD fused model-step bucket: %s tokens / %s requests",
-                    int(num_tokens),
-                    int(padded_num_reqs),
-                )
-                self._compile_pipeline_model_step_variant(
+        """Validate that ``compile()`` already prepared the exact runtime bucket."""
+        missing: list[str] = []
+        if not self.model.mesh.is_mpmd:
+            if not self._model_executor.has_model_step(int(num_tokens), int(padded_num_reqs)):
+                missing.append(f"SPMD model_step({int(num_tokens)}, {int(padded_num_reqs)})")
+        else:
+            has_fused = bool(
+                self._should_use_fused_pipeline_model_step(
                     num_tokens=int(num_tokens),
                     padded_num_reqs=int(padded_num_reqs),
-                    max_num_reqs=max_num_reqs,
-                    metadata=metadata,
                 )
-            need_split_pp_path = self.model.mesh.is_mpmd and (
-                compile_split_pp_path or (not self._model_executor.supports_pipeline_model_step)
+                and self._model_executor.has_model_step(int(num_tokens), int(padded_num_reqs))
             )
-            if need_split_pp_path and not self._model_executor.has_backbone(int(num_tokens)):
-                logger.info("Lazy-compiling MPMD backbone bucket: %s tokens", int(num_tokens))
-                self._compile_backbone_variant(
-                    num_tokens=int(num_tokens),
-                    max_num_reqs=max_num_reqs,
-                    metadata=metadata,
+            has_split = bool(
+                self._has_backbone_variant(
+                    int(num_tokens),
+                    use_pipeline_runtime=bool(use_pipeline_runtime),
                 )
-            if need_split_pp_path and not self._model_executor.has_lm_head(int(padded_num_reqs)):
-                logger.info("Lazy-compiling MPMD lm_head bucket: %s requests", int(padded_num_reqs))
-                self._compile_lm_head_variant(
-                    padded_num_reqs=int(padded_num_reqs),
-                    max_num_reqs=max_num_reqs,
-                    metadata=metadata,
+                and self._model_executor.has_lm_head(int(padded_num_reqs))
+            )
+            if not (has_fused or has_split):
+                missing.append(
+                    "MPMD model bucket "
+                    f"tokens={int(num_tokens)} reqs={int(padded_num_reqs)} "
+                    f"use_pipeline_runtime={bool(use_pipeline_runtime)}"
                 )
-            sampler_key = self._sampler_executor.cache_key(padded_num_reqs=int(sampler_padded_num_reqs))
-            if not self._sampler_executor.has(sampler_key):
-                logger.info("Lazy-compiling sampler bucket: %s requests", int(sampler_padded_num_reqs))
-                self._compile_sampler_variant(
-                    num_tokens=max(int(num_tokens), int(sampler_padded_num_reqs)),
-                    max_num_reqs=max_num_reqs,
-                    padded_num_reqs=int(sampler_padded_num_reqs),
-                    metadata=metadata,
-                )
+
+        sampler_key = self._sampler_executor.cache_key(padded_num_reqs=int(sampler_padded_num_reqs))
+        if not self._sampler_executor.has(sampler_key):
+            missing.append(f"sampler({int(sampler_padded_num_reqs)})")
+        if missing:
+            raise RuntimeError(
+                "Missing precompiled eSurge bucket(s): "
+                + ", ".join(missing)
+                + ". Runtime compilation is disabled; include these buckets in compile()."
+            )
 
     def _compile_model_step_variant(
         self,
@@ -2614,7 +3011,7 @@ class ExecutionManager:
             graphother=graphother,
             inputs=inputs,
         )
-        if model_out is not None:
+        if model_out is not None and not self.model.mesh.is_mpmd:
             self.kv_pages = model_out.kv_pages
         if self.use_aot_forward:
             warm_args = (graphstate, graphother, inputs)
@@ -2651,7 +3048,9 @@ class ExecutionManager:
             graphother=graphother,
             inputs=inputs,
         )
-        if model_out is not None:
+        if model_out is not None and not self.model.mesh.is_mpmd:
+            self.kv_pages = model_out.kv_pages
+        elif model_out is not None:
             self.kv_pages = model_out.kv_pages
         if self.use_aot_forward:
             warm_args = (graphstate, graphother, inputs)
@@ -2663,13 +3062,14 @@ class ExecutionManager:
         num_tokens: int,
         max_num_reqs: int,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
+        use_pipeline_runtime: bool = True,
     ) -> None:
         """Compile the backbone (transformer forward) for a token bucket.
 
         Keyed by ``num_tokens`` only.  Uses ``max_num_reqs`` as the dummy
         ``padded_num_reqs`` so that metadata shapes are fixed.
         """
-        if self._model_executor.has_backbone(num_tokens):
+        if self._has_backbone_variant(num_tokens, use_pipeline_runtime=use_pipeline_runtime):
             return
 
         compargs = self.get_compile_configurations(
@@ -2687,12 +3087,37 @@ class ExecutionManager:
             graphstate=graphstate,
             graphother=graphother,
             inputs=inputs,
+            use_pipeline_runtime=use_pipeline_runtime,
         )
-        if backbone_out is not None:
+        if backbone_out is not None and not self.model.mesh.is_mpmd:
+            self.kv_pages = backbone_out.kv_pages
+        elif backbone_out is not None:
             self.kv_pages = backbone_out.kv_pages
         if self.use_aot_forward:
             warm_args = (graphstate, graphother, inputs)
             self._debug_baselines[f"{num_tokens}_hash_in_backbone"] = _tree_hash(warm_args)
+
+    def _reset_kv_pages_after_compile_warmup(self) -> None:
+        """Replace compile warm-up cache pages with fresh runtime pages.
+
+        Upfront MPMD compilation executes the same donated backbone functions
+        used by decode. That makes compilation truthful, but the warm-up inputs
+        are dummy schedules and dummy page tables. Reinitializing here prevents
+        deleted donated buffers and dummy KV writes from leaking into the first
+        user request while preserving the compiled executables in the executor
+        caches.
+        """
+        if not self.model.mesh.is_mpmd:
+            return
+        if not hasattr(self, "_cache_quantizer") or not hasattr(self, "_cache_masking_details"):
+            return
+        self.kv_pages = None
+        gc.collect()
+        self.kv_pages = self._init_operations_cache_with_retry(
+            quantizer=self._cache_quantizer,
+            masking_details=self._cache_masking_details,
+        )
+        self._model_executor.refresh_kv_pages_template(self.kv_pages)
 
     def _compile_lm_head_variant(
         self,

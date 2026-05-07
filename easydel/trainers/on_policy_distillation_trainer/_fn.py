@@ -187,10 +187,8 @@ def on_policy_distillation_step(
             teacher_kwargs,
             jax.lax.stop_gradient(teacher_state.graphstate),
         )
-        if use_chunked:
-            teacher_hidden_for_kl = teacher_out["h"]
-        else:
-            teacher_logits = teacher_out["l"]
+        teacher_hidden_for_kl = teacher_out["h"] if use_chunked else None
+        teacher_logits = teacher_out["l"] if not use_chunked else None
 
         call_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
         if use_chunked:

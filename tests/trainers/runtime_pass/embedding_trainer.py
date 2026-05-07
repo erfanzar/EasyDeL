@@ -58,7 +58,7 @@ def main():
     tokenizer = get_tokenizer()
 
     model = ed.AutoEasyDeLModelForEmbedding.from_pretrained(
-        "Qwen/Qwen3-4B",
+        pretrained_model_name_or_path="Qwen/Qwen3-4B",
         auto_shard_model=True,
         sharding_axis_dims=(1, 1, -1, 1, 1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
@@ -79,7 +79,6 @@ def main():
             "max_length": 128,
             "total_batch_size": 4,
             "gradient_accumulation_steps": 1,
-            "max_training_steps": 5,
             "query_field": "query",
             "positive_field": "positive",
         },

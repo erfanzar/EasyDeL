@@ -933,6 +933,12 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         rotary_pos_emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
 
         def _layer_loop(block, carry):
+            """Run one vision encoder block inside ``self.blocks.scan``.
+
+            Threads ``(hidden_states, layer_index)`` through the scan,
+            applying each block with the closed-over ``cu_seqlens`` and
+            ``rotary_pos_emb``.
+            """
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 hidden_states = block(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
@@ -1452,6 +1458,12 @@ class Glm4vTextModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Run one GLM-4V text decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)`` through the scan and collects
+            optional intermediate states / attention weights.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

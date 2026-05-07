@@ -566,6 +566,14 @@ class InternLM2Model(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Body of the layer-scan: drive one ``InternLM2Block``.
+
+            The carry tuple is ``(hidden_states, cache_views,
+            all_hidden_states, all_attentions, layer_index)``. The function
+            optionally accumulates pre-block hidden states / attention
+            weights and routes the per-layer cache view through
+            :meth:`_layer_cache_view_at` / :meth:`_layer_cache_view_update`.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

@@ -500,6 +500,14 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         layer_outputs = None
 
         def _layer_loop(block, carry):
+            """Run one GLM-4V-MoE text decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, layer_index)`` through the scan, collecting
+            optional intermediate hidden states, attention weights, and
+            per-layer router logits when the outer ``forward`` requested
+            them.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

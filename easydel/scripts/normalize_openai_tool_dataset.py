@@ -32,16 +32,146 @@ HuggingFace Hub repository.
 from __future__ import annotations
 
 import argparse
+import json
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from easydel.scripts.convert_lambda_hermes_to_openai import (
-    _iter_source_rows,
-    _load_json_dataset,
-    _write_jsonl_dataset,
-    _write_summary,
-    normalize_openai_tool_dataset_example,
-)
+JsonObject = dict[str, Any]
+
+
+@dataclass
+class NormalizationSummary:
+    """Summary emitted after normalizing a tool-calling dataset split."""
+
+    source_dataset: str
+    config_name: str
+    split: str
+    rows_seen: int = 0
+    rows_written: int = 0
+    decoded_json_strings: int = 0
+    drop_incomplete_tool_call_rows: bool = False
+    collapsed_adjacent_assistant_messages: bool = False
+    empty_tool_rows_kept: bool = True
+    stripped_system_tool_sections: bool = False
+    qwen35_chat_template_reference: dict[str, Any] = field(default_factory=dict)
+
+
+def _compact_json(value: Any) -> str:
+    """Serialize metadata as stable, compact JSON."""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _maybe_decode_json_string(value: Any) -> tuple[Any, int]:
+    """Decode stringified JSON leaves while preserving ordinary strings."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith(("{", "[")):
+            try:
+                return json.loads(text), 1
+            except json.JSONDecodeError:
+                return value, 0
+        return value, 0
+    if isinstance(value, list):
+        decoded_count = 0
+        decoded_items = []
+        for item in value:
+            decoded, count = _maybe_decode_json_string(item)
+            decoded_items.append(decoded)
+            decoded_count += count
+        return decoded_items, decoded_count
+    if isinstance(value, dict):
+        decoded_count = 0
+        decoded_items: dict[str, Any] = {}
+        for key, item in value.items():
+            decoded, count = _maybe_decode_json_string(item)
+            decoded_items[str(key)] = decoded
+            decoded_count += count
+        return decoded_items, decoded_count
+    return value, 0
+
+
+def normalize_openai_tool_dataset_example(example: JsonObject) -> JsonObject:
+    """Normalize one OpenAI-style tool-calling row.
+
+    Args:
+        example: Source dataset row. The row may contain JSON fields encoded as
+            strings, commonly under ``messages[*].tool_calls[*].function.arguments``
+            or ``tools[*].function.parameters``.
+
+    Returns:
+        A shallow-normalized row with stringified JSON leaves decoded into
+        native Python lists/dicts. The private ``"_decoded_json_strings"`` field
+        records how many leaves were decoded and is consumed by the writer.
+    """
+
+    normalized, decoded_count = _maybe_decode_json_string(dict(example))
+    if not isinstance(normalized, dict):
+        normalized = dict(example)
+    normalized["_decoded_json_strings"] = decoded_count
+    return normalized
+
+
+def _iter_source_rows(
+    source_dataset: str,
+    config_name: str | None,
+    split: str,
+    *,
+    token: str | None,
+    streaming: bool,
+    max_rows: int | None,
+) -> Iterator[JsonObject]:
+    """Yield rows from a HuggingFace dataset split."""
+
+    from datasets import load_dataset
+
+    kwargs: dict[str, Any] = {"split": split, "token": token, "streaming": streaming}
+    dataset = load_dataset(source_dataset, config_name, **kwargs) if config_name else load_dataset(source_dataset, **kwargs)
+    for idx, row in enumerate(dataset):
+        if max_rows is not None and idx >= max_rows:
+            break
+        yield dict(row)
+
+
+def _write_jsonl_dataset(
+    rows: Iterable[JsonObject],
+    *,
+    output_path: Path,
+    converter: Callable[[JsonObject], JsonObject],
+    source_dataset: str,
+    config_name: str,
+    split: str,
+) -> NormalizationSummary:
+    """Write normalized rows as JSONL and return a conversion summary."""
+
+    summary = NormalizationSummary(source_dataset=source_dataset, config_name=config_name, split=split)
+    with output_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            summary.rows_seen += 1
+            normalized = converter(row)
+            decoded = normalized.pop("_decoded_json_strings", 0)
+            if isinstance(decoded, int):
+                summary.decoded_json_strings += decoded
+            f.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+            summary.rows_written += 1
+    return summary
+
+
+def _load_json_dataset(jsonl_path: Path, split: str):
+    """Load a JSONL file through ``datasets`` so it can be written as parquet."""
+
+    from datasets import load_dataset
+
+    return load_dataset("json", data_files={split: str(jsonl_path)}, split=split)
+
+
+def _write_summary(path: Path, summary: NormalizationSummary) -> None:
+    """Write the normalization summary sidecar."""
+
+    path.write_text(json.dumps(summary.__dict__, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -164,8 +294,6 @@ def main(argv: list[str] | None = None) -> None:
             repo_id=args.repo_id,
             repo_type="dataset",
         )
-
-    from easydel.scripts.convert_lambda_hermes_to_openai import _compact_json
 
     print(_compact_json(summary.__dict__))
 

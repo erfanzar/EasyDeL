@@ -614,7 +614,17 @@ def pretokenize(
 
 
 def _resolve_log_process_update_interval(log_process: bool | int) -> int | None:
-    """Normalize the optional pretokenization tqdm update interval."""
+    """Translate :func:`pretokenize`'s ``log_process`` flag into a tqdm refresh stride.
+
+    Args:
+        log_process: ``False`` disables the bar entirely, ``True`` requests
+            the default 1,000-example refresh cadence, and any positive
+            integer overrides it with that explicit stride.
+
+    Returns:
+        int | None: Number of examples between bar refreshes, or ``None``
+        when no progress bar should be created.
+    """
     if log_process is False:
         return None
     if log_process is True:
@@ -626,14 +636,34 @@ def _resolve_log_process_update_interval(log_process: bool | int) -> int | None:
 
 
 def _make_pre_tokenize_progress_bar():
-    """Create the tqdm progress bar for streaming pretokenization."""
+    """Build the shared tqdm progress bar used during streaming pretokenization.
+
+    Returns:
+        tqdm.auto.tqdm: Bar configured with the ``"Pretokenizing"``
+        description, ``"examples"`` unit, and unit-scaling enabled.
+    """
     from tqdm.auto import tqdm
 
     return tqdm(desc="Pretokenizing", unit="examples", unit_scale=True)
 
 
 def _apply_transform_to_example(transform: tp.Any, example: dict) -> list[dict]:
-    """Apply one regular or expanding transform and materialize the output."""
+    """Apply a single transform to one example, supporting expand-style outputs.
+
+    :class:`~easydel.data.transforms.base.ExpandTransform` instances may
+    yield zero, one, or many rows per input — those are materialised
+    eagerly here. Regular transforms return a single dict (or ``None``
+    to indicate the row should be dropped).
+
+    Args:
+        transform: Transform callable or
+            :class:`~easydel.data.transforms.base.ExpandTransform`.
+        example: Source row dict passed to the transform.
+
+    Returns:
+        list[dict]: Output rows produced by the transform; an empty
+        list when the row is filtered out.
+    """
     if isinstance(transform, ExpandTransform):
         return list(transform(example))
     result = transform(example)
@@ -641,7 +671,23 @@ def _apply_transform_to_example(transform: tp.Any, example: dict) -> list[dict]:
 
 
 def _apply_transform_to_examples(transform: tp.Any, examples: list[dict]) -> list[dict]:
-    """Apply a transform to a row chunk, using a batched fast path when present."""
+    """Apply a transform to a list of rows, using ``map_batch`` when supported.
+
+    Trainer transforms that expose a ``map_batch`` method get the batched
+    fast path (one call per chunk). Anything else — including
+    :class:`~easydel.data.transforms.base.ExpandTransform` — falls back
+    to per-row dispatch via :func:`_apply_transform_to_example`.
+
+    Args:
+        transform: Per-row callable, expand transform, or trainer
+            transform with a batched ``map_batch`` method.
+        examples: Chunk of source rows to transform.
+
+    Returns:
+        list[dict]: Concatenation of all rows produced by applying
+        ``transform`` to ``examples``; ``None`` results from
+        ``map_batch`` are filtered out.
+    """
     map_batch = getattr(transform, "map_batch", None)
     if callable(map_batch) and not isinstance(transform, ExpandTransform):
         return [result for result in map_batch(examples) if result is not None]
@@ -653,7 +699,19 @@ def _apply_transform_to_examples(transform: tp.Any, examples: list[dict]) -> lis
 
 
 def _iter_chunks(examples: tp.Iterator[dict], batch_size: int) -> tp.Iterator[list[dict]]:
-    """Yield fixed-size chunks from an example iterator."""
+    """Group an example iterator into fixed-size lists for batched parallel work.
+
+    The trailing partial chunk (when present) is also yielded — callers
+    are expected to handle a smaller-than-``batch_size`` final chunk.
+
+    Args:
+        examples: Iterator yielding individual row dicts.
+        batch_size: Maximum number of rows per emitted chunk.
+
+    Yields:
+        list[dict]: Chunks of up to ``batch_size`` rows in iteration
+        order.
+    """
     chunk: list[dict] = []
     for example in examples:
         chunk.append(example)
@@ -668,18 +726,47 @@ _PROCESS_TRANSFORM: tp.Any = None
 
 
 def _init_process_transform(transform: tp.Any) -> None:
-    """Install one transform instance in each process-pool worker."""
+    """Process-pool initializer that installs ``transform`` for later dispatches.
+
+    Stores the supplied transform on the module-level
+    ``_PROCESS_TRANSFORM`` slot in the worker process so
+    :func:`_apply_process_transform_to_examples` can pick it up without
+    re-shipping the (potentially heavy) transform on every task.
+
+    Args:
+        transform: Pickleable transform shipped from the driver as the
+            ``initargs`` of :class:`concurrent.futures.ProcessPoolExecutor`.
+    """
     global _PROCESS_TRANSFORM
     _PROCESS_TRANSFORM = transform
 
 
 def _apply_process_transform_to_examples(examples: list[dict]) -> list[dict]:
-    """Apply the process-local transform to one row chunk."""
+    """Worker-side adapter that delegates to the process-local transform.
+
+    Args:
+        examples: Chunk of rows shipped from the driver via the process
+            pool.
+
+    Returns:
+        list[dict]: Rows produced by applying the worker's installed
+        :data:`_PROCESS_TRANSFORM` to ``examples``.
+    """
     return _apply_transform_to_examples(_PROCESS_TRANSFORM, examples)
 
 
 class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
-    """Bounded ordered parallel transform wrapper for pretokenization."""
+    """Thread-pool backed parallel wrapper for pretokenization transforms.
+
+    Wraps an upstream :class:`ShardedDataSource` and applies a transform
+    over fixed-size row chunks using a bounded
+    :class:`concurrent.futures.ThreadPoolExecutor`. Pending futures are
+    drained in submission order (FIFO) so the wrapper preserves
+    per-shard row order — important for downstream packers that rely
+    on stable input ordering. Backpressure is enforced via
+    ``max_pending``; once the queue is full, new submissions block on
+    the oldest future's result.
+    """
 
     def __init__(
         self,
@@ -689,6 +776,20 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
         max_pending: int | None = None,
         batch_size: int | None = None,
     ):
+        """Capture wiring for the parallel transform; no work runs until iteration.
+
+        Args:
+            source: Upstream sharded source whose rows are transformed.
+            transform: Per-row callable, expand transform, or trainer
+                transform with a batched ``map_batch`` method.
+            num_workers: Number of threads in the executor pool;
+                clamped to a minimum of 1.
+            max_pending: Maximum in-flight futures before
+                :meth:`_iter_parallel` starts draining; defaults to
+                ``num_workers * 2``.
+            batch_size: Number of rows grouped into a single transform
+                task; clamped to a minimum of 1, default 4.
+        """
         self._source = source
         self._transform = transform
         self._num_workers = max(1, int(num_workers))
@@ -697,21 +798,56 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
 
     @property
     def shard_names(self) -> tp.Sequence[str]:
+        """Pass-through to the wrapped source's shard list (transform preserves layout)."""
         return self._source.shard_names
 
     def num_shards(self) -> int:
+        """Pass-through to the wrapped source's shard count."""
         return self._source.num_shards()
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
 
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        """Iterate ``shard_name`` with the transform applied in parallel.
+
+        Args:
+            shard_name: Identifier of one shard from
+                :attr:`shard_names`.
+
+        Yields:
+            dict: Transformed rows preserving shard-local order.
+        """
         yield from self._iter_parallel(self._source.open_shard(shard_name))
 
     def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        """Resume-aware variant of :meth:`open_shard` skipping leading rows.
+
+        Args:
+            shard_name: Shard identifier.
+            row: Number of rows to discard before transform application.
+
+        Yields:
+            dict: Transformed rows starting at offset ``row``.
+        """
         yield from self._iter_parallel(self._source.open_shard_at_row(shard_name, row))
 
     def _iter_parallel(self, examples: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        """Drive the thread pool with bounded backpressure and FIFO drain.
+
+        Submits each chunk produced by :func:`_iter_chunks` as a task
+        running :func:`_apply_transform_to_examples`. Once the pending
+        queue exceeds ``max_pending``, the oldest future is awaited
+        (yielding its results) before the next submission to keep
+        memory bounded.
+
+        Args:
+            examples: Source iterator over rows for the active shard.
+
+        Yields:
+            dict: Transformed rows in source order.
+        """
         pending: deque[Future[list[dict]]] = deque()
 
         with ThreadPoolExecutor(max_workers=self._num_workers) as executor:
@@ -727,9 +863,24 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
 
 
 class _ProcessParallelTransformedShardedSource(_ParallelTransformedShardedSource):
-    """Process-backed ordered parallel transform wrapper for CPU-heavy templates."""
+    """Process-pool variant of :class:`_ParallelTransformedShardedSource`.
+
+    Uses :class:`concurrent.futures.ProcessPoolExecutor` with the
+    ``"spawn"`` start method so CPU-heavy transforms (e.g. chat
+    template rendering) escape the GIL. The transform is shipped once
+    via the worker initializer and reused for every chunk; only row
+    payloads cross the process boundary at task time.
+    """
 
     def _iter_parallel(self, examples: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        """Drive the process pool with the same FIFO/backpressure semantics as the parent.
+
+        Args:
+            examples: Source iterator over rows for the active shard.
+
+        Yields:
+            dict: Transformed rows in source order.
+        """
         pending: deque[Future[list[dict]]] = deque()
         mp_context = mp.get_context("spawn")
 
@@ -751,29 +902,74 @@ class _ProcessParallelTransformedShardedSource(_ParallelTransformedShardedSource
 
 
 class _DropFieldsShardedSource(ShardedDataSource[dict]):
-    """Pass-through source wrapper that removes fields from transformed rows."""
+    """Sharded source wrapper that strips a fixed set of keys from every row.
+
+    Used by :func:`pretokenize` when the caller passes ``drop_fields``
+    so unwanted columns are removed before persistence. Preserves
+    every other key untouched.
+    """
 
     def __init__(self, source: ShardedDataSource[dict], fields: frozenset[str]):
+        """Capture the wrapped source and the keys to drop.
+
+        Args:
+            source: Upstream sharded source.
+            fields: Keys removed from each row dict during iteration;
+                stored as a :class:`frozenset` for O(1) membership
+                checks.
+        """
         self._source = source
         self._fields = fields
 
     @property
     def shard_names(self) -> tp.Sequence[str]:
+        """Pass-through to the wrapped source's shard names."""
         return self._source.shard_names
 
     def num_shards(self) -> int:
+        """Pass-through to the wrapped source's shard count."""
         return self._source.num_shards()
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
 
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        """Open a shard and yield rows with the configured fields stripped.
+
+        Args:
+            shard_name: Identifier of one shard from
+                :attr:`shard_names`.
+
+        Yields:
+            dict: Rows from the upstream source with each member of
+            :attr:`_fields` removed (no-op if the key was absent).
+        """
         yield from self._drop_fields(self._source.open_shard(shard_name))
 
     def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        """Resume-aware variant of :meth:`open_shard` skipping leading rows.
+
+        Args:
+            shard_name: Shard identifier.
+            row: Number of rows to discard before yielding.
+
+        Yields:
+            dict: Rows starting at offset ``row`` with the configured
+            fields stripped.
+        """
         yield from self._drop_fields(self._source.open_shard_at_row(shard_name, row))
 
     def _drop_fields(self, rows: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        """Iterate ``rows`` removing every key in :attr:`_fields` in place.
+
+        Args:
+            rows: Source iterator over row dicts.
+
+        Yields:
+            dict: The same row dict (mutated) with the configured keys
+            removed; missing keys are silently ignored.
+        """
         for row in rows:
             for field in self._fields:
                 row.pop(field, None)
@@ -781,12 +977,34 @@ class _DropFieldsShardedSource(ShardedDataSource[dict]):
 
 
 def _is_numeric_scalar(value: tp.Any) -> bool:
-    """Return whether a value is a scalar tensor-like payload."""
+    """Return whether ``value`` is a scalar tensor-compatible payload.
+
+    Booleans, ints, and floats qualify; ``str``/``bytes``/``bytearray``
+    are explicitly excluded even though they pass the ``int``-derived
+    bool check.
+
+    Args:
+        value: Arbitrary Python object to classify.
+
+    Returns:
+        bool: ``True`` for numeric/bool scalars, ``False`` otherwise.
+    """
     return isinstance(value, bool | int | float) and not isinstance(value, str | bytes | bytearray)
 
 
 def _is_numeric_sequence(value: tp.Any) -> bool:
-    """Return whether a Python sequence contains only numeric tensor values."""
+    """Return whether ``value`` is a (possibly nested) numeric Python sequence.
+
+    Walks lists/tuples recursively, requiring every leaf to be a numeric
+    scalar. Empty sequences are treated as numeric (so ``[]`` survives).
+
+    Args:
+        value: Arbitrary Python object to classify.
+
+    Returns:
+        bool: ``True`` when ``value`` is a list/tuple containing only
+        numeric scalars or numeric sub-sequences; ``False`` otherwise.
+    """
     if not isinstance(value, list | tuple):
         return False
     if not value:
@@ -795,7 +1013,21 @@ def _is_numeric_sequence(value: tp.Any) -> bool:
 
 
 def _is_array_field_value(value: tp.Any) -> bool:
-    """Return whether a pretokenized field is safe to persist as tensor data."""
+    """Decide whether a row field is safe to persist as tensor data.
+
+    Used by :class:`_ArrayFieldsOnlyShardedSource` to drop free-form
+    Python objects (strings, dicts, custom objects) before pretokenized
+    rows hit the writer. Recognises numeric scalars, numeric Python
+    sequences, ``numpy`` arrays with numeric dtypes, and any object
+    exposing ``dtype``/``shape`` attributes consistent with a tensor.
+
+    Args:
+        value: Field value to classify.
+
+    Returns:
+        bool: ``True`` when ``value`` is tensor-compatible, ``False``
+        otherwise.
+    """
     if _is_numeric_scalar(value) or _is_numeric_sequence(value):
         return True
 
@@ -816,36 +1048,91 @@ def _is_array_field_value(value: tp.Any) -> bool:
 
 
 class _ArrayFieldsOnlyShardedSource(ShardedDataSource[dict]):
-    """Pass-through source wrapper that keeps only tensor-like row fields."""
+    """Sharded source wrapper that keeps only tensor-compatible row fields.
+
+    Used by :func:`pretokenize` when ``arrays_only=True``. Each row is
+    filtered through :func:`_is_array_field_value` so non-numeric
+    sidecar metadata (strings, dicts, custom objects) is dropped before
+    persistence to formats like Parquet/Arrow that prefer dense tensor
+    columns.
+    """
 
     def __init__(self, source: ShardedDataSource[dict]):
+        """Capture the wrapped source.
+
+        Args:
+            source: Upstream sharded source whose rows are filtered.
+        """
         self._source = source
 
     @property
     def shard_names(self) -> tp.Sequence[str]:
+        """Pass-through to the wrapped source's shard names."""
         return self._source.shard_names
 
     def num_shards(self) -> int:
+        """Pass-through to the wrapped source's shard count."""
         return self._source.num_shards()
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
 
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        """Open a shard yielding rows projected to tensor-compatible fields only.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Yields:
+            dict: Row dicts whose keys are restricted to entries
+            accepted by :func:`_is_array_field_value`.
+        """
         yield from self._array_fields_only(self._source.open_shard(shard_name))
 
     def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        """Resume-aware variant of :meth:`open_shard` skipping leading rows.
+
+        Args:
+            shard_name: Shard identifier.
+            row: Number of rows to discard before yielding.
+
+        Yields:
+            dict: Filtered rows starting at offset ``row``.
+        """
         yield from self._array_fields_only(self._source.open_shard_at_row(shard_name, row))
 
     def _array_fields_only(self, rows: tp.Iterator[dict]) -> tp.Iterator[dict]:
+        """Project each row down to its tensor-compatible fields.
+
+        Args:
+            rows: Source iterator over row dicts.
+
+        Yields:
+            dict: A new dict per input row containing only the fields
+            for which :func:`_is_array_field_value` returns ``True``.
+        """
         for row in rows:
             yield {key: value for key, value in row.items() if _is_array_field_value(value)}
 
 
 class _ProgressBarShardedSource(ShardedDataSource[dict]):
-    """Pass-through source wrapper that updates a tqdm bar as rows are yielded."""
+    """Sharded source wrapper that drives a tqdm progress bar as rows stream through.
+
+    Lazily constructs the bar on first row, accumulates pending updates
+    until ``update_interval`` is reached (so we don't spam tqdm), and
+    closes the bar on the last shard or on exception. Used by
+    :func:`pretokenize` when ``log_process`` is set.
+    """
 
     def __init__(self, source: ShardedDataSource[dict], update_interval: int):
+        """Capture the wrapped source and bar refresh stride.
+
+        Args:
+            source: Upstream sharded source whose rows are tracked.
+            update_interval: Number of rows accumulated before the
+                tqdm bar is refreshed.
+        """
         self._source = source
         self._update_interval = update_interval
         self._count = 0
@@ -854,32 +1141,76 @@ class _ProgressBarShardedSource(ShardedDataSource[dict]):
 
     @property
     def shard_names(self) -> tp.Sequence[str]:
+        """Pass-through to the wrapped source's shard names."""
         return self._source.shard_names
 
     def num_shards(self) -> int:
+        """Pass-through to the wrapped source's shard count."""
         return self._source.num_shards()
 
     def _get_bar(self):
+        """Lazy accessor that creates the tqdm bar on first use.
+
+        Returns:
+            tqdm.auto.tqdm: The shared progress bar instance.
+        """
         if self._bar is None:
             self._bar = _make_pre_tokenize_progress_bar()
         return self._bar
 
     def _update_bar(self, force: bool = False) -> None:
+        """Flush accumulated row counts onto the bar when the threshold is met.
+
+        Args:
+            force: When ``True``, the bar is updated regardless of
+                whether ``update_interval`` has elapsed (used at
+                shutdown to drain partial counts).
+        """
         if self._pending_updates and (force or self._pending_updates >= self._update_interval):
             self._get_bar().update(self._pending_updates)
             self._pending_updates = 0
 
     def _close_bar(self) -> None:
+        """Drain pending updates and close the tqdm bar.
+
+        Idempotent: safe to call from both error and normal-completion
+        paths.
+        """
         self._update_bar(force=True)
         if self._bar is not None:
             self._bar.close()
             self._bar = None
 
     def _is_last_shard(self, shard_name: str) -> bool:
+        """Return whether ``shard_name`` is the trailing shard in the source.
+
+        Used to decide when the bar should be closed automatically.
+
+        Args:
+            shard_name: Identifier to compare against the last entry
+                of :attr:`shard_names`.
+
+        Returns:
+            bool: ``True`` when ``shard_name`` matches the final shard
+            and the source has at least one shard.
+        """
         shard_names = self.shard_names
         return bool(shard_names) and shard_name == shard_names[-1]
 
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
+        """Iterate ``shard_name`` while updating the progress bar per row.
+
+        On exception the bar is closed before the exception propagates,
+        and on normal completion of the last shard the bar is also
+        closed automatically.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Yields:
+            dict: Rows from the wrapped source (passed through
+            unchanged).
+        """
         try:
             for example in self._source.open_shard(shard_name):
                 self._count += 1
@@ -894,6 +1225,15 @@ class _ProgressBarShardedSource(ShardedDataSource[dict]):
                 self._close_bar()
 
     def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
+        """Resume-aware variant of :meth:`open_shard` with the same bar semantics.
+
+        Args:
+            shard_name: Shard identifier.
+            row: Number of rows to discard before yielding.
+
+        Yields:
+            dict: Rows starting at offset ``row``.
+        """
         try:
             for example in self._source.open_shard_at_row(shard_name, row):
                 self._count += 1
@@ -908,6 +1248,7 @@ class _ProgressBarShardedSource(ShardedDataSource[dict]):
                 self._close_bar()
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
 
 

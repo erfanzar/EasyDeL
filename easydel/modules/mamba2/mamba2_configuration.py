@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration for the Mamba-2 (SSD / state-space-duality) language model.
+
+Defines :class:`Mamba2Config`, registered under the ``mamba2`` model-type.
+Mamba-2 generalises Mamba's selective recurrence to a multi-head /
+multi-group form (``num_heads``, ``head_dim``, ``n_groups``) that admits a
+chunked structured-attention rewrite, giving substantial throughput wins
+over Mamba-1 while preserving the linear-time cache semantics. The config
+surfaces the SSD-specific ``chunk_size``, ``head_dim``, ``n_groups``, and
+``state_size`` knobs alongside the usual EasyDeL plumbing.
+"""
 
 import math
 

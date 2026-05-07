@@ -668,6 +668,13 @@ class GemmaModel(EasyDeLBaseModule):
         cache_views = views if trace_layers else None
 
         def _run_layer(block, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            ``carry`` is ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, idx)``. Runs a single Gemma decoder layer,
+            optionally appending the pre-layer hidden state and the layer's
+            attention weights, and returns the updated cache view.
+            """
             hs, cv, ah, aa, idx = carry
             if output_hidden_states:
                 ah = (*ah, hs)

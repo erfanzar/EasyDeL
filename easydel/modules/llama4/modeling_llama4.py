@@ -642,6 +642,7 @@ class Llama4TextMoe(BaseMoeModule):
 
         # MoE expert output
         def ffn_activation(gate, up):
+            """Llama4 SwiGLU expert nonlinearity: ``act_fn(gate) * up``."""
             return self.experts.act_fn(gate) * up
 
         expert_out, router_logits = self.moe_call(
@@ -1169,6 +1170,14 @@ class Llama4TextModel(EasyDeLBaseModule):
         frequencies = self.compute_complex_rotary(position_ids)
 
         def _layer_loop(block, carry):
+            """Body of the text-decoder scan over Llama4 transformer layers.
+
+            Carry: ``(hidden_states, all_hidden_states, all_attentions,
+            layer_index)``. Routes per-layer KV cache views through the
+            HybridCache machinery and applies the precomputed (chunked or
+            full) ``mask_info`` plus complex RoPE ``frequencies`` from the
+            enclosing scope.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -2071,6 +2080,13 @@ class Llama4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
         all_attentions = () if output_attentions else None
 
         def _layer_loop(encoder_layer, carry):
+            """Body of the vision-encoder scan over Llama4 ViT layers.
+
+            Carry: ``(hidden_states, encoder_states, all_attentions,
+            layer_index)``. The vision tower has no KV cache, so the loop
+            only threads optional encoder hidden-state / attention buffers
+            and applies the shared 2D RoPE ``frequencies``.
+            """
             hidden_states, encoder_states, all_attentions, idx = carry
             if output_hidden_states:
                 assert encoder_states is not None

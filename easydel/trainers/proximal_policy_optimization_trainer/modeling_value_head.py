@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
 import spectrax as spx
 
 from easydel.infra.base_module import EasyDeLBaseModule

@@ -262,8 +262,8 @@ def _make_reward_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    training_step,
-    ScheduledLossAdapter(
+    step_fn=training_step,
+    adapter=ScheduledLossAdapter(
         name="reward",
         make_loss=_make_reward_scheduled_loss,
         make_cache_key=_reward_scheduled_loss_cache_key,

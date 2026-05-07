@@ -95,16 +95,17 @@ if TYPE_CHECKING:
 
 # CLIP-style normalization constants used by GLM/Qwen vision towers.
 # These values are the ImageNet-derived mean and std used by OpenAI CLIP.
+# CLIP_IMAGE_MEAN: per-channel mean (RGB order) for CLIP image normalization.
 CLIP_IMAGE_MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-"""np.ndarray: Per-channel mean values for CLIP image normalization (RGB order)."""
 
+# CLIP_IMAGE_STD: per-channel standard deviation (RGB order) for CLIP image normalization.
 CLIP_IMAGE_STD = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
-"""np.ndarray: Per-channel standard deviation values for CLIP image normalization (RGB order)."""
 
 
 # Default resolution buckets for compilation efficiency.
 # Images are resized to the nearest bucket to minimize JAX recompilation
 # while maintaining reasonable image quality across common input sizes.
+# DEFAULT_RESOLUTION_BUCKETS: list of (height, width) tuples used as resize targets.
 DEFAULT_RESOLUTION_BUCKETS = [
     (32, 32),
     (64, 64),
@@ -114,7 +115,6 @@ DEFAULT_RESOLUTION_BUCKETS = [
     (768, 768),
     (1024, 1024),
 ]
-"""list[tuple[int, int]]: Default (height, width) resolution buckets for image resizing."""
 
 
 class MultiModalManager:
@@ -958,6 +958,14 @@ class MultiModalManager:
                 item_type = item.get("type", "")
 
                 def _append_image(img: Any) -> None:
+                    """Append one image item to the local ``images`` list, decoding as needed.
+
+                    Accepts already-loaded PIL images, raw bytes-like payloads
+                    (decoded with PIL), or local filesystem paths (with
+                    ``file://`` prefix stripped). ``None`` is silently ignored
+                    so callers can splice optional content without conditionals.
+                    Raises :class:`ValueError` for unsupported payload shapes.
+                    """
                     if img is None:
                         return
                     if isinstance(img, Image.Image):
@@ -980,6 +988,16 @@ class MultiModalManager:
                     )
 
                 def _append_image_url(image_url_payload: Any) -> None:
+                    """Resolve an OpenAI-style ``image_url`` payload and append the image.
+
+                    Accepts either a raw URL string or the typed
+                    ``{"url": ...}`` dict OpenAI uses. Supports inline
+                    ``data:`` URLs (base64-decoded with PIL) and local
+                    filesystem paths (with ``file://`` stripped). Remote
+                    ``http(s)://`` URLs are intentionally not fetched —
+                    callers are expected to inline media via base64 so the
+                    server stays insulated from outbound network policy.
+                    """
                     url = None
                     if isinstance(image_url_payload, dict):
                         url = image_url_payload.get("url") or image_url_payload.get("image_url")
@@ -1159,6 +1177,14 @@ class MultiModalManager:
         video_end_token_id = getattr(cfg, "video_end_token_id", None) or getattr(cfg, "vision_end_token_id", None)
 
         def _counts(grid: np.ndarray | None) -> list[int]:
+            """Compute per-item placeholder token counts for a ``[N, 3]`` THW grid.
+
+            Each row's product (T*H*W) divided by the model's
+            ``spatial_merge_size**2`` gives the number of placeholder tokens
+            that media item should occupy after spatial merging. Returns an
+            empty list for missing or malformed grids so callers can iterate
+            uniformly across text-only and multimodal inputs.
+            """
             if grid is None:
                 return []
             grid = np.asarray(grid, dtype=np.int64)

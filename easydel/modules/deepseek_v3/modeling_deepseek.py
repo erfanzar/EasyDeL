@@ -1167,6 +1167,17 @@ class DeepseekV3Model(EasyDeLBaseModule):
         )
 
         def _layer_loop(layer, carry):
+            """Per-layer body for the DeepSeek-V3 decoder ``scan``.
+
+            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, idx)``. Records the input hidden state when
+            requested, runs one DeepSeek-V3 decoder layer (MLA attention plus
+            dense MLP for the first ``first_k_dense_replace`` layers, or
+            DeepSeekMoE block with auxiliary-free top-k routing afterwards) at
+            the assigned pipeline stage, accumulates attention weights and
+            MoE router logits when requested, updates the per-layer KV cache
+            slot, and returns the next carry.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

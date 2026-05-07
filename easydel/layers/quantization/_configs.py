@@ -26,6 +26,11 @@ The module supports multiple quantization formats including:
     - NVFP8: NVIDIA's FP8 format (E4M3)
     - Binary/Ternary: Extreme quantization for efficiency
 
+Module-level constants:
+    DEFAULT_QUANTIZATION_PATTERN: Default regex pattern for selecting layers
+        to quantize. Excludes common layers that should remain in full
+        precision (``embedding``, ``norm``, ``lm_head``).
+
 Example:
     >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
     >>>
@@ -52,15 +57,6 @@ from dataclasses import dataclass, field
 from easydel.utils.compiling_utils import hash_fn
 
 DEFAULT_QUANTIZATION_PATTERN = r"^(?!.*(?:embedding|norm|lm_head)).*$"
-"""Default regex pattern for selecting layers to quantize.
-
-This pattern excludes common layers that should remain in full precision:
-    - embedding: Input embeddings (require full precision for vocabulary)
-    - norm: Normalization layers (sensitive to quantization)
-    - lm_head: Language model head (output layer)
-
-All other layers matching this pattern will be considered for quantization.
-"""
 
 
 class QuantizationType(enum.StrEnum):

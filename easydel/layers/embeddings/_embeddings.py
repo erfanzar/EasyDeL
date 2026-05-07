@@ -25,6 +25,12 @@ The embedding implementation supports:
     - Dtype promotion for mixed-precision training
     - Efficient attention mechanism via the `attend` method for weight-tying
 
+Module-level constants:
+    default_embed_init: Default embedding initializer using variance scaling.
+        Uses fan-in variance scaling with normal distribution and
+        ``out_axis=0``, the standard choice for embedding lookup tables to
+        keep activation variance close to one regardless of vocabulary size.
+
 Example:
     >>> from easydel.layers.embeddings import Embed
     >>> import spectrax as spx
@@ -80,11 +86,6 @@ def _promote_dtype(values, *, dtype=None, inexact=None):
 
 
 default_embed_init = jax.nn.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
-"""Default embedding initializer using variance scaling.
-
-Uses fan-in variance scaling with normal distribution and output axis 0,
-which is standard practice for embedding layers to maintain proper gradient flow.
-"""
 
 
 class Embed(spx.Module):

@@ -111,19 +111,18 @@ if tp.TYPE_CHECKING:
     from easydel.layers import Embed, ParallelLinear, QuantizationConfig
 
 
+# Type alias for partition rule specifications.
+#
+# Can be a mapping from parameter name patterns (as strings or tuples) to
+# partition specification functions, or None for default partitioning.
 PartitionLike = Mapping[str, tp.Callable] | Mapping[tuple, tp.Callable] | tuple[tuple[str, tp.Any], ...] | None
-"""Type alias for partition rule specifications.
-
-Can be a mapping from parameter name patterns (as strings or tuples) to
-partition specification functions, or None for default partitioning.
-"""
 
 
 logger = get_logger(__name__)
 
 
+# Alias for EasyDeLBaseConfig for backward compatibility.
 BaseConf = EasyDeLBaseConfig
-"""Alias for EasyDeLBaseConfig for backward compatibility."""
 
 
 def _looks_like_config(value: tp.Any) -> bool:

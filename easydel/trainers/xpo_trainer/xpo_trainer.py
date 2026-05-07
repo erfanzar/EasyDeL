@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Exploratory Preference Optimization (XPO) trainer.
+
+XPO -- Liu et al. (2024) -- adds an explicit *reference-policy*
+exploration bonus on top of a DPO/IPO preference loss.  The trainer
+samples one completion per prompt from the current policy and one
+from a frozen reference, scores both with a single reward function,
+and treats the higher-reward sample as ``chosen``.  This module wires
+:class:`XPOTrainer` against the GRPO base class and the JIT-compiled
+step in ``_fn``.
+"""
 
 from __future__ import annotations
 
@@ -458,20 +468,28 @@ class XPOTrainer(GRPOTrainer):
                 policy_completion_mask = policy_results.completion_mask
             policy_generation_time = policy_time_fn()
 
-            with capture_time() as ref_time_fn:
-                ref_results = self.generate_unified(
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
-                    state=self.ref_state,
-                    apply_chat_template=False,
-                    shard_inputs=False,
-                    all_gather=False,
-                    config_overrides={"num_return_sequences": 1},
-                )
-                jax.block_until_ready(ref_results.sequences)
-                ref_completion_ids = ref_results.completion_ids
-                ref_completion_mask = ref_results.completion_mask
-            ref_generation_time = ref_time_fn()
+            beta_value = self._current_beta_value()
+            alpha_value = self._current_alpha_value()
+            if beta_value == 0.0 and alpha_value == 0.0:
+                ref_results = policy_results
+                ref_completion_ids = policy_completion_ids
+                ref_completion_mask = policy_completion_mask
+                ref_generation_time = 0.0
+            else:
+                with capture_time() as ref_time_fn:
+                    ref_results = self.generate_unified(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_mask,
+                        state=self.ref_state,
+                        apply_chat_template=False,
+                        shard_inputs=False,
+                        all_gather=False,
+                        config_overrides={"num_return_sequences": 1},
+                    )
+                    jax.block_until_ready(ref_results.sequences)
+                    ref_completion_ids = ref_results.completion_ids
+                    ref_completion_mask = ref_results.completion_mask
+                ref_generation_time = ref_time_fn()
 
         preprocessing_time = preprocessing_time_fn()
 
@@ -570,9 +588,6 @@ class XPOTrainer(GRPOTrainer):
                 ref_scores = ref_scores - jnp.where(ref_eos, 0.0, penalty)
 
         chosen_mask = policy_scores >= ref_scores
-
-        beta_value = self._current_beta_value()
-        alpha_value = self._current_alpha_value()
 
         metrics_dict: dict[str, float | int | str] = {
             "rewards/chosen": float(jnp.mean(policy_scores)),

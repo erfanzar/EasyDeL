@@ -644,6 +644,8 @@ class FalconH1Mixer(spx.Module):
         if use_packed_state_updates:
             from easydel.operations.kernels.ssm2 import _single_step_ssm2_fwd
 
+            if packed_num_seqs is None:
+                raise ValueError("packed_num_seqs is required for packed state updates.")
             conv_states = cache_view.conv_state  # [max_seqs, conv_dim, d_conv]
             ssm_states = cache_view.recurrent_state.astype(jnp.float32)  # [max_seqs, H, D, N]
             token_slots = jnp.clip(
@@ -664,6 +666,13 @@ class FalconH1Mixer(spx.Module):
             token_outputs = jnp.zeros((seq_len, self.intermediate_size), dtype=jnp.float32)
 
             def _body(idx, carry):
+                """Per-token decode step for the SSM mixer (single layer).
+
+                ``carry`` is ``(conv_states, ssm_states, token_outputs)``
+                indexed by the per-token ``slot``: advances the depthwise conv
+                ring buffer with the new token, runs one Mamba2 SSM step, and
+                writes the projected output into ``token_outputs[idx]``.
+                """
                 conv_states_c, ssm_states_c, token_outputs_c = carry
                 slot = token_slots[idx]
 
@@ -1305,6 +1314,14 @@ class FalconH1Model(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
 
         def _layer_loop(layer, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions,
+            past_key_values, layer_idx)`` through one FalconH1 hybrid block
+            (parallel attention + SSM mixers + SwiGLU MLP). Updates the
+            layer's :class:`HybridCache` view in-place when caching is active
+            and accumulates hidden states / attention weights as requested.
+            """
             hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1516,6 +1533,7 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
         multiplier = self.base_model.lm_head_multiplier
 
         def _project(hidden_states):
+            """Apply the base LM head and scale by FalconH1's muP multiplier."""
             return base_fn(hidden_states) * multiplier
 
         return _project

@@ -514,6 +514,42 @@ class DeepseekV2MoE(BaseMoeModule):
         norm_topk_prob: bool,
         routed_scaling_factor: float,
     ) -> tuple[Array, Array]:
+        """Top-k routing for DeepSeek-V2 MoE gating.
+
+        Implements both DeepSeek-V2 routing methods on top of softmax-scored
+        gate logits:
+
+        - ``"gready"`` / ``"greedy"``: standard global top-k.
+        - ``"group_limited_greedy"``: partitions the experts into ``n_group``
+          contiguous groups, picks the ``topk_group`` highest-scoring groups
+          per token (using each group's max score as the group score), and
+          then runs top-k restricted to those groups.
+
+        Optionally renormalizes the selected weights (when ``k > 1`` and
+        ``norm_topk_prob``) and finally rescales by ``routed_scaling_factor``.
+
+        Args:
+            gate_logits: Per-token expert logits, ``[tokens, n_experts]``.
+            pre_bias_logits: Unused for V2 (kept for API parity with V3's
+                auxiliary-free routing). Discarded.
+            k: Number of experts to select per token.
+            topk_method: Routing method (``"gready"``/``"greedy"`` or
+                ``"group_limited_greedy"``).
+            n_group: Number of expert groups (group-limited only).
+            topk_group: Active groups per token (group-limited only).
+            n_routed_experts: Total routed experts (must be divisible by
+                ``n_group`` for the group-limited path).
+            norm_topk_prob: If ``True`` and ``k > 1``, renormalize selected
+                weights to sum to 1 before scaling.
+            routed_scaling_factor: Multiplicative scale on the final weights.
+
+        Returns:
+            tuple[Array, Array]: ``(topk_weight, topk_idx)`` of shape
+            ``[tokens, k]`` each.
+
+        Raises:
+            ValueError: If ``topk_method`` is not one of the supported values.
+        """
         del pre_bias_logits
         scores = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
 
@@ -1169,6 +1205,16 @@ class DeepseekV2Model(EasyDeLBaseModule):
         )
 
         def _layer_loop(layer, carry):
+            """Per-layer body for the DeepSeek-V2 decoder ``scan``.
+
+            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
+            all_router_logits, idx)``. Optionally records the input hidden
+            state, runs one DeepSeek-V2 decoder layer (MLA attention + dense
+            MLP or DeepSeekMoE block) at the assigned pipeline stage,
+            accumulates attention weights and MoE router logits when
+            requested, updates the per-layer KV cache slot, and returns the
+            next carry.
+            """
             hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

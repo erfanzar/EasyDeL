@@ -22,7 +22,9 @@ inference initialization path.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 
@@ -68,8 +70,9 @@ def test_create_request_queue_unknown_policy_raises():
 
 def test_request_queue_is_abstract():
     """``RequestQueue`` cannot be instantiated directly; it has unimplemented abstractmethods."""
+    abstract_ctor = cast(Callable[..., object], RequestQueue)
     with pytest.raises(TypeError):
-        RequestQueue()
+        abstract_ctor()
 
 
 def test_fcfs_add_pop_preserves_arrival_order():

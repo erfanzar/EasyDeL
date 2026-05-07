@@ -131,23 +131,21 @@ _STREAM_ERROR = "error"
 _STREAM_END = "end"
 
 
+# Type alias for sampling parameter refinement callbacks.
+#
+# A callable that receives the initial SamplingParams, the original request,
+# and the eSurge instance, and returns modified SamplingParams or None to
+# keep the original.
 RefineSamplingParamsFn = tp.Callable[
     [SamplingParams, ChatCompletionRequest | CompletionRequest, "eSurge"],
     SamplingParams | None,
 ]
-"""Type alias for sampling parameter refinement callbacks.
 
-A callable that receives the initial SamplingParams, the original request,
-and the eSurge instance, and returns modified SamplingParams or None to
-keep the original.
-"""
-
+# Type alias for chat request preprocessing callbacks.
+#
+# A callable that receives a ChatCompletionRequest and returns a modified
+# request or None to keep the original.
 RefineChatRequestFn = tp.Callable[[ChatCompletionRequest], ChatCompletionRequest | None]
-"""Type alias for chat request preprocessing callbacks.
-
-A callable that receives a ChatCompletionRequest and returns a modified
-request or None to keep the original.
-"""
 
 
 class eSurgeAdapter(InferenceEngineAdapter):

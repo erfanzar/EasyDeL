@@ -56,6 +56,9 @@ from tests.trainers._common import (
     load_preference_dataset,
     run_trainer,
 )
+from tests.trainers._common import (
+    dummy_reward_fn as dummy_reward_fn,
+)
 
 SUPPORTED_MPMD_SCHEDULERS = (
     "gpipe",
@@ -127,6 +130,7 @@ def make_config(
     mpmd_overrides["use_wandb"] = False
     mpmd_overrides["do_last_save"] = False
     mpmd_overrides["save_optimizer_state"] = False
+    mpmd_overrides.setdefault("use_esurge_generation", False)
     mpmd_overrides.setdefault("esurge_max_num_batched_tokens", 256)
     mpmd_overrides.setdefault("esurge_max_num_seqs", 2)
     mpmd_overrides.setdefault("esurge_max_num_seq_buckets", [1, 2])
@@ -137,7 +141,10 @@ def make_config(
     _normalize_batching_for_microbatches(mpmd_overrides, scheduler.microbatches)
 
     scheduler_name = type(scheduler).__name__.lower()
-    return _runtime_common.make_config(config_cls, f"mpmd-{scheduler_name}-{name}", overrides=mpmd_overrides)
+    config = _runtime_common.make_config(config_cls, f"mpmd-{scheduler_name}-{name}", overrides=mpmd_overrides)
+    _apply_final_generation_length_env(config)
+    _normalize_config_batching_for_microbatches(config, scheduler.microbatches)
+    return config
 
 
 def mpmd_generation_length_overrides(
@@ -171,7 +178,10 @@ def build_reward_dataset(split: str = PREFERENCE_SPLIT):
 def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelForCausalLM:
     repo = model_repo or MODEL_REPO
     tokenizer = get_tokenizer(repo)
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(repo, **_load_mpmd_model_kwargs())
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=repo,
+        **_load_mpmd_model_kwargs(),
+    )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model  # pyright: ignore[reportReturnType]
 
@@ -179,7 +189,10 @@ def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelFo
 def load_embedding_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelForEmbedding:
     repo = model_repo or MODEL_REPO
     tokenizer = get_tokenizer(repo)
-    model = ed.AutoEasyDeLModelForEmbedding.from_pretrained(repo, **_load_mpmd_model_kwargs())
+    model = ed.AutoEasyDeLModelForEmbedding.from_pretrained(
+        pretrained_model_name_or_path=repo,
+        **_load_mpmd_model_kwargs(),
+    )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model  # pyright: ignore[reportReturnType]
 
@@ -189,10 +202,11 @@ def load_sequence_classifier_model(
 ) -> ed.AutoEasyDeLModelForSequenceClassification:
     repo = model_repo or MODEL_REPO
     tokenizer = get_tokenizer(repo)
+    kwargs = _load_mpmd_model_kwargs()
+    kwargs["config_kwargs"]["num_labels"] = 1
     model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
-        repo,
-        num_labels=1,
-        **_load_mpmd_model_kwargs(),
+        pretrained_model_name_or_path=repo,
+        **kwargs,
     )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model  # pyright: ignore[reportReturnType]
@@ -244,6 +258,49 @@ def _normalize_batching_for_microbatches(overrides: dict[str, Any], microbatches
     if remainder:
         total_batch_size += microbatches - remainder
     overrides["total_batch_size"] = total_batch_size
+
+
+def _normalize_config_batching_for_microbatches(config: Any, microbatches: int) -> None:
+    """Keep constructed trainer configs compatible with the chosen schedule.
+
+    The shared runtime-pass config helper applies its lightweight overrides
+    after caller overrides, so MPMD smoke configs need one final normalization
+    step on the constructed object. Otherwise a lightweight batch size of 1 can
+    escape into a schedule with two or more microbatches and fail before the
+    trainer path is exercised.
+    """
+
+    total_batch_size = int(getattr(config, "total_batch_size", microbatches))
+    if total_batch_size < microbatches:
+        total_batch_size = microbatches
+    remainder = total_batch_size % microbatches
+    if remainder:
+        total_batch_size += microbatches - remainder
+    config.total_batch_size = total_batch_size
+
+
+def _apply_final_generation_length_env(config: Any) -> None:
+    """Apply MPMD generation length env overrides after lightweight defaults.
+
+    The shared trainer helper applies ``EASYDEL_RUNTIME_LIGHTWEIGHT`` after
+    caller overrides. MPMD rollout smoke tests still need a final way to reduce
+    true generation lengths, especially for GRPO-family tests where rollout
+    compilation dominates the validation queue.
+    """
+
+    if not any(
+        key in os.environ
+        for key in (
+            "EASYDEL_MPMD_MAX_PROMPT_LENGTH",
+            "EASYDEL_MPMD_MAX_COMPLETION_LENGTH",
+            "EASYDEL_MPMD_MAX_LENGTH",
+        )
+    ):
+        return
+    lengths = mpmd_generation_length_overrides()
+    for key in ("max_prompt_length", "max_completion_length", "max_length"):
+        if hasattr(config, key):
+            setattr(config, key, lengths[key])
 
 
 def _env_text(name: str, default: str) -> str:

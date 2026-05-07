@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Reward-model trainer.
+
+Wires :class:`RewardTrainer`, the EasyDeL implementation of pairwise
+preference-driven scalar reward-model training (Stiennon et al. 2020 /
+Ouyang et al. 2022).  The trainer pairs each prompt with a chosen and
+a rejected response, scores both with the same reward backbone, and
+optimises the Bradley-Terry log-sigmoid loss with optional reward
+centring -- the typical setup for downstream RLHF (PPO, DPO, GRPO,
+etc.).
+"""
+
 from __future__ import annotations
 
 import typing as tp

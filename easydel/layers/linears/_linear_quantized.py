@@ -1100,6 +1100,20 @@ class ParallelLinearQuantized(spx.Module):
         qmm_kwargs = self._qmm_runtime_kwargs(backend, m_tokens=int(inputs_2d.shape[0]), quant_mode=mode)
 
         def _direct_matmul(runtime_kwargs: dict[str, tp.Any] | None = None) -> Array:
+            """Run ``ej_quantized_matmul`` without ``shard_map`` wrapping.
+
+            Used when no mesh is detected on the inputs (single-host /
+            replicated execution) or when shard-spec resolution fails.
+
+            Args:
+                runtime_kwargs: Optional override of the resolved qmm
+                    runtime kwargs (defaults to ``qmm_kwargs`` from the
+                    enclosing scope). Used for the XLA fallback path on
+                    Mosaic-version errors.
+
+            Returns:
+                Array: Quantized matmul result.
+            """
             runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
             return ej_quantized_matmul(
                 inputs_2d,
@@ -1141,6 +1155,26 @@ class ParallelLinearQuantized(spx.Module):
             local_biases=None,
             runtime_kwargs: dict[str, tp.Any] | None = None,
         ):
+            """Per-shard quantized matmul body executed under ``shard_map``.
+
+            Reconciles the input contraction (K) dimension with the local
+            kernel slice (gathers when needed for column-parallel
+            inputs), runs the quantized matmul, and ``psum``-reduces the
+            output for row-parallel layers.
+
+            Args:
+                local_inputs: Local activation slice for this device.
+                local_kernel: Local quantized-kernel slice.
+                local_scales: Local quantization scales slice.
+                local_biases: Optional local bias slice (``None`` when
+                    the layer has no bias).
+                runtime_kwargs: Optional override of the resolved qmm
+                    runtime kwargs (defaults to the captured
+                    ``qmm_kwargs``).
+
+            Returns:
+                Array: Per-shard output, reduced across TP for row-parallel.
+            """
             runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
             local_inputs = _reconcile_input_k_dim(
                 local_inputs,
@@ -1167,17 +1201,51 @@ class ParallelLinearQuantized(spx.Module):
         shard_kw = dict(mesh=mesh, out_specs=output_spec, check_vma=False)
 
         def _run_mapped(runtime_kwargs: dict[str, tp.Any] | None = None):
+            """Build the right ``shard_map`` and invoke it on the resolved specs.
+
+            Picks between a 3-input (no bias) and 4-input (with bias)
+            ``shard_map`` based on whether ``bias_value`` is ``None``.
+
+            Args:
+                runtime_kwargs: Optional override of the resolved qmm
+                    runtime kwargs (defaults to the captured
+                    ``qmm_kwargs``). Forwarded to ``_local_matmul``.
+
+            Returns:
+                Array: Sharded output of the quantized matmul.
+            """
             runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
             if bias_value is None:
 
                 @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec), **shard_kw)
                 def _mapped(local_inputs, local_kernel, local_scales):
+                    """``shard_map`` body for the no-bias path.
+
+                    Args:
+                        local_inputs: Per-shard activation slice.
+                        local_kernel: Per-shard quantized kernel slice.
+                        local_scales: Per-shard scales slice.
+
+                    Returns:
+                        Array: Local quantized matmul output.
+                    """
                     return _local_matmul(local_inputs, local_kernel, local_scales, runtime_kwargs=runtime_kwargs)
 
                 return _mapped(inputs_2d, kernel_value, scale_value)
 
             @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec, bias_spec), **shard_kw)
             def _mapped(local_inputs, local_kernel, local_scales, local_biases):
+                """``shard_map`` body for the path with biases.
+
+                Args:
+                    local_inputs: Per-shard activation slice.
+                    local_kernel: Per-shard quantized kernel slice.
+                    local_scales: Per-shard scales slice.
+                    local_biases: Per-shard bias slice.
+
+                Returns:
+                    Array: Local quantized matmul output (with bias).
+                """
                 return _local_matmul(
                     local_inputs,
                     local_kernel,

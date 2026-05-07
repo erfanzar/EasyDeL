@@ -640,9 +640,28 @@ def ragged_gated_delta_rule_mixed_prefill(
     V_dim = packed_value.shape[2]
 
     def to_chunk(x):
+        """Reshape ``[total, H, D]`` into ``[num_chunks, H, chunk_size, D]``.
+
+        Args:
+            x: 3-D packed tensor with token-major layout.
+
+        Returns:
+            jax.Array: 4-D chunked, head-major view of ``x``.
+        """
         return x.reshape(num_chunks, chunk_size, H, -1).transpose(0, 2, 1, 3)
 
     def to_chunk_scalar(x):
+        """Reshape ``[total, H]`` into ``[num_chunks, H, chunk_size]``.
+
+        Per-token scalar variant of :func:`to_chunk` used for ``g`` and
+        ``beta``.
+
+        Args:
+            x: 2-D packed tensor.
+
+        Returns:
+            jax.Array: 3-D chunked, head-major view of ``x``.
+        """
         return x.reshape(num_chunks, chunk_size, H).transpose(0, 2, 1)
 
     q_c = to_chunk(packed_query)
@@ -735,6 +754,25 @@ def ragged_gated_delta_rule_mixed_prefill(
     )
 
     def scan_body(h, args):
+        """Inter-chunk recurrence body for the chunked GDR prefill scan.
+
+        For each chunk, optionally resets the state to the per-request
+        initial state (``init_h``), applies the carried-over recurrent
+        contribution to produce the chunk output, and advances the state
+        through the chunk using the accumulated gated decay.
+
+        Args:
+            h: Current recurrent state of shape ``(H, K_dim, V_dim)``.
+            args: Tuple of per-chunk tensors and flags
+                ``(w, u, q_g, attn_i, g_i_last_exp, k_i_g_diff, reset,
+                init_h)`` produced by the surrounding chunked algorithm.
+
+        Returns:
+            tuple: ``(h_new, (o_c, h_new))`` — ``h_new`` is the updated
+            recurrent state, ``o_c`` is the chunk's output of shape
+            ``(H, chunk_size, V_dim)``, and ``h_new`` is also emitted as
+            scan output for downstream use.
+        """
         w, u, q_g, attn_i, g_i_last_exp, k_i_g_diff, reset, init_h = args
 
         h = jnp.where(reset, init_h, h)
@@ -1259,6 +1297,19 @@ def ragged_gated_delta_rule(
     a_reshaped = a.reshape(num_tokens, n_v)
 
     def decode_only_branch(_):
+        """Run the decode-only fast path under :func:`lax.cond`.
+
+        Used when every active request consumes exactly one new token.
+        The unused operand is required by the ``lax.cond`` signature.
+
+        Args:
+            _: Unused operand passed through by ``lax.cond``.
+
+        Returns:
+            tuple: ``(updated_recurrent_state, output)`` produced by
+            :func:`ragged_gated_delta_rule_decode_only`, with output cast
+            back to ``mixed_qkv.dtype``.
+        """
         new_state, output = ragged_gated_delta_rule_decode_only(
             query=q_reshaped,
             key=k_reshaped,
@@ -1276,6 +1327,19 @@ def ragged_gated_delta_rule(
         return new_state, output.astype(mixed_qkv.dtype)
 
     def mixed_prefill_branch(_):
+        """Run the chunked mixed-prefill path under :func:`lax.cond`.
+
+        Used when at least one scheduled request has more than one new
+        token. Pads each request's tokens up to ``chunk_size`` and runs
+        the fully-batched chunked GDR algorithm.
+
+        Args:
+            _: Unused operand passed through by ``lax.cond``.
+
+        Returns:
+            tuple: ``(updated_recurrent_state, output)`` produced by
+            :func:`ragged_gated_delta_rule_mixed_prefill`.
+        """
         return ragged_gated_delta_rule_mixed_prefill(
             query=q_reshaped,
             key=k_reshaped,
@@ -1464,6 +1528,30 @@ class RaggedGatedDeltaRule(OperationImpl):
             local_si,
             local_dist,
         ):
+            """Per-shard ragged GDR body executed under :func:`jax.shard_map`.
+
+            Re-packs the per-head Q/K/V slices back into the
+            ``mixed_qkv`` layout that :func:`ragged_gated_delta_rule`
+            expects, runs the kernel on the local head shard, and
+            returns the per-shard updated state and output.
+
+            Args:
+                local_q: Local query slice along the head axis.
+                local_k: Local key slice along the head axis.
+                local_v: Local value slice along the head axis.
+                local_b: Local beta slice along the head axis.
+                local_a: Local A slice along the head axis.
+                local_state: Local recurrent-state slice.
+                local_A_log: Local ``A_log`` slice.
+                local_dt_bias: Local ``dt_bias`` slice.
+                local_qsl: ``query_start_loc`` (replicated across shards).
+                local_si: ``state_indices`` (replicated).
+                local_dist: ``distribution`` triple (replicated).
+
+            Returns:
+                tuple: ``(local_new_state, local_output)`` matching the
+                outer ``out_specs``.
+            """
             # Derive per-shard head counts from local tensor shapes.
             local_n_kq = local_q.shape[1]
             local_n_v = local_v.shape[1]

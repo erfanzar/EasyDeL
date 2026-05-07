@@ -101,6 +101,43 @@ class GptOssConfig(EasyDeLBaseConfig):
         mlp_activations_limit: float = 7.0,
         **kwargs,
     ):
+        """Initialize a GPT-OSS configuration.
+
+        Args:
+            num_hidden_layers: Decoder block count.
+            num_local_experts: Total routed experts in each MoE FFN layer.
+            vocab_size: Token vocabulary size.
+            hidden_size: Residual-stream dimension.
+            intermediate_size: Inner width of each expert MLP.
+            head_dim: Per-head attention dim; defaults to
+                ``hidden_size // num_attention_heads`` when ``None``.
+            num_attention_heads: Total query heads per attention layer.
+            num_key_value_heads: KV heads for grouped-query attention;
+                defaults to ``num_attention_heads`` when ``None``.
+            sliding_window: Sliding-window length used by layers marked
+                ``"sliding_attention"`` in ``layer_types``.
+            rope_theta: RoPE base frequency.
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            hidden_act: Activation applied to the gate half of the MLPs.
+            initializer_range: Stddev for truncated-normal init.
+            max_position_embeddings: Context-length bound.
+            rms_norm_eps: Epsilon for every RMSNorm.
+            rope_scaling: RoPE scaling mapping; defaults to a YaRN preset
+                (``factor=32``, ``beta_fast=32``, ``beta_slow=1``).
+            attention_dropout: Dropout on attention probabilities.
+            num_experts_per_tok: Routed experts selected per token.
+            router_aux_loss_coef: Coefficient for the load-balancing
+                auxiliary loss.
+            output_router_logits: Default for whether the model returns
+                router logits in its output.
+            use_cache: Whether downstream code should return KV cache.
+            layer_types: Optional per-layer list of ``"full_attention"``
+                vs. ``"sliding_attention"``; defaults to alternating
+                sliding/full starting with sliding for layer 0.
+            mlp_activations_limit: Soft-capping limit applied to MLP
+                activations to prevent magnitude blow-up.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
         if rope_scaling is None:
             rope_scaling = {"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False}
         self.vocab_size = vocab_size

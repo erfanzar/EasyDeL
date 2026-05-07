@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration class for Shanghai AI Lab's InternLM2 decoder LM family.
+
+Defines :class:`InternLM2Config`, registered under the ``internlm2``
+model-type. The config preserves the legacy ``rope_scaling`` /
+``rope_parameters`` aliasing required by the upstream HuggingFace
+remote-code, exposes ``layer_types`` for :class:`HybridCache` integration,
+and surfaces InternLM2-specific knobs such as ``bias`` (Q/K/V/output bias),
+``pretraining_tp`` (column-parallel sharding rank used at pre-training), and
+the ``granted_*`` properties used by the runtime to size frequency / mask
+tables independently of ``max_position_embeddings``.
+"""
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers

@@ -385,6 +385,18 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         quantization_config=quant_model,
         apply_quantization=bool(quant.get("apply_quantization", False)),
         verbose=bool(loader.get("verbose", True)),
+        checkpoint_load_chunk_size=loader.get("checkpoint_load_chunk_size"),
+        checkpoint_load_concurrent_gb=int(loader.get("checkpoint_load_concurrent_gb", 128)),
+        checkpoint_load_tensorstore_io_concurrency=loader.get("checkpoint_load_tensorstore_io_concurrency", 1024),
+        checkpoint_load_tensorstore_copy_concurrency=loader.get("checkpoint_load_tensorstore_copy_concurrency", 1024),
+        checkpoint_load_tensorstore_cache_gb=loader.get("checkpoint_load_tensorstore_cache_gb", 128),
+        checkpoint_load_tensorstore_assume_metadata=bool(
+            loader.get("checkpoint_load_tensorstore_assume_metadata", True)
+        ),
+        checkpoint_load_tensorstore_metadata_workers=int(
+            loader.get("checkpoint_load_tensorstore_metadata_workers", 256)
+        ),
+        checkpoint_load_progress=loader.get("checkpoint_load_progress"),
         from_torch=loader.get("from_torch"),
         trust_remote_code=loader.get("trust_remote_code", False),
         **(model.get("extra_kwargs") or {}),
@@ -490,6 +502,18 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
         quantization_config=quant_model,
         apply_quantization=bool(quant.get("apply_quantization", False)),
         verbose=bool(loader.get("verbose", True)),
+        checkpoint_load_chunk_size=loader.get("checkpoint_load_chunk_size"),
+        checkpoint_load_concurrent_gb=int(loader.get("checkpoint_load_concurrent_gb", 128)),
+        checkpoint_load_tensorstore_io_concurrency=loader.get("checkpoint_load_tensorstore_io_concurrency", 1024),
+        checkpoint_load_tensorstore_copy_concurrency=loader.get("checkpoint_load_tensorstore_copy_concurrency", 1024),
+        checkpoint_load_tensorstore_cache_gb=loader.get("checkpoint_load_tensorstore_cache_gb", 128),
+        checkpoint_load_tensorstore_assume_metadata=bool(
+            loader.get("checkpoint_load_tensorstore_assume_metadata", True)
+        ),
+        checkpoint_load_tensorstore_metadata_workers=int(
+            loader.get("checkpoint_load_tensorstore_metadata_workers", 256)
+        ),
+        checkpoint_load_progress=loader.get("checkpoint_load_progress"),
         **(model.get("extra_kwargs") or {}),
     )
 
@@ -1647,9 +1671,25 @@ def _create_source_from_inform(
             source_type = "txt"
 
     def _projection_columns() -> list[str] | None:
+        """Build the column projection list for columnar source readers.
+
+        Collects ``content_field``, ``pixel_field``, ``additional_fields``,
+        and ``format_fields`` keys from ``inform_cfg`` into a deduplicated
+        ordered list suitable for pushing down to engines like Parquet.
+
+        Returns:
+            list[str] | None: Projected column names, or ``None`` when no
+            columns were specified (caller should read all columns).
+        """
         columns: list[str] = []
 
         def add_column(value: Any) -> None:
+            """Append *value* to ``columns`` if it is a fresh non-empty string.
+
+            Args:
+                value: Candidate column name; ignored unless it is a
+                    non-empty ``str`` not already present in ``columns``.
+            """
             if isinstance(value, str) and value and value not in columns:
                 columns.append(value)
 

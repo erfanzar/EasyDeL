@@ -564,8 +564,8 @@ def _make_cpo_scheduled_loss(call):
 
 
 register_scheduled_loss_adapter(
-    training_step,
-    ScheduledLossAdapter(
+    step_fn=training_step,
+    adapter=ScheduledLossAdapter(
         name="cpo",
         make_loss=_make_cpo_scheduled_loss,
         make_cache_key=_cpo_scheduled_loss_cache_key,

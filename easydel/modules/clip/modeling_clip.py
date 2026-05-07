@@ -682,6 +682,12 @@ class CLIPEncoder(EasyDeLLayerStackMixin, spx.Module):
         all_hidden_states = () if output_hidden_states else None
 
         def _layer_loop(layer, carry):
+            """Per-layer body for ``self.layers.scan``.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions, idx)``
+            through one encoder layer, optionally accumulating the input
+            hidden state and attention weights, and returns the updated carry.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

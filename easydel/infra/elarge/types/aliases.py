@@ -27,6 +27,20 @@ from typing import Any
 import jax
 from jax import numpy as jnp
 
+# Type alias for data type specifications.
+#
+# Represents valid data type values that can be used for model computation and
+# parameter storage. Accepts JAX dtype objects, Python type objects, or string
+# literals for common precision formats.
+#
+# Supported string literals:
+#     - "fp8": 8-bit floating point (FP8 E4M3 or E5M2).
+#     - "bf16": Brain floating point 16-bit.
+#     - "fp16": IEEE 754 half precision 16-bit.
+#     - "fp32": IEEE 754 single precision 32-bit.
+#     - "mxfp4": Microscaling 4-bit floating point.
+#     - "mxfp8": Microscaling 8-bit floating point.
+#     - "nvfp8": NVIDIA FP8 format.
 DTypeLike = (
     str
     | jnp.dtype
@@ -41,22 +55,8 @@ DTypeLike = (
         "nvfp8",
     ]
 )
-"""Type alias for data type specifications.
 
-Represents valid data type values that can be used for model computation and
-parameter storage. Accepts JAX dtype objects, Python type objects, or string
-literals for common precision formats.
-
-Supported string literals:
-    - "fp8": 8-bit floating point (FP8 E4M3 or E5M2).
-    - "bf16": Brain floating point 16-bit.
-    - "fp16": IEEE 754 half precision 16-bit.
-    - "fp32": IEEE 754 single precision 32-bit.
-    - "mxfp4": Microscaling 4-bit floating point.
-    - "mxfp8": Microscaling 8-bit floating point.
-    - "nvfp8": NVIDIA FP8 format.
-"""
-
+# Type alias for JAX precision level specifications.
 PrecisionLike = (
     str
     | jax.lax.Precision
@@ -74,15 +74,14 @@ PrecisionLike = (
         "fastest",
     ]
 )
-"""Type alias for JAX precision level specifications."""
 
+# Type alias for model partitioning rules.
+#
+# A sequence of (pattern, partition_spec) pairs used to determine how model
+# parameters are distributed across devices.
 PartitionRules = tuple[tuple[str, Any], ...]
-"""Type alias for model partitioning rules.
 
-A sequence of (pattern, partition_spec) pairs used to determine how model
-parameters are distributed across devices.
-"""
-
+# Type alias for supported dataset format types.
 DatasetTypeLike = tp.Literal[
     "json",
     "jsonl",
@@ -95,8 +94,8 @@ DatasetTypeLike = tp.Literal[
     "txt",
     "text",
 ]
-"""Type alias for supported dataset format types."""
 
+# Type alias for registered attention operation implementation names.
 OperationImplName = tp.Literal[
     "flash_attn2",
     "ring",
@@ -112,4 +111,3 @@ OperationImplName = tp.Literal[
     "vanilla",
     "autoregressive_decodeattn",
 ]
-"""Type alias for registered attention operation implementation names."""

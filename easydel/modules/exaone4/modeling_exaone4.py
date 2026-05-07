@@ -624,6 +624,14 @@ class Exaone4Model(EasyDeLBaseModule):
         )
 
         def _layer_loop(block, carry):
+            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+
+            Threads ``(hidden_states, all_hidden_states, all_attentions, idx)``
+            through one EXAONE 4 decoder layer (post-norm with conditional
+            RoPE / NoPE), optionally collecting per-layer hidden states or
+            attention weights and updating the layer's KV cache view in-place
+            on ``past_key_values``.
+            """
             hidden_states, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)

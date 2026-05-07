@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Configuration dataclass for the XPO trainer.
+
+Defines :class:`XPOConfig`, which extends :class:`GRPOConfig` with the
+XPO-specific knobs: DPO/IPO ``loss_type``, KL temperature ``beta``,
+exploration weight ``alpha``, and the optional missing-EOS reward
+penalty.  All other rollout / sampling / dataset settings are inherited
+from the GRPO configuration.
+"""
 
 from __future__ import annotations
 

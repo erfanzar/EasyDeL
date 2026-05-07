@@ -175,8 +175,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return None
 
         if not self._stream_state_initialized:
-            self._stream_seen_start = self._is_prompt_reasoning_active() or self.start_token in previous_text or (
-                self._start_token_id is not None and self._start_token_id in previous_token_ids
+            self._stream_seen_start = (
+                self._is_prompt_reasoning_active()
+                or self.start_token in previous_text
+                or (self._start_token_id is not None and self._start_token_id in previous_token_ids)
             )
             self._stream_seen_end = self.end_token in previous_text or (
                 self._end_token_id is not None and self._end_token_id in previous_token_ids
