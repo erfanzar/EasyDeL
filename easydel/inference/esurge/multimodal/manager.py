@@ -81,16 +81,32 @@ See Also:
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
-from PIL import Image
 
 from .cache import VisionEncoderCache
 from .types import MultiModalFeature
 
-if TYPE_CHECKING:
-    pass
+_PILImage: Any | None
+
+try:
+    from PIL import Image as _PILImage
+except ImportError:
+    _PILImage = None
+
+
+_PILLOW_INSTALL_MESSAGE = (
+    "Pillow is required for eSurge multimodal image processing. "
+    "Install it with `pip install easydel[mm]` or `pip install pillow`."
+)
+
+
+def _require_pillow() -> Any:
+    """Return the PIL Image module or raise the optional dependency error."""
+    if _PILImage is None:
+        raise ImportError(_PILLOW_INSTALL_MESSAGE)
+    return _PILImage
 
 
 # CLIP-style normalization constants used by GLM/Qwen vision towers.
@@ -183,7 +199,7 @@ class MultiModalManager:
         self.resolution_buckets = resolution_buckets or DEFAULT_RESOLUTION_BUCKETS
         self.cache = VisionEncoderCache(cache_capacity_mb) if enable_cache else None
 
-    def resize_to_bucket(self, image: Image.Image) -> Image.Image:
+    def resize_to_bucket(self, image: Any) -> Any:
         """Resize image to nearest resolution bucket.
 
         Selects the bucket with total pixels closest to the original image
@@ -204,7 +220,8 @@ class MultiModalManager:
         if (h, w) == (target_h, target_w):
             return image
 
-        return image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        pil_image = _require_pillow()
+        return image.resize((target_w, target_h), pil_image.Resampling.LANCZOS)
 
     @staticmethod
     def _align_dim_to_multiple(dim: int, multiple: int) -> int:
@@ -277,7 +294,7 @@ class MultiModalManager:
         buckets = sorted(set(buckets))
         return buckets
 
-    def _resize_to_buckets(self, image: Image.Image, buckets: list[tuple[int, int]]) -> Image.Image:
+    def _resize_to_buckets(self, image: Any, buckets: list[tuple[int, int]]) -> Any:
         """Resize image to the nearest resolution bucket.
 
         Selects the bucket with total pixel count closest to the original
@@ -296,7 +313,8 @@ class MultiModalManager:
         target_h, target_w = min(buckets, key=lambda b: abs(b[0] * b[1] - original_pixels))
         if (h, w) == (target_h, target_w):
             return image
-        return image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        pil_image = _require_pillow()
+        return image.resize((target_w, target_h), pil_image.Resampling.LANCZOS)
 
     def _token_str_for_id(self, tokenizer: Any, token_id: int | None) -> str | None:
         """Convert a token ID to its string representation.
@@ -683,7 +701,7 @@ class MultiModalManager:
 
     def process_images(
         self,
-        images: list[Image.Image] | None,
+        images: list[Any] | None,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Process images with resolution bucketing.
 
@@ -888,10 +906,13 @@ class MultiModalManager:
             # Resize each frame to a bucket resolution.
             target_h, target_w = min(resize_buckets, key=lambda b: abs(b[0] * b[1] - height * width))
             if (height, width) != (target_h, target_w):
+                pil_image = _require_pillow()
                 resized = np.stack(
                     [
                         np.asarray(
-                            Image.fromarray(frame).convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+                            pil_image.fromarray(frame)
+                            .convert("RGB")
+                            .resize((target_w, target_h), pil_image.Resampling.LANCZOS)
                         )
                         for frame in video
                     ],
@@ -921,7 +942,7 @@ class MultiModalManager:
     def extract_media_from_messages(
         self,
         messages: list[dict],
-    ) -> tuple[list[Image.Image], list[np.ndarray]]:
+    ) -> tuple[list[Any], list[np.ndarray]]:
         """Extract images and videos from OpenAI-style messages.
 
         Parses messages with content arrays containing image/video/text items
@@ -968,20 +989,21 @@ class MultiModalManager:
                     """
                     if img is None:
                         return
-                    if isinstance(img, Image.Image):
+                    pil_image = _require_pillow()
+                    if isinstance(img, pil_image.Image):
                         images.append(img)
                         return
                     if isinstance(img, (bytes, bytearray)):
                         import io
 
-                        images.append(Image.open(io.BytesIO(img)))
+                        images.append(pil_image.open(io.BytesIO(img)))
                         return
                     if isinstance(img, str):
                         path = img
                         if path.startswith("file://"):
                             path = path[len("file://") :]
                         if os.path.exists(path):
-                            images.append(Image.open(path))
+                            images.append(pil_image.open(path))
                             return
                     raise ValueError(
                         "Unsupported image payload; use a PIL.Image, local path, file:// path, or data: URL."
@@ -1006,20 +1028,21 @@ class MultiModalManager:
                     if not isinstance(url, str) or not url:
                         raise ValueError("image_url must be a string or a dict with a non-empty `url` field.")
 
+                    pil_image = _require_pillow()
                     if url.startswith("data:"):
                         import base64
                         import io
 
                         _header, data = url.split(",", 1)
                         image_data = base64.b64decode(data)
-                        images.append(Image.open(io.BytesIO(image_data)))
+                        images.append(pil_image.open(io.BytesIO(image_data)))
                         return
 
                     path = url
                     if path.startswith("file://"):
                         path = path[len("file://") :]
                     if os.path.exists(path):
-                        images.append(Image.open(path))
+                        images.append(pil_image.open(path))
                         return
 
                     raise ValueError(
@@ -1051,7 +1074,7 @@ class MultiModalManager:
     def tokenize_multimodal(
         self,
         messages: list[dict],
-        images: list[Image.Image] | None = None,
+        images: list[Any] | None = None,
         videos: list[np.ndarray] | None = None,
         image_grid_thw: np.ndarray | None = None,
         video_grid_thw: np.ndarray | None = None,
@@ -1272,7 +1295,7 @@ class MultiModalManager:
 
     def process_images_to_features(
         self,
-        images: list[Image.Image] | None,
+        images: list[Any] | None,
         request_idx: int = 0,
     ) -> list[MultiModalFeature]:
         """Process images and create MultiModalFeature objects.
