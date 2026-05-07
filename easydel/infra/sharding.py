@@ -27,6 +27,7 @@ APIs that still require it explicitly.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import dataclasses
 import typing as tp
@@ -59,6 +60,36 @@ AxisEntry = str | tuple[str, ...] | None
 AxisEntries = tuple[AxisEntry, ...]
 LogicalAxisRules = Sequence[tuple[str, str | None]] | Mapping[str, str | None]
 _UNSUPPORTED_SIMPLE_RULE = object()
+_SHARDING_ADJUSTMENT_COUNTER: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar(
+    "easydel_sharding_adjustment_counter",
+    default=None,
+)
+
+
+@contextmanager
+def collect_sharding_adjustments() -> Iterator[dict[str, int]]:
+    """Collect shape/mesh sharding relaxations made inside the context.
+
+    The resolver silently drops axes when a requested partition spec cannot
+    divide a concrete tensor shape. This context gives callers that resolve a
+    whole model tree one aggregate count to log instead of emitting one line
+    per parameter.
+    """
+    counter = {"count": 0}
+    token = _SHARDING_ADJUSTMENT_COUNTER.set(counter)
+    try:
+        yield counter
+    finally:
+        _SHARDING_ADJUSTMENT_COUNTER.reset(token)
+
+
+def _record_sharding_adjustment(before: tp.Any, after: tp.Any) -> None:
+    """Increment the active sharding-adjustment counter when a spec changed."""
+    if before == after:
+        return
+    counter = _SHARDING_ADJUSTMENT_COUNTER.get()
+    if counter is not None:
+        counter["count"] += 1
 
 CANONICAL_MESH_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
@@ -1200,7 +1231,9 @@ class RuntimeShardingResolver:
         if active_mesh is None or shape is NOT_GIVEN:
             return spec
         base_mesh, _ = _resolve_named_sharding_mesh(active_mesh)
-        return sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=base_mesh)
+        safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=base_mesh)
+        _record_sharding_adjustment(spec, safe_spec)
+        return safe_spec
 
     def _resolve_axis_name_entry(self, axis: tp.Any, mode: str) -> AxisEntry:
         """Translate a logical axis (or compound axis tuple) to mesh axes.

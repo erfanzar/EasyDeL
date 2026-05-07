@@ -44,12 +44,19 @@ from typing import Self
 import jax
 import numpy
 import spectrax as spx
+from eformer.loggings import get_logger
 from jax.sharding import NamedSharding, PartitionSpec
 from spectrax import make_shard_and_gather_fns
 
-from easydel.infra.sharding import device_put_if_sharding_mismatch, replicated_named_sharding
+from easydel.infra.sharding import (
+    collect_sharding_adjustments,
+    device_put_if_sharding_mismatch,
+    replicated_named_sharding,
+)
 from easydel.utils.instrumentation import phase_timer
 from easydel.utils.traversals import flatten_dict
+
+logger = get_logger(__name__)
 
 
 def _tree_is_already_named_sharded(tree: tp.Any) -> bool:
@@ -325,22 +332,28 @@ class EasyShardingMixin:
 
         rules: list[tuple[str, jax.sharding.NamedSharding]] = []
         seen: set[str] = set()
-        for path, var in spx.iter_variables(self):
-            if getattr(var, "kind", None) not in graph_collections:
-                continue
-            value = getattr(var, "value", None)
-            shape = tuple(value.shape) if hasattr(value, "shape") else None
-            if shape is None:
-                continue
-            ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=mesh)
-            if ns is None:
-                continue
-            for aliased_path in _metadata_rule_path_aliases(path):
-                for pattern in _metadata_rule_patterns(aliased_path):
-                    if pattern in seen:
-                        continue
-                    seen.add(pattern)
-                    rules.append((pattern, ns))
+        with collect_sharding_adjustments() as sharding_adjustments:
+            for path, var in spx.iter_variables(self):
+                if getattr(var, "kind", None) not in graph_collections:
+                    continue
+                value = getattr(var, "value", None)
+                shape = tuple(value.shape) if hasattr(value, "shape") else None
+                if shape is None:
+                    continue
+                ns = resolver.named_sharding_for_variable(var, shape=shape, mesh=mesh)
+                if ns is None:
+                    continue
+                for aliased_path in _metadata_rule_path_aliases(path):
+                    for pattern in _metadata_rule_patterns(aliased_path):
+                        if pattern in seen:
+                            continue
+                        seen.add(pattern)
+                        rules.append((pattern, ns))
+        if sharding_adjustments["count"]:
+            logger.warning(
+                "Adjusted %d parameter sharding spec(s) to fit the current mesh and tensor shapes.",
+                sharding_adjustments["count"],
+            )
         return tuple(rules)
 
     def resolve_sharding_for_tree(self, tree=None, *, mesh: spx.SpxMesh | None = None):
