@@ -101,7 +101,6 @@ from easydel.utils.traversals import deepcopy_model
 
 from .sharding import (
     MeshLike,
-    device_put_if_sharding_mismatch,
     replicated_named_sharding,
     sanitize_partition_specs_for_shape_tree,
 )
@@ -641,14 +640,15 @@ class EasyDeLState(_PyTreeNode):
         if init_opt_state and tx is None:
             raise ValueError("When passing `init_opt_state` as `True` you have to also provide `tx`.")
 
-        if init_opt_state:
+        defer_sharded_opt_init = bool(init_opt_state and model is not None)
+        if init_opt_state and not defer_sharded_opt_init:
             opt_state = tx.init(graphstate)
         if step is None:
             step = 0
         if graphother is not None:
             graphother = materialize_meta_leaves(graphother, seed=42)
 
-        return cls(
+        state = cls(
             step=step,
             graphdef=graphdef,
             graphstate=graphstate,
@@ -656,6 +656,9 @@ class EasyDeLState(_PyTreeNode):
             tx=tx,
             opt_state=opt_state,
         )
+        if defer_sharded_opt_init:
+            return state.init_tx(tx)
+        return state
 
     def _optimizer_partition_specs(
         self,
@@ -788,14 +791,7 @@ class EasyDeLState(_PyTreeNode):
         #    NamedShardings.  Equivalent to what ``make_shard_and_gather_fns``
         #    does internally, but we already have NamedShardings so we don't
         #    need to round-trip through PartitionSpec.
-        opt_state = jax.tree_util.tree_map(
-            lambda leaf, ns: (
-                device_put_if_sharding_mismatch(leaf, ns) if isinstance(ns, jax.sharding.NamedSharding) else leaf
-            ),
-            opt_state,
-            out_shardings,
-            is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
-        )
+        opt_state = spx.place_setup_tree_with_shardings(opt_state, out_shardings, label="EasyDeLState.init_tx")
 
         return self.replace(tx=tx, opt_state=opt_state)
 
@@ -1796,13 +1792,10 @@ class EasyDeLState(_PyTreeNode):
                 transform_non_params=lambda _: replicated,
                 is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
             )
-            opt_state = jax.tree_util.tree_map(
-                lambda leaf, ns: (
-                    device_put_if_sharding_mismatch(leaf, ns) if isinstance(ns, jax.sharding.NamedSharding) else leaf
-                ),
+            opt_state = spx.place_setup_tree_with_shardings(
                 opt_state,
                 opt_shardings,
-                is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
+                label="EasyDeLState.shard_state",
             )
 
         step = jax.device_put(step, replicated)

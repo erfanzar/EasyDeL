@@ -58,8 +58,8 @@ OptionalMesh: tp.TypeAlias = MeshLike | None
 StageMesh: tp.TypeAlias = Mesh | None
 AxisEntry = str | tuple[str, ...] | None
 AxisEntries = tuple[AxisEntry, ...]
-LogicalAxisRules = Sequence[tuple[str, str | None]] | Mapping[str, str | None]
-_UNSUPPORTED_SIMPLE_RULE = object()
+LogicalAxisRules = Sequence[tuple[str, tp.Any]] | Mapping[str, tp.Any]
+StageRankResolver = tp.Callable[[tuple[int, int] | None, int], int | None]
 _SHARDING_ADJUSTMENT_COUNTER: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar(
     "easydel_sharding_adjustment_counter",
     default=None,
@@ -90,6 +90,7 @@ def _record_sharding_adjustment(before: tp.Any, after: tp.Any) -> None:
     counter = _SHARDING_ADJUSTMENT_COUNTER.get()
     if counter is not None:
         counter["count"] += 1
+
 
 CANONICAL_MESH_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
@@ -168,6 +169,8 @@ def device_put_if_sharding_mismatch(value: tp.Any, sharding: tp.Any, *, donate: 
         return value
     if sharding_matches(value, sharding):
         return value
+    if isinstance(value, jax.ShapeDtypeStruct):
+        return value.update(sharding=sharding)
     return jax.device_put(value, sharding, donate=donate)
 
 
@@ -254,43 +257,26 @@ def _normalize_axes(axes: tp.Iterable[tp.Any]) -> AxisEntries:
     return tuple(_normalize_axis_entry(axis) for axis in axes)
 
 
-def _normalize_logical_axis_rules(overrides: LogicalAxisRules | None) -> tuple[tuple[str, str | None], ...]:
+def _normalize_logical_axis_rules(overrides: LogicalAxisRules | None) -> tuple[tuple[str, AxisEntry], ...]:
     """Coerce logical axis-rule overrides into a sorted tuple of pairs.
 
     Args:
         overrides: Either a mapping or iterable of
-            ``(logical_name, mesh_axis)`` pairs (mesh_axis may be ``None``).
+            ``(logical_name, mesh_axis)`` pairs (mesh_axis may be a
+            single mesh-axis name, a compound tuple/list, or ``None``).
 
     Returns:
-        tuple: Tuple of ``(str, str | None)`` pairs with both keys and values
-        coerced to strings (or ``None``).
+        tuple: Tuple of ``(str, AxisEntry)`` pairs. Compound physical
+        targets are preserved so SpectraX can lower e.g.
+        ``BATCH -> ("fsdp", "dp")`` into ``PartitionSpec(("fsdp", "dp"))``.
     """
     if overrides is None:
         return ()
     items = overrides.items() if isinstance(overrides, Mapping) else overrides
-    normalized: list[tuple[str, str | None]] = []
+    normalized: list[tuple[str, AxisEntry]] = []
     for logical_name, mesh_axis in items:
-        normalized.append((str(logical_name), None if mesh_axis is None else str(mesh_axis)))
+        normalized.append((str(logical_name), _normalize_axis_entry(mesh_axis)))
     return tuple(normalized)
-
-
-def _simple_rule_value(value: tp.Any) -> str | None | object:
-    """Reduce an axis entry to a simple-rule value, or mark it unsupported.
-
-    Args:
-        value: Raw axis entry.
-
-    Returns:
-        str | None | object: ``None`` for empty entries, a single string for
-        one mesh axis, or :data:`_UNSUPPORTED_SIMPLE_RULE` for compound
-        (multi-axis) entries which cannot be expressed as a simple rule.
-    """
-    normalized = _normalize_axis_entry(value)
-    if normalized is None:
-        return None
-    if isinstance(normalized, tuple):
-        return _UNSUPPORTED_SIMPLE_RULE
-    return normalized
 
 
 def is_valid_mesh(mesh: OptionalMesh | tp.Any) -> bool:
@@ -517,6 +503,8 @@ def _resolve_named_sharding_mesh(mesh: MeshLike) -> tuple[Mesh, MpMdMesh | None]
 def _stage_local_mesh(
     mesh: MeshLike,
     metadata: dict[str, tp.Any] | None,
+    *,
+    stage_rank_resolver: StageRankResolver | None = None,
 ) -> Mesh:
     """Return the stage-local submesh implied by parameter metadata.
 
@@ -542,7 +530,11 @@ def _stage_local_mesh(
     base_mesh, mpmd_mesh = _resolve_named_sharding_mesh(mesh)
     if mpmd_mesh is None:
         return base_mesh
-    owner = resolve_stage_rank(assignment, mpmd_mesh.mpmd_dim)
+    owner = (
+        stage_rank_resolver(assignment, mpmd_mesh.mpmd_dim)
+        if stage_rank_resolver is not None
+        else resolve_stage_rank(assignment, mpmd_mesh.mpmd_dim)
+    )
     if owner is None:
         return base_mesh
     return mpmd_mesh.submesh(owner)
@@ -586,7 +578,54 @@ def sanitize_partition_spec_for_shape(
         axes = axes[: len(shape)]
         changed = True
 
+    mesh_shape = getattr(mesh, "shape", None)
+
+    def _mesh_has_axis(axis_name: tp.Any) -> bool:
+        if axis_name is None or axis_name is EMPTY:
+            return True
+        if mesh_shape is None:
+            return True
+        if hasattr(mesh_shape, "__contains__"):
+            try:
+                if axis_name in mesh_shape or str(axis_name) in mesh_shape:
+                    return True
+            except Exception:
+                pass
+        try:
+            mesh_shape[axis_name]
+            return True
+        except Exception:
+            pass
+        try:
+            mesh_shape[str(axis_name)]
+            return True
+        except Exception:
+            return False
+
+    def _drop_missing_mesh_axes(axis_spec: tp.Any) -> tuple[tp.Any, bool]:
+        if axis_spec is None or axis_spec is EMPTY:
+            return axis_spec, False
+        if axis_spec is PartitionSpec.UNCONSTRAINED:
+            return axis_spec, False
+        if isinstance(axis_spec, tuple):
+            kept = tuple(axis for axis in axis_spec if _mesh_has_axis(axis))
+            if kept == axis_spec:
+                return axis_spec, False
+            if not kept:
+                return None, True
+            return (kept[0] if len(kept) == 1 else kept), True
+        if not _mesh_has_axis(axis_spec):
+            return None, True
+        return axis_spec, False
+
     for dim_index, axis_spec in enumerate(axes):
+        if axis_spec is None:
+            continue
+        filtered_axis_spec, axis_changed = _drop_missing_mesh_axes(axis_spec)
+        if axis_changed:
+            axes[dim_index] = filtered_axis_spec
+            axis_spec = filtered_axis_spec
+            changed = True
         if axis_spec is None:
             continue
         shard_factor = _mesh_partition_product(mesh, axis_spec)
@@ -926,12 +965,9 @@ class AxisPolicy:
        and return mesh-axis entries / a :class:`PartitionSpec`. Compound
        entries such as ``("fsdp", "sp")`` are preserved.
     3. **Logical axis rules** — :meth:`logical_axis_rule_pairs` produces the
-       ``(logical_name, mesh_axis_or_None)`` rule list consumed by
-       ``spectrax.logical_axis_rules`` for the simple (single-axis) cases.
-       Compound placements are intentionally excluded since spectrax's rule
-       system only supports one mesh axis per logical name; those flow
-       through :class:`TensorLayout` + :class:`RuntimeShardingResolver`
-       instead.
+       ``(logical_name, mesh_axis_or_tuple_or_None)`` rule list consumed by
+       ``spectrax.logical_axis_rules``. Compound placements are preserved so
+       semantic axes can lower to fused physical mesh axes.
 
     Attributes:
         partition_axis (PartitionAxis): The wrapped logical-to-mesh-axis
@@ -1058,26 +1094,62 @@ class AxisPolicy:
         *,
         mode: str = MODE_TRAIN,
         overrides: LogicalAxisRules | None = None,
-    ) -> tuple[tuple[str, str | None], ...]:
+    ) -> tuple[tuple[str, AxisEntry], ...]:
         """Return spectrax logical-axis rules for the resolvable simple aliases.
 
-        Compound placements such as ``("fsdp", "sp")`` intentionally stay out of
-        this rule set because ``spectrax.logical_axis_rules`` only supports
-        ``logical -> single mesh axis`` mappings. Those richer cases continue to
-        flow through ``TensorLayout`` + ``RuntimeShardingResolver``.
+        Compound placements such as ``("fsdp", "sp")`` are preserved. Local
+        SpectraX accepts fused physical-axis tuples in ``logical_axis_rules``,
+        and dropping them here collapses semantic axes like ``BATCH`` to
+        replicated placement.
         """
-        rules: dict[str, str | None] = {axis_name: axis_name for axis_name in CANONICAL_MESH_AXIS_NAMES}
+        rules: dict[str, AxisEntry] = {axis_name: axis_name for axis_name in CANONICAL_MESH_AXIS_NAMES}
         for semantic_axis in _SIMPLE_SEMANTIC_AXES:
             try:
                 resolved = self.partition_axis.resolve_axis([semantic_axis], mode=mode)[0]
             except Exception:
                 continue
-            simple = _simple_rule_value(resolved)
-            if simple is _UNSUPPORTED_SIMPLE_RULE:
-                continue
-            rules[str(semantic_axis)] = simple
+            rules[str(semantic_axis)] = _normalize_axis_entry(resolved)
         rules.update(dict(_normalize_logical_axis_rules(overrides)))
         return tuple(rules.items())
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PipelineStageRankResolver:
+    """Resolve layer-stage metadata with EasyDeL's virtual PP layout."""
+
+    physical_stages: int
+    virtual_stages: int = 1
+    layout: str = "loop"
+
+    def __call__(self, assignment: tuple[int, int] | None, mpmd_dim: int) -> int | None:
+        """Map a ``(current, total)`` stage hint to a physical PP rank."""
+        if assignment is None:
+            return None
+        physical = int(mpmd_dim or self.physical_stages)
+        if physical <= 1:
+            return 0
+        current, total = assignment
+        if total <= physical or self.virtual_stages <= 1:
+            return resolve_stage_rank((current, total), physical)
+        logical_stages = max(physical, physical * int(self.virtual_stages))
+        logical = resolve_stage_rank((current, total), logical_stages)
+        if logical is None:
+            return None
+        return self.logical_to_physical(logical, physical)
+
+    def logical_to_physical(self, logical_stage: int, physical_stages: int | None = None) -> int:
+        """Map one logical virtual stage to its physical rank."""
+        physical = int(physical_stages or self.physical_stages)
+        if physical <= 1:
+            return 0
+        logical = int(logical_stage)
+        if self.layout == "contiguous":
+            return min(physical - 1, logical // max(1, int(self.virtual_stages)))
+        if self.layout == "interleaved":
+            return logical % physical
+        offset = logical % physical
+        virtual_stage = logical // physical
+        return offset if virtual_stage % 2 == 0 else physical - 1 - offset
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1120,10 +1192,14 @@ class RuntimeShardingResolver:
             method calls don't supply ``mesh=...``. ``None`` lets calls fall
             back to the ambient JAX context (or raise when a mesh is
             required).
+        stage_rank_resolver: Optional resolver for mapping logical layer-stage
+            metadata onto physical PP ranks. This keeps load/init placement
+            aligned with virtual MPMD schedules.
     """
 
     axis_policy: AxisPolicy
     mesh: OptionalMesh = None
+    stage_rank_resolver: StageRankResolver | None = None
 
     def with_mesh(self, mesh: OptionalMesh) -> RuntimeShardingResolver:
         """Return a copy of this resolver bound to a different mesh.
@@ -1134,7 +1210,19 @@ class RuntimeShardingResolver:
         Returns:
             RuntimeShardingResolver: A frozen copy with ``mesh`` replaced.
         """
-        return RuntimeShardingResolver(axis_policy=self.axis_policy, mesh=mesh)
+        return RuntimeShardingResolver(
+            axis_policy=self.axis_policy,
+            mesh=mesh,
+            stage_rank_resolver=self.stage_rank_resolver,
+        )
+
+    def with_stage_rank_resolver(self, resolver: StageRankResolver | None) -> RuntimeShardingResolver:
+        """Return a copy that uses ``resolver`` for pipeline-stage metadata."""
+        return RuntimeShardingResolver(
+            axis_policy=self.axis_policy,
+            mesh=self.mesh,
+            stage_rank_resolver=resolver,
+        )
 
     @property
     def paxis(self) -> PartitionAxis:
@@ -1182,7 +1270,7 @@ class RuntimeShardingResolver:
         mode: str | int | object = MODE_TRAIN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
         overrides: LogicalAxisRules | None = None,
-    ) -> tuple[tuple[str, str | None], ...]:
+    ) -> tuple[tuple[str, AxisEntry], ...]:
         """Materialize logical-axis rule pairs for the resolved mode.
 
         Args:
@@ -1204,7 +1292,7 @@ class RuntimeShardingResolver:
         mode: str | int | object = MODE_TRAIN,
         shape: tuple[int, ...] | object = NOT_GIVEN,
         overrides: LogicalAxisRules | None = None,
-    ) -> Iterator[Mapping[str, str | None]]:
+    ) -> Iterator[Mapping[str, object]]:
         """Open a spectrax logical-axis-rules scope derived from ``axis_policy``."""
         rules = self.logical_axis_rule_pairs(mode=mode, shape=shape, overrides=overrides)
         with spx_logical_axis_rules(rules):
@@ -1250,28 +1338,49 @@ class RuntimeShardingResolver:
         if normalized is None:
             return None
 
-        logical_rules = dict(self.logical_axis_rule_pairs(mode=mode))
-
-        def _resolve_one(name: str) -> str | None:
+        def _resolve_one(name: str) -> AxisEntry:
             """Look up a logical axis name in the resolved rule dict.
 
             Args:
                 name: Logical axis name.
 
             Returns:
-                str | None: The mapped mesh axis name, or ``None`` to
+                AxisEntry: The mapped mesh axis name(s), or ``None`` to
                 replicate (matching SpectraX's default for unknown rules).
             """
-            resolved = logical_rules.get(name, None)
-            if resolved is not None or name in logical_rules:
-                return resolved
-            # Match SpecTrax's built-in behavior for unknown logical names:
-            # missing rules replicate instead of surfacing a raw invalid mesh axis.
-            return None
+            if name in CANONICAL_MESH_AXIS_NAMES:
+                return name
+            try:
+                resolved = self.axis_policy.resolve_axis([name], mode=mode)[0]
+            except Exception:
+                # Match SpecTrax's built-in behavior for unknown logical names:
+                # missing rules replicate instead of surfacing a raw invalid mesh axis.
+                return None
+            if resolved is None or resolved == EMPTY:
+                return None
+            if isinstance(resolved, (tuple, list)):
+                axes = tuple(str(item) for item in resolved if item is not None and item != EMPTY)
+                if not axes:
+                    return None
+                return axes[0] if len(axes) == 1 else axes
+            if resolved is NOT_GIVEN:
+                return None
+            return str(resolved)
+
+        def _flatten_axis_entry(entry: AxisEntry) -> tuple[str, ...]:
+            if entry is None:
+                return ()
+            if isinstance(entry, tuple):
+                return tuple(str(item) for item in entry if item is not None)
+            return (str(entry),)
 
         if isinstance(normalized, tuple):
-            resolved_axes = tuple(axis for item in normalized if (axis := _resolve_one(item)) is not None)
-            return resolved_axes or None
+            resolved_axes = tuple(part for item in normalized for part in _flatten_axis_entry(_resolve_one(item)))
+            if not resolved_axes:
+                return None
+            if len(resolved_axes) == 1:
+                return resolved_axes[0]
+            return resolved_axes
         return _resolve_one(normalized)
 
     def _partition_spec_for_axis_names(self, axes: tp.Iterable[tp.Any], mode: str) -> PartitionSpec:
@@ -1389,7 +1498,11 @@ class RuntimeShardingResolver:
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None:
             raise ValueError("A mesh is required to build NamedSharding.")
-        stage_mesh = _stage_local_mesh(active_mesh, metadata)
+        stage_mesh = _stage_local_mesh(
+            active_mesh,
+            metadata,
+            stage_rank_resolver=self.stage_rank_resolver,
+        )
         spec = self.partition_spec_for_layout(layout=layout, mode=mode, shape=shape, mesh=stage_mesh)
         return self.named_sharding_for_spec(spec, shape=shape, mesh=stage_mesh)
 
@@ -1497,7 +1610,15 @@ class RuntimeShardingResolver:
         spec = self.partition_spec_for_metadata(metadata, mode=mode, shape=shape, mesh=active_mesh)
         if spec is None:
             return None
-        return self.named_sharding_for_spec(spec, shape=shape, mesh=_stage_local_mesh(active_mesh, metadata))
+        return self.named_sharding_for_spec(
+            spec,
+            shape=shape,
+            mesh=_stage_local_mesh(
+                active_mesh,
+                metadata,
+                stage_rank_resolver=self.stage_rank_resolver,
+            ),
+        )
 
     def partition_spec_for_variable(
         self,
@@ -1611,13 +1732,29 @@ class RuntimeShardingResolver:
                     named = var.named_sharding(active_mesh)
                 if shape is NOT_GIVEN:
                     return named
-                return self.named_sharding_for_spec(named.spec, shape=shape, mesh=named.mesh)
+                return self.named_sharding_for_spec(
+                    named.spec,
+                    shape=shape,
+                    mesh=_stage_local_mesh(
+                        active_mesh,
+                        var.metadata,
+                        stage_rank_resolver=self.stage_rank_resolver,
+                    ),
+                )
             except Exception:
                 pass
         spec = self.partition_spec_for_variable(var, mode=mode, shape=shape, mesh=active_mesh)
         if spec is None:
             return None
-        return self.named_sharding_for_spec(spec, shape=shape, mesh=_stage_local_mesh(active_mesh, var.metadata))
+        return self.named_sharding_for_spec(
+            spec,
+            shape=shape,
+            mesh=_stage_local_mesh(
+                active_mesh,
+                var.metadata,
+                stage_rank_resolver=self.stage_rank_resolver,
+            ),
+        )
 
     def resolve(
         self,
@@ -1718,6 +1855,7 @@ def coerce_runtime_sharding_resolver(
         return value.with_mesh(mesh if mesh is not None else value.mesh)
 
     inferred_mesh = mesh if mesh is not None else getattr(value, "mesh", None)
+    stage_rank_resolver = getattr(value, "stage_rank_resolver", None)
     axis_source = value
     for attr_name in ("axis_policy", "partition_axis", "paxis"):
         candidate = getattr(value, attr_name, None)
@@ -1725,7 +1863,11 @@ def coerce_runtime_sharding_resolver(
             axis_source = candidate
             break
 
-    return RuntimeShardingResolver(axis_policy=coerce_axis_policy(axis_source), mesh=inferred_mesh)
+    return RuntimeShardingResolver(
+        axis_policy=coerce_axis_policy(axis_source),
+        mesh=inferred_mesh,
+        stage_rank_resolver=stage_rank_resolver,
+    )
 
 
 @contextmanager
@@ -1736,7 +1878,7 @@ def logical_axis_rules(
     mode: str | int | object = MODE_TRAIN,
     shape: tuple[int, ...] | object = NOT_GIVEN,
     overrides: LogicalAxisRules | None = None,
-) -> Iterator[Mapping[str, str | None]]:
+) -> Iterator[Mapping[str, object]]:
     """Open a spectrax logical-axis-rules scope derived from EasyDeL sharding config."""
     resolver = coerce_runtime_sharding_resolver(value, mesh=mesh)
     with resolver.logical_axis_rules(mode=mode, shape=shape, overrides=overrides) as active_rules:
@@ -1801,8 +1943,10 @@ __all__ = [
     "LogicalAxisRules",
     "MeshLike",
     "OptionalMesh",
+    "PipelineStageRankResolver",
     "RuntimeShardingResolver",
     "StageMesh",
+    "StageRankResolver",
     "TensorLayout",
     "axis_index",
     "coerce_axis_policy",

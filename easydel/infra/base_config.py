@@ -93,7 +93,7 @@ from .etils import (
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
 )
-from .sharding import AxisPolicy, LogicalAxisRules, MeshLike, RuntimeShardingResolver
+from .sharding import AxisPolicy, LogicalAxisRules, MeshLike, PipelineStageRankResolver, RuntimeShardingResolver
 
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
@@ -1416,7 +1416,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return parent.devices.flatten()
 
         mpmd = parent.mpmd_mesh
-        owner = resolve_stage_rank(current_stage_assignment(), mpmd.mpmd_dim)
+        assignment = current_stage_assignment()
+        stage_rank_resolver = getattr(self.runtime_sharding_resolver, "stage_rank_resolver", None)
+        owner = (
+            stage_rank_resolver(assignment, mpmd.mpmd_dim)
+            if stage_rank_resolver is not None
+            else resolve_stage_rank(assignment, mpmd.mpmd_dim)
+        )
         if owner is None:
             owner = 0
         return mpmd.submesh(owner).devices.flatten()
@@ -3144,7 +3150,21 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self.axis_policy = AxisPolicy.from_partition_axis(getattr(self, "partition_axis", None))
         if not isinstance(getattr(self, "partition_axis", None), PartitionAxis):
             self.partition_axis = self.axis_policy.to_partition_axis()
-        return RuntimeShardingResolver(axis_policy=self.axis_policy, mesh=self.mesh)
+        mesh = self.mesh
+        stage_rank_resolver = None
+        physical_stages = int(getattr(mesh, "shape", {}).get("pp", 1))
+        virtual_stages = int(getattr(self, "pipeline_virtual_stages", 1) or 1)
+        if physical_stages > 1 and virtual_stages > 1:
+            stage_rank_resolver = PipelineStageRankResolver(
+                physical_stages=physical_stages,
+                virtual_stages=virtual_stages,
+                layout=str(getattr(self, "pipeline_stage_layout", "loop")),
+            )
+        return RuntimeShardingResolver(
+            axis_policy=self.axis_policy,
+            mesh=mesh,
+            stage_rank_resolver=stage_rank_resolver,
+        )
 
     def logical_axis_rules(
         self,

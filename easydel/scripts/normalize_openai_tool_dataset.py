@@ -129,7 +129,9 @@ def _iter_source_rows(
     from datasets import load_dataset
 
     kwargs: dict[str, Any] = {"split": split, "token": token, "streaming": streaming}
-    dataset = load_dataset(source_dataset, config_name, **kwargs) if config_name else load_dataset(source_dataset, **kwargs)
+    dataset = (
+        load_dataset(source_dataset, config_name, **kwargs) if config_name else load_dataset(source_dataset, **kwargs)
+    )
     for idx, row in enumerate(dataset):
         if max_rows is not None and idx >= max_rows:
             break

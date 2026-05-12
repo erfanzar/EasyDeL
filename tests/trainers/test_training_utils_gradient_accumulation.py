@@ -159,6 +159,27 @@ def test_compile_trainer_step_does_not_schedule_full_trainer_steps(monkeypatch):
     assert "batch_argnums" not in captured
 
 
+def test_physical_stage_config_context_restores_virtual_stage_settings():
+    class _Config:
+        pipeline_virtual_stages = 4
+
+    class _Child:
+        config = _Config()
+
+    class _Module:
+        config = _Config()
+        model = _Child()
+
+    module = _Module()
+
+    with training_utils.sync_module_physical_stage_config(module):
+        assert module.config.pipeline_virtual_stages == 1
+        assert module.model.config.pipeline_virtual_stages == 1
+
+    assert module.config.pipeline_virtual_stages == 4
+    assert module.model.config.pipeline_virtual_stages == 4
+
+
 def test_compile_trainer_step_uses_scheduled_wrapper_for_base_training_step(monkeypatch):
     from easydel.trainers.trainer._fn import training_step
 

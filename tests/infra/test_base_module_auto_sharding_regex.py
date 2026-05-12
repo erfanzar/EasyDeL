@@ -116,20 +116,19 @@ class _CompoundModel(_ConfigBypassMixin, EasyDeLBaseModule):
         self.layer = layer_type()
 
 
-def test_resolve_shardings_compacts_layer_indices():
+def test_resolve_shardings_keeps_layer_indices_for_stage_specific_rules():
     model = _DummyModel(config=_DummyConfig(), rngs=spx.Rngs(0))
     rules = model.resolve_shardings_regex()
 
     assert rules, "Expected sharding rules to be generated."
-    assert rules[-1][0] == ".*"
 
     path = "layers/5/weight"
     matching = [(pat, spec) for pat, spec in rules if re.match(pat, path)]
     assert matching, "Expected a regex rule matching layers/5/weight."
-    assert tuple(matching[0][1])[-1] == "tp"
+    assert tuple(matching[0][1].spec)[-1] == "tp"
 
     exact_rule = "^layers/5/weight$"
-    assert all(pat != exact_rule for pat, _ in rules), "Expected compacted regex, not an exact rule."
+    assert all(pat != exact_rule for pat, _ in rules), "Expected metadata path regexes, not a bare exact rule."
 
 
 def test_resolve_shardings_matches_optimizer_prefixed_paths():
@@ -139,7 +138,7 @@ def test_resolve_shardings_matches_optimizer_prefixed_paths():
     for path in ("mu/layers/5/weight", "0/mu/layers/5/weight"):
         matching = [(pat, spec) for pat, spec in rules if re.match(pat, path)]
         assert matching, "Expected a regex rule matching optimizer-prefixed parameter paths."
-        assert tuple(matching[0][1])[-1] == "tp"
+        assert tuple(matching[0][1].spec)[-1] == "tp"
 
 
 def test_metadata_for_layout_uses_spectrax_sharding_for_compound_axes():

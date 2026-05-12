@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import collections
 import collections.abc
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -535,6 +536,50 @@ def sync_module_schedule_config(module: tp.Any, schedule: tp.Any) -> None:
         _sync_schedule_config(getattr(child, "config", None), schedule, set())
 
 
+def _sync_physical_stage_config(
+    config: tp.Any,
+    seen: set[int],
+    changes: list[tuple[tp.Any, tp.Any]],
+) -> None:
+    """Keep auxiliary regular MPMD forwards on physical PP stage markers."""
+    if config is None:
+        return
+    config_id = id(config)
+    if config_id in seen:
+        return
+    seen.add(config_id)
+
+    if hasattr(config, "pipeline_virtual_stages"):
+        changes.append((config, config.pipeline_virtual_stages))
+        config.pipeline_virtual_stages = 1
+
+    for attr_name in ("text_config", "vision_config", "encoder_config", "decoder_config"):
+        _sync_physical_stage_config(getattr(config, attr_name, None), seen, changes)
+
+
+@contextlib.contextmanager
+def sync_module_physical_stage_config(module: tp.Any) -> tp.Iterator[None]:
+    """Temporarily configure auxiliary forwards for physical PP rank markers.
+
+    Scheduled train losses use ``sync_module_schedule_config`` so virtual-stage
+    schedules emit ``pp * V`` logical markers. Auxiliary forwards compiled as a
+    regular ``spx.jit`` do not pass ``schedule=...`` and must therefore emit
+    exactly ``pp`` physical-rank markers. The original config values are
+    restored after the auxiliary call.
+    """
+    changes: list[tuple[tp.Any, tp.Any]] = []
+    _sync_physical_stage_config(getattr(module, "config", None), set(), changes)
+
+    for attr_name in ("model", "base_model", "language_model", "visual"):
+        child = getattr(module, attr_name, None)
+        _sync_physical_stage_config(getattr(child, "config", None), set(), changes)
+    try:
+        yield
+    finally:
+        for config, old_value in reversed(changes):
+            config.pipeline_virtual_stages = old_value
+
+
 def bind_scheduled_module(
     call: ScheduledStepCall,
     tree: tp.Any,
@@ -619,15 +664,15 @@ def prepare_scheduled_reference_outputs(
 
     ref_model = reference_state.model
     ref_model.eval()
-    sync_module_schedule_config(ref_model, call.schedule)
-    constrained_batch = spx.with_sharding_constraint(
-        batch,
-        call.get(partition_spec_field),
-        mesh=ref_model.mesh,
-        ignore_mpmd=True,
-    )
-    ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
-    ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch))
+    with sync_module_physical_stage_config(ref_model):
+        constrained_batch = spx.with_sharding_constraint(
+            batch,
+            call.get(partition_spec_field),
+            mesh=ref_model.mesh,
+            ignore_mpmd=True,
+        )
+        ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
+        ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch))
     for output_key, batch_key in output_to_batch.items():
         batch[batch_key] = ref_out[output_key]
     return batch

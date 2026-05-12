@@ -538,9 +538,11 @@ class EasyDeLLayerStackMixin:
         if not hasattr(hidden_states, "shape"):
             return None
         try:
+            shape = tuple(hidden_states.shape)
+            mode = spx.common_types.MODE_DECODE if len(shape) > 1 and int(shape[1]) == 1 else spx.common_types.MODE_TRAIN
             return self.config.runtime_sharding_resolver.with_mesh(self.config.mesh).resolve(
-                dynamic_axes=spx.common_types.HiddenStateSharding,
-                shape=tuple(hidden_states.shape),
+                axes=spx.common_types.HiddenStateSharding.axes,
+                mode=mode,
             )
         except Exception:
             return None

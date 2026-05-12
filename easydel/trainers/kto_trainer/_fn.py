@@ -44,7 +44,7 @@ from ..training_utils import (
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
     stop_gradient_tree,
-    sync_module_schedule_config,
+    sync_module_physical_stage_config,
     update_metrics,
     update_state_respectfully,
 )
@@ -427,17 +427,17 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
 
     ref_model = reference_state.model
     ref_model.eval()
-    sync_module_schedule_config(ref_model, call.schedule)
-    ref_kl_batch = constrain_scheduled_batch(ref_model, kl_batch, partition_spec)
-    ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
-    ref_out = stop_gradient_tree(ref_forward(ref_model, ref_kl_batch))
+    with sync_module_physical_stage_config(ref_model):
+        ref_kl_batch = constrain_scheduled_batch(ref_model, kl_batch, partition_spec)
+        ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
+        ref_out = stop_gradient_tree(ref_forward(ref_model, ref_kl_batch))
     batch["_reference_kl_logps"] = ref_out["completion_logps"]
 
     policy_model = call.state.model
-    sync_module_schedule_config(policy_model, call.schedule)
-    policy_kl_batch = constrain_scheduled_batch(policy_model, kl_batch, partition_spec)
-    policy_forward = cached_scheduled_auxiliary(forward_fn, policy_model.mesh)
-    policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
+    with sync_module_physical_stage_config(policy_model):
+        policy_kl_batch = constrain_scheduled_batch(policy_model, kl_batch, partition_spec)
+        policy_forward = cached_scheduled_auxiliary(forward_fn, policy_model.mesh)
+        policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
     batch["_policy_kl_logps"] = policy_out["completion_logps"]
     return batch
 

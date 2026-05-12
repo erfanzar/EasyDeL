@@ -39,6 +39,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 from spectrax import with_sharding_constraint
+from spectrax.sharding import named_sharding_for_shape, reshape_with_named_shardings, transpose_with_named_shardings
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -59,6 +60,65 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+
+
+def _chunk_sequence_for_scan(value: Array, chunk_size: int, *, context: str) -> Array:
+    """Reshape ``(B, L, ...)`` to ``(chunks, B, chunk, ...)`` without losing layout."""
+    bsz, seq_len = value.shape[:2]
+    n_chunks = seq_len // chunk_size
+    source_sharding = getattr(value, "sharding", None)
+    source_parts: list[object] | None = None
+    if isinstance(source_sharding, jax.sharding.NamedSharding):
+        source_parts = list(tuple(source_sharding.spec))
+        while len(source_parts) < len(value.shape):
+            source_parts.append(None)
+
+    reshape_axes = (bsz, n_chunks, chunk_size, *value.shape[2:])
+    reshape_spec = None
+    reshape_sharding = None
+    if source_parts is not None:
+        reshape_spec = PartitionSpec(source_parts[0], None, source_parts[1], *source_parts[2 : len(value.shape)])
+        reshape_sharding = named_sharding_for_shape(
+            source_sharding,
+            tuple(int(dim) for dim in reshape_axes),
+            reshape_spec,
+            context=f"{context}:reshape",
+        )
+
+    if isinstance(source_sharding, jax.sharding.NamedSharding) and reshape_sharding is not None:
+        reshaped = reshape_with_named_shardings(
+            value,
+            reshape_axes,
+            in_sharding=source_sharding,
+            out_sharding=reshape_sharding,
+        )
+    else:
+        reshaped = value.reshape(reshape_axes)
+
+    permutation = (1, 0, 2, *range(3, len(reshape_axes)))
+    scan_sharding = None
+    if source_parts is not None:
+        scan_spec = PartitionSpec(None, source_parts[0], source_parts[1], *source_parts[2 : len(value.shape)])
+        scan_shape = tuple(reshape_axes[axis] for axis in permutation)
+        scan_sharding = named_sharding_for_shape(
+            source_sharding,
+            tuple(int(dim) for dim in scan_shape),
+            scan_spec,
+            context=f"{context}:transpose",
+        )
+
+    if isinstance(reshape_sharding, jax.sharding.NamedSharding) and isinstance(
+        scan_sharding, jax.sharding.NamedSharding
+    ):
+        chunked = transpose_with_named_shardings(
+            reshaped,
+            permutation,
+            in_sharding=reshape_sharding,
+            out_sharding=scan_sharding,
+        )
+    else:
+        chunked = reshaped.transpose(permutation)
+    return chunked
 
 
 def _per_token_xent(
@@ -341,7 +401,6 @@ def chunked_distillation_loss(
             labels = jnp.pad(labels, ((0, 0), (0, pad_len)), constant_values=-100)
 
     L_padded = L + pad_len
-    n_chunks = L_padded // chunk_size
 
     mask, safe_labels, has_labels = _build_mask_and_labels(
         attention_mask=attention_mask,
@@ -352,11 +411,12 @@ def chunked_distillation_loss(
         batch_size=B,
     )
 
-    # Reshape to [n_chunks, B, chunk_size, ...] for scanning.
-    s_chunks = student_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3)
-    t_chunks = teacher_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3)
-    m_chunks = mask.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
-    l_chunks = safe_labels.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
+    # Reshape to [n_chunks, B, chunk_size, ...] for scanning while carrying
+    # the incoming layout through the split/transpose.
+    s_chunks = _chunk_sequence_for_scan(student_hidden, chunk_size, context="student_hidden")
+    t_chunks = _chunk_sequence_for_scan(teacher_hidden, chunk_size, context="teacher_hidden")
+    m_chunks = _chunk_sequence_for_scan(mask, chunk_size, context="distillation_mask")
+    l_chunks = _chunk_sequence_for_scan(safe_labels, chunk_size, context="distillation_labels")
 
     _use_hard = use_hard_labels and has_labels
 

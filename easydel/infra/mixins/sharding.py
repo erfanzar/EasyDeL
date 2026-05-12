@@ -390,12 +390,6 @@ class EasyShardingMixin:
                 NamedSharding: A regex-matched sharding, or the replicated
                 fallback for small/scalar/non-array leaves.
             """
-            if (
-                (hasattr(leaf, "shape") and int(numpy.prod(leaf.shape)) < 128)
-                or (len(getattr(leaf, "shape", ())) == 0)
-                or (not hasattr(leaf, "shape"))
-            ):
-                return empty_sharding
             for pattern, sharding in rules:
                 if re.search(pattern, path):
                     out = (
@@ -412,6 +406,12 @@ class EasyShardingMixin:
                             spec=PartitionSpec(*tuple(out.spec)[: leaf.ndim]),
                         )
                     return out
+            if (
+                (hasattr(leaf, "shape") and int(numpy.prod(leaf.shape)) < 128)
+                or (len(getattr(leaf, "shape", ())) == 0)
+                or (not hasattr(leaf, "shape"))
+            ):
+                return empty_sharding
             return empty_sharding
 
         return jax.tree_util.tree_map_with_path(lambda path, leaf: _spec_for(jax_path_to_string(path), leaf), tree)

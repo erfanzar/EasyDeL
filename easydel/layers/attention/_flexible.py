@@ -393,6 +393,7 @@ class FlexibleAttentionModule(spx.Module):
         dropout_prob: float | None = None,
         dropout_rng: tp.Any | None = None,
         deterministic: bool | None = None,
+        output_attentions: bool | None = None,
         precision: lax.PrecisionLike | None = None,
         prevent_cse: bool = True,
         cum_seqlens_q: Int[JArray, "batch_plus_one"] | None = None,  # noqa
@@ -433,6 +434,7 @@ class FlexibleAttentionModule(spx.Module):
             dropout_prob (float, optional): Dropout probability for attention weights. Defaults to None.
             dropout_rng (PRNGKey, optional): PRNG key for dropout. Defaults to None.
             deterministic (bool, optional): If True, disables dropout. Defaults to None (uses self.deterministic).
+            output_attentions (bool, optional): If True, materialize and return attention weights.
             precision (lax.PrecisionLike, optional): JAX precision setting. Defaults to None.
             prevent_cse (bool, optional): Prevent common subexpression elimination. Defaults to True.
             cum_seqlens_q (Array, optional): Cumulative sequence lengths for queries. Defaults to None.
@@ -483,6 +485,11 @@ class FlexibleAttentionModule(spx.Module):
             deterministic_computed = self.deterministic
         else:
             deterministic_computed = deterministic
+
+        if output_attentions is None:
+            output_attentions_computed = bool(getattr(self.config, "output_attentions", False))
+        else:
+            output_attentions_computed = output_attentions
 
         # Use provided softmax_scale or self.softmax_scale
         if softmax_scale is None:
@@ -576,6 +583,19 @@ class FlexibleAttentionModule(spx.Module):
             )
             return ScaledDotProductAttn(metadata=self.metadata)
 
+        def _call_attention(callable_attn: tp.Any, input_kwargs: dict[str, tp.Any]) -> AttentionOutput:
+            call_kwargs = input_kwargs
+            impl_names = _get_impl_names(callable_attn)
+            weight_aware_impls = {
+                AttentionMechanisms.VANILLA.value,
+                AttentionMechanisms.BLOCKSPARSE.value,
+                AttentionMechanisms.SPLASH.value,
+            }
+            if impl_names & weight_aware_impls:
+                call_kwargs = dict(input_kwargs)
+                call_kwargs["return_attention_weights"] = output_attentions_computed
+            return callable_attn(**call_kwargs)
+
         with _attention_mesh_context(self.config):  # pyright: ignore[reportOptionalContextManager]
             input_dict: dict[str, tp.Any] = dict(
                 query=query_states,
@@ -615,10 +635,10 @@ class FlexibleAttentionModule(spx.Module):
                 has_decode_impl: bool = self.impl_decode is not None
                 callable_attn: tp.Any = self.impl_decode if has_decode_impl else self.impl
                 callable_attn = _maybe_route_varlen_multihost_tpu_attention(callable_attn)
-                output = callable_attn(**input_dict)
+                output = _call_attention(callable_attn, input_dict)
             else:
                 callable_attn = _maybe_route_varlen_multihost_tpu_attention(self.impl)
-                output = callable_attn(**input_dict)
+                output = _call_attention(callable_attn, input_dict)
 
         target_dtype: jnp.dtype = self.impl.metadata.runtime_dtype
 
@@ -642,7 +662,9 @@ class FlexibleAttentionModule(spx.Module):
         result = AttentionOutput(
             attention_outputs=jtu.tree_map(cast_to_dtype, output.attention_outputs),
             attention_weights=(
-                jtu.tree_map(cast_to_dtype, output.attention_weights) if output.attention_weights is not None else None
+                jtu.tree_map(cast_to_dtype, output.attention_weights)
+                if output_attentions_computed and output.attention_weights is not None
+                else None
             ),
             cache_view=output.cache_view,
         )

@@ -133,17 +133,25 @@ def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):
 
 def test_init_tx_skips_redundant_device_put_for_already_sharded_slots(monkeypatch, tiny_sharded_llama):
     state = EasyDeLState.create(model=tiny_sharded_llama)
-    original_fastpath = base_state_module.device_put_if_sharding_mismatch
+    original_place_setup = base_state_module.spx.place_setup_tree_with_shardings
     calls = {"matched": 0, "placed": 0}
 
-    def counting_fastpath(leaf, sharding, *, donate=False):
-        if sharding_matches(leaf, sharding):
-            calls["matched"] += 1
-        else:
-            calls["placed"] += 1
-        return original_fastpath(leaf, sharding, donate=donate)
+    def counting_place_setup(tree, shardings, *args, **kwargs):
+        leaves = jax.tree_util.tree_leaves(tree)
+        sharding_leaves = jax.tree_util.tree_leaves(
+            shardings,
+            is_leaf=lambda value: isinstance(value, NamedSharding) or value is None,
+        )
+        for leaf, sharding in zip(leaves, sharding_leaves, strict=False):
+            if sharding is None or not hasattr(leaf, "shape"):
+                continue
+            if sharding_matches(leaf, sharding):
+                calls["matched"] += 1
+            else:
+                calls["placed"] += 1
+        return original_place_setup(tree, shardings, *args, **kwargs)
 
-    monkeypatch.setattr(base_state_module, "device_put_if_sharding_mismatch", counting_fastpath)
+    monkeypatch.setattr(base_state_module.spx, "place_setup_tree_with_shardings", counting_place_setup)
     updated = state.init_tx(optax.adam(1e-3))
 
     assert updated.tx is not None

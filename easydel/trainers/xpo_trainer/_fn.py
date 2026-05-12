@@ -49,7 +49,7 @@ from ..training_utils import (
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
-    sync_module_schedule_config,
+    sync_module_physical_stage_config,
     update_metrics,
     update_state_respectfully,
 )
@@ -519,11 +519,11 @@ def _prepare_xpo_scheduled_batch(call) -> dict[str, tp.Any]:
         raise RuntimeError("XPO scheduled MPMD training requires reference_state.")
     ref_module = reference_state.merge(reference_state.graphstate)
     ref_module.eval()
-    sync_module_schedule_config(ref_module, call.schedule)
-    partition_spec = call.get("partition_spec")
-    batch_for_ref = constrain_scheduled_batch(ref_module, batch, partition_spec)
-    ref_forward = _cached_xpo_reference_forward(ref_module.mesh)
-    ref_on_policy, ref_on_ref = ref_forward(ref_module, batch_for_ref, call.get("logprob_vocab_chunk_size"))
+    with sync_module_physical_stage_config(ref_module):
+        partition_spec = call.get("partition_spec")
+        batch_for_ref = constrain_scheduled_batch(ref_module, batch, partition_spec)
+        ref_forward = _cached_xpo_reference_forward(ref_module.mesh)
+        ref_on_policy, ref_on_ref = ref_forward(ref_module, batch_for_ref, call.get("logprob_vocab_chunk_size"))
     batch["_ref_on_policy"] = jax.lax.stop_gradient(ref_on_policy)
     batch["_ref_on_ref"] = jax.lax.stop_gradient(ref_on_ref)
     return batch

@@ -207,6 +207,8 @@ class BlockSparseAttn(OperationImpl):
                 AttentionOutput: Result produced by the vanilla fallback.
             """
             vanilla_attn = VanillaAttn(self.metadata)
+            fallback_kwargs = dict(ignore)
+            fallback_kwargs["allow_memory_efficient_fallback"] = False
             return vanilla_attn(
                 query=query,
                 key=key,
@@ -218,7 +220,7 @@ class BlockSparseAttn(OperationImpl):
                 sliding_window=sliding_window,
                 causal=causal,
                 cache_metadata=cache_metadata,
-                **ignore,
+                **fallback_kwargs,
             )
 
         def _extract_block_size(

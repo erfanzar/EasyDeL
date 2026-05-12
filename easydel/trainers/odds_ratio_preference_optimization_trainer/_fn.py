@@ -103,7 +103,7 @@ def concatenated_forward(
     """
     if padding_value is None:
         raise ValueError("`padding_value` can not be set as `None` it must be an integer.")
-    model = state.model if isinstance(state, EasyDeLState) else state
+    model = state.model if isinstance(state, EasyDeLState) else getattr(state, "model", state)
 
     # Concatenate inputs from chosen and rejected examples.
     concatenated_batch = concatenated_inputs(batch, is_encoder_decoder)

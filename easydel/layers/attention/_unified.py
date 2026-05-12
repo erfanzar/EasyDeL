@@ -1263,6 +1263,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
         )
 
         if attentions.cache_view is not None:
@@ -1447,6 +1448,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 keys_values=mla_keys_values,
                 keys_pe=mla_keys_pe,
                 softmax_scale=mla_softmax_scale,
+                output_attentions=output_attentions,
             )
 
             # Kernel output: [total_tokens, N, kv_lora_rank]
@@ -1511,6 +1513,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 causal=causal_for_kernel,
                 sliding_window=sliding_window_for_kernel,
                 softmax_aux=softmax_aux,
+                output_attentions=output_attentions,
             )
 
             attn_out = attentions.attention_outputs
@@ -1598,6 +1601,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))

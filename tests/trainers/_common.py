@@ -35,7 +35,9 @@ MODEL_REPO: str = os.environ.get("EASYDEL_RUNTIME_MODEL_REPO", _DEFAULT_MODEL_RE
 
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
 PREFERENCE_SPLIT = os.environ.get("EASYDEL_RUNTIME_DATASET_SPLIT") or (
-    "train[:32]" if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"} else "train[:50%]"
+    "train[:32]"
+    if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+    else "train[:50%]"
 )
 MAX_PROMPT_LENGTH = 256
 MAX_COMPLETION_LENGTH = 256

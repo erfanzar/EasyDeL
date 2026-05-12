@@ -360,14 +360,21 @@ class Registry:
                 currently registered aliases for the category to help the
                 caller spot typos.
         """
+        wakeup_error: Exception | None = None
         if wakeup:
             try:
                 from easydel import inference, infra, kernels, layers, modules, trainers  # noqa  # pyright: ignore[reportUnusedImport]
-            except Exception:
-                ...
+            except Exception as exc:
+                wakeup_error = exc
+                logger.debug("Registry wakeup failed while importing EasyDeL built-ins.", exc_info=True)
         impl_cls = cls.get(category, impl_name)
         if impl_cls is None:
             available = cls.list_implementations(category)
+            if wakeup_error is not None:
+                raise RegistryError(
+                    f"Implementation '{impl_name}' not found in category '{category}' after registry wakeup failed. "
+                    f"Available: {available}. Wakeup error: {type(wakeup_error).__name__}: {wakeup_error}"
+                ) from wakeup_error
             raise RegistryError(
                 f"Implementation '{impl_name}' not found in category '{category}'. Available: {available}"
             )
