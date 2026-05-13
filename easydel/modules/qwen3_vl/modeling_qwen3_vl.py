@@ -935,7 +935,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+        with self.assign_layer_stage(layer_idx=0, total_layers=config.depth):
             self.pos_embed = Embed(
                 num_embeddings=config.num_position_embeddings,
                 features=config.hidden_size,

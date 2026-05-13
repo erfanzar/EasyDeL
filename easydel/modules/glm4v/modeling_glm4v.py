@@ -719,7 +719,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         )
 
         num_positions = int((config.image_size // config.patch_size) ** 2)
-        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+        with self.assign_layer_stage(0, total_layers=config.depth):
             self.pos_embed = Embed(
                 num_embeddings=num_positions,
                 features=config.hidden_size,

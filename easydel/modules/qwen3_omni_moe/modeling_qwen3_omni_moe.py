@@ -1178,7 +1178,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+        with self.assign_layer_stage(0, total_layers=config.depth):
             self.pos_embed = Embed(
                 num_embeddings=config.num_position_embeddings,
                 features=config.hidden_size,
@@ -4306,7 +4306,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
 
         text_config = config.text_config
 
-        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+        with self.assign_layer_stage(0, total_layers=text_config.num_hidden_layers):
             self.embed_tokens = Embed(
                 text_config.vocab_size,
                 text_config.hidden_size,

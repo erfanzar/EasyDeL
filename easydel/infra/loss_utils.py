@@ -381,7 +381,7 @@ class LossConfig:
         chunk_token_size: If set, enables token-dimension chunking with this
             chunk size. Reduces memory for long sequences.
         chunk_block_size: If set, enables blockwise processing with this block
-            size. Alternative memory optimization strategy (default=4096).
+            size. Alternative memory optimization strategy (default=None).
         compute_dtype: Data type for computation. One of "fp32" or "bf16".
             If None, uses the input dtype.
 
@@ -416,7 +416,7 @@ class LossConfig:
     ) = None
     chunk_vocab_size: int | None = None
     chunk_token_size: int | None = None
-    chunk_block_size: int | None = 4096
+    chunk_block_size: int | None = None
     compute_dtype: tp.Literal["fp32", "bf16"] | None = None
 
     def __repr__(self):
@@ -2409,11 +2409,11 @@ def _should_chunk_causal_lm_loss(
     if loss_factor in {"NO_WEIGHT_NUM_REAL_TARGET_TOKENS", "AVERAGE_PER_SEQUENCE"}:
         return False
 
+    if labels.ndim < 2:
+        return False
+
     model_chunk_size = module.config.lmhead_chunksize
     explicit_chunk = token_chunk_size is not None or config.chunk_token_size is not None or model_chunk_size is not None
-    memory_tuned = explicit_chunk or config.chunk_block_size is not None or config.chunk_vocab_size is not None
-    if not memory_tuned or labels.ndim < 2:
-        return False
 
     effective_seq_len = max(1, int(labels.shape[1]) - (1 if config.shift_tokens else 0))
     projected_logit_elements = int(labels.shape[0]) * effective_seq_len * _resolve_module_vocab_size(module)
