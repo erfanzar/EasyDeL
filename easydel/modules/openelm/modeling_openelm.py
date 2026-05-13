@@ -746,13 +746,14 @@ class OpenELMModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.token_embeddings = Embed(
-            config.vocab_size,
-            config.model_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.token_embeddings = Embed(
+                config.vocab_size,
+                config.model_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = _openelm_decoder_layer_block(config)
         self.layers = nn.ModuleList([])
@@ -780,15 +781,16 @@ class OpenELMModel(EasyDeLBaseModule):
         if config.share_input_output_layers:
             self.classifier = None
         else:
-            self.classifier = ColumnParallelLinear(
-                config.model_dim,
-                config.vocab_size,
-                use_bias=False,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-            )
+            with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+                self.classifier = ColumnParallelLinear(
+                    config.model_dim,
+                    config.vocab_size,
+                    use_bias=False,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                )
         self.num_transformer_layers = config.num_transformer_layers
 
     @cached_property

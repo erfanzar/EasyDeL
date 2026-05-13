@@ -190,13 +190,14 @@ class SiglipVisionEmbeddings(spx.Module):
         self.patch_size = config.patch_size
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
-        self.position_embedding = Embed(
-            self.num_positions,
-            self.embed_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.position_embedding = Embed(
+                self.num_positions,
+                self.embed_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
@@ -301,22 +302,24 @@ class SiglipTextEmbeddings(spx.Module):
         """
         embed_dim = config.hidden_size
 
-        self.token_embedding = Embed(
-            config.vocab_size,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.position_embedding = Embed(
-            config.max_position_embeddings,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.token_embedding = Embed(
+                config.vocab_size,
+                embed_dim,
+                embedding_init=jax.nn.initializers.normal(),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.position_embedding = Embed(
+                config.max_position_embeddings,
+                embed_dim,
+                embedding_init=jax.nn.initializers.normal(),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,

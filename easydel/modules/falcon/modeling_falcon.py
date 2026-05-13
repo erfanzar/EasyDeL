@@ -586,13 +586,14 @@ class FalconModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.word_embeddings = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.word_embeddings = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             FalconBlock,
             policy=config.gradient_checkpointing,

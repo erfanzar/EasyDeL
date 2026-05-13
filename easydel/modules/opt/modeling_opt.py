@@ -629,60 +629,65 @@ class OPTDecoder(EasyDeLBaseModule):
         self.padding_idx = self.config.pad_token_id
         self.max_target_positions = self.config.max_position_embeddings
 
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            config.word_embed_proj_dim,
-            embedding_init=jax.nn.initializers.normal(config.init_std),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.word_embed_proj_dim,
+                embedding_init=jax.nn.initializers.normal(config.init_std),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         self.position_offset = offset
         # Use `Embed` directly so HF -> EasyDeL conversion treats this as an embedding
         # (no weight transpose) and maps `*.weight` -> `*.embedding`.
         assert self.config.max_position_embeddings is not None
-        self.embed_positions = Embed(
-            self.config.max_position_embeddings + offset,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(config.init_std),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_positions = Embed(
+                self.config.max_position_embeddings + offset,
+                embed_dim,
+                embedding_init=jax.nn.initializers.normal(config.init_std),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         if self.config.word_embed_proj_dim != self.config.hidden_size:
-            self.project_in = ColumnParallelLinear(
-                self.config.word_embed_proj_dim,
-                self.config.hidden_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            self.project_out = RowParallelLinear(
-                self.config.hidden_size,
-                self.config.word_embed_proj_dim,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
+            with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+                self.project_in = ColumnParallelLinear(
+                    self.config.word_embed_proj_dim,
+                    self.config.hidden_size,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+            with self.assign_layer_stage(self.config.num_hidden_layers - 1, total_layers=self.config.num_hidden_layers):
+                self.project_out = RowParallelLinear(
+                    self.config.hidden_size,
+                    self.config.word_embed_proj_dim,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
 
         else:
             self.project_in = None
             self.project_out = None
 
         if self.config.do_layer_norm_before and not self.config._remove_final_layer_norm:
-            self.final_layer_norm = LayerNorm(
-                self.config.hidden_size,
-                dtype=self.dtype,
-                param_dtype=param_dtype,
-                epsilon=1e-05,
-                rngs=rngs,
-            )
+            with self.assign_layer_stage(self.config.num_hidden_layers - 1, total_layers=self.config.num_hidden_layers):
+                self.final_layer_norm = LayerNorm(
+                    self.config.hidden_size,
+                    dtype=self.dtype,
+                    param_dtype=param_dtype,
+                    epsilon=1e-05,
+                    rngs=rngs,
+                )
         else:
             self.final_layer_norm = None
 

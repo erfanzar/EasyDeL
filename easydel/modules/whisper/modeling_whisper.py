@@ -778,14 +778,15 @@ class WhisperEncoder(EasyDeLBaseModule):
                     )
                 )
 
-        self.embed_positions = Embed(
-            self.config.max_source_positions,
-            self.config.d_model,
-            dtype=self.dtype,
-            embedding_init=sinusoidal_embedding_init,
-            param_dtype=self.param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_positions = Embed(
+                self.config.max_source_positions,
+                self.config.d_model,
+                dtype=self.dtype,
+                embedding_init=sinusoidal_embedding_init,
+                param_dtype=self.param_dtype,
+                rngs=rngs,
+            )
 
         final_layer_idx = max(0, self.config.encoder_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.encoder_layers):
@@ -938,20 +939,22 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            self.config.vocab_size,
-            self.config.d_model,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.embed_positions = Embed(
-            self.config.max_target_positions,
-            self.config.d_model,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                self.config.vocab_size,
+                self.config.d_model,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_positions = Embed(
+                self.config.max_target_positions,
+                self.config.d_model,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             WhisperDecoderLayer,

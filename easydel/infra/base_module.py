@@ -2581,7 +2581,7 @@ class EasyDeLBaseModule(
         w = self.get_embedding().weight.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
 
-    def make_lm_head_fn(self) -> "Callable[[Array], Array]":
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> "Callable[[Array], Array]":
         """Return a trace-safe callable that projects hidden states to logits.
 
         The returned function can safely be called from inside any JAX
@@ -2607,6 +2607,20 @@ class EasyDeLBaseModule(
         Trainers should call this method **once** before entering a
         traced loop and use the returned function inside the loop body.
 
+        Args:
+            vocab_shard_stage: Optional MPMD stage index for the tied-embedding
+                weight reshard.  When set (and the embedding is tied), the
+                resolved ``w = embed.weight.T`` is constrained on that stage's
+                submesh to ``P(None, ("fsdp","sp","tp"))`` -- hidden replicated,
+                vocab over the full intra-stage model-parallel axes.  This is the
+                column-parallel form: the matmul contracts ``hidden=None`` so it
+                emits no all-reduce over the full ``[..., vocab]`` tensor; XLA
+                only all-gathers the small ``hidden=tp`` activation, and
+                downstream log-softmax/KL reductions are tiny per-token
+                all-reduces.  Trainers running on a pipelined mesh should pass
+                the terminal-stage rank so the constraint resolves to that
+                submesh; ``None`` keeps the legacy behaviour (no constraint).
+
         Returns:
             A callable ``fn(hidden_states) -> logits`` that preserves
             all model-specific projection semantics.
@@ -2622,6 +2636,13 @@ class EasyDeLBaseModule(
             False,
         )
         w = self.get_embedding().weight.value.T if tie_embeddings else None
+
+        if w is not None and vocab_shard_stage is not None:
+            w = spx.with_sharding_constraint(
+                w,
+                PartitionSpec(None, ("fsdp", "sp", "tp")),
+                stage=int(vocab_shard_stage),
+            )
 
         _native_forward = getattr(head, "native_forward", None)
 

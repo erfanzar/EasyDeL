@@ -1086,7 +1086,8 @@ class Gemma4VisionEncoder(EasyDeLLayerStackMixin, spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        self.rotary_emb = Gemma4VisionRotaryEmbedding(config=config, dtype=dtype)
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.rotary_emb = Gemma4VisionRotaryEmbedding(config=config, dtype=dtype)
         remat_layer_block = auto_remat(
             Gemma4VisionEncoderLayer,
             policy=config.gradient_checkpointing,
@@ -2787,14 +2788,15 @@ class Gemma4TextModel(EasyDeLBaseModule):
         )
         self.hidden_size = config.hidden_size
 
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            self.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                self.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             Gemma4DecoderLayer,
@@ -2821,29 +2823,32 @@ class Gemma4TextModel(EasyDeLBaseModule):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.embed_tokens_per_layer = Embed(
-                config.vocab_size_per_layer_input,
-                config.num_hidden_layers * config.hidden_size_per_layer_input,
-                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
+            with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+                self.embed_tokens_per_layer = Embed(
+                    config.vocab_size_per_layer_input,
+                    config.num_hidden_layers * config.hidden_size_per_layer_input,
+                    embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    rngs=rngs,
+                )
             self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = ParallelLinear(
-                config.hidden_size,
-                config.num_hidden_layers * config.hidden_size_per_layer_input,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
+            with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+                self.per_layer_model_projection = ParallelLinear(
+                    config.hidden_size,
+                    config.num_hidden_layers * config.hidden_size_per_layer_input,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    rngs=rngs,
+                )
             self.per_layer_model_projection_scale = config.hidden_size**-0.5
-            self.per_layer_projection_norm = Gemma4RMSNorm(
-                config,
-                param_dtype=param_dtype,
-                dim=config.hidden_size_per_layer_input,
-            )
+            with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+                self.per_layer_projection_norm = Gemma4RMSNorm(
+                    config,
+                    param_dtype=param_dtype,
+                    dim=config.hidden_size_per_layer_input,
+                )
 
         # Keep the cached layer-type summary hashable so split graphdefs can
         # flow through static JAX/SpecTrax compilation paths.
@@ -3368,7 +3373,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection preserving Gemma-4 tied-embedding attend path and soft-capping."""
         cap_value = self.config.final_logit_softcapping
         if getattr(self.config, "tie_word_embeddings", False):
@@ -3390,7 +3395,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
 
         else:
             # Untied: delegate to base (native_forward bypass) + add capping.
-            base_fn = super().make_lm_head_fn()
+            base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
             if cap_value is None:
                 return base_fn
 
@@ -3902,9 +3907,9 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             logits = cap * jax.nn.tanh(logits / cap)
         return logits
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Gemma-4 VLM soft-capping."""
-        base_fn = super().make_lm_head_fn()
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         cap_value = getattr(self.config.text_config, "final_logit_softcapping", None)
         if cap_value is None:
             return base_fn

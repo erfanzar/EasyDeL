@@ -51,6 +51,7 @@ from easydel.trainers._logprob_utils import (
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
@@ -72,6 +73,7 @@ def concatenated_forward(
     padding_value: tp.Any,
     max_length: int | None = None,
     logprob_vocab_chunk_size: int | None = None,
+    vocab_shard_stage: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """
     Computes log-probabilities and logits for both chosen and rejected examples by concatenating
@@ -209,6 +211,7 @@ def concatenated_forward(
             token_chunk_size=lmhead_chunksize,
             vocab_chunk_size=logprob_vocab_chunk_size,
             return_correct_counts=True,
+            vocab_shard_stage=vocab_shard_stage,
         )
         token_counts = jnp.maximum(token_counts, 1.0)
         all_log_probs = sum_logps / token_counts
@@ -696,6 +699,7 @@ def _make_orpo_scheduled_loss(call):
         """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
         (
             policy_chosen_logps,
             policy_rejected_logps,
@@ -703,7 +707,7 @@ def _make_orpo_scheduled_loss(call):
             _policy_rejected_logits,
             policy_nll_loss,
             _policy_accuracy,
-        ) = concatenated_forward(module, call_batch)
+        ) = concatenated_forward(module, call_batch, vocab_shard_stage=_terminal_rank)
         losses, *_ = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
         return policy_nll_loss - losses.mean()
 

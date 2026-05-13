@@ -401,15 +401,20 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             return self._logit_cap_feature.apply(logits)
         return logits
 
-    def make_lm_head_fn(self) -> Callable[[Array], Array]:
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> Callable[[Array], Array]:
         """Trace-safe LM-head projection with logit capping.
 
         Extends ``EasyDeLBaseModule.make_lm_head_fn`` by wrapping the
         base projection with :meth:`apply_logit_cap`.  Model subclasses
         that add further post-processing in ``compute_lm_logits`` (e.g.
         logit soft-capping or scaling) should override this method.
+
+        ``vocab_shard_stage`` is forwarded to the base ``make_lm_head_fn`` so
+        the column-parallel reshard of the tied-embedding LM-head weight (see
+        :meth:`easydel.infra.base_module.EasyDeLBaseModule.make_lm_head_fn`)
+        takes effect through this subclass too.
         """
-        base_fn = super().make_lm_head_fn()
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         _cap = self.apply_logit_cap
 
         def _project(hidden_states: Array) -> Array:

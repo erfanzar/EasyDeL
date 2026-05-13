@@ -199,6 +199,19 @@ class DistillationConfig(TrainingArguments):
             )
         },
     )
+    checkpoint_kl_loss: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to wrap the per-chunk KL/CE body of the chunked distillation loss in "
+                "`jax.checkpoint` so each chunk's vocab-sized logits are recomputed during the "
+                "backward pass instead of being kept live. `True` (default) keeps peak memory "
+                "≈ O(B*chunk_size*V) regardless of sequence length. Set `False` to skip the "
+                "recompute (faster backward) at the cost of holding every chunk's logits in "
+                "memory simultaneously — only viable for small effective batch / chunk_size."
+            )
+        },
+    )
 
     def __post_init__(
         self,

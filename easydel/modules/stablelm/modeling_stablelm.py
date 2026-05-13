@@ -625,13 +625,14 @@ class StableLmModel(EasyDeLBaseModule):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             StableLmDecoderLayer,
             policy=config.gradient_checkpointing,

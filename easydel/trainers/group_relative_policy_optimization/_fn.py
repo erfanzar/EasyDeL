@@ -79,6 +79,7 @@ def get_per_token_logps(
     prompt_length,
     model_kwargs=None,
     logprob_vocab_chunk_size: int | None = None,
+    vocab_shard_stage: int | None = None,
 ):
     """Compute per-token log probabilities for generated sequences.
 
@@ -153,6 +154,7 @@ def get_per_token_logps(
             token_chunk_size=lmhead_chunksize,
             vocab_chunk_size=logprob_vocab_chunk_size,
             return_entropy=False,
+            vocab_shard_stage=vocab_shard_stage,
         )
         return token_log_probs
     logits = outputs.logits
@@ -204,6 +206,7 @@ def get_per_token_logps_and_entropies(
     prompt_length,
     model_kwargs=None,
     logprob_vocab_chunk_size: int | None = None,
+    vocab_shard_stage: int | None = None,
 ):
     """Compute per-token log probabilities and entropy for the completion portion.
 
@@ -276,6 +279,7 @@ def get_per_token_logps_and_entropies(
             token_chunk_size=lmhead_chunksize,
             vocab_chunk_size=logprob_vocab_chunk_size,
             return_entropy=True,
+            vocab_shard_stage=vocab_shard_stage,
         )
         return token_log_probs, entropies
     logits = outputs.logits

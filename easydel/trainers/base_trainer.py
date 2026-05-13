@@ -5053,7 +5053,11 @@ class BaseTrainer(BaseTrainerProtocol):
             """Checkpointer callback that serializes trainer state to disk.
 
             Args:
-                dest: Relative checkpoint destination path.
+                dest: Checkpoint destination path. The spectrax ``Checkpointer`` already
+                    composes this from its ``base_path`` (= ``_get_save_directory()``) plus
+                    the per-step subdir, so it is an **absolute** path here. Older
+                    checkpointers may pass a relative subdir, which we still join with the
+                    save directory.
                 mesh: Device mesh (unused, required by checkpointer API).
                 meta: Checkpoint metadata dict provided by the checkpointer. The
                     save-permanence decision from this payload is treated as
@@ -5062,7 +5066,11 @@ class BaseTrainer(BaseTrainerProtocol):
             """
             if isinstance(meta, dict):
                 checkpointer_metadata[0] = dict(meta)
-            full_path = str(self.arguments._get_save_directory() / dest)
+            dest_str = str(dest)
+            if "://" in dest_str or dest_str.startswith("/") or dest_str.startswith("~"):
+                full_path = dest_str
+            else:
+                full_path = str(self.arguments._get_save_directory() / dest)
             saved_directory[0] = self._save_state(
                 state=s,
                 save_directory=full_path,

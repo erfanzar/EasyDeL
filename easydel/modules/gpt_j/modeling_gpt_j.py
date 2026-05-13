@@ -634,14 +634,15 @@ class GPTJModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.embed_dim = config.hidden_size
-        self.wte = Embed(
-            self.config.vocab_size,
-            self.embed_dim,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.wte = Embed(
+                self.config.vocab_size,
+                self.embed_dim,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         self.dropout = nn.Dropout(
             rate=self.config.embd_pdrop,
             rngs=rngs,

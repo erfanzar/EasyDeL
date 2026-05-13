@@ -51,6 +51,7 @@ from .._logprob_utils import compute_token_logps_and_entropies_chunked, resolve_
 from .._shared import apply_paired_truncation, gather_multimodal_kwargs
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
@@ -104,6 +105,7 @@ def _compute_dpo_outputs_from_hidden_states(
     chunk_size: int,
     logprob_vocab_chunk_size: int | None,
     loss_type: LOSS_FN_VARIANTS,
+    vocab_shard_stage: int | None = None,
 ) -> dict[str, Array]:
     """Project DPO hidden states through the LM head chunk-by-chunk across the sequence dimension.
 
@@ -171,7 +173,11 @@ def _compute_dpo_outputs_from_hidden_states(
     batch_size, seq_len = labels.shape
     chunk_size = max(1, min(int(chunk_size), int(seq_len)))
 
-    _lm_head_fn = model.make_lm_head_fn() if hasattr(model, "make_lm_head_fn") else model.compute_lm_logits
+    _lm_head_fn = (
+        model.make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+        if hasattr(model, "make_lm_head_fn")
+        else model.compute_lm_logits
+    )
     _has_prepare = hasattr(model, "prepare_lm_head_inputs")
 
     def _project_chunk(chunk_hidden_states: Array) -> Array:
@@ -937,6 +943,7 @@ def concatenated_forward(
     aux_loss_enabled: bool = False,
     loss_type: str = "sigmoid",
     logprob_vocab_chunk_size: int | None = None,
+    vocab_shard_stage: int | None = None,
 ) -> dict[str, Array]:
     """
     Runs the model on concatenated chosen/rejected inputs for efficiency.
@@ -1057,6 +1064,7 @@ def concatenated_forward(
             chunk_size=lmhead_chunksize,
             logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             loss_type=loss_type,
+            vocab_shard_stage=vocab_shard_stage,
         )
     else:
         if logits is None:
@@ -1376,7 +1384,8 @@ def _make_dpo_scheduled_loss(call):
         """
         module = bind_scheduled_module(call, tree)
         batch = constrain_scheduled_batch(module, batch, partition_spec)
-        model_output = concatenated_forward_fn(module, batch)
+        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+        model_output = concatenated_forward_fn(module, batch, vocab_shard_stage=_terminal_rank)
 
         chosen_logps = model_output["chosen_logps"]
         rejected_logps = model_output["rejected_logps"]

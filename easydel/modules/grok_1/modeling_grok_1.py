@@ -704,13 +704,14 @@ class Grok1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             Grok1DecoderLayer,
@@ -1097,9 +1098,9 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         lm_logits = lm_logits * self.output_multiplier_scale
         return lm_logits
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Grok-1 output multiplier scaling."""
-        base_fn = super().make_lm_head_fn()
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         scale = self.output_multiplier_scale
 
         def _project(hidden_states):

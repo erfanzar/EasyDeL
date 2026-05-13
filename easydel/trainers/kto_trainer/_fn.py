@@ -425,18 +425,23 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
     kl_batch = _build_kl_batch(batch)
     partition_spec = call.get("partition_spec")
 
+    _kl_microbatches = getattr(call.schedule, "microbatches", 1)
     ref_model = reference_state.model
     ref_model.eval()
     with sync_module_physical_stage_config(ref_model):
         ref_kl_batch = constrain_scheduled_batch(ref_model, kl_batch, partition_spec)
-        ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
+        ref_forward = cached_scheduled_auxiliary(
+            forward_fn, ref_model.mesh, microbatches=_kl_microbatches, batch_argnums=1
+        )
         ref_out = stop_gradient_tree(ref_forward(ref_model, ref_kl_batch))
     batch["_reference_kl_logps"] = ref_out["completion_logps"]
 
     policy_model = call.state.model
     with sync_module_physical_stage_config(policy_model):
         policy_kl_batch = constrain_scheduled_batch(policy_model, kl_batch, partition_spec)
-        policy_forward = cached_scheduled_auxiliary(forward_fn, policy_model.mesh)
+        policy_forward = cached_scheduled_auxiliary(
+            forward_fn, policy_model.mesh, microbatches=_kl_microbatches, batch_argnums=1
+        )
         policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
     batch["_policy_kl_logps"] = policy_out["completion_logps"]
     return batch

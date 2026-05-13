@@ -468,13 +468,14 @@ class PhiModel(EasyDeLBaseModule):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         self.embed_dropout = nn.Dropout(config.embd_pdrop, rngs=rngs)
         remat_layer_block = auto_remat(
             PhiDecoderLayer,
@@ -497,13 +498,14 @@ class PhiModel(EasyDeLBaseModule):
                 )
         if self.config.scan_layers and self._pipeline_stage_count() == 1:
             self.layers = self.layers.stack()
-        self.final_layernorm = LayerNorm(
-            config.hidden_size,
-            epsilon=config.layer_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            self.final_layernorm = LayerNorm(
+                config.hidden_size,
+                epsilon=config.layer_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     @functools.cached_property
     def frequencies(self):

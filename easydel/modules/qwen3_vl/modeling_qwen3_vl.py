@@ -935,13 +935,14 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.pos_embed = Embed(
-            num_embeddings=config.num_position_embeddings,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.pos_embed = Embed(
+                num_embeddings=config.num_position_embeddings,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         self.spatial_merge_size = config.spatial_merge_size
         head_dim = config.hidden_size // config.num_heads
@@ -1516,14 +1517,15 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             Qwen3VLTextDecoderLayer,

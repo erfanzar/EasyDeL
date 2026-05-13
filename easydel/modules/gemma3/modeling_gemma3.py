@@ -620,14 +620,15 @@ class Gemma3TextModel(EasyDeLBaseModule):
         )
         self.hidden_size = self.config.hidden_size
 
-        self.embed_tokens = Embed(
-            self.config.vocab_size,
-            self.hidden_size,
-            embedding_init=jax.jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                self.config.vocab_size,
+                self.hidden_size,
+                embedding_init=jax.jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             Gemma3DecoderLayer,
             policy=config.gradient_checkpointing,
@@ -1035,9 +1036,9 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Gemma-3 soft-capping."""
-        base_fn = super().make_lm_head_fn()
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         cap_value = self.config.final_logit_softcapping
         if cap_value is None:
             return base_fn
@@ -1913,7 +1914,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Gemma-3 VLM soft-capping (bypasses nn.remat)."""
         _native = self.lm_head.native_forward
         cap_value = self.config.get_text_config().final_logit_softcapping

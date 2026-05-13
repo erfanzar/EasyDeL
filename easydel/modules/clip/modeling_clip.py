@@ -178,14 +178,15 @@ class CLIPVisionEmbeddings(spx.Module):
 
         self.num_patches = (image_size // patch_size) ** 2
         num_positions = self.num_patches + 1
-        self.position_embedding = Embed(
-            num_positions,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.position_embedding = Embed(
+                num_positions,
+                embed_dim,
+                embedding_init=jax.nn.initializers.normal(),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(self, pixel_values):
         """Create vision embeddings from pixel values.
@@ -244,22 +245,24 @@ class CLIPTextEmbeddings(spx.Module):
         """
         embed_dim = config.hidden_size
 
-        self.token_embedding = Embed(
-            config.vocab_size,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.position_embedding = Embed(
-            config.max_position_embeddings,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.token_embedding = Embed(
+                config.vocab_size,
+                embed_dim,
+                embedding_init=jax.nn.initializers.normal(),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.position_embedding = Embed(
+                config.max_position_embeddings,
+                embed_dim,
+                embedding_init=jax.nn.initializers.normal(),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(self, input_ids, position_ids):
         """Create text embeddings from token IDs.

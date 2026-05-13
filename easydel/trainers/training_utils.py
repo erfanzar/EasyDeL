@@ -36,10 +36,12 @@ import contextlib
 import dataclasses
 import functools
 import inspect
+import time
 import typing as tp
 import warnings
 
 import jax
+import numpy as np
 import spectrax as spx
 from jax import lax
 from jax import numpy as jnp
@@ -49,7 +51,9 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.infra.sharding import MeshLike
-from easydel.utils.helpers import check_bool_flag
+from easydel.utils.helpers import check_bool_flag, get_logger
+
+logger = get_logger("EasyDeL-ScheduledTrainerStep")
 
 if tp.TYPE_CHECKING:
     from easydel.infra.etils import MpMdSchedulers
@@ -57,6 +61,7 @@ if tp.TYPE_CHECKING:
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 _UNSPECIFIED = object()
+
 
 QuantizationMode = tp.Literal[
     "nf4",
@@ -144,6 +149,64 @@ _ScheduledLossFn = tp.Callable[[tp.Any, collections.abc.Mapping[str, jax.Array]]
 _ScheduledValueAndGradFn = tp.Callable[[tp.Any, dict], tuple[jax.Array, tp.Any]]
 _SCHEDULED_LOSS_ADAPTERS: dict[tuple[str, str], ScheduledLossAdapter] = {}
 _SCHEDULED_AUXILIARY_CACHE: dict[tuple[int, int], tp.Callable[..., tp.Any]] = {}
+_SCHEDULED_AUX_PIPELINE_EXECUTOR: list[tp.Any] = []
+
+
+def _scheduled_aux_pipeline_executor() -> tp.Any:
+    """Return a cached :class:`spx.MpmdPipelineExecutor` for the auxiliary (teacher/ref) forward.
+
+    Used by :func:`cached_scheduled_auxiliary` to wavefront-overlap the per-microbatch
+    forward-only auxiliary MPMD pipeline. ``use_workers=True`` runs one resident daemon worker
+    per physical pipeline rank so disjoint stage submeshes actually execute concurrently --
+    ``use_workers=False`` (the previous setting) had the wavefront loop ``wait_stage(...)``-block
+    on each stage's device output before building the next stage's inputs, so the host could
+    never get ahead and the "pipeline" ran ~serially (~196s for a forward-only pass that should
+    be ~10-25s). ``dispatch_many`` still wires its deterministic ordered-transport gate through
+    to the workers, so multi-controller pair-mesh collectives stay in one global launch order.
+    Set ``EASYDEL_AUX_PIPELINE_INLINE=1`` to force the old inline (single-thread) executor.
+    Returns ``None`` if the executor cannot be constructed (then the caller falls back to
+    plain sequential ``spx.jit`` calls).
+    """
+    if _SCHEDULED_AUX_PIPELINE_EXECUTOR:
+        return _SCHEDULED_AUX_PIPELINE_EXECUTOR[0]
+    use_workers = not check_bool_flag("EASYDEL_AUX_PIPELINE_INLINE", default=False)
+    executor = None
+    try:
+        executor = spx.MpmdPipelineExecutor(use_workers=use_workers)
+        try:
+            if int(jax.process_index()) == 0:
+                logger.info("cached_scheduled_auxiliary: MpmdPipelineExecutor(use_workers=%s)", use_workers)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            executor = spx.MpmdPipelineExecutor(use_workers=False)
+        except Exception:
+            executor = None
+    _SCHEDULED_AUX_PIPELINE_EXECUTOR.append(executor)
+    return executor
+
+
+_SCHED_SECTION_LOG_BUDGET = [36]
+
+
+def _log_sched_section(label: str, t0: float, block_on: tp.Any = None) -> None:
+    """Log how long a scheduled-step section took (wall, after a device sync on ``block_on``)."""
+    if _SCHED_SECTION_LOG_BUDGET[0] <= 0:
+        return
+    if block_on is not None:
+        try:
+            jax.block_until_ready(block_on)
+        except Exception:
+            pass
+    elapsed = time.perf_counter() - t0
+    try:
+        if int(jax.process_index()) != 0:
+            return
+    except Exception:
+        return
+    _SCHED_SECTION_LOG_BUDGET[0] -= 1
+    logger.info("scheduled_training_step section %-34s : %.3fs", label, elapsed)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -358,6 +421,263 @@ class _ScheduledValueAndGradCompiler:
         self.cached_key = key
         self.cached_value_and_grad = value_and_grad
         return value_and_grad
+
+
+def _make_eformer_stage_local_apply_fn(
+    tx: tp.Any,
+) -> tp.Callable[..., None]:
+    """Build a SpectraX-compatible ``apply_fn`` from an eFormer stage-local optimizer.
+
+    The returned callable matches the contract ``sxvalue_and_grad_and_apply`` expects:
+    ``apply_fn(rank, *, grad_accums, state)`` mutates ``state["new_params_buf"][rank]`` and
+    ``state["new_opt_state_buf"][rank]`` with the optimizer-updated full params/opt-state
+    trees (only the leaves owned by ``rank`` are actually updated; leaves owned by other
+    ranks are passed through unchanged, so the default last-write-wins assembler at the
+    runtime exit yields a correct merged tree).
+
+    The work-per-rank goes through the optimizer's ``apply_gradients_stage_local`` method
+    (eFormer's stage-local AdamW path -- the batched per-submesh kernel lives directly in
+    ``eformer.optimizers._stage_local._apply_adamw_stage_local`` and is the default
+    implementation, not a monkey-patch). That kernel does the right thing when handed a
+    *sparse* gradient tree (leaves owned by other ranks set to ``None``): the per-submesh
+    grouping naturally collapses to one group for the rank's submesh, and ``None``-grad
+    leaves are carried through unchanged.
+
+    Args:
+        tx: The optimizer state's ``tx`` attribute -- must expose
+            ``apply_gradients_stage_local(params, grads, opt_state, learning_rate_fn,
+            delete_grads)``. eFormer's chained AdamW already does.
+
+    Returns:
+        A callable suitable for passing as ``apply_fn`` to
+        :func:`spectrax.sxvalue_and_grad_and_apply`.
+
+    Raises:
+        RuntimeError: At call time, if the optimizer does not implement
+            ``apply_gradients_stage_local``.
+    """
+    apply_stage_local = getattr(tx, "apply_gradients_stage_local", None)
+    if not callable(apply_stage_local):
+        raise RuntimeError(
+            "Fused stage-local apply requires an optimizer with "
+            "`apply_gradients_stage_local` (use an eFormer chained AdamW)."
+        )
+
+    is_leaf_none = lambda x: x is None  # noqa: E731
+
+    def apply_fn(rank: int, *, grad_accums: dict, state: dict) -> None:
+        """Per-rank stage-local optimizer apply.
+
+        Builds a sparse gradient tree where only leaves owned by ``rank`` carry their
+        gradient (other leaves are None), then calls the optimizer's
+        ``apply_gradients_stage_local`` with the full params / sparse grads / full
+        opt_state. The kernel updates only the leaves with non-None grads (i.e. this
+        rank's leaves), leaving everything else identity-passed-through. The result
+        is the full new_params / new_opt_state tree with *only this rank's leaves
+        updated*; the assembler in :func:`_assemble_fused_apply_outputs` walks every
+        rank's tree and merges per-leaf-by-owner to produce the correct global
+        new_params / new_opt_state.
+
+        Args:
+            rank: Physical pipeline rank this apply unit owns.
+            grad_accums: SpectraX dispatcher's ``flat_idx -> accumulated grad``
+                map. May contain entries from other ranks (if they happened to
+                finish bwd before this rank) -- we filter by ``leaf_stage_owners``.
+            state: Mutable apply context dict from
+                ``sxvalue_and_grad_and_apply``. Reads ``params``, ``opt_state``,
+                ``learning_rate_fn``, ``leaf_stage_owners``. Writes
+                ``new_params_buf[rank]`` and ``new_opt_state_buf[rank]``.
+        """
+        params = state["params"]
+        opt_state = state["opt_state"]
+        learning_rate_fn = state["learning_rate_fn"]
+        leaf_stage_owners: dict = state["leaf_stage_owners"]
+        treedef = tu.tree_structure(params, is_leaf=is_leaf_none)
+        p_flat = tu.tree_leaves(params, is_leaf=is_leaf_none)
+        sparse_g_flat: list = []
+        for flat_idx in range(len(p_flat)):
+            owner = leaf_stage_owners.get(flat_idx)
+            if owner is None or owner == rank:
+                sparse_g_flat.append(grad_accums.get(flat_idx))
+            else:
+                sparse_g_flat.append(None)
+        sparse_grads = tu.tree_unflatten(treedef, sparse_g_flat)
+        new_params, new_opt_state = apply_stage_local(
+            params=params,
+            grads=sparse_grads,
+            opt_state=opt_state,
+            learning_rate_fn=learning_rate_fn,
+            delete_grads=False,
+        )
+        state["new_params_buf"][rank] = new_params
+        state["new_opt_state_buf"][rank] = new_opt_state
+
+    return apply_fn
+
+
+def _assemble_fused_apply_outputs(apply_context: dict) -> tuple[tp.Any, tp.Any]:
+    """Merge per-rank fused apply outputs into a single new_params / new_opt_state.
+
+    Each rank's apply_fn writes the full new_params / new_opt_state tree to its
+    buffer, but only the leaves owned by that rank are actually updated -- the
+    other leaves are the original input values (eFormer's stage-local kernel
+    skips leaves with None grads). The correct merged tree picks, for each leaf
+    position, the array from the buffer of the rank that owns that leaf.
+
+    Args:
+        apply_context: The mutable context dict from
+            :func:`spectrax.sxvalue_and_grad_and_apply`. Reads
+            ``new_params_buf``, ``new_opt_state_buf``, ``leaf_stage_owners``,
+            ``params`` (treedef template), ``opt_state`` (treedef template).
+
+    Returns:
+        ``(new_params, new_opt_state)`` -- the merged trees.
+
+    Raises:
+        RuntimeError: If no rank wrote into the buffers (apply_fn never fired).
+    """
+    new_params_buf = apply_context["new_params_buf"]
+    new_opt_state_buf = apply_context["new_opt_state_buf"]
+    leaf_stage_owners: dict = apply_context["leaf_stage_owners"]
+    if not new_params_buf or not new_opt_state_buf:
+        raise RuntimeError(
+            "Fused stage-local apply produced empty per-rank output buffers. "
+            "This indicates the apply units never fired -- check that the schedule "
+            "has enough physical ranks to host the model and that apply_jits got "
+            "populated for every rank."
+        )
+    is_leaf_none = lambda x: x is None  # noqa: E731
+
+    template_rank = next(iter(new_params_buf))
+    template_params = new_params_buf[template_rank]
+    p_treedef = tu.tree_structure(template_params, is_leaf=is_leaf_none)
+    p_flats = {r: tu.tree_leaves(new_params_buf[r], is_leaf=is_leaf_none) for r in new_params_buf}
+    n_leaves = len(p_flats[template_rank])
+    merged_p: list = []
+    for i in range(n_leaves):
+        owner = leaf_stage_owners.get(i, template_rank)
+        source_rank = owner if owner in p_flats else template_rank
+        merged_p.append(p_flats[source_rank][i])
+    new_params = tu.tree_unflatten(p_treedef, merged_p)
+
+    template_opt_state = new_opt_state_buf[template_rank]
+    os_treedef = tu.tree_structure(template_opt_state, is_leaf=is_leaf_none)
+    os_flats = {r: tu.tree_leaves(new_opt_state_buf[r], is_leaf=is_leaf_none) for r in new_opt_state_buf}
+    template_os_flat = os_flats[template_rank]
+    n_os_leaves = len(template_os_flat)
+    merged_os: list = []
+    for i in range(n_os_leaves):
+        leaf_template = template_os_flat[i]
+        owner_rank = None
+        sharding = getattr(leaf_template, "sharding", None)
+        if sharding is not None:
+            try:
+                template_devices = sharding.device_set
+            except Exception:
+                template_devices = None
+            if template_devices is not None:
+                rank_submeshes = apply_context.get("rank_submeshes", ())
+                for r in new_opt_state_buf:
+                    if r >= len(rank_submeshes):
+                        continue
+                    submesh = rank_submeshes[r]
+                    devices = getattr(submesh, "devices", None)
+                    if devices is None:
+                        continue
+                    device_set = set(devices.flat) if hasattr(devices, "flat") else set(devices)
+                    if device_set == template_devices:
+                        owner_rank = r
+                        break
+        if owner_rank is None:
+            owner_rank = template_rank
+        source_rank = owner_rank if owner_rank in os_flats else template_rank
+        merged_os.append(os_flats[source_rank][i])
+    new_opt_state = tu.tree_unflatten(os_treedef, merged_os)
+
+    return new_params, new_opt_state
+
+
+@dataclasses.dataclass
+class _ScheduledValueAndGradAndApplyCompiler:
+    """Per-step lazy compiler for ``spx.sxvalue_and_grad_and_apply``.
+
+    Mirror of :class:`_ScheduledValueAndGradCompiler` but caches the fused
+    value-and-grad-and-apply callable instead of the plain value-and-grad.
+    Caller invokes the returned callable as
+    ``fused_step(tree, batch, opt_state, learning_rate_fn, apply_fn)``
+    and gets back ``(loss, new_tree, new_opt_state)`` -- the optimizer apply has
+    already run inside the MPMD schedule as per-rank APPLY units.
+
+    Attributes:
+        mesh: The SpectraX/JAX mesh the compiled loss runs on.
+        schedule: The MPMD schedule.
+        batch_argnums: Positional indices of the per-microbatch arguments.
+        adapter: The trainer-specific :class:`ScheduledLossAdapter`.
+        cached_key: Last adapter cache key (``None`` until first compile).
+        cached_fused: Last compiled fused callable.
+    """
+
+    mesh: MeshLike
+    schedule: tp.Any
+    batch_argnums: int | tp.Sequence[int] | None
+    adapter: ScheduledLossAdapter
+    cached_key: tuple[tp.Any, ...] | None = None
+    cached_fused: tp.Callable[..., tp.Any] | None = None
+
+    def get(self, call: ScheduledStepCall) -> tp.Callable[..., tp.Any]:
+        """Return a cached fused value-and-grad-and-apply callable for ``call``.
+
+        On cache miss, compiles a fresh ``spx.jit``-wrapped loss with the
+        configured schedule and wraps it in
+        :func:`spectrax.sxvalue_and_grad_and_apply`.
+
+        Args:
+            call: Current scheduled step call context.
+
+        Returns:
+            A callable ``(tree, batch, opt_state, learning_rate_fn, apply_fn)
+            -> (loss, new_tree, new_opt_state)``.
+        """
+        key = self.adapter.make_cache_key(call)
+        if self.cached_fused is not None and self.cached_key == key:
+            return self.cached_fused
+
+        loss_fn = self.adapter.make_loss(call)
+        scheduled_loss = spx.jit(
+            loss_fn,
+            mesh=self.mesh,
+            schedule=self.schedule,
+            static_argnums=(),
+            batch_argnums=self.batch_argnums,
+        )
+        scheduled_vga = spx.sxvalue_and_grad_and_apply(scheduled_loss, argnums=0)
+
+        def fused_step(tree, batch, opt_state, learning_rate_fn, apply_fn):
+            """Run the scheduled fused value-and-grad-and-apply.
+
+            Args:
+                tree: The state pytree to differentiate against and update.
+                batch: Per-microbatch input dict.
+                opt_state: Optimizer state pytree matching ``tree``.
+                learning_rate_fn: Optional optax schedule callback.
+                apply_fn: Per-rank apply callable (see
+                    :func:`_make_eformer_stage_local_apply_fn`).
+
+            Returns:
+                ``(loss, new_tree, new_opt_state)``.
+            """
+            return scheduled_vga(
+                tree,
+                batch,
+                apply_fn=apply_fn,
+                opt_state=opt_state,
+                learning_rate_fn=learning_rate_fn,
+                assemble_outputs=_assemble_fused_apply_outputs,
+            )
+
+        self.cached_key = key
+        self.cached_fused = fused_step
+        return fused_step
 
 
 def filter_kwargs_for_callable(
@@ -611,15 +931,166 @@ def constrain_scheduled_batch(
     )
 
 
-def cached_scheduled_auxiliary(fn: tp.Callable[..., tp.Any], mesh: MeshLike) -> tp.Callable[..., tp.Any]:
-    """Return a cached regular ``spx.jit`` for non-gradient auxiliary forwards."""
+def _aux_leading_batch_size(value: tp.Any) -> int | None:
+    """Return the leading-axis size of the first array leaf in ``value``, if any."""
 
-    key = (id(fn), id(mesh))
+    for leaf in tu.tree_leaves(value):
+        shape = getattr(leaf, "shape", None)
+        if shape is not None and len(shape) > 0:
+            return int(shape[0])
+    return None
+
+
+def _aux_slice_tree_leading_axis(value: tp.Any, start: int, size: int, full: int) -> tp.Any:
+    """Slice every array leaf of ``value`` whose leading axis equals ``full`` to ``[start:start+size]``."""
+
+    def _slice(leaf: tp.Any) -> tp.Any:
+        shape = getattr(leaf, "shape", None)
+        if shape is None or len(shape) == 0 or int(shape[0]) != full:
+            return leaf
+        return lax.slice_in_dim(leaf, start, start + size, axis=0)
+
+    return tu.tree_map(_slice, value)
+
+
+def _aux_concat_microbatch_outputs(microbatch_outputs: list[tp.Any], chunk: int) -> tp.Any:
+    """Concatenate per-microbatch output trees along axis 0 for leaves of leading size ``chunk``.
+
+    Each microbatch already produced a ``(chunk, ...)`` shard living on its stage submesh; the
+    concatenation stitches them back into a ``(microbatches * chunk, ...)`` array that stays sharded
+    over the same submesh (axis-0 inputs are sharded over the data axis, so the concat output is too).
+    Leaves whose leading axis is not ``chunk`` (scalars, metadata) are passed through from the first
+    microbatch unchanged.
+    """
+
+    def _concat(*leaves: tp.Any) -> tp.Any:
+        first = leaves[0]
+        shape = getattr(first, "shape", None)
+        if shape is None or len(shape) == 0 or int(shape[0]) != chunk:
+            return first
+        return jnp.concatenate(leaves, axis=0)
+
+    return tu.tree_map(_concat, *microbatch_outputs)
+
+
+def cached_scheduled_auxiliary(
+    fn: tp.Callable[..., tp.Any],
+    mesh: MeshLike,
+    *,
+    microbatches: int = 1,
+    batch_argnums: int | tp.Sequence[int] = 1,
+) -> tp.Callable[..., tp.Any]:
+    """Return a cached regular ``spx.jit`` for non-gradient auxiliary (teacher/reference) forwards.
+
+    When ``microbatches > 1`` the returned wrapper runs the compiled MPMD forward once per
+    schedule-sized leading-axis chunk of the batched positional argument(s) named by
+    ``batch_argnums`` and concatenates the real array outputs. This mirrors the
+    per-microbatch contract of the scheduled training step: the auxiliary forward is a *true*
+    MPMD pipeline (the same per-rank stages, dispatched per microbatch), and no full-batch
+    activation or hidden state is ever materialized — the largest live tensor inside the
+    forward is ``(global_batch / microbatches, ...)``, and the reassembled output stays
+    sharded over its producing stage submesh.
+
+    ``microbatches <= 1`` (no MPMD schedule, or a 1-microbatch schedule) keeps the plain
+    single-call ``spx.jit`` behavior.
+    """
+
+    batch_argnums_t: tuple[int, ...]
+    if isinstance(batch_argnums, int):
+        batch_argnums_t = (batch_argnums,)
+    else:
+        batch_argnums_t = tuple(int(i) for i in batch_argnums)
+    microbatches = max(1, int(microbatches))
+
+    key = (id(fn), id(mesh), microbatches, batch_argnums_t)
     cached = _SCHEDULED_AUXILIARY_CACHE.get(key)
-    if cached is None:
-        cached = spx.jit(fn, mesh=mesh)
-        _SCHEDULED_AUXILIARY_CACHE[key] = cached
-    return cached
+    if cached is not None:
+        return cached
+
+    compiled = spx.jit(fn, mesh=mesh)
+    if microbatches <= 1 or not batch_argnums_t:
+        _SCHEDULED_AUXILIARY_CACHE[key] = compiled
+        return compiled
+
+    @functools.wraps(fn)
+    def _microbatched(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        batch_sizes: list[int] = []
+        for argnum in batch_argnums_t:
+            if argnum >= len(args):
+                raise ValueError(
+                    f"cached_scheduled_auxiliary: batch_argnums contains {argnum} but only "
+                    f"{len(args)} positional argument(s) were passed."
+                )
+            size = _aux_leading_batch_size(args[argnum])
+            if size is not None:
+                batch_sizes.append(size)
+        if not batch_sizes:
+            return compiled(*args, **kwargs)
+        batch_size = batch_sizes[0]
+        if any(s != batch_size for s in batch_sizes):
+            raise ValueError(
+                f"cached_scheduled_auxiliary: batched arguments must share a leading size; got {tuple(batch_sizes)}."
+            )
+        if batch_size % microbatches != 0:
+            raise ValueError(
+                f"cached_scheduled_auxiliary: batch size {batch_size} is not divisible by microbatches {microbatches}."
+            )
+        chunk = batch_size // microbatches
+        arg_batches: list[tuple[tp.Any, ...]] = []
+        for mb in range(microbatches):
+            start = mb * chunk
+            sliced = list(args)
+            for argnum in batch_argnums_t:
+                sliced[argnum] = _aux_slice_tree_leading_axis(sliced[argnum], start, chunk, batch_size)
+            arg_batches.append(tuple(sliced))
+        microbatch_outputs: list[tp.Any] | None = None
+        used_wavefront = False
+        if not kwargs:
+            executor = _scheduled_aux_pipeline_executor()
+            if executor is not None:
+                try:
+                    microbatch_outputs = list(executor.dispatch_many(compiled, arg_batches))
+                    used_wavefront = True
+                except Exception as exc:
+                    if _SCHED_SECTION_LOG_BUDGET[0] > 0:
+                        logger.info(
+                            "cached_scheduled_auxiliary: dispatch_many unavailable (%s); using sequential calls", exc
+                        )
+                    microbatch_outputs = None
+        if microbatch_outputs is None:
+            microbatch_outputs = [compiled(*ab, **kwargs) for ab in arg_batches]
+        if _SCHED_SECTION_LOG_BUDGET[0] > 0:
+            try:
+                if int(jax.process_index()) == 0:
+                    logger.info(
+                        "cached_scheduled_auxiliary: %d microbatch(es) via %s",
+                        microbatches,
+                        "MpmdPipelineExecutor.dispatch_many (wavefront)"
+                        if used_wavefront
+                        else "sequential spx.jit calls",
+                    )
+                    if used_wavefront:
+                        st = getattr(executor, "last_stats", None)
+                        if st is not None:
+                            logger.info(
+                                "  dispatch_many stats: stage_launches=%s queue_wait=%.2fs dispatch=%.2fs "
+                                "submit=%.2fs prepare=%.2fs assemble=%.2fs | per-stage assemble_ms=%s execute_ms=%s submit_ms=%s",
+                                getattr(st, "stage_launches", None),
+                                getattr(st, "queue_wait_time", 0.0) or 0.0,
+                                getattr(st, "stage_dispatch_time", 0.0) or 0.0,
+                                getattr(st, "submit_time", 0.0) or 0.0,
+                                getattr(st, "prepare_time", 0.0) or 0.0,
+                                getattr(st, "assemble_time", 0.0) or 0.0,
+                                [round(x) for x in (getattr(st, "stage_assemble_times_ms", ()) or ())],
+                                [round(x) for x in (getattr(st, "stage_execute_times_ms", ()) or ())],
+                                [round(x) for x in (getattr(st, "stage_submit_times_ms", ()) or ())],
+                            )
+            except Exception:
+                pass
+        return _aux_concat_microbatch_outputs(microbatch_outputs, chunk)
+
+    _SCHEDULED_AUXILIARY_CACHE[key] = _microbatched
+    return _microbatched
 
 
 def stop_gradient_tree(value: tp.Any) -> tp.Any:
@@ -671,7 +1142,12 @@ def prepare_scheduled_reference_outputs(
             mesh=ref_model.mesh,
             ignore_mpmd=True,
         )
-        ref_forward = cached_scheduled_auxiliary(forward_fn, ref_model.mesh)
+        ref_forward = cached_scheduled_auxiliary(
+            forward_fn,
+            ref_model.mesh,
+            microbatches=getattr(call.schedule, "microbatches", 1),
+            batch_argnums=1,
+        )
         ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch))
     for output_key, batch_key in output_to_batch.items():
         batch[batch_key] = ref_out[output_key]
@@ -1486,6 +1962,81 @@ def _scheduled_step_name(fn: tp.Callable[..., tp.Any]) -> str:
     return name or module or type(fn).__name__
 
 
+def _scheduled_terminal_stage_rank(module: tp.Any, schedule: tp.Any) -> int | None:
+    """Physical MPMD rank that hosts the terminal (loss) pipeline stage, or ``None``.
+
+    Used by scheduled-loss closures so model-side ``spx.with_sharding_constraint``
+    calls (e.g. inside :func:`module.make_lm_head_fn` or chunked-CE projectors)
+    can name the right stage submesh. A bare constraint there would resolve
+    per-process on a multi-stage mesh and miscompile, since the loss runs
+    outside any ``spx.assign_stage`` context.
+
+    Returns ``None`` when there is no multi-stage pipeline (single-rank,
+    no mesh, or any inspection failure) -- callers should treat that as
+    "no constraint" (safe no-op) rather than a miscompile.
+    """
+    try:
+        mesh = getattr(module, "mesh", None)
+        n = getattr(mesh, "mpmd_dim", None)
+        if n is None and hasattr(module, "_pipeline_physical_stage_count"):
+            n = int(module._pipeline_physical_stage_count())
+        if n is None or int(n) <= 1:
+            return None
+        terminal_loc = schedule.terminal_loc(int(n))
+        if isinstance(terminal_loc, (tuple, list)):
+            return int(terminal_loc[0])
+        return int(terminal_loc)
+    except Exception:
+        return None
+
+
+def _mpmd_host_replicate_scalar(value: tp.Any) -> tp.Any:
+    """Make a scheduled-MPMD scalar (e.g. the step loss) host-fetchable on every controller.
+
+    The scheduled VJP computes its scalar loss on the *terminal* pipeline stage's device
+    submesh. Under multi-controller (multi-host) execution every controller process that
+    does not own a device of that submesh holds a ``jax.Array`` with **zero** addressable
+    shards, so ``jax.device_get(loss)`` (used for the ``break_on_nan`` guard and by the
+    trainer for metrics/logging) raises ``Fetching value for jax.Array that spans
+    non-addressable (non process local) devices``.
+
+    This broadcasts the value from the single lowest-indexed owning process to **all**
+    processes through an all-processes psum (``broadcast_one_to_all``), so host-side
+    bookkeeping works. ``NaN``/``Inf`` are preserved (``nan + 0 + ... == nan``), so the
+    NaN guard still fires correctly. Single-process runs are returned unchanged.
+
+    Note: we deliberately do **not** short-circuit on ``value.is_fully_addressable`` --
+    that predicate is process-local, so doing so could make some controllers skip the
+    collective while others enter it (deadlock). When ``process_count > 1`` every
+    controller must take the same branch.
+    """
+    try:
+        proc_count = int(jax.process_count())
+    except Exception:
+        return value
+    if proc_count <= 1:
+        return value
+    sharding = getattr(value, "sharding", None)
+    if sharding is None:
+        return value
+    try:
+        owner_procs = sorted({int(d.process_index) for d in sharding.device_set})
+    except Exception:
+        return value
+    if not owner_procs:
+        return value
+    from jax.experimental import multihost_utils
+
+    src_proc = owner_procs[0]
+    is_source = int(jax.process_index()) == src_proc
+    if is_source:
+        local = np.asarray(jax.device_get(value)).astype(np.float32).reshape(())
+    else:
+        local = np.zeros((), dtype=np.float32)
+    gathered = multihost_utils.broadcast_one_to_all(local, is_source=is_source)
+    return jnp.asarray(np.asarray(gathered).reshape(()))
+
+
 def _apply_stage_local_gradients(
     *,
     state: EasyDeLState,
@@ -1645,6 +2196,12 @@ def _compile_scheduled_training_step(
         batch_argnums=batch_argnums,
         adapter=adapter,
     )
+    _ScheduledValueAndGradAndApplyCompiler(
+        mesh=mesh,
+        schedule=schedule,
+        batch_argnums=batch_argnums,
+        adapter=adapter,
+    )
 
     def scheduled_training_step(
         state: EasyDeLState,
@@ -1688,7 +2245,9 @@ def _compile_scheduled_training_step(
             schedule=schedule,
         )
         if adapter.prepare_batch is not None:
+            _t_prep = time.perf_counter()
             batch = dict(adapter.prepare_batch(call))
+            _log_sched_section("prepare_batch (teacher/ref fwd)", _t_prep, batch)
             bound_arguments["batch"] = batch
             call = ScheduledStepCall(
                 step_fn=step_fn,
@@ -1699,7 +2258,9 @@ def _compile_scheduled_training_step(
                 bound_arguments=bound_arguments,
                 schedule=schedule,
             )
+
         value_and_grad = scheduled_vag.get(call)
+        _t_vag = time.perf_counter()
         loss, gradients = _run_scheduled_value_and_grad(
             value_and_grad=value_and_grad,
             graphstate=state.graphstate,
@@ -1707,13 +2268,18 @@ def _compile_scheduled_training_step(
             batch_size=batch_size,
             minibatch_size=minibatch_size,
         )
-        return _apply_stage_local_gradients(
+        _log_sched_section("value_and_grad (student fwd+bwd)", _t_vag, (loss, gradients))
+        loss = _mpmd_host_replicate_scalar(loss)
+        _t_opt = time.perf_counter()
+        out = _apply_stage_local_gradients(
             state=state,
             gradients=gradients,
             loss=loss,
             loss_config=loss_config,
             learning_rate_fn=learning_rate_fn,
         )
+        _log_sched_section("apply_stage_local_gradients (opt)", _t_opt, out)
+        return out
 
     scheduled_training_step.__name__ = f"{type(schedule).__name__}_{adapter.name}_{_scheduled_step_name(step_fn)}"
     scheduled_training_step.static_argnums_ = _normalize_static_argnums(static_argnums)

@@ -308,6 +308,7 @@ def compute_sequence_scores_from_hidden_states(
     token_chunk_size: int,
     vocab_chunk_size: int | None,
     return_correct_counts: bool = False,
+    vocab_shard_stage: int | None = None,
 ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Project hidden states through the LM head chunk-by-chunk and accumulate masked sequence-level scores.
 
@@ -386,7 +387,7 @@ def compute_sequence_scores_from_hidden_states(
     # forward methods (which may carry nn.remat wrappers) from inside
     # nested JAX traced regions, preventing TraceContextError.
     _lm_head_fn = (
-        projection_model.make_lm_head_fn()
+        projection_model.make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         if hasattr(projection_model, "make_lm_head_fn")
         else projection_model.compute_lm_logits
     )
@@ -536,6 +537,7 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
     token_chunk_size: int,
     vocab_chunk_size: int | None,
     return_entropy: bool,
+    vocab_shard_stage: int | None = None,
 ) -> tuple[Array, Array | None]:
     """Project hidden states through the LM head chunk-by-chunk and return per-token log-probabilities and optional entropies.
 
@@ -600,7 +602,7 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
     token_chunk_size = max(1, min(int(token_chunk_size), int(seq_len)))
 
     _lm_head_fn = (
-        projection_model.make_lm_head_fn()
+        projection_model.make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         if hasattr(projection_model, "make_lm_head_fn")
         else projection_model.compute_lm_logits
     )

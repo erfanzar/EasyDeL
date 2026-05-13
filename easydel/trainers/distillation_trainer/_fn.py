@@ -43,9 +43,11 @@ from spectrax.sharding import named_sharding_for_shape, reshape_with_named_shard
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.utils.helpers import check_bool_flag
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     cached_scheduled_auxiliary,
     constrain_scheduled_batch,
@@ -60,6 +62,8 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+
+_DEBUG_LMHEAD_SHARDING = check_bool_flag("EASYDEL_DEBUG_LMHEAD_SHARDING", default=False)
 
 
 def _chunk_sequence_for_scan(value: Array, chunk_size: int, *, context: str) -> Array:
@@ -366,6 +370,9 @@ def chunked_distillation_loss(
     temperature: float = 4.0,
     alpha: float = 0.9,
     chunk_size: int = 128,
+    checkpoint_chunks: bool = True,
+    hidden_partition_spec: PartitionSpec | None = None,
+    hidden_shard_stage: int | None = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Memory-efficient distillation loss that avoids materialising full logits.
 
@@ -376,9 +383,11 @@ def chunked_distillation_loss(
     to scalar KL / CE contributions.  Peak logit memory drops from
     ``O(B * L * V)`` to ``O(B * chunk_size * V)``.
 
-    The scan body is wrapped in ``jax.checkpoint`` so that during the backward
-    pass each chunk's logits are *recomputed* from the hidden states rather
-    than stored, keeping memory constant regardless of sequence length.
+    When ``checkpoint_chunks`` is ``True`` (default) the per-chunk body is
+    wrapped in ``jax.checkpoint`` so that during the backward pass each chunk's
+    logits are *recomputed* from the hidden states rather than stored, keeping
+    memory constant regardless of sequence length. Set it ``False`` to skip the
+    recompute (faster backward) when every chunk's logits fit in memory at once.
 
     Distillation metrics follow:
     ``distill_xent_loss = E_t[-log p_s] * T^2``,
@@ -420,7 +429,6 @@ def chunked_distillation_loss(
 
     _use_hard = use_hard_labels and has_labels
 
-    @jax.checkpoint
     def _chunk_kl_ce(s_h, t_h, m, sl):
         """Project a token-chunk of hidden states and compute KL/CE contributions.
 
@@ -434,8 +442,19 @@ def chunked_distillation_loss(
             ``(distill_xent, teacher_entropy, ce, mask_sum)`` scalars
             for this chunk.
         """
+        if hidden_partition_spec is not None:
+            s_h = with_sharding_constraint(s_h, hidden_partition_spec, stage=hidden_shard_stage)
+            t_h = with_sharding_constraint(t_h, hidden_partition_spec, stage=hidden_shard_stage)
+        if _DEBUG_LMHEAD_SHARDING:
+            jax.debug.inspect_array_sharding(
+                s_h, callback=lambda sh: print(f"[chunked-KL] student_hidden chunk sharding: {sh}", flush=True)
+            )
         s_logits = student_lm_head_fn(s_h)
         t_logits = teacher_lm_head_fn(t_h)
+        if _DEBUG_LMHEAD_SHARDING:
+            jax.debug.inspect_array_sharding(
+                s_logits, callback=lambda sh: print(f"[chunked-KL] student_logits chunk sharding: {sh}", flush=True)
+            )
         return _compute_kl_and_ce(
             student_logits=s_logits,
             teacher_logits=t_logits,
@@ -445,6 +464,9 @@ def chunked_distillation_loss(
             temperature=temperature,
             dtype=dtype,
         )
+
+    if checkpoint_chunks:
+        _chunk_kl_ce = jax.checkpoint(_chunk_kl_ce)
 
     def _scan_body(carry, xs):
         """Add one chunk's KL/CE contributions into the scan accumulators.
@@ -719,6 +741,7 @@ def distillation_step(
     attention_normalize: bool = False,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
     logits_chunk_size: int | None = None,
+    checkpoint_kl_loss: bool = True,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single knowledge-distillation training or evaluation step.
 
@@ -764,6 +787,9 @@ def distillation_step(
             straight-through gradient estimation.
         logits_chunk_size: When set, compute the KL loss in chunks of this
             many tokens to save memory. ``None`` uses the standard full-logits path.
+        checkpoint_kl_loss: When ``True`` (default) and the chunked path is active, wrap each
+            chunk's KL/CE body in ``jax.checkpoint`` so its vocab-sized logits are recomputed in
+            the backward pass instead of stored. Set ``False`` to skip the recompute.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
@@ -910,6 +936,9 @@ def distillation_step(
                 temperature=temperature,
                 alpha=alpha,
                 chunk_size=int(logits_chunk_size),
+                checkpoint_chunks=checkpoint_kl_loss,
+                hidden_partition_spec=_LMHEAD_HIDDEN_PSPEC,
+                hidden_shard_stage=None,
             )
         else:
             total_loss, loss_components = distillation_loss(
@@ -1005,6 +1034,25 @@ def distillation_step(
         return metrics
 
 
+def _fold_teacher_into_scheduled_step() -> bool:
+    """Whether to run the teacher model *inside* the scheduled student step.
+
+    Folding traces the (frozen) teacher model into the same ``spx.jit(loss_fn, schedule=...)``
+    as the student so its layers ride the well-overlapped scheduled MPMD pipeline instead of the
+    slow standalone ``MpmdPipelineExecutor.dispatch_many`` forward.
+
+    On by default. SpectraX's ``_normalize_marker_flows`` pass recognises the two model flows'
+    repeated ``sxstage_iter(stage=0..n-1)`` sequences and coalesces them into one boundary set,
+    so logical stage K runs both the teacher's and the student's stage-K layers between the same
+    pair of markers. Set ``EASYDEL_DISTILL_FOLD_TEACHER=0`` to fall back to the standalone teacher
+    forward (``cached_scheduled_auxiliary`` + ``dispatch_many``).
+    """
+    return check_bool_flag("EASYDEL_DISTILL_FOLD_TEACHER", default=True)
+
+
+_LMHEAD_HIDDEN_PSPEC = PartitionSpec(("dp", "fsdp"), "sp", None)
+
+
 def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
     """Inject precomputed teacher outputs into ``call.batch``.
 
@@ -1013,13 +1061,17 @@ def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
     ``teacher_hidden_for_kl`` (chunked path), plus optional teacher
     hidden states and attentions when the trainer requested them.
 
+    When :func:`_fold_teacher_into_scheduled_step` is on (default) *and* the chunked path is
+    active, this is a no-op: the teacher forward is folded into the scheduled student step
+    (see :func:`_make_distillation_scheduled_loss`).
+
     Args:
         call: The :class:`ScheduledStepCall` describing the current
             step.
 
     Returns:
         A copy of ``call.batch`` with the appropriate teacher outputs
-        attached.
+        attached (or unchanged when the teacher forward is folded).
 
     Raises:
         RuntimeError: If no teacher state is available.
@@ -1031,6 +1083,8 @@ def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
     required_key = "teacher_hidden_for_kl" if use_chunked else "teacher_logits"
     if required_key in batch:
         return batch
+    if use_chunked and _fold_teacher_into_scheduled_step():
+        return batch
 
     teacher_state = call.get("teacher_state")
     if teacher_state is None:
@@ -1041,7 +1095,12 @@ def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
     sync_module_schedule_config(teacher_model, call.schedule)
     constrained_batch = constrain_scheduled_batch(teacher_model, batch, call.get("partition_spec"))
     forward_fn = _make_distillation_aux_forward(use_chunked, request_hidden_states, request_attentions)
-    teacher_forward = cached_scheduled_auxiliary(forward_fn, teacher_model.mesh)
+    teacher_forward = cached_scheduled_auxiliary(
+        forward_fn,
+        teacher_model.mesh,
+        microbatches=getattr(call.schedule, "microbatches", 1),
+        batch_argnums=1,
+    )
     teacher_outputs = stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))
     if use_chunked:
         batch["teacher_hidden_for_kl"] = teacher_outputs["hidden_for_kl"]
@@ -1079,6 +1138,7 @@ def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "attention_layers",
             "attention_normalize",
             "logits_chunk_size",
+            "checkpoint_kl_loss",
         ),
         object_fields=("straight_through_emulator", "teacher_state"),
     )
@@ -1109,6 +1169,7 @@ def _make_distillation_scheduled_loss(call):
     attention_normalize = call.get("attention_normalize", False)
     logits_chunk_size = call.get("logits_chunk_size")
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
+    checkpoint_kl_loss = bool(call.get("checkpoint_kl_loss", True))
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
     teacher_state = call.get("teacher_state")
@@ -1148,14 +1209,44 @@ def _make_distillation_scheduled_loss(call):
         attention_mask = call_batch.get("attention_mask", None)
         completion_mask = call_batch.get("completion_mask", None)
 
-        if use_chunked:
+        teacher_precomputed_key = "teacher_hidden_for_kl" if use_chunked else "teacher_logits"
+        if teacher_precomputed_key in call_batch:
+            teacher_outputs: dict[str, tp.Any] = {
+                ("hidden_for_kl" if use_chunked else "logits"): jax.lax.stop_gradient(
+                    call_batch[teacher_precomputed_key]
+                ),
+            }
+            if request_hidden_states and "teacher_hidden_states" in call_batch:
+                teacher_outputs["hidden_states"] = call_batch["teacher_hidden_states"]
+            if request_attentions and "teacher_attentions" in call_batch:
+                teacher_outputs["attentions"] = call_batch["teacher_attentions"]
+            teacher_lm_head_module = teacher_state.model if teacher_state is not None else None
+        else:
             if teacher_state is None:
+                raise RuntimeError("Distillation scheduled MPMD training requires teacher_state.")
+            teacher_module = teacher_state.merge(teacher_state.graphstate)
+            teacher_module.eval()
+            sync_module_schedule_config(teacher_module, call.schedule)
+            teacher_outputs = stop_gradient_tree(
+                _distillation_forward_outputs(
+                    teacher_module,
+                    call_batch,
+                    use_chunked=use_chunked,
+                    request_hidden_states=request_hidden_states,
+                    request_attentions=request_attentions,
+                )
+            )
+            teacher_lm_head_module = teacher_module
+
+        if use_chunked:
+            if teacher_lm_head_module is None:
                 raise RuntimeError("Chunked distillation scheduled MPMD training requires teacher_state.")
+            _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
             total_loss, _loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs["hidden_for_kl"],
-                teacher_hidden=jax.lax.stop_gradient(call_batch["teacher_hidden_for_kl"]),
-                student_lm_head_fn=module.make_lm_head_fn(),
-                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
+                teacher_hidden=teacher_outputs["hidden_for_kl"],
+                student_lm_head_fn=module.make_lm_head_fn(vocab_shard_stage=_terminal_rank),
+                teacher_lm_head_fn=teacher_lm_head_module.make_lm_head_fn(vocab_shard_stage=_terminal_rank),
                 attention_mask=attention_mask,
                 loss_mask=completion_mask,
                 labels=labels,
@@ -1163,11 +1254,14 @@ def _make_distillation_scheduled_loss(call):
                 temperature=temperature,
                 alpha=alpha,
                 chunk_size=int(logits_chunk_size),
+                checkpoint_chunks=checkpoint_kl_loss,
+                hidden_partition_spec=(_LMHEAD_HIDDEN_PSPEC if _terminal_rank is not None else None),
+                hidden_shard_stage=_terminal_rank,
             )
         else:
             total_loss, _loss_components = distillation_loss(
                 student_logits=student_outputs["logits"],
-                teacher_logits=jax.lax.stop_gradient(call_batch["teacher_logits"]),
+                teacher_logits=teacher_outputs["logits"],
                 attention_mask=attention_mask,
                 loss_mask=completion_mask,
                 labels=labels,
@@ -1178,7 +1272,7 @@ def _make_distillation_scheduled_loss(call):
 
         if request_hidden_states:
             student_hidden = student_outputs.get("hidden_states")
-            teacher_hiddens = call_batch.get("teacher_hidden_states")
+            teacher_hiddens = teacher_outputs.get("hidden_states")
             if student_hidden is None or teacher_hiddens is None:
                 raise ValueError(
                     "Hidden-state distillation requested but models did not return hidden states. "
@@ -1196,7 +1290,7 @@ def _make_distillation_scheduled_loss(call):
 
         if request_attentions:
             student_attentions = student_outputs.get("attentions")
-            teacher_attns = call_batch.get("teacher_attentions")
+            teacher_attns = teacher_outputs.get("attentions")
             if student_attentions is None or teacher_attns is None:
                 raise ValueError(
                     "Attention distillation requested but models did not return attention probabilities. "

@@ -763,22 +763,24 @@ class GPT2Model(EasyDeLBaseModule):
         )
         self.embed_dim = self.config.hidden_size
 
-        self.wte = Embed(
-            self.config.vocab_size,
-            self.embed_dim,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=self.dtype,
-            rngs=rngs,
-            param_dtype=param_dtype,
-        )
-        self.wpe = Embed(
-            self.config.max_position_embeddings,
-            self.embed_dim,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=self.dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.wte = Embed(
+                self.config.vocab_size,
+                self.embed_dim,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=self.dtype,
+                rngs=rngs,
+                param_dtype=param_dtype,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.wpe = Embed(
+                self.config.max_position_embeddings,
+                self.embed_dim,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=self.dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
         remat_layer_block = auto_remat(

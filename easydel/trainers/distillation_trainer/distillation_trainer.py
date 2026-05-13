@@ -193,9 +193,10 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.attention_normalize),
             straight_through_emulator,
             self.arguments.logits_chunk_size,
+            bool(self.arguments.checkpoint_kl_loss),
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
         sharded_training_step_function = compile_trainer_step(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -222,6 +223,7 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.attention_normalize),
             None,
             self.arguments.logits_chunk_size,
+            bool(self.arguments.checkpoint_kl_loss),
         )
 
         sharded_evaluation_step_function = compile_trainer_step(

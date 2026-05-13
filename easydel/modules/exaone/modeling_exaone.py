@@ -494,14 +494,15 @@ class ExaoneModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = Embed(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.wte = Embed(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         self.drop = nn.Dropout(self.config.embed_dropout, rngs=rngs)
 

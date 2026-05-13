@@ -498,15 +498,16 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         )
 
         mel_after_conv = (((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2
-        self.conv_out = ColumnParallelLinear(
-            config.downsample_hidden_size * mel_after_conv,
-            config.d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.encoder_layers):
+            self.conv_out = ColumnParallelLinear(
+                config.downsample_hidden_size * mel_after_conv,
+                config.d_model,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
 
         self.max_source_positions = config.max_source_positions
         self.d_model = config.d_model
@@ -525,33 +526,36 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
                     )
                 )
 
-        self.ln_post = LayerNorm(
-            config.d_model,
-            epsilon=1e-5,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.encoder_layers - 1, total_layers=config.encoder_layers):
+            self.ln_post = LayerNorm(
+                config.d_model,
+                epsilon=1e-5,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
-        self.proj1 = ColumnParallelLinear(
-            config.d_model,
-            config.d_model,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.encoder_layers - 1, total_layers=config.encoder_layers):
+            self.proj1 = ColumnParallelLinear(
+                config.d_model,
+                config.d_model,
+                use_bias=True,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
         self.act = ACT2FN[config.activation_function]
-        self.proj2 = RowParallelLinear(
-            config.d_model,
-            config.output_dim,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.encoder_layers - 1, total_layers=config.encoder_layers):
+            self.proj2 = RowParallelLinear(
+                config.d_model,
+                config.output_dim,
+                use_bias=True,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
 
     def forward(
         self,
@@ -1174,13 +1178,14 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.pos_embed = Embed(
-            num_embeddings=config.num_position_embeddings,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.pos_embed = Embed(
+                num_embeddings=config.num_position_embeddings,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         head_dim = config.hidden_size // config.num_heads
@@ -3006,14 +3011,15 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.codec_embedding = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.codec_embedding = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             Qwen3OmniMoeTalkerTextDecoderLayer,
@@ -4065,14 +4071,15 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             Qwen3OmniMoeTextDecoderLayer,
@@ -4299,14 +4306,15 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
 
         text_config = config.text_config
 
-        self.embed_tokens = Embed(
-            text_config.vocab_size,
-            text_config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=text_config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                text_config.vocab_size,
+                text_config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=text_config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             Qwen3OmniMoeTextDecoderLayer,

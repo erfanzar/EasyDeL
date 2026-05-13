@@ -43,6 +43,7 @@ from easydel.trainers.direct_preference_optimization_trainer._fn import concaten
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
@@ -68,6 +69,7 @@ def concatenated_forward(
     max_length: int | None = None,
     truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     aux_loss_enabled: bool = False,
+    vocab_shard_stage: int | None = None,
     loss_type: LOSS_TYPES = "sigmoid",
     logprob_vocab_chunk_size: int | None = None,
 ) -> dict[str, jax.Array]:
@@ -158,6 +160,7 @@ def concatenated_forward(
             loss_mask=loss_mask,
             token_chunk_size=lmhead_chunksize,
             vocab_chunk_size=logprob_vocab_chunk_size,
+            vocab_shard_stage=vocab_shard_stage,
         )
     else:
         gathered_logps, _ = compute_token_logps_and_entropies_chunked(
@@ -539,7 +542,8 @@ def _make_cpo_scheduled_loss(call):
         """
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-        model_outputs = concatenated_forward_fn(module, call_batch)
+        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+        model_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
 
         losses, _, _ = cpo_loss(
             model_outputs["chosen_logps"],

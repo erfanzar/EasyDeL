@@ -45,6 +45,7 @@ from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
@@ -132,6 +133,7 @@ def concatenated_forward(
     truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     aux_loss_enabled: bool = False,
     logprob_vocab_chunk_size: int | None = None,
+    vocab_shard_stage: int | None = None,
 ) -> dict[str, jax.Array]:
     """Run a BCO model forward pass and accumulate per-example completion logps.
 
@@ -262,6 +264,7 @@ def concatenated_forward(
                 loss_mask=loss_mask,
                 token_chunk_size=lmhead_chunksize,
                 vocab_chunk_size=logprob_vocab_chunk_size,
+                vocab_shard_stage=vocab_shard_stage,
             )
         else:
             if logits is None:
@@ -660,8 +663,9 @@ def _make_bco_scheduled_loss(call):
         call_batch.pop("running_mean", None)
         module = bind_scheduled_module(call, tree)
         call_batch = constrain_scheduled_batch(module, call_batch, partition_spec)
+        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
 
-        policy_outputs = concatenated_forward_fn(module, call_batch)
+        policy_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
         completion_logps = policy_outputs["completion_logps"]
 
         reference_completion_logps = call_batch.get("reference_logps")

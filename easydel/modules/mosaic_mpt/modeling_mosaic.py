@@ -659,13 +659,14 @@ class MptModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.d_model,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.wte = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.d_model,
+                rngs=rngs,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            )
 
         remat_layer_block = auto_remat(
             MptBlock,
@@ -687,14 +688,15 @@ class MptModel(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm_f = LayerNorm(
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            epsilon=config.layer_norm_epsilon,
-            use_bias=config.use_norm_bias,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            self.norm_f = LayerNorm(
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                epsilon=config.layer_norm_epsilon,
+                use_bias=config.use_norm_bias,
+                rngs=rngs,
+            )
 
     @cached_property
     def alibi(self):

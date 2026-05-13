@@ -719,13 +719,14 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         )
 
         num_positions = int((config.image_size // config.patch_size) ** 2)
-        self.pos_embed = Embed(
-            num_embeddings=num_positions,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.pos_embed = Embed(
+                num_embeddings=num_positions,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         self.num_grid_per_side = int(math.sqrt(num_positions))
         self.reform_param = {
             "embeddings.position_embedding": {
@@ -1322,14 +1323,15 @@ class Glm4vTextModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             Glm4vTextDecoderLayer,
             policy=config.gradient_checkpointing,

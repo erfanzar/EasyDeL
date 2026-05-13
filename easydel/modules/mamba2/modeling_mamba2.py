@@ -732,13 +732,14 @@ class Mamba2Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embeddings = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embeddings = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         self.layers = nn.ModuleList([])
         for layer_idx in range(config.num_hidden_layers):
             with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
@@ -753,13 +754,14 @@ class Mamba2Model(EasyDeLBaseModule):
                     )
                 )
 
-        self.norm_f = Mamba2RMSNorm(
-            config.hidden_size,
-            eps=config.layer_norm_epsilon,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            self.norm_f = Mamba2RMSNorm(
+                config.hidden_size,
+                eps=config.layer_norm_epsilon,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,

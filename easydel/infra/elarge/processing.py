@@ -956,6 +956,19 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
     op_configs = cfg.get("base_config", {}).get("operation_configs")
     set_maybe("operation_configs", op_configs)
 
+    trainer_cfg = cfg.get("trainer", {})
+    mpmd_scheduler = trainer_cfg.get("mpmd_scheduler") if isinstance(trainer_cfg, Mapping) else None
+    if mpmd_scheduler is not None:
+        vsr = getattr(mpmd_scheduler, "virtual_stages_per_rank", None)
+        if callable(vsr):
+            try:
+                set_maybe("pipeline_virtual_stages", max(1, int(vsr())))
+            except Exception:
+                pass
+        stage_layout = getattr(mpmd_scheduler, "stage_layout", None)
+        if isinstance(stage_layout, str) and stage_layout:
+            set_maybe("pipeline_stage_layout", stage_layout)
+
     return cast(EasyDeLBaseConfigDict, cast(object, base))
 
 

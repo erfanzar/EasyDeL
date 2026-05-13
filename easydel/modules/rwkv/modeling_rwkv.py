@@ -754,13 +754,14 @@ class RwkvModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embeddings = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embeddings = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             RwkvBlock,
             policy=config.gradient_checkpointing,
@@ -783,12 +784,13 @@ class RwkvModel(EasyDeLBaseModule):
 
         self.layers_are_rescaled = False
         self.deterministic = True
-        self.ln_out = LayerNorm(
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            self.ln_out = LayerNorm(
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     def forward(
         self,

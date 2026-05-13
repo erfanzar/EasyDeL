@@ -827,13 +827,14 @@ class ArcticModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         remat_layer_block = auto_remat(
             ArcticDecoderLayer,

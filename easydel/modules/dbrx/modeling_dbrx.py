@@ -1101,13 +1101,14 @@ class DbrxModel(EasyDeLBaseModule):
         self.vocab_size = self.config.vocab_size
         self.emb_pdrop = self.config.emb_pdrop
 
-        self.wte = Embed(
-            self.config.vocab_size,
-            self.config.d_model,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.wte = Embed(
+                self.config.vocab_size,
+                self.config.d_model,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             DbrxBlock,
             policy=config.gradient_checkpointing,
@@ -1127,13 +1128,14 @@ class DbrxModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        self.norm_f = LayerNorm(
-            self.config.hidden_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(self.config.num_hidden_layers - 1, total_layers=self.config.num_hidden_layers):
+            self.norm_f = LayerNorm(
+                self.config.hidden_size,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
     @cached_property
     def frequencies(self):

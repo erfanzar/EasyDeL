@@ -1174,13 +1174,14 @@ class FalconH1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
 
         layer_block = auto_remat(
             FalconH1DecoderLayer,
@@ -1202,9 +1203,10 @@ class FalconH1Model(EasyDeLBaseModule):
                     )
                 )
 
-        self.final_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
-        )
+        with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            self.final_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            )
 
         self.embedding_multiplier = float(config.embedding_multiplier)
         self.lm_head_multiplier = float(config.lm_head_multiplier)
@@ -1527,9 +1529,9 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
             past_key_values=outputs.past_key_values,
         )
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Falcon-H1 muP lm_head_multiplier."""
-        base_fn = super().make_lm_head_fn()
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         multiplier = self.base_model.lm_head_multiplier
 
         def _project(hidden_states):

@@ -526,14 +526,15 @@ class CohereModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
         remat_layer_block = auto_remat(
             CohereBlock,
             policy=config.gradient_checkpointing,
@@ -888,9 +889,9 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         logits = super().compute_lm_logits(hidden_states)
         return logits * self.logit_scale
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Cohere logit scaling."""
-        base_fn = super().make_lm_head_fn()
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         scale = self.logit_scale
 
         def _project(hidden_states):

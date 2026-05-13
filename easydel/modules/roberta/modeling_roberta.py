@@ -153,37 +153,41 @@ class RobertaEmbeddings(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.word_embeddings = Embed(
-            num_embeddings=self.config.vocab_size,
-            features=self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.position_embeddings = Embed(
-            num_embeddings=self.config.max_position_embeddings,
-            features=self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.token_type_embeddings = Embed(
-            num_embeddings=self.config.type_vocab_size,
-            features=self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.LayerNorm = LayerNorm(
-            self.config.hidden_size,
-            epsilon=self.config.layer_norm_eps,
-            param_dtype=param_dtype,
-            dtype=dtype,
-            rngs=rngs,
-        )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.word_embeddings = Embed(
+                num_embeddings=self.config.vocab_size,
+                features=self.config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.position_embeddings = Embed(
+                num_embeddings=self.config.max_position_embeddings,
+                features=self.config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.token_type_embeddings = Embed(
+                num_embeddings=self.config.type_vocab_size,
+                features=self.config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.LayerNorm = LayerNorm(
+                self.config.hidden_size,
+                epsilon=self.config.layer_norm_eps,
+                param_dtype=param_dtype,
+                dtype=dtype,
+                rngs=rngs,
+            )
         self.dropout = nn.Dropout(
             rate=self.config.hidden_dropout_prob,
             rngs=rngs,
