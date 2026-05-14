@@ -278,12 +278,14 @@ def ppo_step(
         ``(updated_state, metrics)`` in training mode; in eval mode
         only the :class:`LossMetrics`.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/ppo/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the clipped PPO objective for a single minibatch.
@@ -299,79 +301,90 @@ def ppo_step(
             :class:`LossMetrics` instance with diagnostic statistics
             (policy/value losses, approx KL, clip fractions, etc.).
         """
-        if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if is_training and straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree)
 
-        input_ids = minibatch["input_ids"]
-        attention_mask = minibatch["attention_mask"]
-        completion_mask = minibatch["completion_mask"].astype(jnp.float32)
+            input_ids = minibatch["input_ids"]
+            attention_mask = minibatch["attention_mask"]
+            completion_mask = minibatch["completion_mask"].astype(jnp.float32)
 
-        old_logps = minibatch["old_logps"]
-        old_values = minibatch["old_values"]
-        advantages = jax.lax.stop_gradient(minibatch["advantages"])
-        returns = jax.lax.stop_gradient(minibatch["returns"])
+            old_logps = minibatch["old_logps"]
+            old_values = minibatch["old_values"]
+            advantages = jax.lax.stop_gradient(minibatch["advantages"])
+            returns = jax.lax.stop_gradient(minibatch["returns"])
 
-        new_logps, new_values, entropies = get_per_token_logps_values_entropies(
-            module,
-            input_ids,
-            attention_mask,
-            prompt_length,
-            logprob_vocab_chunk_size,
-        )
+            with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+                new_logps, new_values, entropies = get_per_token_logps_values_entropies(
+                    module,
+                    input_ids,
+                    attention_mask,
+                    prompt_length,
+                    logprob_vocab_chunk_size,
+                )
 
-        log_ratio = new_logps - old_logps
-        ratio = jnp.exp(log_ratio)
+            with jax.named_scope(scope_root + "/loss_fn/policy_loss"):
+                log_ratio = new_logps - old_logps
+                ratio = jnp.exp(log_ratio)
 
-        pg_losses = -advantages * ratio
-        pg_losses2 = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
-        pg_loss = _masked_mean(jnp.maximum(pg_losses, pg_losses2), completion_mask)
+                pg_losses = -advantages * ratio
+                pg_losses2 = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
+                pg_loss = _masked_mean(jnp.maximum(pg_losses, pg_losses2), completion_mask)
 
-        values_clipped = old_values + jnp.clip(new_values - old_values, -cliprange_value, cliprange_value)
-        vf_losses1 = jnp.square(new_values - returns)
-        vf_losses2 = jnp.square(values_clipped - returns)
-        vf_loss = 0.5 * _masked_mean(jnp.maximum(vf_losses1, vf_losses2), completion_mask)
+            with jax.named_scope(scope_root + "/loss_fn/value_loss"):
+                values_clipped = old_values + jnp.clip(new_values - old_values, -cliprange_value, cliprange_value)
+                vf_losses1 = jnp.square(new_values - returns)
+                vf_losses2 = jnp.square(values_clipped - returns)
+                vf_loss = 0.5 * _masked_mean(jnp.maximum(vf_losses1, vf_losses2), completion_mask)
 
-        entropy = _masked_mean(entropies, completion_mask)
-        loss = pg_loss + vf_coef * vf_loss - entropy_coef * entropy
+            with jax.named_scope(scope_root + "/loss_fn/entropy_and_combine"):
+                entropy = _masked_mean(entropies, completion_mask)
+                loss = pg_loss + vf_coef * vf_loss - entropy_coef * entropy
 
-        approx_kl = 0.5 * _masked_mean(jnp.square(log_ratio), completion_mask)
-        pg_clipfrac = _masked_mean(((pg_losses2 > pg_losses).astype(jnp.float32)), completion_mask)
-        vf_clipfrac = _masked_mean(((vf_losses2 > vf_losses1).astype(jnp.float32)), completion_mask)
+            with jax.named_scope(scope_root + "/loss_fn/diagnostics"):
+                approx_kl = 0.5 * _masked_mean(jnp.square(log_ratio), completion_mask)
+                pg_clipfrac = _masked_mean(((pg_losses2 > pg_losses).astype(jnp.float32)), completion_mask)
+                vf_clipfrac = _masked_mean(((vf_losses2 > vf_losses1).astype(jnp.float32)), completion_mask)
 
-        other_metrics: dict[str, jax.Array] = {
-            "policy_loss": pg_loss,
-            "value_loss": vf_loss,
-            "mean_entropy": entropy,
-            "approx_kl": approx_kl,
-            "pg_clipfrac": pg_clipfrac,
-            "vf_clipfrac": vf_clipfrac,
-            "ratio_mean": _masked_mean(ratio, completion_mask),
-            "advantages_mean": _masked_mean(advantages, completion_mask),
-            "returns_mean": _masked_mean(returns, completion_mask),
-        }
+                other_metrics: dict[str, jax.Array] = {
+                    "policy_loss": pg_loss,
+                    "value_loss": vf_loss,
+                    "mean_entropy": entropy,
+                    "approx_kl": approx_kl,
+                    "pg_clipfrac": pg_clipfrac,
+                    "vf_clipfrac": vf_clipfrac,
+                    "ratio_mean": _masked_mean(ratio, completion_mask),
+                    "advantages_mean": _masked_mean(advantages, completion_mask),
+                    "returns_mean": _masked_mean(returns, completion_mask),
+                }
 
-        return loss, LossMetrics(loss=loss, accuracy=1, other_metrics=other_metrics)
+            return loss, LossMetrics(loss=loss, accuracy=1, other_metrics=other_metrics)
 
     if is_training:
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=state.step,
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            state = update_state_respectfully(
+                state=state,
                 gradients=gradients,
-            ),
-        )
+                loss_config=loss_config,
+                metrics=update_metrics(
+                    metrics=metrics,
+                    learning_rate_fn=learning_rate_fn,
+                    step=state.step,
+                    gradients=gradients,
+                ),
+            )
         return state, metrics
 
-    _, metrics = loss_fn(state.graphstate, batch)
+    with jax.named_scope(scope_root + "/eval_call"):
+        _, metrics = loss_fn(state.graphstate, batch)
     return metrics

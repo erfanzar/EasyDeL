@@ -134,12 +134,14 @@ def nash_md_step(
         policy log-prob for diagnostics.
     """
 
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/nash_md/" + ("train_step" if is_train else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
     beta = jnp.asarray(beta, dtype=jnp.float32)
 
     def loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
@@ -159,71 +161,79 @@ def nash_md_step(
         Returns:
             ``(loss, metrics)`` ready for ``minibatch_call``.
         """
-        if is_train and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree=tree)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if is_train and straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree=tree)
 
-        prompt_ids = minibatch["prompt_ids"]
-        prompt_mask = minibatch["prompt_mask"]
-        completion_ids = minibatch["completion_ids"]
-        completion_mask = minibatch["completion_mask"]
-        ref_token_logps = minibatch["ref_token_logps"]
-        probabilities = minibatch["probabilities"]
+            prompt_ids = minibatch["prompt_ids"]
+            prompt_mask = minibatch["prompt_mask"]
+            completion_ids = minibatch["completion_ids"]
+            completion_mask = minibatch["completion_mask"]
+            ref_token_logps = minibatch["ref_token_logps"]
+            probabilities = minibatch["probabilities"]
 
-        policy_token_logps = _compute_policy_logps(
-            module,
-            prompt_ids,
-            prompt_mask,
-            completion_ids,
-            completion_mask,
-            logprob_vocab_chunk_size,
-        )
-        mask = completion_mask.astype(policy_token_logps.dtype)
-        policy_token_logps = policy_token_logps * mask
-        ref_token_logps = ref_token_logps * mask
+            with jax.named_scope(scope_root + "/loss_fn/policy_logps"):
+                policy_token_logps = _compute_policy_logps(
+                    module,
+                    prompt_ids,
+                    prompt_mask,
+                    completion_ids,
+                    completion_mask,
+                    logprob_vocab_chunk_size,
+                )
+                mask = completion_mask.astype(policy_token_logps.dtype)
+                policy_token_logps = policy_token_logps * mask
+                ref_token_logps = ref_token_logps * mask
 
-        policy_logps = policy_token_logps.sum(axis=1)
-        log_ratio = policy_token_logps - ref_token_logps
-        kl_vector = log_ratio.sum(axis=1)
-        kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
+            with jax.named_scope(scope_root + "/loss_fn/compute_nash_md_loss"):
+                policy_logps = policy_token_logps.sum(axis=1)
+                log_ratio = policy_token_logps - ref_token_logps
+                kl_vector = log_ratio.sum(axis=1)
+                kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
 
-        score = (probabilities - 0.5) * policy_logps
-        loss_vector = beta * kl_loss - score
-        loss = loss_vector.mean()
+                score = (probabilities - 0.5) * policy_logps
+                loss_vector = beta * kl_loss - score
+                loss = loss_vector.mean()
 
-        metrics = LossMetrics(
-            loss=loss,
-            other_metrics={
-                "score": score.mean(),
-                "kl": kl_vector.mean(),
-                "probability": probabilities.mean(),
-                "policy_logps": policy_logps.mean(),
-            },
-        )
-        return loss, metrics
+            metrics = LossMetrics(
+                loss=loss,
+                other_metrics={
+                    "score": score.mean(),
+                    "kl": kl_vector.mean(),
+                    "probability": probabilities.mean(),
+                    "policy_logps": policy_logps.mean(),
+                },
+            )
+            return loss, metrics
 
     if is_train:
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        metrics = update_metrics(
-            metrics=metrics,
-            learning_rate_fn=learning_rate_fn,
-            step=state.step,
-            gradients=gradients,
-        )
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=metrics,
-        )
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            metrics = update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=state.step,
+                gradients=gradients,
+            )
+            state = update_state_respectfully(
+                state=state,
+                gradients=gradients,
+                loss_config=loss_config,
+                metrics=metrics,
+            )
         return state, metrics
 
-    _, metrics = loss_fn(state.graphstate, batch)
+    with jax.named_scope(scope_root + "/eval_call"):
+        _, metrics = loss_fn(state.graphstate, batch)
     return metrics
 
 
@@ -269,25 +279,29 @@ def _make_nash_md_scheduled_loss(call):
         Returns:
             The scalar Nash-MD loss.
         """
-        module = bind_scheduled_module(call, tree)
-        batch = constrain_scheduled_batch(module, batch, partition_spec)
-        completion_mask = batch["completion_mask"]
-        policy_token_logps = _compute_policy_logps(
-            module,
-            batch["prompt_ids"],
-            batch["prompt_mask"],
-            batch["completion_ids"],
-            completion_mask,
-            logprob_vocab_chunk_size,
-        )
-        mask = completion_mask.astype(policy_token_logps.dtype)
-        policy_token_logps = policy_token_logps * mask
-        ref_token_logps = jax.lax.stop_gradient(batch["ref_token_logps"]) * mask
-        policy_logps = policy_token_logps.sum(axis=1)
-        log_ratio = policy_token_logps - ref_token_logps
-        kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
-        score = (batch["probabilities"] - 0.5) * policy_logps
-        return (beta * kl_loss - score).mean()
+        with jax.named_scope("easydel/trainer/nash_md/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                batch = constrain_scheduled_batch(module, batch, partition_spec)
+            completion_mask = batch["completion_mask"]
+            with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/policy_logps"):
+                policy_token_logps = _compute_policy_logps(
+                    module,
+                    batch["prompt_ids"],
+                    batch["prompt_mask"],
+                    batch["completion_ids"],
+                    completion_mask,
+                    logprob_vocab_chunk_size,
+                )
+                mask = completion_mask.astype(policy_token_logps.dtype)
+                policy_token_logps = policy_token_logps * mask
+                ref_token_logps = jax.lax.stop_gradient(batch["ref_token_logps"]) * mask
+            with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/compute_nash_md_loss"):
+                policy_logps = policy_token_logps.sum(axis=1)
+                log_ratio = policy_token_logps - ref_token_logps
+                kl_loss = (log_ratio * policy_token_logps).sum(axis=1)
+                score = (batch["probabilities"] - 0.5) * policy_logps
+                return (beta * kl_loss - score).mean()
 
     return scheduled_loss
 

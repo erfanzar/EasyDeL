@@ -434,6 +434,9 @@ class Trainer(BaseTrainer):
                         break
             return self._prepare_training_output(state=state, run_exception=run_exception), run_exception
         finally:
+            # Stop the JAX profiler trace (if one was started after step 1).
+            # Guarded internally so this is a no-op when profiling was disabled.
+            self._stop_profiler()
             pbar.close()
 
     def _run_evaluation(
@@ -596,6 +599,10 @@ class Trainer(BaseTrainer):
                         current_step = int(jax.device_get(state.step))
                 if run_exception is not None:
                     return state, run_exception, train_iter
+                # Start the JAX profiler once step 1 has fully completed.
+                # The first step's wall-time is dominated by JIT compile;
+                # skipping it gives a profile of steady-state training.
+                self._maybe_start_profiler(current_step)
                 try:
                     mean_loss, mean_accuracy = metrics_tracker.update(
                         loss=metrics.loss,

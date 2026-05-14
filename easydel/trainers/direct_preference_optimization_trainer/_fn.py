@@ -1172,36 +1172,40 @@ def training_step(
         ``rejected_rewards`` (``beta * (logp - logp_ref)``, stop-gradient'd),
         and the standard learning-rate / gradient-norm fields.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
+    scope_root = "easydel/trainer/dpo/train_step"
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
 
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
-    _loss_func = get_loss_function(
-        loss_type=loss_type,
-        beta=beta,
-        label_smoothing=label_smoothing,
-    )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    with jax.named_scope(scope_root + "/resolve_loss_function"):
+        _loss_func = get_loss_function(
+            loss_type=loss_type,
+            beta=beta,
+            label_smoothing=label_smoothing,
+        )
 
     if not reference_free:
-        # Pre-compute reference logps outside jax.value_and_grad to avoid
-        # nn.remat trace-level conflicts when the reference model uses
-        # gradient checkpointing inside the grad trace.
-        ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
-        if ref_chosen_logps is None or ref_rejected_logps is None:
-            rfm = reference_state.model
-            ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
-            ref_chosen_logps = ref_out["chosen_logps"]
-            ref_rejected_logps = ref_out["rejected_logps"]
+        with jax.named_scope(scope_root + "/reference_forward"):
+            # Pre-compute reference logps outside jax.value_and_grad to avoid
+            # nn.remat trace-level conflicts when the reference model uses
+            # gradient checkpointing inside the grad trace.
+            ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+            if ref_chosen_logps is None or ref_rejected_logps is None:
+                rfm = reference_state.model
+                ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
+                ref_chosen_logps = ref_out["chosen_logps"]
+                ref_rejected_logps = ref_out["rejected_logps"]
 
-        if "ref_chosen_logps" not in batch or "ref_rejected_logps" not in batch:
-            batch = {
-                **batch,
-                "ref_chosen_logps": ref_chosen_logps,
-                "ref_rejected_logps": ref_rejected_logps,
-            }
+            if "ref_chosen_logps" not in batch or "ref_rejected_logps" not in batch:
+                batch = {
+                    **batch,
+                    "ref_chosen_logps": ref_chosen_logps,
+                    "ref_rejected_logps": ref_rejected_logps,
+                }
 
     def calculate_loss(tree: spx.State, call_batch):
         """Compute the DPO loss + metrics for a single minibatch.
@@ -1235,60 +1239,69 @@ def training_step(
             stop-gradient'd ``chosen_rewards`` / ``rejected_rewards`` for
             logging.
         """
-        if straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree=tree)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree=tree)
 
-        model_output = concatenated_forward(module, call_batch)
+            with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+                model_output = concatenated_forward(module, call_batch)
 
-        chosen_logps = model_output["chosen_logps"]
-        rejected_logps = model_output["rejected_logps"]
-        if reference_free:
-            ref_chosen_logps = jnp.zeros_like(chosen_logps)
-            ref_rejected_logps = jnp.zeros_like(rejected_logps)
-        else:
-            ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
-            ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
-        losses = _loss_func(
-            chosen_logps,
-            rejected_logps,
-            ref_chosen_logps,
-            ref_rejected_logps,
-            beta,
-            label_smoothing,
+            chosen_logps = model_output["chosen_logps"]
+            rejected_logps = model_output["rejected_logps"]
+            with jax.named_scope(scope_root + "/loss_fn/resolve_reference_logps"):
+                if reference_free:
+                    ref_chosen_logps = jnp.zeros_like(chosen_logps)
+                    ref_rejected_logps = jnp.zeros_like(rejected_logps)
+                else:
+                    ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
+                    ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
+            with jax.named_scope(scope_root + "/loss_fn/compute_dpo_loss"):
+                losses = _loss_func(
+                    chosen_logps,
+                    rejected_logps,
+                    ref_chosen_logps,
+                    ref_rejected_logps,
+                    beta,
+                    label_smoothing,
+                )
+
+            with jax.named_scope(scope_root + "/loss_fn/rewards_and_metrics"):
+                chosen_rewards = beta * jax.lax.stop_gradient(chosen_logps - ref_chosen_logps)
+                rejected_rewards = beta * jax.lax.stop_gradient(rejected_logps - ref_rejected_logps)
+                if "aux_loss" in model_output:
+                    losses += model_output["aux_loss"]
+
+                metrics = LossMetrics(
+                    loss=losses.mean(),
+                    rejected_rewards=rejected_rewards,
+                    chosen_rewards=chosen_rewards,
+                )
+            return metrics.loss, metrics
+
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=batch,
+            minibatch_size=minibatch_size,
+            grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
         )
 
-        chosen_rewards = beta * jax.lax.stop_gradient(chosen_logps - ref_chosen_logps)
-        rejected_rewards = beta * jax.lax.stop_gradient(rejected_logps - ref_rejected_logps)
-        if "aux_loss" in model_output:
-            losses += model_output["aux_loss"]
-
-        metrics = LossMetrics(
-            loss=losses.mean(),
-            rejected_rewards=rejected_rewards,
-            chosen_rewards=chosen_rewards,
+    with jax.named_scope(scope_root + "/update_state"):
+        metrics = update_metrics(
+            metrics=metrics,
+            learning_rate_fn=learning_rate_fn,
+            step=state.step,
+            gradients=gradients,
         )
-        return metrics.loss, metrics
-
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=batch,
-        minibatch_size=minibatch_size,
-        grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
-    )
-
-    metrics = update_metrics(
-        metrics=metrics,
-        learning_rate_fn=learning_rate_fn,
-        step=state.step,
-        gradients=gradients,
-    )
-    state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=loss_config,
-        metrics=metrics,
-    )
+        state = update_state_respectfully(
+            state=state,
+            gradients=gradients,
+            loss_config=loss_config,
+            metrics=metrics,
+        )
     return (state, metrics)
 
 
@@ -1382,34 +1395,41 @@ def _make_dpo_scheduled_loss(call):
             RuntimeError: If reference logps are missing while the
                 trainer is not in reference-free mode.
         """
-        module = bind_scheduled_module(call, tree)
-        batch = constrain_scheduled_batch(module, batch, partition_spec)
-        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
-        model_output = concatenated_forward_fn(module, batch, vocab_shard_stage=_terminal_rank)
+        with jax.named_scope("easydel/trainer/dpo/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/dpo/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                batch = constrain_scheduled_batch(module, batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+            with jax.named_scope("easydel/trainer/dpo/scheduled_loss/policy_forward"):
+                model_output = concatenated_forward_fn(module, batch, vocab_shard_stage=_terminal_rank)
 
-        chosen_logps = model_output["chosen_logps"]
-        rejected_logps = model_output["rejected_logps"]
-        if reference_free:
-            ref_chosen_logps = jnp.zeros_like(chosen_logps)
-            ref_rejected_logps = jnp.zeros_like(rejected_logps)
-        else:
-            ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
-            if ref_chosen_logps is None or ref_rejected_logps is None:
-                raise RuntimeError("DPO scheduled MPMD loss requires precomputed reference log-probs in the batch.")
-            ref_chosen_logps = jax.lax.stop_gradient(ref_chosen_logps)
-            ref_rejected_logps = jax.lax.stop_gradient(ref_rejected_logps)
+            chosen_logps = model_output["chosen_logps"]
+            rejected_logps = model_output["rejected_logps"]
+            with jax.named_scope("easydel/trainer/dpo/scheduled_loss/resolve_reference_logps"):
+                if reference_free:
+                    ref_chosen_logps = jnp.zeros_like(chosen_logps)
+                    ref_rejected_logps = jnp.zeros_like(rejected_logps)
+                else:
+                    ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+                    if ref_chosen_logps is None or ref_rejected_logps is None:
+                        raise RuntimeError(
+                            "DPO scheduled MPMD loss requires precomputed reference log-probs in the batch."
+                        )
+                    ref_chosen_logps = jax.lax.stop_gradient(ref_chosen_logps)
+                    ref_rejected_logps = jax.lax.stop_gradient(ref_rejected_logps)
 
-        losses = loss_func(
-            chosen_logps,
-            rejected_logps,
-            ref_chosen_logps,
-            ref_rejected_logps,
-            beta,
-            label_smoothing,
-        )
-        if "aux_loss" in model_output:
-            losses += model_output["aux_loss"]
-        return losses.mean()
+            with jax.named_scope("easydel/trainer/dpo/scheduled_loss/compute_dpo_loss"):
+                losses = loss_func(
+                    chosen_logps,
+                    rejected_logps,
+                    ref_chosen_logps,
+                    ref_rejected_logps,
+                    beta,
+                    label_smoothing,
+                )
+                if "aux_loss" in model_output:
+                    losses += model_output["aux_loss"]
+            return losses.mean()
 
     return scheduled_loss
 
@@ -1465,18 +1485,21 @@ def evaluation_step(
         ``LossMetrics`` with ``loss``, ``chosen_rewards``, and
         ``rejected_rewards`` populated.
     """
-    *_, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=1,
-        batch_partition_spec=partition_spec,
-    )
+    eval_scope = "easydel/trainer/dpo/eval_step"
+    with jax.named_scope(eval_scope + "/prepare_batch"):
+        *_, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=1,
+            batch_partition_spec=partition_spec,
+        )
 
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
-    _loss_func = get_loss_function(
-        loss_type=loss_type,
-        beta=beta,
-        label_smoothing=label_smoothing,
-    )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    with jax.named_scope(eval_scope + "/resolve_loss_function"):
+        _loss_func = get_loss_function(
+            loss_type=loss_type,
+            beta=beta,
+            label_smoothing=label_smoothing,
+        )
 
     def calculate_loss(tree: spx.State):
         """Compute DPO eval metrics on the captured ``batch``.
@@ -1496,41 +1519,47 @@ def evaluation_step(
             ``LossMetrics`` populated with the mean loss and the
             implicit reward arrays.
         """
-        model_output = concatenated_forward(state.merge(tree), batch)
-        chosen_logps = model_output["chosen_logps"]
-        rejected_logps = model_output["rejected_logps"]
+        with jax.named_scope(eval_scope + "/loss_fn"):
+            with jax.named_scope(eval_scope + "/loss_fn/policy_forward"):
+                model_output = concatenated_forward(state.merge(tree), batch)
+            chosen_logps = model_output["chosen_logps"]
+            rejected_logps = model_output["rejected_logps"]
 
-        if reference_free:
-            ref_chosen_for_loss = jnp.zeros_like(chosen_logps)
-            ref_rejected_for_loss = jnp.zeros_like(rejected_logps)
-        else:
-            ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
-            if ref_chosen_logps is None or ref_rejected_logps is None:
-                ref_model = state.model if reference_state is None else reference_state.model
-                ref_output = concatenated_forward(ref_model, batch)
-                ref_chosen_logps = ref_output["chosen_logps"]
-                ref_rejected_logps = ref_output["rejected_logps"]
-            ref_chosen_for_loss = ref_chosen_logps
-            ref_rejected_for_loss = ref_rejected_logps
+            with jax.named_scope(eval_scope + "/loss_fn/resolve_reference_logps"):
+                if reference_free:
+                    ref_chosen_for_loss = jnp.zeros_like(chosen_logps)
+                    ref_rejected_for_loss = jnp.zeros_like(rejected_logps)
+                else:
+                    ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+                    if ref_chosen_logps is None or ref_rejected_logps is None:
+                        ref_model = state.model if reference_state is None else reference_state.model
+                        ref_output = concatenated_forward(ref_model, batch)
+                        ref_chosen_logps = ref_output["chosen_logps"]
+                        ref_rejected_logps = ref_output["rejected_logps"]
+                    ref_chosen_for_loss = ref_chosen_logps
+                    ref_rejected_for_loss = ref_rejected_logps
 
-        losses = _loss_func(
-            chosen_logps,
-            rejected_logps,
-            ref_chosen_for_loss,
-            ref_rejected_for_loss,
-            beta,
-            label_smoothing,
-        )
+            with jax.named_scope(eval_scope + "/loss_fn/compute_dpo_loss"):
+                losses = _loss_func(
+                    chosen_logps,
+                    rejected_logps,
+                    ref_chosen_for_loss,
+                    ref_rejected_for_loss,
+                    beta,
+                    label_smoothing,
+                )
 
-        chosen_rewards = beta * (chosen_logps - ref_chosen_for_loss)
-        rejected_rewards = beta * (rejected_logps - ref_rejected_for_loss)
+            with jax.named_scope(eval_scope + "/loss_fn/rewards_and_metrics"):
+                chosen_rewards = beta * (chosen_logps - ref_chosen_for_loss)
+                rejected_rewards = beta * (rejected_logps - ref_rejected_for_loss)
 
-        metrics = LossMetrics(
-            loss=losses.mean(),
-            rejected_rewards=rejected_rewards,
-            chosen_rewards=chosen_rewards,
-        )
-        return metrics
+                metrics = LossMetrics(
+                    loss=losses.mean(),
+                    rejected_rewards=rejected_rewards,
+                    chosen_rewards=chosen_rewards,
+                )
+            return metrics
 
-    metrics = calculate_loss(state.graphstate)
+    with jax.named_scope(eval_scope + "/eval_call"):
+        metrics = calculate_loss(state.graphstate)
     return metrics

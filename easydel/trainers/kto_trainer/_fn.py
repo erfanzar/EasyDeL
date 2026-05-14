@@ -288,22 +288,25 @@ def training_step(
         ``kl`` anchor, and any auxiliary metrics in ``other_metrics``.
     """
 
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/kto/train_step"
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    batch = dict(batch)
-    if "reference_logps" not in batch:
-        ref_out = forward_fn(reference_state.model, batch)
-        batch["reference_logps"] = jax.lax.stop_gradient(ref_out["completion_logps"])
+        batch = dict(batch)
+    with jax.named_scope(scope_root + "/reference_forward"):
+        if "reference_logps" not in batch:
+            ref_out = forward_fn(reference_state.model, batch)
+            batch["reference_logps"] = jax.lax.stop_gradient(ref_out["completion_logps"])
 
-    if calculate_kl:
-        kl_batch = _build_kl_batch(batch)
-        ref_kl_out = forward_fn(reference_state.model, kl_batch)
-        batch["_reference_kl_logps"] = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
+        if calculate_kl:
+            kl_batch = _build_kl_batch(batch)
+            ref_kl_out = forward_fn(reference_state.model, kl_batch)
+            batch["_reference_kl_logps"] = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
 
     def _loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         """Compute the KTO loss for one minibatch.
@@ -322,63 +325,72 @@ def training_step(
             ``(loss, metrics)`` with chosen / rejected rewards and the
             KL diagnostic recorded under ``other_metrics["kl"]``.
         """
-        if straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree=tree)
-        policy_out = forward_fn(module, minibatch)
-        policy_logps = policy_out["completion_logps"]
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree=tree)
+            with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+                policy_out = forward_fn(module, minibatch)
+                policy_logps = policy_out["completion_logps"]
 
-        reference_logps = jax.lax.stop_gradient(minibatch["reference_logps"])
+            reference_logps = jax.lax.stop_gradient(minibatch["reference_logps"])
 
-        if calculate_kl:
-            kl_batch = _build_kl_batch(minibatch)
-            policy_kl_logps = jax.lax.stop_gradient(forward_fn(module, kl_batch)["completion_logps"])
-            reference_kl_logps = jax.lax.stop_gradient(minibatch["_reference_kl_logps"])
-        else:
-            policy_kl_logps = reference_kl_logps = None
+            if calculate_kl:
+                with jax.named_scope(scope_root + "/loss_fn/policy_kl_forward"):
+                    kl_batch = _build_kl_batch(minibatch)
+                    policy_kl_logps = jax.lax.stop_gradient(forward_fn(module, kl_batch)["completion_logps"])
+                    reference_kl_logps = jax.lax.stop_gradient(minibatch["_reference_kl_logps"])
+            else:
+                policy_kl_logps = reference_kl_logps = None
 
-        loss, chosen_rewards, rejected_rewards, kl = kto_objective(
-            policy_logps,
-            reference_logps,
-            minibatch["label"],
-            beta=beta,
-            desirable_weight=desirable_weight,
-            undesirable_weight=undesirable_weight,
-            loss_type=loss_type,
-            policy_kl_logps=policy_kl_logps,
-            reference_kl_logps=reference_kl_logps,
+            with jax.named_scope(scope_root + "/loss_fn/compute_kto_loss"):
+                loss, chosen_rewards, rejected_rewards, kl = kto_objective(
+                    policy_logps,
+                    reference_logps,
+                    minibatch["label"],
+                    beta=beta,
+                    desirable_weight=desirable_weight,
+                    undesirable_weight=undesirable_weight,
+                    loss_type=loss_type,
+                    policy_kl_logps=policy_kl_logps,
+                    reference_kl_logps=reference_kl_logps,
+                )
+
+                if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
+                    loss = loss + aux_loss_coef * policy_out["aux_loss"]
+
+            with jax.named_scope(scope_root + "/loss_fn/build_metrics"):
+                metrics = LossMetrics(
+                    loss=loss,
+                    chosen_rewards=chosen_rewards,
+                    rejected_rewards=rejected_rewards,
+                    other_metrics={"kl": kl},
+                )
+            return metrics.loss, metrics
+
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=batch,
+            minibatch_size=minibatch_size,
+            grad_fn=jax.value_and_grad(_loss_fn, has_aux=True),
         )
 
-        if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
-            loss = loss + aux_loss_coef * policy_out["aux_loss"]
-
-        metrics = LossMetrics(
-            loss=loss,
-            chosen_rewards=chosen_rewards,
-            rejected_rewards=rejected_rewards,
-            other_metrics={"kl": kl},
+    with jax.named_scope(scope_root + "/update_state"):
+        metrics = update_metrics(
+            metrics=metrics,
+            learning_rate_fn=learning_rate_fn,
+            step=state.step,
+            gradients=gradients,
         )
-        return metrics.loss, metrics
-
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=batch,
-        minibatch_size=minibatch_size,
-        grad_fn=jax.value_and_grad(_loss_fn, has_aux=True),
-    )
-
-    metrics = update_metrics(
-        metrics=metrics,
-        learning_rate_fn=learning_rate_fn,
-        step=state.step,
-        gradients=gradients,
-    )
-    state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=loss_config,
-        metrics=metrics,
-    )
+        state = update_state_respectfully(
+            state=state,
+            gradients=gradients,
+            loss_config=loss_config,
+            metrics=metrics,
+        )
     return state, metrics
 
 
@@ -505,33 +517,37 @@ def _make_kto_scheduled_loss(call):
         Returns:
             The scalar KTO loss with optional aux-loss term.
         """
-        module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-        policy_out = forward_fn(module, call_batch)
-        policy_logps = policy_out["completion_logps"]
-        reference_logps = jax.lax.stop_gradient(call_batch["reference_logps"])
+        with jax.named_scope("easydel/trainer/kto/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/kto/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+            with jax.named_scope("easydel/trainer/kto/scheduled_loss/policy_forward"):
+                policy_out = forward_fn(module, call_batch)
+                policy_logps = policy_out["completion_logps"]
+                reference_logps = jax.lax.stop_gradient(call_batch["reference_logps"])
 
-        if calculate_kl:
-            policy_kl_logps = jax.lax.stop_gradient(call_batch["_policy_kl_logps"])
-            reference_kl_logps = jax.lax.stop_gradient(call_batch["_reference_kl_logps"])
-        else:
-            policy_kl_logps = reference_kl_logps = None
+            if calculate_kl:
+                policy_kl_logps = jax.lax.stop_gradient(call_batch["_policy_kl_logps"])
+                reference_kl_logps = jax.lax.stop_gradient(call_batch["_reference_kl_logps"])
+            else:
+                policy_kl_logps = reference_kl_logps = None
 
-        loss, *_ = kto_objective(
-            policy_logps,
-            reference_logps,
-            call_batch["label"],
-            beta=beta,
-            desirable_weight=desirable_weight,
-            undesirable_weight=undesirable_weight,
-            loss_type=loss_type,
-            policy_kl_logps=policy_kl_logps,
-            reference_kl_logps=reference_kl_logps,
-        )
+            with jax.named_scope("easydel/trainer/kto/scheduled_loss/compute_kto_loss"):
+                loss, *_ = kto_objective(
+                    policy_logps,
+                    reference_logps,
+                    call_batch["label"],
+                    beta=beta,
+                    desirable_weight=desirable_weight,
+                    undesirable_weight=undesirable_weight,
+                    loss_type=loss_type,
+                    policy_kl_logps=policy_kl_logps,
+                    reference_kl_logps=reference_kl_logps,
+                )
 
-        if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
-            loss = loss + aux_loss_coef * policy_out["aux_loss"]
-        return loss
+                if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
+                    loss = loss + aux_loss_coef * policy_out["aux_loss"]
+            return loss
 
     return scheduled_loss
 
@@ -590,42 +606,49 @@ def evaluation_step(
         Loss metrics.
     """
 
-    *_, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=1,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    eval_scope = "easydel/trainer/kto/eval_step"
 
-    policy_out = forward_fn(state.model, batch)
-    policy_logps = policy_out["completion_logps"]
+    with jax.named_scope(eval_scope + "/prepare_batch"):
+        *_, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=1,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    if "reference_logps" in batch:
-        reference_logps = batch["reference_logps"]
-    else:
-        reference_logps = forward_fn(reference_state.model, batch)["completion_logps"]
+    with jax.named_scope(eval_scope + "/policy_forward"):
+        policy_out = forward_fn(state.model, batch)
+        policy_logps = policy_out["completion_logps"]
+
+    with jax.named_scope(eval_scope + "/reference_forward"):
+        if "reference_logps" in batch:
+            reference_logps = batch["reference_logps"]
+        else:
+            reference_logps = forward_fn(reference_state.model, batch)["completion_logps"]
 
     if calculate_kl:
-        kl_batch = _build_kl_batch(batch)
-        policy_kl_logps = forward_fn(state.model, kl_batch)["completion_logps"]
-        reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
+        with jax.named_scope(eval_scope + "/kl_forward"):
+            kl_batch = _build_kl_batch(batch)
+            policy_kl_logps = forward_fn(state.model, kl_batch)["completion_logps"]
+            reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
     else:
         policy_kl_logps = reference_kl_logps = None
 
-    loss, chosen_rewards, rejected_rewards, kl = kto_objective(
-        policy_logps,
-        reference_logps,
-        batch["label"],
-        beta=beta,
-        desirable_weight=desirable_weight,
-        undesirable_weight=undesirable_weight,
-        loss_type=loss_type,
-        policy_kl_logps=policy_kl_logps,
-        reference_kl_logps=reference_kl_logps,
-    )
+    with jax.named_scope(eval_scope + "/compute_kto_loss"):
+        loss, chosen_rewards, rejected_rewards, kl = kto_objective(
+            policy_logps,
+            reference_logps,
+            batch["label"],
+            beta=beta,
+            desirable_weight=desirable_weight,
+            undesirable_weight=undesirable_weight,
+            loss_type=loss_type,
+            policy_kl_logps=policy_kl_logps,
+            reference_kl_logps=reference_kl_logps,
+        )
 
-    if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
-        loss = loss + aux_loss_coef * policy_out["aux_loss"]
+        if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
+            loss = loss + aux_loss_coef * policy_out["aux_loss"]
 
     return LossMetrics(
         loss=loss,

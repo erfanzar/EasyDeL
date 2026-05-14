@@ -196,12 +196,14 @@ def sparse_distillation_step(
         If training: ``(updated_state, metrics)``
         If evaluation: ``metrics``
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/sparse_distillation/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the sparse-distillation loss for one minibatch.
@@ -216,59 +218,67 @@ def sparse_distillation_step(
         Returns:
             tuple[jax.Array, LossMetrics]: ``(scalar_loss, metrics)``.
         """
-        if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if is_training and straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree)
 
-        input_ids = minibatch["input_ids"]
-        attention_mask = minibatch["attention_mask"]
-        completion_mask = minibatch.get("completion_mask")
-        labels = minibatch.get("labels")
-        teacher_top_k_indices = minibatch["teacher_top_k_indices"]
-        teacher_top_k_logprobs = minibatch["teacher_top_k_logprobs"]
+            input_ids = minibatch["input_ids"]
+            attention_mask = minibatch["attention_mask"]
+            completion_mask = minibatch.get("completion_mask")
+            labels = minibatch.get("labels")
+            teacher_top_k_indices = minibatch["teacher_top_k_indices"]
+            teacher_top_k_logprobs = minibatch["teacher_top_k_logprobs"]
 
-        call_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
-        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
-        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-        student_outputs = module(**call_kwargs)
+            call_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+            call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
+            call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+            with jax.named_scope(scope_root + "/loss_fn/student_forward"):
+                student_outputs = module(**call_kwargs)
 
-        total_loss, loss_components = partial_kl_distillation_loss(
-            student_logits=student_outputs.logits,
-            teacher_top_k_indices=teacher_top_k_indices,
-            teacher_top_k_logprobs=teacher_top_k_logprobs,
-            attention_mask=attention_mask,
-            loss_mask=completion_mask,
-            labels=labels,
-            use_hard_labels=(labels is not None),
-            temperature=temperature,
-            alpha=alpha,
-        )
+            with jax.named_scope(scope_root + "/loss_fn/partial_kl_loss"):
+                total_loss, loss_components = partial_kl_distillation_loss(
+                    student_logits=student_outputs.logits,
+                    teacher_top_k_indices=teacher_top_k_indices,
+                    teacher_top_k_logprobs=teacher_top_k_logprobs,
+                    attention_mask=attention_mask,
+                    loss_mask=completion_mask,
+                    labels=labels,
+                    use_hard_labels=(labels is not None),
+                    temperature=temperature,
+                    alpha=alpha,
+                )
 
-        metrics = LossMetrics(
-            loss=total_loss,
-            other_metrics={key: jnp.asarray(value) for key, value in loss_components.items()},
-        )
-        return total_loss, metrics
+            metrics = LossMetrics(
+                loss=total_loss,
+                other_metrics={key: jnp.asarray(value) for key, value in loss_components.items()},
+            )
+            return total_loss, metrics
 
     if is_training:
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=state.step,
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            state = update_state_respectfully(
+                state=state,
                 gradients=gradients,
-            ),
-        )
+                loss_config=loss_config,
+                metrics=update_metrics(
+                    metrics=metrics,
+                    learning_rate_fn=learning_rate_fn,
+                    step=state.step,
+                    gradients=gradients,
+                ),
+            )
         return state, metrics
     else:
-        _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
+        with jax.named_scope(scope_root + "/eval_call"):
+            _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
         return metrics

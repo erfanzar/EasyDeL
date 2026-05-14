@@ -308,6 +308,15 @@ class BaseTrainerCfg(TypedDict, total=False):
         backend: JAX backend to use (e.g., "gpu", "tpu").
         auto_shard_states: Whether to automatically shard model states across devices.
         performance_mode: Whether to enable performance optimizations.
+        profiler_path: Optional output directory for the JAX profiler trace. When set,
+            the trainer calls ``jax.profiler.start_trace(profiler_path)`` immediately
+            after the first training step completes (so the trace excludes the initial
+            JIT-compile of step 1) and ``jax.profiler.stop_trace()`` when training
+            finishes. Set to None to disable.
+        profiler_host_tracer_level: Optional ``ProfileOptions().host_tracer_level``
+            override (1-4) for the trace; higher values capture more host-side detail.
+        profiler_python_tracer_level: Optional ``ProfileOptions().python_tracer_level``
+            override for Python function-level profiling.
         track_memory: Whether to track memory usage. Can be bool or float threshold.
         low_mem_usage: Whether to enable low memory usage optimizations.
         quantization_mode: QAT/STE quantization mode for forward-pass emulation.
@@ -487,6 +496,9 @@ class BaseTrainerCfg(TypedDict, total=False):
     backend: NotRequired[str | None]
     auto_shard_states: NotRequired[bool]
     performance_mode: NotRequired[bool]
+    profiler_path: NotRequired[str | None]
+    profiler_host_tracer_level: NotRequired[int | None]
+    profiler_python_tracer_level: NotRequired[int | None]
     track_memory: NotRequired[bool | float]
     low_mem_usage: NotRequired[bool]
     quantization_mode: NotRequired[Literal["nf4", "affine", "mxfp8", "nvfp8", "mxfp4", "nvfp4"] | None]
@@ -1580,6 +1592,9 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "use_wandb": True,
     "auto_shard_states": True,
     "performance_mode": False,
+    "profiler_path": None,
+    "profiler_host_tracer_level": None,
+    "profiler_python_tracer_level": None,
     "track_memory": False,
     "low_mem_usage": True,
     "lmhead_chunksize": None,

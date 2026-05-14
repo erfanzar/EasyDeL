@@ -463,12 +463,14 @@ def training_step(
     step_batch = dict(batch)
     step_batch.pop("running_mean", None)
 
-    _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
-        batch=step_batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    step_batch = with_sharding_constraint(step_batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/bco/train_step"
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
+            batch=step_batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        step_batch = with_sharding_constraint(step_batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: jax.ArrayTree, call_batch: dict[str, jax.Array]):
         """Compute the BCO loss for one minibatch.
@@ -487,91 +489,102 @@ def training_step(
             ``(loss, metrics)`` where ``loss`` is the scalar BCO loss
             and ``metrics`` is a populated :class:`LossMetrics`.
         """
-        if straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        model = state.merge(tree=tree)
-        policy_outputs = concatenated_forward_fn(model, call_batch)
-        completion_logps = policy_outputs["completion_logps"]
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                model = state.merge(tree=tree)
+            with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+                policy_outputs = concatenated_forward_fn(model, call_batch)
+                completion_logps = policy_outputs["completion_logps"]
 
-        labels = call_batch["label"].astype(bool)
-        chosen_mask = labels
-        rejected_mask = jnp.logical_not(labels)
+            with jax.named_scope(scope_root + "/loss_fn/build_masks"):
+                labels = call_batch["label"].astype(bool)
+                chosen_mask = labels
+                rejected_mask = jnp.logical_not(labels)
 
-        if "reference_logps" in call_batch:
-            reference_completion_logps = call_batch["reference_logps"]
-        else:
-            if reference_state is None:
-                reference_model = model
-            else:
-                reference_model = reference_state.model
-            ref_outputs = concatenated_forward_fn(reference_model, call_batch)
-            reference_completion_logps = jax.lax.stop_gradient(ref_outputs["completion_logps"])
+            with jax.named_scope(scope_root + "/loss_fn/resolve_reference_logps"):
+                if "reference_logps" in call_batch:
+                    reference_completion_logps = call_batch["reference_logps"]
+                else:
+                    if reference_state is None:
+                        reference_model = model
+                    else:
+                        reference_model = reference_state.model
+                    ref_outputs = concatenated_forward_fn(reference_model, call_batch)
+                    reference_completion_logps = jax.lax.stop_gradient(ref_outputs["completion_logps"])
 
-        udm_weights = call_batch.get("udm_weights", None)
-        if udm_weights is not None:
-            rejected_weights = jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
-        else:
-            rejected_weights = None
+            with jax.named_scope(scope_root + "/loss_fn/udm_weights"):
+                udm_weights = call_batch.get("udm_weights", None)
+                if udm_weights is not None:
+                    rejected_weights = jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
+                else:
+                    rejected_weights = None
 
-        (
-            losses,
-            chosen_rewards_masked,
-            rejected_rewards_masked,
-            chosen_losses,
-            rejected_losses,
-            chosen_valid,
-            rejected_valid,
-        ) = compute_bco_loss(
-            completion_logps,
-            reference_completion_logps,
-            chosen_mask,
-            rejected_mask,
-            beta=beta,
-            delta=running_delta,
-            udm_weights=rejected_weights,
+            with jax.named_scope(scope_root + "/loss_fn/compute_bco_loss"):
+                (
+                    losses,
+                    chosen_rewards_masked,
+                    rejected_rewards_masked,
+                    chosen_losses,
+                    rejected_losses,
+                    chosen_valid,
+                    rejected_valid,
+                ) = compute_bco_loss(
+                    completion_logps,
+                    reference_completion_logps,
+                    chosen_mask,
+                    rejected_mask,
+                    beta=beta,
+                    delta=running_delta,
+                    udm_weights=rejected_weights,
+                )
+
+                if policy_outputs.get("aux_loss") is not None:
+                    losses = losses + policy_outputs["aux_loss"]
+
+            with jax.named_scope(scope_root + "/loss_fn/build_metrics"):
+                metrics = LossMetrics(
+                    loss=losses,
+                    chosen_rewards=chosen_rewards_masked,
+                    rejected_rewards=rejected_rewards_masked,
+                    other_metrics={
+                        "delta": running_delta,
+                        "logps/chosen": (completion_logps * chosen_mask.astype(completion_logps.dtype)).sum()
+                        / jnp.maximum(chosen_valid.sum(), 1.0),
+                        "logps/rejected": (completion_logps * rejected_mask.astype(completion_logps.dtype)).sum()
+                        / jnp.maximum(rejected_valid.sum(), 1.0),
+                        "logits/mean": policy_outputs["mean_completion_logits"],
+                        "count/chosen": chosen_valid.sum(),
+                        "count/rejected": rejected_valid.sum(),
+                        "loss/chosen": chosen_losses.sum() / jnp.maximum(chosen_valid.sum(), 1.0),
+                        "loss/rejected": rejected_losses.sum() / jnp.maximum(rejected_valid.sum(), 1.0),
+                    },
+                )
+            return metrics.loss, metrics
+
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=step_batch,
+            minibatch_size=minibatch_size,
+            grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
         )
 
-        if policy_outputs.get("aux_loss") is not None:
-            losses = losses + policy_outputs["aux_loss"]
-
-        metrics = LossMetrics(
-            loss=losses,
-            chosen_rewards=chosen_rewards_masked,
-            rejected_rewards=rejected_rewards_masked,
-            other_metrics={
-                "delta": running_delta,
-                "logps/chosen": (completion_logps * chosen_mask.astype(completion_logps.dtype)).sum()
-                / jnp.maximum(chosen_valid.sum(), 1.0),
-                "logps/rejected": (completion_logps * rejected_mask.astype(completion_logps.dtype)).sum()
-                / jnp.maximum(rejected_valid.sum(), 1.0),
-                "logits/mean": policy_outputs["mean_completion_logits"],
-                "count/chosen": chosen_valid.sum(),
-                "count/rejected": rejected_valid.sum(),
-                "loss/chosen": chosen_losses.sum() / jnp.maximum(chosen_valid.sum(), 1.0),
-                "loss/rejected": rejected_losses.sum() / jnp.maximum(rejected_valid.sum(), 1.0),
-            },
+    with jax.named_scope(scope_root + "/update_state"):
+        metrics = update_metrics(
+            metrics=metrics,
+            learning_rate_fn=learning_rate_fn,
+            step=state.step,
+            gradients=gradients,
         )
-        return metrics.loss, metrics
-
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=step_batch,
-        minibatch_size=minibatch_size,
-        grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
-    )
-
-    metrics = update_metrics(
-        metrics=metrics,
-        learning_rate_fn=learning_rate_fn,
-        step=state.step,
-        gradients=gradients,
-    )
-    new_state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=loss_config,
-        metrics=metrics,
-    )
+        new_state = update_state_respectfully(
+            state=state,
+            gradients=gradients,
+            loss_config=loss_config,
+            metrics=metrics,
+        )
     return new_state, metrics
 
 
@@ -653,48 +666,54 @@ def _make_bco_scheduled_loss(call):
             RuntimeError: If ``reference_logps`` is missing from the
                 batch.
         """
-        running_delta = batch.get("running_mean")
-        if running_delta is None:
-            running_delta = jnp.array(0.0, dtype=jnp.float32)
-        else:
-            running_delta = jnp.asarray(running_delta).reshape(())
+        with jax.named_scope("easydel/trainer/bco/scheduled_loss"):
+            running_delta = batch.get("running_mean")
+            if running_delta is None:
+                running_delta = jnp.array(0.0, dtype=jnp.float32)
+            else:
+                running_delta = jnp.asarray(running_delta).reshape(())
 
-        call_batch = dict(batch)
-        call_batch.pop("running_mean", None)
-        module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, call_batch, partition_spec)
-        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+            with jax.named_scope("easydel/trainer/bco/scheduled_loss/bind_module"):
+                call_batch = dict(batch)
+                call_batch.pop("running_mean", None)
+                module = bind_scheduled_module(call, tree)
+                call_batch = constrain_scheduled_batch(module, call_batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
 
-        policy_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
-        completion_logps = policy_outputs["completion_logps"]
+            with jax.named_scope("easydel/trainer/bco/scheduled_loss/policy_forward"):
+                policy_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
+                completion_logps = policy_outputs["completion_logps"]
 
-        reference_completion_logps = call_batch.get("reference_logps")
-        if reference_completion_logps is None:
-            raise RuntimeError("BCO scheduled MPMD loss requires precomputed reference_logps in the batch.")
-        reference_completion_logps = jax.lax.stop_gradient(reference_completion_logps)
+            with jax.named_scope("easydel/trainer/bco/scheduled_loss/resolve_reference_logps"):
+                reference_completion_logps = call_batch.get("reference_logps")
+                if reference_completion_logps is None:
+                    raise RuntimeError("BCO scheduled MPMD loss requires precomputed reference_logps in the batch.")
+                reference_completion_logps = jax.lax.stop_gradient(reference_completion_logps)
 
-        labels = call_batch["label"].astype(bool)
-        chosen_mask = labels
-        rejected_mask = jnp.logical_not(labels)
-        udm_weights = call_batch.get("udm_weights", None)
-        rejected_weights = (
-            jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
-            if udm_weights is not None
-            else None
-        )
+            with jax.named_scope("easydel/trainer/bco/scheduled_loss/build_masks"):
+                labels = call_batch["label"].astype(bool)
+                chosen_mask = labels
+                rejected_mask = jnp.logical_not(labels)
+                udm_weights = call_batch.get("udm_weights", None)
+                rejected_weights = (
+                    jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
+                    if udm_weights is not None
+                    else None
+                )
 
-        loss, *_ = compute_bco_loss(
-            completion_logps,
-            reference_completion_logps,
-            chosen_mask,
-            rejected_mask,
-            beta=beta,
-            delta=running_delta,
-            udm_weights=rejected_weights,
-        )
-        if policy_outputs.get("aux_loss") is not None:
-            loss = loss + policy_outputs["aux_loss"]
-        return loss
+            with jax.named_scope("easydel/trainer/bco/scheduled_loss/compute_bco_loss"):
+                loss, *_ = compute_bco_loss(
+                    completion_logps,
+                    reference_completion_logps,
+                    chosen_mask,
+                    rejected_mask,
+                    beta=beta,
+                    delta=running_delta,
+                    udm_weights=rejected_weights,
+                )
+                if policy_outputs.get("aux_loss") is not None:
+                    loss = loss + policy_outputs["aux_loss"]
+            return loss
 
     return scheduled_loss
 
@@ -742,52 +761,59 @@ def evaluation_step(
         ``chosen_rewards`` / ``rejected_rewards`` arrays.
     """
 
+    eval_scope = "easydel/trainer/bco/eval_step"
+
     running_delta = batch.get("running_mean")
     if running_delta is None:
         running_delta = jnp.array(0.0, dtype=jnp.float32)
     else:
         running_delta = jnp.asarray(running_delta).reshape(())
 
-    policy_outputs = concatenated_forward_fn(state.model, batch)
-    completion_logps = policy_outputs["completion_logps"]
+    with jax.named_scope(eval_scope + "/policy_forward"):
+        policy_outputs = concatenated_forward_fn(state.model, batch)
+        completion_logps = policy_outputs["completion_logps"]
 
-    labels = batch["label"].astype(bool)
-    chosen_mask = labels
-    rejected_mask = jnp.logical_not(labels)
+    with jax.named_scope(eval_scope + "/build_masks"):
+        labels = batch["label"].astype(bool)
+        chosen_mask = labels
+        rejected_mask = jnp.logical_not(labels)
 
-    if "reference_logps" in batch:
-        reference_completion_logps = batch["reference_logps"]
-    else:
-        if reference_state is None:
-            reference_model = state.model
+    with jax.named_scope(eval_scope + "/resolve_reference_logps"):
+        if "reference_logps" in batch:
+            reference_completion_logps = batch["reference_logps"]
         else:
-            reference_model = reference_state.model
-        ref_outputs = concatenated_forward_fn(reference_model, batch)
-        reference_completion_logps = ref_outputs["completion_logps"]
+            if reference_state is None:
+                reference_model = state.model
+            else:
+                reference_model = reference_state.model
+            ref_outputs = concatenated_forward_fn(reference_model, batch)
+            reference_completion_logps = ref_outputs["completion_logps"]
 
-    udm_weights = batch.get("udm_weights", None)
-    if udm_weights is not None:
-        rejected_weights = jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
-    else:
-        rejected_weights = None
+    with jax.named_scope(eval_scope + "/udm_weights"):
+        udm_weights = batch.get("udm_weights", None)
+        if udm_weights is not None:
+            rejected_weights = jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
+        else:
+            rejected_weights = None
 
-    (
-        losses,
-        chosen_rewards,
-        rejected_rewards,
-        chosen_losses,
-        rejected_losses,
-        chosen_valid,
-        rejected_valid,
-    ) = compute_bco_loss(
-        completion_logps,
-        reference_completion_logps,
-        chosen_mask,
-        rejected_mask,
-        beta=beta,
-        delta=running_delta,
-        udm_weights=rejected_weights,
-    )
+    with jax.named_scope(eval_scope + "/compute_bco_loss"):
+        (
+            losses,
+            chosen_rewards,
+            rejected_rewards,
+            chosen_losses,
+            rejected_losses,
+            chosen_valid,
+            rejected_valid,
+        ) = compute_bco_loss(
+            completion_logps,
+            reference_completion_logps,
+            chosen_mask,
+            rejected_mask,
+            beta=beta,
+            delta=running_delta,
+            udm_weights=rejected_weights,
+        )
 
     metrics = LossMetrics(
         loss=losses,

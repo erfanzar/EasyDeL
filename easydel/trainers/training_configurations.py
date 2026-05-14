@@ -642,6 +642,37 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to enable performance mode (e.g., XLA compilation)."},
     )
+    profiler_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional output directory for the JAX profiler trace. When set, the trainer calls "
+                "`jax.profiler.start_trace(profiler_path)` immediately after the first training step "
+                "completes (so the trace excludes the initial JIT-compile of step 1) and "
+                "`jax.profiler.stop_trace()` when training finishes. Only rank 0 records the trace "
+                "unless `log_all_workers` is True. Set to None to disable profiling."
+            )
+        },
+    )
+    profiler_host_tracer_level: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional `jax.profiler.ProfileOptions().host_tracer_level` override (1-4). Higher "
+                "values capture more host-side detail at the cost of more overhead. Only used when "
+                "`profiler_path` is set."
+            )
+        },
+    )
+    profiler_python_tracer_level: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional `jax.profiler.ProfileOptions().python_tracer_level` override for Python "
+                "function-level profiling. Only used when `profiler_path` is set."
+            )
+        },
+    )
     pruning_module: tp.Any = field(
         default=None,
         metadata={"help": "The pruning module to use."},

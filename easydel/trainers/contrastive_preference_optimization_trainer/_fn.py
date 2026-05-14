@@ -392,12 +392,14 @@ def training_step(
         ``chosen_rewards`` / ``rejected_rewards`` arrays for logging.
     """
 
-    _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/cpo/train_step"
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: spx.State, call_batch: dict[str, jax.Array]):
         """Compute the CPO loss and diagnostic metrics for one minibatch.
@@ -415,71 +417,81 @@ def training_step(
             ``(loss, metrics)`` with reward margin/accuracy and chosen
             / rejected logit means recorded in ``metrics.other_metrics``.
         """
-        if straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        policy_model = state.merge(tree=tree)
-        model_outputs = concatenated_forward_fn(policy_model, call_batch)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                policy_model = state.merge(tree=tree)
+            with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+                model_outputs = concatenated_forward_fn(policy_model, call_batch)
 
-        losses, chosen_rewards, rejected_rewards = cpo_loss(
-            model_outputs["chosen_logps"],
-            model_outputs["rejected_logps"],
-            beta=beta,
-            label_smoothing=label_smoothing,
-            loss_type=loss_type,
-            simpo_gamma=simpo_gamma,
-            alpha=alpha,
-        )
+            with jax.named_scope(scope_root + "/loss_fn/compute_cpo_loss"):
+                losses, chosen_rewards, rejected_rewards = cpo_loss(
+                    model_outputs["chosen_logps"],
+                    model_outputs["rejected_logps"],
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    simpo_gamma=simpo_gamma,
+                    alpha=alpha,
+                )
 
-        chosen_rewards = jax.lax.stop_gradient(chosen_rewards)
-        rejected_rewards = jax.lax.stop_gradient(rejected_rewards)
-        policy_nll_loss = _policy_nll_loss(
-            model_outputs["chosen_logps_raw"],
-            model_outputs["chosen_lengths"],
-        )
+            with jax.named_scope(scope_root + "/loss_fn/policy_nll"):
+                chosen_rewards = jax.lax.stop_gradient(chosen_rewards)
+                rejected_rewards = jax.lax.stop_gradient(rejected_rewards)
+                policy_nll_loss = _policy_nll_loss(
+                    model_outputs["chosen_logps_raw"],
+                    model_outputs["chosen_lengths"],
+                )
 
-        loss = losses.mean() + cpo_alpha * policy_nll_loss
-        aux_loss = model_outputs.get("aux_loss")
-        if aux_loss is not None:
-            loss = loss + aux_loss
+            with jax.named_scope(scope_root + "/loss_fn/combine_losses"):
+                loss = losses.mean() + cpo_alpha * policy_nll_loss
+                aux_loss = model_outputs.get("aux_loss")
+                if aux_loss is not None:
+                    loss = loss + aux_loss
 
-        reward_margin = jnp.mean(chosen_rewards - rejected_rewards)
-        reward_accuracy = jnp.mean((chosen_rewards > rejected_rewards).astype(jnp.float32))
+            with jax.named_scope(scope_root + "/loss_fn/diagnostics"):
+                reward_margin = jnp.mean(chosen_rewards - rejected_rewards)
+                reward_accuracy = jnp.mean((chosen_rewards > rejected_rewards).astype(jnp.float32))
 
-        other_metrics = {
-            "policy_nll_loss": policy_nll_loss,
-            "reward_margin": reward_margin,
-            "reward_accuracy": reward_accuracy,
-            "mean_chosen_logits": model_outputs["mean_chosen_logits"],
-            "mean_rejected_logits": model_outputs["mean_rejected_logits"],
-        }
-        metrics = LossMetrics(
-            loss=loss,
-            chosen_rewards=chosen_rewards,
-            rejected_rewards=rejected_rewards,
-            other_metrics=other_metrics,
-        )
-        return loss, metrics
+                other_metrics = {
+                    "policy_nll_loss": policy_nll_loss,
+                    "reward_margin": reward_margin,
+                    "reward_accuracy": reward_accuracy,
+                    "mean_chosen_logits": model_outputs["mean_chosen_logits"],
+                    "mean_rejected_logits": model_outputs["mean_rejected_logits"],
+                }
+                metrics = LossMetrics(
+                    loss=loss,
+                    chosen_rewards=chosen_rewards,
+                    rejected_rewards=rejected_rewards,
+                    other_metrics=other_metrics,
+                )
+            return loss, metrics
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=batch,
-        minibatch_size=minibatch_size,
-        grad_fn=grad_fn,
-    )
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=batch,
+            minibatch_size=minibatch_size,
+            grad_fn=grad_fn,
+        )
 
-    metrics = update_metrics(
-        metrics=metrics,
-        learning_rate_fn=learning_rate_fn,
-        step=state.step,
-        gradients=gradients,
-    )
-    new_state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=loss_config,
-        metrics=metrics,
-    )
+    with jax.named_scope(scope_root + "/update_state"):
+        metrics = update_metrics(
+            metrics=metrics,
+            learning_rate_fn=learning_rate_fn,
+            step=state.step,
+            gradients=gradients,
+        )
+        new_state = update_state_respectfully(
+            state=state,
+            gradients=gradients,
+            loss_config=loss_config,
+            metrics=metrics,
+        )
     return new_state, metrics
 
 
@@ -540,29 +552,35 @@ def _make_cpo_scheduled_loss(call):
             The combined CPO + chosen-NLL scalar loss (with optional
             aux-loss term added).
         """
-        module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
-        model_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
+        with jax.named_scope("easydel/trainer/cpo/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/cpo/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+            with jax.named_scope("easydel/trainer/cpo/scheduled_loss/policy_forward"):
+                model_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
 
-        losses, _, _ = cpo_loss(
-            model_outputs["chosen_logps"],
-            model_outputs["rejected_logps"],
-            beta=beta,
-            label_smoothing=label_smoothing,
-            loss_type=loss_type,
-            simpo_gamma=simpo_gamma,
-            alpha=alpha,
-        )
-        policy_nll_loss = _policy_nll_loss(
-            model_outputs["chosen_logps_raw"],
-            model_outputs["chosen_lengths"],
-        )
-        loss = losses.mean() + cpo_alpha * policy_nll_loss
-        aux_loss = model_outputs.get("aux_loss")
-        if aux_loss is not None:
-            loss = loss + aux_loss
-        return loss
+            with jax.named_scope("easydel/trainer/cpo/scheduled_loss/compute_cpo_loss"):
+                losses, _, _ = cpo_loss(
+                    model_outputs["chosen_logps"],
+                    model_outputs["rejected_logps"],
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    simpo_gamma=simpo_gamma,
+                    alpha=alpha,
+                )
+            with jax.named_scope("easydel/trainer/cpo/scheduled_loss/policy_nll"):
+                policy_nll_loss = _policy_nll_loss(
+                    model_outputs["chosen_logps_raw"],
+                    model_outputs["chosen_lengths"],
+                )
+            with jax.named_scope("easydel/trainer/cpo/scheduled_loss/combine_losses"):
+                loss = losses.mean() + cpo_alpha * policy_nll_loss
+                aux_loss = model_outputs.get("aux_loss")
+                if aux_loss is not None:
+                    loss = loss + aux_loss
+            return loss
 
     return scheduled_loss
 
@@ -617,40 +635,46 @@ def evaluation_step(
         margin, reward accuracy, mean logits).
     """
     del partition_spec
+    eval_scope = "easydel/trainer/cpo/eval_step"
 
-    model_outputs = concatenated_forward_fn(state.model, batch)
-    losses, chosen_rewards, rejected_rewards = cpo_loss(
-        model_outputs["chosen_logps"],
-        model_outputs["rejected_logps"],
-        beta=beta,
-        label_smoothing=label_smoothing,
-        loss_type=loss_type,
-        simpo_gamma=simpo_gamma,
-        alpha=alpha,
-    )
+    with jax.named_scope(eval_scope + "/policy_forward"):
+        model_outputs = concatenated_forward_fn(state.model, batch)
+    with jax.named_scope(eval_scope + "/compute_cpo_loss"):
+        losses, chosen_rewards, rejected_rewards = cpo_loss(
+            model_outputs["chosen_logps"],
+            model_outputs["rejected_logps"],
+            beta=beta,
+            label_smoothing=label_smoothing,
+            loss_type=loss_type,
+            simpo_gamma=simpo_gamma,
+            alpha=alpha,
+        )
 
-    chosen_rewards = jax.lax.stop_gradient(chosen_rewards)
-    rejected_rewards = jax.lax.stop_gradient(rejected_rewards)
-    policy_nll_loss = _policy_nll_loss(
-        model_outputs["chosen_logps_raw"],
-        model_outputs["chosen_lengths"],
-    )
+    with jax.named_scope(eval_scope + "/policy_nll"):
+        chosen_rewards = jax.lax.stop_gradient(chosen_rewards)
+        rejected_rewards = jax.lax.stop_gradient(rejected_rewards)
+        policy_nll_loss = _policy_nll_loss(
+            model_outputs["chosen_logps_raw"],
+            model_outputs["chosen_lengths"],
+        )
 
-    loss = losses.mean() + cpo_alpha * policy_nll_loss
-    aux_loss = model_outputs.get("aux_loss")
-    if aux_loss is not None:
-        loss = loss + aux_loss
+    with jax.named_scope(eval_scope + "/combine_losses"):
+        loss = losses.mean() + cpo_alpha * policy_nll_loss
+        aux_loss = model_outputs.get("aux_loss")
+        if aux_loss is not None:
+            loss = loss + aux_loss
 
-    reward_margin = jnp.mean(chosen_rewards - rejected_rewards)
-    reward_accuracy = jnp.mean((chosen_rewards > rejected_rewards).astype(jnp.float32))
+    with jax.named_scope(eval_scope + "/diagnostics"):
+        reward_margin = jnp.mean(chosen_rewards - rejected_rewards)
+        reward_accuracy = jnp.mean((chosen_rewards > rejected_rewards).astype(jnp.float32))
 
-    other_metrics = {
-        "policy_nll_loss": policy_nll_loss,
-        "reward_margin": reward_margin,
-        "reward_accuracy": reward_accuracy,
-        "mean_chosen_logits": model_outputs["mean_chosen_logits"],
-        "mean_rejected_logits": model_outputs["mean_rejected_logits"],
-    }
+        other_metrics = {
+            "policy_nll_loss": policy_nll_loss,
+            "reward_margin": reward_margin,
+            "reward_accuracy": reward_accuracy,
+            "mean_chosen_logits": model_outputs["mean_chosen_logits"],
+            "mean_rejected_logits": model_outputs["mean_rejected_logits"],
+        }
 
     return LossMetrics(
         loss=loss,

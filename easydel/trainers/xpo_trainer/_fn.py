@@ -283,36 +283,39 @@ def xpo_step(
         the :class:`LossMetrics` instance.
     """
 
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/xpo/" + ("train_step" if is_train else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    ref_module = reference_state.merge(reference_state.graphstate)
-    batch = dict(batch)
-    batch["_ref_on_policy"] = jax.lax.stop_gradient(
-        _compute_logps(
-            ref_module,
-            batch["prompt_ids"],
-            batch["prompt_mask"],
-            batch["policy_completion_ids"],
-            batch["policy_completion_mask"],
-            logprob_vocab_chunk_size,
+    with jax.named_scope(scope_root + "/reference_forward"):
+        ref_module = reference_state.merge(reference_state.graphstate)
+        batch = dict(batch)
+        batch["_ref_on_policy"] = jax.lax.stop_gradient(
+            _compute_logps(
+                ref_module,
+                batch["prompt_ids"],
+                batch["prompt_mask"],
+                batch["policy_completion_ids"],
+                batch["policy_completion_mask"],
+                logprob_vocab_chunk_size,
+            )
         )
-    )
-    batch["_ref_on_ref"] = jax.lax.stop_gradient(
-        _compute_logps(
-            ref_module,
-            batch["prompt_ids"],
-            batch["prompt_mask"],
-            batch["ref_completion_ids"],
-            batch["ref_completion_mask"],
-            logprob_vocab_chunk_size,
+        batch["_ref_on_ref"] = jax.lax.stop_gradient(
+            _compute_logps(
+                ref_module,
+                batch["prompt_ids"],
+                batch["prompt_mask"],
+                batch["ref_completion_ids"],
+                batch["ref_completion_mask"],
+                logprob_vocab_chunk_size,
+            )
         )
-    )
-    del ref_module
+        del ref_module
 
     def loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         """Compute the XPO scalar loss and diagnostics for a minibatch.
@@ -330,8 +333,10 @@ def xpo_step(
             chosen / rejected rewards and accuracy.
         """
         if is_train and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree=tree)
+            with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                tree = straight_through_emulator(tree)
+        with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+            module = state.merge(tree=tree)
 
         prompt_ids = minibatch["prompt_ids"]
         prompt_mask = minibatch["prompt_mask"]
@@ -343,96 +348,103 @@ def xpo_step(
         beta = minibatch["beta"][0]
         alpha = minibatch["alpha"][0]
 
-        policy_on_policy = _compute_logps(
-            module,
-            prompt_ids,
-            prompt_mask,
-            policy_completion_ids,
-            policy_completion_mask,
-            logprob_vocab_chunk_size,
-        )
-        policy_on_ref = _compute_logps(
-            module,
-            prompt_ids,
-            prompt_mask,
-            ref_completion_ids,
-            ref_completion_mask,
-            logprob_vocab_chunk_size,
-        )
-        ref_on_policy = jax.lax.stop_gradient(minibatch["_ref_on_policy"])
-        ref_on_ref = jax.lax.stop_gradient(minibatch["_ref_on_ref"])
+        with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+            policy_on_policy = _compute_logps(
+                module,
+                prompt_ids,
+                prompt_mask,
+                policy_completion_ids,
+                policy_completion_mask,
+                logprob_vocab_chunk_size,
+            )
+            policy_on_ref = _compute_logps(
+                module,
+                prompt_ids,
+                prompt_mask,
+                ref_completion_ids,
+                ref_completion_mask,
+                logprob_vocab_chunk_size,
+            )
+            ref_on_policy = jax.lax.stop_gradient(minibatch["_ref_on_policy"])
+            ref_on_ref = jax.lax.stop_gradient(minibatch["_ref_on_ref"])
 
-        policy_logps_policy = _sum_logps(policy_on_policy, policy_completion_mask)
-        policy_logps_ref = _sum_logps(policy_on_ref, ref_completion_mask)
-        ref_logps_policy = _sum_logps(ref_on_policy, policy_completion_mask)
-        ref_logps_ref = _sum_logps(ref_on_ref, ref_completion_mask)
+        with jax.named_scope(scope_root + "/loss_fn/sum_logps"):
+            policy_logps_policy = _sum_logps(policy_on_policy, policy_completion_mask)
+            policy_logps_ref = _sum_logps(policy_on_ref, ref_completion_mask)
+            ref_logps_policy = _sum_logps(ref_on_policy, policy_completion_mask)
+            ref_logps_ref = _sum_logps(ref_on_ref, ref_completion_mask)
 
-        chosen_policy_logps = jnp.where(chosen_mask, policy_logps_policy, policy_logps_ref)
-        chosen_ref_logps = jnp.where(chosen_mask, ref_logps_policy, ref_logps_ref)
-        rejected_policy_logps = jnp.where(chosen_mask, policy_logps_ref, policy_logps_policy)
-        rejected_ref_logps = jnp.where(chosen_mask, ref_logps_ref, ref_logps_policy)
+            chosen_policy_logps = jnp.where(chosen_mask, policy_logps_policy, policy_logps_ref)
+            chosen_ref_logps = jnp.where(chosen_mask, ref_logps_policy, ref_logps_ref)
+            rejected_policy_logps = jnp.where(chosen_mask, policy_logps_ref, policy_logps_policy)
+            rejected_ref_logps = jnp.where(chosen_mask, ref_logps_ref, ref_logps_policy)
 
-        chosen_log_ratio = chosen_policy_logps - chosen_ref_logps
-        rejected_log_ratio = rejected_policy_logps - rejected_ref_logps
-        logits = chosen_log_ratio - rejected_log_ratio
+            chosen_log_ratio = chosen_policy_logps - chosen_ref_logps
+            rejected_log_ratio = rejected_policy_logps - rejected_ref_logps
+            logits = chosen_log_ratio - rejected_log_ratio
 
-        loss_type = minibatch["loss_type"][0]
-        sigmoid_losses = -jnn.log_sigmoid(beta * logits)
-        ipo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
-        dpo_losses = jnp.where(loss_type == 0, sigmoid_losses, ipo_losses)
+        with jax.named_scope(scope_root + "/loss_fn/compute_xpo_loss"):
+            loss_type = minibatch["loss_type"][0]
+            sigmoid_losses = -jnn.log_sigmoid(beta * logits)
+            ipo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
+            dpo_losses = jnp.where(loss_type == 0, sigmoid_losses, ipo_losses)
 
-        xpo_losses = alpha * policy_logps_ref
-        total_loss = (dpo_losses + xpo_losses).mean()
+            xpo_losses = alpha * policy_logps_ref
+            total_loss = (dpo_losses + xpo_losses).mean()
 
-        chosen_rewards = beta * chosen_log_ratio
-        rejected_rewards = beta * rejected_log_ratio
-        margin = chosen_rewards - rejected_rewards
-        accuracy = jnp.mean(margin > 0)
+        with jax.named_scope(scope_root + "/loss_fn/diagnostics"):
+            chosen_rewards = beta * chosen_log_ratio
+            rejected_rewards = beta * rejected_log_ratio
+            margin = chosen_rewards - rejected_rewards
+            accuracy = jnp.mean(margin > 0)
 
-        kl_policy = ((policy_on_policy - ref_on_policy) * policy_completion_mask).sum(axis=1)
-        kl_ref = ((policy_on_ref - ref_on_ref) * ref_completion_mask).sum(axis=1)
-        mean_kl = jnp.mean((kl_policy + kl_ref) / 2)
+            kl_policy = ((policy_on_policy - ref_on_policy) * policy_completion_mask).sum(axis=1)
+            kl_ref = ((policy_on_ref - ref_on_ref) * ref_completion_mask).sum(axis=1)
+            mean_kl = jnp.mean((kl_policy + kl_ref) / 2)
 
-        entropy_policy = -_sum_logps(policy_on_policy, policy_completion_mask)
-        entropy_ref = -_sum_logps(policy_on_ref, ref_completion_mask)
-        mean_entropy = jnp.mean((entropy_policy + entropy_ref) / 2)
+            entropy_policy = -_sum_logps(policy_on_policy, policy_completion_mask)
+            entropy_ref = -_sum_logps(policy_on_ref, ref_completion_mask)
+            mean_entropy = jnp.mean((entropy_policy + entropy_ref) / 2)
 
-        metrics = LossMetrics(
-            loss=total_loss,
-            other_metrics={
-                "loss_dpo": dpo_losses.mean(),
-                "loss_xpo": xpo_losses.mean(),
-                "kl": mean_kl,
-                "entropy": mean_entropy,
-                "chosen_rewards": jnp.mean(chosen_rewards),
-                "rejected_rewards": jnp.mean(rejected_rewards),
-                "margin": jnp.mean(margin),
-                "accuracy": accuracy,
-                "beta": beta,
-                "alpha": alpha,
-            },
-        )
+            metrics = LossMetrics(
+                loss=total_loss,
+                other_metrics={
+                    "loss_dpo": dpo_losses.mean(),
+                    "loss_xpo": xpo_losses.mean(),
+                    "kl": mean_kl,
+                    "entropy": mean_entropy,
+                    "chosen_rewards": jnp.mean(chosen_rewards),
+                    "rejected_rewards": jnp.mean(rejected_rewards),
+                    "margin": jnp.mean(margin),
+                    "accuracy": accuracy,
+                    "beta": beta,
+                    "alpha": alpha,
+                },
+            )
         return total_loss, metrics
 
     if is_train:
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        metrics = update_metrics(
-            metrics=metrics, learning_rate_fn=learning_rate_fn, step=state.step, gradients=gradients
-        )
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=metrics,
-        )
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            metrics = update_metrics(
+                metrics=metrics, learning_rate_fn=learning_rate_fn, step=state.step, gradients=gradients
+            )
+            state = update_state_respectfully(
+                state=state,
+                gradients=gradients,
+                loss_config=loss_config,
+                metrics=metrics,
+            )
         return state, metrics
 
-    _, metrics = loss_fn(state.graphstate, batch)
+    with jax.named_scope(scope_root + "/eval_call"):
+        _, metrics = loss_fn(state.graphstate, batch)
     return metrics
 
 
@@ -572,30 +584,34 @@ def _make_xpo_scheduled_loss(call):
         Returns:
             jax.Array: Scalar loss.
         """
-        module = bind_scheduled_module(call, tree)
-        batch = constrain_scheduled_batch(module, batch, partition_spec)
-        policy_on_policy, policy_on_ref = _compute_pair_logps(
-            module,
-            batch["prompt_ids"],
-            batch["prompt_mask"],
-            batch["policy_completion_ids"],
-            batch["policy_completion_mask"],
-            batch["ref_completion_ids"],
-            batch["ref_completion_mask"],
-            logprob_vocab_chunk_size,
-        )
-        return _xpo_loss_from_logps(
-            policy_on_policy=policy_on_policy,
-            policy_on_ref=policy_on_ref,
-            ref_on_policy=jax.lax.stop_gradient(batch["_ref_on_policy"]),
-            ref_on_ref=jax.lax.stop_gradient(batch["_ref_on_ref"]),
-            policy_completion_mask=batch["policy_completion_mask"],
-            ref_completion_mask=batch["ref_completion_mask"],
-            chosen_mask=batch["chosen_mask"].astype(bool),
-            beta=batch["beta"][0],
-            alpha=batch["alpha"][0],
-            loss_type=batch["loss_type"][0],
-        )
+        with jax.named_scope("easydel/trainer/xpo/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/xpo/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                batch = constrain_scheduled_batch(module, batch, partition_spec)
+            with jax.named_scope("easydel/trainer/xpo/scheduled_loss/policy_forward"):
+                policy_on_policy, policy_on_ref = _compute_pair_logps(
+                    module,
+                    batch["prompt_ids"],
+                    batch["prompt_mask"],
+                    batch["policy_completion_ids"],
+                    batch["policy_completion_mask"],
+                    batch["ref_completion_ids"],
+                    batch["ref_completion_mask"],
+                    logprob_vocab_chunk_size,
+                )
+            with jax.named_scope("easydel/trainer/xpo/scheduled_loss/compute_xpo_loss"):
+                return _xpo_loss_from_logps(
+                    policy_on_policy=policy_on_policy,
+                    policy_on_ref=policy_on_ref,
+                    ref_on_policy=jax.lax.stop_gradient(batch["_ref_on_policy"]),
+                    ref_on_ref=jax.lax.stop_gradient(batch["_ref_on_ref"]),
+                    policy_completion_mask=batch["policy_completion_mask"],
+                    ref_completion_mask=batch["ref_completion_mask"],
+                    chosen_mask=batch["chosen_mask"].astype(bool),
+                    beta=batch["beta"][0],
+                    alpha=batch["alpha"][0],
+                    loss_type=batch["loss_type"][0],
+                )
 
     return scheduled_loss
 

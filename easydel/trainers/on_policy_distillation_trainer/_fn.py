@@ -109,12 +109,14 @@ def on_policy_distillation_step(
         If training: (updated_state, metrics)
         If evaluation: metrics
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/on_policy_distillation/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
@@ -132,8 +134,10 @@ def on_policy_distillation_step(
             :class:`LossMetrics` instance with per-component diagnostics.
         """
         if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = student_state.merge(tree)
+            with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                tree = straight_through_emulator(tree)
+        with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+            module = student_state.merge(tree)
 
         input_ids = minibatch["input_ids"]
         attention_mask = minibatch["attention_mask"]
@@ -183,47 +187,50 @@ def on_policy_distillation_step(
                 results["l"] = jax.lax.stop_gradient(out.logits)
             return results
 
-        teacher_out = _teacher_fwd(
-            teacher_kwargs,
-            jax.lax.stop_gradient(teacher_state.graphstate),
-        )
-        teacher_hidden_for_kl = teacher_out["h"] if use_chunked else None
-        teacher_logits = teacher_out["l"] if not use_chunked else None
+        with jax.named_scope(scope_root + "/loss_fn/teacher_forward"):
+            teacher_out = _teacher_fwd(
+                teacher_kwargs,
+                jax.lax.stop_gradient(teacher_state.graphstate),
+            )
+            teacher_hidden_for_kl = teacher_out["h"] if use_chunked else None
+            teacher_logits = teacher_out["l"] if not use_chunked else None
 
         call_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
         if use_chunked:
             call_kwargs["apply_lm_head"] = False
         call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-        student_outputs = module(**call_kwargs)
+        with jax.named_scope(scope_root + "/loss_fn/student_forward"):
+            student_outputs = module(**call_kwargs)
 
         # Compute distillation loss on generated tokens only (using completion_mask).
         # No hard labels are used since completions are generated, not from a dataset.
-        if use_chunked:
-            total_loss, loss_components = chunked_distillation_loss(
-                student_hidden=student_outputs.last_hidden_state,
-                teacher_hidden=teacher_hidden_for_kl,
-                student_lm_head_fn=module.make_lm_head_fn(),
-                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
-                attention_mask=attention_mask,
-                loss_mask=completion_mask,
-                labels=None,
-                use_hard_labels=False,
-                temperature=temperature,
-                alpha=alpha,
-                chunk_size=int(logits_chunk_size),
-            )
-        else:
-            total_loss, loss_components = distillation_loss(
-                student_logits=student_outputs.logits,
-                teacher_logits=teacher_logits,
-                attention_mask=attention_mask,
-                loss_mask=completion_mask,
-                labels=None,
-                use_hard_labels=False,
-                temperature=temperature,
-                alpha=alpha,
-            )
+        with jax.named_scope(scope_root + "/loss_fn/distillation_loss"):
+            if use_chunked:
+                total_loss, loss_components = chunked_distillation_loss(
+                    student_hidden=student_outputs.last_hidden_state,
+                    teacher_hidden=teacher_hidden_for_kl,
+                    student_lm_head_fn=module.make_lm_head_fn(),
+                    teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
+                    attention_mask=attention_mask,
+                    loss_mask=completion_mask,
+                    labels=None,
+                    use_hard_labels=False,
+                    temperature=temperature,
+                    alpha=alpha,
+                    chunk_size=int(logits_chunk_size),
+                )
+            else:
+                total_loss, loss_components = distillation_loss(
+                    student_logits=student_outputs.logits,
+                    teacher_logits=teacher_logits,
+                    attention_mask=attention_mask,
+                    loss_mask=completion_mask,
+                    labels=None,
+                    use_hard_labels=False,
+                    temperature=temperature,
+                    alpha=alpha,
+                )
 
         metrics = LossMetrics(
             loss=total_loss,
@@ -232,24 +239,27 @@ def on_policy_distillation_step(
         return total_loss, metrics
 
     if is_training:
-        gradients, metrics = minibatch_call(
-            state=student_state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        student_state = update_state_respectfully(
-            state=student_state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=student_state.step,
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=student_state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            student_state = update_state_respectfully(
+                state=student_state,
                 gradients=gradients,
-            ),
-        )
+                loss_config=loss_config,
+                metrics=update_metrics(
+                    metrics=metrics,
+                    learning_rate_fn=learning_rate_fn,
+                    step=student_state.step,
+                    gradients=gradients,
+                ),
+            )
         return student_state, metrics
     else:
-        _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
+        with jax.named_scope(scope_root + "/eval_call"):
+            _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
         return metrics

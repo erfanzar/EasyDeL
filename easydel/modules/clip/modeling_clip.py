@@ -114,7 +114,7 @@ def clip_loss(similarity: jax.Array) -> jax.Array:
     return (caption_loss + image_loss) / 2.0
 
 
-class CLIPVisionEmbeddings(spx.Module):
+class CLIPVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
     """Patch + position + CLS embedding for the CLIP ViT tower.
 
     Computes the standard ViT input contract:
@@ -215,7 +215,7 @@ class CLIPVisionEmbeddings(spx.Module):
         return checkpoint_name(embeddings, name="embeddings")
 
 
-class CLIPTextEmbeddings(spx.Module):
+class CLIPTextEmbeddings(EasyDeLLayerStackMixin, spx.Module):
     """Token + learned absolute position embedding for the CLIP text encoder.
 
     Looks up token ids in ``token_embedding`` (vocab ``config.vocab_size``,
@@ -243,6 +243,7 @@ class CLIPTextEmbeddings(spx.Module):
                 Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        self.config = config
         embed_dim = config.hidden_size
 
         with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):

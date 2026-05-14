@@ -504,14 +504,16 @@ def orpo_step(
             - In "train" mode: A tuple containing the updated model state and the computed loss metrics.
             - In "eval" mode: The computed loss metrics.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        batch_partition_spec=partition_spec,
-        gradient_accumulation_steps=gradient_accumulation_steps if mode == "train" else 1,
-    )
+    scope_root = "easydel/trainer/orpo/" + ("train_step" if mode == "train" else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            batch_partition_spec=partition_spec,
+            gradient_accumulation_steps=gradient_accumulation_steps if mode == "train" else 1,
+        )
 
-    # Apply sharding constraints to the batch.
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+        # Apply sharding constraints to the batch.
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: spx.State, batch: dict):
         """
@@ -528,78 +530,86 @@ def orpo_step(
             tp.Tuple[Array, LossMetrics]: The computed loss and a LossMetrics object containing
             additional metrics.
         """
-        if mode == "train" and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        (
-            policy_chosen_logps,
-            policy_rejected_logps,
-            policy_chosen_logits,
-            policy_rejected_logits,
-            policy_nll_loss,
-            policy_accuracy,
-        ) = concatenated_forward(state.merge_to_state(tree), batch)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if mode == "train" and straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
+                (
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    policy_chosen_logits,
+                    policy_rejected_logits,
+                    policy_nll_loss,
+                    policy_accuracy,
+                ) = concatenated_forward(state.merge_to_state(tree), batch)
 
-        (
-            losses,
-            chosen_rewards,
-            rejected_rewards,
-            log_odds_ratio,
-            log_odds_chosen,
-        ) = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
+            with jax.named_scope(scope_root + "/loss_fn/compute_orpo_loss"):
+                (
+                    losses,
+                    chosen_rewards,
+                    rejected_rewards,
+                    log_odds_ratio,
+                    log_odds_chosen,
+                ) = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
 
-        loss = policy_nll_loss - losses.mean()
+                loss = policy_nll_loss - losses.mean()
 
-        reward_accuracies = (chosen_rewards > rejected_rewards).astype("float32")
-        metrics = {
-            "rewards/chosen": chosen_rewards.mean(),
-            "rewards/rejected": rejected_rewards.mean(),
-            "rewards/accuracies": reward_accuracies.mean(),
-            "rewards/margins": (chosen_rewards - rejected_rewards).mean(),
-            "logps/rejected": policy_rejected_logps.mean(),
-            "logps/chosen": policy_chosen_logps.mean(),
-            "logits/rejected": policy_rejected_logits.mean(),
-            "logits/chosen": policy_chosen_logits.mean(),
-            "nll_loss": policy_nll_loss.mean(),
-            "nll_accuracy": policy_accuracy.mean(),
-            "log_odds_ratio": log_odds_ratio,
-            "log_odds_chosen": log_odds_chosen,
-        }
+            with jax.named_scope(scope_root + "/loss_fn/build_metrics"):
+                reward_accuracies = (chosen_rewards > rejected_rewards).astype("float32")
+                metrics = {
+                    "rewards/chosen": chosen_rewards.mean(),
+                    "rewards/rejected": rejected_rewards.mean(),
+                    "rewards/accuracies": reward_accuracies.mean(),
+                    "rewards/margins": (chosen_rewards - rejected_rewards).mean(),
+                    "logps/rejected": policy_rejected_logps.mean(),
+                    "logps/chosen": policy_chosen_logps.mean(),
+                    "logits/rejected": policy_rejected_logits.mean(),
+                    "logits/chosen": policy_chosen_logits.mean(),
+                    "nll_loss": policy_nll_loss.mean(),
+                    "nll_accuracy": policy_accuracy.mean(),
+                    "log_odds_ratio": log_odds_ratio,
+                    "log_odds_chosen": log_odds_chosen,
+                }
 
-        if mode == "eval":
-            # Prefix metric names with 'eval_' in evaluation mode.
-            metrics = {f"eval_{k}": v for k, v in metrics.items()}
+                if mode == "eval":
+                    # Prefix metric names with 'eval_' in evaluation mode.
+                    metrics = {f"eval_{k}": v for k, v in metrics.items()}
 
-        return loss, LossMetrics(
-            loss=loss,
-            other_metrics=metrics,
-        )
+            return loss, LossMetrics(
+                loss=loss,
+                other_metrics=metrics,
+            )
 
     if mode == "train":
-        # Compute gradients and metrics via minibatch processing.
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
-        )
-        # Update model state with computed gradients.
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=metrics,
-        )
-        # Update metrics with learning rate and step information.
-        metrics = update_metrics(
-            metrics=metrics,
-            learning_rate_fn=learning_rate_fn,
-            step=state.step,
-            gradients=gradients,
-        )
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            # Compute gradients and metrics via minibatch processing.
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            # Update model state with computed gradients.
+            state = update_state_respectfully(
+                state=state,
+                gradients=gradients,
+                loss_config=loss_config,
+                metrics=metrics,
+            )
+            # Update metrics with learning rate and step information.
+            metrics = update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=state.step,
+                gradients=gradients,
+            )
         return state, metrics
     else:
-        # In evaluation mode, compute loss metrics without updating the state.
-        _, metrics = calculate_loss(state.graphstate, batch)
+        with jax.named_scope(scope_root + "/eval_call"):
+            # In evaluation mode, compute loss metrics without updating the state.
+            _, metrics = calculate_loss(state.graphstate, batch)
         return metrics
 
 
@@ -697,19 +707,23 @@ def _make_orpo_scheduled_loss(call):
         Returns:
             Array: Scalar loss value.
         """
-        module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-        _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
-        (
-            policy_chosen_logps,
-            policy_rejected_logps,
-            _policy_chosen_logits,
-            _policy_rejected_logits,
-            policy_nll_loss,
-            _policy_accuracy,
-        ) = concatenated_forward(module, call_batch, vocab_shard_stage=_terminal_rank)
-        losses, *_ = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
-        return policy_nll_loss - losses.mean()
+        with jax.named_scope("easydel/trainer/orpo/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/orpo/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+            with jax.named_scope("easydel/trainer/orpo/scheduled_loss/policy_forward"):
+                (
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    _policy_chosen_logits,
+                    _policy_rejected_logits,
+                    policy_nll_loss,
+                    _policy_accuracy,
+                ) = concatenated_forward(module, call_batch, vocab_shard_stage=_terminal_rank)
+            with jax.named_scope("easydel/trainer/orpo/scheduled_loss/compute_orpo_loss"):
+                losses, *_ = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
+                return policy_nll_loss - losses.mean()
 
     return scheduled_loss
 

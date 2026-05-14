@@ -106,13 +106,15 @@ def training_step(
         ``(updated_state, metrics)`` where ``metrics`` carries the
         scalar loss alongside the per-branch reward arrays.
     """
-    # Determine batch size, minibatch size, and enforce partition spec.
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/reward/train_step"
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        # Determine batch size, minibatch size, and enforce partition spec.
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the reward-model Bradley-Terry loss for one microbatch.
@@ -139,51 +141,59 @@ def training_step(
             arrays carry per-sample scalar predictions for downstream
             accuracy/diagnostic computation.
         """
-        if straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree)
 
-        rewards_chosen = module(
-            input_ids=minibatch["input_ids_chosen"],
-            attention_mask=minibatch["attention_mask_chosen"],
-        ).logits
-        rewards_rejected = module(
-            input_ids=minibatch["input_ids_rejected"],
-            attention_mask=minibatch["attention_mask_rejected"],
-        ).logits
-        if "margin" in minibatch:
-            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - minibatch["margin"]))
-        else:
-            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
+            with jax.named_scope(scope_root + "/loss_fn/forward_chosen"):
+                rewards_chosen = module(
+                    input_ids=minibatch["input_ids_chosen"],
+                    attention_mask=minibatch["attention_mask_chosen"],
+                ).logits
+            with jax.named_scope(scope_root + "/loss_fn/forward_rejected"):
+                rewards_rejected = module(
+                    input_ids=minibatch["input_ids_rejected"],
+                    attention_mask=minibatch["attention_mask_rejected"],
+                ).logits
+            with jax.named_scope(scope_root + "/loss_fn/bt_loss"):
+                if "margin" in minibatch:
+                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - minibatch["margin"]))
+                else:
+                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
 
-        if center_rewards_coefficient is not None:
-            loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
-        metrics = LossMetrics(
-            loss=loss,
-            chosen_rewards=rewards_chosen,
-            rejected_rewards=rewards_rejected,
+                if center_rewards_coefficient is not None:
+                    loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+            metrics = LossMetrics(
+                loss=loss,
+                chosen_rewards=rewards_chosen,
+                rejected_rewards=rewards_rejected,
+            )
+            return loss, metrics
+
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        # Compute gradients and metrics across minibatches.
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=batch,
+            minibatch_size=minibatch_size,
+            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
         )
-        return loss, metrics
-
-    # Compute gradients and metrics across minibatches.
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=batch,
-        minibatch_size=minibatch_size,
-        grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-    )
-    # Update state using the computed gradients and updated metrics.
-    state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=loss_config,
-        metrics=update_metrics(
-            metrics=metrics,
-            learning_rate_fn=learning_rate_fn,
-            step=state.step,
+    with jax.named_scope(scope_root + "/update_state"):
+        # Update state using the computed gradients and updated metrics.
+        state = update_state_respectfully(
+            state=state,
             gradients=gradients,
-        ),
-    )
+            loss_config=loss_config,
+            metrics=update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=state.step,
+                gradients=gradients,
+            ),
+        )
     return state, metrics
 
 
@@ -235,28 +245,33 @@ def _make_reward_scheduled_loss(call):
         Returns:
             jax.Array: Scalar loss.
         """
-        module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+        with jax.named_scope("easydel/trainer/reward/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/reward/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                call_batch = constrain_scheduled_batch(module, batch, partition_spec)
 
-        input_ids = jax.numpy.concatenate(
-            [call_batch["input_ids_chosen"], call_batch["input_ids_rejected"]],
-            axis=0,
-        )
-        attention_mask = jax.numpy.concatenate(
-            [call_batch["attention_mask_chosen"], call_batch["attention_mask_rejected"]],
-            axis=0,
-        )
-        rewards = module(input_ids=input_ids, attention_mask=attention_mask).logits
-        rewards_chosen, rewards_rejected = jax.numpy.split(rewards, 2, axis=0)
+            with jax.named_scope("easydel/trainer/reward/scheduled_loss/concat_inputs"):
+                input_ids = jax.numpy.concatenate(
+                    [call_batch["input_ids_chosen"], call_batch["input_ids_rejected"]],
+                    axis=0,
+                )
+                attention_mask = jax.numpy.concatenate(
+                    [call_batch["attention_mask_chosen"], call_batch["attention_mask_rejected"]],
+                    axis=0,
+                )
+            with jax.named_scope("easydel/trainer/reward/scheduled_loss/forward"):
+                rewards = module(input_ids=input_ids, attention_mask=attention_mask).logits
+                rewards_chosen, rewards_rejected = jax.numpy.split(rewards, 2, axis=0)
 
-        if "margin" in call_batch:
-            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - call_batch["margin"]))
-        else:
-            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
+            with jax.named_scope("easydel/trainer/reward/scheduled_loss/bt_loss"):
+                if "margin" in call_batch:
+                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - call_batch["margin"]))
+                else:
+                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
 
-        if center_rewards_coefficient is not None:
-            loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
-        return loss
+                if center_rewards_coefficient is not None:
+                    loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+            return loss
 
     return scheduled_loss
 
@@ -303,13 +318,15 @@ def evaluation_step(
         :class:`LossMetrics` carrying the scalar BT loss together with
         the per-branch reward arrays.
     """
-    # Enforce partitioning constraints and determine required sharding.
-    *_, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=1,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    eval_scope = "easydel/trainer/reward/eval_step"
+    with jax.named_scope(eval_scope + "/prepare_batch"):
+        # Enforce partitioning constraints and determine required sharding.
+        *_, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=1,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree):
         """Compute the reward-model BT loss/metrics for an eval batch (no gradient).
@@ -330,30 +347,36 @@ def evaluation_step(
             ``rejected_rewards`` populated.
         """
 
-        # Merge the state with the provided tree update.
-        module = state.merge(tree)
+        with jax.named_scope(eval_scope + "/loss_fn"):
+            # Merge the state with the provided tree update.
+            with jax.named_scope(eval_scope + "/loss_fn/merge_state"):
+                module = state.merge(tree)
 
-        rewards_chosen = module(
-            input_ids=batch["input_ids_chosen"],
-            attention_mask=batch["attention_mask_chosen"],
-        ).logits
-        rewards_rejected = module(
-            input_ids=batch["input_ids_rejected"],
-            attention_mask=batch["attention_mask_rejected"],
-        ).logits
-        if "margin" in batch:
-            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - batch["margin"]))
-        else:
-            loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
+            with jax.named_scope(eval_scope + "/loss_fn/forward_chosen"):
+                rewards_chosen = module(
+                    input_ids=batch["input_ids_chosen"],
+                    attention_mask=batch["attention_mask_chosen"],
+                ).logits
+            with jax.named_scope(eval_scope + "/loss_fn/forward_rejected"):
+                rewards_rejected = module(
+                    input_ids=batch["input_ids_rejected"],
+                    attention_mask=batch["attention_mask_rejected"],
+                ).logits
+            with jax.named_scope(eval_scope + "/loss_fn/bt_loss"):
+                if "margin" in batch:
+                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - batch["margin"]))
+                else:
+                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
 
-        if center_rewards_coefficient is not None:
-            loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
-        metrics = LossMetrics(
-            loss=loss,
-            chosen_rewards=rewards_chosen,
-            rejected_rewards=rewards_rejected,
-        )
-        return metrics
+                if center_rewards_coefficient is not None:
+                    loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+            metrics = LossMetrics(
+                loss=loss,
+                chosen_rewards=rewards_chosen,
+                rejected_rewards=rewards_rejected,
+            )
+            return metrics
 
-    metrics = loss_fn(state.graphstate)
+    with jax.named_scope(eval_scope + "/eval_call"):
+        metrics = loss_fn(state.graphstate)
     return metrics

@@ -122,14 +122,16 @@ def sdpo_step(
         ``(updated_state, metrics)`` when ``is_training=True``, or just
         ``metrics`` when ``is_training=False``.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    state_model = getattr(state, "model", None)
-    state_mesh = getattr(state_model, "mesh", None)
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state_mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/sdpo/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        state_model = getattr(state, "model", None)
+        state_mesh = getattr(state_model, "mesh", None)
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state_mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the SDPO loss for a single minibatch.
@@ -154,8 +156,10 @@ def sdpo_step(
             ValueError: If ``distillation_type`` is not ``'kl'`` or ``'jsd'``.
         """
         if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree)
+            with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                tree = straight_through_emulator(tree)
+        with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+            module = state.merge(tree)
 
         prompt_ids = minibatch["prompt_ids"]
         prompt_mask = minibatch["prompt_mask"]
@@ -204,22 +208,24 @@ def sdpo_step(
                 chunk_student_attn_mask = jnp.concatenate(
                     [expanded_prompt_mask[start:end], chunk_completion_mask], axis=1
                 )
-                chunk_student_logps = get_per_token_logps(
-                    module,
-                    chunk_student_input_ids,
-                    chunk_student_attn_mask,
-                    prompt_len,
-                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-                )
-                chunk_teacher_logps = jax.lax.stop_gradient(
-                    get_per_token_logps(
+                with jax.named_scope(scope_root + "/loss_fn/chunked/student_logps"):
+                    chunk_student_logps = get_per_token_logps(
                         module,
-                        teacher_ids[start:end],
-                        teacher_mask[start:end],
-                        teacher_prompt_length,
+                        chunk_student_input_ids,
+                        chunk_student_attn_mask,
+                        prompt_len,
                         logprob_vocab_chunk_size=logprob_vocab_chunk_size,
                     )
-                )
+                with jax.named_scope(scope_root + "/loss_fn/chunked/teacher_logps"):
+                    chunk_teacher_logps = jax.lax.stop_gradient(
+                        get_per_token_logps(
+                            module,
+                            teacher_ids[start:end],
+                            teacher_mask[start:end],
+                            teacher_prompt_length,
+                            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                        )
+                    )
 
                 if distillation_type == "kl":
                     chunk_target_logps = chunk_teacher_logps
@@ -271,44 +277,49 @@ def sdpo_step(
         else:
             student_input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
             student_attn_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
-            student_logps = get_per_token_logps(
-                module,
-                student_input_ids,
-                student_attn_mask,
-                prompt_len,
-                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-            )
-
-            teacher_logps = jax.lax.stop_gradient(
-                get_per_token_logps(
+            with jax.named_scope(scope_root + "/loss_fn/student_logps"):
+                student_logps = get_per_token_logps(
                     module,
-                    teacher_ids,
-                    teacher_mask,
-                    teacher_prompt_length,
+                    student_input_ids,
+                    student_attn_mask,
+                    prompt_len,
                     logprob_vocab_chunk_size=logprob_vocab_chunk_size,
                 )
-            )
 
-            if distillation_type == "kl":
-                target_logps = teacher_logps
-            elif distillation_type == "jsd":
-                target_logps = jnp.logaddexp(student_logps, teacher_logps) - jnp.log(2.0)
-            else:
-                raise ValueError(f"Unknown distillation_type '{distillation_type}'. Must be 'kl' or 'jsd'.")
-            distill_weight = jax.lax.stop_gradient(student_logps - target_logps)
-            per_token_loss = distill_weight * student_logps
+            with jax.named_scope(scope_root + "/loss_fn/teacher_logps"):
+                teacher_logps = jax.lax.stop_gradient(
+                    get_per_token_logps(
+                        module,
+                        teacher_ids,
+                        teacher_mask,
+                        teacher_prompt_length,
+                        logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                    )
+                )
 
-            ref_per_token_logps = None
-            if beta != 0.0:
-                ref_per_token_logps = minibatch["ref_per_token_logps"]
-                if ref_per_token_logps.shape[1] != completion_ids.shape[1]:
-                    ref_per_token_logps = ref_per_token_logps[:, : completion_ids.shape[1]]
-                per_token_kl = jnp.exp(ref_per_token_logps - student_logps) - (ref_per_token_logps - student_logps) - 1
-                per_token_loss = per_token_loss + beta * per_token_kl
-            else:
-                per_token_kl = None
+            with jax.named_scope(scope_root + "/loss_fn/compute_sdpo_loss"):
+                if distillation_type == "kl":
+                    target_logps = teacher_logps
+                elif distillation_type == "jsd":
+                    target_logps = jnp.logaddexp(student_logps, teacher_logps) - jnp.log(2.0)
+                else:
+                    raise ValueError(f"Unknown distillation_type '{distillation_type}'. Must be 'kl' or 'jsd'.")
+                distill_weight = jax.lax.stop_gradient(student_logps - target_logps)
+                per_token_loss = distill_weight * student_logps
 
-            loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(num_items, 1.0)
+                ref_per_token_logps = None
+                if beta != 0.0:
+                    ref_per_token_logps = minibatch["ref_per_token_logps"]
+                    if ref_per_token_logps.shape[1] != completion_ids.shape[1]:
+                        ref_per_token_logps = ref_per_token_logps[:, : completion_ids.shape[1]]
+                    per_token_kl = (
+                        jnp.exp(ref_per_token_logps - student_logps) - (ref_per_token_logps - student_logps) - 1
+                    )
+                    per_token_loss = per_token_loss + beta * per_token_kl
+                else:
+                    per_token_kl = None
+
+                loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(num_items, 1.0)
 
             def masked_mean(x):
                 """Compute the mean of ``x`` over completion-mask positions.
@@ -344,24 +355,27 @@ def sdpo_step(
         )
 
     if is_training:
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=state.step,
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            state = update_state_respectfully(
+                state=state,
                 gradients=gradients,
-            ),
-        )
+                loss_config=loss_config,
+                metrics=update_metrics(
+                    metrics=metrics,
+                    learning_rate_fn=learning_rate_fn,
+                    step=state.step,
+                    gradients=gradients,
+                ),
+            )
         return state, metrics
     else:
-        _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
+        with jax.named_scope(scope_root + "/eval_call"):
+            _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
         return metrics

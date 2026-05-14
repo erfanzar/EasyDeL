@@ -249,12 +249,14 @@ def gkd_step(
         otherwise ``LossMetrics``. ``other_metrics["gkd_jsd_loss"]``
         records the raw scalar GJSD value.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/gkd/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
     def teacher_forward(minibatch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
         """Run the teacher in stop-gradient mode and return its logits.
@@ -299,10 +301,11 @@ def gkd_step(
             teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
             return jax.lax.stop_gradient(teacher_outputs.logits)
 
-        return _teacher_fwd(
-            teacher_call_kwargs,
-            jax.lax.stop_gradient(teacher_state.graphstate),
-        )
+        with jax.named_scope(scope_root + "/teacher_forward"):
+            return _teacher_fwd(
+                teacher_call_kwargs,
+                jax.lax.stop_gradient(teacher_state.graphstate),
+            )
 
     def loss_fn(tree, minibatch):
         """Compute the GKD loss for one minibatch.
@@ -320,56 +323,64 @@ def gkd_step(
             ``(loss, metrics)`` where ``metrics`` records the GJSD
             value under ``other_metrics["gkd_jsd_loss"]``.
         """
-        if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = student_state.merge(tree)
-        call_kwargs = dict(minibatch)
-        labels = call_kwargs.pop("labels", None)
-        call_kwargs.pop("completion_mask", None)
-        call_kwargs.pop("assistant_masks", None)
-        teacher_logits = teacher_forward(minibatch)
-        call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
-        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-        student_outputs = module(**call_kwargs)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if is_training and straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = student_state.merge(tree)
+            call_kwargs = dict(minibatch)
+            labels = call_kwargs.pop("labels", None)
+            call_kwargs.pop("completion_mask", None)
+            call_kwargs.pop("assistant_masks", None)
+            teacher_logits = teacher_forward(minibatch)
+            call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
+            call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+            with jax.named_scope(scope_root + "/loss_fn/student_forward"):
+                student_outputs = module(**call_kwargs)
 
-        completion_mask = minibatch.get("completion_mask")
-        attention_mask = minibatch.get("attention_mask")
-        mask = completion_mask if completion_mask is not None else attention_mask
+            completion_mask = minibatch.get("completion_mask")
+            attention_mask = minibatch.get("attention_mask")
+            mask = completion_mask if completion_mask is not None else attention_mask
 
-        loss_value = generalized_jsd_loss(
-            student_logits=student_outputs.logits,
-            teacher_logits=teacher_logits,
-            labels=labels,
-            mask=mask,
-            beta=beta,
-            temperature=temperature,
-        )
-        metrics = LossMetrics(
-            loss=loss_value,
-            other_metrics={"gkd_jsd_loss": jnp.asarray(loss_value)},
-        )
-        return loss_value, metrics
+            with jax.named_scope(scope_root + "/loss_fn/compute_gjsd_loss"):
+                loss_value = generalized_jsd_loss(
+                    student_logits=student_outputs.logits,
+                    teacher_logits=teacher_logits,
+                    labels=labels,
+                    mask=mask,
+                    beta=beta,
+                    temperature=temperature,
+                )
+            metrics = LossMetrics(
+                loss=loss_value,
+                other_metrics={"gkd_jsd_loss": jnp.asarray(loss_value)},
+            )
+            return loss_value, metrics
 
     if is_training:
-        gradients, metrics = minibatch_call(
-            state=student_state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        student_state = update_state_respectfully(
-            state=student_state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=student_state.step,
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=student_state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            student_state = update_state_respectfully(
+                state=student_state,
                 gradients=gradients,
-            ),
-        )
+                loss_config=loss_config,
+                metrics=update_metrics(
+                    metrics=metrics,
+                    learning_rate_fn=learning_rate_fn,
+                    step=student_state.step,
+                    gradients=gradients,
+                ),
+            )
         return student_state, metrics
-    _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
+    with jax.named_scope(scope_root + "/eval_call"):
+        _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
     return metrics
 
 
@@ -456,30 +467,34 @@ def _make_gkd_scheduled_loss(call):
         Returns:
             The generalized JSD loss scalar.
         """
-        module = bind_scheduled_module(call, tree)
-        model_batch = dict(batch)
-        teacher_logits = call.get("_gkd_teacher_logits")
-        if teacher_logits is None:
-            teacher_logits = model_batch.get("teacher_logits")
-        if teacher_logits is None:
-            raise RuntimeError("GKD scheduled MPMD loss requires precomputed teacher_logits.")
-        model_batch.pop("teacher_logits", None)
-        call_batch = constrain_scheduled_batch(module, model_batch, partition_spec)
-        labels = call_batch.get("labels")
-        student_logits = _gkd_forward_logits(module, call_batch)
-        teacher_logits = jnp.asarray(teacher_logits)
-        teacher_logits = jax.lax.stop_gradient(teacher_logits)
-        completion_mask = call_batch.get("completion_mask")
-        attention_mask = call_batch.get("attention_mask")
-        mask = completion_mask if completion_mask is not None else attention_mask
-        return generalized_jsd_loss(
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            labels=labels,
-            mask=mask,
-            beta=beta,
-            temperature=temperature,
-        )
+        with jax.named_scope("easydel/trainer/gkd/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/gkd/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                model_batch = dict(batch)
+                teacher_logits = call.get("_gkd_teacher_logits")
+                if teacher_logits is None:
+                    teacher_logits = model_batch.get("teacher_logits")
+                if teacher_logits is None:
+                    raise RuntimeError("GKD scheduled MPMD loss requires precomputed teacher_logits.")
+                model_batch.pop("teacher_logits", None)
+                call_batch = constrain_scheduled_batch(module, model_batch, partition_spec)
+            labels = call_batch.get("labels")
+            with jax.named_scope("easydel/trainer/gkd/scheduled_loss/student_forward"):
+                student_logits = _gkd_forward_logits(module, call_batch)
+            teacher_logits = jnp.asarray(teacher_logits)
+            teacher_logits = jax.lax.stop_gradient(teacher_logits)
+            completion_mask = call_batch.get("completion_mask")
+            attention_mask = call_batch.get("attention_mask")
+            mask = completion_mask if completion_mask is not None else attention_mask
+            with jax.named_scope("easydel/trainer/gkd/scheduled_loss/compute_gjsd_loss"):
+                return generalized_jsd_loss(
+                    student_logits=student_logits,
+                    teacher_logits=teacher_logits,
+                    labels=labels,
+                    mask=mask,
+                    beta=beta,
+                    temperature=temperature,
+                )
 
     return scheduled_loss
 

@@ -84,12 +84,14 @@ def base_step(
         metrics)`` in training mode; just ``metrics`` in evaluation
         mode.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/base/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the base-trainer scalar loss and metrics for one microbatch.
@@ -123,41 +125,49 @@ def base_step(
             objective and ``metrics`` is the :class:`LossMetrics`
             instance returned by ``module.compute_loss``.
         """
-        if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree)
-        if not is_training:
-            module.eval()
-        call_batch = module.prepare_inputs_for_call(**minibatch)
-        labels = call_batch.pop("labels", None)
-        outputs, metrics = module.compute_loss(
-            labels=labels,
-            loss_config=loss_config,
-            **call_batch,
-        )
-        return outputs.loss, metrics
+        with jax.named_scope(scope_root + "/loss_fn"):
+            if is_training and straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree)
+                if not is_training:
+                    module.eval()
+            with jax.named_scope(scope_root + "/loss_fn/prepare_inputs"):
+                call_batch = module.prepare_inputs_for_call(**minibatch)
+                labels = call_batch.pop("labels", None)
+            with jax.named_scope(scope_root + "/loss_fn/forward_and_loss"):
+                outputs, metrics = module.compute_loss(
+                    labels=labels,
+                    loss_config=loss_config,
+                    **call_batch,
+                )
+            return outputs.loss, metrics
 
     if not is_training:
-        _, metrics = loss_fn(state.graphstate, batch)
+        with jax.named_scope(scope_root + "/eval_call"):
+            _, metrics = loss_fn(state.graphstate, batch)
         return metrics
 
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=batch,
-        minibatch_size=minibatch_size,
-        grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-    )
-    state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=loss_config,
-        metrics=update_metrics(
-            metrics=metrics,
-            learning_rate_fn=learning_rate_fn,
-            step=state.step,
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=batch,
+            minibatch_size=minibatch_size,
+            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+        )
+    with jax.named_scope(scope_root + "/update_state"):
+        state = update_state_respectfully(
+            state=state,
             gradients=gradients,
-        ),
-    )
+            loss_config=loss_config,
+            metrics=update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=state.step,
+                gradients=gradients,
+            ),
+        )
     return state, metrics
 
 
@@ -273,16 +283,20 @@ def _make_base_scheduled_loss(call):
         Returns:
             jax.Array: Scalar loss returned by ``module.compute_loss``.
         """
-        module = bind_scheduled_module(call, tree)
-        batch = constrain_scheduled_batch(module, batch, partition_spec)
-        call_batch = module.prepare_inputs_for_call(**batch)
-        labels = call_batch.pop("labels", None)
-        outputs, _metrics = module.compute_loss(
-            labels=labels,
-            loss_config=loss_config,
-            **call_batch,
-        )
-        return outputs.loss
+        with jax.named_scope("easydel/trainer/base/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/base/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                batch = constrain_scheduled_batch(module, batch, partition_spec)
+            with jax.named_scope("easydel/trainer/base/scheduled_loss/prepare_inputs"):
+                call_batch = module.prepare_inputs_for_call(**batch)
+                labels = call_batch.pop("labels", None)
+            with jax.named_scope("easydel/trainer/base/scheduled_loss/forward_and_loss"):
+                outputs, _metrics = module.compute_loss(
+                    labels=labels,
+                    loss_config=loss_config,
+                    **call_batch,
+                )
+            return outputs.loss
 
     return scheduled_loss
 

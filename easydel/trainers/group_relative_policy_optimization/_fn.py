@@ -408,13 +408,15 @@ def grpo_step(
             is True, returns the updated state and loss metrics. When False,
             returns only the loss metrics.
     """
-    # Determine batch size, minibatch size, and enforce partition spec.
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/grpo/" + ("train_step" if is_training else "eval_step")
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        # Determine batch size, minibatch size, and enforce partition spec.
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the GRPO surrogate loss for one minibatch.
@@ -443,8 +445,10 @@ def grpo_step(
             quantizer signals.
         """
         if is_training and straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        module = state.merge(tree)
+            with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                tree = straight_through_emulator(tree)
+        with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+            module = state.merge(tree)
 
         (
             prompt_ids,
@@ -540,14 +544,15 @@ def grpo_step(
                     end,
                     prompt_batch_size=completion_batch_size,
                 )
-                chunk_per_token_logps = get_per_token_logps(
-                    module,
-                    chunk_input_ids,
-                    chunk_attention_mask,
-                    prompt_len,
-                    model_kwargs=chunk_model_kwargs,
-                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-                )
+                with jax.named_scope(scope_root + "/loss_fn/chunked/policy_logps"):
+                    chunk_per_token_logps = get_per_token_logps(
+                        module,
+                        chunk_input_ids,
+                        chunk_attention_mask,
+                        prompt_len,
+                        model_kwargs=chunk_model_kwargs,
+                        logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                    )
                 chunk_ref_per_token_logps = (
                     minibatch["ref_per_token_logps"][start:end, : completion_ids.shape[1]]
                     if beta != 0.0
@@ -689,31 +694,35 @@ def grpo_step(
             )
 
         entropies = None
-        if top_entropy_quantile < 1.0:
-            per_token_logps, entropies = get_per_token_logps_and_entropies(
-                module,
-                input_ids,
-                attention_mask,
-                prompt_len,
-                model_kwargs=completion_model_kwargs,
-                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-            )
-        else:
-            per_token_logps = get_per_token_logps(
-                module,
-                input_ids,
-                attention_mask,
-                prompt_len,
-                model_kwargs=completion_model_kwargs,
-                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-            )
+        with jax.named_scope(scope_root + "/loss_fn/policy_logps"):
+            if top_entropy_quantile < 1.0:
+                per_token_logps, entropies = get_per_token_logps_and_entropies(
+                    module,
+                    input_ids,
+                    attention_mask,
+                    prompt_len,
+                    model_kwargs=completion_model_kwargs,
+                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                )
+            else:
+                per_token_logps = get_per_token_logps(
+                    module,
+                    input_ids,
+                    attention_mask,
+                    prompt_len,
+                    model_kwargs=completion_model_kwargs,
+                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                )
 
-        ref_per_token_logps = None
-        if beta != 0.0:
-            ref_per_token_logps = minibatch["ref_per_token_logps"][:, : completion_ids.shape[1]]
-            per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-        else:
-            per_token_kl = jnp.zeros_like(per_token_logps)
+        with jax.named_scope(scope_root + "/loss_fn/kl_to_reference"):
+            ref_per_token_logps = None
+            if beta != 0.0:
+                ref_per_token_logps = minibatch["ref_per_token_logps"][:, : completion_ids.shape[1]]
+                per_token_kl = (
+                    jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                )
+            else:
+                per_token_kl = jnp.zeros_like(per_token_logps)
 
         advantages = minibatch["advantages"]
         if advantages.ndim == 1:
@@ -737,26 +746,27 @@ def grpo_step(
                 "Possible values are 'token' and 'sequence'."
             )
 
-        coef_1 = jnp.exp(log_importance_weights)
+        with jax.named_scope(scope_root + "/loss_fn/policy_objective"):
+            coef_1 = jnp.exp(log_importance_weights)
 
-        if loss_type == "cispo":
-            clamped_ratios = jnp.minimum(coef_1, epsilon_high)
-            per_token_loss = -clamped_ratios * advantages * per_token_logps
-        elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
-            coef_2 = jnp.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
-            if delta is not None:
-                coef_1 = jnp.minimum(coef_1, delta)
+            if loss_type == "cispo":
+                clamped_ratios = jnp.minimum(coef_1, epsilon_high)
+                per_token_loss = -clamped_ratios * advantages * per_token_logps
+            elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+                coef_2 = jnp.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
+                if delta is not None:
+                    coef_1 = jnp.minimum(coef_1, delta)
 
-            per_token_loss1 = coef_1 * advantages
-            per_token_loss2 = coef_2 * advantages
-            # Use min for A >= 0, max for A < 0 (pessimistic bound)
-            per_token_loss = -jnp.where(
-                advantages >= 0,
-                jnp.minimum(per_token_loss1, per_token_loss2),
-                jnp.maximum(per_token_loss1, per_token_loss2),
-            )
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}")
+                per_token_loss1 = coef_1 * advantages
+                per_token_loss2 = coef_2 * advantages
+                # Use min for A >= 0, max for A < 0 (pessimistic bound)
+                per_token_loss = -jnp.where(
+                    advantages >= 0,
+                    jnp.minimum(per_token_loss1, per_token_loss2),
+                    jnp.maximum(per_token_loss1, per_token_loss2),
+                )
+            else:
+                raise ValueError(f"Unknown loss type: {loss_type}")
 
         if top_entropy_quantile < 1.0 and entropies is not None:
             masked_entropies = jnp.where(completion_mask > 0, entropies, jnp.nan)
@@ -770,24 +780,25 @@ def grpo_step(
         completion_token_count = jnp.sum(completion_mask)
         completion_lengths = jnp.sum(completion_mask, axis=1)
 
-        if loss_type == "grpo":
-            loss = jnp.mean(jnp.sum(per_token_loss * completion_mask, axis=1) / jnp.maximum(completion_lengths, 1.0))
-        elif loss_type == "bnpo":
-            loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(completion_token_count, 1.0)
-        elif loss_type == "dr_grpo":
-            loss = jnp.sum(per_token_loss * completion_mask) / (per_token_loss.shape[0] * per_token_loss.shape[1])
-        elif loss_type in ["cispo", "dapo"]:
-            normalizer = (
-                completion_token_count
-                if completion_was_truncated
-                else minibatch.get(
-                    "num_items_in_batch",
-                    completion_token_count,
+        with jax.named_scope(scope_root + "/loss_fn/reduce_loss"):
+            if loss_type == "grpo":
+                loss = jnp.mean(jnp.sum(per_token_loss * completion_mask, axis=1) / jnp.maximum(completion_lengths, 1.0))
+            elif loss_type == "bnpo":
+                loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(completion_token_count, 1.0)
+            elif loss_type == "dr_grpo":
+                loss = jnp.sum(per_token_loss * completion_mask) / (per_token_loss.shape[0] * per_token_loss.shape[1])
+            elif loss_type in ["cispo", "dapo"]:
+                normalizer = (
+                    completion_token_count
+                    if completion_was_truncated
+                    else minibatch.get(
+                        "num_items_in_batch",
+                        completion_token_count,
+                    )
                 )
-            )
-            loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}")
+                loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
+            else:
+                raise ValueError(f"Unknown loss type: {loss_type}")
 
         def masked_mean(x):
             """Average ``x`` over masked completion tokens.
@@ -840,26 +851,29 @@ def grpo_step(
 
     # Compute gradients and metrics across minibatches.
     if is_training:
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-        )
-        state = update_state_respectfully(
-            state=state,
-            gradients=gradients,
-            loss_config=loss_config,
-            metrics=update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=state.step,
+        with jax.named_scope(scope_root + "/grad_and_minibatch"):
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            )
+        with jax.named_scope(scope_root + "/update_state"):
+            state = update_state_respectfully(
+                state=state,
                 gradients=gradients,
-            ),
-        )
+                loss_config=loss_config,
+                metrics=update_metrics(
+                    metrics=metrics,
+                    learning_rate_fn=learning_rate_fn,
+                    step=state.step,
+                    gradients=gradients,
+                ),
+            )
         return state, metrics
     else:
-        _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
+        with jax.named_scope(scope_root + "/eval_call"):
+            _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
         return metrics
 
 
@@ -910,31 +924,32 @@ def _make_grpo_scheduled_loss(call):
     def scheduled_loss(tree, batch):
         """Return the scalar GRPO loss for one scheduled microbatch."""
 
-        if straight_through_emulator is not None:
-            tree = straight_through_emulator(tree)
-        scheduled_state = call.state.replace(graphstate=tree)
-        metrics = grpo_step(
-            scheduled_state,
-            batch,
-            num_generations,
-            beta,
-            loss_config=loss_config,
-            learning_rate_fn=learning_rate_fn,
-            partition_spec=partition_spec,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            is_training=False,
-            loss_type=loss_type,
-            epsilon=epsilon,
-            epsilon_high=epsilon_high,
-            delta=delta,
-            importance_sampling_level=importance_sampling_level,
-            top_entropy_quantile=top_entropy_quantile,
-            completion_chunk_size=completion_chunk_size,
-            max_loss_completion_tokens=max_loss_completion_tokens,
-            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-            straight_through_emulator=None,
-        )
-        return metrics.loss
+        with jax.named_scope("easydel/trainer/grpo/scheduled_loss"):
+            if straight_through_emulator is not None:
+                tree = straight_through_emulator(tree)
+            scheduled_state = call.state.replace(graphstate=tree)
+            metrics = grpo_step(
+                scheduled_state,
+                batch,
+                num_generations,
+                beta,
+                loss_config=loss_config,
+                learning_rate_fn=learning_rate_fn,
+                partition_spec=partition_spec,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                is_training=False,
+                loss_type=loss_type,
+                epsilon=epsilon,
+                epsilon_high=epsilon_high,
+                delta=delta,
+                importance_sampling_level=importance_sampling_level,
+                top_entropy_quantile=top_entropy_quantile,
+                completion_chunk_size=completion_chunk_size,
+                max_loss_completion_tokens=max_loss_completion_tokens,
+                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                straight_through_emulator=None,
+            )
+            return metrics.loss
 
     return scheduled_loss
 

@@ -1987,6 +1987,13 @@ class BaseTrainer(BaseTrainerProtocol):
         self.train_tracker = getattr(self, "train_tracker", CompilationTracker())
         self.evalu_tracker = getattr(self, "evalu_tracker", CompilationTracker())
 
+        # JAX profiler bookkeeping. When `arguments.profiler_path` is set the
+        # trainer starts a trace once, after step 1 completes (so the trace
+        # excludes the initial JIT-compile of step 1), and stops it in the
+        # finally block of the training loop.
+        self._profiler_started = getattr(self, "_profiler_started", False)
+        self._profiler_active = getattr(self, "_profiler_active", False)
+
         self._train_shared_fn_static_args_ = getattr(
             self,
             "_train_shared_fn_static_args_",
@@ -5603,6 +5610,83 @@ class BaseTrainer(BaseTrainerProtocol):
             compiled = True
 
         return compiled
+
+    def _maybe_start_profiler(self, current_step: int) -> None:
+        """Start the JAX profiler trace after step 1 has completed.
+
+        Called from the inner training loop on every post-step iteration.
+        No-ops unless ``self.arguments.profiler_path`` is set, this is the
+        first call past step 1, and (by default) we are on rank 0.
+
+        The first training step bakes the JIT compilation of the step
+        function into the wall-clock time; starting the trace *after* step
+        1 means the recorded profile reflects steady-state training rather
+        than compilation. ``stop_trace`` is invoked from the surrounding
+        training loop's ``finally`` block so it always runs.
+
+        Args:
+            current_step: Global training step *after* the most recent
+                optimizer apply. The trace is started as soon as this
+                reaches ``>= 1``.
+        """
+        if self._profiler_started or self._profiler_active:
+            return
+        profiler_path = getattr(self.arguments, "profiler_path", None)
+        if profiler_path is None:
+            return
+        if current_step < 1:
+            return
+        # Only rank 0 records the trace by default; multi-host traces would
+        # otherwise step on each other's output files. Users that want
+        # per-worker traces can set `log_all_workers=True`.
+        if jax.process_index() != 0 and not self.arguments.log_all_workers:
+            self._profiler_started = True
+            return
+        try:
+            ePath(profiler_path).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # pragma: no cover - mkdir is best-effort
+            logger.warning(f"Could not create profiler_path={profiler_path!r}: {exc}")
+        host_level = getattr(self.arguments, "profiler_host_tracer_level", None)
+        python_level = getattr(self.arguments, "profiler_python_tracer_level", None)
+        try:
+            profile_options = None
+            if host_level is not None or python_level is not None:
+                profile_options = jax.profiler.ProfileOptions()
+                if host_level is not None:
+                    profile_options.host_tracer_level = int(host_level)
+                if python_level is not None:
+                    profile_options.python_tracer_level = int(python_level)
+            if profile_options is not None:
+                jax.profiler.start_trace(str(profiler_path), profiler_options=profile_options)
+            else:
+                jax.profiler.start_trace(str(profiler_path))
+        except Exception as exc:
+            logger.warning(f"Failed to start JAX profiler trace at {profiler_path!r}: {exc}")
+            self._profiler_started = True
+            return
+        self._profiler_started = True
+        self._profiler_active = True
+        logger.info(
+            f"JAX profiler trace started at step {current_step}; writing to {profiler_path}"
+            f" (host_tracer_level={host_level}, python_tracer_level={python_level})."
+        )
+
+    def _stop_profiler(self) -> None:
+        """Stop the JAX profiler trace if one is active. Idempotent / safe to call.
+
+        Invoked from the ``finally`` block of the outer training loop so the
+        trace is always closed, even when training exits via an exception
+        (``KeyboardInterrupt``, timer limit, etc.).
+        """
+        if not getattr(self, "_profiler_active", False):
+            return
+        try:
+            jax.profiler.stop_trace()
+            logger.info(f"JAX profiler trace stopped; output written under {self.arguments.profiler_path}.")
+        except Exception as exc:  # pragma: no cover - stop should rarely fail
+            logger.warning(f"Failed to stop JAX profiler trace: {exc}")
+        finally:
+            self._profiler_active = False
 
     def _should_run_evaluation(self, current_step):
         """

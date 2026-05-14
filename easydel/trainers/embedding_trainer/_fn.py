@@ -270,12 +270,14 @@ def embedding_training_step(
         accuracy for InfoNCE/MNRL), and any per-dimension MRL
         diagnostics in ``other_metrics``.
     """
-    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+    scope_root = "easydel/trainer/embedding/train_step"
+    with jax.named_scope(scope_root + "/prepare_batch"):
+        _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     loss_fns = {
         "infonce": infonce_loss,
@@ -301,79 +303,87 @@ def embedding_training_step(
             ``(loss, metrics)`` with optional contrastive accuracy
             recorded in ``metrics.accuracy``.
         """
-        module = state.merge(tree)
+        with jax.named_scope(scope_root + "/loss_fn"):
+            with jax.named_scope(scope_root + "/loss_fn/merge_state"):
+                module = state.merge(tree)
 
-        q_embeds = _embed_batch(
-            module,
-            minibatch["query_input_ids"],
-            minibatch["query_attention_mask"],
-            normalize=normalize,
-        )
-        p_embeds = _embed_batch(
-            module,
-            minibatch["positive_input_ids"],
-            minibatch["positive_attention_mask"],
-            normalize=normalize,
-        )
+            with jax.named_scope(scope_root + "/loss_fn/embed_query"):
+                q_embeds = _embed_batch(
+                    module,
+                    minibatch["query_input_ids"],
+                    minibatch["query_attention_mask"],
+                    normalize=normalize,
+                )
+            with jax.named_scope(scope_root + "/loss_fn/embed_positive"):
+                p_embeds = _embed_batch(
+                    module,
+                    minibatch["positive_input_ids"],
+                    minibatch["positive_attention_mask"],
+                    normalize=normalize,
+                )
 
-        n_embeds = None
-        if "negative_input_ids" in minibatch:
-            n_embeds = _embed_batch(
-                module,
-                minibatch["negative_input_ids"],
-                minibatch["negative_attention_mask"],
-                normalize=normalize,
+            n_embeds = None
+            if "negative_input_ids" in minibatch:
+                with jax.named_scope(scope_root + "/loss_fn/embed_negative"):
+                    n_embeds = _embed_batch(
+                        module,
+                        minibatch["negative_input_ids"],
+                        minibatch["negative_attention_mask"],
+                        normalize=normalize,
+                    )
+
+            loss_kwargs = {}
+            if loss_type in ("infonce", "mnrl"):
+                loss_kwargs["temperature"] = temperature
+            elif loss_type == "triplet":
+                loss_kwargs["margin"] = margin
+
+            with jax.named_scope(scope_root + "/loss_fn/compute_contrastive_loss"):
+                if matryoshka_dims is not None:
+                    loss, extra_metrics = matryoshka_loss(
+                        base_loss_fn,
+                        q_embeds,
+                        p_embeds,
+                        n_embeds,
+                        matryoshka_dims,
+                        **loss_kwargs,
+                    )
+                elif n_embeds is not None:
+                    loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, n_embeds, **loss_kwargs)
+                else:
+                    if loss_type == "triplet":
+                        loss = jnp.float32(0.0)
+                        extra_metrics = {"fraction_active_triplets": jnp.float32(0.0)}
+                    else:
+                        loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
+
+            metrics = LossMetrics(
+                loss=loss,
+                accuracy=extra_metrics.get("contrastive_accuracy", None),
+                other_metrics=extra_metrics,
             )
+            return loss, metrics
 
-        loss_kwargs = {}
-        if loss_type in ("infonce", "mnrl"):
-            loss_kwargs["temperature"] = temperature
-        elif loss_type == "triplet":
-            loss_kwargs["margin"] = margin
-
-        if matryoshka_dims is not None:
-            loss, extra_metrics = matryoshka_loss(
-                base_loss_fn,
-                q_embeds,
-                p_embeds,
-                n_embeds,
-                matryoshka_dims,
-                **loss_kwargs,
-            )
-        elif n_embeds is not None:
-            loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, n_embeds, **loss_kwargs)
-        else:
-            if loss_type == "triplet":
-                loss = jnp.float32(0.0)
-                extra_metrics = {"fraction_active_triplets": jnp.float32(0.0)}
-            else:
-                loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
-
-        metrics = LossMetrics(
-            loss=loss,
-            accuracy=extra_metrics.get("contrastive_accuracy", None),
-            other_metrics=extra_metrics,
+    with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        gradients, metrics = minibatch_call(
+            state=state,
+            batch=batch,
+            minibatch_size=minibatch_size,
+            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
         )
-        return loss, metrics
 
-    gradients, metrics = minibatch_call(
-        state=state,
-        batch=batch,
-        minibatch_size=minibatch_size,
-        grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-    )
-
-    state = update_state_respectfully(
-        state=state,
-        gradients=gradients,
-        loss_config=None,
-        metrics=update_metrics(
-            metrics=metrics,
-            learning_rate_fn=learning_rate_fn,
-            step=state.step,
+    with jax.named_scope(scope_root + "/update_state"):
+        state = update_state_respectfully(
+            state=state,
             gradients=gradients,
-        ),
-    )
+            loss_config=None,
+            metrics=update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=state.step,
+                gradients=gradients,
+            ),
+        )
     return state, metrics
 
 
@@ -499,18 +509,21 @@ def _make_embedding_scheduled_loss(call):
         Returns:
             The scalar contrastive loss (extra metrics are dropped).
         """
-        module = bind_scheduled_module(call, tree)
-        batch = constrain_scheduled_batch(module, batch, partition_spec)
-        loss, _extra_metrics = _embedding_loss_values(
-            module=module,
-            batch=batch,
-            loss_type=loss_type,
-            temperature=temperature,
-            margin=margin,
-            normalize=normalize,
-            matryoshka_dims=matryoshka_dims,
-        )
-        return loss
+        with jax.named_scope("easydel/trainer/embedding/scheduled_loss"):
+            with jax.named_scope("easydel/trainer/embedding/scheduled_loss/bind_module"):
+                module = bind_scheduled_module(call, tree)
+                batch = constrain_scheduled_batch(module, batch, partition_spec)
+            with jax.named_scope("easydel/trainer/embedding/scheduled_loss/compute_contrastive_loss"):
+                loss, _extra_metrics = _embedding_loss_values(
+                    module=module,
+                    batch=batch,
+                    loss_type=loss_type,
+                    temperature=temperature,
+                    margin=margin,
+                    normalize=normalize,
+                    matryoshka_dims=matryoshka_dims,
+                )
+            return loss
 
     return scheduled_loss
 

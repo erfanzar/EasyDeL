@@ -158,7 +158,7 @@ class SiglipOutput(ModelOutput):
         )
 
 
-class SiglipVisionEmbeddings(spx.Module):
+class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
     """Vision embeddings module for SigLIP models.
 
     Converts image pixel values into patch embeddings with position encodings
@@ -274,7 +274,7 @@ class SiglipVisionEmbeddings(spx.Module):
         return checkpoint_name(embeddings, "embeddings")
 
 
-class SiglipTextEmbeddings(spx.Module):
+class SiglipTextEmbeddings(EasyDeLLayerStackMixin, spx.Module):
     """Text embeddings module for SigLIP models.
 
     Combines token embeddings and position embeddings for text
@@ -300,6 +300,7 @@ class SiglipTextEmbeddings(spx.Module):
                 Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        self.config = config
         embed_dim = config.hidden_size
 
         with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
