@@ -31,9 +31,9 @@ classifiers = [
 dependencies = [
 	"jax>=0.10.0",
 	"jaxlib>=0.10.0",
-	"eformer==0.0.100",
+	"eformer==0.0.101",
 	"ejkernel==0.0.79",
-	"spectrax-lib==0.1.2",
+	"spectrax-lib==0.1.3",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
 	"transformers~=5.5.0",

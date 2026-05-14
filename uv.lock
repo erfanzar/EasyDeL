@@ -799,7 +799,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.100" },
+    { name = "eformer", specifier = "==0.0.101" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "ejkernel", specifier = "==0.0.79" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.79" },
@@ -825,7 +825,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "setuptools", marker = "extra == 'profile'", specifier = ">=70,<81" },
-    { name = "spectrax-lib", specifier = "==0.1.2" },
+    { name = "spectrax-lib", specifier = "==0.1.3" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = "~=2.19.0" },
     { name = "tensorflow-datasets", marker = "extra == 'tensorflow'", specifier = "~=4.9.9" },
@@ -844,7 +844,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "
 
 [[package]]
 name = "eformer"
-version = "0.0.100"
+version = "0.0.101"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -866,9 +866,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2a/49/04033ad353167d6eafa730746b5221abd7dc428a59b0b1e4d0d25cf34e2f/eformer-0.0.100.tar.gz", hash = "sha256:391b8cf9c7eaf51532bd71b24cb1c578bda9854ed3d2fed407c96d47cfff92f4", size = 292867, upload-time = "2026-04-29T16:00:01.362Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/32/3929919338ed5f7be3534318f9a3906d3d6f9a7911f720d7fc021c518ddd/eformer-0.0.101.tar.gz", hash = "sha256:830df5dc6cc14a2f8c4a18ca0c488ec72fb3a48f64396ef1e9121ec20be0618c", size = 302143, upload-time = "2026-05-14T16:06:59.768Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6d/67/92d95810aba7849bcf363924975576b0c39bab8e9013a4a1f646c1d3269a/eformer-0.0.100-py3-none-any.whl", hash = "sha256:673fbf5429f21439daf11ba6ea2d69de4ed26fd480f261805f5d533b56e6ac61", size = 354469, upload-time = "2026-04-29T15:59:59.248Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/86/5d7df517c8da52322a001e0bb868b0d7a5aec809fdd73a0f784e043deabe/eformer-0.0.101-py3-none-any.whl", hash = "sha256:42fc34fb6a6159e96ef54ecdb105cb165f53e407797a1594a44295fbaeacbf02", size = 363619, upload-time = "2026-05-14T16:06:58.592Z" },
 ]
 
 [[package]]
@@ -4220,7 +4220,7 @@ wheels = [
 
 [[package]]
 name = "spectrax-lib"
-version = "0.1.2"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fsspec", extra = ["http"] },
@@ -4232,9 +4232,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "treescope" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/88/d2/e5875ded9bd1de29efd76257938a18c25fb2e3134091ccc3760b120e61a8/spectrax_lib-0.1.2.tar.gz", hash = "sha256:8f9a96c52d802227207e14bf17588b141b0e7a5e3bff9b8cc03baadc35248cd0", size = 495852, upload-time = "2026-05-07T20:43:41.957Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/15/f6/616dcfe263147c75d70bd4198a708232518498431c3ce0fb1d313d9d9c2c/spectrax_lib-0.1.3.tar.gz", hash = "sha256:0be19fd610bcec1c0a5617ec2d57ce5de1f39e3d49358f9214da041a4d0a28eb", size = 551638, upload-time = "2026-05-14T16:08:07.358Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/f8/e8d0edbc48aeab31ff320d539e7ad8e60a8866b3ae964d45ef5338ab25d2/spectrax_lib-0.1.2-py3-none-any.whl", hash = "sha256:8a6e9d8622846ee0206689d65b1f4f6e1825c9338a37b3a2655132cb9fdba6c3", size = 582882, upload-time = "2026-05-07T20:43:40.376Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/d3/e6ed69d31188fa05fac99e1360e283c7eeefcc5ac9a053c98d15478d01fe/spectrax_lib-0.1.3-py3-none-any.whl", hash = "sha256:5c8c8d8dc34574b424a544d3f8c5b4ba4b4c9035043cb8dcc18e1d4840b62e22", size = 639973, upload-time = "2026-05-14T16:08:08.653Z" },
 ]
 
 [[package]]
