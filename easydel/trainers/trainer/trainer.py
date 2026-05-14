@@ -575,88 +575,121 @@ class Trainer(BaseTrainer):
         run_exception: Exception | None = None
 
         while True:
-            current_step = int(jax.device_get(state.step))
-            if current_step >= self.max_training_steps or current_step >= epoch_end_step:
-                break
-            try:
-                batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                step_metrics.start_step()
-                state = self.on_step_start(state=state, step=current_step)
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
-                return state, exc, train_iter
+            with capture_time() as iteration_time:
+                current_step = int(jax.device_get(state.step))
+                if current_step >= self.max_training_steps or current_step >= epoch_end_step:
+                    break
+                try:
+                    with capture_time() as data_collection_time:
+                        batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                        batch = data_collator(batch)
+                    step_metrics.start_step()
+                    state = self.on_step_start(state=state, step=current_step)
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
+                    return state, exc, train_iter
 
-            # Execute training step
-            with self.train_tracker.trace_compilation():
-                with capture_time() as execution_time:
-                    state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
-                    metrics.execution_time = execution_time()
-                    current_step = int(jax.device_get(state.step))
-            if run_exception is not None:
-                return state, run_exception, train_iter
-            try:
-                mean_loss, mean_accuracy = metrics_tracker.update(
-                    loss=metrics.loss,
-                    accuracy=metrics.accuracy,
-                    step=current_step,
-                )
-                metrics = self.apply_training_hooks(metrics=metrics)
-                train_metrics = step_metrics.calculate(
-                    metrics=metrics,
-                    current_step=current_step,
-                    learning_rate=(
-                        self.scheduler(current_step) if self.scheduler is not None else self.arguments.learning_rate
-                    ),
-                    epoch=epoch,
-                    epoch_progress=min(max((current_step - epoch_start_step) / epoch_total_steps, 0.0), 1.0),
-                    flops_per_token=self._backward_flops_per_token,
-                    extra_flops_per_token=self._extra_backward_flops_per_token,
-                    batch_size=self.training_batch_size,
-                    seq_length=self.arguments.max_length,
-                    mean_loss=mean_loss,
-                    mean_accuracy=mean_accuracy,
-                    mode="train",
-                )
-                state, metrics = self.on_step_end(
-                    state=state,
-                    metrics=metrics,
-                    step=current_step,
-                )
-                self.log_metrics(
-                    metrics=train_metrics,
-                    pbar=pbar,
-                    step=current_step,
-                    mode="train",
-                )
-                if self._should_save_tpu_preemption_checkpoint(current_step):
-                    if jax.process_index() == 0 or self.arguments.log_all_workers:
-                        logger.warning(
-                            f"TPU preemption sync point reached at step {current_step}. Saving coordinated checkpoint."
+                # Execute training step
+                with self.train_tracker.trace_compilation():
+                    with capture_time() as execution_time:
+                        state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
+                        metrics.execution_time = execution_time()
+                        current_step = int(jax.device_get(state.step))
+                if run_exception is not None:
+                    return state, run_exception, train_iter
+                try:
+                    mean_loss, mean_accuracy = metrics_tracker.update(
+                        loss=metrics.loss,
+                        accuracy=metrics.accuracy,
+                        step=current_step,
+                    )
+                    metrics = self.apply_training_hooks(metrics=metrics)
+                    train_metrics = step_metrics.calculate(
+                        metrics=metrics,
+                        current_step=current_step,
+                        learning_rate=(
+                            self.scheduler(current_step) if self.scheduler is not None else self.arguments.learning_rate
+                        ),
+                        epoch=epoch,
+                        epoch_progress=min(max((current_step - epoch_start_step) / epoch_total_steps, 0.0), 1.0),
+                        flops_per_token=self._backward_flops_per_token,
+                        extra_flops_per_token=self._extra_backward_flops_per_token,
+                        batch_size=self.training_batch_size,
+                        seq_length=self.arguments.max_length,
+                        mean_loss=mean_loss,
+                        mean_accuracy=mean_accuracy,
+                        mode="train",
+                    )
+                    train_metrics["performance/data_collection_time"] = float(data_collection_time())
+                    train_step_time = train_metrics.get("performance/train_step_time")
+                    if train_step_time is not None:
+                        remaining_steps = max(self.max_training_steps - current_step, 0)
+                        remaining_seconds = remaining_steps * float(train_step_time)
+                        train_metrics["performance/remaining_minutes"] = remaining_seconds / 60.0
+                        train_metrics["performance/remaining_hours"] = remaining_seconds / 3600.0
+                    state, metrics = self.on_step_end(
+                        state=state,
+                        metrics=metrics,
+                        step=current_step,
+                    )
+                    with capture_time() as logging_time:
+                        self.log_metrics(
+                            metrics=train_metrics,
+                            pbar=pbar,
+                            step=current_step,
+                            mode="train",
                         )
-                    self._save_tpu_preemption_checkpoint(state=state, step=current_step)
-                    return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), train_iter
-                self.log_weight_distribution(state=state, step=current_step)
-                self.log_watchers(state=state, step=current_step)
-                try:
-                    self.maybe_generate(state=state, step=current_step, metrics=metrics)
-                except Exception as exc:  # pragma: no cover - preview must not interrupt training
-                    logger.warning(f"Preview generation hook failed: {exc}")
-                try:
-                    self.maybe_benchmark(state=state, step=current_step)
-                except Exception as exc:  # pragma: no cover - benchmarks must not interrupt training
-                    logger.warning(f"Benchmark hook failed: {exc}")
+                    if self._should_save_tpu_preemption_checkpoint(current_step):
+                        if jax.process_index() == 0 or self.arguments.log_all_workers:
+                            logger.warning(
+                                f"TPU preemption sync point reached at step {current_step}. Saving coordinated checkpoint."
+                            )
+                        self._save_tpu_preemption_checkpoint(state=state, step=current_step)
+                        return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), train_iter
+                    with capture_time() as weight_distribution_time:
+                        self.log_weight_distribution(state=state, step=current_step)
+                    with capture_time() as watchers_time:
+                        self.log_watchers(state=state, step=current_step)
+                    with capture_time() as generation_time:
+                        try:
+                            self.maybe_generate(state=state, step=current_step, metrics=metrics)
+                        except Exception as exc:  # pragma: no cover - preview must not interrupt training
+                            logger.warning(f"Preview generation hook failed: {exc}")
+                    with capture_time() as benchmark_time:
+                        try:
+                            self.maybe_benchmark(state=state, step=current_step)
+                        except Exception as exc:  # pragma: no cover - benchmarks must not interrupt training
+                            logger.warning(f"Benchmark hook failed: {exc}")
 
-                self._save_checkpoint_for_step(
-                    state=state,
-                    step=current_step,
-                    merge_lora_before_save=self.arguments.merge_lora_before_save,
-                )
-                if self._should_run_evaluation(current_step):
-                    for _ in self.eval(model_state=state):
-                        ...
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                return state, run_exception, train_iter
-            if run_exception is not None:
-                break
+                    with capture_time() as checkpoint_time:
+                        self._save_checkpoint_for_step(
+                            state=state,
+                            step=current_step,
+                            merge_lora_before_save=self.arguments.merge_lora_before_save,
+                        )
+                    with capture_time() as evaluation_time:
+                        if self._should_run_evaluation(current_step):
+                            for _ in self.eval(model_state=state):
+                                ...
+                    self.log_metrics(
+                        metrics={
+                            "performance/logging_time": float(logging_time()),
+                            "performance/weight_distribution_time": float(weight_distribution_time()),
+                            "performance/watchers_time": float(watchers_time()),
+                            "performance/generation_time": float(generation_time()),
+                            "performance/benchmark_time": float(benchmark_time()),
+                            "performance/checkpoint_time": float(checkpoint_time()),
+                            "performance/evaluation_time": float(evaluation_time()),
+                            "performance/iteration_time": float(iteration_time()),
+                        },
+                        pbar=pbar,
+                        step=current_step,
+                        mode="train",
+                        update_progress=False,
+                    )
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+                    return state, run_exception, train_iter
+                if run_exception is not None:
+                    break
         return state, run_exception, train_iter
 
     def _eval_epoch(
@@ -728,11 +761,13 @@ class Trainer(BaseTrainer):
 
         for current_step in range(1, self.max_evaluation_steps + 1):
             try:
-                batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
+                with capture_time() as data_collection_time:
+                    batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
+                    batch = data_collator(batch)
                 step_metrics.start_step()
                 with self.evalu_tracker.trace_compilation():
                     with capture_time() as execution_time:
-                        metrics = self._execute_eval_step(state, data_collator(batch))
+                        metrics = self._execute_eval_step(state, batch)
                         metrics.execution_time = execution_time()
                 mean_loss, mean_accuracy = metrics_tracker.update(
                     metrics.loss,
@@ -753,6 +788,7 @@ class Trainer(BaseTrainer):
                     mean_accuracy=mean_accuracy,
                     mode="eval",
                 )
+                eval_metrics["performance/eval/data_collection_time"] = float(data_collection_time())
                 for metric_name, metric_value in eval_metrics.items():
                     summary_metrics_helper.accumulate_summary_metric(
                         summary_metric_sums=summary_metric_sums,

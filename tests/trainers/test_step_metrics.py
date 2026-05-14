@@ -15,7 +15,7 @@
 from types import SimpleNamespace
 
 from easydel.infra.loss_utils import LossMetrics
-from easydel.trainers.metrics import MetricsTracker, StepMetrics
+from easydel.trainers.metrics import JSONProgressBar, MetricsTracker, StepMetrics
 
 
 def test_step_metrics_reports_fractional_epoch_progress(monkeypatch):
@@ -45,6 +45,38 @@ def test_step_metrics_reports_fractional_epoch_progress(monkeypatch):
 
     assert results["train/epoch"] == 0.25
     assert results["train/epoch_index"] == 0
+    assert results["performance/execution_time"] == 2.0
+    assert results["performance/preprocessing_time"] == 0.0
+    assert results["performance/train_step_time"] == 2.0
+
+
+def test_step_metrics_offsets_fractional_progress_by_epoch_index(monkeypatch):
+    step_metrics = StepMetrics(arguments=SimpleNamespace(performance_mode=True))
+    step_metrics.start_time = 0.0
+    step_metrics.step_start_time = 10.0
+    monkeypatch.setattr("easydel.trainers.metrics.time.time", lambda: 12.0)
+
+    metrics = LossMetrics(
+        loss=1.0,
+        accuracy=None,
+        execution_time=2.0,
+    )
+
+    results = step_metrics.calculate(
+        metrics=metrics,
+        current_step=10,
+        epoch=1,
+        epoch_progress=0.1,
+        flops_per_token=1.0,
+        extra_flops_per_token=0.0,
+        batch_size=2,
+        seq_length=4,
+        learning_rate=1e-4,
+        mode="train",
+    )
+
+    assert results["train/epoch"] == 1.1
+    assert results["train/epoch_index"] == 1
 
 
 def test_metrics_tracker_counts_updates_and_ignores_missing_accuracy():
@@ -69,3 +101,23 @@ def test_metrics_tracker_ignores_non_finite_accuracy():
 
     assert mean_loss == 2.0
     assert mean_accuracy == 0.75
+
+
+def test_json_progress_bar_nests_parental_metric_keys(monkeypatch):
+    logged: list[dict] = []
+    monkeypatch.setattr("easydel.trainers.metrics.logger.info", logged.append)
+
+    JSONProgressBar().set_postfix(
+        loss=1.0,
+        **{"performance/train_step_time": 2.0, "performance/data_collection_time": 0.25},
+    )
+
+    assert logged == [
+        {
+            "loss": 1.0,
+            "performance": {
+                "train_step_time": 2.0,
+                "data_collection_time": 0.25,
+            },
+        }
+    ]

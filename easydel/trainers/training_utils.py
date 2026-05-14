@@ -206,7 +206,7 @@ def _log_sched_section(label: str, t0: float, block_on: tp.Any = None) -> None:
     except Exception:
         return
     _SCHED_SECTION_LOG_BUDGET[0] -= 1
-    logger.info("scheduled_training_step section %-34s : %.3fs", label, elapsed)
+    logger.debug("scheduled_training_step section %-34s : %.3fs", label, elapsed)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -41,6 +41,27 @@ def test_compute_weight_stats_accepts_spectrax_state():
     assert histogram.size == 8
 
 
+def test_compute_weight_stats_accepts_leaves_on_different_devices():
+    devices = jax.devices()
+    if len(devices) < 3:
+        return
+
+    params = {
+        "parameters": {
+            "lm_head": {"weight": jax.device_put(jnp.arange(8, dtype=jnp.float32), devices[0])},
+            "layer": {"weight": jax.device_put(jnp.arange(8, 16, dtype=jnp.float32), devices[2])},
+        }
+    }
+
+    stats = jax.device_get(compute_weight_stats(params, r".*weight"))
+
+    assert set(stats) == {
+        "parameters/layer/weight/histogram",
+        "parameters/lm_head/weight/histogram",
+    }
+    assert all(isinstance(histogram, MetricsHistogram) for histogram in stats.values())
+
+
 def test_training_arguments_weight_distribution_accepts_spectrax_state(monkeypatch):
     class _State:
         graphstate = spx.State({"parameters": {"layer.weight": jnp.arange(8, dtype=jnp.float32)}})

@@ -313,6 +313,20 @@ def test_causal_lm_loss_strategy_disables_lm_head_for_large_blockwise_loss():
     assert plan.forward_kwargs == {"apply_lm_head": False}
 
 
+def test_causal_lm_loss_strategy_auto_disables_lm_head_for_large_logits_without_chunk_config():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((4, 4096), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_DummyCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=None, chunk_vocab_size=None, chunk_token_size=None),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {"apply_lm_head": False}
+
+
 def test_causal_lm_loss_strategy_honors_explicit_token_chunk_size_loss_kwarg():
     strategy = resolve_loss_strategy(ForCausalLMLoss)
     labels = jnp.ones((2, 8), dtype=jnp.int32)

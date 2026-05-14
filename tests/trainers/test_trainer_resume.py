@@ -56,7 +56,7 @@ class _StepMetricsStub:
         return None
 
     def calculate(self, **kwargs):
-        return {}
+        return {"performance/train_step_time": 7.2}
 
 
 class _EvalStepMetricsStub:
@@ -69,9 +69,9 @@ class _EvalStepMetricsStub:
             "eval/mean_loss": kwargs["mean_loss"],
             "eval/mean_accuracy": kwargs["mean_accuracy"],
             "eval/attention_loss": jnp.asarray(kwargs["current_step"] * 10.0),
-            "eval-mlperf/execution_time": jnp.asarray(kwargs["current_step"] * 0.5),
-            "eval-mlperf/total_tokens": jnp.asarray(kwargs["current_step"] * 8.0),
-            "eval-mlperf/total_flops": jnp.asarray(kwargs["current_step"] * 16.0),
+            "performance/eval/execution_time": jnp.asarray(kwargs["current_step"] * 0.5),
+            "performance/eval/total_tokens": jnp.asarray(kwargs["current_step"] * 8.0),
+            "performance/eval/total_flops": jnp.asarray(kwargs["current_step"] * 16.0),
         }
 
 
@@ -180,8 +180,8 @@ def test_train_epoch_uses_preemption_checkpoint_path_before_regular_checkpointin
     trainer.on_step_start = lambda state, step: state
     trainer.on_step_end = lambda state, metrics, step: (state, metrics)
     trainer.apply_training_hooks = lambda metrics: metrics
-    logged_steps: list[int] = []
-    trainer.log_metrics = lambda **kwargs: logged_steps.append(kwargs["step"])
+    logged_calls: list[dict[str, object]] = []
+    trainer.log_metrics = lambda **kwargs: logged_calls.append(kwargs)
     trainer.log_weight_distribution = lambda **kwargs: None
     trainer.log_watchers = lambda **kwargs: None
     trainer.maybe_generate = lambda **kwargs: None
@@ -221,7 +221,9 @@ def test_train_epoch_uses_preemption_checkpoint_path_before_regular_checkpointin
     assert state.step == 1
     assert isinstance(run_exception, EasyDeLPreemptionSignal)
     assert saved_steps == [1]
-    assert logged_steps == [1]
+    assert [call["step"] for call in logged_calls] == [1]
+    assert logged_calls[0]["metrics"]["performance/remaining_minutes"] == pytest.approx(0.36)
+    assert logged_calls[0]["metrics"]["performance/remaining_hours"] == pytest.approx(0.006)
 
 
 def test_train_epoch_forwards_merge_lora_before_save_to_regular_checkpoint(monkeypatch):
@@ -335,10 +337,10 @@ def test_eval_epoch_logs_batch_progress_locally_and_reports_summary_at_global_st
     assert logged_calls[-1]["metrics"]["eval/loss"] == 3.0
     assert logged_calls[-1]["metrics"]["eval/accuracy"] == pytest.approx(0.2)
     assert logged_calls[-1]["metrics"]["eval/attention_loss"] == pytest.approx(20.0)
-    assert logged_calls[-1]["metrics"]["eval-mlperf/total_tokens"] == pytest.approx(48.0)
-    assert logged_calls[-1]["metrics"]["eval-mlperf/total_flops"] == pytest.approx(96.0)
-    assert logged_calls[-1]["metrics"]["eval-mlperf/throughput"] == pytest.approx(16.0)
-    assert logged_calls[-1]["metrics"]["eval-mlperf/tflops"] == pytest.approx(3.2e-11)
+    assert logged_calls[-1]["metrics"]["performance/eval/total_tokens"] == pytest.approx(48.0)
+    assert logged_calls[-1]["metrics"]["performance/eval/total_flops"] == pytest.approx(96.0)
+    assert logged_calls[-1]["metrics"]["performance/eval/throughput"] == pytest.approx(16.0)
+    assert logged_calls[-1]["metrics"]["performance/eval/tflops"] == pytest.approx(3.2e-11)
 
 
 def test_eval_epoch_summary_matches_step_perplexity_behavior_for_large_losses():

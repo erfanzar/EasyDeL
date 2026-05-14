@@ -5937,8 +5937,8 @@ class BaseTrainer(BaseTrainerProtocol):
         """Log metrics to configured backends and update the progress bar.
 
         Metrics are logged at intervals defined by log_steps (for progress bar)
-        and report_steps (for W&B/TensorBoard). MLPerf and grad_norm metrics
-        are filtered from the progress bar display.
+        and report_steps (for W&B/TensorBoard). Gradient-norm metrics are
+        filtered from the progress bar display.
 
         Args:
             metrics: Dictionary of metric names to values.
@@ -5956,13 +5956,7 @@ class BaseTrainer(BaseTrainerProtocol):
             display_metrics = {
                 k.replace("train/", "").replace("eval/", ""): v
                 for k, v in metrics.items()
-                if not (
-                    k.startswith("train-mlperf/")
-                    or k.startswith("eval-mlperf/")
-                    or k.startswith("mlperf/")
-                    or k.startswith("train/grad_norm")
-                    or k.startswith("eval/grad_norm")
-                )
+                if not (k.startswith("train/grad_norm") or k.startswith("eval/grad_norm"))
             }
             # Update progress bar
             pbar.set_postfix(**display_metrics)

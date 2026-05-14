@@ -127,7 +127,7 @@ class StepMetrics:
             dict: Comprehensive metrics including:
                 - Basic metrics (loss, perplexity, accuracy)
                 - Performance metrics (TFLOPs, throughput)
-                - MLPerf benchmark metrics
+                - Performance timing and throughput metrics
                 - Optional gradient norms and detailed statistics
 
         Note:
@@ -136,28 +136,37 @@ class StepMetrics:
 
         step_time = time.time() - self.step_start_time
         total_time = time.time() - self.start_time
-        preprocessing_time = 0
-        if metrics.other_metrics is not None:
-            preprocessing_time = metrics.other_metrics.get("preprocessing_time", 0)
-        execution_time = metrics.execution_time - preprocessing_time
+        preprocessing_time = 0.0
+        other_metrics = getattr(metrics, "other_metrics", None)
+        if other_metrics is not None:
+            preprocessing_time = float(other_metrics.get("preprocessing_time", 0.0))
+        execution_time = max(float(metrics.execution_time) - preprocessing_time, 0.0)
+        execution_time_for_rate = execution_time if execution_time > 0.0 else 1e-12
         flops = flops_per_token * seq_length
         total_flops = flops * batch_size
 
         extra_flops = extra_flops_per_token * seq_length
         total_flops += extra_flops * batch_size
 
-        tflops = (total_flops / execution_time) / 1e12
+        tflops = (total_flops / execution_time_for_rate) / 1e12
         total_tokens = batch_size * seq_length
         visited_tokens = total_tokens * current_step
-        throughput = total_tokens / execution_time
-        perf_key = (mode or "step") + "-mlperf"
-        mlperf_metrics = {
+        throughput = total_tokens / execution_time_for_rate
+        if mode == "eval":
+            perf_key = "performance/eval"
+        elif mode == "train":
+            perf_key = "performance"
+        else:
+            perf_key = "performance/step"
+        step_time_key = f"{mode}_step_time" if mode is not None else "step_time"
+        performance_metrics = {
             f"{perf_key}/execution_time": float(execution_time),
             f"{perf_key}/flops": float(flops),
             f"{perf_key}/flops_per_token": float(flops_per_token),
             f"{perf_key}/extra_flops": float(extra_flops),
             f"{perf_key}/extra_flops_per_token": float(extra_flops_per_token),
-            f"{perf_key}/step_time": float(step_time),
+            f"{perf_key}/preprocessing_time": float(preprocessing_time),
+            f"{perf_key}/{step_time_key}": float(step_time),
             f"{perf_key}/tflops": float(tflops),
             f"{perf_key}/throughput": throughput,
             f"{perf_key}/total_flops": float(total_flops),
@@ -167,18 +176,15 @@ class StepMetrics:
 
         loss = metrics.loss
         z_loss = metrics.z_loss
-        epoch_value = float(epoch) if epoch_progress is None else float(epoch_progress)
+        epoch_value = float(epoch) if epoch_progress is None else float(epoch) + float(epoch_progress)
 
         basic_metrics = {
             "epoch": epoch_value,
             "epoch_index": int(epoch),
-            "execution_time": float(execution_time),
             "learning_rate": float(np.array(learning_rate).item()),
             "loss": float(loss),
             "perplexity": float(jnp.exp(loss)),
             f"{mode}_step": int(current_step),
-            f"{mode}_step_time": float(step_time),
-            "tflops": float(tflops),
             "visited_tokens": visited_tokens,
             "z_loss": float(z_loss) if z_loss is not None else None,
             **extras,
@@ -190,14 +196,14 @@ class StepMetrics:
             basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards).item())
         if metrics.rejected_rewards is not None:
             basic_metrics["rejected_rewards"] = float(jnp.mean(metrics.rejected_rewards).item())
-        if metrics.other_metrics is not None:
-            basic_metrics.update(metrics.other_metrics)
+        if other_metrics is not None:
+            basic_metrics.update(other_metrics)
         if not self.arguments.performance_mode and (mode == "train" or mode is None):
             detailed_metrics = self._calculate_detailed_metrics(metrics)
             basic_metrics.update(detailed_metrics)
         if mode is not None:
             basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
-        basic_metrics.update(mlperf_metrics)
+        basic_metrics.update(performance_metrics)
 
         return basic_metrics
 
@@ -239,7 +245,7 @@ class StepMetrics:
 
         Most metrics use a "mean" reduction across steps, but a few are
         either skipped (e.g. last-step counters that should not be averaged)
-        or summed (e.g. MLPerf totals).
+        or summed (e.g. performance totals).
 
         Args:
             metric_name: The full metric name as logged.
@@ -262,8 +268,9 @@ class StepMetrics:
                 "mean_accuracy",
             }:
                 return "ignore"
-        if mode is not None and metric_name.startswith(f"{mode}-mlperf/"):
-            bare_metric_name = metric_name.removeprefix(f"{mode}-mlperf/")
+        performance_prefix = "performance/eval/" if mode == "eval" else "performance/"
+        if metric_name.startswith(performance_prefix):
+            bare_metric_name = metric_name.removeprefix(performance_prefix)
             if bare_metric_name == "total_time":
                 return "ignore"
             if bare_metric_name in {"total_flops", "total_tokens"}:
@@ -313,7 +320,7 @@ class StepMetrics:
 
         Combines ``last_metrics`` (carrying point-in-time values like
         ``train_step``) with mean/sum reductions over the accumulated
-        running totals.  For ``mode="eval"``, also derives MLPerf throughput
+        running totals.  For ``mode="eval"``, also derives performance throughput
         and TFLOPS plus convenience aliases like ``eval/loss`` and
         ``eval/perplexity``.
 
@@ -340,14 +347,16 @@ class StepMetrics:
                 summary_metrics[metric_name] = metric_total / summary_metric_counts[metric_name]
 
         if mode == "eval":
-            mlperf_prefix = "eval-mlperf/"
-            total_execution_time = summary_metric_sums.get(f"{mlperf_prefix}execution_time")
-            total_tokens = summary_metrics.get(f"{mlperf_prefix}total_tokens")
-            total_flops = summary_metrics.get(f"{mlperf_prefix}total_flops")
+            performance_prefix = "performance/eval/"
+            total_execution_time = summary_metric_sums.get(f"{performance_prefix}execution_time")
+            total_tokens = summary_metrics.get(f"{performance_prefix}total_tokens")
+            total_flops = summary_metrics.get(f"{performance_prefix}total_flops")
             if total_execution_time is not None and total_tokens is not None and float(total_execution_time) > 0.0:
-                summary_metrics[f"{mlperf_prefix}throughput"] = float(total_tokens) / float(total_execution_time)
+                summary_metrics[f"{performance_prefix}throughput"] = float(total_tokens) / float(total_execution_time)
             if total_execution_time is not None and total_flops is not None and float(total_execution_time) > 0.0:
-                summary_metrics[f"{mlperf_prefix}tflops"] = (float(total_flops) / float(total_execution_time)) / 1e12
+                summary_metrics[f"{performance_prefix}tflops"] = (
+                    float(total_flops) / float(total_execution_time)
+                ) / 1e12
             if summary_metrics.get("eval/mean_loss") is not None:
                 summary_metrics["eval/loss"] = summary_metrics["eval/mean_loss"]
                 summary_metrics["eval/perplexity"] = float(jnp.exp(summary_metrics["eval/mean_loss"]))
@@ -695,13 +704,26 @@ class JSONProgressBar(BaseProgressBar):
         Args:
             **kwargs: Metric key/value pairs to log.
         """
+        nested_kwargs: dict[str, tp.Any] = {}
         for k in list(kwargs.keys()):
             val = kwargs.get(k)
             if hasattr(val, "size") and val.size == 1:
-                kwargs[k] = val.item()
+                val = val.item()
             if isinstance(val, float) and k != "learning_rate":
-                kwargs[k] = round(val, 3)
-        logger.info(kwargs)
+                val = round(val, 3)
+            if "/" not in k:
+                nested_kwargs[k] = val
+                continue
+            current = nested_kwargs
+            parts = k.split("/")
+            for part in parts[:-1]:
+                child = current.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    current[part] = child
+                current = child
+            current[parts[-1]] = val
+        logger.info(nested_kwargs)
 
     def reset(self) -> None:
         """No-op."""
@@ -893,7 +915,45 @@ class MetricsHistogram:
         return jnp.sqrt(self.variance).reshape(-1)
 
 
-@ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
+def _device_set_key(value: tp.Any) -> tuple[tuple[str, int, int], ...]:
+    """Return a stable key describing the devices backing ``value``."""
+    devices = []
+    for leaf in jax.tree_util.tree_leaves(value):
+        sharding = getattr(leaf, "sharding", None)
+        device_set = getattr(sharding, "device_set", None)
+        if device_set is None:
+            leaf_devices = getattr(leaf, "devices", None)
+            if callable(leaf_devices):
+                device_set = leaf_devices()
+        if device_set is None:
+            device = getattr(leaf, "device", None)
+            if device is not None:
+                device_set = {device}
+        if device_set is None:
+            continue
+        devices.extend(device_set)
+    if not devices:
+        return ()
+    return tuple(
+        sorted(
+            {
+                (
+                    getattr(device, "platform", ""),
+                    int(getattr(device, "process_index", 0)),
+                    int(getattr(device, "id", -1)),
+                )
+                for device in devices
+            }
+        )
+    )
+
+
+@ejit  # pyright: ignore[reportUntypedFunctionDecorator]
+def _compute_weight_stats_group(params: dict[str, tp.Any]) -> dict[str, MetricsHistogram]:
+    """Compute weight stats for one homogeneous device-set group."""
+    return {f"{path}/histogram": MetricsHistogram.from_array(weight) for path, weight in params.items()}
+
+
 def compute_weight_stats(params: dict[str, tp.Any] | tp.Any, repattern: str) -> dict[str, MetricsHistogram]:
     """Compute statistics for model weights in a JIT-compatible way.
 
@@ -912,7 +972,10 @@ def compute_weight_stats(params: dict[str, tp.Any] | tp.Any, repattern: str) -> 
              containing MetricsHistogram objects.
 
     Note:
-        JIT-compiled with static pattern argument for efficiency.
+        The outer tree walk intentionally partitions matching parameters by
+        device set before calling a jitted group helper. This keeps MPMD
+        pipeline stages on separate device sets valid without falling back to
+        one compiled dispatch per parameter.
         Useful for detecting gradient explosion, vanishing gradients,
         or monitoring weight distributions during training.
 
@@ -923,14 +986,17 @@ def compute_weight_stats(params: dict[str, tp.Any] | tp.Any, repattern: str) -> 
     raw = getattr(params, "raw", None)
     if callable(raw):
         params = raw()
-    stats = {}
+    groups: dict[tuple[tuple[str, int, int], ...], dict[str, tp.Any]] = defaultdict(dict)
     for path, param in traversals.flatten_dict(params).items():
         weight = param.value if hasattr(param, "value") else param
         pattern_search = ".".join([str(p) for p in path])
         output_path = "/".join([str(p) for p in path])
         if re.match(repattern, pattern_search):
-            stats[f"{output_path}/histogram"] = MetricsHistogram.from_array(weight)
+            groups[_device_set_key(weight)][output_path] = weight
 
+    stats = {}
+    for group in groups.values():
+        stats.update(_compute_weight_stats_group(group))
     return stats
 
 

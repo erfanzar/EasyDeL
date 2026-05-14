@@ -882,7 +882,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         Note:
             - Updates progress bar every log_steps
             - Logs to wandb/tensorboard every report_steps
-            - Filters out internal metrics (mlperf, grad_norm)
+            - Filters out internal gradient-norm metrics
         """
 
     @abstractmethod

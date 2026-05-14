@@ -245,6 +245,37 @@ RESUME_MODEL_SUBDIR = "_resume_model"
 logger = get_logger(__name__)
 
 
+def _materialize_replicated_setup_scalars(tree: tp.Any, shardings: tp.Any) -> tp.Any:
+    """Place replicated scalar setup leaves directly on their target sharding.
+
+    Optax creates global counters such as ``count`` as scalar arrays on the
+    default device. Those leaves are not parameter slots, so
+    ``tree_map_params(..., transform_non_params=replicated)`` correctly assigns
+    them replicated mesh shardings. Materialize those scalar values on that
+    target sharding here so the generic setup placement helper does not have to
+    repair a ``SingleDeviceSharding`` -> full-mesh mismatch.
+    """
+
+    def _place_scalar(leaf: tp.Any, sharding: tp.Any) -> tp.Any:
+        if not isinstance(leaf, jax.Array) or not isinstance(sharding, jax.sharding.NamedSharding):
+            return leaf
+        if tuple(getattr(leaf, "shape", ())) != ():
+            return leaf
+        if getattr(sharding, "spec", None) != PartitionSpec():
+            return leaf
+        source_sharding = getattr(leaf, "sharding", None)
+        if isinstance(source_sharding, jax.sharding.NamedSharding) and source_sharding == sharding:
+            return leaf
+        return jax.device_put(device_get(leaf), sharding)
+
+    return jax.tree_util.tree_map(
+        _place_scalar,
+        tree,
+        shardings,
+        is_leaf=lambda x: isinstance(x, jax.sharding.Sharding) or x is None,
+    )
+
+
 def _read_checkpoint_metadata(load_directory: str | os.PathLike | ePathLike) -> dict[str, tp.Any]:
     """Best-effort read of the checkpoint discovery metadata."""
     metadata_path = ePath(load_directory) / "metadata.json"
@@ -786,6 +817,8 @@ class EasyDeLState(_PyTreeNode):
             )
         else:
             out_shardings = opt_state
+
+        opt_state = _materialize_replicated_setup_scalars(opt_state, out_shardings)
 
         # 3. Materialise via per-leaf device_put against the resolved
         #    NamedShardings.  Equivalent to what ``make_shard_and_gather_fns``
@@ -1792,6 +1825,7 @@ class EasyDeLState(_PyTreeNode):
                 transform_non_params=lambda _: replicated,
                 is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
             )
+            opt_state = _materialize_replicated_setup_scalars(opt_state, opt_shardings)
             opt_state = spx.place_setup_tree_with_shardings(
                 opt_state,
                 opt_shardings,
