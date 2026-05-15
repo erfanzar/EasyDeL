@@ -274,6 +274,7 @@ class OPTAttention(AttentionModule):
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,

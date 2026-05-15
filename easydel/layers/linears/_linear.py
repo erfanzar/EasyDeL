@@ -148,6 +148,14 @@ class ParallelLinear(spx.Module):
 
     _direction: tp.Literal["row", "column"] | None = None
 
+    if tp.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            inputs: Shaped[Array, "... in_features"],
+            w: Array | None = None,
+        ) -> Shaped[Array, "... out_features"]: ...
+
     def __init__(
         self,
         in_features: int,

@@ -746,12 +746,39 @@ class GRPOTrainerCfg(BaseTrainerCfg):
             Set to ``None`` to disable chunking.
         max_loss_completion_tokens: Optional cap on completion tokens used by
             the GRPO loss. Set to ``None`` to disable truncation.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for per-token log-prob
+            and entropy reductions. ``None`` disables chunking.
         top_p: Top-p (nucleus) sampling probability threshold.
-        top_k: Top-k sampling parameter.
+        top_k: Top-k sampling parameter (``None`` disables top-k).
         presence_penalty: Presence penalty for generation.
         frequency_penalty: Frequency penalty for generation.
         repetition_penalty: Repetition penalty for generation.
         temperature: Sampling temperature for generation diversity.
+        epsilon: Lower clipping bound for importance-sampling weights in the
+            policy surrogate.
+        epsilon_high: Optional asymmetric upper clip; falls back to ``epsilon``
+            when ``None``.
+        delta: Optional two-sided dynamic clipping bound (DAPO).
+        loss_type: GRPO loss variant. One of ``"grpo"``, ``"bnpo"``,
+            ``"dr_grpo"``, ``"dapo"``, ``"cispo"``.
+        importance_sampling_level: Aggregate the importance-sampling ratio
+            per ``"token"`` or per ``"sequence"``.
+        num_iterations: Number of optimizer updates per generated batch.
+        num_generations: Alias for ``num_return_sequences`` kept for TRL
+            parity.
+        reward_weights: Optional weights for combining multiple reward
+            functions. Length must match the number of reward functions.
+        scale_rewards: Reward-scaling strategy: ``"group"`` (default),
+            ``"batch"``, ``"none"``, or the booleans ``True``/``False``
+            (which map to ``"group"`` / ``"none"``).
+        mask_truncated_completions: When ``True``, completions that hit the
+            generation cap without emitting EOS are masked out of the loss.
+        top_entropy_quantile: Keep only the top fraction (by token entropy)
+            in the loss. ``1.0`` disables filtering.
+        min_p: Optional minimum-probability sampling filter (HF "top-p-min").
+        generation_kwargs: Extra kwargs forwarded to the generation config.
+        chat_template_kwargs: Extra kwargs forwarded to chat-template
+            application during generation.
 
     Example:
         >>> config: GRPOTrainerCfg = {
@@ -761,6 +788,9 @@ class GRPOTrainerCfg(BaseTrainerCfg):
         ...     "max_prompt_length": 512,
         ...     "max_completion_length": 256,
         ...     "num_return_sequences": 4,
+        ...     "loss_type": "dapo",
+        ...     "epsilon": 0.2,
+        ...     "importance_sampling_level": "token",
         ... }
     """
 
@@ -779,11 +809,27 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     max_loss_completion_tokens: NotRequired[int | None]
     logprob_vocab_chunk_size: NotRequired[int | None]
     top_p: NotRequired[float]
-    top_k: NotRequired[int]
+    top_k: NotRequired[int | None]
     presence_penalty: NotRequired[float]
     frequency_penalty: NotRequired[float]
     repetition_penalty: NotRequired[float]
     temperature: NotRequired[float]
+    # Loss / clipping knobs.
+    epsilon: NotRequired[float]
+    epsilon_high: NotRequired[float | None]
+    delta: NotRequired[float | None]
+    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo"]]
+    importance_sampling_level: NotRequired[Literal["token", "sequence"]]
+    num_iterations: NotRequired[int]
+    num_generations: NotRequired[int | None]
+    reward_weights: NotRequired[list[float] | None]
+    scale_rewards: NotRequired[Literal["group", "batch", "none"] | bool]
+    mask_truncated_completions: NotRequired[bool]
+    top_entropy_quantile: NotRequired[float]
+    # Generation-side knobs.
+    min_p: NotRequired[float | None]
+    generation_kwargs: NotRequired[dict | None]
+    chat_template_kwargs: NotRequired[dict | None]
 
 
 class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
@@ -807,6 +853,9 @@ class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
         tool_names: List of registered tool names to make available.
         tool_call_parser: Tool call parser variant.
         max_tool_calls_per_step: Maximum tool calls per agent turn.
+        tool_schemas: Explicit tool schemas (list of JSON-schema dicts) that
+            override ``tool_names`` when provided. ``None`` falls back to
+            resolving schemas from ``tool_names``.
 
     Example:
         >>> config: AgenticMoshPitTrainerCfg = {
@@ -816,6 +865,7 @@ class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
         ...     "num_env_groups": 8,
         ...     "reward_mode": "episode",
         ...     "advantage_estimator": "grpo",
+        ...     "tool_schemas": [{"name": "search", "parameters": {...}}],
         ... }
     """
 
@@ -832,6 +882,7 @@ class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
     tool_caller: NotRequired[str | None]
     max_tool_calls_per_step: NotRequired[int]
     reasoning_parser: NotRequired[str | None]
+    tool_schemas: NotRequired[list[dict] | None]
 
 
 class RLVRTrainerCfg(GRPOTrainerCfg):
@@ -871,6 +922,72 @@ class RLVRTrainerCfg(GRPOTrainerCfg):
     reward_clip_range: NotRequired[float | None]
     difficulty_key: NotRequired[str | None]
     difficulty_loss_weight: NotRequired[bool]
+
+
+class GFPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Group Filtered Policy Optimization trainer (GFPOConfig).
+
+    GFPO extends GRPO by filtering completions within each group before
+    the policy update, keeping only the best ``num_remains_in_group``
+    rollouts according to a configurable ranking signal (length and/or
+    efficiency penalties applied on top of the reward).
+
+    All GRPO knobs are inherited; the fields below are GFPO-only.
+
+    Attributes:
+        num_remains_in_group: Number of completions kept per group after
+            filtering. ``None`` disables filtering (vanilla GRPO).
+        filter_by_length: When ``True``, length is folded into the
+            ranking signal used to drop completions.
+        filter_by_efficiency: When ``True``, an efficiency proxy
+            (e.g. tokens-per-reward) is folded into the ranking signal.
+        length_weight: Weight on the length component of the filter
+            signal.
+        efficiency_weight: Weight on the efficiency component of the
+            filter signal.
+
+    Example:
+        >>> config: GFPOTrainerCfg = {
+        ...     "trainer_type": "gfpo",
+        ...     "learning_rate": 1e-6,
+        ...     "num_return_sequences": 8,
+        ...     "num_remains_in_group": 4,
+        ...     "filter_by_length": True,
+        ...     "length_weight": 0.5,
+        ... }
+    """
+
+    num_remains_in_group: NotRequired[int | None]
+    filter_by_length: NotRequired[bool]
+    filter_by_efficiency: NotRequired[bool]
+    length_weight: NotRequired[float]
+    efficiency_weight: NotRequired[float]
+
+
+class GSPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Group Sequence Policy Optimization trainer (GSPOConfig).
+
+    GSPO is a GRPO variant that aggregates the importance-sampling ratio
+    over the full completion (``importance_sampling_level="sequence"``)
+    rather than per-token. The shipped defaults also tighten ``epsilon``
+    and reduce the supported ``loss_type`` surface to the variants that
+    are well-defined under sequence-level IS.
+
+    All GRPO knobs are inherited; this class only narrows the ``loss_type``
+    Literal and re-declares the GSPO-relevant fields for documentation.
+
+    Example:
+        >>> config: GSPOTrainerCfg = {
+        ...     "trainer_type": "gspo",
+        ...     "learning_rate": 1e-6,
+        ...     "importance_sampling_level": "sequence",
+        ...     "epsilon": 3e-4,
+        ...     "loss_type": "grpo",
+        ... }
+    """
+
+    importance_sampling_level: NotRequired[Literal["sequence", "token"]]
+    loss_type: NotRequired[Literal["grpo", "dapo", "cispo"]]
 
 
 class SDPOTrainerCfg(GRPOTrainerCfg):
@@ -920,12 +1037,24 @@ class PPOTrainerCfg(BaseTrainerCfg):
         tools: List of tool definitions for tool-use scenarios.
         skip_apply_chat_template: Whether to skip applying chat template.
         num_return_sequences: Number of completions to generate per prompt.
+        num_generations: Alias for ``num_return_sequences`` kept for parity
+            with the rest of the on-policy RL family.
+        num_ppo_epochs: Number of minibatch epochs replayed over each
+            rollout batch before resampling.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for per-token
+            log-prob / entropy reductions. ``None`` disables chunking.
         top_p: Top-p (nucleus) sampling probability threshold.
-        top_k: Top-k sampling parameter.
+        top_k: Top-k sampling parameter (``None`` disables top-k).
         presence_penalty: Presence penalty for generation.
         frequency_penalty: Frequency penalty for generation.
         repetition_penalty: Repetition penalty for generation.
         temperature: Sampling temperature for generation.
+        min_p: Optional minimum-probability sampling filter (HF "top-p-min").
+        generation_kwargs: Extra kwargs forwarded to the generation config.
+        chat_template_kwargs: Extra kwargs forwarded to chat-template
+            application during generation.
+        mask_truncated_completions: When ``True``, completions that hit the
+            generation cap without emitting EOS are masked out of the loss.
 
     Example:
         >>> config: PPOTrainerCfg = {
@@ -935,6 +1064,7 @@ class PPOTrainerCfg(BaseTrainerCfg):
         ...     "cliprange": 0.2,
         ...     "gamma": 0.99,
         ...     "lam": 0.95,
+        ...     "num_ppo_epochs": 4,
         ... }
     """
 
@@ -956,13 +1086,19 @@ class PPOTrainerCfg(BaseTrainerCfg):
     tools: NotRequired[list[dict | Any] | None]
     skip_apply_chat_template: NotRequired[bool]
     num_return_sequences: NotRequired[int]
+    num_generations: NotRequired[int | None]
+    num_ppo_epochs: NotRequired[int]
     logprob_vocab_chunk_size: NotRequired[int | None]
     top_p: NotRequired[float]
-    top_k: NotRequired[int]
+    top_k: NotRequired[int | None]
     presence_penalty: NotRequired[float]
     frequency_penalty: NotRequired[float]
     repetition_penalty: NotRequired[float]
     temperature: NotRequired[float]
+    min_p: NotRequired[float | None]
+    generation_kwargs: NotRequired[dict | None]
+    chat_template_kwargs: NotRequired[dict | None]
+    mask_truncated_completions: NotRequired[bool]
 
 
 class SFTTrainerCfg(BaseTrainerCfg):
@@ -981,10 +1117,16 @@ class SFTTrainerCfg(BaseTrainerCfg):
         add_special_tokens: Whether to add special tokens (BOS/EOS) to sequences.
         packing: Whether to pack multiple sequences into a single training
             example for improved efficiency.
+        packing_strategy: Selects the packing algorithm. ``"bfd"`` (best-fit
+            decreasing) is the SFT default; ``"wrapped"`` falls back to
+            greedy packing.
+        assistant_only_loss: When ``True`` the loss mask is restricted to
+            assistant turns only, ignoring system / user tokens.
         dataset_num_proc: Number of processes for dataset preprocessing.
         dataset_batch_size: Batch size for dataset preprocessing operations.
         dataset_kwargs: Additional keyword arguments for dataset processing.
-        eval_packing: Whether to use packing during evaluation.
+        eval_packing: Eval-time override for ``packing``. When ``None``
+            inherits the train-time value.
         num_of_sequences: Target number of sequences per packed example.
 
     Example:
@@ -993,6 +1135,8 @@ class SFTTrainerCfg(BaseTrainerCfg):
         ...     "learning_rate": 2e-5,
         ...     "max_length": 2048,
         ...     "packing": True,
+        ...     "packing_strategy": "bfd",
+        ...     "assistant_only_loss": True,
         ...     "dataset_text_field": "text",
         ... }
     """
@@ -1000,6 +1144,8 @@ class SFTTrainerCfg(BaseTrainerCfg):
     dataset_text_field: NotRequired[str | None]
     add_special_tokens: NotRequired[bool]
     packing: NotRequired[bool]
+    packing_strategy: NotRequired[Literal["bfd", "wrapped"]]
+    assistant_only_loss: NotRequired[bool]
     dataset_num_proc: NotRequired[int | None]
     dataset_batch_size: NotRequired[int]
     dataset_kwargs: NotRequired[dict[str, Any] | None]
@@ -1056,6 +1202,31 @@ class DistillationTrainerCfg(BaseTrainerCfg):
             information about class relationships.
         alpha: Weight for distillation loss relative to task loss.
             alpha * distillation_loss + (1 - alpha) * task_loss.
+        logits_chunk_size: Optional sequence-axis chunk size used when
+            running the LM head chunk-by-chunk to bound peak memory.
+            ``None`` materialises the full ``[B, L, V]`` logit tensor.
+        checkpoint_kl_loss: When ``True`` (default) and the chunked LM-head
+            path is active, wrap each chunk's KL/CE body in
+            :func:`jax.checkpoint` to trade compute for memory in the
+            backward pass.
+        dataset_text_field: Name of the dataset field consumed by the
+            SFT-style supervised CE term. ``None`` auto-detects.
+        assistant_only_loss: When ``True`` the supervised CE term is
+            restricted to assistant turns only.
+        completion_only_loss: Deprecated alias for ``assistant_only_loss``;
+            if explicitly set, it overrides.
+        hidden_state_loss_weight: Coefficient on the optional hidden-state
+            matching loss. ``None`` / ``0`` disables.
+        hidden_state_layers: Tuple of layer indices to match in the
+            hidden-state matching loss. ``None`` uses the model default.
+        hidden_state_loss: Distance function for hidden-state matching.
+            Currently only ``"mse"`` is supported.
+        attention_loss_weight: Coefficient on the optional attention-matrix
+            matching loss. ``None`` / ``0`` disables.
+        attention_layers: Tuple of attention-layer indices to match. ``None``
+            uses the model default.
+        attention_normalize: When ``True``, L1-normalize attention matrices
+            before computing the matching loss.
 
     Example:
         >>> config: DistillationTrainerCfg = {
@@ -1063,12 +1234,27 @@ class DistillationTrainerCfg(BaseTrainerCfg):
         ...     "learning_rate": 2e-5,
         ...     "temperature": 2.0,
         ...     "alpha": 0.9,
+        ...     "hidden_state_loss_weight": 0.1,
+        ...     "attention_loss_weight": 0.05,
         ... }
     """
 
     temperature: NotRequired[float]
     alpha: NotRequired[float]
     logits_chunk_size: NotRequired[int | None]
+    checkpoint_kl_loss: NotRequired[bool]
+    # SFT-style supervised CE knobs (used when ``alpha`` < 1).
+    dataset_text_field: NotRequired[str | None]
+    assistant_only_loss: NotRequired[bool]
+    completion_only_loss: NotRequired[bool | None]
+    # Optional hidden-state matching loss.
+    hidden_state_loss_weight: NotRequired[float | None]
+    hidden_state_layers: NotRequired[tuple[int, ...] | None]
+    hidden_state_loss: NotRequired[Literal["mse"]]
+    # Optional attention-matrix matching loss.
+    attention_loss_weight: NotRequired[float | None]
+    attention_layers: NotRequired[tuple[int, ...] | None]
+    attention_normalize: NotRequired[bool]
 
 
 class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
@@ -1091,6 +1277,8 @@ class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
         frequency_penalty: Frequency penalty for generation.
         repetition_penalty: Repetition penalty for generation.
         generate_with_teacher: If True, teacher generates completions.
+        skip_apply_chat_template: Whether to skip applying the chat template
+            to prompts when sampling on-policy completions.
 
     Example:
         >>> config: OnPolicyDistillationTrainerCfg = {
@@ -1113,6 +1301,7 @@ class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
     frequency_penalty: NotRequired[float]
     repetition_penalty: NotRequired[float]
     generate_with_teacher: NotRequired[bool]
+    skip_apply_chat_template: NotRequired[bool]
 
 
 class SeqKDTrainerCfg(BaseTrainerCfg):
@@ -1132,6 +1321,8 @@ class SeqKDTrainerCfg(BaseTrainerCfg):
         presence_penalty: Presence penalty for generation.
         frequency_penalty: Frequency penalty for generation.
         repetition_penalty: Repetition penalty for generation.
+        skip_apply_chat_template: Whether to skip applying the chat template
+            to prompts when the teacher samples completions for SeqKD.
     """
 
     max_prompt_length: NotRequired[int]
@@ -1143,6 +1334,7 @@ class SeqKDTrainerCfg(BaseTrainerCfg):
     presence_penalty: NotRequired[float]
     frequency_penalty: NotRequired[float]
     repetition_penalty: NotRequired[float]
+    skip_apply_chat_template: NotRequired[bool]
 
 
 class SparseDistillationTrainerCfg(DistillationTrainerCfg):
@@ -1163,6 +1355,8 @@ class SparseDistillationTrainerCfg(DistillationTrainerCfg):
         presence_penalty: Presence penalty for generation.
         frequency_penalty: Frequency penalty for generation.
         repetition_penalty: Repetition penalty for generation.
+        skip_apply_chat_template: Whether to skip applying the chat template
+            to prompts when sampling on-policy completions for distillation.
     """
 
     top_k_teacher: NotRequired[int]
@@ -1175,6 +1369,7 @@ class SparseDistillationTrainerCfg(DistillationTrainerCfg):
     presence_penalty: NotRequired[float]
     frequency_penalty: NotRequired[float]
     repetition_penalty: NotRequired[float]
+    skip_apply_chat_template: NotRequired[bool]
 
 
 class KTOTrainerCfg(BaseTrainerCfg):
@@ -1496,6 +1691,8 @@ class TrainerConfig(
     AgenticMoshPitTrainerCfg,
     RLVRTrainerCfg,
     SDPOTrainerCfg,
+    GFPOTrainerCfg,
+    GSPOTrainerCfg,
     PPOTrainerCfg,
     SFTTrainerCfg,
     RewardTrainerCfg,
@@ -1586,7 +1783,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "report_metrics": True,
     "progress_bar_type": "tqdm",
     "weight_distribution_pattern": r".*",
-    "weight_distribution_log_steps": 50,
+    "weight_distribution_log_steps": 500,
     "verbose": True,
     "process_zero_is_admin": True,
     "use_wandb": True,

@@ -279,20 +279,23 @@ class Glm4MoeLiteMLPStack(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return apply_logical_sharding(
-            checkpoint_name(
-                self.down_proj(
-                    self.act_fn(
-                        checkpoint_name(self.gate_proj(hidden_states, group_sizes, sorted_experts), name="mlp_gate")
-                    )
-                    * checkpoint_name(self.up_proj(hidden_states, group_sizes, sorted_experts), name="mlp_up"),
-                    group_sizes,
-                    sorted_experts,
+        return typing.cast(
+            Array,
+            apply_logical_sharding(
+                checkpoint_name(
+                    self.down_proj(
+                        self.act_fn(
+                            checkpoint_name(self.gate_proj(hidden_states, group_sizes, sorted_experts), name="mlp_gate")
+                        )
+                        * checkpoint_name(self.up_proj(hidden_states, group_sizes, sorted_experts), name="mlp_up"),
+                        group_sizes,
+                        sorted_experts,
+                    ),
+                    name="mlp_down",
                 ),
-                name="mlp_down",
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
             ),
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
         )
 
 
@@ -1022,6 +1025,7 @@ class Glm4MoeLiteAttention(UnifiedAttention):
                 attn_output = jnp.pad(attn_output, pad_width)
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,

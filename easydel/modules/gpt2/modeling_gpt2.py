@@ -417,6 +417,7 @@ class GPT2Attention(UnifiedAttention):
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs))
         attn_output = checkpoint_name(self.c_proj(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
@@ -888,10 +889,13 @@ class GPT2Model(EasyDeLBaseModule):
             position_ids = mask_info.q_position_ids
 
         if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids must be provided when inputs_embeds is None.")
             inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
 
         position_embeds = self.wpe(position_ids.astype("i4"))
 
+        assert inputs_embeds is not None
         hidden_states = inputs_embeds + position_embeds
         hidden_states = self.dropout(hidden_states)
 

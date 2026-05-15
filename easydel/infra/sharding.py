@@ -322,7 +322,7 @@ def resolve_stage_mesh(
     except Exception:
         pass
 
-    return mesh if is_valid_mesh(mesh) else None
+    return tp.cast(Mesh, mesh) if is_valid_mesh(mesh) else None
 
 
 def resolve_stage_cache_mesh(mesh: OptionalMesh = None, *, arr: tp.Any = None) -> StageMesh:
@@ -334,7 +334,7 @@ def resolve_array_mesh(arr: tp.Any) -> StageMesh:
     """Resolve a JAX mesh from an array's named sharding, if present."""
     sharding = getattr(arr, "sharding", None)
     if isinstance(sharding, NamedSharding) and is_valid_mesh(sharding.mesh):
-        return sharding.mesh
+        return tp.cast(Mesh, sharding.mesh)
     return None
 
 
@@ -497,7 +497,7 @@ def _resolve_named_sharding_mesh(mesh: MeshLike) -> tuple[Mesh, MpMdMesh | None]
         return mesh.jax_mesh, mesh.mpmd_mesh
     if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
         return mesh.jax_mesh, mesh
-    return mesh, None
+    return tp.cast(Mesh, mesh), None
 
 
 def _stage_local_mesh(
@@ -525,7 +525,7 @@ def _stage_local_mesh(
             return mesh.jax_mesh
         if _HAS_SPECTRAX_MESH_TYPES and isinstance(mesh, MpMdMesh):
             return mesh.jax_mesh
-        return mesh
+        return tp.cast(Mesh, mesh)
 
     base_mesh, mpmd_mesh = _resolve_named_sharding_mesh(mesh)
     if mpmd_mesh is None:
@@ -1262,7 +1262,7 @@ class RuntimeShardingResolver:
             if shape is NOT_GIVEN:
                 raise ValueError("shape is required when resolving a dynamic sharding mode.")
             return MODE_DECODE if shape[selected_mode] == 1 else MODE_TRAIN
-        return selected_mode
+        return tp.cast(str, selected_mode)
 
     def logical_axis_rule_pairs(
         self,
@@ -1731,7 +1731,7 @@ class RuntimeShardingResolver:
                 with self.logical_axis_rules(mode=resolved_mode, shape=shape):
                     named = var.named_sharding(active_mesh)
                 if shape is NOT_GIVEN:
-                    return named
+                    return tp.cast(NamedSharding, named)
                 return self.named_sharding_for_spec(
                     named.spec,
                     shape=shape,
@@ -1842,7 +1842,7 @@ class RuntimeShardingResolver:
         )
         if auto_correct:
             spec = self._sanitize_spec(spec, shape=tuple(x.shape))
-        return spx.with_sharding_constraint(x, spec, mesh=self.mesh)
+        return tp.cast(jax.Array, spx.with_sharding_constraint(x, spec, mesh=self.mesh))
 
 
 def coerce_runtime_sharding_resolver(

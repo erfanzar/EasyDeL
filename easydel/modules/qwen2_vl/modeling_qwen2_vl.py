@@ -427,6 +427,7 @@ class Qwen2VLPatchEmbed(spx.Module):
         precision: jax.lax.PrecisionLike = None,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
+        partition_manager=None,
         *,
         rngs: spx.Rngs,
     ) -> None:
@@ -447,6 +448,7 @@ class Qwen2VLPatchEmbed(spx.Module):
         self.temporal_patch_size = temporal_patch_size
         self.in_channels = in_channels
         self.embed_dim = embed_dim
+        self.partition_manager = partition_manager
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
         self.proj = nn.Conv(
@@ -482,6 +484,11 @@ class Qwen2VLPatchEmbed(spx.Module):
         )
         hidden_states = self.proj(hidden_states.astype(self.dtype))
         hidden_states = hidden_states.reshape(-1, self.embed_dim)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.partition_manager,
+        )
         return hidden_states
 
 
@@ -724,6 +731,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
                 for k, v in config.__dict__.items():
                     if not hasattr(self, k):
                         setattr(self, k, v)
+                self.runtime_sharding_resolver = getattr(config, "runtime_sharding_resolver", None)
                 self.bits = getattr(config, "bits", None)
                 self.easy_method = getattr(config, "easy_method", None)
                 self.scan_mlp_chunk_size = getattr(config, "scan_mlp_chunk_size", 1024)
@@ -853,7 +861,9 @@ class Qwen2VLVisionAttention(UnifiedAttention):
 
         attn_output = jnp.concatenate(attn_outputs, axis=1)
         attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.proj(attn_output)
+        attn_output = self.shard_attention_prod(attn_output)
         return attn_output
 
 
@@ -1307,6 +1317,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            partition_manager=config.runtime_sharding_resolver,
             rngs=rngs,
         )
 
@@ -1461,7 +1472,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
         )
-        return self.merger(hidden_states)
+        return tp.cast(Array, self.merger(hidden_states))
 
     def get_encoder(self):
         """
@@ -2219,7 +2230,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         Returns:
             Projected video features
         """
-        return self.base_model.get_video_features(pixel_values_videos, video_grid_thw)
+        return tp.cast(Array, self.base_model.get_video_features(pixel_values_videos, video_grid_thw))
 
     def get_image_features(
         self,
@@ -2237,7 +2248,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         Returns:
             Projected image features
         """
-        return self.base_model.get_image_features(pixel_values, image_grid_thw)
+        return tp.cast(Array, self.base_model.get_image_features(pixel_values, image_grid_thw))
 
     def compute_embedding(self, input_ids, *args, **kwargs):
         """Compute input embeddings with vision tokens merged in.

@@ -202,7 +202,7 @@ def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, 
     return align_to_multiple(num_kv_heads * 2, packing)
 
 
-def _canonicalize_dtype(dtype: jnp.dtype) -> type:
+def _canonicalize_dtype(dtype: jnp.dtype) -> jnp.dtype:
     """Normalize dtype objects/classes to the scalar type form used by eformer maps.
 
     Args:
@@ -211,7 +211,7 @@ def _canonicalize_dtype(dtype: jnp.dtype) -> type:
     Returns:
         The scalar Python ``type`` underlying ``dtype`` (e.g. ``np.float16``).
     """
-    return jnp.dtype(dtype).type
+    return jnp.dtype(dtype)
 
 
 def _dtype_to_string(dtype: jnp.dtype) -> str:

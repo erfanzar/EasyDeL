@@ -137,6 +137,7 @@ def main():
 
     for prompt in prompts:
         print(f"\n>> {prompt[:60]}...")
+        out = None
         for out in esurge.chat(
             [{"role": "user", "content": prompt}],
             sampling_params=ed.SamplingParams(max_tokens=512),
@@ -144,7 +145,8 @@ def main():
         ):
             if out.delta_text is not None:
                 print(out.delta_text, end="")
-        print(f"\n   TPS: {out.tokens_per_second:.1f}")
+        if out is not None:
+            print(f"\n   TPS: {out.tokens_per_second:.1f}")
 
     # ── Print a metrics snapshot ──
     summary = esurge.get_metrics_summary()

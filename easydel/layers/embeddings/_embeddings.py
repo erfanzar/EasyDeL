@@ -138,6 +138,10 @@ class Embed(spx.Module):
         except TypeError:
             object.__setattr__(self, name, value)
 
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, inputs: Array) -> Array: ...
+
     def __init__(
         self,
         num_embeddings: int,

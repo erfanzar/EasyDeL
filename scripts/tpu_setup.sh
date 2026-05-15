@@ -12,6 +12,49 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# ---------- Argument parsing ----------
+EASYDEL_BRANCH=""
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--branch <branch-or-tag-or-sha>]
+
+Options:
+  --branch <ref>   Install easydel from the given git ref (branch, tag, or
+                   commit SHA) on https://github.com/erfanzar/easydel.git.
+                   When omitted, installs from the default branch.
+  -h, --help       Show this help message.
+EOF
+}
+
+while (( "$#" )); do
+  case "$1" in
+    --branch)
+      if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
+        log_error "--branch requires a value (branch / tag / commit SHA)."
+        usage; exit 1
+      fi
+      EASYDEL_BRANCH="$2"
+      shift 2
+      ;;
+    --branch=*)
+      EASYDEL_BRANCH="${1#--branch=}"
+      if [ -z "$EASYDEL_BRANCH" ]; then
+        log_error "--branch= requires a value."
+        usage; exit 1
+      fi
+      shift
+      ;;
+    -h|--help)
+      usage; exit 0
+      ;;
+    *)
+      log_error "Unknown argument: $1"
+      usage; exit 1
+      ;;
+  esac
+done
+
 metadata_value() {
   local path="$1"
   curl -fsS "http://metadata.google.internal/computeMetadata/v1/${path}" -H "Metadata-Flavor: Google" 2>/dev/null || true
@@ -227,8 +270,15 @@ log_info "Uninstalling existing easydel on TPU hosts (if any)..."
 "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip uninstall --python ${REMOTE_VENV_PATH}/bin/python easydel" || true
 
 # Use PEP 508 direct URL so extras are preserved:
-# 'easydel[extras] @ git+https://...'
-install_package_on_tpu "'easydel[tpu,torch,lm_eval] @ git+https://github.com/erfanzar/easydel.git'"
+# 'easydel[extras] @ git+https://...[@ref]'
+EASYDEL_GIT_URL="git+https://github.com/erfanzar/easydel.git"
+if [ -n "${EASYDEL_BRANCH:-}" ]; then
+  EASYDEL_GIT_URL="${EASYDEL_GIT_URL}@${EASYDEL_BRANCH}"
+  log_info "Installing easydel from branch/ref: ${EASYDEL_BRANCH}"
+else
+  log_info "Installing easydel from the default branch."
+fi
+install_package_on_tpu "'easydel[tpu,torch,lm_eval] @ ${EASYDEL_GIT_URL}'"
 install_package_on_tpu "ray[default]==2.54.0"
 # Configure Ray (use the actual eopod binary we installed locally, not uv run)
 log_info "Configuring Ray..."
@@ -246,6 +296,7 @@ log_info "Project: $PROJECT_ID"
 log_info "TPU Name: $TPU_NAME"
 log_info "TPU Type: $TPU_TYPE"
 log_info "Zone: $ZONE"
+log_info "EasyDeL ref: ${EASYDEL_BRANCH:-<default branch>}"
 echo ""
 log_info "Final TPU status:"
 gcloud compute tpus tpu-vm list --project="$PROJECT_ID" --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)" || true

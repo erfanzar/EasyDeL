@@ -356,6 +356,7 @@ class Phi3Attention(UnifiedAttention):
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attn_output=attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output=attn_output)
         if self.resid_dropout is not None:
             attn_output = self.resid_dropout(attn_output)
 

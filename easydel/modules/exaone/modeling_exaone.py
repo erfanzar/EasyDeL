@@ -280,7 +280,7 @@ class ExaoneAttention(spx.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        mode: common_types.RUNTIME_MODE_TYPES,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,

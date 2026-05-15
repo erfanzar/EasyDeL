@@ -153,6 +153,45 @@ def test_distillation_teacher_forward_uses_minibatches(monkeypatch):
     assert metrics.loss.shape == ()
 
 
+def test_distillation_step_uses_precomputed_teacher_logits(monkeypatch):
+    teacher_call_shapes: list[tuple[int, ...]] = []
+    student_state = _StudentState()
+    teacher_state = _TeacherState(teacher_call_shapes)
+    input_ids = jnp.arange(12, dtype=jnp.int32).reshape(4, 3)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": jnp.ones((4, 3), dtype=jnp.int32),
+        "_teacher_logits": jnp.stack((input_ids * 0.5 + 0.1, input_ids * -0.25 - 0.2), axis=-1),
+    }
+
+    def run_single_minibatch_with_teacher(state, batch, minibatch_size, grad_fn):
+        batch_size = int(batch["input_ids"].shape[0])
+        minibatch = jax.tree_util.tree_map(
+            lambda x: x[:minibatch_size] if hasattr(x, "shape") and x.ndim > 0 and x.shape[0] == batch_size else x,
+            batch,
+        )
+        (_, metrics), grads = grad_fn(state.graphstate, minibatch)
+        return grads, metrics
+
+    monkeypatch.setattr(distill_fn, "minibatch_call", run_single_minibatch_with_teacher)
+    monkeypatch.setattr(distill_fn, "update_state_respectfully", lambda state, gradients, loss_config, metrics: state)
+    monkeypatch.setattr(distill_fn, "update_metrics", lambda metrics, learning_rate_fn, step, gradients: metrics)
+    monkeypatch.setattr(distill_fn, "with_sharding_constraint", lambda batch, sharding, **kwargs: batch)
+
+    _state, metrics = distill_fn.distillation_step(
+        student_state=student_state,
+        batch=batch,
+        teacher_state=teacher_state,
+        gradient_accumulation_steps=2,
+        is_training=True,
+        temperature=1.0,
+        alpha=1.0,
+    )
+
+    assert teacher_call_shapes == []
+    assert metrics.loss.shape == ()
+
+
 def test_gkd_teacher_forward_uses_minibatches(monkeypatch):
     teacher_call_shapes: list[tuple[int, ...]] = []
     student_state = _StudentState()

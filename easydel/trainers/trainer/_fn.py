@@ -198,15 +198,18 @@ def training_step(
     Returns:
         tuple[EasyDeLState, LossMetrics]: Updated state and metrics.
     """
-    return base_step(
-        state=state,
-        batch=batch,
-        loss_config=loss_config,
-        learning_rate_fn=learning_rate_fn,
-        partition_spec=partition_spec,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        is_training=True,
-        straight_through_emulator=straight_through_emulator,
+    return tp.cast(
+        tuple[EasyDeLState, LossMetrics],
+        base_step(
+            state=state,
+            batch=batch,
+            loss_config=loss_config,
+            learning_rate_fn=learning_rate_fn,
+            partition_spec=partition_spec,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            is_training=True,
+            straight_through_emulator=straight_through_emulator,
+        ),
     )
 
 
@@ -230,13 +233,16 @@ def evaluation_step(
     Returns:
         LossMetrics: Metrics for the evaluated batch.
     """
-    return base_step(
-        state=state,
-        batch=batch,
-        loss_config=loss_config,
-        partition_spec=partition_spec,
-        gradient_accumulation_steps=1,
-        is_training=False,
+    return tp.cast(
+        LossMetrics,
+        base_step(
+            state=state,
+            batch=batch,
+            loss_config=loss_config,
+            partition_spec=partition_spec,
+            gradient_accumulation_steps=1,
+            is_training=False,
+        ),
     )
 
 

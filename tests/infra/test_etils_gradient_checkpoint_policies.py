@@ -13,12 +13,24 @@
 # limitations under the License.
 
 import jax
+import pytest
 
 from easydel.infra.etils import GRADIENT_CHECKPOINT_TARGETS, EasyDeLGradientCheckPointers
 from easydel.infra.utils import get_gradient_checkpoint_policy
 
 
-def test_mlp_notsaveable_uses_non_mlp_targets(monkeypatch):
+@pytest.mark.parametrize(
+    ("policy_name", "excluded_prefixes"),
+    [
+        (EasyDeLGradientCheckPointers.MLP_NOTSAVEABLE, ("mlp_",)),
+        (EasyDeLGradientCheckPointers.ATTN_NOTSAVEABLE, ("attn_",)),
+        (EasyDeLGradientCheckPointers.MLP_ATTN_NOTSAVEABLE, ("mlp_", "attn_")),
+        (EasyDeLGradientCheckPointers.LMHEAD_NOTSAVEABLE, ("lm_head_",)),
+        (EasyDeLGradientCheckPointers.ATTN_LMHEAD_NOTSAVEABLE, ("attn_", "lm_head_")),
+        (EasyDeLGradientCheckPointers.MLP_LMHEAD_NOTSAVEABLE, ("mlp_", "lm_head_")),
+    ],
+)
+def test_notsaveable_policies_exclude_expected_target_families(monkeypatch, policy_name, excluded_prefixes):
     captured = {}
     sentinel = object()
 
@@ -28,41 +40,11 @@ def test_mlp_notsaveable_uses_non_mlp_targets(monkeypatch):
 
     monkeypatch.setattr(jax.checkpoint_policies, "save_only_these_names", fake_save_only_these_names)
 
-    policy = get_gradient_checkpoint_policy(EasyDeLGradientCheckPointers.MLP_NOTSAVEABLE)
-
-    assert policy is sentinel
-    assert set(captured["names"]) == {name for name in GRADIENT_CHECKPOINT_TARGETS if not name.startswith("mlp_")}
-
-
-def test_attn_notsaveable_uses_non_attn_targets(monkeypatch):
-    captured = {}
-    sentinel = object()
-
-    def fake_save_only_these_names(*names):
-        captured["names"] = names
-        return sentinel
-
-    monkeypatch.setattr(jax.checkpoint_policies, "save_only_these_names", fake_save_only_these_names)
-
-    policy = get_gradient_checkpoint_policy(EasyDeLGradientCheckPointers.ATTN_NOTSAVEABLE)
-
-    assert policy is sentinel
-    assert set(captured["names"]) == {name for name in GRADIENT_CHECKPOINT_TARGETS if not name.startswith("attn_")}
-
-
-def test_mlp_attn_notsaveable_uses_non_mlp_non_attn_targets(monkeypatch):
-    captured = {}
-    sentinel = object()
-
-    def fake_save_only_these_names(*names):
-        captured["names"] = names
-        return sentinel
-
-    monkeypatch.setattr(jax.checkpoint_policies, "save_only_these_names", fake_save_only_these_names)
-
-    policy = get_gradient_checkpoint_policy(EasyDeLGradientCheckPointers.MLP_ATTN_NOTSAVEABLE)
+    policy = get_gradient_checkpoint_policy(policy_name)
 
     assert policy is sentinel
     assert set(captured["names"]) == {
-        name for name in GRADIENT_CHECKPOINT_TARGETS if not name.startswith("mlp_") and not name.startswith("attn_")
+        name for name in GRADIENT_CHECKPOINT_TARGETS if not name.startswith(excluded_prefixes)
     }
+    assert any(name.startswith(prefix) for prefix in excluded_prefixes for name in GRADIENT_CHECKPOINT_TARGETS)
+    assert not any(name.startswith(excluded_prefixes) for name in captured["names"])

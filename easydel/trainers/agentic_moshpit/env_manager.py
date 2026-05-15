@@ -474,7 +474,7 @@ class RolloutManager:
         trajectories: list[TrajectoryResult],
         max_prompt_length: int,
         max_completion_length: int,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, np.ndarray | list[list[float]]]:
         """Collate trajectories into batched arrays for training.
 
         Separates each trajectory into prompt and completion portions,

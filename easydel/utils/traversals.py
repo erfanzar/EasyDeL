@@ -417,7 +417,7 @@ def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
     for opaque_name in model._spx_attr_order:
         if opaque_name not in bound._spx_attr_order:
             bound._spx_attr_order.append(opaque_name)
-    return bound
+    return tp.cast(M, bound)
 
 
 def specs_to_name_sharding(tree: dict, mesh: MeshLike | None = None) -> dict:
@@ -598,12 +598,12 @@ def iter_module_search(model: spx.Module, instance: type[T] | None = None) -> Ge
         for path_str, module in spx.iter_modules(model):
             if isinstance(module, _skip_types):
                 continue
-            yield tuple(path_str.split(".")), module
+            yield tuple(path_str.split(".")), tp.cast(T, module)
     else:
         for path_str, module in spx.iter_modules(model, select=instance):
             if isinstance(module, _skip_types):
                 continue
-            yield tuple(path_str.split(".")), module
+            yield tuple(path_str.split(".")), tp.cast(T, module)
 
 
 def get_module_from_path(model: spx.Module, path: ModulePath) -> spx.Module | None:

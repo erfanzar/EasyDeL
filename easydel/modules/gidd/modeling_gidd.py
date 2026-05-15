@@ -473,6 +473,7 @@ class GiddAttention(AttentionModule):
             self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
             name="attn_output",
         )
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(  # pyright: ignore[reportReturnType]
             attention_output=attn_output,

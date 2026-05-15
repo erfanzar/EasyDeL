@@ -677,7 +677,7 @@ class TransformerCacheView(BaseCacheView):
                 The same tensor with its sharding refreshed.
             """
             axes = getattr(self, "kv_sharding_axes", (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM))
-            return apply_logical_sharding(x, axes=axes, **sharding_statics)
+            return tp.cast(JAXArray, apply_logical_sharding(x, axes=axes, **sharding_statics))
 
         @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
         def _update_kv(

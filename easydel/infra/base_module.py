@@ -842,7 +842,7 @@ class EasyDeLBaseModule(
                 bound._spx_attr_order.append(opaque_name)
         # Preserve training mode across bind/reconstruct
         bound.train(self.training)
-        return bound
+        return tp.cast(Self, bound)
 
     @property
     def graphdef(self: Self) -> spx.GraphDef:
@@ -1616,7 +1616,7 @@ class EasyDeLBaseModule(
         """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
-        return self.get_embedding()(jnp.asarray(input_ids, dtype="i4"))
+        return tp.cast(Array, self.get_embedding()(jnp.asarray(input_ids, dtype="i4")))
 
     def compute_embedding_with_info(
         self: Self, input_ids: Int[Array, "..."], *args, **kwargs
@@ -2335,43 +2335,163 @@ class EasyDeLBaseModule(
         """
         from .utils import ActivationType, FlopCalcConfig, flops_per_token
 
+        def _config_value(source, *names, default=0):
+            for name in names:
+                value = getattr(source, name, None)
+                if value is not None:
+                    return value
+            return default
+
+        def _as_int(value, default=0):
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _activation_value(source, default=ActivationType.SILU):
+            value = _config_value(source, "hidden_act", "activation_function", "activation", default=default)
+            try:
+                return ActivationType(value)
+            except (TypeError, ValueError):
+                return value
+
+        def _count_moe_layers(source, num_layers, num_experts):
+            if num_experts <= 1 or num_layers <= 0:
+                return 0
+
+            explicit_num_moe_layers = _config_value(source, "num_moe_layers", "moe_num_layers", default=None)
+            if explicit_num_moe_layers is not None:
+                return max(0, min(_as_int(explicit_num_moe_layers), num_layers))
+
+            layer_types = getattr(source, "layer_types", None)
+            if layer_types is not None:
+                layer_types = list(layer_types)
+                return sum(
+                    1
+                    for layer_type in layer_types[:num_layers]
+                    if "moe" in str(layer_type).lower() or "sparse" in str(layer_type).lower()
+                )
+
+            mlp_only_layers = getattr(source, "mlp_only_layers", None)
+            if isinstance(mlp_only_layers, (list, tuple, set)):
+                return max(
+                    0, num_layers - len({layer_idx for layer_idx in mlp_only_layers if 0 <= layer_idx < num_layers})
+                )
+
+            first_dense_layer_count = _as_int(
+                _config_value(source, "first_k_dense_replace", "first_k_dense_layers", default=0)
+            )
+            moe_layer_freq = max(
+                1, _as_int(_config_value(source, "moe_layer_freq", "decoder_sparse_step", default=1), 1)
+            )
+            return sum(1 for layer_idx in range(first_dense_layer_count, num_layers) if layer_idx % moe_layer_freq == 0)
+
         try:
             config = self.config
             text_config = getattr(config, "text_config", config)
             vision_config = getattr(config, "vision_config", config)
             if sequence_length is None:
-                sequence_length = text_config.granted_mask_max_position_embedding
+                sequence_length = _config_value(
+                    text_config,
+                    "granted_mask_max_position_embedding",
+                    "max_position_embeddings",
+                    "n_positions",
+                    "seq_length",
+                    default=2048,
+                )
 
-            num_heads = text_config.num_attention_heads
-            hidden_dim = text_config.hidden_size
+            num_heads = _config_value(text_config, "num_attention_heads", "n_head", "num_heads")
+            num_heads = _as_int(num_heads)
+            hidden_dim = _config_value(text_config, "hidden_size", "n_embd", "d_model")
+            hidden_dim = _as_int(hidden_dim)
+            intermediate_dim = _as_int(
+                _config_value(text_config, "intermediate_size", "ffn_dim", "n_inner", default=hidden_dim * 4)
+            )
+            num_layers = _as_int(_config_value(text_config, "num_hidden_layers", "n_layer", "num_layers", "depth"))
+            num_experts = _as_int(
+                _config_value(
+                    text_config, "num_local_experts", "num_experts", "n_routed_experts", "n_experts", default=1
+                ),
+                1,
+            )
+            num_shared_experts = _as_int(_config_value(text_config, "num_shared_experts", "n_shared_experts", default=0))
+            num_experts_per_tok = _as_int(
+                _config_value(
+                    text_config, "num_experts_per_tok", "num_experts_per_token", "moe_top_k", "top_k", default=1
+                ),
+                1,
+            )
+            moe_intermediate_dim = _config_value(
+                text_config,
+                "moe_intermediate_size",
+                "moe_ffn_dim",
+                "expert_intermediate_size",
+                default=None,
+            )
+            if moe_intermediate_dim is not None:
+                moe_intermediate_dim = _as_int(moe_intermediate_dim)
+            layer_types = getattr(text_config, "layer_types", None)
             fconf = FlopCalcConfig(
                 hidden_dim=hidden_dim,
-                intermediate_dim=text_config.intermediate_size,
-                num_layers=text_config.num_hidden_layers,
+                intermediate_dim=intermediate_dim,
+                num_layers=num_layers,
                 num_heads=num_heads,
-                activation_type=getattr(text_config, "hidden_act", ActivationType.SILU),
-                head_dim=getattr(text_config, "head_dim", hidden_dim // num_heads),
-                kv_heads=getattr(text_config, "num_key_value_heads", num_heads),
+                activation_type=_activation_value(text_config),
+                head_dim=_as_int(
+                    _config_value(text_config, "head_dim", default=hidden_dim // num_heads if num_heads else 0)
+                ),
+                kv_heads=_as_int(
+                    _config_value(text_config, "num_key_value_heads", "num_kv_heads", default=num_heads), num_heads
+                ),
                 seq_len=sequence_length,
                 task=self._model_task,
-                vocab_size=text_config.vocab_size,
+                vocab_size=_as_int(
+                    _config_value(text_config, "vocab_size", default=_config_value(config, "vocab_size", default=0))
+                ),
                 include_loss=include_loss,
-                num_labels=getattr(text_config, "num_labels", 0),
-                num_experts=getattr(text_config, "num_local_experts", 0),
-                num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 0),
+                num_labels=_as_int(_config_value(text_config, "num_labels", default=0)),
+                num_experts=num_experts,
+                num_shared_experts=num_shared_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                moe_intermediate_dim=moe_intermediate_dim,
+                shared_expert_intermediate_dim=_as_int(
+                    _config_value(
+                        text_config,
+                        "shared_expert_intermediate_size",
+                        "moe_shared_expert_intermediate_size",
+                        default=0,
+                    )
+                ),
+                num_moe_layers=_count_moe_layers(text_config, num_layers, num_experts),
+                layer_types=layer_types,
+                sliding_window=_config_value(text_config, "sliding_window", "window_size", default=None),
                 glu=getattr(text_config, "glu_mlp", True),
-                vision_hidden_dim=getattr(vision_config, "hidden_size", 0),
-                vision_intermediate_dim=getattr(vision_config, "intermediate_size", 0),
-                vision_num_heads=getattr(vision_config, "num_attention_heads", 0),
-                vision_num_layers=getattr(vision_config, "num_hidden_layers", 0),
-                vision_seq_len=getattr(vision_config, "max_position_embeddings", 0),
+                vision_hidden_dim=_as_int(_config_value(vision_config, "hidden_size", "d_model", default=0)),
+                vision_intermediate_dim=_as_int(
+                    _config_value(vision_config, "intermediate_size", "mlp_dim", "ffn_dim", default=0)
+                ),
+                vision_num_heads=_as_int(_config_value(vision_config, "num_attention_heads", "num_heads", default=0)),
+                vision_num_layers=_as_int(
+                    _config_value(vision_config, "num_hidden_layers", "num_layers", "depth", default=0)
+                ),
+                vision_seq_len=_config_value(
+                    vision_config,
+                    "max_position_embeddings",
+                    "num_position_embeddings",
+                    "seq_length",
+                    default=0,
+                ),
+                vision_head_dim=_config_value(vision_config, "head_dim", default=None),
+                vision_activation_type=_activation_value(vision_config, ActivationType.GELU),
             )
 
             flops = flops_per_token(fconf)
             if include_backward:
                 flops *= 3
-        except Exception:
-            logger.warning_once("Calculating Flops Failed!")
+        except Exception as exc:
+            logger.warning_once(f"Calculating Flops Failed! {type(exc).__name__}: {exc}")
             flops = 1
         return flops
 
@@ -2579,7 +2699,7 @@ class EasyDeLBaseModule(
             False,
         )
         w = self.get_embedding().weight.value.T if tie_embeddings else None
-        return self.get_lm_head()(hidden_states, w=w)
+        return tp.cast(Array, self.get_lm_head()(hidden_states, w=w))
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> "Callable[[Array], Array]":
         """Return a trace-safe callable that projects hidden states to logits.
@@ -2659,8 +2779,8 @@ class EasyDeLBaseModule(
                     Array: Projected logits over the vocabulary.
                 """
                 if w is None:
-                    return head(hidden_states)
-                return head(hidden_states, w=w)
+                    return tp.cast(Array, head(hidden_states))
+                return tp.cast(Array, head(hidden_states, w=w))
 
         def _project(hidden_states: "Array") -> "Array":
             """Trace-safe LM-head projection bound to the resolved tied weight.
@@ -2671,7 +2791,7 @@ class EasyDeLBaseModule(
             Returns:
                 Array: Logits over the vocabulary.
             """
-            return _native_forward(hidden_states, w=w)
+            return tp.cast(Array, _native_forward(hidden_states, w=w))
 
         return _project
 

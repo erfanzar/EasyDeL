@@ -97,7 +97,10 @@ def _make_trainer(*, max_training_steps: int = 11, num_train_epochs: int = 2):
         ids_to_pop_from_dataset=None,
         total_batch_size=1,
         gradient_accumulation_steps=1,
+        profiler_path=None,
     )
+    trainer._profiler_started = False
+    trainer._profiler_active = False
     trainer.max_training_steps = max_training_steps
     trainer.dataloader_train = list(range(64))
     trainer._model = SimpleNamespace(mesh=_MeshCtx())
@@ -292,6 +295,68 @@ def test_train_epoch_forwards_merge_lora_before_save_to_regular_checkpoint(monke
     assert save_calls[0]["step"] == 1
     assert save_calls[0]["force"] is False
     assert save_calls[0]["merge_lora_before_save"] is True
+
+
+def test_train_epoch_blocks_until_ready_when_profiler_is_active(monkeypatch):
+    monkeypatch.setattr("easydel.trainers.trainer.trainer.jax.process_index", lambda: 0)
+    block_calls: list[object] = []
+    monkeypatch.setattr(
+        "easydel.trainers.trainer.trainer.jax.block_until_ready",
+        lambda value: block_calls.append(value) or value,
+    )
+    trainer, _ = _make_trainer(max_training_steps=1, num_train_epochs=1)
+    trainer.arguments.learning_rate = 1e-3
+    trainer.arguments.max_length = 16
+    trainer.arguments.merge_lora_before_save = False
+    trainer.arguments.profiler_path = "/tmp/profiler"
+    trainer._profiler_active = True
+    trainer._profiler_started = True
+    trainer.data_collator = None
+    trainer.scheduler = None
+    trainer._backward_flops_per_token = 0.0
+    trainer._extra_backward_flops_per_token = 0.0
+    trainer.train_tracker = SimpleNamespace(trace_compilation=lambda: _MeshCtx())
+    trainer.on_step_start = lambda state, step: state
+    trainer.on_step_end = lambda state, metrics, step: (state, metrics)
+    trainer.apply_training_hooks = lambda metrics: metrics
+    trainer.log_metrics = lambda **kwargs: None
+    trainer.log_weight_distribution = lambda **kwargs: None
+    trainer.log_watchers = lambda **kwargs: None
+    trainer.maybe_generate = lambda **kwargs: None
+    trainer.maybe_benchmark = lambda **kwargs: None
+    trainer._should_save_tpu_preemption_checkpoint = lambda step: False
+    trainer._should_run_evaluation = lambda current_step: False
+    trainer._save_checkpoint_for_step = lambda *args, **kwargs: None
+
+    def _execute_train_step(state, batch):
+        del batch
+        return (
+            _StateStub(step=state.step + 1),
+            SimpleNamespace(loss=0.0, accuracy=1.0, execution_time=0.0),
+            None,
+        )
+
+    trainer._execute_train_step = _execute_train_step
+
+    state, run_exception, _ = Trainer._train_epoch(
+        trainer,
+        state=_StateStub(step=0),
+        train_dataset=[{"tokens": 1}],
+        train_iter=iter([{"tokens": 1}]),
+        metrics_tracker=_MetricsTrackerStub(),
+        step_metrics=_StepMetricsStub(),
+        pbar=None,
+        epoch=0,
+        epoch_start_step=0,
+        epoch_end_step=1,
+    )
+
+    assert run_exception is None
+    assert state.step == 1
+    assert len(block_calls) == 1
+    blocked_state, blocked_metrics = block_calls[0]
+    assert blocked_state.step == 1
+    assert blocked_metrics.loss == 0.0
 
 
 def test_eval_epoch_logs_batch_progress_locally_and_reports_summary_at_global_step():

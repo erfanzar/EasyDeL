@@ -693,8 +693,12 @@ class Trainer(BaseTrainer):
                         mode="train",
                         update_progress=False,
                     )
-                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                    return state, run_exception, train_iter
+                    if self._profiler_should_block_until_ready():
+                        state, metrics = jax.block_until_ready((state, metrics))
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as exc:
+                    return state, exc, train_iter
+                except TypeError as exc:
+                    return state, exc, train_iter
                 if run_exception is not None:
                     break
         return state, run_exception, train_iter
@@ -813,8 +817,10 @@ class Trainer(BaseTrainer):
                 )
                 final_eval_metrics = eval_metrics
                 yield eval_metrics
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
                 break
+            except TypeError:
+                raise
         if final_eval_metrics is not None:
             summary_eval_metrics = summary_metrics_helper.summarize_metrics(
                 last_metrics=final_eval_metrics,

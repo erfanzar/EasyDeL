@@ -252,6 +252,7 @@ class Grok1Attention(AttentionModule):
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         attn_output = self.resid_dropout(attn_output)
         return AttentionLayerOutput(

@@ -742,7 +742,12 @@ class FalconH1Mixer(spx.Module):
                 scan_output = y * jax.nn.silu(gate.astype(jnp.float32))
 
             contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
-            return contextualized_states, updated_cache_view
+            contextualized_states = apply_logical_sharding(
+                contextualized_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            return tp.cast(Array, contextualized_states), updated_cache_view
 
         updated_cache_view = cache_view
 
@@ -829,7 +834,12 @@ class FalconH1Mixer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
-        return contextualized_states, updated_cache_view
+        contextualized_states = apply_logical_sharding(
+            contextualized_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return tp.cast(Array, contextualized_states), updated_cache_view
 
 
 class FalconH1MLP(spx.Module):
@@ -920,7 +930,7 @@ class FalconH1MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return y
+        return tp.cast(Array, y)
 
 
 class FalconH1DecoderLayer(spx.Module):
@@ -1519,7 +1529,7 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
         hidden_states = outputs.last_hidden_state
         logits = None
         if apply_lm_head:
-            logits = self.lm_head(hidden_states) * self.model.lm_head_multiplier
+            logits = self.compute_lm_logits(self.prepare_lm_head_inputs(hidden_states))
 
         return CausalLMOutput(
             logits=logits,
@@ -1528,6 +1538,10 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply Falcon-H1's LM head with muP output scaling."""
+        return super().apply_lm_head(hidden_states) * self.model.lm_head_multiplier
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
         """Trace-safe projection with Falcon-H1 muP lm_head_multiplier."""

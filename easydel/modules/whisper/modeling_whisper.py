@@ -330,6 +330,7 @@ class WhisperAttention(AttentionModule):
         attn_output = checkpoint_name(
             self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
         )
+        attn_output = self.shard_attention_prod(attn_output)
 
         return attn_output, attentions.attention_weights, cache_view
 

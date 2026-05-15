@@ -104,7 +104,7 @@ def test_metrics_tracker_ignores_non_finite_accuracy():
 
 
 def test_json_progress_bar_nests_parental_metric_keys(monkeypatch):
-    logged: list[dict] = []
+    logged: list[str] = []
     monkeypatch.setattr("easydel.trainers.metrics.logger.info", logged.append)
 
     JSONProgressBar().set_postfix(
@@ -113,11 +113,5 @@ def test_json_progress_bar_nests_parental_metric_keys(monkeypatch):
     )
 
     assert logged == [
-        {
-            "loss": 1.0,
-            "performance": {
-                "train_step_time": 2.0,
-                "data_collection_time": 0.25,
-            },
-        }
+        "{'loss': 1.0, \x1b[96m'performance': {'train_step_time': 2.0, 'data_collection_time': 0.25}\x1b[0m}"
     ]

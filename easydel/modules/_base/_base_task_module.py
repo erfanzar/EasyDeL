@@ -66,7 +66,7 @@ See Also:
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 import jax
 import spectrax as spx
@@ -74,6 +74,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
+from spectrax import apply_logical_sharding, common_types
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -461,6 +462,20 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             return chunk_size
         return max(1, min(chunk_size, int(seq_len)))
 
+    def _constrain_lm_logits(self, logits: Array) -> Array:
+        """Constrain full-rank LM logits through the configured logical-axis rules."""
+        if logits.ndim != 3:
+            return logits
+        return cast(
+            Array,
+            apply_logical_sharding(
+                logits,
+                axes=(common_types.BATCH, common_types.LENGTH, common_types.VOCAB),
+                mode=common_types.MODE_TRAIN,
+                partition_manager=self.config.runtime_sharding_resolver,
+            ),
+        )
+
     def compute_lm_logits(self, hidden_states: Array) -> Array:
         """Project hidden states to vocabulary logits, optionally chunking across tokens.
 
@@ -498,7 +513,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         chunk_size = self._resolve_lmhead_chunksize(hidden_states.shape[1] if hidden_states.ndim == 3 else None)
         if chunk_size is None or hidden_states.ndim != 3 or hidden_states.shape[1] <= chunk_size:
             logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-            return self.apply_logit_cap(logits)
+            return self._constrain_lm_logits(self.apply_logit_cap(logits))
 
         batch_size, seq_len, _hidden_dim = hidden_states.shape
         pad_len = (-seq_len) % chunk_size
@@ -511,7 +526,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         def _project_chunk(chunk_hidden_states: Array) -> Array:
             """Project a single chunk of hidden states through the LM head with logit capping."""
             logits = checkpoint_name(self.apply_lm_head(chunk_hidden_states), "lm_head_output")
-            return self.apply_logit_cap(logits)
+            return self._constrain_lm_logits(self.apply_logit_cap(logits))
 
         _project_chunk = jax.checkpoint(_project_chunk, prevent_cse=False)
         first_chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, 0, chunk_size, axis=1)
@@ -535,7 +550,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             logits = lax.fori_loop(1, num_chunks, _write_chunk, logits)
         if pad_len:
             logits = logits[:, :seq_len, :]
-        return logits
+        return self._constrain_lm_logits(logits)
 
     def compute_router_aux_loss(self, outputs) -> Any:
         """Compute router auxiliary loss for MoE models if configured.

@@ -42,7 +42,7 @@ time, to repair an HF helper that occasionally returns a Python ``0``.
 """
 
 from functools import cached_property
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -364,6 +364,7 @@ class DbrxAttention(UnifiedAttention):
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -917,7 +918,7 @@ class DbrxFFN(spx.Module):
                 dynamic_axes=common_types.HiddenStateSharding,
                 partition_manager=self.config.runtime_sharding_resolver,
             )
-        return out, router_logits
+        return cast(Array, out), router_logits
 
 
 class DbrxBlock(spx.Module):

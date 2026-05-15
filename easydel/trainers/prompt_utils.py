@@ -576,7 +576,11 @@ def render_prompt_with_suffix(
             f"applied to the prompt alone for `{field_name}`."
             f"\n**Prompt**:\n{prompt_text}\n\n**Prompt + Suffix**:\n{full_conversation}"
         )
-    return prompt_text, full_conversation[len(prompt_text) :], full_conversation
+    return (
+        tp.cast(str, prompt_text),
+        tp.cast(str, full_conversation[len(prompt_text) :]),
+        tp.cast(str, full_conversation),
+    )
 
 
 def apply_chat_template(

@@ -5688,6 +5688,10 @@ class BaseTrainer(BaseTrainerProtocol):
         finally:
             self._profiler_active = False
 
+    def _profiler_should_block_until_ready(self) -> bool:
+        """Return whether the training loop should sync step outputs for profiling."""
+        return bool(self.arguments.profiler_path is not None and self._profiler_active)
+
     def _should_run_evaluation(self, current_step):
         """
         Determine if evaluation should be run at current step.

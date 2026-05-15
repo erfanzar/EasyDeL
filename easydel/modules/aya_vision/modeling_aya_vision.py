@@ -29,6 +29,8 @@ Exports:
   registration with the LM head used for autoregressive generation.
 """
 
+import typing as tp
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -364,7 +366,7 @@ class AyaVisionModel(EasyDeLBaseModule):
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
             selected_image_feature = selected_image_feature
-        image_features = self.multi_modal_projector(selected_image_feature)
+        image_features = tp.cast(Array, self.multi_modal_projector(selected_image_feature))
 
         return image_features
 

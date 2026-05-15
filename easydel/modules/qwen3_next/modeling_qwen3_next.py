@@ -200,7 +200,7 @@ def _preserve_array_sharding(
         mode=common_types.MODE_PREFILL,
         shape=value.shape,
     )
-    return with_sharding_constraint(value, spec, mesh=mesh)
+    return typing.cast(Array, with_sharding_constraint(value, spec, mesh=mesh))
 
 
 def apply_grouped_single_step_gdr(
@@ -1734,6 +1734,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
         attn_output = self._merge_heads(attn_output)
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.o_proj(attn_output)
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -1959,7 +1960,7 @@ class Qwen3NextLinearAttention(spx.Module):
             dimension_numbers=dim_numbers,
             feature_group_count=self.conv1d.groups,
         )
-        return with_sharding_constraint(conv_output, replicated_3d, mesh=stage_mesh)
+        return typing.cast(Array, with_sharding_constraint(conv_output, replicated_3d, mesh=stage_mesh))
 
     def fix_query_key_value_ordering(
         self,
@@ -2015,7 +2016,7 @@ class Qwen3NextLinearAttention(spx.Module):
         mask_info: MaskInfo | None,
         cache_view: LinearCacheView | None = None,
         cache_metadata: LinearMetadata | None = None,
-    ) -> DecoderLayerOutput:
+    ) -> AttentionLayerOutput:
         """Forward pass through the linear attention layer.
 
         Uses GatedDeltaNet for efficient linear complexity attention with:
@@ -2130,6 +2131,11 @@ class Qwen3NextLinearAttention(spx.Module):
             output = self.norm(output, z)
             output = output.reshape(batch_size, seq_len, -1)
             output = self.out_proj(output)
+            output = apply_logical_sharding(
+                output,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
 
             return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
 
@@ -2231,6 +2237,11 @@ class Qwen3NextLinearAttention(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         output = self.out_proj(output)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
 
         new_cache_view = cache_view
         if cache_view is not None and not use_packed_state_updates:

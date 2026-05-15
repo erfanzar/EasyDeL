@@ -302,6 +302,10 @@ class RMSNorm(spx.Module):
         :class:`RMSNormGated`: SiLU-gated variant used by linear-attention blocks.
     """
 
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]: ...
+
     kernel_init = staticmethod(jax.nn.initializers.ones)
     """Callable: Static initializer for scale parameters, defaults to ones."""
 
@@ -465,6 +469,14 @@ class RMSNormGated(spx.Module):
         weight (spx.Parameter[Array]): Per-feature scale of shape
             ``(hidden_size,)``, initialized to ones.
     """
+
+    if tp.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            x: Float[Array, "... dim"],
+            gate: Float[Array, "... dim"] | None = None,
+        ) -> Float[Array, "... dim"]: ...
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
 
@@ -781,6 +793,10 @@ class LayerNorm(spx.Module):
         >>> y = norm(x)
         >>> assert y.shape == (2, 512, 768)
     """
+
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, x: Array, *, mask: jax.Array | None = None) -> Array: ...
 
     def __init__(
         self,

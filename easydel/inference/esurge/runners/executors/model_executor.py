@@ -1018,7 +1018,7 @@ class ModelStepExecutor:
         graphstate: tp.Any,
         graphother: tp.Any,
         inputs: StepFunctionInputs,
-    ) -> ModelStepOutputs | None:
+    ) -> ModelStepOutputs | BackboneOutputs | None:
         """Compile (or no-op-if-cached) the backbone and the LM head.
 
         Backbone is keyed solely by ``num_tokens`` because its compute

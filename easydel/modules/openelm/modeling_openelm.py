@@ -398,6 +398,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,

@@ -955,7 +955,7 @@ class EasyDeLState(_PyTreeNode):
             self.graphother,
         )
         full_state = tree.merge(other, copy=False)
-        return spx.bind(self.graphdef, full_state)
+        return tp.cast("EasyDeLBaseModule", spx.bind(self.graphdef, full_state))
 
     def merge_to_state(self: Self, tree) -> Self:
         """Create a new state with updated parameters.
@@ -1028,7 +1028,7 @@ class EasyDeLState(_PyTreeNode):
         # the spectrax setattr path so accessing `state.model` is pure.
         object.__setattr__(model, "_esurge_cache_scope_key", self.esurge_cache_scope_key)
         # TODO: Make me Dynamic.
-        return model
+        return tp.cast("EasyDeLBaseModule", model)
 
     @property
     def size(self) -> int:

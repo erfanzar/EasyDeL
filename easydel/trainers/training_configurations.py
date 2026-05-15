@@ -1799,8 +1799,10 @@ class TrainingArguments:
             - Computes statistics across all processes in distributed training
             - Logs both histograms and scalar statistics for each parameter
         """
+        if self.weight_distribution_log_steps <= 0:
+            return
         try:
-            if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
+            if (step % self.weight_distribution_log_steps) == 0:
                 stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
                 stats = jax.device_get(stats)
 

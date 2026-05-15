@@ -406,6 +406,7 @@ class MptAttention(UnifiedAttention):
             attention.attention_outputs.reshape(batch_size, sequence_length, self.config.hidden_size)
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(

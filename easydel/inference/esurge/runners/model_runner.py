@@ -1009,7 +1009,6 @@ class eSurgeRunner:
         np.ndarray,
         np.ndarray,
         np.ndarray,
-        list[dict[int, float] | None],
         int | None,
     ]:
         """Return CPU-side state views aligned to the active scheduler window.
@@ -1147,7 +1146,7 @@ class eSurgeRunner:
 
         if not has_interior_zero_rows:
             row_indices = np.arange(start_index, start_index + prefix_stop, dtype=np.int32)
-            req_ids_window = [typing.cast(str, rid) for rid in window_req_ids[:prefix_stop]]
+            req_ids_window: list[str | None] = [typing.cast(str, rid) for rid in window_req_ids[:prefix_stop]]
             scheduled_list = [int(scheduled) for scheduled in window_scheduled[:prefix_stop]]
             return row_indices, req_ids_window, scheduled_list, start_index + prefix_stop, False
 
@@ -1158,7 +1157,7 @@ class eSurgeRunner:
             return row_indices, req_ids_window, scheduled_list, start_index + prefix_stop, False
 
         row_indices_list: list[int] = []
-        req_ids_window: list[str] = []
+        req_ids_window: list[str | None] = []
         scheduled_list: list[int] = []
         for offset in range(prefix_stop):
             rid = window_req_ids[offset]
@@ -3157,7 +3156,7 @@ class eSurgeRunner:
             This is the synchronous version. For async execution that allows
             overlapping with scheduling, use execute_model_async() instead.
         """
-        return self._execute_model_impl(scheduler_output)
+        return typing.cast(ModelRunnerOutput, self._execute_model_impl(scheduler_output))
 
     def execute_model_async(self, scheduler_output: SchedulerOutput) -> _AsyncExecutionHandle:
         """Dispatch model work and defer the host-side token materialization.
@@ -3168,7 +3167,7 @@ class eSurgeRunner:
         queued, and letting the lifecycle loop do scheduler prefetch work before
         calling wait_for_execution().
         """
-        return self._execute_model_impl(scheduler_output, return_async_output=True)
+        return typing.cast(_AsyncExecutionHandle, self._execute_model_impl(scheduler_output, return_async_output=True))
 
     def initialize_async_executor(self) -> None:
         """Retire any legacy background executor and confirm same-thread overlap.

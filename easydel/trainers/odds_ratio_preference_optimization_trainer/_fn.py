@@ -649,17 +649,20 @@ def orpo_training_step(
     Returns:
         tuple[EasyDeLState, LossMetrics]: Updated state and computed metrics.
     """
-    return orpo_step(
-        state=state,
-        batch=batch,
-        concatenated_forward=concatenated_forward,
-        beta=beta,
-        learning_rate_fn=learning_rate_fn,
-        mode="train",
-        loss_config=loss_config,
-        partition_spec=partition_spec,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        straight_through_emulator=straight_through_emulator,
+    return tp.cast(
+        tuple[EasyDeLState, LossMetrics],
+        orpo_step(
+            state=state,
+            batch=batch,
+            concatenated_forward=concatenated_forward,
+            beta=beta,
+            learning_rate_fn=learning_rate_fn,
+            mode="train",
+            loss_config=loss_config,
+            partition_spec=partition_spec,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            straight_through_emulator=straight_through_emulator,
+        ),
     )
 
 

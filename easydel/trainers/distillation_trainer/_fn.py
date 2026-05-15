@@ -64,6 +64,35 @@ from ..training_utils import (
 )
 
 _DEBUG_LMHEAD_SHARDING = check_bool_flag("EASYDEL_DEBUG_LMHEAD_SHARDING", default=False)
+_PRECOMPUTED_TEACHER_BATCH_KEYS = frozenset(
+    {
+        "_teacher_logits",
+        "teacher_logits",
+        "_teacher_hidden_for_kl",
+        "teacher_hidden_for_kl",
+        "_teacher_hidden_states",
+        "teacher_hidden_states",
+        "_teacher_attentions",
+        "teacher_attentions",
+    }
+)
+
+
+def _constrain_distillation_input_batch(
+    batch: collections.abc.Mapping[str, tp.Any],
+    partition_spec: PartitionSpec | None,
+    *,
+    mesh: tp.Any,
+) -> dict[str, tp.Any]:
+    """Constrain user batch inputs without resharding precomputed teacher outputs."""
+    teacher_entries = {key: value for key, value in batch.items() if key in _PRECOMPUTED_TEACHER_BATCH_KEYS}
+    input_entries = {key: value for key, value in batch.items() if key not in _PRECOMPUTED_TEACHER_BATCH_KEYS}
+    constrained = tp.cast(
+        dict[str, tp.Any],
+        dict(with_sharding_constraint(input_entries, partition_spec, mesh=mesh, ignore_mpmd=True)),
+    )
+    constrained.update(teacher_entries)
+    return constrained
 
 
 def _chunk_sequence_for_scan(value: Array, chunk_size: int, *, context: str) -> Array:
@@ -651,7 +680,16 @@ def _distillation_forward_outputs(
     call_kwargs.pop("labels", None)
     call_kwargs.pop("completion_mask", None)
     call_kwargs.pop("assistant_masks", None)
-    for key in ("teacher_logits", "teacher_hidden_for_kl", "teacher_hidden_states", "teacher_attentions"):
+    for key in (
+        "teacher_logits",
+        "teacher_hidden_for_kl",
+        "teacher_hidden_states",
+        "teacher_attentions",
+        "_teacher_logits",
+        "_teacher_hidden_for_kl",
+        "_teacher_hidden_states",
+        "_teacher_attentions",
+    ):
         call_kwargs.pop(key, None)
     if use_chunked:
         call_kwargs["apply_lm_head"] = False
@@ -680,6 +718,54 @@ def _distillation_forward_outputs(
         if attentions is not None:
             result["attentions"] = tuple(attentions)
     return result
+
+
+def _teacher_outputs_to_batch(outputs: dict[str, tp.Any], *, use_chunked: bool) -> dict[str, tp.Any]:
+    """Map teacher forward outputs to batch keys consumed by distillation losses."""
+    batch_updates: dict[str, tp.Any] = {}
+    if use_chunked:
+        hidden = outputs["hidden_for_kl"]
+        batch_updates["_teacher_hidden_for_kl"] = hidden
+        batch_updates["teacher_hidden_for_kl"] = hidden
+    else:
+        logits = outputs["logits"]
+        batch_updates["_teacher_logits"] = logits
+        batch_updates["teacher_logits"] = logits
+    if "hidden_states" in outputs:
+        batch_updates["_teacher_hidden_states"] = outputs["hidden_states"]
+        batch_updates["teacher_hidden_states"] = outputs["hidden_states"]
+    if "attentions" in outputs:
+        batch_updates["_teacher_attentions"] = outputs["attentions"]
+        batch_updates["teacher_attentions"] = outputs["attentions"]
+    return batch_updates
+
+
+def distillation_teacher_forward_step(
+    teacher_state: EasyDeLState,
+    batch: collections.abc.Mapping[str, jax.Array],
+    partition_spec: PartitionSpec | None = None,
+    logits_chunk_size: int | None = None,
+    hidden_state_weight: float = 0.0,
+    attention_weight: float = 0.0,
+) -> dict[str, tp.Any]:
+    """Run the frozen teacher as a standalone compiled program."""
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
+    request_hidden_states = hidden_state_weight != 0.0
+    request_attentions = attention_weight != 0.0
+    with jax.named_scope("easydel/trainer/distillation/teacher_program/prepare_batch"):
+        batch = with_sharding_constraint(batch, partition_spec, mesh=teacher_state.model.mesh, ignore_mpmd=True)
+    with jax.named_scope("easydel/trainer/distillation/teacher_program/teacher_forward"):
+        teacher_module = teacher_state.merge(jax.lax.stop_gradient(teacher_state.graphstate))
+        outputs = _stop_gradient_tree(
+            _distillation_forward_outputs(
+                teacher_module,
+                batch,
+                use_chunked=use_chunked,
+                request_hidden_states=request_hidden_states,
+                request_attentions=request_attentions,
+            )
+        )
+    return _teacher_outputs_to_batch(outputs, use_chunked=use_chunked)
 
 
 @functools.lru_cache(maxsize=16)
@@ -803,7 +889,7 @@ def distillation_step(
             gradient_accumulation_steps=gradient_accumulation_steps,
             batch_partition_spec=partition_spec,
         )
-        batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
+        batch = _constrain_distillation_input_batch(batch, partition_spec, mesh=student_state.model.mesh)
 
     if hidden_state_loss != "mse":
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
@@ -864,20 +950,7 @@ def distillation_step(
                     result["attentions"] = _stop_gradient_tree(tuple(teacher_attns))
             return result
 
-    # Run the teacher's backbone forward once over the full batch,
-    # outside of value_and_grad. The outputs are stashed in the batch
-    # dict under ``_teacher_*`` keys; minibatch_call slices them
-    # alongside the rest of the batch leaves.
     batch = dict(batch)
-    teacher_precomputed = teacher_forward(batch)
-    if use_chunked:
-        batch["_teacher_hidden_for_kl"] = teacher_precomputed["hidden_for_kl"]
-    else:
-        batch["_teacher_logits"] = teacher_precomputed["logits"]
-    if request_hidden_states and "hidden_states" in teacher_precomputed:
-        batch["_teacher_hidden_states"] = teacher_precomputed["hidden_states"]
-    if request_attentions and "attentions" in teacher_precomputed:
-        batch["_teacher_attentions"] = teacher_precomputed["attentions"]
 
     def loss_fn(tree, minibatch):
         """Compute the distillation loss for one minibatch.
@@ -902,8 +975,12 @@ def distillation_step(
                 tree = straight_through_emulator(tree)
         with jax.named_scope(scope_root + "/loss_fn/merge_state"):
             module = student_state.merge(tree)
-        # Teacher outputs were precomputed outside value_and_grad and
-        # sliced by minibatch_call; just pull them from the minibatch.
+        required_teacher_key = "_teacher_hidden_for_kl" if use_chunked else "_teacher_logits"
+        if required_teacher_key not in minibatch:
+            teacher_precomputed = teacher_forward(minibatch)
+            minibatch = dict(minibatch)
+            minibatch.update(_teacher_outputs_to_batch(teacher_precomputed, use_chunked=use_chunked))
+
         teacher_hidden_for_kl = jax.lax.stop_gradient(minibatch["_teacher_hidden_for_kl"]) if use_chunked else None
         teacher_logits = jax.lax.stop_gradient(minibatch["_teacher_logits"]) if not use_chunked else None
         teacher_hiddens = (
@@ -924,6 +1001,10 @@ def distillation_step(
         call_kwargs.pop("_teacher_logits", None)
         call_kwargs.pop("_teacher_hidden_states", None)
         call_kwargs.pop("_teacher_attentions", None)
+        call_kwargs.pop("teacher_hidden_for_kl", None)
+        call_kwargs.pop("teacher_logits", None)
+        call_kwargs.pop("teacher_hidden_states", None)
+        call_kwargs.pop("teacher_attentions", None)
         if use_chunked:
             call_kwargs["apply_lm_head"] = False
         if request_hidden_states:
@@ -1112,7 +1193,6 @@ def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
         raise RuntimeError("Distillation scheduled MPMD training requires teacher_state.")
 
     teacher_model = teacher_state.model
-    teacher_model.eval()
     sync_module_schedule_config(teacher_model, call.schedule)
     constrained_batch = constrain_scheduled_batch(teacher_model, batch, call.get("partition_spec"))
     forward_fn = _make_distillation_aux_forward(use_chunked, request_hidden_states, request_attentions)
@@ -1219,7 +1299,7 @@ def _make_distillation_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/distillation/scheduled_loss/bind_module"):
             module = bind_scheduled_module(call, tree)
-            call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+            call_batch = _constrain_distillation_input_batch(batch, partition_spec, mesh=module.mesh)
         with jax.named_scope("easydel/trainer/distillation/scheduled_loss/student_forward"):
             student_outputs = _distillation_forward_outputs(
                 module,
@@ -1249,7 +1329,6 @@ def _make_distillation_scheduled_loss(call):
                 if teacher_state is None:
                     raise RuntimeError("Distillation scheduled MPMD training requires teacher_state.")
                 teacher_module = teacher_state.merge(teacher_state.graphstate)
-                teacher_module.eval()
                 sync_module_schedule_config(teacher_module, call.schedule)
                 teacher_outputs = stop_gradient_tree(
                     _distillation_forward_outputs(

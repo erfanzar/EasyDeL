@@ -181,6 +181,10 @@ class Gemma4RMSNorm(spx.Module):
             output is simply ``norm(x)`` with no learned parameters.
     """
 
+    if typing.TYPE_CHECKING:
+
+        def __call__(self, hidden_states: Array) -> Array: ...
+
     kernel_init = staticmethod(jax.nn.initializers.ones)
 
     def __init__(
@@ -835,7 +839,13 @@ class Gemma4VisionAttention(spx.Module):
             mask_info=mask_info,
             causal=False,
         )
-        attention_output = self.o_proj(attentions.attention_outputs.reshape(batch_size, sequence_length, -1))
+        attention_output = attentions.attention_outputs.reshape(batch_size, sequence_length, -1)
+        attention_output = apply_logical_sharding(
+            attention_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        attention_output = self.o_proj(attention_output)
         attention_output = apply_logical_sharding(
             attention_output,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1873,6 +1883,7 @@ class Gemma4Attention(UnifiedAttention):
         attention_out = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attention_out)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
@@ -2020,6 +2031,7 @@ class Gemma4Attention(UnifiedAttention):
         attention_out = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attention_out)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
@@ -3356,7 +3368,7 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         Returns:
             Vocabulary logits ``[batch, seq_len, vocab_size]``, optionally soft-capped.
         """
-        return self.apply_lm_head(hidden_states)
+        return self._constrain_lm_logits(self.apply_lm_head(hidden_states))
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
         """Project hidden states to Gemma4 text logits for runtime sampling paths."""
@@ -3852,7 +3864,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             pixel_values=pixel_values,
             pixel_position_ids=image_position_ids,
         )
-        return self.base_model.embed_vision(vision_outputs.last_hidden_state)
+        return typing.cast(Array, self.base_model.embed_vision(vision_outputs.last_hidden_state))
 
     def compute_embedding(
         self,
@@ -3988,7 +4000,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(outputs.last_hidden_state)
+            lm_logits = self.compute_lm_logits(outputs.last_hidden_state)
 
         return VLMCausalLMOutput(
             logits=lm_logits,

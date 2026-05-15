@@ -69,6 +69,7 @@ def main():
     )
     esurge = elm.build_esurge()
 
+    out = None
     for out in esurge.chat(
         [{"role": "user", "content": "code fibo in c"}],
         sampling_params=ed.SamplingParams(max_tokens=2048),
@@ -79,7 +80,8 @@ def main():
 
         if out.delta_reasoning_content is not None:
             print(f"\033[1;38;5;99m{out.delta_reasoning_content}", end="")
-    print(f"\n\nTPS:{out.tokens_per_second}")
+    if out is not None:
+        print(f"\n\nTPS:{out.tokens_per_second}")
 
 
 if __name__ == "__main__":

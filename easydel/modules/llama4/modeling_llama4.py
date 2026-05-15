@@ -1526,7 +1526,7 @@ class Llama4VisionPixelShuffleMLP(spx.Module):
             Downsampled and transformed features [batch, reduced_patches, output_dim].
         """
         encoded_patches = pixel_shuffle(encoded_patches, self.pixel_shuffle_ratio)
-        return self.mlp(encoded_patches)
+        return tp.cast(Array, self.mlp(encoded_patches))
 
 
 def reshape_for_broadcast(frequencies: jax.Array, query: jax.Array) -> jax.Array:
@@ -1717,6 +1717,7 @@ class Llama4VisionAttention(AttentionModule):
         attn_output = attentions.attention_outputs.reshape(*input_shape, -1)
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.o_proj(attn_output)
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,

@@ -32,7 +32,7 @@ Exports:
 """
 
 from functools import cached_property
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -362,7 +362,8 @@ class GPTJAttention(UnifiedAttention):
             Projected output after applying dropout, with shape (batch, seq_len, hidden_size).
         """
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
-        return self.resid_dropout(attn_output)
+        attn_output = self.shard_attention_prod(attn_output)
+        return cast(Array, self.resid_dropout(attn_output))
 
 
 class GPTJMLP(spx.Module):

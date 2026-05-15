@@ -39,6 +39,7 @@ Exports:
     - :class:`Gemma3ForConditionalGeneration`: Vision-language generation head.
 """
 
+import typing as tp
 from functools import cached_property, partial
 
 import jax
@@ -1449,7 +1450,7 @@ class Gemma3Model(EasyDeLBaseModule):
             Array: Projected image features ready for merging with text embeddings.
         """
         vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
-        image_features = self.multi_modal_projector(vision_outputs)
+        image_features = tp.cast(Array, self.multi_modal_projector(vision_outputs))
         return image_features
 
     def compute_embedding(

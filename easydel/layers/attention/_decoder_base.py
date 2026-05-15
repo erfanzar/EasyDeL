@@ -104,6 +104,7 @@ See Also:
 """
 
 from collections.abc import Callable
+from typing import cast
 
 import jax.numpy as jnp
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -344,10 +345,13 @@ class BaseDecoderLayer:
             ``hidden_states`` with a sharding constraint matching
             :data:`common_types.HiddenStateSharding`.
         """
-        return apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=partition_manager,
+        return cast(
+            Array,
+            apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=partition_manager,
+            ),
         )
 
     @staticmethod

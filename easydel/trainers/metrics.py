@@ -54,6 +54,20 @@ from jax import numpy as jnp
 
 logger = get_logger("TrainerMetrics")
 
+_ANSI_CYAN = "\033[96m"
+_ANSI_RESET = "\033[0m"
+
+
+def _format_metrics_log(metrics: dict[str, tp.Any]) -> str:
+    """Return a dict-like metrics log with the performance block highlighted."""
+    items: list[str] = []
+    for key, value in metrics.items():
+        item = f"{key!r}: {value!r}"
+        if key == "performance":
+            item = f"{_ANSI_CYAN}{item}{_ANSI_RESET}"
+        items.append(item)
+    return "{" + ", ".join(items) + "}"
+
 
 class StepMetrics:
     """Handles calculation and tracking of training metrics.
@@ -723,7 +737,7 @@ class JSONProgressBar(BaseProgressBar):
                     current[part] = child
                 current = child
             current[parts[-1]] = val
-        logger.info(nested_kwargs)
+        logger.info(_format_metrics_log(nested_kwargs))
 
     def reset(self) -> None:
         """No-op."""

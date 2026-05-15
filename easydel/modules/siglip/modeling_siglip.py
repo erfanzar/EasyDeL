@@ -483,8 +483,9 @@ class SiglipAttention(AttentionModule):
             causal=self.causal,
         )
 
-        attn_output = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -1201,6 +1202,7 @@ class MultiheadAttention(spx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
+        partition_manager=None,
         *,
         rngs: spx.Rngs,
     ):
@@ -1226,6 +1228,7 @@ class MultiheadAttention(spx.Module):
             )
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.partition_manager = partition_manager
 
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
@@ -1290,7 +1293,13 @@ class MultiheadAttention(spx.Module):
             vout,
         )
 
-        return checkpoint_name(self.out_proj(attn.reshape(qbs, qss, qds)), "attn_output")
+        attn_output = checkpoint_name(self.out_proj(attn.reshape(qbs, qss, qds)), "attn_output")
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.partition_manager,
+        )
+        return attn_output
 
 
 class SiglipMultiheadAttentionPoolingHead(spx.Module):
@@ -1320,6 +1329,7 @@ class SiglipMultiheadAttentionPoolingHead(spx.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        self.config = config
         self.probe = ArrayParam.bound(
             shape=(1, 1, config.hidden_size),
             dtype=param_dtype,
@@ -1332,6 +1342,7 @@ class SiglipMultiheadAttentionPoolingHead(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            partition_manager=config.runtime_sharding_resolver,
             rngs=rngs,
         )
         self.layernorm = LayerNorm(
@@ -1361,9 +1372,19 @@ class SiglipMultiheadAttentionPoolingHead(spx.Module):
         batch_size = hidden_state.shape[0]
         probe = self.probe.value.repeat(batch_size, 0)
         hidden_state = self.attention(probe, hidden_state, hidden_state)
+        hidden_state = apply_logical_sharding(
+            hidden_state,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         residual = hidden_state
         hidden_state = self.layernorm(hidden_state)
         hidden_state = checkpoint_name(residual + self.mlp(hidden_state), "residual")
+        hidden_state = apply_logical_sharding(
+            hidden_state,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         return hidden_state[:, 0]
 
 

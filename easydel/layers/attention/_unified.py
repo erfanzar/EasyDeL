@@ -1272,6 +1272,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         attention_out = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attention_out)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
@@ -1521,6 +1522,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -1606,6 +1608,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
 
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)

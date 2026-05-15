@@ -923,11 +923,14 @@ def constrain_scheduled_batch(
 ) -> dict[str, tp.Any]:
     """Apply the standard EasyDeL scheduled batch sharding constraint."""
 
-    return spx.with_sharding_constraint(
-        dict(batch),
-        partition_spec,
-        mesh=module.mesh,
-        ignore_mpmd=True,
+    return tp.cast(
+        dict[str, tp.Any],
+        spx.with_sharding_constraint(
+            dict(batch),
+            partition_spec,
+            mesh=module.mesh,
+            ignore_mpmd=True,
+        ),
     )
 
 
@@ -1045,6 +1048,7 @@ def cached_scheduled_auxiliary(
             arg_batches.append(tuple(sliced))
         microbatch_outputs: list[tp.Any] | None = None
         used_wavefront = False
+        executor = None
         if not kwargs:
             executor = _scheduled_aux_pipeline_executor()
             if executor is not None:

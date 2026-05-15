@@ -38,6 +38,7 @@ References:
 
 from __future__ import annotations
 
+import typing
 from collections.abc import Callable
 from functools import cached_property
 
@@ -46,7 +47,7 @@ import jax.numpy as jnp
 import spectrax as spx
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
-from spectrax import common_types, nn
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.infra.base_module import EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
@@ -243,6 +244,7 @@ class MoonVisionPatchEmbed(spx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
+        partition_manager=None,
         *,
         rngs: spx.Rngs,
     ) -> None:
@@ -268,6 +270,7 @@ class MoonVisionPatchEmbed(spx.Module):
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.dtype = dtype
+        self.partition_manager = partition_manager
 
         self.proj = nn.Conv2d(
             in_channels=in_dim,
@@ -311,7 +314,13 @@ class MoonVisionPatchEmbed(spx.Module):
             pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
         x = self.proj(pixel_values.astype(self.dtype))
         x = x.reshape(x.shape[0], -1)
-        return checkpoint_name(self.pos_emb(x, grid_hws), "embeddings")
+        x = checkpoint_name(self.pos_emb(x, grid_hws), "embeddings")
+        x = apply_logical_sharding(
+            x,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.partition_manager,
+        )
+        return typing.cast(Array, x)
 
 
 class Rope2DPosEmb(spx.Module):
@@ -850,6 +859,7 @@ class MoonVitPretrainedModel(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            partition_manager=config.runtime_sharding_resolver,
             rngs=rngs,
         )
         self.encoder = MoonVitEncoder(
@@ -929,6 +939,7 @@ class KimiVLMultiModalProjector(spx.Module):
         merge_kernel = tuple(config.vision_config.merge_kernel_size)
         hidden_size = config.vision_config.hidden_size * merge_kernel[0] * merge_kernel[1]
 
+        self.config = config
         self.hidden_size = hidden_size
         self.pre_norm = LayerNorm(
             config.vision_config.hidden_size,
@@ -971,9 +982,24 @@ class KimiVLMultiModalProjector(spx.Module):
         """
         image_features = jnp.concatenate(image_features, axis=0)
         hidden_states = self.pre_norm(image_features).reshape(-1, self.hidden_size)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         hidden_states = checkpoint_name(self.linear_1(hidden_states), "mlp_up")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         hidden_states = jax.nn.gelu(hidden_states, approximate=False)
         hidden_states = checkpoint_name(self.linear_2(hidden_states), "mlp_down")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
@@ -1114,7 +1140,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
             image_features = spx.sxstage_region("kimi_vl_vision")(self.vision_tower)(pixel_values, image_grid_hws)
         else:
             image_features = self.vision_tower(pixel_values, image_grid_hws)
-        return self.multi_modal_projector(image_features)
+        return typing.cast(Array, self.multi_modal_projector(image_features))
 
     def get_image_features(
         self,

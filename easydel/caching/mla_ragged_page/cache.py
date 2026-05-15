@@ -373,9 +373,11 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
                 ``[num_pages, page_size_per_kv_packing, kv_packing, kv_dim_padded]``.
         """
         pages = self.kv_pages
+        if pages is None:
+            raise ValueError("MLA ragged page cache has no KV pages.")
         if isinstance(pages, ImplicitArray):
             pages = pages.materialize()
-        return pages
+        return tp.cast(Array, pages)
 
     @property
     def key_pages(self):

@@ -210,6 +210,8 @@ def main() -> None:
     dtype = jnp.bfloat16
     gdr_op = _make_gdr_op(args.layout, runtime_dtype=dtype, grouped_decode_backend=args.gdr_backend)
     mesh = gdr_op.metadata.mesh
+    if mesh is None:
+        raise RuntimeError("GatedDeltaRuleOp metadata did not provide a mesh.")
 
     print(
         f"backend={jax.default_backend()} devices={len(jax.devices())} "

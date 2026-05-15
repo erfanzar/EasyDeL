@@ -1425,10 +1425,13 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         Returns:
             jax.Array: The input tensor with applied sharding constraints based on the config.
         """
-        return apply_logical_sharding(
-            x=attn_output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
+        return tp.cast(
+            JArray,
+            apply_logical_sharding(
+                x=attn_output,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            ),
         )
 
     def _merge_heads(self, hidden_states: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch seq hidden"]:

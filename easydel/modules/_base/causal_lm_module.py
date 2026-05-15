@@ -617,10 +617,13 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             config_has_pp = pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
         if is_mpmd_mesh(mesh) or int(getattr(mesh, "shape", {}).get("pp", 1)) > 1 or config_has_pp:
             return hidden_states
-        return apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
+        return typing.cast(
+            Array,
+            apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            ),
         )
 
     def compute_lm_logits(self, hidden_states: Array) -> Array:

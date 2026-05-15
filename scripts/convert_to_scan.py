@@ -45,7 +45,7 @@ SCAN_IMPORT = """        from easydel.infra.layer_scan import (
 """
 
 
-def make_standard_replacement(block_call: str, has_router_logits: bool = False) -> str:
+def make_standard_replacement(block_call: str, has_router_logits: bool = False) -> str | None:
     """Generate scan replacement for standard models."""
     # Extract kwargs from block call
     kwargs_match = re.search(r"block\((.*?)\n            \)", block_call, re.DOTALL)

@@ -561,6 +561,10 @@ class ParallelLinearQuantized(spx.Module):
 
     _direction: tp.Literal["row", "column"] | None = None
 
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, inputs: Array, w: Array | None = None) -> Array: ...
+
     def __init__(
         self,
         in_features: int,

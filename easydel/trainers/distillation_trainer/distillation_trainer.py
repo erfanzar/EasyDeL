@@ -38,7 +38,7 @@ from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
-from ._fn import distillation_step
+from ._fn import distillation_step, distillation_teacher_forward_step
 from .distillation_config import DistillationConfig
 
 if tp.TYPE_CHECKING:
@@ -132,8 +132,12 @@ class DistillationTrainer(Trainer):
 
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
-        if not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+        if isinstance(teacher_model, EasyDeLState):
+            teacher_module = teacher_model.model
+        else:
+            teacher_module = teacher_model
+        teacher_module.eval()
+        teacher_model = teacher_module.to_state(trainable_selector=arguments.trainable_selector)
 
         self.teacher_state = teacher_model
 
@@ -196,10 +200,18 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.checkpoint_kl_loss),
         )
 
+        teacher_static_argnums = (2, 3, 4, 5)
+        sharded_teacher_forward_function = compile_trainer_step(
+            distillation_teacher_forward_step,
+            in_shardings=(self.teacher_state.shardings, empty_sharding),
+            static_argnums=teacher_static_argnums,
+            mesh=self.model.mesh,
+        )
+
         static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
-        sharded_training_step_function = compile_trainer_step(
+        sharded_student_training_step_function = compile_trainer_step(
             distillation_step,
-            in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+            in_shardings=(self.state_shardings, None, self.teacher_state.shardings),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnames,
@@ -226,14 +238,52 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.checkpoint_kl_loss),
         )
 
-        sharded_evaluation_step_function = compile_trainer_step(
+        sharded_student_evaluation_step_function = compile_trainer_step(
             distillation_step,
-            in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+            in_shardings=(self.state_shardings, None, self.teacher_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+
+        def _precompute_teacher_outputs(teacher_state: EasyDeLState, batch: dict[str, tp.Any], static_args: tuple):
+            partition_spec = static_args[2]
+            hidden_state_weight = static_args[7]
+            attention_weight = static_args[10]
+            logits_chunk_size = static_args[14]
+            teacher_outputs = sharded_teacher_forward_function(
+                teacher_state,
+                batch,
+                partition_spec,
+                logits_chunk_size,
+                hidden_state_weight,
+                attention_weight,
+            )
+            batch = dict(batch)
+            batch.update(teacher_outputs)
+            return batch
+
+        def sharded_training_step_function(
+            student_state: EasyDeLState,
+            batch: dict[str, tp.Any],
+            teacher_state: EasyDeLState,
+            *static_args,
+        ):
+            batch = _precompute_teacher_outputs(teacher_state, batch, static_args)
+            return sharded_student_training_step_function(student_state, batch, teacher_state, *static_args)
+
+        def sharded_evaluation_step_function(
+            student_state: EasyDeLState,
+            batch: dict[str, tp.Any],
+            teacher_state: EasyDeLState,
+            *static_args,
+        ):
+            batch = _precompute_teacher_outputs(teacher_state, batch, static_args)
+            return sharded_student_evaluation_step_function(student_state, batch, teacher_state, *static_args)
+
+        sharded_training_step_function.static_argnums_ = static_argnames
+        sharded_evaluation_step_function.static_argnums_ = static_argnames
 
         flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)
 

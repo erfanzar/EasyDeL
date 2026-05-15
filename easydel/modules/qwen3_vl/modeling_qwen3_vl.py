@@ -465,6 +465,7 @@ class Qwen3VLVisionPatchEmbed(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
+        self.config = config
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
@@ -502,6 +503,11 @@ class Qwen3VLVisionPatchEmbed(spx.Module):
         )
         hidden_states = self.proj(hidden_states.astype(self.dtype))
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         return hidden_states
 
 
@@ -791,7 +797,9 @@ class Qwen3VLVisionAttention(UnifiedAttention):
 
         attn_output = attn_output.squeeze(0)
         attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.proj(attn_output), "vision_attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
         return attn_output
 
 

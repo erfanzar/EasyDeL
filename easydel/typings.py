@@ -725,5 +725,5 @@ def _default_field(value: tp.Any) -> dataclasses.Field:
         ``default_factory`` as appropriate.
     """
     if isinstance(value, (dict, list, set)):
-        return dataclasses.field(default_factory=lambda value=value: value.copy())
+        return tp.cast(dataclasses.Field[tp.Any], dataclasses.field(default_factory=lambda value=value: value.copy()))
     return dataclasses.field(default=value)

@@ -1195,6 +1195,11 @@ class KimiDeltaAttention(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         output = self.o_proj(output)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
 
         new_cache_view = cache_view
         if cache_view is not None:

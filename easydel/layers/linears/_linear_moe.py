@@ -563,6 +563,15 @@ class RowParallelMoELinear(ParallelMoELinear):
 
     _direction: typing.Literal["row", "column"] | None = "row"
 
+    if typing.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            inputs: Float[Array, "tokens_ragged hidden_dim"],
+            group_sizes: Int[Array, "num_groups"],  # noqa
+            sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+        ) -> Float[Array, "tokens_ragged out_dim"]: ...
+
 
 class ColumnParallelMoELinear(ParallelMoELinear):
     """Column-parallel variant of ParallelMoELinear.
@@ -588,3 +597,12 @@ class ColumnParallelMoELinear(ParallelMoELinear):
     """
 
     _direction: typing.Literal["row", "column"] | None = "column"
+
+    if typing.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            inputs: Float[Array, "tokens_ragged hidden_dim"],
+            group_sizes: Int[Array, "num_groups"],  # noqa
+            sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+        ) -> Float[Array, "tokens_ragged out_dim"]: ...

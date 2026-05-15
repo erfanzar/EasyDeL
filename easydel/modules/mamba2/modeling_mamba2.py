@@ -581,6 +581,11 @@ class Mamba2Mixer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
+        contextualized_states = apply_logical_sharding(
+            contextualized_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         return contextualized_states, cache_view
 
 

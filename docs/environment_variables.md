@@ -53,19 +53,25 @@ Appended to existing values when `EASYDEL_AUTO` is true:
   - `--xla_gpu_enable_triton_gemm=true`
   - `--xla_gpu_enable_command_buffer=''`
   - `--xla_disable_hlo_passes=collective-permute-motion`
-- `LIBTPU_INIT_ARGS` adds:
-  - `--xla_tpu_enable_latency_hiding_scheduler=true`
-  - `--xla_enable_async_collective_permute=true`
-  - `--xla_tpu_enable_ag_backward_pipelining=true`
-  - `--xla_tpu_enable_data_parallel_all_reduce_opt=true`
-  - `--xla_tpu_data_parallel_opt_different_sized_ops=true`
-  - `--xla_tpu_enable_async_collective_fusion=true`
-  - `--xla_tpu_enable_async_collective_fusion_multiple_steps=true`
-  - `--xla_tpu_overlap_compute_collective_tc=true`
+- EasyDeL's targeted TPU bundle uses `EASYDEL_TARGETED_TPU_GENERATION` when it is set to a known
+  TPU generation. If it is absent, EasyDeL tries to infer the TPU generation without initializing
+  the JAX TPU backend by checking TPU-related environment variables and GCE metadata
+  (`instance/attributes/accelerator-type`, `instance/attributes/acceleratorType`, and
+  `instance/machine-type`). Unknown values intentionally add no generation-specific TPU flags.
+  Dependencies imported by EasyDeL may still set their own libtpu flags independently.
+
+Known `EASYDEL_TARGETED_TPU_GENERATION` values:
+
+- `v4`, `tpu-v4`, `4`: v4-style async all-gather plus `TPU_MEGACORE=MEGACORE_DENSE`.
+- `v5e`, `tpu-v5e`, `5e`: v5e-style data-parallel overlap and all-gather continuation-fusion flags.
+- `v5p`, `tpu-v5p`, `5p`: v5p-style async collective-permute, AG backward pipelining, data-parallel overlap, and all-gather continuation-fusion flags.
+- `v6e`, `v6`, `trillium`, `max-6`, `max6`, `tpu-v6e`, `6`, `6e`: v6e dense continuation-fusion bundle:
+  - `--xla_tpu_scoped_vmem_limit_kib=98304`
   - `--xla_enable_async_all_gather=true`
+  - `--xla_tpu_overlap_compute_collective_tc=true`
+  - `--xla_tpu_enable_async_collective_fusion_multiple_steps=true`
+  - `--xla_tpu_enable_async_collective_fusion=true`
   - `--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true`
-  - `--xla_tpu_megacore_fusion_allow_ags=false`
-  - `TPU_MEGACORE=MEGACORE_DENSE`
 
 Set only if missing when `EASYDEL_AUTO` is true:
 

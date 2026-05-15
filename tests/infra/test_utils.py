@@ -299,6 +299,36 @@ def test_flop_transformer_body_scales_linearly_with_layers():
     assert f_two_layers == pytest.approx(2 * f_one_layer)
 
 
+def test_flop_transformer_body_sliding_attention_uses_window():
+    cfg_full = _basic_cfg(layer_types=["full_attention"], sliding_window=16)
+    cfg_sliding = _basic_cfg(layer_types=["sliding_attention"], sliding_window=16)
+
+    full = flop_transformer_body(layers=1, seq_len=64, hidden_dim=128, intermediate_dim=512, cfg=cfg_full)
+    sliding = flop_transformer_body(layers=1, seq_len=64, hidden_dim=128, intermediate_dim=512, cfg=cfg_sliding)
+
+    assert sliding < full
+
+
+def test_flop_transformer_body_linear_attention_is_cheaper_than_full_attention():
+    cfg_full = _basic_cfg(layer_types=["full_attention"])
+    cfg_linear = _basic_cfg(layer_types=["linear_attention"])
+
+    full = flop_transformer_body(layers=1, seq_len=256, hidden_dim=128, intermediate_dim=512, cfg=cfg_full)
+    linear = flop_transformer_body(layers=1, seq_len=256, hidden_dim=128, intermediate_dim=512, cfg=cfg_linear)
+
+    assert linear < full
+
+
+def test_flop_transformer_body_respects_moe_layer_count():
+    cfg_dense = _basic_cfg(num_experts=8, num_experts_per_tok=2, num_moe_layers=0)
+    cfg_sparse = _basic_cfg(num_experts=8, num_experts_per_tok=2, num_moe_layers=2)
+
+    dense = flop_transformer_body(layers=2, seq_len=64, hidden_dim=128, intermediate_dim=512, cfg=cfg_dense)
+    sparse = flop_transformer_body(layers=2, seq_len=64, hidden_dim=128, intermediate_dim=512, cfg=cfg_sparse)
+
+    assert sparse > dense
+
+
 def test_flop_seq2seq_more_encoder_layers_costs_more():
     """A seq2seq model with deeper encoder costs more than a shallow one."""
     cfg_short = _basic_cfg(enc_num_layers=2, enc_seq_len=64)
@@ -323,6 +353,34 @@ def test_flop_vision_tower_scales_with_vision_layers():
         vision_seq_len=16,
     )
     assert flop_vision_tower(cfg_four) == pytest.approx(4 * flop_vision_tower(cfg_one))
+
+
+def test_flop_vision_tower_missing_sequence_length_is_zero_cost():
+    """Some VLM configs expose ``max_position_embeddings=None`` for vision."""
+    cfg = _basic_cfg(
+        vision_num_layers=4,
+        vision_hidden_dim=64,
+        vision_intermediate_dim=128,
+        vision_num_heads=4,
+        vision_seq_len=None,
+    )
+    assert flop_vision_tower(cfg) == 0.0
+
+
+def test_flop_vision_tower_does_not_use_text_attention_geometry():
+    """Vision tower cost must use vision heads/head_dim, not text-model fields."""
+    common = dict(
+        vision_num_layers=2,
+        vision_hidden_dim=64,
+        vision_intermediate_dim=128,
+        vision_num_heads=4,
+        vision_head_dim=16,
+        vision_seq_len=16,
+    )
+    cfg_text_heads_one = _basic_cfg(num_heads=1, kv_heads=1, head_dim=128, **common)
+    cfg_text_heads_many = _basic_cfg(num_heads=8, kv_heads=8, head_dim=16, **common)
+
+    assert flop_vision_tower(cfg_text_heads_one) == pytest.approx(flop_vision_tower(cfg_text_heads_many))
 
 
 def test_flop_attention_zero_seq_len_raises_division_by_zero():
@@ -355,3 +413,18 @@ def test_flops_per_token_include_loss_adds_cost():
     base = _basic_cfg(task=TaskType.CAUSAL_LM, vocab_size=10000, include_loss=False)
     with_loss = _basic_cfg(task=TaskType.CAUSAL_LM, vocab_size=10000, include_loss=True)
     assert flops_per_token(with_loss) > flops_per_token(base)
+
+
+def test_flops_per_token_image_text_handles_missing_vision_sequence_length():
+    """Qwen3.5-style VLM configs should not collapse to fallback FLOPs."""
+    cfg = _basic_cfg(
+        task=TaskType.IMAGE_TEXT_TO_TEXT,
+        vocab_size=10000,
+        include_loss=True,
+        vision_num_layers=0,
+        vision_hidden_dim=768,
+        vision_intermediate_dim=3072,
+        vision_num_heads=12,
+        vision_seq_len=None,
+    )
+    assert flops_per_token(cfg) > flops_per_token(_basic_cfg(task=TaskType.BASE_MODULE))

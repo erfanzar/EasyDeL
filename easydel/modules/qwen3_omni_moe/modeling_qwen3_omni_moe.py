@@ -306,7 +306,13 @@ class Qwen3OmniMoeAudioAttention(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return self.out_proj(attn_output)
+        attn_output = self.out_proj(attn_output)
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return typing.cast(Array, attn_output)
 
 
 class Qwen3OmniMoeAudioEncoderLayer(spx.Module):
@@ -777,6 +783,7 @@ class Qwen3OmniMoeVisionPatchEmbed(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
+        self.config = config
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
@@ -813,7 +820,13 @@ class Qwen3OmniMoeVisionPatchEmbed(spx.Module):
             (0, 2, 3, 4, 1),
         )
         hidden_states = self.proj(hidden_states.astype(self.dtype))
-        return hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return hidden_states
 
 
 class Qwen3OmniMoeVisionPatchMerger(spx.Module):
@@ -1043,7 +1056,18 @@ class Qwen3OmniMoeVisionAttention(spx.Module):
         ).attention_outputs
 
         attn_output = attn_output.reshape(seq_length, -1)
-        return checkpoint_name(self.proj(attn_output), "vision_attn_output")
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        attn_output = checkpoint_name(self.proj(attn_output), "vision_attn_output")
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return typing.cast(Array, attn_output)
 
 
 class Qwen3OmniMoeVisionBlock(spx.Module):
@@ -1316,7 +1340,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             (hidden_states, 0),
             trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
         )
-        return self.merger(hidden_states)
+        return typing.cast(Array, self.merger(hidden_states))
 
     def get_encoder(self):
         """Return the vision encoder itself.
@@ -3663,7 +3687,13 @@ class Qwen3OmniMoeCode2WavAttention(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return typing.cast(Array, attn_output)
 
 
 class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
@@ -3948,7 +3978,7 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         hidden_states = self.code_embedding(codes_with_offset.astype("i4")).mean(axis=1)
 
         # Pass through transformer
-        outputs = self.pre_transformer(hidden_states, attention_mask)
+        outputs = typing.cast(BaseModelOutput, self.pre_transformer(hidden_states, attention_mask))
 
         return outputs
 
@@ -4961,7 +4991,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         logits = None
         if apply_lm_head:
-            logits = self.lm_head(outputs.last_hidden_state)
+            logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         return MoeCausalLMOutput(
             logits=logits,

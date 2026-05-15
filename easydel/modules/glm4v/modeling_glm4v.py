@@ -191,6 +191,7 @@ class Glm4vVisionPatchEmbed(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.dtype = dtype
+        self.config = config
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
@@ -228,6 +229,11 @@ class Glm4vVisionPatchEmbed(spx.Module):
         )
         hidden_states = self.proj(hidden_states.astype(self.dtype))
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
         return hidden_states
 
 
@@ -467,7 +473,10 @@ class Glm4vVisionAttention(UnifiedAttention):
 
         attn_output = attn_output.squeeze(0)
         attn_output = attn_output.reshape(seq_length, -1)
-        return checkpoint_name(self.proj(attn_output), "vision_attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+        attn_output = checkpoint_name(self.proj(attn_output), "vision_attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+        return attn_output
 
 
 class Glm4vVisionBlock(spx.Module):
@@ -582,6 +591,7 @@ class Glm4vVisionPatchMerger(spx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
+        partition_manager=None,
         *,
         rngs: spx.Rngs,
     ) -> None:
@@ -596,6 +606,7 @@ class Glm4vVisionPatchMerger(spx.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        self.partition_manager = partition_manager
         self.proj = ColumnParallelLinear(
             dim,
             dim,
@@ -656,8 +667,19 @@ class Glm4vVisionPatchMerger(spx.Module):
             Array: Merged embeddings of shape (num_patches, dim).
         """
         hidden_state = self.proj(hidden_state)
+        hidden_state = apply_logical_sharding(
+            hidden_state,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.partition_manager,
+        )
         hidden_state = self.act1(self.norm(hidden_state))
-        return self.down_proj(self.act(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        hidden_state = self.down_proj(self.act(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        hidden_state = apply_logical_sharding(
+            hidden_state,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.partition_manager,
+        )
+        return hidden_state
 
 
 @register_module(TaskType.BASE_VISION, config=Glm4vConfig, model_type="glm4v")
@@ -772,6 +794,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            partition_manager=config.runtime_sharding_resolver,
             rngs=rngs,
         )
 

@@ -384,11 +384,16 @@ class MiniMaxLightningAttention(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
 
         if cache_view is not None:
             cache_view = cache_view.update_recurrent_state(attn_weights_inter)
 
-        return attn_output, cache_view
+        return typing.cast(Array, attn_output), cache_view
 
 
 class MiniMaxAttention(UnifiedAttention[MiniMaxConfig]):

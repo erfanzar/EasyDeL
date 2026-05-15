@@ -53,7 +53,7 @@ import typing as tp
 import warnings
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import lru_cache, partial
 
@@ -81,6 +81,7 @@ warnings.filterwarnings("ignore", message="Primitive dynamic_update_slice was no
 logger = get_logger(__name__)
 
 _ATTN_CHECKPOINT_NAME_PATTERN = re.compile(r"^attn_")
+_LMHEAD_CHECKPOINT_NAME_PATTERN = re.compile(r"^lm_head_")
 _MLP_CHECKPOINT_NAME_PATTERN = re.compile(r"^mlp_")
 
 
@@ -90,7 +91,7 @@ def _select_checkpoint_names_by_regex(
     exclude_patterns: Sequence[re.Pattern[str]] | None = None,
 ) -> list[str]:
     """Resolve known checkpoint names using include/exclude regex filters."""
-    names = list(GRADIENT_CHECKPOINT_TARGETS)
+    names = [str(name) for name in GRADIENT_CHECKPOINT_TARGETS]
     if include_patterns:
         names = [name for name in names if any(pattern.search(name) for pattern in include_patterns)]
     if exclude_patterns:
@@ -198,6 +199,9 @@ def get_gradient_checkpoint_policy(
             - 'mlp_notsaveable': Save all known checkpoint names except MLP-family names
             - 'attn_notsaveable': Save all known checkpoint names except attention-family names
             - 'mlp_attn_notsaveable': Save all known checkpoint names except MLP and attention names
+            - 'lmhead_notsaveable': Save all known checkpoint names except LM-head names
+            - 'attn_lmhead_notsaveable': Save all known checkpoint names except attention and LM-head names
+            - 'mlp_lmhead_notsaveable': Save all known checkpoint names except MLP and LM-head names
             - 'save_from_both_policies': Combine two policies
         save_names: List of checkpoint names to save (used with 'save_only_these_names')
         exclude_names: List of checkpoint names to exclude (used with 'save_anything_except_these_names')
@@ -238,6 +242,22 @@ def get_gradient_checkpoint_policy(
     elif name == "mlp_attn_notsaveable":
         save_names = _select_checkpoint_names_by_regex(
             exclude_patterns=[_MLP_CHECKPOINT_NAME_PATTERN, _ATTN_CHECKPOINT_NAME_PATTERN]
+        )
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "lmhead_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(exclude_patterns=[_LMHEAD_CHECKPOINT_NAME_PATTERN])
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "attn_lmhead_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(
+            exclude_patterns=[_ATTN_CHECKPOINT_NAME_PATTERN, _LMHEAD_CHECKPOINT_NAME_PATTERN]
+        )
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "mlp_lmhead_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(
+            exclude_patterns=[_MLP_CHECKPOINT_NAME_PATTERN, _LMHEAD_CHECKPOINT_NAME_PATTERN]
         )
         return jax.checkpoint_policies.save_only_these_names(*save_names)
 
@@ -1584,6 +1604,11 @@ class FlopCalcConfig:
     num_experts: int = 1
     num_shared_experts: int = 0
     num_experts_per_tok: int = 1
+    moe_intermediate_dim: int | None = None
+    shared_expert_intermediate_dim: int = 0
+    num_moe_layers: int | None = None
+    layer_types: Sequence[str] | None = None
+    sliding_window: int | None = None
 
     # Task specifics
     activation_type: ActivationType = ActivationType.GELU
@@ -1596,7 +1621,9 @@ class FlopCalcConfig:
     vision_intermediate_dim: int = 0
     vision_num_layers: int = 0
     vision_num_heads: int = 0
-    vision_seq_len: int = 0
+    vision_seq_len: int | None = 0
+    vision_head_dim: int | None = None
+    vision_activation_type: ActivationType = ActivationType.GELU
 
     include_loss: bool = False
 
@@ -1646,6 +1673,22 @@ def flop_attention(
     return qkv_proj + dense_proj + attn
 
 
+def flop_linear_attention(
+    hidden_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int | None,
+    seq_len: int,
+) -> float:
+    """Estimate per-token FLOPs for linear-recurrent attention/state-space blocks."""
+    if head_dim is None:
+        head_dim = hidden_dim // num_heads
+    qkv_proj = 2 * hidden_dim * (num_heads * head_dim + 2 * num_kv_heads * head_dim)
+    dense_proj = 2 * hidden_dim * hidden_dim
+    recurrent_state = 4 * seq_len * num_heads * head_dim
+    return qkv_proj + dense_proj + recurrent_state
+
+
 def flop_cross_attention(
     hidden_dim: int,
     num_heads: int,
@@ -1672,6 +1715,56 @@ def flop_cross_attention(
     return proj + scores + softmax + wsum + out_proj
 
 
+def flop_dense_mlp(
+    cfg: FlopCalcConfig,
+    hidden_dim: int,
+    intermediate_dim: int,
+) -> float:
+    """Estimate FLOPs for a dense FFN block."""
+    factor = 3 if cfg.glu else 2
+    matmuls = 2 * factor * hidden_dim * intermediate_dim
+    activation_flops = flop_activation(cfg.activation_type, intermediate_dim)
+    return matmuls + activation_flops
+
+
+def flop_moe_mlp(
+    cfg: FlopCalcConfig,
+    hidden_dim: int,
+    intermediate_dim: int,
+) -> float:
+    """Estimate FLOPs for the active experts of an MoE FFN block."""
+    expert_dim = cfg.moe_intermediate_dim or intermediate_dim
+    active_expert_cost = flop_dense_mlp(cfg, hidden_dim, expert_dim) * max(cfg.num_experts_per_tok, 1)
+
+    shared_dim = cfg.shared_expert_intermediate_dim or intermediate_dim
+    shared_expert_cost = flop_dense_mlp(cfg, hidden_dim, shared_dim) * max(cfg.num_shared_experts, 0)
+
+    router = 2 * hidden_dim * cfg.num_experts if cfg.num_experts > 1 else 0
+    return active_expert_cost + shared_expert_cost + router
+
+
+def _num_moe_layers(cfg: FlopCalcConfig, layers: int) -> int:
+    if cfg.num_experts <= 1:
+        return 0
+    if cfg.num_moe_layers is not None:
+        return max(0, min(cfg.num_moe_layers, layers))
+    return layers
+
+
+def _attention_flops_for_layer(
+    cfg: FlopCalcConfig,
+    hidden_dim: int,
+    seq_len: int,
+    layer_type: str | None,
+) -> float:
+    layer_type = (layer_type or "").lower()
+    if "sliding" in layer_type and cfg.sliding_window:
+        seq_len = min(seq_len, cfg.sliding_window)
+    if "linear" in layer_type or "mamba" in layer_type or "gated_delta" in layer_type:
+        return flop_linear_attention(hidden_dim, cfg.num_heads, cfg.kv_heads, cfg.head_dim, seq_len)
+    return flop_attention(hidden_dim, cfg.num_heads, cfg.kv_heads, cfg.head_dim, seq_len)
+
+
 def flop_mlp(
     cfg: FlopCalcConfig,
     hidden_dim: int,
@@ -1688,16 +1781,9 @@ def flop_mlp(
         float: FLOPs including up/down/gate projections, activation, and
         router cost when MoE is active.
     """
-    factor = 3 if cfg.glu else 2
-    base = factor * hidden_dim * intermediate_dim
-    total_ffn = base * (cfg.num_experts_per_tok + cfg.num_shared_experts)
-    activation_flops = flop_activation(
-        cfg.activation_type,
-        intermediate_dim * (cfg.num_experts_per_tok + cfg.num_shared_experts),
-    )
-
-    router = 2 * hidden_dim * cfg.num_experts if cfg.num_experts > 1 else 0
-    return 2 * total_ffn + activation_flops + router
+    if cfg.num_experts > 1:
+        return flop_moe_mlp(cfg, hidden_dim, intermediate_dim)
+    return flop_dense_mlp(cfg, hidden_dim, intermediate_dim)
 
 
 def flop_lm_head(hidden_dim: int, vocab_size: int) -> float:
@@ -1757,16 +1843,22 @@ def flop_transformer_body(
     Returns:
         float: Total FLOPs across all layers.
     """
+    if layers <= 0 or seq_len <= 0 or hidden_dim <= 0 or intermediate_dim <= 0 or cfg.num_heads <= 0:
+        return 0.0
+
     ln = 2 * flop_layernorm(hidden_dim)
-    att = flop_attention(
-        hidden_dim,
-        cfg.num_heads,
-        cfg.kv_heads,
-        cfg.head_dim,
-        seq_len,
+    layer_types = list(cfg.layer_types or ())
+    if len(layer_types) < layers:
+        layer_types.extend([None] * (layers - len(layer_types)))
+
+    att = sum(
+        _attention_flops_for_layer(cfg, hidden_dim, seq_len, layer_types[layer_idx]) for layer_idx in range(layers)
     )
-    mlp = flop_mlp(cfg, hidden_dim, intermediate_dim)
-    return layers * (ln + att + mlp)
+    moe_layers = _num_moe_layers(cfg, layers)
+    dense_layers = layers - moe_layers
+    dense_mlp = flop_dense_mlp(cfg, hidden_dim, intermediate_dim)
+    moe_mlp = flop_moe_mlp(cfg, hidden_dim, intermediate_dim) if moe_layers else 0.0
+    return layers * ln + att + dense_layers * dense_mlp + moe_layers * moe_mlp
 
 
 def flop_seq2seq(cfg: FlopCalcConfig) -> float:
@@ -1814,12 +1906,43 @@ def flop_vision_tower(cfg: FlopCalcConfig) -> float:
     Returns:
         float: FLOPs for the vision encoder.
     """
+    if (
+        cfg.vision_num_layers <= 0
+        or cfg.vision_hidden_dim <= 0
+        or cfg.vision_intermediate_dim <= 0
+        or cfg.vision_num_heads <= 0
+        or cfg.vision_seq_len is None
+        or cfg.vision_seq_len <= 0
+    ):
+        return 0.0
+
+    vision_head_dim = cfg.vision_head_dim
+    if vision_head_dim is None:
+        vision_head_dim = cfg.vision_hidden_dim // cfg.vision_num_heads
+
+    vision_cfg = replace(
+        cfg,
+        num_heads=cfg.vision_num_heads,
+        kv_heads=cfg.vision_num_heads,
+        head_dim=vision_head_dim,
+        activation_type=cfg.vision_activation_type,
+        glu=False,
+        num_experts=1,
+        num_shared_experts=0,
+        num_experts_per_tok=1,
+        moe_intermediate_dim=None,
+        shared_expert_intermediate_dim=0,
+        num_moe_layers=0,
+        layer_types=None,
+        sliding_window=None,
+    )
+
     return flop_transformer_body(
         cfg.vision_num_layers,
         cfg.vision_seq_len,
         cfg.vision_hidden_dim,
         cfg.vision_intermediate_dim,
-        cfg,
+        vision_cfg,
     )
 
 
@@ -1883,14 +2006,8 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
         body_cost = flop_vision_tower(cfg)
 
     elif cfg.task == TaskType.IMAGE_TEXT_TO_TEXT:
-        try:
-            vision = flop_vision_tower(cfg)
-            text = flop_seq2seq(cfg)
-        except ZeroDivisionError:
-            vision = 0
-            text = 0
-
-        clm_head = flop_transformer_body(
+        vision = flop_vision_tower(cfg)
+        text = flop_transformer_body(
             cfg.num_layers,
             cfg.seq_len,
             cfg.hidden_dim,
@@ -1898,7 +2015,7 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
             cfg,
         )
 
-        body_cost = vision + text + clm_head
+        body_cost = vision + text
         head_cost = flop_lm_head(cfg.hidden_dim, cfg.vocab_size)
         loss_cost = flop_loss(cfg.vocab_size) if cfg.include_loss else 0
 

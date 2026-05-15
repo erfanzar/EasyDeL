@@ -293,7 +293,7 @@ def concatenated_forward(
 
     if aux_loss_enabled and hasattr(outputs, "aux_loss"):
         output["aux_loss"] = outputs.aux_loss
-    return output
+    return tp.cast(dict[str, jax.Array], output)
 
 
 def compute_bco_loss(

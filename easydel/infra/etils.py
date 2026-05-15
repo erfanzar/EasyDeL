@@ -210,6 +210,12 @@ class EasyDeLGradientCheckPointers(StrEnum):
             Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
         MLP_ATTN_NOTSAVEABLE: Save everything except MLP and attention checkpoint names.
             Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
+        LMHEAD_NOTSAVEABLE: Save everything except LM-head checkpoint names.
+            Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
+        ATTN_LMHEAD_NOTSAVEABLE: Save everything except attention and LM-head checkpoint names.
+            Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
+        MLP_LMHEAD_NOTSAVEABLE: Save everything except MLP and LM-head checkpoint names.
+            Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
         SAVE_FROM_BOTH_POLICIES: Combines inclusion and exclusion policies.
             Uses both include and exclude lists for maximum flexibility.
 
@@ -234,6 +240,9 @@ class EasyDeLGradientCheckPointers(StrEnum):
     MLP_NOTSAVEABLE = "mlp_notsaveable"
     ATTN_NOTSAVEABLE = "attn_notsaveable"
     MLP_ATTN_NOTSAVEABLE = "mlp_attn_notsaveable"
+    LMHEAD_NOTSAVEABLE = "lmhead_notsaveable"
+    ATTN_LMHEAD_NOTSAVEABLE = "attn_lmhead_notsaveable"
+    MLP_LMHEAD_NOTSAVEABLE = "mlp_lmhead_notsaveable"
     SAVE_FROM_BOTH_POLICIES = "save_from_both_policies"
 
 
@@ -320,6 +329,9 @@ AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
     "mlp_notsaveable",
     "attn_notsaveable",
     "mlp_attn_notsaveable",
+    "lmhead_notsaveable",
+    "attn_lmhead_notsaveable",
+    "mlp_lmhead_notsaveable",
     "save_from_both_policies",
 ]
 

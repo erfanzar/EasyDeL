@@ -434,7 +434,7 @@ class TurboQuantRaggedPagesCache(RaggedPagesCache):
         """
         if not self.views or self.views[-1] is None:
             return None
-        return self.views[-1].metadata
+        return tp.cast(TurboQuantRaggedPagesCacheConfig, self.views[-1].metadata)
 
     @classmethod
     def init_cache(
