@@ -43,7 +43,6 @@ from spectrax.sharding import named_sharding_for_shape, reshape_with_named_shard
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
-from easydel.utils.helpers import check_bool_flag
 
 from ..training_utils import (
     ScheduledLossAdapter,
@@ -60,8 +59,6 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
-
-_DEBUG_LMHEAD_SHARDING = check_bool_flag("EASYDEL_DEBUG_LMHEAD_SHARDING", default=False)
 
 
 def _constrain_distillation_input_batch(
@@ -456,16 +453,8 @@ def chunked_distillation_loss(
         if hidden_partition_spec is not None:
             s_h = with_sharding_constraint(s_h, hidden_partition_spec, stage=hidden_shard_stage)
             t_h = with_sharding_constraint(t_h, hidden_partition_spec, stage=hidden_shard_stage)
-        if _DEBUG_LMHEAD_SHARDING:
-            jax.debug.inspect_array_sharding(
-                s_h, callback=lambda sh: print(f"[chunked-KL] student_hidden chunk sharding: {sh}", flush=True)
-            )
         s_logits = student_lm_head_fn(s_h)
         t_logits = teacher_lm_head_fn(t_h)
-        if _DEBUG_LMHEAD_SHARDING:
-            jax.debug.inspect_array_sharding(
-                s_logits, callback=lambda sh: print(f"[chunked-KL] student_logits chunk sharding: {sh}", flush=True)
-            )
         return _compute_kl_and_ce(
             student_logits=s_logits,
             teacher_logits=t_logits,
