@@ -383,6 +383,11 @@ class Trainer(BaseTrainer):
         disabled = False
         if jax.process_index() != 0 and not self.arguments.log_all_workers:
             disabled = True
+        self._runtime_trace(
+            "training_loop.begin",
+            max_training_steps=self.max_training_steps,
+            num_train_epochs=self.arguments.num_train_epochs,
+        )
         pbar = self.create_progress_bar(
             total=self.max_training_steps,
             disabled=disabled,
@@ -392,6 +397,7 @@ class Trainer(BaseTrainer):
         initial_step = int(jax.device_get(state.step))
         start_epoch = 0
         train_iter = iter(self.dataloader_train)
+        self._runtime_trace("training_loop.iterator.created", initial_step=initial_step)
 
         if initial_step > 0:
             if self.max_training_steps is None:
@@ -410,11 +416,19 @@ class Trainer(BaseTrainer):
                 )
         try:
             run_exception = None
+            self._runtime_trace("training_loop.mesh.enter")
             with self.mesh:
+                self._runtime_trace("training_loop.mesh.entered")
                 for epoch in range(start_epoch, self.arguments.num_train_epochs):
                     epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
                     if epoch_start_step >= epoch_end_step:
                         continue
+                    self._runtime_trace(
+                        "training_loop.epoch.begin",
+                        epoch=epoch,
+                        epoch_start_step=epoch_start_step,
+                        epoch_end_step=epoch_end_step,
+                    )
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
@@ -428,11 +442,25 @@ class Trainer(BaseTrainer):
                     )
 
                     current_step = int(jax.device_get(state.step))
+                    self._runtime_trace(
+                        "training_loop.epoch.end",
+                        epoch=epoch,
+                        current_step=current_step,
+                        run_exception=type(run_exception).__name__ if run_exception is not None else None,
+                    )
                     if current_step >= self.max_training_steps:
                         break
                     if run_exception is not None:
                         break
+            self._runtime_trace(
+                "training_loop.end",
+                final_step=int(jax.device_get(state.step)),
+                run_exception=type(run_exception).__name__ if run_exception is not None else None,
+            )
             return self._prepare_training_output(state=state, run_exception=run_exception), run_exception
+        except BaseException as exc:
+            self._runtime_trace("training_loop.exception", exc_type=type(exc).__name__, exc=str(exc))
+            raise
         finally:
             # Stop the JAX profiler trace (if one was started after step 1).
             # Guarded internally so this is a no-op when profiling was disabled.
@@ -576,34 +604,87 @@ class Trainer(BaseTrainer):
             epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
         epoch_total_steps = max(epoch_end_step - epoch_start_step, 1)
         run_exception: Exception | None = None
+        self._runtime_trace(
+            "train_epoch.begin",
+            epoch=epoch,
+            epoch_start_step=epoch_start_step,
+            epoch_end_step=epoch_end_step,
+            epoch_total_steps=epoch_total_steps,
+        )
 
         while True:
             with capture_time() as iteration_time:
                 current_step = int(jax.device_get(state.step))
                 if current_step >= self.max_training_steps or current_step >= epoch_end_step:
+                    self._runtime_trace(
+                        "train_epoch.break",
+                        epoch=epoch,
+                        current_step=current_step,
+                        max_training_steps=self.max_training_steps,
+                        epoch_end_step=epoch_end_step,
+                    )
                     break
                 try:
+                    self._runtime_trace("train_step.batch_fetch.begin", epoch=epoch, current_step=current_step)
                     with capture_time() as data_collection_time:
                         batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                        self._runtime_trace(
+                            "train_step.batch_fetch.end",
+                            epoch=epoch,
+                            current_step=current_step,
+                            batch=self._runtime_batch_summary(batch),
+                        )
+                        self._runtime_trace("train_step.collate.begin", epoch=epoch, current_step=current_step)
                         batch = data_collator(batch)
+                        self._runtime_trace(
+                            "train_step.collate.end",
+                            epoch=epoch,
+                            current_step=current_step,
+                            batch=self._runtime_batch_summary(batch),
+                        )
                     step_metrics.start_step()
+                    self._runtime_trace("train_step.on_step_start.begin", epoch=epoch, current_step=current_step)
                     state = self.on_step_start(state=state, step=current_step)
+                    self._runtime_trace("train_step.on_step_start.end", epoch=epoch, current_step=current_step)
                 except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
+                    self._runtime_trace(
+                        "train_step.setup.interrupt",
+                        epoch=epoch,
+                        current_step=current_step,
+                        exc_type=type(exc).__name__,
+                        exc=str(exc),
+                    )
                     return state, exc, train_iter
 
                 # Execute training step
+                self._runtime_trace("train_step.execute.begin", epoch=epoch, current_step=current_step)
                 with self.train_tracker.trace_compilation():
                     with capture_time() as execution_time:
                         state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
                         metrics.execution_time = execution_time()
                         current_step = int(jax.device_get(state.step))
+                self._runtime_trace(
+                    "train_step.execute.end",
+                    epoch=epoch,
+                    current_step=current_step,
+                    execution_time=float(execution_time()),
+                    run_exception=type(run_exception).__name__ if run_exception is not None else None,
+                )
                 if run_exception is not None:
+                    self._runtime_trace(
+                        "train_step.execute.run_exception",
+                        epoch=epoch,
+                        current_step=current_step,
+                        exc_type=type(run_exception).__name__,
+                        exc=str(run_exception),
+                    )
                     return state, run_exception, train_iter
                 # Start the JAX profiler once step 1 has fully completed.
                 # The first step's wall-time is dominated by JIT compile;
                 # skipping it gives a profile of steady-state training.
                 self._maybe_start_profiler(current_step)
                 try:
+                    self._runtime_trace("train_step.host_metrics.begin", epoch=epoch, current_step=current_step)
                     mean_loss, mean_accuracy = metrics_tracker.update(
                         loss=metrics.loss,
                         accuracy=metrics.accuracy,
@@ -694,13 +775,36 @@ class Trainer(BaseTrainer):
                         update_progress=False,
                     )
                     if self._profiler_should_block_until_ready():
+                        self._runtime_trace("train_step.profiler_block.begin", epoch=epoch, current_step=current_step)
                         state, metrics = jax.block_until_ready((state, metrics))
+                        self._runtime_trace("train_step.profiler_block.end", epoch=epoch, current_step=current_step)
+                    self._runtime_trace("train_step.host_metrics.end", epoch=epoch, current_step=current_step)
                 except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as exc:
+                    self._runtime_trace(
+                        "train_step.host_metrics.interrupt",
+                        epoch=epoch,
+                        current_step=current_step,
+                        exc_type=type(exc).__name__,
+                        exc=str(exc),
+                    )
                     return state, exc, train_iter
                 except TypeError as exc:
+                    self._runtime_trace(
+                        "train_step.host_metrics.type_error",
+                        epoch=epoch,
+                        current_step=current_step,
+                        exc_type=type(exc).__name__,
+                        exc=str(exc),
+                    )
                     return state, exc, train_iter
                 if run_exception is not None:
                     break
+        self._runtime_trace(
+            "train_epoch.end",
+            epoch=epoch,
+            final_step=int(jax.device_get(state.step)),
+            run_exception=type(run_exception).__name__ if run_exception is not None else None,
+        )
         return state, run_exception, train_iter
 
     def _eval_epoch(
@@ -924,12 +1028,19 @@ class Trainer(BaseTrainer):
             )
         metrics = LossMetrics()
         try:
+            self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
             batch, informations = self._preprocess_batch_input(
                 state=state,
                 batch=batch,
                 is_train=True,
             )
+            self._runtime_trace(
+                "execute_train_step.preprocess.end",
+                batch=self._runtime_batch_summary(batch),
+                information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
+            )
 
+            self._runtime_trace("execute_train_step.compiled_call.begin")
             state, metrics = jax.block_until_ready(
                 self.sharded_training_step_function(
                     state,
@@ -937,6 +1048,11 @@ class Trainer(BaseTrainer):
                     *self._train_shared_fn_extra_args,
                     *self._train_shared_fn_static_args,
                 )
+            )
+            self._runtime_trace(
+                "execute_train_step.compiled_call.end",
+                step=int(jax.device_get(state.step)),
+                metrics_type=type(metrics).__name__,
             )
 
             if len(informations) != 0:
@@ -959,8 +1075,18 @@ class Trainer(BaseTrainer):
             EasyDeLBreakRequest,
             TypeError,
         ) as run_exception:
+            self._runtime_trace(
+                "execute_train_step.control_exception",
+                exc_type=type(run_exception).__name__,
+                exc=str(run_exception),
+            )
             return state, metrics, run_exception
         except Exception as run_exception:
+            self._runtime_trace(
+                "execute_train_step.exception",
+                exc_type=type(run_exception).__name__,
+                exc=str(run_exception),
+            )
             if self._is_memory_oom_exception(run_exception):
                 annotated_exception = self._augment_memory_oom_exception(run_exception)
                 logger.error(str(annotated_exception))
@@ -1025,17 +1151,32 @@ class Trainer(BaseTrainer):
             - Saves checkpoints periodically based on save_steps
             - Can be interrupted with Ctrl+C without losing progress
         """
-        self.start_training_hook()
-        state = self.model_state
-        metrics_tracker = MetricsTracker()
-        step_metrics = StepMetrics(self.arguments)
-        self._setup_initial_metrics(state)
-        output, run_exception = self._run_training_loop(
-            state=self.model_state,
-            metrics_tracker=metrics_tracker,
-            step_metrics=step_metrics,
-        )
-        return self._finalize_training(output, run_exception)
+        self._runtime_trace("train.begin")
+        try:
+            self._runtime_trace("train.start_training_hook.begin")
+            self.start_training_hook()
+            self._runtime_trace("train.start_training_hook.end")
+            state = self.model_state
+            metrics_tracker = MetricsTracker()
+            step_metrics = StepMetrics(self.arguments)
+            self._runtime_trace("train.setup_initial_metrics.begin")
+            self._setup_initial_metrics(state)
+            self._runtime_trace("train.setup_initial_metrics.end")
+            output, run_exception = self._run_training_loop(
+                state=self.model_state,
+                metrics_tracker=metrics_tracker,
+                step_metrics=step_metrics,
+            )
+            self._runtime_trace(
+                "train.finalize.begin",
+                run_exception=type(run_exception).__name__ if run_exception is not None else None,
+            )
+            output = self._finalize_training(output, run_exception)
+            self._runtime_trace("train.end")
+            return output
+        except BaseException as exc:
+            self._runtime_trace("train.exception", exc_type=type(exc).__name__, exc=str(exc))
+            raise
 
     def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """

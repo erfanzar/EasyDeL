@@ -451,6 +451,7 @@ class BCOTrainer(Trainer):
         ref_sharding = self.reference_state.shardings if self.reference_state is not None else empty_sharding
 
         train_static_argnums = (3, 4, 5, 6, 7, 8, 9)
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             training_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
@@ -460,9 +461,11 @@ class BCOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (forward_fn, self.arguments.beta)
         eval_static_argnums = (3, 4)
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
@@ -471,6 +474,7 @@ class BCOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         self.sharded_training_step_function = sharded_training_step_function
         self.sharded_evaluation_step_function = sharded_evaluation_step_function

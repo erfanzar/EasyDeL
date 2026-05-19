@@ -162,6 +162,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
     """
 
     model_type = "qwen3_5_text"
+    base_config_key = "text_config"
 
     def __init__(
         self,

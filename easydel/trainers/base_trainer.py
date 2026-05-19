@@ -36,12 +36,15 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import faulthandler
 import gc
 import itertools
 import json
+import logging
 import operator
 import os
 import pprint
+import sys
 import time
 import typing as tp
 from abc import abstractmethod
@@ -280,6 +283,61 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self._apply_runtime_model_config_overrides_to_state(value, arguments)
 
+    def _runtime_trace(self, event: str, **details: tp.Any) -> None:
+        """Emit a runtime breadcrumb at DEBUG level.
+
+        Gated by the easydel logger level: set ``LOGGING_LEVEL_ED=DEBUG`` (or otherwise
+        raise this module's logger to ``DEBUG``) to surface the breadcrumbs. The output
+        format matches the prior ``(EasyDeLRuntimeTrace ...)`` stderr line so existing
+        log parsers keep working.
+
+        Args:
+            event: Short event name, e.g. ``"train_step.execute.begin"``.
+            **details: Arbitrary key/value pairs. ``None`` values are skipped; long
+                ``repr``s are truncated to 500 chars.
+        """
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            detail_parts = []
+            for key, value in details.items():
+                if value is None:
+                    continue
+                text = repr(value)
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                detail_parts.append(f"{key}={text}")
+            detail_text = " ".join(detail_parts)
+            logger.debug(
+                "(EasyDeLRuntimeTrace pid=%d time=%.6f trainer=%s event=%s%s)",
+                os.getpid(),
+                time.time(),
+                self.__class__.__name__,
+                event,
+                f" {detail_text}" if detail_text else "",
+            )
+        except Exception:
+            pass
+
+    def _runtime_batch_summary(self, batch: tp.Any) -> str:
+        """Return a small, safe summary of a batch without materializing values."""
+        try:
+            if isinstance(batch, collections.abc.Mapping):
+                pieces = []
+                items = list(batch.items())
+                for key, value in items[:12]:
+                    shape = getattr(value, "shape", None)
+                    dtype = getattr(value, "dtype", None)
+                    pieces.append(f"{key}:shape={shape},dtype={dtype},type={type(value).__name__}")
+                if len(items) > 12:
+                    pieces.append(f"...+{len(items) - 12} keys")
+                return "{" + ", ".join(pieces) + "}"
+            shape = getattr(batch, "shape", None)
+            dtype = getattr(batch, "dtype", None)
+            return f"type={type(batch).__name__},shape={shape},dtype={dtype}"
+        except Exception as exc:
+            return f"<batch-summary-error {type(exc).__name__}: {exc}>"
+
     def __init__(
         self,
         arguments: TrainingArguments | None = None,
@@ -310,6 +368,11 @@ class BaseTrainer(BaseTrainerProtocol):
             ValueError: If both model and model_state are provided, or if neither is provided
             ValueError: If arguments is None
         """
+        try:
+            faulthandler.enable(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        self._runtime_trace("__init__.begin")
         if arguments is None:
             raise ValueError("training argument must be passed to Trainers.")
         if model_state is not None and model is not None:
@@ -450,6 +513,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self._initialize_attributes()
         self.initialize_trainer_utils()
+        self._runtime_trace("__init__.end")
 
     @staticmethod
     def _apply_runtime_model_config_overrides_to_state(
@@ -2188,6 +2252,17 @@ class BaseTrainer(BaseTrainerProtocol):
                 return False
             return 0
 
+        def _normalize_batch_array(array):
+            """Keep integer batch leaves TPU-friendly after host collation."""
+            dtype = getattr(array, "dtype", None)
+            if dtype is None:
+                return array
+            if np.issubdtype(dtype, np.integer) and not np.issubdtype(dtype, np.bool_):
+                if isinstance(array, jax.Array):
+                    return array.astype(jnp.int32)
+                return array.astype(np.int32, copy=False)
+            return array
+
         # Handle list of dicts (uncollated batch)
         if isinstance(batch, (list, tuple)) and len(batch) > 0 and isinstance(batch[0], dict):
             # Collate list of dicts into dict of arrays with padding
@@ -2201,7 +2276,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     arrays = [np.asarray(v) for v in values]
                     # Check if arrays have same shape
                     if all(arr.shape == arrays[0].shape for arr in arrays):
-                        collated[key] = np.stack(arrays)
+                        collated[key] = _normalize_batch_array(np.stack(arrays))
                     else:
                         # Pad sequences to same length (for 1D arrays like input_ids)
                         if all(arr.ndim == 1 for arr in arrays):
@@ -2213,7 +2288,7 @@ class BaseTrainer(BaseTrainerProtocol):
                                     padded.append(np.pad(arr, (0, max_len - len(arr)), constant_values=pad_value))
                                 else:
                                     padded.append(arr)
-                            collated[key] = np.stack(padded)
+                            collated[key] = _normalize_batch_array(np.stack(padded))
                         else:
                             # Can't handle multi-dimensional arrays with different shapes
                             pass
@@ -2227,7 +2302,7 @@ class BaseTrainer(BaseTrainerProtocol):
             if isinstance(value, (np.ndarray, jax.Array)):
                 # Check if it's a numeric dtype (not object/string)
                 if hasattr(value, "dtype") and np.issubdtype(value.dtype, np.number):
-                    purified[key] = value
+                    purified[key] = _normalize_batch_array(value)
                 elif hasattr(value, "dtype") and value.dtype == np.bool_:
                     purified[key] = value
             elif isinstance(value, (list, tuple)):
@@ -2235,7 +2310,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 try:
                     arr = np.asarray(value)
                     if np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_:
-                        purified[key] = arr
+                        purified[key] = _normalize_batch_array(arr)
                 except (ValueError, TypeError):
                     pass  # Skip non-convertible values
         return purified
@@ -4330,12 +4405,21 @@ class BaseTrainer(BaseTrainerProtocol):
         steps determined during dataloader configuration.
         """
 
-        self._initialize_wandb()
-        self._initialize_timer()
-        self._configure_dataloaders()
-        self._configure_model()
-        self._configure_state()
-        self._configure_functions()
+        for name, fn in (
+            ("initialize_wandb", self._initialize_wandb),
+            ("initialize_timer", self._initialize_timer),
+            ("configure_dataloaders", self._configure_dataloaders),
+            ("configure_model", self._configure_model),
+            ("configure_state", self._configure_state),
+            ("configure_functions", self._configure_functions),
+        ):
+            self._runtime_trace(f"{name}.begin")
+            try:
+                fn()
+            except BaseException as exc:
+                self._runtime_trace(f"{name}.exception", exc_type=type(exc).__name__, exc=str(exc))
+                raise
+            self._runtime_trace(f"{name}.end")
 
     def _initialize_wandb(self):
         """Initialize Weights & Biases logging if enabled.
@@ -4384,6 +4468,13 @@ class BaseTrainer(BaseTrainerProtocol):
                 self.dataloader_eval = dataset_configurations.dataloader_eval
                 self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
         self.timer.log("configure dataloaders")
+        self._runtime_trace(
+            "_configure_dataloaders.done",
+            max_training_steps=self.max_training_steps,
+            max_evaluation_steps=self.max_evaluation_steps,
+            train_loader=type(self.dataloader_train).__name__,
+            eval_loader=type(self.dataloader_eval).__name__ if self.dataloader_eval is not None else None,
+        )
 
     def _configure_model(self):
         """
@@ -4401,6 +4492,12 @@ class BaseTrainer(BaseTrainerProtocol):
             self.config = model_configurations.config
 
         self.timer.log("configure Model, Optimizer, Scheduler and Config")
+        self._runtime_trace(
+            "_configure_model.done",
+            model=type(self._model).__name__,
+            tx=type(self.tx).__name__ if self.tx is not None else None,
+            scheduler=type(self.scheduler).__name__ if self.scheduler is not None else None,
+        )
 
     def _configure_functions(self):
         """
@@ -4421,7 +4518,10 @@ class BaseTrainer(BaseTrainerProtocol):
             self.checkpoint_manager = functions.checkpoint_manager
             self.checkpointer = self._create_checkpointer()
         self.timer.log("configure functions and sharding them")
+        self._runtime_trace("_configure_functions.compiled")
+        self._runtime_trace("_configure_generation_function.begin")
         self._configure_generation_function()
+        self._runtime_trace("_configure_generation_function.end")
 
     def _configure_state(self):
         """
@@ -4457,6 +4557,11 @@ class BaseTrainer(BaseTrainerProtocol):
                 self._shard_auxiliary_model_states()
 
         self.timer.log("configure sharded state")
+        self._runtime_trace(
+            "_configure_state.done",
+            step=int(jax.device_get(self.model_state.step)),
+            state_type=type(self.model_state).__name__,
+        )
 
     @abstractmethod
     def create_grain_collect_function(

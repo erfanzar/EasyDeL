@@ -231,6 +231,7 @@ class GKDTrainer(SFTTrainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9, 10)
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             gkd_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -240,6 +241,7 @@ class GKDTrainer(SFTTrainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
         sharded_training_step_function.static_argnums_ = static_argnums
 
         self._eval_shared_fn_static_args = (
@@ -253,6 +255,7 @@ class GKDTrainer(SFTTrainer):
             None,
         )
 
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             gkd_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -261,6 +264,7 @@ class GKDTrainer(SFTTrainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
         sharded_evaluation_step_function.static_argnums_ = static_argnums
 
         self.sharded_training_step_function = sharded_training_step_function

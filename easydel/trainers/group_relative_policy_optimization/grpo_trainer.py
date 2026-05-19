@@ -434,6 +434,7 @@ class GRPOTrainer(Trainer):
 
         static_argnames = tuple(range(2, 19))
 
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             grpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -443,6 +444,7 @@ class GRPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             self.num_generations,
@@ -464,6 +466,7 @@ class GRPOTrainer(Trainer):
             straight_through_emulator,
         )
 
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             grpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -472,6 +475,7 @@ class GRPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, model_kwargs=None, graphdef=None):
             """Sharded reference-model per-token log-prob forward.

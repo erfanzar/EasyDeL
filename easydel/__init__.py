@@ -52,6 +52,10 @@ from .utils import is_package_available as _is_package_available
 _logger = _get_logger("EasyDeL")
 _apply_linkup()
 
+# If distributed initialization is explicitly enabled, do it before any
+# compatibility/version imports can pull JAX-heavy modules into the process.
+_distributed_init_enabled = _initialize_distributed(_logger)
+
 _import_structure = {
     "utils": [
         "ModelConverter",
@@ -1145,9 +1149,6 @@ else:
     del _version
     del _eform_version
 
-
-# Keep import side effects minimal: distributed/JAX backend initialization is opt-in.
-_distributed_init_enabled = _initialize_distributed(_logger)
 
 del _logger
 del _LazyModule

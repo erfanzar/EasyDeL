@@ -13,11 +13,24 @@
 # limitations under the License.
 """Offline knowledge-distillation trainer.
 
-Trains a smaller "student" model to match a frozen "teacher" via a
-combination of temperature-scaled KL divergence on token logits and a
-standard supervised cross-entropy term, mixed by ``alpha``.  Hidden-
-state matching and routing logits are supported through optional
-projection heads when configured in :class:`DistillationConfig`.
+Trains a "student" model to match a frozen "teacher" via a combination of
+temperature-scaled KL divergence on token logits and an optional supervised
+cross-entropy term mixed by ``alpha``. The configured loss may additionally
+include:
+
+- Masked MSE on per-layer hidden states (``hidden_state_loss_weight`` /
+  ``hidden_state_layers`` in :class:`DistillationConfig`).
+- Masked MSE on per-layer attention probabilities, optionally L1-normalised
+  (``attention_loss_weight`` / ``attention_layers`` / ``attention_normalize``).
+- A memory-saving chunked KL path that streams logits in slices of
+  ``logits_chunk_size`` tokens, with optional ``jax.checkpoint`` rematerialisation
+  controlled by ``checkpoint_kl_loss``.
+- Quantization-aware straight-through emulation for the student
+  (``quantization_mode`` / ``quantization_bits`` / ``tensor_straight_through`` /
+  ``straight_through_emulator``).
+
+Both ejit-style ``spx.jit`` and MPMD-scheduled compilation paths are supported
+based on whether ``arguments.mpmd_scheduler`` is set.
 """
 
 from __future__ import annotations
@@ -25,6 +38,7 @@ from __future__ import annotations
 import typing as tp
 
 import numpy as np
+import spectrax as spx
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -38,7 +52,7 @@ from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
-from ._fn import distillation_step, distillation_teacher_forward_step
+from ._fn import distillation_step
 from .distillation_config import DistillationConfig
 
 if tp.TYPE_CHECKING:
@@ -51,37 +65,41 @@ logger = get_logger(__name__)
 class DistillationTrainer(Trainer):
     """Knowledge distillation trainer for model compression.
 
-    Implements knowledge distillation to transfer knowledge from a larger
-    teacher model to a smaller student model. The training combines distillation
-    loss (KL divergence between teacher and student outputs) with standard
-    supervised loss, controlled by the alpha parameter.
+    Transfers knowledge from a frozen teacher to a trainable student by minimising
+    a temperature-scaled KL term on logits, optionally mixed with a hard-label
+    cross-entropy term and optional hidden-state / attention auxiliary losses.
 
     Key features:
-    - Temperature-scaled softmax for softer probability distributions
-    - Configurable balance between distillation and supervised loss
-    - Support for both language and multimodal models
-    - Efficient JAX-based implementation with JIT compilation
+        - Temperature-scaled KL on full or chunked logits
+        - α / (1-α) mix between KL and supervised CE
+        - Optional masked-MSE losses on hidden states and attention probabilities
+        - Optional QAT straight-through emulation on the student forward
+        - Two compile backends: ``spx.jit`` (default) and MPMD-scheduled
+          (``arguments.mpmd_scheduler is not None``)
 
-    The distillation loss is computed as:
-        Loss = α * KL(student/T, teacher/T) * T² + (1-α) * CE(student, labels)
-    where T is the temperature parameter.
+    Loss (with hard labels, no auxiliaries):
+        ``Loss = α * (E_t[-log p_s] - E_t[-log p_t]) * T² + (1 - α) * CE(student, labels)``
+
+    With auxiliary terms:
+        ``Loss += hidden_state_loss_weight * Σ_l MSE(h_s[l], h_t[l]; mask)``
+        ``Loss += attention_loss_weight   * Σ_l MSE(a_s[l], a_t[l]; mask)``
 
     Attributes:
-        teacher_state: State of the teacher model (frozen during training)
-        arguments: DistillationConfig with training hyperparameters
+        teacher_state: Frozen :class:`EasyDeLState` of the teacher model.
+        arguments: :class:`DistillationConfig` instance carrying all knobs.
 
     Example:
         >>> config = DistillationConfig(
         ...     temperature=3.0,
         ...     alpha=0.7,
-        ...     learning_rate=2e-5
+        ...     learning_rate=2e-5,
         ... )
         >>> trainer = DistillationTrainer(
         ...     arguments=config,
         ...     student_model=student,
         ...     teacher_model=teacher,
         ...     train_dataset=dataset,
-        ...     processing_class=tokenizer
+        ...     processing_class=tokenizer,
         ... )
         >>> trainer.train()
     """
@@ -101,24 +119,36 @@ class DistillationTrainer(Trainer):
     ):
         """Initialize the offline distillation trainer.
 
-        Resolves the student and teacher into :class:`EasyDeLState`
-        objects, ensures the tokenizer has a pad token, and forwards
-        construction to :class:`Trainer`.
+        Workflow:
+            1. Resolve the processor's ``pad_token`` to ``eos_token`` when unset
+               (mutates the caller's tokenizer in place).
+            2. Convert ``student_model`` to :class:`EasyDeLState` via
+               ``to_state(trainable_selector=arguments.trainable_selector)`` so
+               only the selected parameter collection participates in optimizer
+               updates.
+            3. Put ``teacher_model`` into eval mode and convert it to a state
+               (no ``trainable_selector`` — the teacher is frozen wholesale).
+            4. Delegate to :class:`Trainer.__init__` for dataloaders, optimizer,
+               scheduler, and the shared training loop.
 
         Args:
             arguments: Distillation-specific training configuration.
-            processing_class: Tokenizer/processor used for SFT-style
-                preprocessing of completions.
-            student_model: Trainable student module or state.
-            teacher_model: Frozen teacher module or state.
+            processing_class: Tokenizer/processor used for SFT-style preprocessing.
+                Its ``pad_token`` may be mutated to match ``eos_token``.
+            student_model: Trainable student module or pre-built state. Required.
+            teacher_model: Frozen teacher module or pre-built state. Required.
+                A module input is forced into eval mode before state export; a
+                pre-built state is taken as-is.
             train_dataset: Training dataset of completion examples.
-            eval_dataset: Optional evaluation dataset.
-            data_collator: Optional custom collator; otherwise the
-                default completion-only collator is used.
+            eval_dataset: Optional evaluation dataset (single or named-split dict).
+            data_collator: Optional custom collator; otherwise the default
+                completion-only collator is used.
 
         Raises:
-            TypeError: If ``arguments`` is not a
-                :class:`DistillationConfig`.
+            TypeError: If ``arguments`` is not a :class:`DistillationConfig`.
+            AttributeError: If ``student_model`` or ``teacher_model`` is ``None``
+                (they default to ``None`` for legacy signature compatibility but
+                must be supplied — the conversion to state then fails).
         """
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
@@ -132,12 +162,9 @@ class DistillationTrainer(Trainer):
 
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
-        if isinstance(teacher_model, EasyDeLState):
-            teacher_module = teacher_model.model
-        else:
-            teacher_module = teacher_model
-        teacher_module.eval()
-        teacher_model = teacher_module.to_state(trainable_selector=arguments.trainable_selector)
+        if not isinstance(teacher_model, EasyDeLState):
+            teacher_model.eval()
+            teacher_model = teacher_model.to_state()
 
         self.teacher_state = teacher_model
 
@@ -153,20 +180,41 @@ class DistillationTrainer(Trainer):
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled distillation training/evaluation step functions.
 
-        Resolves the optional QAT straight-through emulator, captures
-        the temperature/alpha/auxiliary-loss weights and the
-        hidden-state / attention layer indices, and compiles
-        :func:`distillation_step` once for training (with student
-        state donation) and once for evaluation under the active
-        MPMD pipeline schedule. The teacher state's sharding spec is
-        threaded through ``in_shardings`` so the compiled step can
-        run the teacher forward in stop-gradient mode in place.
+        Steps:
+            1. Resolve the optional QAT straight-through emulator and capture all
+               loss knobs (temperature, alpha, hidden-state / attention weights and
+               layer indices, logits chunk size, KL-checkpoint flag).
+            2. Pack the captured knobs into ``_train_shared_fn_static_args`` and
+               ``_eval_shared_fn_static_args`` (identical except ``is_train`` and
+               the straight-through emulator slot).
+            3. Compile :func:`distillation_step` twice — once for training (with
+               student state donation via ``donate_argnums=(0,)``) and once for
+               evaluation (no donation, ``out_shardings=empty_sharding``).
+            4. Pick the compile backend based on ``arguments.mpmd_scheduler``:
+               ``spx.jit`` directly when ``None``; otherwise
+               :func:`compile_trainer_step` with the MPMD schedule and mesh.
+            5. Record the teacher's per-token forward FLOPs as the extra forward
+               compute (no backward — the teacher is frozen).
+
+        The teacher state's sharding spec is threaded through ``in_shardings`` so
+        the compiled step receives ``teacher_state`` as a regular input and runs
+        its forward (with ``jax.lax.stop_gradient`` applied inside ``loss_fn``)
+        without a separate auxiliary program.
+
+        Emits debug-level runtime traces for the compile-wrapper begin/end of both
+        train and eval paths.
 
         Returns:
-            ``TrainerConfigureFunctionOutput`` with the sharded
-            training / evaluation step callables, the model mesh,
-            and the streaming checkpoint manager.
+            :class:`TrainerConfigureFunctionOutput` with the sharded training and
+            evaluation step callables, the model mesh, and the streaming
+            checkpoint manager.
         """
+        self._runtime_trace(
+            "configure_functions.distillation",
+            mpmd_scheduler=self.arguments.mpmd_scheduler,
+            logits_chunk_size=self.arguments.logits_chunk_size,
+            gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+        )
         mesh = self.model.mesh
 
         empty_sharding = replicated_named_sharding(mesh)
@@ -200,24 +248,27 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.checkpoint_kl_loss),
         )
 
-        teacher_static_argnums = (2, 3, 4, 5)
-        sharded_teacher_forward_function = compile_trainer_step(
-            distillation_teacher_forward_step,
-            in_shardings=(self.teacher_state.shardings, empty_sharding),
-            static_argnums=teacher_static_argnums,
-            mesh=self.model.mesh,
-        )
-
-        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
-        sharded_student_training_step_function = compile_trainer_step(
-            distillation_step,
-            in_shardings=(self.state_shardings, None, self.teacher_state.shardings),
-            out_shardings=(self.state_shardings, empty_sharding),
-            donate_argnums=(0,),
-            static_argnums=static_argnames,
-            mesh=self.model.mesh,
-            schedule=self.arguments.mpmd_scheduler,
-        )
+        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+        self._runtime_trace("train.compile_wrapper.begin")
+        if self.arguments.mpmd_scheduler is None:
+            sharded_training_step_function = spx.jit(
+                distillation_step,
+                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                out_shardings=(self.state_shardings, empty_sharding),
+                donate_argnums=(0,),
+                static_argnums=static_argnums,
+            )
+        else:
+            sharded_training_step_function = compile_trainer_step(
+                distillation_step,
+                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                out_shardings=(self.state_shardings, empty_sharding),
+                donate_argnums=(0,),
+                static_argnums=static_argnums,
+                mesh=self.model.mesh,
+                schedule=self.arguments.mpmd_scheduler,
+            )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -238,57 +289,35 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.checkpoint_kl_loss),
         )
 
-        sharded_student_evaluation_step_function = compile_trainer_step(
-            distillation_step,
-            in_shardings=(self.state_shardings, None, self.teacher_state.shardings),
-            out_shardings=empty_sharding,
-            static_argnums=static_argnames,
-            mesh=self.model.mesh,
-            schedule=self.arguments.mpmd_scheduler,
-        )
-
-        def _precompute_teacher_outputs(teacher_state: EasyDeLState, batch: dict[str, tp.Any], static_args: tuple):
-            partition_spec = static_args[2]
-            hidden_state_weight = static_args[7]
-            attention_weight = static_args[10]
-            logits_chunk_size = static_args[14]
-            teacher_outputs = sharded_teacher_forward_function(
-                teacher_state,
-                batch,
-                partition_spec,
-                logits_chunk_size,
-                hidden_state_weight,
-                attention_weight,
+        self._runtime_trace("eval.compile_wrapper.begin")
+        if self.arguments.mpmd_scheduler is None:
+            sharded_evaluation_step_function = spx.jit(
+                distillation_step,
+                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                out_shardings=empty_sharding,
+                static_argnums=static_argnums,
             )
-            batch = dict(batch)
-            batch.update(teacher_outputs)
-            return batch
+        else:
+            sharded_evaluation_step_function = compile_trainer_step(
+                distillation_step,
+                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                out_shardings=empty_sharding,
+                static_argnums=static_argnums,
+                mesh=self.model.mesh,
+                schedule=self.arguments.mpmd_scheduler,
+            )
+        self._runtime_trace("eval.compile_wrapper.end")
 
-        def sharded_training_step_function(
-            student_state: EasyDeLState,
-            batch: dict[str, tp.Any],
-            teacher_state: EasyDeLState,
-            *static_args,
-        ):
-            batch = _precompute_teacher_outputs(teacher_state, batch, static_args)
-            return sharded_student_training_step_function(student_state, batch, teacher_state, *static_args)
+        sharded_training_step_function.static_argnums_ = static_argnums
+        sharded_evaluation_step_function.static_argnums_ = static_argnums
 
-        def sharded_evaluation_step_function(
-            student_state: EasyDeLState,
-            batch: dict[str, tp.Any],
-            teacher_state: EasyDeLState,
-            *static_args,
-        ):
-            batch = _precompute_teacher_outputs(teacher_state, batch, static_args)
-            return sharded_student_evaluation_step_function(student_state, batch, teacher_state, *static_args)
-
-        sharded_training_step_function.static_argnums_ = static_argnames
-        sharded_evaluation_step_function.static_argnums_ = static_argnames
-
-        flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)
-
-        self._extra_forward_flops_per_token = flops_per_tkn
-        self._extra_backward_flops_per_token = flops_per_tkn
+        # Teacher is frozen: it contributes a forward pass only, no backward.
+        teacher_forward_flops = self.teacher_state.model.flops_per_token(
+            include_loss=False,
+            include_backward=False,
+        )
+        self._extra_forward_flops_per_token = teacher_forward_flops
+        self._extra_backward_flops_per_token = 0.0
 
         self.arguments.ensure_checkpoint_path()
         return TrainerConfigureFunctionOutput(
@@ -330,7 +359,36 @@ class DistillationTrainer(Trainer):
         batch: dict[str, tp.Any],
         is_train: bool,
     ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
-        """Normalize completion masks/labels for mixed SFT + pretrain distillation batches."""
+        """Normalize completion masks and labels for distillation batches.
+
+        Operates host-side after the parent's preprocessing. Handles three cases
+        so downstream JIT receives a consistent shape regardless of whether the
+        upstream collator produced ``assistant_masks``, ``completion_mask``,
+        and/or ``labels``:
+
+        1. ``assistant_masks`` is rebranded as ``completion_mask`` and dropped
+           from the batch (the student forward must not receive it as a kwarg).
+        2. If ``completion_mask`` is present, it is anded with ``attention_mask``
+           and re-cast to the attention mask's dtype. When ``labels`` are absent,
+           they are synthesised from ``input_ids`` with ``-100`` written at
+           positions where ``completion_mask == 0`` or ``attention_mask == 0``.
+        3. If ``labels`` are present but ``completion_mask`` isn't, a derived
+           completion mask is built from ``labels != -100`` (anded with
+           ``attention_mask`` when available).
+
+        All work is on NumPy host arrays — no device synchronisation is forced
+        on inputs that are already CPU-resident.
+
+        Args:
+            state: Current student state (unused here; threaded by the parent
+                signature).
+            batch: Host-side batch dict mutated in place by this method.
+            is_train: Whether this is a training step; forwarded to the parent.
+
+        Returns:
+            ``(batch, infos)`` where ``infos`` is the parent's auxiliary
+            information dict.
+        """
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 
         if "assistant_masks" in batch:
@@ -370,11 +428,21 @@ class DistillationTrainer(Trainer):
         return batch, infos
 
     @property
-    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
-        """Forward the teacher state to the shared training step."""
+    def _train_shared_fn_extra_args(self) -> tuple[EasyDeLState]:
+        """Extra positional args appended to every compiled training step call.
+
+        Returns the single teacher :class:`EasyDeLState` that
+        :func:`distillation_step` consumes as its third positional argument.
+        Matches main-branch behaviour: the teacher is passed in directly rather
+        than precomputed outside the compiled step.
+        """
         return (self.teacher_state,)
 
     @property
-    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
-        """Forward the teacher state to the shared evaluation step."""
+    def _eval_shared_fn_extra_args(self) -> tuple[EasyDeLState]:
+        """Extra positional args appended to every compiled evaluation step call.
+
+        Same as :attr:`_train_shared_fn_extra_args` — the evaluation step uses
+        the same compiled function with ``is_train=False`` in its static args.
+        """
         return (self.teacher_state,)

@@ -265,6 +265,7 @@ class NashMDTrainer(GRPOTrainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9)
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             nash_md_step,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
@@ -274,6 +275,8 @@ class NashMDTrainer(GRPOTrainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             nash_md_step,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
@@ -282,6 +285,7 @@ class NashMDTrainer(GRPOTrainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         def _compute_model_logps(
             graphtree: spx.State,

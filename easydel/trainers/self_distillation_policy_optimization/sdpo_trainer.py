@@ -361,6 +361,7 @@ class SDPOTrainer(GRPOTrainer):
 
         self._train_shared_fn_static_args = (*shared_static, True, straight_through_emulator)
 
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             sdpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -370,9 +371,11 @@ class SDPOTrainer(GRPOTrainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (*shared_static, False, straight_through_emulator)
 
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             sdpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -381,6 +384,7 @@ class SDPOTrainer(GRPOTrainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
             """Compute frozen reference-model per-token log probabilities.

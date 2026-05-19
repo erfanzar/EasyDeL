@@ -438,6 +438,7 @@ class PPOTrainer(Trainer):
             straight_through_emulator,
         )
         static_argnums = tuple(range(2, 14))
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -447,6 +448,7 @@ class PPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             prompt_length,
@@ -462,6 +464,7 @@ class PPOTrainer(Trainer):
             False,  # is_train
             straight_through_emulator,
         )
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -470,6 +473,7 @@ class PPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
             """Compute frozen reference-model per-token log probabilities.

@@ -320,6 +320,7 @@ class OnPolicyDistillationTrainer(Trainer):
 
         static_argnames = tuple(range(3, 12))
 
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             on_policy_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -329,6 +330,7 @@ class OnPolicyDistillationTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -342,6 +344,7 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.logits_chunk_size,
         )
 
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             on_policy_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -350,6 +353,7 @@ class OnPolicyDistillationTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)
         self._extra_forward_flops_per_token = flops_per_tkn

@@ -1049,6 +1049,33 @@ def test_purify_batch_preserves_label_ignore_index_when_padding_list_batches():
     )
 
 
+def test_purify_batch_downcasts_integer_list_batches_to_int32():
+    trainer = object.__new__(_PreviewTrainer)
+
+    batch = [
+        {
+            "input_ids": [11, 12, 13],
+            "attention_mask": [1, 1, 1],
+            "loss": np.asarray([1.5], dtype=np.float64),
+        },
+        {
+            "input_ids": [21, 22],
+            "attention_mask": [1, 1],
+            "loss": np.asarray([2.5], dtype=np.float64),
+        },
+    ]
+
+    purified = BaseTrainer._purify_batch(trainer, batch)
+
+    assert purified["input_ids"].dtype == np.int32
+    assert purified["attention_mask"].dtype == np.int32
+    assert purified["loss"].dtype == np.float64
+    np.testing.assert_array_equal(
+        purified["input_ids"],
+        np.asarray([[11, 12, 13], [21, 22, 0]], dtype=np.int32),
+    )
+
+
 def test_prepare_generation_input_accepts_chat_prompt_field():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(max_length=8, generation_dataset_prompt_field="generation_prompt")

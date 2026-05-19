@@ -319,6 +319,7 @@ class ORPOTrainer(Trainer):
 
         train_static_argnums = (2, 3, 4, 5, 6, 7, 8)
 
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             orpo_training_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -328,6 +329,7 @@ class ORPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             partial_concatenated_forward,
@@ -341,6 +343,7 @@ class ORPOTrainer(Trainer):
         )
 
         eval_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             orpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -349,6 +352,7 @@ class ORPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         self._extra_forward_flops_per_token = 0
         self._extra_backward_flops_per_token = 0

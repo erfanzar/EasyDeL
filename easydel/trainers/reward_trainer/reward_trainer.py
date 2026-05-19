@@ -263,6 +263,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_training_static_argnums = (2, 3, 4, 5, 6, 7)
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             training_step,
             static_argnums=sharded_training_static_argnums,
@@ -272,6 +273,7 @@ class RewardTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -280,6 +282,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_evaluation_static_argnums = (2, 3, 4)
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=sharded_evaluation_static_argnums,
@@ -288,6 +291,7 @@ class RewardTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         sharded_training_step_function.static_argnums_ = sharded_training_static_argnums
         sharded_evaluation_step_function.static_argnums_ = sharded_evaluation_static_argnums

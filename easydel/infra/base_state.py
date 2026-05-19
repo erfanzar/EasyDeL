@@ -245,6 +245,68 @@ RESUME_MODEL_SUBDIR = "_resume_model"
 logger = get_logger(__name__)
 
 
+def _optimizer_state_shardings_from_params(
+    tx: optax.GradientTransformation,
+    opt_state: tp.Any,
+    param_shardings: tp.Any,
+    replicated: jax.sharding.NamedSharding,
+) -> tp.Any:
+    """Mirror parameter shardings onto optimizer slots.
+
+    ``optax.tree_map_params`` is the preferred path, but it requires custom
+    pytree aux data to match between placeholder init and real init. Some local
+    optimizers keep per-parameter routing metadata (for example ``layer_ids``)
+    as aux data, so placeholder init has empty aux while real init has one id
+    per parameter. In that case, keep the optimizer metadata intact and mirror
+    any subtree shaped like the parameter tree by structure.
+    """
+
+    def _is_sharding_leaf(value: tp.Any) -> bool:
+        return isinstance(value, jax.sharding.Sharding) or value is None
+
+    def _normalize_sharding(value: tp.Any) -> jax.sharding.NamedSharding:
+        return value if isinstance(value, jax.sharding.NamedSharding) else replicated
+
+    param_slot_shardings = jax.tree_util.tree_map(
+        _normalize_sharding,
+        param_shardings,
+        is_leaf=_is_sharding_leaf,
+    )
+
+    if hasattr(optax, "tree_map_params"):
+        try:
+            return optax.tree_map_params(
+                tx,
+                lambda _param, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
+                opt_state,
+                param_shardings,
+                transform_non_params=lambda _: replicated,
+                is_leaf=_is_sharding_leaf,
+            )
+        except ValueError as exc:
+            if "Mismatch custom node data" not in str(exc):
+                raise
+
+    param_treedef = jax.tree_util.tree_structure(param_shardings, is_leaf=_is_sharding_leaf)
+
+    def _matches_param_tree(value: tp.Any) -> bool:
+        try:
+            return jax.tree_util.tree_structure(value) == param_treedef
+        except Exception:
+            return False
+
+    def _state_sharding(value: tp.Any) -> tp.Any:
+        if _matches_param_tree(value):
+            return param_slot_shardings
+        return replicated
+
+    return jax.tree_util.tree_map(
+        _state_sharding,
+        opt_state,
+        is_leaf=_matches_param_tree,
+    )
+
+
 def _materialize_replicated_setup_scalars(tree: tp.Any, shardings: tp.Any) -> tp.Any:
     """Place replicated scalar setup leaves directly on their target sharding.
 
@@ -806,17 +868,7 @@ class EasyDeLState(_PyTreeNode):
         opt_state = tx.init(self.graphstate)
 
         # 2. Mirror each param's NamedSharding onto its matching opt-state slot.
-        if hasattr(optax, "tree_map_params"):
-            out_shardings = optax.tree_map_params(
-                tx,
-                lambda _param, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
-                opt_state,
-                param_shardings,
-                transform_non_params=lambda _: replicated,
-                is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
-            )
-        else:
-            out_shardings = opt_state
+        out_shardings = _optimizer_state_shardings_from_params(tx, opt_state, param_shardings, replicated)
 
         opt_state = _materialize_replicated_setup_scalars(opt_state, out_shardings)
 
@@ -1817,14 +1869,7 @@ class EasyDeLState(_PyTreeNode):
         opt_state = self.opt_state
         if opt_state is not None and self.tx is not None and hasattr(optax, "tree_map_params"):
             param_shardings = spx.extract_sharding_structure(graphstate, mesh=mesh)
-            opt_shardings = optax.tree_map_params(
-                self.tx,
-                lambda _p, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
-                opt_state,
-                param_shardings,
-                transform_non_params=lambda _: replicated,
-                is_leaf=lambda x: isinstance(x, jax.sharding.NamedSharding) or x is None,
-            )
+            opt_shardings = _optimizer_state_shardings_from_params(self.tx, opt_state, param_shardings, replicated)
             opt_state = _materialize_replicated_setup_scalars(opt_state, opt_shardings)
             opt_state = spx.place_setup_tree_with_shardings(
                 opt_state,

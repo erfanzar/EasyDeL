@@ -332,6 +332,7 @@ class SparseDistillationTrainer(Trainer):
 
         static_argnames = tuple(range(2, 10))
 
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             sparse_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -341,6 +342,7 @@ class SparseDistillationTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -353,6 +355,7 @@ class SparseDistillationTrainer(Trainer):
             None,  # straight_through_emulator
         )
 
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             sparse_distillation_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -361,6 +364,7 @@ class SparseDistillationTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
 
         if self.teacher_state is not None:
             flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=False)

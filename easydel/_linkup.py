@@ -413,15 +413,15 @@ def _apply_auto_environment() -> None:
     _os.environ["NUMEXPR_NUM_THREADS"] = "8"
 
     _os.environ["KMP_AFFINITY"] = "noverbose"
-    _os.environ["GRPC_VERBOSITY"] = "ERROR"
-    _os.environ["GLOG_minloglevel"] = "3"
+    _os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+    _os.environ.setdefault("GLOG_minloglevel", "3")
     _os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
-    _os.environ["TPU_MIN_LOG_LEVEL"] = "4"
-    _os.environ["TPU_STDERR_LOG_LEVEL"] = "4"
+    _os.environ.setdefault("TPU_MIN_LOG_LEVEL", "4")
+    _os.environ.setdefault("TPU_STDERR_LOG_LEVEL", "4")
 
-    _os.environ["TPU_LOG_DIR"] = "disabled"
-    _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    _os.environ.setdefault("TPU_LOG_DIR", "disabled")
+    _os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "

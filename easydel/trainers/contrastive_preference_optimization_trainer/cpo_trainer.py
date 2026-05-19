@@ -278,6 +278,7 @@ class CPOTrainer(Trainer):
         )
 
         training_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+        self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             training_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -287,6 +288,7 @@ class CPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("train.compile_wrapper.end")
         sharded_training_step_function.static_argnums_ = training_static_argnums
 
         self._eval_shared_fn_static_args = (
@@ -301,6 +303,7 @@ class CPOTrainer(Trainer):
         )
 
         evaluation_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
+        self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -309,6 +312,7 @@ class CPOTrainer(Trainer):
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
         )
+        self._runtime_trace("eval.compile_wrapper.end")
         sharded_evaluation_step_function.static_argnums_ = evaluation_static_argnums
 
         self.arguments.ensure_checkpoint_path()
