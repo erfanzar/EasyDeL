@@ -861,7 +861,7 @@ class MinimaxToolParser(ToolParser):
             ) or self._handle_tool_args_streaming(tool_content, current_tools_count)
 
         except Exception:
-            logger.exception("An unexpected error occurred ", "during streaming tool call handling.")
+            logger.exception("An unexpected error occurred during streaming tool call handling.")
             return None
 
     def _find_tool_start_outside_thinking(self, current_text: str) -> int | None:

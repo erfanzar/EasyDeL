@@ -229,7 +229,11 @@ class FunctionDefinition(OpenAIBaseModel):
 
 
 class FunctionCallSelection(OpenAIBaseModel):
-    """Typed legacy function-call selector used by request models."""
+    """Typed legacy function-call selector used by request models.
+
+    Attributes:
+        name: Name of the legacy function to invoke.
+    """
 
     name: str
 
@@ -247,20 +251,35 @@ class ToolDefinition(OpenAIBaseModel):
 
 
 class ToolChoiceFunction(OpenAIBaseModel):
-    """Typed tool-choice selector for OpenAI-compatible requests."""
+    """Typed tool-choice selector for OpenAI-compatible requests.
+
+    Attributes:
+        name: Name of the function the caller is forcing the model to call.
+    """
 
     name: str
 
 
 class ToolChoiceOption(OpenAIBaseModel):
-    """Typed tool-choice object preserving OpenAI wire compatibility."""
+    """Typed tool-choice object preserving OpenAI wire compatibility.
+
+    Attributes:
+        type: Type of the selected tool; currently always ``"function"``.
+        function: Selector identifying the function to invoke.
+    """
 
     type: str = "function"
     function: ToolChoiceFunction
 
 
 class ConversationReference(OpenAIBaseModel):
-    """Typed conversation reference for Responses API continuation."""
+    """Typed conversation reference for Responses API continuation.
+
+    Attributes:
+        id: Conversation identifier (preferred field).
+        conversation_id: Alternate name used by some clients.
+        conversation: Legacy alias still seen on older payloads.
+    """
 
     id: str | None = None
     conversation_id: str | None = None
@@ -268,7 +287,13 @@ class ConversationReference(OpenAIBaseModel):
 
 
 class ResponseReasoningConfig(OpenAIBaseModel):
-    """Typed reasoning config for Responses API requests."""
+    """Typed reasoning config for Responses API requests.
+
+    Attributes:
+        summary: Whether to emit a reasoning summary. Accepts a bool, a
+            string flag (``"auto"``, ``"none"``, …), or ``None`` for the
+            server-side default.
+    """
 
     summary: bool | str | None = None
 

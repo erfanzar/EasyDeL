@@ -677,7 +677,11 @@ def typed_config_dataclass(
     if post_init is not None:
 
         def __post_init__(self):
-            """Forward to the user-supplied ``post_init`` validator."""
+            """Forward to the user-supplied ``post_init`` validator.
+
+            Invoked automatically by the dataclass machinery after fields are
+            populated.
+            """
             post_init(self)
 
         class_namespace["__post_init__"] = __post_init__

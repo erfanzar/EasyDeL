@@ -53,15 +53,32 @@ class _Entry:
 
 
 class FileResponseStore:
-    """File-backed persistent store for Responses API state.
+    """File-backed persistent store for OpenAI Responses API state.
 
-    Storage layout:
+    Holds two LRU-bounded :class:`OrderedDict` indices — one for
+    response records and one for conversation histories — and persists
+    every record as a single zlib-compressed JSON blob under
+    ``storage_dir``. All writes go through an atomic write+rename
+    sequence with a ``.bak`` companion so a crash mid-flush cannot
+    corrupt the live files; the JSON index is re-flushed on every
+    mutation.
+
+    Storage layout::
+
         <storage_dir>/
             index.json
             responses/
                 <response_id>.bin
             conversations/
                 <sha256(conversation_id)>.bin
+
+    Attributes:
+        storage_dir (Path): Root directory containing the index and the
+            two record subdirectories.
+        responses_dir (Path): Subdirectory for response records.
+        conversations_dir (Path): Subdirectory for conversation
+            records.
+        index_file (Path): On-disk index path (``<storage_dir>/index.json``).
     """
 
     def __init__(

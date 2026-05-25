@@ -64,9 +64,13 @@ class ResponseSummaryText(OpenAIBaseModel):
     """A single block of summary text inside a ``ResponseReasoningItem``.
 
     The Responses API allows a reasoning item to carry one or more summary
-    blocks (indexed by ``summary_index`` in the delta events).  In practice
+    blocks (indexed by ``summary_index`` in the delta events). In practice
     eSurge always emits exactly one summary per reasoning item, but the list
     structure is kept for forward-compatibility with the OpenAI spec.
+
+    Attributes:
+        type: Discriminator literal; always ``"summary_text"``.
+        text: Summary text content.
     """
 
     type: tp.Literal["summary_text"] = "summary_text"
@@ -79,6 +83,12 @@ class ResponseOutputTextPart(OpenAIBaseModel):
     Maps to the ``output_text`` discriminator in the Responses API.
     ``annotations`` and ``logprobs`` are placeholder lists reserved for
     future use (e.g. citation annotations, per-token log-probabilities).
+
+    Attributes:
+        type: Discriminator literal; always ``"output_text"``.
+        annotations: Reserved for future annotation payloads (e.g. citations).
+        logprobs: Reserved for future log-probability payloads.
+        text: Plain text content of this part.
     """
 
     type: tp.Literal["output_text"] = "output_text"
@@ -90,15 +100,22 @@ class ResponseOutputTextPart(OpenAIBaseModel):
 class ResponseReasoningItem(OpenAIBaseModel):
     """Output item representing chain-of-thought reasoning from the model.
 
-    This item is emitted into the ``output`` list of a ``ResponsesResponse``
-    when the engine detects a reasoning section (e.g. ``<think>…</think>``
-    blocks) and ``include_reasoning_summary`` is enabled on the request.
-    The reasoning text is stored inside a ``summary`` list of
-    ``ResponseSummaryText`` blocks rather than as a flat string so that
-    streaming can address individual blocks by index.
+    Emitted into the ``output`` list of a :class:`ResponsesResponse` when the
+    engine detects a reasoning section (e.g. ``<think>…</think>`` blocks) and
+    ``include_reasoning_summary`` is enabled on the request. The reasoning
+    text is stored inside a ``summary`` list of :class:`ResponseSummaryText`
+    blocks rather than as a flat string so that streaming can address
+    individual blocks by index.
 
     During streaming the item starts with ``status="in_progress"`` and
     transitions to ``"completed"`` once the reasoning boundary is closed.
+
+    Attributes:
+        id: Stable unique identifier (``"rs_…"``).
+        type: Discriminator literal; always ``"reasoning"``.
+        summary: List of :class:`ResponseSummaryText` blocks (usually one).
+        status: Item lifecycle status (``"in_progress"`` / ``"completed"`` /
+            ``None``).
     """
 
     id: str = Field(default_factory=lambda: f"rs_{uuid.uuid4().hex}")
@@ -110,14 +127,23 @@ class ResponseReasoningItem(OpenAIBaseModel):
 class ResponseFunctionCallItem(OpenAIBaseModel):
     """Output item representing a single function (tool) call.
 
-    Each tool call extracted by the tool parser becomes one of these items
-    in the response's ``output`` list.  ``call_id`` is the unique identifier
-    the client uses to match the tool result back, ``name`` is the function
-    name, and ``arguments`` is the JSON-serialized argument string.
+    Each tool call extracted by the tool parser becomes one of these items in
+    the response's ``output`` list. ``call_id`` is the unique identifier the
+    client uses to match the tool result back, ``name`` is the function name,
+    and ``arguments`` is the JSON-serialized argument string.
 
     During streaming the item starts with ``status="in_progress"`` while
     arguments are still arriving, then transitions to ``"completed"`` when
     the ``response.function_call_arguments.done`` event is emitted.
+
+    Attributes:
+        id: Stable unique identifier for this item (``"fc_…"``).
+        type: Discriminator literal; always ``"function_call"``.
+        call_id: Identifier shared with the client to match tool results
+            (``"call_…"``).
+        name: Function (tool) name.
+        arguments: JSON-encoded argument string.
+        status: Item lifecycle status.
     """
 
     id: str = Field(default_factory=lambda: f"fc_{uuid.uuid4().hex}")
@@ -131,15 +157,22 @@ class ResponseFunctionCallItem(OpenAIBaseModel):
 class ResponseMessageItem(OpenAIBaseModel):
     """Output item representing an assistant text message.
 
-    This is the most common item type — it holds the visible text the
-    model produced after reasoning and tool-call markup have been stripped.
-    ``content`` is a list of ``ResponseOutputTextPart`` (always length 1
-    in the current implementation) to match the OpenAI spec's multi-part
+    This is the most common item type — it holds the visible text the model
+    produced after reasoning and tool-call markup have been stripped.
+    ``content`` is a list of :class:`ResponseOutputTextPart` (always length
+    1 in the current implementation) to match the OpenAI spec's multi-part
     structure.
 
     A message item is emitted whenever there is visible text output *or*
-    when no tool calls were made (so the client always receives at least
-    one output item).
+    when no tool calls were made (so the client always receives at least one
+    output item).
+
+    Attributes:
+        id: Stable unique identifier (``"msg_…"``).
+        type: Discriminator literal; always ``"message"``.
+        role: Message role; always ``"assistant"``.
+        content: Ordered list of text parts.
+        status: Item lifecycle status.
     """
 
     id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
@@ -158,10 +191,15 @@ ResponsesOutputItem = tp.Annotated[
 class ResponsesUsage(OpenAIBaseModel):
     """Token-level usage statistics attached to a ``ResponsesResponse``.
 
-    Mirrors the ``usage`` block from the OpenAI Responses API.  Unlike the
-    Chat Completions ``UsageInfo`` (which also carries throughput metrics),
-    this model is intentionally minimal — just raw token counts — because
-    throughput data is not part of the Responses spec.
+    Mirrors the ``usage`` block from the OpenAI Responses API. Unlike the
+    Chat Completions :class:`UsageInfo` (which also carries throughput
+    metrics), this model is intentionally minimal — just raw token counts —
+    because throughput data is not part of the Responses spec.
+
+    Attributes:
+        input_tokens: Number of tokens in the prompt.
+        output_tokens: Number of tokens in the completion.
+        total_tokens: Sum of ``input_tokens`` and ``output_tokens``.
     """
 
     input_tokens: int = 0
@@ -172,10 +210,13 @@ class ResponsesUsage(OpenAIBaseModel):
 class ResponsesTextFormat(OpenAIBaseModel):
     """Text-format discriminator used inside ``ResponsesTextConfig``.
 
-    Currently only ``"text"`` is supported.  The field exists so the
-    serialized JSON matches the ``text.format.type`` nesting that the
-    OpenAI Responses API returns, allowing clients to parse responses
-    without special-casing EasyDeL output.
+    Currently only ``"text"`` is supported. The field exists so the
+    serialized JSON matches the ``text.format.type`` nesting that the OpenAI
+    Responses API returns, allowing clients to parse responses without
+    special-casing EasyDeL output.
+
+    Attributes:
+        type: Discriminator literal; always ``"text"``.
     """
 
     type: tp.Literal["text"] = "text"
@@ -184,9 +225,12 @@ class ResponsesTextFormat(OpenAIBaseModel):
 class ResponsesTextConfig(OpenAIBaseModel):
     """Configuration block describing the text format of a response.
 
-    Wraps a ``ResponsesTextFormat`` and is attached to every
-    ``ResponsesResponse``.  This mirrors the ``text`` field in the OpenAI
+    Wraps a :class:`ResponsesTextFormat` and is attached to every
+    :class:`ResponsesResponse`. Mirrors the ``text`` field in the OpenAI
     spec and is present primarily for wire-format compatibility.
+
+    Attributes:
+        format: Text-format descriptor.
     """
 
     format: ResponsesTextFormat = Field(default_factory=ResponsesTextFormat)
@@ -195,22 +239,45 @@ class ResponsesTextConfig(OpenAIBaseModel):
 class ResponsesResponse(OpenAIBaseModel):
     """Top-level object returned by the ``/v1/responses`` endpoint.
 
-    Represents a complete (or in-progress) response from the model.
-    The ``output`` list contains an ordered sequence of
-    ``ResponsesOutputItem`` instances — reasoning summaries, function calls,
-    and the final assistant message — that together describe everything the
-    model produced.
+    Represents a complete (or in-progress) response from the model. The
+    ``output`` list contains an ordered sequence of
+    :class:`ResponsesOutputItem` instances — reasoning summaries, function
+    calls, and the final assistant message — that together describe
+    everything the model produced.
 
     During non-streaming requests this object is returned once in its
-    entirety.  During streaming it is first sent inside a
+    entirety. During streaming it is first sent inside a
     ``response.created`` event (with ``status="in_progress"`` and an empty
-    ``output``) and then again inside the final ``response.completed``
-    event with all fields populated.
+    ``output``) and then again inside the final ``response.completed`` event
+    with all fields populated.
 
-    Fields like ``instructions``, ``temperature``, ``tool_choice``, etc.
-    are echo-back fields: they reflect the parameters the caller set on
-    the request so that downstream consumers can inspect them without
-    needing access to the original request payload.
+    Fields like ``instructions``, ``temperature``, ``tool_choice``, etc. are
+    echo-back fields: they reflect the parameters the caller set on the
+    request so that downstream consumers can inspect them without needing
+    access to the original request payload.
+
+    Attributes:
+        id: Unique response identifier (``"resp_…"``).
+        object: Object discriminator; always ``"response"``.
+        created_at: Unix timestamp when the response was created.
+        model: Identifier of the generating model.
+        status: Response lifecycle status (``"in_progress"`` / ``"completed"``).
+        output: Ordered list of output items.
+        usage: Token usage block, or ``None`` for in-progress payloads.
+        error: Free-form error info, if any.
+        incomplete_details: Reason details when the response stopped short.
+        instructions: Echo of the request's system instructions.
+        max_output_tokens: Echo of the request's max output tokens.
+        previous_response_id: Echo of the request's continuation ID.
+        store: Echo of the request's ``store`` flag.
+        temperature: Echo of the sampling temperature.
+        top_p: Echo of the nucleus sampling threshold.
+        truncation: Echo of the truncation strategy.
+        tool_choice: Echo of the tool-choice selector.
+        tools: Echo of the tool definitions provided in the request.
+        parallel_tool_calls: Echo of the ``parallel_tool_calls`` flag.
+        metadata: Echo of the request's custom metadata.
+        text: Text-format configuration block.
     """
 
     id: str
@@ -239,15 +306,31 @@ class ResponsesResponse(OpenAIBaseModel):
 class ResponsesFinalizationOptions(OpenAIBaseModel):
     """Optional overrides applied to the final ``ResponsesResponse`` at stream close.
 
-    When the ``ResponsesStreamAccumulator`` (in ``stream_protocol.py``)
-    builds the terminal ``response.completed`` event it merges these
-    overrides into the response object via ``model_copy(update=…)``.
-    This allows the server to inject request-echo fields (``instructions``,
-    ``tool_choice``, ``metadata``, etc.) that are not known until the
-    request handler processes the original payload.
+    When the :class:`ResponsesStreamAccumulator` (in
+    :mod:`stream_protocol`) builds the terminal ``response.completed`` event
+    it merges these overrides into the response object via
+    ``model_copy(update=…)``. This allows the server to inject request-echo
+    fields (``instructions``, ``tool_choice``, ``metadata``, …) that are not
+    known until the request handler processes the original payload.
 
-    All fields default to ``None`` / empty so that only explicitly-set
-    values overwrite the response.
+    All fields default to ``None`` / empty so that only explicitly-set values
+    overwrite the response.
+
+    Attributes:
+        error: Echo of any error info to attach.
+        incomplete_details: Echo of incomplete-details metadata.
+        instructions: Echo of system instructions.
+        max_output_tokens: Echo of the max output token budget.
+        previous_response_id: Echo of the continuation ID.
+        store: Echo of the storage flag.
+        temperature: Echo of the temperature.
+        top_p: Echo of the nucleus threshold.
+        truncation: Echo of the truncation strategy.
+        tool_choice: Echo of the tool-choice selector.
+        tools: Echo of the request's tool definitions.
+        parallel_tool_calls: Echo of the parallel-tool-calls flag.
+        metadata: Echo of the request's custom metadata.
+        text: Text-format configuration block.
     """
 
     error: tp.Any = None
@@ -271,6 +354,10 @@ class ResponsesFinalizationOptions(OpenAIBaseModel):
         Mutable containers (``tools``, ``metadata``) are shallow-copied so
         that callers cannot accidentally mutate the finalization options
         through the response object.
+
+        Returns:
+            Plain dictionary representation suitable for passing as the
+            ``update`` argument of :meth:`ResponsesResponse.model_copy`.
         """
         return {
             "error": self.error,
@@ -293,10 +380,14 @@ class ResponsesFinalizationOptions(OpenAIBaseModel):
 class ResponseCreatedEvent(OpenAIBaseModel):
     """Payload for the ``response.created`` SSE event.
 
-    This is always the first event in a Responses API stream.  It carries
-    a skeleton ``ResponsesResponse`` with ``status="in_progress"`` and an
-    empty ``output`` list so the client knows the response ID and model
-    before any content arrives.
+    Always the first event in a Responses API stream. Carries a skeleton
+    :class:`ResponsesResponse` with ``status="in_progress"`` and an empty
+    ``output`` list so the client knows the response ID and model before any
+    content arrives.
+
+    Attributes:
+        type: Event discriminator; always ``"response.created"``.
+        response: Skeleton response object.
     """
 
     type: tp.Literal["response.created"] = "response.created"
@@ -307,9 +398,12 @@ class ResponseOutputItemAddedEvent(OpenAIBaseModel):
     """Payload for the ``response.output_item.added`` SSE event.
 
     Emitted once for each new output item (reasoning, function call, or
-    message) as soon as it is created.  ``output_index`` gives the item's
-    position in the response ``output`` list so the client can build its
-    own mirror.
+    message) as soon as it is created.
+
+    Attributes:
+        type: Event discriminator; always ``"response.output_item.added"``.
+        output_index: Position of the new item in the response ``output`` list.
+        item: The freshly-created output item.
     """
 
     type: tp.Literal["response.output_item.added"] = "response.output_item.added"
@@ -320,10 +414,17 @@ class ResponseOutputItemAddedEvent(OpenAIBaseModel):
 class ResponseReasoningSummaryTextDeltaEvent(OpenAIBaseModel):
     """Payload for the ``response.reasoning_summary_text.delta`` SSE event.
 
-    Carries an incremental chunk of reasoning-summary text.  The client
-    should concatenate ``delta`` values to reconstruct the full summary.
+    Carries an incremental chunk of reasoning-summary text. The client should
+    concatenate ``delta`` values to reconstruct the full summary.
     ``summary_index`` identifies which summary block within the reasoning
     item is being extended (always 0 in the current implementation).
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the reasoning item in ``output``.
+        item_id: Stable identifier of the reasoning item.
+        summary_index: Index of the summary block being extended.
+        delta: Incremental text chunk.
     """
 
     type: tp.Literal["response.reasoning_summary_text.delta"] = "response.reasoning_summary_text.delta"
@@ -336,9 +437,16 @@ class ResponseReasoningSummaryTextDeltaEvent(OpenAIBaseModel):
 class ResponseReasoningSummaryTextDoneEvent(OpenAIBaseModel):
     """Payload for the ``response.reasoning_summary_text.done`` SSE event.
 
-    Emitted once when the reasoning summary text is finalized.  ``text``
+    Emitted once when the reasoning summary text is finalized. ``text``
     contains the complete summary so the client can verify its accumulated
     value and discard partial state.
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the reasoning item in ``output``.
+        item_id: Stable identifier of the reasoning item.
+        summary_index: Index of the summary block being closed.
+        text: Final, complete summary text.
     """
 
     type: tp.Literal["response.reasoning_summary_text.done"] = "response.reasoning_summary_text.done"
@@ -352,9 +460,15 @@ class ResponseFunctionCallArgumentsDeltaEvent(OpenAIBaseModel):
     """Payload for the ``response.function_call_arguments.delta`` SSE event.
 
     Streams an incremental chunk of the JSON-serialized function-call
-    arguments for one tool call.  The client concatenates ``delta``
-    strings and JSON-parses the result once the corresponding ``done``
-    event arrives.
+    arguments for one tool call. The client concatenates ``delta`` strings
+    and JSON-parses the result once the corresponding ``done`` event
+    arrives.
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the function-call item in ``output``.
+        item_id: Stable identifier of the function-call item.
+        delta: Incremental JSON-arguments chunk.
     """
 
     type: tp.Literal["response.function_call_arguments.delta"] = "response.function_call_arguments.delta"
@@ -367,8 +481,12 @@ class ResponseFunctionCallArgumentsDoneEvent(OpenAIBaseModel):
     """Payload for the ``response.function_call_arguments.done`` SSE event.
 
     Emitted once per function call when its arguments are complete.
-    ``arguments`` contains the full JSON string so the client can
-    validate against its accumulated deltas.
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the function-call item in ``output``.
+        item_id: Stable identifier of the function-call item.
+        arguments: Final, complete JSON-arguments string.
     """
 
     type: tp.Literal["response.function_call_arguments.done"] = "response.function_call_arguments.done"
@@ -381,9 +499,16 @@ class ResponseContentPartAddedEvent(OpenAIBaseModel):
     """Payload for the ``response.content_part.added`` SSE event.
 
     Signals that a new content part (text block) has been opened inside a
-    message output item.  The ``part`` field carries an empty
-    ``ResponseOutputTextPart`` so the client can create its local
+    message output item. The ``part`` field carries an empty
+    :class:`ResponseOutputTextPart` so the client can create its local
     representation before text deltas start flowing.
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the message item in ``output``.
+        item_id: Stable identifier of the message item.
+        content_index: Index of the new content part within the message.
+        part: Empty content-part placeholder.
     """
 
     type: tp.Literal["response.content_part.added"] = "response.content_part.added"
@@ -396,10 +521,17 @@ class ResponseContentPartAddedEvent(OpenAIBaseModel):
 class ResponseOutputTextDeltaEvent(OpenAIBaseModel):
     """Payload for the ``response.output_text.delta`` SSE event.
 
-    Carries an incremental chunk of visible assistant text.  This is the
-    Responses API equivalent of ``choices[0].delta.content`` in the Chat
-    Completions streaming format.  ``content_index`` identifies which
-    content part the delta belongs to (always 0 today).
+    Carries an incremental chunk of visible assistant text. The Responses
+    API equivalent of ``choices[0].delta.content`` in the Chat Completions
+    streaming format. ``content_index`` identifies which content part the
+    delta belongs to (always 0 today).
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the message item in ``output``.
+        item_id: Stable identifier of the message item.
+        content_index: Index of the content part being extended.
+        delta: Incremental visible text chunk.
     """
 
     type: tp.Literal["response.output_text.delta"] = "response.output_text.delta"
@@ -412,9 +544,14 @@ class ResponseOutputTextDeltaEvent(OpenAIBaseModel):
 class ResponseOutputTextDoneEvent(OpenAIBaseModel):
     """Payload for the ``response.output_text.done`` SSE event.
 
-    Emitted when all text for a content part has been sent.  ``text``
-    contains the full accumulated string so the client can replace its
-    delta-assembled buffer with an authoritative copy.
+    Emitted when all text for a content part has been sent.
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the message item in ``output``.
+        item_id: Stable identifier of the message item.
+        content_index: Index of the content part being closed.
+        text: Final, complete text for the content part.
     """
 
     type: tp.Literal["response.output_text.done"] = "response.output_text.done"
@@ -428,10 +565,15 @@ class ResponseOutputItemDoneEvent(OpenAIBaseModel):
     """Payload for the ``response.output_item.done`` SSE event.
 
     Marks a single output item (reasoning, function call, or message) as
-    finalized.  ``item`` carries the complete, up-to-date item model so the
-    client can reconcile its local state.  Every item that was opened with
+    finalized. ``item`` carries the complete, up-to-date item model so the
+    client can reconcile its local state. Every item opened with
     ``response.output_item.added`` will eventually receive a corresponding
     ``done`` event.
+
+    Attributes:
+        type: Event discriminator.
+        output_index: Position of the item in ``output``.
+        item: The fully-populated output item.
     """
 
     type: tp.Literal["response.output_item.done"] = "response.output_item.done"
@@ -442,11 +584,14 @@ class ResponseOutputItemDoneEvent(OpenAIBaseModel):
 class ResponseCompletedEvent(OpenAIBaseModel):
     """Payload for the ``response.completed`` SSE event.
 
-    This is always the last event in a Responses API stream.  It carries
-    the fully-populated ``ResponsesResponse`` (with usage, all output
-    items, and finalization overrides applied) so the client has an
-    authoritative snapshot identical to what a non-streaming request
-    would have returned.
+    Always the last event in a Responses API stream. Carries the
+    fully-populated :class:`ResponsesResponse` (with usage, all output items,
+    and finalization overrides applied) so the client has an authoritative
+    snapshot identical to what a non-streaming request would have returned.
+
+    Attributes:
+        type: Event discriminator.
+        response: Completed response object.
     """
 
     type: tp.Literal["response.completed"] = "response.completed"
@@ -473,8 +618,12 @@ class StreamEventFrame:
     """A single server-sent event in the Responses API stream.
 
     Pairs an event name (e.g. ``"response.output_text.delta"``) with its
-    typed payload model.  The ``eSurgeApiServer`` serializes each frame
-    as an SSE line: ``event: {event}\\ndata: {json(payload)}\\n\\n``.
+    typed payload model. The ``eSurgeApiServer`` serializes each frame as an
+    SSE line: ``event: {event}\\ndata: {json(payload)}\\n\\n``.
+
+    Attributes:
+        event: SSE event name.
+        payload: Typed payload model for the event.
     """
 
     event: str
@@ -486,10 +635,15 @@ class ReasoningStreamState:
     """Mutable accumulator state for a reasoning output item being streamed.
 
     Created by ``ResponsesStreamAccumulator._ensure_reasoning_item`` the
-    first time a reasoning delta arrives.  The accumulator appends text
-    to ``item.summary[0].text`` on each delta and flips ``done=True``
-    after emitting the ``response.reasoning_summary_text.done`` event so
-    that finalize does not duplicate it.
+    first time a reasoning delta arrives. The accumulator appends text to
+    ``item.summary[0].text`` on each delta and flips ``done=True`` after
+    emitting the ``response.reasoning_summary_text.done`` event so that
+    finalize does not duplicate it.
+
+    Attributes:
+        item: The reasoning output item being assembled.
+        output_index: Position of the item in the response ``output`` list.
+        done: ``True`` once the closing ``done`` event has been emitted.
     """
 
     item: ResponseReasoningItem
@@ -498,7 +652,11 @@ class ReasoningStreamState:
 
     @property
     def item_id(self) -> str:
-        """Stable unique identifier for this reasoning item across all delta events."""
+        """Return the stable unique identifier of the reasoning item.
+
+        Returns:
+            The ``item.id`` value used in every event referring to this item.
+        """
         return self.item.id
 
 
@@ -507,10 +665,16 @@ class FunctionCallStreamState:
     """Mutable accumulator state for a function-call output item being streamed.
 
     One instance is created per tool call (keyed by ``call_id`` or
-    positional index) when the first arguments delta arrives.  The
-    accumulator concatenates argument chunks into ``item.arguments``
-    and marks ``done=True`` after the ``response.function_call_arguments.done``
-    event is emitted during finalization.
+    positional index) when the first arguments delta arrives. The
+    accumulator concatenates argument chunks into ``item.arguments`` and
+    marks ``done=True`` after the
+    ``response.function_call_arguments.done`` event is emitted during
+    finalization.
+
+    Attributes:
+        item: The function-call output item being assembled.
+        output_index: Position of the item in the response ``output`` list.
+        done: ``True`` once the closing ``done`` event has been emitted.
     """
 
     item: ResponseFunctionCallItem
@@ -519,7 +683,11 @@ class FunctionCallStreamState:
 
     @property
     def item_id(self) -> str:
-        """Stable unique identifier for this function-call item across all delta events."""
+        """Return the stable unique identifier of the function-call item.
+
+        Returns:
+            The ``item.id`` value used in every event referring to this item.
+        """
         return self.item.id
 
 
@@ -527,12 +695,18 @@ class FunctionCallStreamState:
 class MessageStreamState:
     """Mutable accumulator state for a message output item being streamed.
 
-    Created the first time visible assistant text arrives.  The
-    accumulator appends text deltas and, during finalization, replaces
-    the item's content list with a single ``ResponseOutputTextPart``
-    containing the complete text.  ``content_index`` is always 0 in the
-    current implementation but is kept for spec-compatibility with
-    multi-part messages.
+    Created the first time visible assistant text arrives. The accumulator
+    appends text deltas and, during finalization, replaces the item's
+    content list with a single :class:`ResponseOutputTextPart` containing
+    the complete text. ``content_index`` is always ``0`` in the current
+    implementation but is kept for spec-compatibility with multi-part
+    messages.
+
+    Attributes:
+        item: The message output item being assembled.
+        output_index: Position of the item in the response ``output`` list.
+        done: ``True`` once the closing ``done`` event has been emitted.
+        content_index: Index of the active content part within the message.
     """
 
     item: ResponseMessageItem
@@ -542,29 +716,42 @@ class MessageStreamState:
 
     @property
     def item_id(self) -> str:
-        """Stable unique identifier for this message item across all delta events."""
+        """Return the stable unique identifier of the message item.
+
+        Returns:
+            The ``item.id`` value used in every event referring to this item.
+        """
         return self.item.id
 
 
 def assistant_message_from_output_items(output_items: list[ResponsesOutputItem]) -> ChatMessage:
     """Collapse a list of Responses API output items into a single ``ChatMessage``.
 
-    This is needed when the server stores a completed Responses API
-    response in conversation history and later needs to inject it as
-    an ``assistant`` message in a follow-up Chat Completions request.
+    Needed when the server stores a completed Responses API response in
+    conversation history and later needs to inject it as an ``assistant``
+    message in a follow-up Chat Completions request.
 
     The function iterates over each output item:
 
-    - ``ResponseMessageItem``: text parts are concatenated into the
+    - :class:`ResponseMessageItem`: text parts are concatenated into the
       message's ``content`` string.
-    - ``ResponseFunctionCallItem``: converted into a ``ToolCall`` and
-      appended to the message's ``tool_calls`` list.
-    - ``ResponseReasoningItem``: skipped (reasoning is not part of the
+    - :class:`ResponseFunctionCallItem`: converted into a :class:`ToolCall`
+      and appended to the message's ``tool_calls`` list.
+    - :class:`ResponseReasoningItem`: skipped (reasoning is not part of the
       visible conversation history).
 
     Raw dicts are accepted alongside model instances so that items
-    round-tripped through JSON (e.g. from a response store) work without
-    an explicit deserialization step.
+    round-tripped through JSON (e.g. from a response store) work without an
+    explicit deserialization step.
+
+    Args:
+        output_items: Output items pulled from a completed Responses
+            payload; may contain model instances or raw dicts.
+
+    Returns:
+        A :class:`ChatMessage` with role ``"assistant"``; ``content`` is set
+        from the joined text parts and ``tool_calls`` from any function
+        calls.
     """
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []

@@ -68,6 +68,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         The primary signal is token-ID suffix (if available). Text suffix is used
         as a fallback and to support tokenizers without direct token-ID mapping.
+
+        Args:
+            prompt_text: Prompt text sent to the model.
+            prompt_token_ids: Token IDs for ``prompt_text``. The last ID is
+                checked against ``_start_token_id`` to decide whether the
+                chat template already opened the reasoning block.
         """
         super().configure_prompt_context(prompt_text, prompt_token_ids)
         has_start_suffix_by_token = False
@@ -85,24 +91,55 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         ``assume_reasoning`` remains a manual override that callers can flip
         on to force prompt-gated parsing without an explicit detection.
+
+        Returns:
+            ``True`` when either ``_prompt_started_reasoning`` (auto-detected)
+            or ``assume_reasoning`` (manual override) is set.
         """
         # `assume_reasoning` remains as a compatibility override.
         return self._prompt_started_reasoning or self.assume_reasoning
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        """Check if the end-of-reasoning token is present in the token IDs."""
+        """Check if the end-of-reasoning token is present in the token IDs.
+
+        Args:
+            input_ids: Decoded token IDs to scan for ``_end_token_id``.
+
+        Returns:
+            ``True`` when ``_end_token_id`` is known and appears in
+            ``input_ids``; ``False`` otherwise.
+        """
         if self._end_token_id is not None:
             return self._end_token_id in input_ids
         return False
 
     def is_reasoning_end_streaming(self, input_ids: Sequence[int], delta_ids: Sequence[int]) -> bool:
-        """Check if end token appears in delta (more efficient for streaming)."""
+        """Check if end token appears in delta (more efficient for streaming).
+
+        Args:
+            input_ids: Full cumulative token IDs (unused; kept for interface
+                parity with non-streaming variant).
+            delta_ids: Token IDs for the most recent streamed chunk.
+
+        Returns:
+            ``True`` when ``_end_token_id`` is known and appears in
+            ``delta_ids``; ``False`` otherwise.
+        """
         if self._end_token_id is not None:
             return self._end_token_id in delta_ids
         return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        """Extract content token IDs by removing everything up to and including the end token."""
+        """Extract content token IDs by stripping everything up to and including the end token.
+
+        Args:
+            input_ids: Full decoded token sequence including reasoning region.
+
+        Returns:
+            Suffix of ``input_ids`` after the first occurrence of
+            ``_end_token_id``; the original list when the end token is not
+            present or not known.
+        """
         if self._end_token_id is None or self._end_token_id not in input_ids:
             return input_ids
         end_idx = input_ids.index(self._end_token_id)
@@ -118,8 +155,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
         Handles both explicit delimiter mode (start_token in output) and
         prompt-gated asymmetric mode (start_token injected by chat template).
 
+        Args:
+            model_output: Complete decoded text from the model.
+            request: Optional request context (unused by the base class; kept
+                for interface parity with :class:`ReasoningParser`).
+
         Returns:
-            Tuple of (reasoning_content, visible_content). Either may be None.
+            Tuple of (reasoning_content, visible_content). Either element may
+            be ``None`` when the corresponding portion is missing or empty.
         """
         if self.start_token not in model_output:
             if self._is_prompt_reasoning_active():
@@ -167,9 +210,20 @@ class BaseThinkingReasoningParser(ReasoningParser):
         to the reasoning section, content section, or straddles a boundary.
         Supports prompt-gated mode where the start token was in the prompt.
 
+        Args:
+            previous_text: Cumulative text before this streamed chunk.
+            current_text: Cumulative text including the new chunk (unused
+                except via ``previous_text``/``delta_text``).
+            delta_text: Newly produced text in this chunk.
+            previous_token_ids: Token IDs prior to the chunk.
+            current_token_ids: Cumulative token IDs (unused; kept for parity).
+            delta_token_ids: Token IDs corresponding to ``delta_text``.
+            request: Optional request context (unused).
+
         Returns:
-            DeltaMessage with reasoning_content and/or content set,
-            or None if the delta is a boundary token with no text to emit.
+            A :class:`DeltaMessage` with ``reasoning_content`` and/or
+            ``content`` set, or ``None`` if the delta only contains a boundary
+            token with no surrounding text to emit.
         """
         if not delta_text:
             return None

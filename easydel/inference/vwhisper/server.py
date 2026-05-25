@@ -435,7 +435,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
 
         finally:
             # Clean up the temporary file
-            if "temp_file_path" in locals():
+            if temp_file_path is not None and os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
 
     @app.post("/v1/audio/translations")
@@ -531,7 +531,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
 
         finally:
             # Clean up the temporary file
-            if "temp_file_path" in locals():
+            if temp_file_path is not None and os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
 
     return app

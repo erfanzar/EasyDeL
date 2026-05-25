@@ -39,6 +39,14 @@ except ModuleNotFoundError:  # pragma: no cover
     from logging import getLogger as _getlogger
 
     def _get_logger(name: str | None = None):
+        """Fallback logger factory used when ``eformer.loggings`` is unavailable.
+
+        Args:
+            name: Optional logger name. Defaults to the current module's name.
+
+        Returns:
+            A ``logging.Logger`` configured with the resolved name.
+        """
         return _getlogger(name or __name__)
 
 
@@ -525,10 +533,21 @@ _import_structure = {
         "Qwen3_5Config",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MTPHead",
+        "Qwen3_5MTPLayer",
+        "Qwen3_5MTPOutput",
         "Qwen3_5Model",
         "Qwen3_5TextConfig",
         "Qwen3_5TextModel",
         "Qwen3_5VisionConfig",
+    ],
+    "modules.gemma4_assistant": [
+        "Gemma4AssistantCentroidHead",
+        "Gemma4AssistantConfig",
+        "Gemma4AssistantForCausalLM",
+        "Gemma4AssistantModel",
+        "Gemma4AssistantOutput",
+        "Gemma4AssistantTextConfig",
     ],
     "modules.qwen3_5_moe": [
         "Qwen3_5MoeConfig",
@@ -843,6 +862,14 @@ if _tp.TYPE_CHECKING:
         Gemma4VisionConfig,
         Gemma4VisionModel,
     )
+    from .modules.gemma4_assistant import (
+        Gemma4AssistantCentroidHead,
+        Gemma4AssistantConfig,
+        Gemma4AssistantForCausalLM,
+        Gemma4AssistantModel,
+        Gemma4AssistantOutput,
+        Gemma4AssistantTextConfig,
+    )
     from .modules.gidd import GiddConfig, GiddForDiffusionLM, GiddModel
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
@@ -930,6 +957,9 @@ if _tp.TYPE_CHECKING:
         Qwen3_5ForCausalLM,
         Qwen3_5ForConditionalGeneration,
         Qwen3_5Model,
+        Qwen3_5MTPHead,
+        Qwen3_5MTPLayer,
+        Qwen3_5MTPOutput,
         Qwen3_5TextConfig,
         Qwen3_5TextModel,
         Qwen3_5VisionConfig,

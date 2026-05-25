@@ -9,7 +9,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-specific reasoning parsers for EasyDeL inference."""
+"""Model-specific reasoning parsers for EasyDeL inference.
+
+Each submodule registers one or more :class:`~easydel.inference.reasoning.abstract_reasoning.ReasoningParser`
+subclasses that know how to split a particular model family's output into a
+reasoning / thinking section and a visible content section.
+
+Exported parsers cover, among others, DeepSeek R1 / V3 (``<think>...</think>``),
+Qwen3 (``<think>...</think>`` with prompt-gated mode), Mistral (``[THINK]``
+tokens), Granite (``Here's my thought process:``), GPT-OSS and Gemma4
+(``<|channel|>`` channel markers), Seed-OSS (``<seed:think>``), Olmo3, Ernie 4.5,
+Hunyuan A13B, MiniMax M2 (with an ``append_think`` variant), Step3 / Step3.5,
+plus an ``IdentityReasoningParser`` no-op fallback. The names listed in
+``__all__`` are the public symbols re-exported from
+:mod:`easydel.inference.reasoning`.
+"""
 
 from .deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from .deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser

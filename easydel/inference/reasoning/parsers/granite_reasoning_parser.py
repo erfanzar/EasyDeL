@@ -9,13 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reasoning parser for IBM Granite models.
+"""Reasoning parser for IBM Granite chain-of-thought models.
 
-Format uses text delimiters:
+Granite does not use bracket/special tokens to delimit reasoning. Instead, it
+emits literal English phrases as delimiters::
+
     Here's my thought process:
-    <reasoning>
+    ...chain-of-thought reasoning...
     Here's my response:
-    <content>
+    ...visible response...
+
+Both delimiters tolerate the "Here's"/"Here is" variants. The parser performs
+text-level matching (via a single compiled regex for batch mode and substring
+scans for streaming mode) since the delimiter strings are not single tokens
+in the vocabulary.
 """
 
 from __future__ import annotations
@@ -40,13 +47,34 @@ _RESPONSE_STARTERS = [
 
 @ReasoningParserManager.register_module(["granite"])  # pyright: ignore[reportUntypedClassDecorator]
 class GraniteReasoningParser(ReasoningParser):
-    """Reasoning parser for Granite models using text delimiters."""
+    """Reasoning parser for IBM Granite outputs using English-phrase delimiters.
+
+    Granite chain-of-thought outputs are split with literal English phrases
+    rather than special tokens. The parser compiles a regex that matches the
+    ``Here's my thought process: ... Here's my response: ...`` shape, then
+    keeps a tiny two-flag state machine (``_in_reasoning`` /
+    ``_reasoning_done``) so streaming deltas survive partial delimiter
+    arrival across chunk boundaries.
+
+    Attributes:
+        _regex (re.Pattern[str]): Compiled regex matching the full
+            thought/response sandwich across newlines (``re.DOTALL``).
+        _thought_starters (list[str]): Accepted opening phrases.
+        _response_starters (list[str]): Accepted closing phrases.
+        _in_reasoning (bool): Streaming flag — ``True`` once the thought
+            delimiter has been observed and reasoning content is being
+            collected.
+        _reasoning_done (bool): Streaming flag — ``True`` once the response
+            delimiter has been observed and subsequent deltas are visible
+            content.
+    """
 
     def __init__(self, tokenizer: AnyTokenizer):
-        """Initialize with tokenizer and compile regex for thought/response delimiters.
+        """Initialize parser state and compile the thought/response regex.
 
         Args:
-            tokenizer: Tokenizer used for decoding token sequences to text
+            tokenizer: HuggingFace tokenizer used by
+                :meth:`is_reasoning_end` to decode token IDs back into text
                 for delimiter matching.
         """
         super().__init__(tokenizer)
@@ -62,16 +90,51 @@ class GraniteReasoningParser(ReasoningParser):
         self._reasoning_done = False
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        """Check if a response starter phrase appears in decoded text."""
+        """Report whether a ``Here's my response:`` phrase has been emitted.
+
+        Args:
+            input_ids: Sequence of generated token IDs which are decoded
+                back to text for substring matching against the response
+                starters.
+
+        Returns:
+            ``True`` when any of the response-starter phrases appears in
+            the decoded text, ``False`` otherwise.
+        """
         text = self.model_tokenizer.decode(list(input_ids), skip_special_tokens=False)
         return any(s in text for s in self._response_starters)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        """Return all token IDs (Granite uses text-level delimiter splitting)."""
+        """Return ``input_ids`` verbatim.
+
+        Granite splits at the text level rather than via dedicated content
+        tokens, so all token IDs are forwarded; downstream consumers should
+        operate on the decoded text instead.
+
+        Args:
+            input_ids: Full generated token-ID sequence.
+
+        Returns:
+            A list copy of ``input_ids``.
+        """
         return list(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
-        """Extract reasoning and content using thought/response text delimiters."""
+        """Split the model output into reasoning and content via the compiled regex.
+
+        Args:
+            model_output: Full decoded text produced by the model.
+            request: Optional inference request; unused, kept for interface
+                parity with sibling parsers.
+
+        Returns:
+            Tuple ``(reasoning, content)`` extracted from the regex
+            capture groups. When the regex does not match (no
+            thought/response sandwich found), returns
+            ``(None, model_output)`` so the whole text is treated as
+            visible content. Either element may be ``None`` when the
+            captured group was empty after stripping.
+        """
         match = self._regex.search(model_output)
         if not match:
             return None, model_output
@@ -89,7 +152,26 @@ class GraniteReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
-        """Stream reasoning/content by tracking thought/response text delimiters."""
+        """Route streaming deltas using thought/response delimiter scanning.
+
+        Maintains the parser's two-flag state machine so the correct half
+        of the output is emitted for each delta even when the delimiter
+        straddles a chunk.
+
+        Args:
+            previous_text: Cumulative text before this chunk (unused).
+            current_text: Cumulative text including this chunk; scanned
+                for the response-starter phrases.
+            delta_text: Newly produced text in this chunk.
+            previous_token_ids: Token IDs before this chunk (unused).
+            current_token_ids: Token IDs including this chunk (unused).
+            delta_token_ids: Token IDs for ``delta_text`` (unused).
+            request: Optional inference request (unused).
+
+        Returns:
+            A :class:`DeltaMessage` carrying ``reasoning_content`` and/or
+            ``content`` for this step, or ``None`` when the delta is empty.
+        """
         if not delta_text:
             return None
 

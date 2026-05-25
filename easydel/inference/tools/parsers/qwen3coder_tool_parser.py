@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3 Coder tool parser aligned with vLLM."""
+"""Qwen3 Coder tool parser aligned with vLLM.
+
+Parses tool calls emitted by Qwen3 Coder models in the ``<tool_call>``
+XML envelope::
+
+    <tool_call><function=name><parameter=x>value</parameter></function></tool_call>
+
+Supports both complete (non-streaming) extraction via
+:meth:`Qwen3CoderToolParser.extract_tool_calls` and incremental
+streaming extraction via :meth:`Qwen3CoderToolParser.extract_tool_calls_streaming`,
+including schema-aware coercion of parameter string values to their
+JSON-Schema declared types using the tool definitions on the request.
+"""
 
 from __future__ import annotations
 
@@ -113,7 +125,12 @@ class Qwen3CoderToolParser(ToolParser):
         logger.debug("vLLM Successfully import tool parser %s !", self.__class__.__name__)
 
     def _generate_tool_call_id(self) -> str:
-        """Generate a unique tool call ID."""
+        """Generate a unique tool call ID.
+
+        Returns:
+            A new ``call_<24-hex-chars>`` identifier suitable for use as the
+            ``id`` field of an OpenAI-format ``ToolCall``.
+        """
         return f"call_{uuid.uuid4().hex[:24]}"
 
     def _reset_streaming_state(self):

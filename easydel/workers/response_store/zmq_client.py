@@ -32,16 +32,20 @@ import zmq
 
 
 class ResponseStoreWorkerClient:
-    """Thread-safe ZMQ client for communicating with a response store worker.
+    """Thread-safe ZMQ REQ client for the Responses API state store worker.
 
-    Provides methods to get, put, and delete responses and conversations
-    from a remote ``FileResponseStore`` running in a separate process.
+    Wraps a single ``zmq.REQ`` socket plus a :class:`threading.Lock`
+    so multiple FastAPI request handlers can share one client without
+    interleaving sends and receives. Each public method maps 1:1 to a
+    command consumed by ``worker_main.py`` and re-raises worker-side
+    errors as :class:`RuntimeError`.
 
-    Args:
-        endpoint: ZeroMQ endpoint of the response store worker.
-
-    Raises:
-        ValueError: If ``endpoint`` is empty.
+    Attributes:
+        endpoint (str): The ZMQ endpoint URI this client is connected
+            to; surfaced via the :attr:`endpoint` property.
+        enabled (bool): Always ``True`` on this concrete client; the
+            :attr:`enabled` property exists so the API server can swap
+            in a no-op stub when persistence is disabled.
     """
 
     def __init__(self, endpoint: str):
@@ -160,14 +164,23 @@ class ResponseStoreWorkerClient:
         return tp.cast(dict[str, tp.Any], stats) if isinstance(stats, dict) else {}
 
     def shutdown(self) -> None:
-        """Send a shutdown command to the worker and close the connection."""
+        """Send ``shutdown`` to the worker then close the local socket.
+
+        The local socket is always released even when the worker has
+        already exited or the round-trip otherwise fails.
+        """
         try:
             self._request({"cmd": "shutdown"})
         finally:
             self.close()
 
     def close(self) -> None:
-        """Close the ZeroMQ socket without sending a shutdown command."""
+        """Close the local REQ socket without notifying the worker.
+
+        Used by :meth:`ResponseStoreWorkerManager.shutdown` in the
+        attached (non-owning) mode where the upstream worker is
+        managed by an external lifecycle.
+        """
         self._socket.close(0)
 
     @property

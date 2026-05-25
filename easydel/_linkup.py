@@ -194,6 +194,16 @@ def _patch_removed_jax_config_flags() -> None:
     removed_flags = {"jax_pmap_shmap_merge"}
 
     def _patched_update(name, value):
+        """Swallow ``jax.config.update`` calls for removed flags.
+
+        Args:
+            name: Configuration flag name being set.
+            value: New value for the flag.
+
+        Returns:
+            The original ``jax.config.update`` return value, or ``None`` when
+            ``name`` is in the removed-flag denylist.
+        """
         if name in removed_flags:
             return None
         return update(name, value)
@@ -212,6 +222,12 @@ def _patch_transformers_import_utils() -> None:
     if not hasattr(_hf_import_utils, "is_torch_fx_available"):
 
         def _is_torch_fx_available() -> bool:
+            """Best-effort replacement for the removed HF ``is_torch_fx_available``.
+
+            Returns:
+                ``True`` when PyTorch is importable, ``False`` otherwise.
+                Catches all errors and returns ``False`` defensively.
+            """
             try:
                 is_torch_available = getattr(_hf_import_utils, "is_torch_available", None)
                 return bool(is_torch_available()) if callable(is_torch_available) else False
@@ -237,6 +253,16 @@ def _patch_transformers_rope_scaling_property() -> None:
         return
 
     def _patched_get(self):
+        """Return ``None`` for default-typed DeepSeek ``rope_scaling`` dicts.
+
+        Args:
+            self: Owning ``PretrainedConfig`` instance.
+
+        Returns:
+            The original property value, or ``None`` for DeepSeek v2/v3
+            configs whose ``rope_scaling`` mapping uses the default rope
+            type (which HF newer code interprets as "no scaling").
+        """
         value = original_get(self)
         if getattr(self, "model_type", None) in {"deepseek_v2", "deepseek_v3"} and isinstance(value, dict):
             rope_type = value.get("rope_type", value.get("type"))
@@ -274,6 +300,19 @@ def _patch_transformers_mrope_default_rope_validation() -> None:
         optional_keys=None,
         ignore_keys=None,
     ):
+        """Tolerate mRoPE metadata under ``rope_type='default'`` configs.
+
+        Args:
+            rope_type: The rope variant declared by the config.
+            received_keys: Keys actually present in ``rope_scaling``.
+            required_keys: Keys that must be present for ``rope_type``.
+            optional_keys: Keys that are allowed but not required.
+            ignore_keys: Keys to skip from the validation entirely; mRoPE
+                metadata keys are added to this set when applicable.
+
+        Returns:
+            The original HF validator return value.
+        """
         if rope_type == "default" and mrope_metadata_keys.intersection(received_keys):
             ignore_keys = set(ignore_keys or ()) | mrope_metadata_keys
         return original_check(rope_type, received_keys, required_keys, optional_keys, ignore_keys)
@@ -294,6 +333,16 @@ def _patch_transformers_init_weights_tie_signature() -> None:
         return
 
     def _patched_init_weights(self):
+        """Retry weight tying when HF's new ``init_weights`` signature is stale.
+
+        Args:
+            self: The HuggingFace ``PreTrainedModel`` instance.
+
+        Returns:
+            The original ``init_weights`` return value, or the result of
+            ``self.tie_weights()`` when the call fails because the remote
+            model uses the legacy signature.
+        """
         try:
             return original_init_weights(self)
         except TypeError as exc:
@@ -317,6 +366,17 @@ def _patch_eformer_exception_serialization() -> None:
         return
 
     def _coerce_picklable_exception(exception: BaseException | None) -> BaseException | None:
+        """Return ``exception`` if picklable, else a ``RuntimeError`` fallback.
+
+        Args:
+            exception: Exception to make safe for ``pickle.dumps``.
+
+        Returns:
+            ``None`` when ``exception`` is ``None``; the original exception
+            when it round-trips through ``pickle``; otherwise a
+            ``RuntimeError`` that preserves the qualified type name,
+            ``str(exception)``, and any attached ``__notes__``.
+        """
         if exception is None:
             return None
         try:
@@ -339,6 +399,17 @@ def _patch_eformer_exception_serialization() -> None:
             return fallback
 
     def _patched_ser_exc_info(cls, exception: BaseException | None = None):
+        """Sanitize the inner exception of an ``ExceptionInfo`` for pickling.
+
+        Args:
+            cls: The ``ExceptionInfo`` class (classmethod plumbing).
+            exception: Exception to capture; ``None`` defers to the original
+                implementation's default behavior.
+
+        Returns:
+            The original ``ExceptionInfo`` with ``ex`` replaced by a
+            pickle-safe value.
+        """
         exc_info = original_ser_exc_info(cls, exception)
         exc_info.ex = _coerce_picklable_exception(exc_info.ex)
         return exc_info
@@ -362,6 +433,21 @@ def _patch_transformers_autoconfig_gated_repo_skip() -> None:
         return
 
     def _patched_from_pretrained(cls, *args, **kwargs):
+        """Convert gated-repo ``OSError``s into ``unittest.SkipTest`` under pytest.
+
+        Args:
+            cls: The owning ``AutoConfig`` class.
+            *args: Forwarded positional args (e.g. repo id).
+            **kwargs: Forwarded keyword args.
+
+        Returns:
+            The original ``from_pretrained`` result on success.
+
+        Raises:
+            OSError: When the failure is not a gated-repo error.
+            unittest.SkipTest: When running under pytest and the failure is
+                a known gated-repo error message.
+        """
         import os as _runtime_os
 
         try:

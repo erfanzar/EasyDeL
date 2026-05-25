@@ -240,16 +240,16 @@ class LogitsProcessorList(list):
 
 @auto_pytree
 class TemperatureLogitsWarper(LogitsWarper):
-    r"""
-    [`LogitsWarper`] that applies temperature scaling to the logits distribution.
+    r"""Apply temperature scaling to the logits distribution.
 
-    Divides the logits by the `temperature` value. A temperature of 0.0 or 1.0 results
-    in no change. Temperatures below 1.0 make the distribution sharper (less random),
-    while temperatures above 1.0 make it flatter (more random).
+    Divides the logits by the ``temperature`` value. A temperature of 1.0 (or
+    the sentinel ``-1``) results in no change. Temperatures below 1.0 make the
+    distribution sharper (less random), while temperatures above 1.0 make it
+    flatter (more random).
 
-    Args:
+    Attributes:
         temperature: The temperature value for scaling. Must be non-negative.
-            Setting to 0.0 disables the warper effectively.
+            A value of ``-1`` is treated as a sentinel that disables scaling.
     """
 
     temperature: jnp.ndarray
@@ -276,23 +276,24 @@ class TemperatureLogitsWarper(LogitsWarper):
 
 @auto_pytree
 class TopPLogitsWarper(LogitsWarper):
-    """
-    [`LogitsWarper`] that implements top-p (nucleus) sampling.
+    """Implement top-p (nucleus) sampling as a logits warper.
 
-    Filters the vocabulary distribution by keeping only the smallest set of tokens
-    whose cumulative probability mass exceeds the threshold `top_p`. The logits
-    of the filtered tokens are set to `filter_value`.
+    Filters the vocabulary distribution by keeping only the smallest set of
+    tokens whose cumulative probability mass exceeds the threshold ``top_p``.
+    The logits of the filtered tokens are set to ``filter_value``.
 
-    Reference: [The Curious Case of Neural Text Degeneration](https://arxiv.org/abs/1904.09751)
-    by Holtzman et al. (2019).
+    Reference: `The Curious Case of Neural Text Degeneration`__ by Holtzman et
+    al. (2019).
 
-    Args:
-        top_p: The cumulative probability threshold. Must be in (0, 1].
-            Setting `top_p=1.0` disables the filter.
+    __ https://arxiv.org/abs/1904.09751
+
+    Attributes:
+        top_p: The cumulative probability threshold. Must be in ``(0, 1]``.
+            Setting ``top_p=1.0`` disables the filter.
         filter_value: The value assigned to the logits of filtered tokens.
-            Defaults to -infinity.
+            Defaults to ``-inf``.
         min_tokens_to_keep: Minimum number of tokens to retain, even if their
-            cumulative probability exceeds `top_p`. Defaults to 1.
+            cumulative probability exceeds ``top_p``. Defaults to ``1``.
     """
 
     top_p: float
@@ -334,21 +335,19 @@ class TopPLogitsWarper(LogitsWarper):
 
 @auto_pytree
 class TopKLogitsWarper(LogitsWarper):
-    r"""
-    [`LogitsWarper`] that implements top-k sampling.
+    r"""Implement top-k sampling as a logits warper.
 
-    Filters the vocabulary distribution by keeping only the `top_k` tokens with the
-    highest probabilities (logits). The logits of the filtered tokens are set to
-    `filter_value`.
+    Filters the vocabulary distribution by keeping only the ``top_k`` tokens
+    with the highest logits. The logits of the filtered tokens are set to
+    ``filter_value``.
 
-    Args:
-        top_k: The number of highest probability tokens to keep. Setting `top_k=0`
-            disables the filter.
-        filter_value: The value assigned to the logits of filtered tokens.
-            Defaults to -infinity.
-        min_tokens_to_keep: Minimum number of tokens to retain, overriding `top_k`
-            if `top_k` is smaller. Ensures at least this many tokens are considered.
-            Defaults to 1.
+    Attributes:
+        top_k: Number of highest-probability tokens to keep. Setting
+            ``top_k=0`` disables the filter.
+        filter_value: Value assigned to the logits of filtered tokens.
+            Defaults to ``-inf``.
+        min_tokens_to_keep: Minimum number of tokens to retain, overriding
+            ``top_k`` when ``top_k`` is smaller. Defaults to ``1``.
     """
 
     top_k: int
@@ -398,16 +397,14 @@ class TopKLogitsWarper(LogitsWarper):
 
 @auto_pytree
 class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that ensures the beginning-of-sequence (BOS) token is
-    generated as the very first token.
+    r"""Force the beginning-of-sequence (BOS) token as the first generated token.
 
-    This processor modifies the logits only at the first generation step (`cur_len` = 1).
-    It sets the logit of the `bos_token_id` to 0 (probability 1) and all other logits
-    to `filter_value` (-infinity).
+    This processor modifies the logits only at the first generation step
+    (``cur_len == 1``). It sets the logit of ``bos_token_id`` to ``0``
+    (probability ``1``) and all other logits to ``-inf``.
 
-    Args:
-        bos_token_id: The integer ID of the Beginning-Of-Sequence token.
+    Attributes:
+        bos_token_id: The integer ID of the beginning-of-sequence token.
     """
 
     bos_token_id: int
@@ -431,17 +428,15 @@ class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that forces the end-of-sequence (EOS) token to be generated
-    when the generation process reaches the predefined `max_length`.
+    r"""Force the end-of-sequence (EOS) token when ``max_length`` is reached.
 
-    This processor modifies the logits only at the step where `cur_len` equals
-    `max_length - 1`. It sets the logit of the `eos_token_id` to 0 (probability 1)
-    and all other logits to `filter_value` (-infinity).
+    This processor modifies the logits only at the step where ``cur_len``
+    equals ``max_length - 1``. It sets the logit of ``eos_token_id`` to ``0``
+    (probability ``1``) and all other logits to ``-inf``.
 
-    Args:
-        max_length: The maximum allowed sequence length (including prompt).
-        eos_token_id: The integer ID of the End-Of-Sequence token.
+    Attributes:
+        max_length: Maximum allowed sequence length, including the prompt.
+        eos_token_id: Integer ID of the end-of-sequence token.
     """
 
     max_length: int
@@ -466,17 +461,16 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class MinLengthLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that prevents the generation of the end-of-sequence (EOS)
-    token until a minimum sequence length (`min_length`) has been reached.
+    r"""Suppress the EOS token until a minimum sequence length is reached.
 
-    This processor sets the logit of the `eos_token_id` to `filter_value` (-infinity)
-    if the current sequence length `cur_len` is less than `min_length`.
+    Sets the logit of ``eos_token_id`` to ``-inf`` whenever the current sequence
+    length ``cur_len`` is less than ``min_length``, ensuring at least that many
+    tokens are generated before termination becomes possible.
 
-    Args:
-        min_length: The minimum number of tokens that must be generated before the
+    Attributes:
+        min_length: Minimum number of tokens that must be generated before the
             EOS token is allowed.
-        eos_token_id: The integer ID of the End-Of-Sequence token.
+        eos_token_id: Integer ID of the end-of-sequence token.
     """
 
     min_length: int
@@ -512,20 +506,17 @@ class MinLengthLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that suppresses a specified list of tokens only at a specific
-    early step in the generation process.
+    r"""Suppress a list of tokens at a single specific generation step.
 
-    This is useful for preventing certain tokens (like BOS) from being generated
-    immediately after the prompt.
+    The suppression occurs only when ``cur_len`` equals ``begin_index``. The
+    logits of ``begin_suppress_tokens`` are set to ``-inf`` at that step and
+    left unchanged on every other step. Useful for preventing tokens like BOS
+    from being generated immediately after the prompt.
 
-    The suppression occurs only when `cur_len` equals `begin_index`. The logits of the
-    `begin_suppress_tokens` are set to `filter_value` (-infinity) at that step.
-
-    Args:
-        begin_suppress_tokens: A list or tuple of token IDs to suppress at the start.
-        begin_index: The generation step index (0-based relative to the start of generation)
-            at which to apply the suppression.
+    Attributes:
+        begin_suppress_tokens: Token IDs to suppress at the start.
+        begin_index: Generation step index (0-based, relative to the start of
+            generation) at which to apply the suppression.
     """
 
     begin_suppress_tokens: list
@@ -549,15 +540,13 @@ class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class SuppressTokensLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that suppresses a specified list of tokens throughout the
-    entire generation process.
+    r"""Suppress a list of tokens at every step of the generation process.
 
-    This processor sets the logits of the `suppress_tokens` to `filter_value` (-infinity)
-    at every generation step where the list is not empty.
+    Sets the logits of ``suppress_tokens`` to ``-inf`` at every generation step
+    whenever the list is non-empty.
 
-    Args:
-        suppress_tokens: A list or tuple of token IDs to suppress consistently.
+    Attributes:
+        suppress_tokens: Token IDs to suppress on every generation step.
     """
 
     suppress_tokens: list
@@ -579,21 +568,19 @@ class SuppressTokensLogitsProcessor(LogitsProcessor):
 
 
 class ForceTokensLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that forces specific tokens to be generated at predefined
-    positions during the generation.
+    r"""Force specific tokens at predefined positions during generation.
 
-    This processor uses a mapping (`force_token_map`) where keys are the generation
-    indices (0-based, relative to the start of generation) and values are the token IDs
-    to be forced at those indices.
+    Uses a mapping (``force_token_map``) where keys are generation indices
+    (0-based, relative to the start of generation) and values are token IDs to
+    be forced at those indices. When the current generation step ``cur_len``
+    matches an index in the map, the logit of the corresponding forced token
+    ID is set to ``0`` (probability ``1``), and all other logits are set to
+    ``-inf``.
 
-    When the current generation step `cur_len` matches an index in the map, the logit
-    of the corresponding forced token ID is set to 0 (probability 1), and all other
-    logits are set to `filter_value` (-infinity).
-
-    Args:
-        force_token_map: A mapping from generation index to the token ID to force.
-            Can be provided as a `dict` or a `list` of `(index, token_id)` pairs.
+    Attributes:
+        force_token_array (jnp.ndarray): Integer array of length
+            ``max(index) + 1`` storing the forced token ID for each step;
+            entries set to ``-1`` indicate steps without forced tokens.
     """
 
     def __init__(self, force_token_map):
@@ -649,36 +636,40 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
 
 
 class WhisperTimeStampLogitsProcessor(LogitsProcessor):
-    r"""
-    A specialized [`LogitsProcessor`] tailored for handling timestamp tokens during
-    generation with Whisper-style models used for Automatic Speech Recognition (ASR).
+    r"""Apply Whisper-style timestamp constraints to logits during ASR decoding.
 
-    It enforces several constraints specific to timestamp prediction:
-    1. **Suppresses `<|notimestamps|>`:** Prevents the model from predicting the token
-       that indicates the absence of timestamps.
-    2. **Alternating Tokens:** Enforces that text tokens and timestamp tokens generally
-       alternate. If the last generated token was a timestamp, it biases against
-       predicting another timestamp immediately after (unless it's the very beginning
-       or certain edge cases).
-    3. **Initial Timestamp Limit:** Restricts the maximum value of the *first* timestamp
-       token predicted using `max_initial_timestamp_index`.
-    4. **Timestamp Probability Check:** If the total probability mass assigned to all
-       valid timestamp tokens is higher than the probability of the single most likely
-       *non-timestamp* token, it forces the model to sample a timestamp token by
-       suppressing all non-timestamp tokens.
+    A specialized :class:`LogitsProcessor` tailored for timestamp tokens during
+    generation with Whisper-style models used for Automatic Speech Recognition
+    (ASR). It enforces several constraints specific to timestamp prediction:
+
+    1. **Suppresses ``<|notimestamps|>``:** Prevents the model from predicting
+       the token that indicates the absence of timestamps.
+    2. **Alternating tokens:** Enforces that text tokens and timestamp tokens
+       generally alternate. If the last generated token was a timestamp, it
+       biases against predicting another timestamp immediately after (with a
+       couple of edge cases near the start).
+    3. **Initial timestamp limit:** Restricts the maximum value of the *first*
+       timestamp token via ``max_initial_timestamp_index``.
+    4. **Timestamp probability check:** If the total probability mass on all
+       valid timestamp tokens is higher than the probability of the single
+       most likely non-timestamp token, the model is forced to sample a
+       timestamp token by suppressing all non-timestamp tokens.
 
     Note:
-        This processor assumes the existence of specific token IDs related to timestamps
-        (e.g., `eos_token_id`, `no_timestamps_token_id`, `timestamp_begin`) which are
-        typically defined in the model's generation configuration.
+        This processor assumes the existence of specific token IDs related to
+        timestamps (``eos_token_id``, ``no_timestamps_token_id``,
+        ``timestamp_begin``) typically defined in the model's generation
+        configuration.
 
-    Args:
-        generate_config: Configuration object containing Whisper-specific generation parameters
-            like `eos_token_id`, `no_timestamps_token_id`, `is_multilingual`,
-            `max_initial_timestamp_index`.
-        model_config: The model's configuration (used for `vocab_size` as a fallback).
-        decoder_input_length: The length of the initial input sequence provided to the decoder
-            (e.g., the prompt length).
+    Attributes:
+        eos_token_id (int): End-of-sequence token ID.
+        no_timestamps_token_id (int): Token that signals absence of timestamps;
+            always suppressed.
+        timestamp_begin (int): First token ID in the timestamp range.
+        begin_index (int): Generation index at which timestamp constraints
+            become active.
+        max_initial_timestamp_index (int): Inclusive upper bound on the first
+            allowed timestamp index; defaults to ``model_config.vocab_size``.
     """
 
     def __init__(self, generate_config, model_config, decoder_input_length):
@@ -785,17 +776,15 @@ class WhisperTimeStampLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class PresencePenaltyLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that penalizes tokens based on their presence in the sequence
-    generated so far (`input_ids`).
+    r"""Penalize tokens already present in the generated sequence.
 
-    This processor subtracts a fixed `presence_penalty` value from the logits of all
-    tokens that have appeared at least once in the `input_ids`.
-    Positive penalties discourage the model from reusing tokens, promoting topic diversity.
+    Subtracts a fixed ``presence_penalty`` from the logits of any token that
+    has appeared at least once in ``input_ids``. Positive penalties discourage
+    the model from reusing tokens and promote topic diversity.
 
-    Args:
-        presence_penalty: The penalty value subtracted from the logits of present tokens.
-            Must be non-negative. Defaults to 0.0 (no penalty).
+    Attributes:
+        presence_penalty: Penalty value subtracted from the logits of present
+            tokens. Must be non-negative; ``0.0`` disables the processor.
     """
 
     presence_penalty: float
@@ -834,17 +823,15 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that penalizes tokens based on their frequency (number of
-    occurrences) in the sequence generated so far (`input_ids`).
+    r"""Penalize tokens proportionally to their occurrence count in the sequence.
 
-    This processor subtracts a penalty proportional to the token's count from its logit.
-    The penalty is calculated as `count * frequency_penalty`.
-    Positive penalties discourage the model from repeating specific tokens frequently.
+    Subtracts a penalty proportional to a token's count in ``input_ids`` from
+    its logit. The penalty is computed as ``count * frequency_penalty``;
+    positive values discourage the model from repeating specific tokens.
 
-    Args:
-        frequency_penalty: The penalty factor. Must be non-negative.
-            Defaults to 0.0 (no penalty).
+    Attributes:
+        frequency_penalty: Penalty factor. Must be non-negative; ``0.0``
+            disables the processor.
     """
 
     frequency_penalty: float
@@ -883,25 +870,24 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that applies a multiplicative penalty to the logits of tokens
-    that have already appeared in the generated sequence (`input_ids`).
+    r"""Apply a multiplicative CTRL-style repetition penalty to seen tokens.
 
-    For previously seen tokens:
-    - If the original logit is positive, it's divided by `repetition_penalty`.
-    - If the original logit is negative, it's multiplied by `repetition_penalty`.
+    For each token that has already appeared in ``input_ids``:
 
-    This aims to discourage repetition.
+    - If the original logit is positive, it is divided by
+      ``repetition_penalty``.
+    - If the original logit is negative, it is multiplied by
+      ``repetition_penalty``.
 
-    Reference: [CTRL: A Conditional Transformer Language Model for Controllable Generation](https://arxiv.org/abs/1909.05858)
-    by Keskar et al. (2019).
+    Reference: `CTRL: A Conditional Transformer Language Model for
+    Controllable Generation`__ by Keskar et al. (2019).
 
-    Args:
-        repetition_penalty: The penalty factor. Must be positive.
-            - 1.0 means no penalty.
-            - Values > 1.0 discourage repetition.
-            - Values < 1.0 encourage repetition.
-            Defaults to 1.0.
+    __ https://arxiv.org/abs/1909.05858
+
+    Attributes:
+        repetition_penalty: Multiplicative penalty factor. Must be positive.
+            ``1.0`` means no penalty; values ``> 1.0`` discourage repetition;
+            values ``< 1.0`` encourage repetition.
     """
 
     repetition_penalty: float
@@ -929,7 +915,7 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
             presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
             positive_penalized_scores = x / repetition_penalty
             negative_penalized_scores = x * repetition_penalty
-            scores_intermediate = jnp.where(x > 0, positive_penalized_scores, scores)
+            scores_intermediate = jnp.where(x > 0, positive_penalized_scores, x)
             penalized_scores = jnp.where(x < 0, negative_penalized_scores, scores_intermediate)
             x = jnp.where(presence_mask, penalized_scores, x)
             return x.astype(org_dtype)
@@ -946,22 +932,22 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
 
 @auto_pytree
 class MinPLogitsWarper(LogitsWarper):
-    r"""
-    [`LogitsWarper`] implementing min-p sampling.
+    r"""Implement min-p sampling as a logits warper.
 
-    Filters the vocabulary distribution by removing tokens whose probability `P(token)`
-    is less than `min_p` times the probability of the most likely token `P(max)`. That is,
-    it keeps tokens where `P(token) >= min_p * P(max)`.
+    Filters the vocabulary distribution by removing tokens whose probability
+    ``P(token)`` is less than ``min_p`` times the probability of the most
+    likely token ``P(max)``. That is, it keeps tokens where
+    ``P(token) >= min_p * P(max)``. This is an alternative filtering strategy
+    to top-p or top-k.
 
-    This is an alternative filtering strategy to top-p or top-k.
-
-    Args:
-        min_p: The minimum probability threshold relative to the peak probability.
-            Must be in [0, 1]. Setting `min_p=0.0` disables the filter.
-        filter_value: The value assigned to the logits of filtered tokens.
-            Defaults to -infinity.
+    Attributes:
+        min_p: Minimum probability threshold relative to the peak probability.
+            Must be in ``[0, 1]``; ``0.0`` disables the filter.
+        filter_value: Value assigned to the logits of filtered tokens.
+            Defaults to ``-inf``.
         min_tokens_to_keep: Minimum number of tokens to retain, even if their
-            probability falls below the `min_p * P(max)` threshold. Defaults to 1.
+            probability falls below the ``min_p * P(max)`` threshold.
+            Defaults to ``1``.
     """
 
     min_p: float
@@ -1004,18 +990,19 @@ class MinPLogitsWarper(LogitsWarper):
 
 @auto_pytree
 class NoRepeatNGramLogitsProcessor(LogitsProcessor):
-    r"""
-    [`LogitsProcessor`] that prevents the generation of n-grams that have already
-    occurred in the sequence generated so far (`input_ids`).
+    r"""Forbid generating n-grams that have already occurred in the sequence.
 
-    At each step, it considers the last `ngram_size - 1` tokens generated. It then identifies
-    all tokens in the vocabulary that would complete an n-gram already present in the full
-    `input_ids` sequence. The logits for these banned tokens are set to `filter_value` (-infinity).
+    At each step, the processor considers the last ``ngram_size - 1`` tokens
+    generated. It then identifies all tokens in the vocabulary that would
+    complete an n-gram already present in the full ``input_ids`` sequence,
+    and sets the logits for those banned tokens to ``-inf``.
 
-    Reference: [Fairseq Sequence Generator](https://github.com/pytorch/fairseq/blob/a07cb6f40480928c9e0548b737aadd36ee66ac76/fairseq/sequence_generator.py#L345)
+    Reference: `Fairseq Sequence Generator`__.
 
-    Args:
-        ngram_size: The size of the n-gram to prevent from repeating. Setting `ngram_size=0`
+    __ https://github.com/pytorch/fairseq/blob/a07cb6f40480928c9e0548b737aadd36ee66ac76/fairseq/sequence_generator.py#L345
+
+    Attributes:
+        ngram_size: Size of the n-gram to prevent from repeating; ``0``
             disables the processor.
     """
 

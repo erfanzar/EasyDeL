@@ -9,7 +9,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mixin class for reasoning extraction functionality in inference servers."""
+"""Mixin class for reasoning extraction functionality in inference servers.
+
+Provides :class:`ReasoningMixin`, a per-server bridge between OpenAI-compatible
+API surfaces and the registered :class:`~easydel.inference.reasoning.abstract_reasoning.ReasoningParser`
+implementations. The mixin owns a ``reasoning_parsers`` dict keyed by model
+name and exposes:
+
+* :meth:`ReasoningMixin.initialize_reasoning_parsers` — bulk construction of
+  per-model parsers from a tokenizer/processor map.
+* :meth:`ReasoningMixin.extract_reasoning_batch` — non-streaming split into
+  reasoning / visible content.
+* :meth:`ReasoningMixin.extract_reasoning_streaming` — streaming split that
+  emits :class:`~easydel.inference.openai_api_modules.DeltaMessage` payloads.
+* :meth:`ReasoningMixin.get_reasoning_parser_for_model` — direct lookup.
+
+Mirrors the shape of ``ToolCallingMixin`` and is intended to be combined with
+it on an inference server class.
+"""
 
 from __future__ import annotations
 

@@ -85,9 +85,17 @@ class CompletionOutputLike(Protocol):
     """Structural protocol describing a single completion sample from the engine.
 
     Each ``RequestOutputLike`` contains one or more ``CompletionOutputLike``
-    entries in its ``outputs`` list (one per ``n`` or beam).  The protocol
+    entries in its ``outputs`` list (one per ``n`` or beam). The protocol
     is intentionally duck-typed so that both the real ``CompletionOutput``
     dataclass and lightweight test stubs satisfy it without inheritance.
+
+    Attributes:
+        finish_reason: Why generation stopped for this sample
+            (``"stop"``, ``"length"``, ``"finished"``, …), or ``None``
+            when still in progress.
+        tool_calls: Tool calls extracted from this sample, or ``None``.
+        reasoning_content: Reasoning text extracted from this sample, or
+            ``None`` when no reasoning was emitted.
     """
 
     finish_reason: str | None
@@ -98,12 +106,30 @@ class CompletionOutputLike(Protocol):
 class RequestOutputLike(Protocol):
     """Structural protocol describing an engine output snapshot.
 
-    The eSurge engine emits one of these per decoding step.  It carries
-    both *accumulated* state (``accumulated_text``, ``tool_calls``) and
-    *delta* state (``delta_text``, ``delta_tool_calls``) so that
-    consumers can choose between snapshot-based and incremental
-    processing.  Prompt token IDs may be flat or segmented (for
-    multi-segment prompts), so both shapes are accepted.
+    The eSurge engine emits one of these per decoding step. It carries both
+    *accumulated* state (``accumulated_text``, ``tool_calls``) and *delta*
+    state (``delta_text``, ``delta_tool_calls``) so that consumers can choose
+    between snapshot-based and incremental processing. Prompt token IDs may be
+    flat or segmented (for multi-segment prompts), so both shapes are
+    accepted.
+
+    Attributes:
+        prompt_token_ids: Prompt token IDs, flat or segmented per encoder
+            segment.
+        outputs: List of per-sample / per-beam outputs.
+        num_generated_tokens: Total generated tokens so far on the primary
+            sample.
+        tokens_per_second: Rolling generation throughput.
+        processing_time: Elapsed wall-clock time for the request, in seconds.
+        first_token_time: Time-to-first-token in seconds, or ``None`` before
+            the first token is emitted.
+        delta_text: Newly produced assistant text since the previous snapshot.
+        delta_reasoning_content: Newly produced reasoning text since the
+            previous snapshot.
+        delta_tool_calls: Streaming tool-call deltas produced by parsers.
+        reasoning_content: Accumulated reasoning text on the primary sample.
+        accumulated_text: Accumulated assistant text on the primary sample.
+        tool_calls: Accumulated tool calls on the primary sample.
     """
 
     prompt_token_ids: list[list[int]] | list[int]
@@ -124,15 +150,22 @@ def compute_stream_delta_text(current_text: str, previous_text: str, fallback_de
     """Compute a safe streaming delta from two accumulated text snapshots.
 
     The primary strategy is a simple prefix check: if ``current_text``
-    starts with ``previous_text``, the delta is the tail.  When that
-    fails (e.g. the parser rewrote a boundary, or reasoning extraction
-    shifted indices), the function walks backwards looking for the
-    longest suffix of ``previous_text`` that matches a prefix of
-    ``current_text`` and returns the non-overlapping tail.
+    starts with ``previous_text``, the delta is the tail. When that fails
+    (e.g. the parser rewrote a boundary, or reasoning extraction shifted
+    indices), the function walks backwards looking for the longest suffix of
+    ``previous_text`` that matches a prefix of ``current_text`` and returns
+    the non-overlapping tail.
 
-    If no reliable delta can be determined, ``fallback_delta`` is
-    returned (typically the raw ``delta_text`` from the engine) as a
-    last resort, or an empty string if even that is unsafe.
+    Args:
+        current_text: Current cumulative output text from the engine.
+        previous_text: Previously emitted cumulative text.
+        fallback_delta: Engine-supplied delta to use when the cumulative
+            comparison cannot recover a safe delta.
+
+    Returns:
+        The text segment newly produced since ``previous_text``. Returns
+        ``fallback_delta`` when no reliable cumulative delta can be derived,
+        or an empty string if even that would be unsafe.
     """
 
     current_text = current_text or ""
@@ -164,8 +197,15 @@ def prompt_token_count_from_output(output: RequestOutputLike) -> int:
     """Extract the total prompt token count from a ``RequestOutputLike``.
 
     Handles both flat (``list[int]``) and segmented (``list[list[int]]``)
-    prompt token ID layouts.  Segmented layouts occur when the prompt was
+    prompt token ID layouts. Segmented layouts occur when the prompt was
     split across multiple encoder segments (e.g. for multimodal inputs).
+
+    Args:
+        output: Engine output snapshot whose prompt IDs should be summed.
+
+    Returns:
+        Total number of prompt tokens across all segments; ``0`` when the
+        prompt is empty.
     """
 
     prompt_ids = output.prompt_token_ids
@@ -180,10 +220,16 @@ def normalize_tool_calls(tool_calls: tp.Any) -> list[ToolCall] | None:
     """Validate and coerce heterogeneous tool-call data into ``ToolCall`` instances.
 
     Accepts a list that may contain ``ToolCall`` model instances, raw dicts,
-    or other Pydantic-compatible representations.  Each element is passed
+    or other Pydantic-compatible representations. Each element is passed
     through ``ToolCall.model_validate``; items that fail validation are
-    silently dropped.  Returns ``None`` (not an empty list) when no valid
-    calls remain, so callers can use a simple truthiness check.
+    silently dropped.
+
+    Args:
+        tool_calls: Iterable / value emitted by an engine or parser.
+
+    Returns:
+        A list of validated :class:`ToolCall` objects, or ``None`` when no
+        valid calls remain (use a truthiness check at the call site).
     """
     if not tool_calls:
         return None
@@ -204,9 +250,16 @@ def normalize_tool_calls(tool_calls: tp.Any) -> list[ToolCall] | None:
 def normalize_delta_tool_calls(tool_calls: tp.Any) -> list[DeltaToolCall] | None:
     """Validate and coerce heterogeneous delta-tool-call data into ``DeltaToolCall`` instances.
 
-    Same contract as ``normalize_tool_calls`` but for the streaming delta
-    variant which carries partial function names and argument chunks
+    Same contract as :func:`normalize_tool_calls` but for the streaming
+    delta variant, which carries partial function names and argument chunks
     rather than complete calls.
+
+    Args:
+        tool_calls: Iterable / value emitted by an engine or streaming parser.
+
+    Returns:
+        A list of validated :class:`DeltaToolCall` objects, or ``None`` when
+        no valid deltas remain.
     """
     if not tool_calls:
         return None
@@ -227,10 +280,16 @@ def normalize_delta_tool_calls(tool_calls: tp.Any) -> list[DeltaToolCall] | None
 def jsonify_tool_calls(tool_calls: tp.Any) -> list[tp.Any] | None:
     """Normalize tool calls and serialize each to a JSON-safe dict.
 
-    Combines ``normalize_tool_calls`` with ``model_dump`` so the result
+    Combines :func:`normalize_tool_calls` with ``model_dump`` so the result
     can be directly embedded in a JSON response body without further
-    processing.  ``exclude_unset`` and ``exclude_none`` keep the output
-    compact.
+    processing. ``exclude_unset`` and ``exclude_none`` keep the output compact.
+
+    Args:
+        tool_calls: Heterogeneous tool-call value to serialize.
+
+    Returns:
+        A list of JSON-compatible dicts ready for embedding in a response, or
+        ``None`` when no valid tool calls were present.
     """
     normalized = normalize_tool_calls(tool_calls)
     if normalized is None:
@@ -246,17 +305,26 @@ def coerce_stream_delta_message(
 ) -> DeltaMessage | None:
     """Normalize an engine/parser streaming delta into a safe ``DeltaMessage``.
 
-    The engine and various tool/reasoning parsers return deltas in
-    different shapes — ``DeltaMessage`` instances, plain strings, raw
-    dicts, or even ``None``.  This function coerces all of them into a
-    canonical ``DeltaMessage``, applying three fixups:
+    The engine and various tool/reasoning parsers return deltas in different
+    shapes — :class:`DeltaMessage` instances, plain strings, raw dicts, or
+    even ``None``. This function coerces all of them into a canonical
+    :class:`DeltaMessage`, applying three fixups:
 
     1. If the input is ``None`` and ``fallback_text`` is non-empty, a
        text-only delta is synthesized.
     2. ``default_role`` is applied when the delta lacks a role.
-    3. When ``tool_calls`` are present, ``content`` is forced to
-       ``None`` to match the OpenAI streaming spec (which does not
-       allow both in the same chunk).
+    3. When ``tool_calls`` are present, ``content`` is forced to ``None`` to
+       match the OpenAI streaming spec (which does not allow both in the same
+       chunk).
+
+    Args:
+        delta_message: Raw delta object emitted by the engine or a parser.
+        fallback_text: Text to use when ``delta_message`` lacks a text body.
+        default_role: Role to assign when the delta omits one.
+
+    Returns:
+        A :class:`DeltaMessage` ready for SSE emission, or ``None`` when no
+        usable content was produced.
     """
 
     if delta_message is None:
@@ -298,19 +366,32 @@ def build_responses_reasoning_item(reasoning_text: str) -> ResponseReasoningItem
     """Create a ``ResponseReasoningItem`` wrapping the given reasoning text.
 
     The text is stored inside a single ``ResponseSummaryText`` block at
-    ``summary[0]``.  During streaming the accumulator later updates this
+    ``summary[0]``. During streaming the accumulator later updates this
     block in-place as more reasoning tokens arrive.
+
+    Args:
+        reasoning_text: Reasoning summary text to embed in the item.
+
+    Returns:
+        A new :class:`ResponseReasoningItem` containing one summary block.
     """
     return ResponseReasoningItem(summary=[ResponseSummaryText(text=reasoning_text)])
 
 
 def build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[ResponseFunctionCallItem]:
-    """Convert a list of raw/normalized tool calls into ``ResponseFunctionCallItem`` instances.
+    """Convert raw/normalized tool calls into ``ResponseFunctionCallItem`` instances.
 
     Each valid tool call becomes one item with ``call_id``, ``name``, and
-    ``arguments`` populated from the corresponding ``ToolCall``.  Calls
+    ``arguments`` populated from the corresponding :class:`ToolCall`. Calls
     with an empty function name are silently skipped because they usually
     indicate an incomplete parse artifact.
+
+    Args:
+        tool_calls: List of tool calls (mixed shapes accepted), or ``None``.
+
+    Returns:
+        A list of :class:`ResponseFunctionCallItem` objects (empty when
+        ``tool_calls`` is falsy or only contains invalid entries).
     """
     normalized_tool_calls = normalize_tool_calls(tool_calls)
     if not normalized_tool_calls:
@@ -335,9 +416,16 @@ def build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list
 def build_responses_message_item(output_text: str) -> ResponseMessageItem:
     """Create a ``ResponseMessageItem`` containing the given assistant text.
 
-    The text is wrapped in a single ``ResponseOutputTextPart`` inside the
-    item's ``content`` list.  Status is set to ``"completed"`` because
+    The text is wrapped in a single :class:`ResponseOutputTextPart` inside
+    the item's ``content`` list. Status is set to ``"completed"`` because
     this builder is used for non-streaming (batch) responses.
+
+    Args:
+        output_text: Assistant-visible text to embed.
+
+    Returns:
+        A new :class:`ResponseMessageItem` ready to include in a final
+        Responses payload.
     """
     return ResponseMessageItem(
         content=[ResponseOutputTextPart(text=output_text)],
@@ -352,10 +440,18 @@ def should_emit_responses_message_item(
     """Decide whether a message output item should be included in the response.
 
     A message item is emitted when either (a) there is visible assistant
-    text, or (b) no tool calls were extracted.  The second case ensures
-    that the client always receives at least one output item — an empty
-    message — even if the model produced no text and no tool calls
-    (e.g. an early abort).
+    text, or (b) no tool calls were extracted. The second case ensures that
+    the client always receives at least one output item — an empty message —
+    even if the model produced no text and no tool calls (e.g. an early
+    abort).
+
+    Args:
+        output_text: Generated assistant text to consider for inclusion.
+        tool_calls: Tool calls accompanying the output, or ``None``.
+
+    Returns:
+        ``True`` when a message item should be emitted alongside any
+        tool-call / reasoning items.
     """
     return bool(output_text) or not tool_calls
 
@@ -370,11 +466,23 @@ def build_responses_output_items(
     """Assemble the complete ``output`` list for a finished ``ResponsesResponse``.
 
     Items are appended in display order:
+
     1. A reasoning summary (if enabled and non-empty reasoning text exists).
     2. One function-call item per extracted tool call.
-    3. A message item (unless suppressed by ``should_emit_responses_message_item``).
+    3. A message item (unless suppressed by
+       :func:`should_emit_responses_message_item`).
 
     This mirrors the ordering the OpenAI Responses API uses.
+
+    Args:
+        output_text: Assistant-visible text generated by the model.
+        tool_calls: Optional tool/function call records.
+        reasoning_text: Optional reasoning text emitted by the model.
+        include_reasoning_summary: When ``True``, prepend a reasoning item if
+            ``reasoning_text`` is non-empty.
+
+    Returns:
+        Ordered list of :class:`ResponsesOutputItem` objects.
     """
     items: list[ResponsesOutputItem] = []
     if include_reasoning_summary and isinstance(reasoning_text, str) and reasoning_text.strip():
@@ -390,9 +498,16 @@ def responses_assistant_message_from_output_items(
 ) -> ChatMessage:
     """Convert Responses API output items back into a ``ChatMessage``.
 
-    Thin wrapper around ``assistant_message_from_output_items`` (defined
-    in ``typed_models``) exposed here for convenience so that callers in
-    the server layer do not need to import from both modules.
+    Thin wrapper around ``assistant_message_from_output_items`` (defined in
+    :mod:`typed_models`) exposed here for convenience so that callers in the
+    server layer do not need to import from both modules.
+
+    Args:
+        output_items: Output items from a Responses payload.
+
+    Returns:
+        A :class:`ChatMessage` with role ``"assistant"`` summarizing the
+        provided output items.
     """
     return assistant_message_from_output_items(output_items)
 
@@ -413,10 +528,27 @@ def build_responses_object(
     """Build a complete, non-streaming ``ResponsesResponse`` object.
 
     If ``output_items`` is not provided, the function assembles them
-    automatically via ``build_responses_output_items``.  ``created_at``
-    defaults to the current Unix timestamp.  The returned object is
-    ready to be serialized as the response body of a non-streaming
-    ``/v1/responses`` request.
+    automatically via :func:`build_responses_output_items`. ``created_at``
+    defaults to the current Unix timestamp. The returned object is ready to
+    be serialized as the response body of a non-streaming ``/v1/responses``
+    request.
+
+    Args:
+        response_id: Unique identifier embedded in the response (``"resp_…"``).
+        model: Model name echoed back to the client.
+        output_text: Assistant-visible generated text.
+        prompt_tokens: Number of prompt tokens billed for the request.
+        completion_tokens: Number of completion tokens billed.
+        tool_calls: Optional tool/function call records.
+        reasoning_text: Optional reasoning text emitted by the model.
+        include_reasoning_summary: Whether to include the reasoning summary
+            item when ``reasoning_text`` is non-empty.
+        output_items: Pre-built output items; constructed automatically when
+            not provided.
+        created_at: Unix timestamp; defaults to the current time.
+
+    Returns:
+        Fully populated :class:`ResponsesResponse` ready for serialization.
     """
     created_at_value = int(created_at if created_at is not None else time.time())
     if output_items is None:
@@ -450,14 +582,25 @@ def iter_chat_completion_stream_responses(
 ) -> tp.Iterator[ChatCompletionStreamResponse]:
     """Convert a stream of engine output snapshots into OpenAI Chat Completion SSE chunks.
 
-    Each yielded ``ChatCompletionStreamResponse`` corresponds to one
-    ``data:`` line in the SSE stream.  The final chunk carries a
-    non-null ``finish_reason`` (``"stop"``, ``"tool_calls"``, or
-    ``"length"``) and an empty/null content delta to signal end-of-stream.
+    Each yielded :class:`ChatCompletionStreamResponse` corresponds to one
+    ``data:`` line in the SSE stream. The final chunk carries a non-null
+    ``finish_reason`` (``"stop"``, ``"tool_calls"``, or ``"length"``) and an
+    empty/null content delta to signal end-of-stream.
 
-    Tool-call deltas are passed through as-is; the ``finish_reason``
-    is upgraded to ``"tool_calls"`` whenever at least one delta or
-    batch tool call was detected during the stream.
+    Tool-call deltas are passed through as-is; the ``finish_reason`` is
+    upgraded to ``"tool_calls"`` whenever at least one delta or batch tool
+    call was detected during the stream.
+
+    Args:
+        outputs: Iterator of engine output snapshots.
+        model: Model identifier embedded in each emitted chunk.
+
+    Yields:
+        :class:`ChatCompletionStreamResponse` chunks, with the final chunk
+        carrying the resolved ``finish_reason``.
+
+    Raises:
+        RuntimeError: If ``outputs`` produced no snapshots at all.
     """
 
     prompt_tokens = 0
@@ -674,8 +817,11 @@ class ResponsesStreamAccumulator:
         """Return the opening ``response.created`` event that starts the SSE stream.
 
         The skeleton response has ``status="in_progress"`` and an empty
-        ``output`` list.  The client uses the ``id`` and ``model`` fields
-        to associate subsequent delta events with this response.
+        ``output`` list. The client uses the ``id`` and ``model`` fields to
+        associate subsequent delta events with this response.
+
+        Returns:
+            A list containing the single ``response.created`` frame.
         """
         response = ResponsesResponse(
             id=self.response_id,
@@ -809,19 +955,23 @@ class ResponsesStreamAccumulator:
         Inspects the snapshot's delta fields to route data to the correct
         output item:
 
-        - **Reasoning deltas** are appended to the reasoning summary text
-          and emitted as ``response.reasoning_summary_text.delta`` events.
+        - **Reasoning deltas** are appended to the reasoning summary text and
+          emitted as ``response.reasoning_summary_text.delta`` events.
         - **Tool-call deltas** create or extend function-call items, emitting
           ``response.output_item.added`` (on first sight) and
           ``response.function_call_arguments.delta`` events.
         - **Text deltas** are appended to the message item and emitted as
-          ``response.output_text.delta`` events.  Text is suppressed once
-          a tool-call delta has been seen (matching OpenAI behavior where
+          ``response.output_text.delta`` events. Text is suppressed once a
+          tool-call delta has been seen (matching OpenAI behavior where
           content and tool calls are mutually exclusive in a single chunk).
 
-        Returns a list of ``StreamEventFrame`` objects to be sent to the
-        client.  May return an empty list if the snapshot carried no
-        actionable deltas (e.g. a control-token-only step).
+        Args:
+            output: One engine output snapshot.
+
+        Returns:
+            List of :class:`StreamEventFrame` objects to send to the client.
+            May be empty if the snapshot carried no actionable deltas (for
+            example, a control-token-only step).
         """
         frames: list[StreamEventFrame] = []
         primary_output = self._primary_output(output)
@@ -934,12 +1084,20 @@ class ResponsesStreamAccumulator:
            ``response.output_text.done`` and ``response.output_item.done``
            with the final text.
 
-        4. **Response close** — builds the complete ``ResponsesResponse``
-           with usage stats, applies ``final_response_overrides``, and
-           emits ``response.completed``.
+        4. **Response close** — builds the complete :class:`ResponsesResponse`
+           with usage stats, applies ``final_response_overrides``, and emits
+           ``response.completed``.
+
+        Args:
+            last_output: Final engine snapshot, providing accumulated text,
+                tool calls, and token counts.
+            prompt_tokens: Number of prompt tokens to record in the usage
+                summary.
 
         Returns:
-            A tuple of (list of final frames, the completed ResponsesResponse).
+            Tuple of ``(frames, response)``: the list of closing
+            :class:`StreamEventFrame` objects to emit and the assembled
+            :class:`ResponsesResponse`.
         """
         frames: list[StreamEventFrame] = []
         primary_output = self._primary_output(last_output)
@@ -1106,11 +1264,30 @@ def iter_responses_stream_frames(
 ) -> tp.Iterator[StreamEventFrame]:
     """Convert a stream of engine output snapshots into Responses API SSE event frames.
 
-    This is the top-level entry point for Responses API streaming.  It
-    creates a ``ResponsesStreamAccumulator``, feeds each snapshot through
-    ``add_output``, and calls ``finalize`` after the last snapshot.  The
+    Top-level entry point for Responses API streaming. Creates a
+    :class:`ResponsesStreamAccumulator`, feeds each snapshot through
+    :meth:`ResponsesStreamAccumulator.add_output`, and calls
+    :meth:`ResponsesStreamAccumulator.finalize` after the last snapshot. The
     caller (typically the API server) iterates over the yielded
-    ``StreamEventFrame`` objects and serializes each as an SSE line.
+    :class:`StreamEventFrame` objects and serializes each as an SSE line.
+
+    Args:
+        outputs: Iterator of engine output snapshots.
+        response_id: Identifier embedded in every emitted event.
+        model: Model name echoed in events.
+        include_reasoning_summary: When ``True``, surface reasoning text as
+            its own reasoning output item.
+        final_response_overrides: Optional finalization overrides applied to
+            the completed :class:`ResponsesResponse`.
+        created_at: Unix timestamp embedded in the skeleton response;
+            defaults to the current time.
+
+    Yields:
+        :class:`StreamEventFrame` objects covering the entire response
+        lifecycle (created, deltas, completed).
+
+    Raises:
+        RuntimeError: If ``outputs`` produced no snapshots at all.
     """
 
     accumulator = ResponsesStreamAccumulator(

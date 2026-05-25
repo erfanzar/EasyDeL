@@ -9,9 +9,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reasoning parser for GptOss models.
+"""Reasoning parser for GptOss (OpenAI open-weights) chain-of-thought models.
 
-Format uses channel tags: <|channel|>analysis<reasoning><|message|><content>
+GptOss models emit reasoning inside a ``<|channel|>``-tagged analysis section
+followed by a ``<|message|>`` delimiter that switches to the visible response.
+Cumulative format::
+
+    <|channel|>analysis text<|message|>visible response
+
+This parser splits the cumulative output at those two markers and emits the
+two halves as ``reasoning_content`` and ``content`` respectively, both in
+batch mode (:meth:`extract_reasoning`) and during streaming
+(:meth:`extract_reasoning_streaming`).
 """
 
 from __future__ import annotations
@@ -26,19 +35,36 @@ from ..abstract_reasoning import ReasoningParser, ReasoningParserManager
 
 @ReasoningParserManager.register_module(["openai_gptoss", "gptoss"])  # pyright: ignore[reportUntypedClassDecorator]
 class GptOssReasoningParser(ReasoningParser):
-    """Reasoning parser for GptOss models using channel tags.
+    """Reasoning parser for GptOss models using channel/message marker tags.
 
-    Format: <|channel|>analysis_text<|message|>response_text
+    Splits cumulative model output into a hidden reasoning section and a
+    visible content section using the canonical GptOss grammar:
+
+        ``<|channel|>analysis_text<|message|>response_text``
+
+    The parser holds a small two-flag state machine (``_in_reasoning`` /
+    ``_reasoning_done``) that survives across streaming deltas so it can
+    correctly attribute partial chunks to either the reasoning or content
+    side even when the ``<|channel|>`` or ``<|message|>`` boundary tokens
+    straddle a chunk.
+
+    Attributes:
+        CHANNEL_TAG (str): Marker that opens the analysis (reasoning)
+            channel.
+        MESSAGE_TAG (str): Marker that closes reasoning and switches the
+            output stream to visible content.
     """
 
     CHANNEL_TAG = "<|channel|>"
     MESSAGE_TAG = "<|message|>"
 
     def __init__(self, tokenizer: AnyTokenizer):
-        """Initialize and resolve channel/message tag token IDs from vocabulary.
+        """Initialize the parser and resolve marker token IDs.
 
         Args:
-            tokenizer: Tokenizer used to resolve tag token IDs and decode outputs.
+            tokenizer: HuggingFace tokenizer whose vocabulary is consulted
+                to resolve the integer token IDs of ``CHANNEL_TAG`` and
+                ``MESSAGE_TAG`` for id-level boundary scans.
         """
         super().__init__(tokenizer)
         self._channel_token_id = self.vocab.get(self.CHANNEL_TAG)
@@ -47,20 +73,50 @@ class GptOssReasoningParser(ReasoningParser):
         self._reasoning_done = False
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        """Check if the <|message|> token is present, signaling end of reasoning."""
+        """Check whether the reasoning section has ended.
+
+        Args:
+            input_ids: Sequence of decoded token IDs scanned for the
+                ``<|message|>`` marker that closes reasoning.
+
+        Returns:
+            ``True`` when ``<|message|>`` has been emitted at least once,
+            ``False`` while the model is still inside the analysis channel
+            (or when the marker is not in the tokenizer vocabulary).
+        """
         if self._message_token_id is not None:
             return self._message_token_id in input_ids
         return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        """Extract token IDs after the <|message|> delimiter."""
+        """Return token IDs emitted after the ``<|message|>`` delimiter.
+
+        Args:
+            input_ids: Full generated token-ID sequence.
+
+        Returns:
+            The slice of ``input_ids`` that follows the first
+            ``<|message|>`` token, or a copy of the whole list when the
+            delimiter has not appeared yet.
+        """
         if self._message_token_id is None or self._message_token_id not in input_ids:
             return list(input_ids)
         idx = input_ids.index(self._message_token_id)
         return input_ids[idx + 1 :]
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
-        """Split output at <|channel|> and <|message|> tags into reasoning and content."""
+        """Split a complete generation into reasoning and visible content.
+
+        Args:
+            model_output: Full decoded text produced by the model.
+            request: Optional inference request; unused, kept for interface
+                parity with sibling parsers.
+
+        Returns:
+            Tuple ``(reasoning, content)``. ``reasoning`` is ``None`` when
+            the ``<|channel|>`` marker is absent; ``content`` is ``None``
+            when the ``<|message|>`` marker has not yet been emitted.
+        """
         if self.CHANNEL_TAG not in model_output:
             return None, model_output
 
@@ -82,7 +138,30 @@ class GptOssReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
-        """Stream reasoning/content by tracking <|channel|> and <|message|> state."""
+        """Route a streaming delta into ``reasoning_content`` or ``content``.
+
+        Maintains an internal phase flag that flips when ``<|channel|>`` or
+        ``<|message|>`` appears in the delta. Once ``<|message|>`` has been
+        seen, all subsequent deltas are surfaced as visible ``content``.
+
+        Args:
+            previous_text: Cumulative decoded text before this chunk
+                (unused, kept for interface parity).
+            current_text: Cumulative decoded text including this chunk
+                (unused, kept for interface parity).
+            delta_text: Newly produced text in this chunk.
+            previous_token_ids: Token IDs before this chunk (unused).
+            current_token_ids: Token IDs including this chunk (unused).
+            delta_token_ids: Token IDs corresponding to ``delta_text``
+                (unused).
+            request: Optional inference request (unused).
+
+        Returns:
+            A :class:`DeltaMessage` carrying ``reasoning_content`` and/or
+            ``content`` for this step, or ``None`` when there is nothing
+            meaningful to emit (e.g. an empty delta or a delta that only
+            contained a partial marker).
+        """
         if not delta_text:
             return None
 

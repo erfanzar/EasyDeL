@@ -9,11 +9,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reasoning parser for DeepSeek V3 models with conditional thinking support.
+"""Reasoning parser for DeepSeek V3 (and look-alike) models.
 
-Delegates to DeepSeekR1ReasoningParser when thinking is enabled,
-or IdentityReasoningParser when disabled. Also used as the parser
-for GLM-4.5, Holo2, and Kimi-K2 (they share the same format).
+DeepSeek V3 only emits ``<think>``/``</think>`` reasoning when the chat
+template enables it. This module provides a thin wrapper parser that
+inspects the tokenizer's chat template at construction time and chooses
+the appropriate delegate:
+
+* When the chat template references ``thinking`` / ``enable_thinking`` or
+  literally contains ``<think>``, :class:`DeepSeekR1ReasoningParser` is
+  used for full chain-of-thought extraction.
+* Otherwise :class:`IdentityReasoningParser` is selected as a no-op
+  passthrough so the rest of the pipeline behaves as if reasoning was
+  disabled.
+
+The wrapper is also registered for GLM-4.5, Holo2 and Kimi-K2 since those
+families ship with the same conditional grammar.
 """
 
 from __future__ import annotations
@@ -28,13 +39,25 @@ from .identity_reasoning_parser import IdentityReasoningParser
 
 @ReasoningParserManager.register_module(["deepseek_v3", "glm45", "holo2", "kimi_k2"])  # pyright: ignore[reportUntypedClassDecorator]
 class DeepSeekV3ReasoningParser(ReasoningParser):
-    """Conditional reasoning parser: delegates to R1 or Identity based on tokenizer config.
+    """Conditional reasoning parser that delegates based on tokenizer config.
 
-    If the tokenizer has a chat template with thinking/enable_thinking support,
-    this parser uses DeepSeekR1ReasoningParser. Otherwise, it falls through
-    to IdentityReasoningParser (no reasoning extraction).
+    Selects :class:`DeepSeekR1ReasoningParser` when the tokenizer's chat
+    template indicates that ``<think>`` reasoning is enabled (by referring
+    to ``thinking`` / ``enable_thinking`` or literally containing the
+    start tag), otherwise falls through to :class:`IdentityReasoningParser`
+    so output is passed through unchanged. The delegate can also be
+    promoted to R1 at runtime by :meth:`configure_prompt_context` if the
+    prompt ends with ``<think>``.
 
-    Prompt context and compatibility flags are forwarded to the selected delegate.
+    All :class:`ReasoningParser` methods forward to the selected delegate
+    after first mirroring compatibility flags (currently
+    ``assume_reasoning``) so manual overrides on the wrapper are honoured.
+
+    Attributes:
+        _delegate (ReasoningParser): The currently active delegate parser.
+            Starts as either :class:`DeepSeekR1ReasoningParser` or
+            :class:`IdentityReasoningParser`; may be promoted to R1 inside
+            :meth:`configure_prompt_context`.
     """
 
     def __init__(self, tokenizer):
@@ -71,7 +94,19 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         self._delegate.assume_reasoning = self.assume_reasoning
 
     def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
-        """Configure prompt context; may upgrade Identity delegate to R1 if prompt starts reasoning."""
+        """Configure prompt context and possibly promote the delegate to R1.
+
+        When the active delegate is :class:`IdentityReasoningParser` but the
+        prompt itself ends with the ``<think>`` start tag (either as text
+        or as the trailing token ID), the delegate is replaced with a
+        fresh :class:`DeepSeekR1ReasoningParser` so the subsequent
+        generation is parsed as chain-of-thought.
+
+        Args:
+            prompt_text: Raw prompt text rendered by the chat template.
+            prompt_token_ids: Tokenised prompt; the last token ID is
+                inspected for an explicit ``<think>`` open tag.
+        """
         super().configure_prompt_context(prompt_text, prompt_token_ids)
         if isinstance(self._delegate, IdentityReasoningParser):
             start_token = DeepSeekR1ReasoningParser.start_token
@@ -86,17 +121,40 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         self._delegate.configure_prompt_context(prompt_text, prompt_token_ids)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        """Delegate reasoning-end check to the selected parser."""
+        """Forward the end-of-reasoning check to the selected delegate.
+
+        Args:
+            input_ids: Generated token-ID sequence inspected by the
+                delegate.
+
+        Returns:
+            The delegate's verdict on whether reasoning has finished.
+        """
         self._sync_delegate_state()
         return self._delegate.is_reasoning_end(input_ids)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        """Delegate content ID extraction to the selected parser."""
+        """Forward content-ID extraction to the selected delegate.
+
+        Args:
+            input_ids: Full generated token-ID sequence.
+
+        Returns:
+            The visible-content token IDs as returned by the delegate.
+        """
         self._sync_delegate_state()
         return self._delegate.extract_content_ids(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
-        """Delegate batch reasoning extraction to the selected parser."""
+        """Forward batch reasoning extraction to the selected delegate.
+
+        Args:
+            model_output: Full decoded text produced by the model.
+            request: Optional inference request forwarded verbatim.
+
+        Returns:
+            Tuple ``(reasoning, content)`` as produced by the delegate.
+        """
         self._sync_delegate_state()
         return self._delegate.extract_reasoning(model_output, request)
 
@@ -110,7 +168,21 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
-        """Delegate streaming reasoning extraction to the selected parser."""
+        """Forward streaming extraction to the selected delegate.
+
+        Args:
+            previous_text: Cumulative text before this chunk.
+            current_text: Cumulative text including this chunk.
+            delta_text: Newly produced text in this chunk.
+            previous_token_ids: Token IDs before this chunk.
+            current_token_ids: Token IDs including this chunk.
+            delta_token_ids: Token IDs for ``delta_text``.
+            request: Optional inference request forwarded verbatim.
+
+        Returns:
+            The :class:`DeltaMessage` produced by the delegate (or
+            ``None`` when the delegate has nothing to emit).
+        """
         self._sync_delegate_state()
         return self._delegate.extract_reasoning_streaming(
             previous_text,

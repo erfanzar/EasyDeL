@@ -52,7 +52,19 @@ STRING_DELIM = '<|"|>'
 
 
 def _parse_gemma4_value(value_str: str) -> object:
-    """Parse a single Gemma4 value (after key:) into a Python object."""
+    """Parse a single Gemma4 value (after ``key:``) into a Python object.
+
+    Recognises ``true``/``false`` literals, integer / float numbers, and
+    falls back to the raw string when no other interpretation applies.
+
+    Args:
+        value_str: The bare value substring extracted from a Gemma4 args
+            block (no surrounding ``<|"|>`` string delimiters).
+
+    Returns:
+        ``True``/``False`` for boolean literals, ``int``/``float`` for
+        numeric literals, otherwise the trimmed source string.
+    """
     value_str = value_str.strip()
     if not value_str:
         return value_str
@@ -187,7 +199,20 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
 
 
 def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
-    """Parse a Gemma4 array content string into a Python list."""
+    """Parse a Gemma4 array content string into a Python list.
+
+    Counterpart to :func:`_parse_gemma4_args` for ``[...]`` bodies. Supports
+    string elements delimited by ``<|"|>``, nested objects and arrays, and
+    bare scalar values.
+
+    Args:
+        arr_str: The array body without the surrounding ``[`` / ``]``.
+        partial: When ``True``, the trailing scalar item is dropped because
+            it may still be growing in a streaming context.
+
+    Returns:
+        The list of decoded Python values.
+    """
     items: list = []
     i = 0
     n = len(arr_str)
@@ -591,7 +616,24 @@ class Gemma4ToolParser(ToolParser):
         return None
 
     def _emit_argument_diff(self, raw_args_str: str) -> DeltaMessage | None:
-        """Parse raw args, convert to JSON, withhold trailing closers, diff and emit."""
+        """Parse raw args, convert to JSON, withhold trailing closers, diff and emit.
+
+        Parses the partial Gemma4 argument body, serialises it as JSON,
+        strips trailing characters that may still shift as more tokens
+        arrive (e.g. ``}``, ``"``, ``]``, fragments of ``<|"|>``), and emits
+        only the diff against the previously streamed JSON for the current
+        tool.
+
+        Args:
+            raw_args_str: The current partial Gemma4 argument body
+                (without enclosing braces).
+
+        Returns:
+            A :class:`DeltaMessage` carrying the new argument-string diff,
+            or ``None`` when there is nothing safe to emit yet (e.g. the
+            parser detected that the structure changed and is waiting for
+            the final flush).
+        """
         try:
             current_args = _parse_gemma4_args(raw_args_str, partial=True)
         except Exception:

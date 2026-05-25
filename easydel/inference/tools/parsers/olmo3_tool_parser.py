@@ -354,7 +354,7 @@ def _make_valid_python(text: str) -> tuple[str, str] | None:
                 raise _UnexpectedAstError("Mismatched curly braces")
         elif char in {"'", '"'}:
             if bracket_stack and bracket_stack[-1] == char:
-                if index > 0 and text[index - 1] == "\\\\":
+                if index > 0 and text[index - 1] == "\\":
                     pass
                 else:
                     bracket_stack.pop()

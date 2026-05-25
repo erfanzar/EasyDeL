@@ -14,7 +14,7 @@
 
 """Subprocess entry point for the Responses API state store ZMQ worker.
 
-Wraps :class:`FileResponseStore` behind a ZMQ REP socket so multiple
+Wraps :class:`FileResponseStore` behind a ZMQ ``REP`` socket so multiple
 API server processes can share ``response_id`` and ``conversation_id``
 records. Dispatches one command per request (``get_response``,
 ``put_response``, ``delete_response`` and the conversation
@@ -23,7 +23,23 @@ backing store's results as plain dicts.
 
 Errors raised inside the store are caught and forwarded as
 ``{"status": "error", "message": ...}`` so the client side can re-raise
-them as ``RuntimeError`` without taking the whole worker process down.
+them as :class:`RuntimeError` without taking the whole worker process
+down.
+
+Invocation:
+    The script is invoked via ``python -m
+    easydel.workers.response_store.worker_main`` with the following
+    CLI options::
+
+        --endpoint <zmq-endpoint>           (required)
+        --storage-dir <path>                (default: ~/.cache/easydel-response-store)
+        --max-stored-responses <int>        (default 10_000)
+        --max-stored-conversations <int>    (default 1_000)
+        --compression-level <int>           (default 3, 0=disable, 9=max)
+
+    Before importing JAX-aware modules ``main()`` forces a CPU-only
+    placement so the store worker never competes with the model
+    workers for accelerators.
 """
 
 from __future__ import annotations
@@ -51,19 +67,37 @@ def _worker(
     max_stored_conversations: int,
     compression_level: int,
 ) -> None:
-    """Run the response store worker event loop.
+    """Run the store worker REQ/REP loop until ``shutdown`` arrives.
 
-    Binds a ZMQ REP socket to ``endpoint`` and serves requests to get,
-    put, and delete response/conversation records backed by a
-    ``FileResponseStore``.
+    Constructs a single :class:`FileResponseStore`, binds a ZMQ
+    ``REP`` socket on ``endpoint``, then serves one Pyobj-encoded
+    command per iteration. Each incoming message must be a dict with
+    a ``cmd`` key. Supported commands:
+
+    * ``get_response`` / ``put_response`` / ``delete_response`` —
+      retrieve, write, or remove a response record by
+      ``response_id``.
+    * ``get_conversation`` / ``put_conversation`` /
+      ``delete_conversation`` — same for conversation histories.
+    * ``stats`` — return :meth:`FileResponseStore.stats`.
+    * ``shutdown`` — break the loop after replying ``ok``.
+
+    Exceptions raised by the store are caught, logged with their
+    traceback, and forwarded to the client as
+    ``{"status": "error", "message": str(exc)}`` so the worker stays
+    alive across transient I/O failures.
 
     Args:
-        endpoint: ZeroMQ endpoint to bind to (e.g. ``ipc:///tmp/store.sock``).
-        storage_dir: Directory for persistent file storage. Defaults to
-            ``~/.cache/easydel-response-store`` when ``None``.
-        max_stored_responses: Maximum number of response records to retain.
-        max_stored_conversations: Maximum number of conversation records to retain.
-        compression_level: zlib compression level (0-9) for stored data.
+        endpoint: ZMQ endpoint to bind to (e.g.
+            ``ipc:///tmp/store.sock``).
+        storage_dir: Filesystem location for persistent records;
+            ``None`` falls back to ``~/.cache/easydel-response-store``.
+        max_stored_responses: LRU capacity for response records;
+            ``0`` disables response storage entirely.
+        max_stored_conversations: LRU capacity for conversation
+            records; ``0`` disables conversation storage entirely.
+        compression_level: zlib compression level for record blobs
+            (``0`` disables, ``9`` is max).
     """
     if storage_dir is None:
         storage_dir = str(Path.home() / ".cache" / "easydel-response-store")
@@ -148,10 +182,15 @@ def _worker(
 
 
 def main() -> None:
-    """CLI entry point for the response store worker process.
+    """CLI entry point: parse arguments, force CPU JAX, run the loop.
 
-    Parses command-line arguments and starts the ZMQ worker loop. Intended
-    to be invoked as a subprocess by ``ResponseStoreWorkerManager``.
+    Parses ``sys.argv`` for the worker configuration described in the
+    module docstring, sets ``JAX_PLATFORMS=cpu`` (plus
+    ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and
+    ``ENABLE_DISTRIBUTED_INIT=0``) so spawning this script never
+    competes with the model workers for accelerators, then hands off
+    to :func:`_worker`. Intended to be invoked as a subprocess by
+    :class:`ResponseStoreWorkerManager`.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)

@@ -122,7 +122,17 @@ class FunctionGemmaToolParser(ToolParser):
         self.buffered_delta_text = ""
 
     def _scan_escape_token(self, text: str, index: int) -> tuple[int, bool]:
-        """Advance across a configured escape token if present at *index*."""
+        """Advance across a configured escape token if present at ``index``.
+
+        Args:
+            text: The text being scanned.
+            index: Position in ``text`` to test for an escape token.
+
+        Returns:
+            A ``(advance, matched)`` tuple where ``advance`` is the number of
+            characters to consume past ``index`` (0 if no match) and
+            ``matched`` is ``True`` when an escape token started at ``index``.
+        """
 
         for token in self.escape_tokens:
             if text.startswith(token, index):
@@ -130,7 +140,20 @@ class FunctionGemmaToolParser(ToolParser):
         return 0, False
 
     def _split_top_level(self, text: str, separator: str) -> list[str]:
-        """Split *text* on *separator* while respecting nested JSON-like syntax."""
+        """Split ``text`` on ``separator`` while respecting nested JSON-like syntax.
+
+        Brace / bracket nesting depth and escape-delimited string regions are
+        tracked so the separator is only honoured at the top level. Used to
+        carve a parameter blob like ``a:<escape>{"x":1}<escape>,b:2`` into
+        individual ``key:value`` segments without splitting inside the JSON.
+
+        Args:
+            text: Argument-block text to segment.
+            separator: Single-character delimiter to split on at top level.
+
+        Returns:
+            List of top-level segments in their original order.
+        """
 
         segments: list[str] = []
         depth_brace = 0
@@ -165,7 +188,18 @@ class FunctionGemmaToolParser(ToolParser):
         return segments
 
     def _split_key_value(self, text: str) -> tuple[str, str] | None:
-        """Split a single top-level ``key:value`` segment."""
+        """Split a single top-level ``key:value`` segment.
+
+        Locates the first top-level ``:`` (outside braces/brackets and escape
+        regions) and partitions the segment into key and value strings.
+
+        Args:
+            text: A single segment produced by :meth:`_split_top_level`.
+
+        Returns:
+            A ``(key, value)`` tuple, or ``None`` if no top-level ``:`` was
+            found in the segment.
+        """
 
         depth_brace = 0
         depth_bracket = 0
@@ -196,7 +230,19 @@ class FunctionGemmaToolParser(ToolParser):
         return None
 
     def _normalize_argument_value(self, value: str) -> object:
-        """Convert Gemma/FunctionGemma escaped argument syntax into Python values."""
+        """Convert Gemma/FunctionGemma escaped argument syntax into Python values.
+
+        Strips outer ``<escape>...<escape>`` wrappers, swaps ``<|"|>`` for
+        ``"``, and then attempts to ``json.loads`` the result. Falls back to
+        the cleaned string on JSON decode failure.
+
+        Args:
+            value: Raw value substring extracted from the call payload.
+
+        Returns:
+            A JSON-decoded Python object (``dict``, ``list``, ``int``, etc.)
+            when decoding succeeds; otherwise the unescaped string.
+        """
 
         normalized = value.strip()
         if not normalized:

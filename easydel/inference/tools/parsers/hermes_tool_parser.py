@@ -65,42 +65,55 @@ from ..abstract_tool import ToolParser, ToolParserManager
 
 @ToolParserManager.register_module("hermes")  # pyright: ignore[reportUntypedClassDecorator]
 class HermesToolParser(ToolParser):
-    """
-    Tool call parser for Hermes models.
+    """Tool call parser for NousResearch Hermes models.
 
-    Handles tool calls wrapped in <tool_call> XML-style tags with JSON content.
-    Designed for NousResearch Hermes models and similar architectures that use
-    XML-style delimiters for function calling.
+    Handles tool calls wrapped in ``<tool_call>`` / ``</tool_call>`` XML-style
+    tags with JSON content. Designed for Hermes-2/3 and architectures that
+    follow the same delimiter convention for function calling.
 
     Format:
-        <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
+        ``<tool_call>{"name": "function_name", "arguments": {...}}</tool_call>``
 
     Features:
-        - XML-style token boundary detection (<tool_call> and </tool_call>)
-        - Token-level buffering for accurate boundary detection
+        - XML-style token boundary detection
+        - Token-level buffering for accurate boundary detection across
+          multi-token delimiters
         - Supports multiple tool calls in a single response
-        - Handles partial JSON parsing for streaming
-        - Scratch pad support for intermediate reasoning
+        - Handles partial JSON parsing for streaming via ``partial_json_parser``
+        - Scratch pad support for intermediate reasoning blocks
 
     Attributes:
-        current_tool_name_sent: Tracks if function name was sent in stream
-        prev_tool_call_arr: Previous tool calls for streaming comparison
-        current_tool_id: Index of current tool being processed
-        streamed_args_for_tool: Arguments sent so far for each tool
-        tool_call_start_token: Opening delimiter for tool calls
-        tool_call_end_token: Closing delimiter for tool calls
-        buffered_delta_text: Buffer for multi-token delimiter detection
+        current_tool_name_sent (bool): Whether the current function's name has
+            been emitted in the active streaming session.
+        prev_tool_call_arr (list[dict] | None): History of previously parsed
+            tool call dicts; used to diff arguments between chunks.
+        current_tool_id (int): Index of the tool currently being assembled
+            (``-1`` means none yet).
+        streamed_args_for_tool (list[str]): Per-tool buffer of argument
+            characters already sent downstream.
+        tool_call_start_token (str): Opening delimiter ``<tool_call>``.
+        tool_call_end_token (str): Closing delimiter ``</tool_call>``.
+        tool_call_regex (re.Pattern): Matches a full or trailing tool call body.
+        scratch_pad_regex (re.Pattern): Matches ``<scratch_pad>...</scratch_pad>``
+            reasoning blocks.
+        tool_call_start_token_ids (list[int]): Tokenized start delimiter.
+        tool_call_end_token_ids (list[int]): Tokenized end delimiter.
+        tool_call_start_token_array (list[str]): Per-token decoded start delimiter
+            pieces, used to recognize fragments across stream chunks.
+        tool_call_end_token_array (list[str]): Per-token decoded end delimiter
+            pieces.
+        buffered_delta_text (str): Buffer for multi-token delimiter detection.
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
-        """
-        Initialize the Hermes tool parser.
+        """Initialize the Hermes tool parser.
 
         Args:
-            tokenizer: The model tokenizer for encoding/decoding tokens
+            tokenizer: The model tokenizer used for encoding the tool-call
+                delimiters and for token-level operations during streaming.
 
         Raises:
-            ValueError: If tokenizer is not provided
+            ValueError: If ``tokenizer`` is falsy (e.g. ``None``).
         """
         super().__init__(tokenizer)
 
@@ -133,18 +146,19 @@ class HermesToolParser(ToolParser):
         self.buffered_delta_text = ""
 
     def tool_call_delta_buffer(self, delta_text: str) -> str:
-        """
-        Buffer delta text to handle multi-token delimiters.
+        """Buffer delta text to handle multi-token delimiters.
 
-        This method accumulates partial tokens that might form tool call
-        delimiters, ensuring accurate boundary detection when delimiters
-        span multiple tokens.
+        Accumulates partial tokens that may form a ``<tool_call>`` or
+        ``</tool_call>`` delimiter, ensuring accurate boundary detection when a
+        delimiter is split across multiple streaming tokens.
 
         Args:
-            delta_text: The new text delta from streaming
+            delta_text: The new text delta produced by the model this step.
 
         Returns:
-            Processed text with complete delimiters or empty string if buffering
+            The delta text to forward downstream. Returns an empty string when
+            the delta is being buffered as part of an incomplete delimiter, or
+            the combined buffered + current text when a delimiter completes.
         """
         if delta_text in self.tool_call_start_token_array or delta_text in self.tool_call_end_token_array:
             if delta_text == self.tool_call_start_token_array[-1] or delta_text == self.tool_call_end_token_array[-1]:
@@ -167,25 +181,23 @@ class HermesToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        """
-        Extract tool calls from complete model response.
+        """Extract tool calls from a complete model response.
 
-        Parses XML-style tool call tags and extracts JSON function calls.
-        Supports multiple tool calls and returns remaining content.
+        Parses ``<tool_call>...</tool_call>`` blocks and extracts the JSON
+        function call contained in each one. Supports multiple tool calls and
+        returns any leading non-tool-call text as ``content``.
 
         Args:
-            model_output: Complete model output containing tool calls
-            request: Original chat completion request (unused)
+            model_output: Complete model output that may contain tool calls.
+            request: Original chat completion request (unused, kept for
+                interface parity).
 
         Returns:
-            ExtractedToolCallInformation with:
-                - tools_called: Whether tool calls were found
-                - tool_calls: List of ToolCall objects
-                - content: Text content before tool calls (if any)
-
-        Example:
-            Input: "Let me help. <tool_call>{"name": "search", "arguments": {"q": "weather"}}</tool_call>"
-            Output: tools_called=True, tool_calls=[ToolCall(...)], content="Let me help. "
+            ExtractedToolCallInformation: An object with:
+                - ``tools_called``: Whether at least one tool call was parsed.
+                - ``tool_calls``: Parsed ``ToolCall`` list.
+                - ``content``: Text appearing before the first tool call (or
+                  ``None`` when the response starts with one).
         """
         if self.tool_call_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
@@ -224,31 +236,39 @@ class HermesToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        """
-        Extract tool calls from streaming model output.
+        """Extract tool calls from streaming model output.
 
-        Handles incremental parsing of tool calls during streaming generation.
-        Maintains state across calls to track partial tool calls and arguments.
-        Uses buffering to handle multi-token delimiters correctly.
+        Handles incremental parsing during streaming generation. Maintains
+        state across calls to track partial tool calls and accumulate
+        argument deltas. Multi-token delimiters are reassembled via
+        :meth:`tool_call_delta_buffer`.
 
         Args:
-            previous_text: Text generated before this delta
-            current_text: Text including this delta
-            delta_text: New text in this streaming chunk
-            previous_token_ids: Token IDs before this delta
-            current_token_ids: Token IDs including this delta
-            delta_token_ids: New token IDs in this chunk
-            request: Original chat completion request
+            previous_text: Cumulative text produced before this delta.
+            current_text: Cumulative text including the current delta.
+            delta_text: Text newly produced in this streaming chunk.
+            previous_token_ids: Token IDs produced before this delta.
+            current_token_ids: Token IDs including this delta.
+            delta_token_ids: Token IDs produced in this delta.
+            request: Original chat completion request.
 
         Returns:
-            DeltaMessage with incremental tool call updates or content,
-            or None if more tokens needed for parsing
+            DeltaMessage | None: An incremental update with either ``content``
+            (plain text before a tool call) or ``tool_calls`` (delta name /
+            argument fragments), or ``None`` when more tokens are required to
+            disambiguate.
 
-        State Management:
-            - Tracks tool call boundaries with start/end token counts
-            - Maintains current tool ID for multi-tool responses
-            - Buffers partial arguments until complete
-            - Handles transition between content and tool calls
+        Notes:
+            State management invariants:
+
+            - Counts of start/end delimiter tokens drive tool boundary
+              transitions.
+            - ``current_tool_id`` tracks which tool index is currently being
+              streamed across calls.
+            - Partial arguments are buffered until complete to keep the
+              emitted JSON well-formed.
+            - Plain content and tool-call regions are emitted in distinct
+              ``DeltaMessage`` shapes.
         """
         delta_text = self.tool_call_delta_buffer(delta_text)
 

@@ -286,7 +286,7 @@ class Internlm2ToolParser(ToolParser):
             )
 
             if not tools or name not in [t.function.name for t in tools]:
-                ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=text)
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=text)
 
             tool_calls = [ToolCall(function=FunctionCall(name=name, arguments=parameters))]
             return ExtractedToolCallInformation(
