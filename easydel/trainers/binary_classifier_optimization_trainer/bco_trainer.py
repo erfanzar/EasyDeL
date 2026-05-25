@@ -235,11 +235,18 @@ class BCOTrainer(Trainer):
             self._train_density_ratio_classifier()
 
     def _get_preprocess_transform(self) -> BCOPreprocessTransform | None:
-        """Get BCO preprocessing transform for ShardedDataSource.
+        """Build the lazy BCO preprocessing transform for ``ShardedDataSource``.
 
-        BCOPreprocessTransform is an ExpandTransform that handles the full
-        preprocessing pipeline: extract prompts, unpair preference data,
-        apply chat template, and tokenize.
+        :class:`BCOPreprocessTransform` is an expand-style transform
+        that runs the full preprocessing pipeline (extract prompts from
+        chosen/rejected pairs, unpair preference data into desirable /
+        undesirable rows, apply the chat template, and tokenise) during
+        iteration rather than ahead of time.
+
+        Returns:
+            The configured :class:`BCOPreprocessTransform`, or ``None``
+            if the dataset is already tokenised (carries
+            ``prompt_input_ids``).
         """
         if self._is_pretokenized():
             return None
@@ -253,7 +260,18 @@ class BCOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Return ``True`` when the train dataset already carries token ids.
+
+        Peeks at the first sample of the first shard and checks for the
+        presence of ``prompt_input_ids``. Used to short-circuit the
+        preprocessing transform when callers feed in an already-
+        tokenised dataset.
+
+        Returns:
+            ``True`` if the dataset is pre-tokenised, ``False`` if not
+            (including when ``_train_source`` is missing or the first
+            shard is empty).
+        """
         if self._train_source is None:
             return False
         try:
@@ -263,14 +281,23 @@ class BCOTrainer(Trainer):
             return False
 
     def _vectorize_prompt(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-        """Convert prompt tokens to embeddings using the embedding function.
+        """Embed prompt tokens via the UDM embedding function.
+
+        Rewrites the policy's ``pad_token_id`` to the embedding
+        tokenizer's pad id (so cross-tokenizer setups still produce
+        well-formed inputs), invokes ``self.embedding_func``, and
+        unwraps tuple outputs by taking the first element (matching the
+        HF convention for ``(last_hidden_state, pooler_output, ...)``).
 
         Args:
-            input_ids: Token IDs.
-            attention_mask: Attention mask.
+            input_ids: ``[batch, seq]`` token id array under the policy
+                tokenizer.
+            attention_mask: Matching ``[batch, seq]`` attention mask.
 
         Returns:
-            Prompt embeddings.
+            ``np.ndarray`` of prompt embeddings. Returns an empty array
+            when ``embedding_func`` or ``embedding_tokenizer`` is
+            unset.
         """
         if self.embedding_func is None or self.embedding_tokenizer is None:
             return np.array([])
@@ -288,10 +315,22 @@ class BCOTrainer(Trainer):
         return np.asarray(embeddings)
 
     def _train_density_ratio_classifier(self):
-        """Train UDM density ratio classifier by iterating over transformed source.
+        """Fit the UDM density-ratio classifier on prompt embeddings.
 
-        Iterates over _train_source to collect embeddings for desirable and
-        undesirable examples, then fits a logistic regression classifier.
+        Streams up to ``prompt_sample_size`` desirable and ``prompt_sample_size``
+        undesirable embeddings from the transformed train source,
+        pools them along the token axis, and fits a class-balanced
+        logistic regression via :meth:`_fit_logistic_regression`. The
+        resulting ``(weights, bias)`` pair is cached on
+        ``self.clf_weights`` and consumed by
+        :meth:`_preprocess_batch_input` to compute per-example UDM
+        density-ratio weights at train time.
+
+        A warning is logged (and the method becomes a no-op) when:
+
+        - ``_train_source`` is not available,
+        - the source yields no ``embedding_input_ids``,
+        - or one of the two label streams is empty.
         """
         if self._train_source is None:
             logger.warning("Cannot train UDM classifier: _train_source is not available.")
@@ -363,17 +402,26 @@ class BCOTrainer(Trainer):
         max_iter: int = 500,
         tol: float = 1e-5,
     ) -> tuple[np.ndarray, float]:
-        """Fit logistic regression classifier using gradient descent.
+        """Fit a class-balanced logistic regression by full-batch gradient descent.
+
+        Runs at most ``max_iter`` gradient steps on the binary
+        cross-entropy with per-class reweighting so the desirable /
+        undesirable streams contribute equally regardless of frequency.
+        Stops early when both the weight delta L2 and the bias delta
+        fall below ``tol``.
 
         Args:
-            embeddings: Feature embeddings.
-            labels: Binary labels.
-            lr: Learning rate.
-            max_iter: Maximum iterations.
-            tol: Convergence tolerance.
+            embeddings: ``[n_samples, embedding_dim]`` feature matrix.
+            labels: ``[n_samples]`` binary labels (1 for desirable, 0
+                for undesirable).
+            lr: Gradient descent learning rate.
+            max_iter: Maximum number of full-batch GD iterations.
+            tol: Convergence tolerance on the parameter delta.
 
         Returns:
-            Tuple of (weights, bias).
+            Tuple ``(weights, bias)`` with the fitted classifier
+            parameters (``weights`` is float32, ``bias`` is a Python
+            float).
         """
         weights = np.zeros(embeddings.shape[1], dtype=np.float32)
         bias = 0.0
@@ -398,10 +446,21 @@ class BCOTrainer(Trainer):
         return weights.astype(np.float32), float(bias)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure JIT-compiled training and evaluation functions.
+        """Build the JIT-compiled BCO training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, builds the
+        BCO concatenated forward closure (with encoder-decoder /
+        truncation / vocab-chunk-size knobs baked in) and compiles it
+        via :func:`compile_trainer_auxiliary` for stand-alone reference
+        scoring. Then compiles :func:`training_step` and
+        :func:`evaluation_step` with the right input/output shardings,
+        donate args (training only), and the active MPMD pipeline
+        schedule.
 
         Returns:
-            Configuration containing compiled step functions and mesh.
+            :class:`TrainerConfigureFunctionOutput` carrying the sharded
+            training and evaluation step callables, the model mesh, and
+            the streaming checkpoint manager.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
@@ -495,14 +554,22 @@ class BCOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for Grain data loading.
+        """Return the BCO Grain-compatible data collator.
+
+        Both ``max_sequence_length`` and ``truncation_mode`` are
+        accepted for API symmetry with the base trainer; the cached
+        :class:`BCODataCollatorGrain` already encapsulates BCO-specific
+        padding and label masking rules and is returned unchanged.
 
         Args:
-            max_sequence_length: Maximum sequence length.
-            truncation_mode: How to truncate sequences.
+            max_sequence_length: Maximum sequence length (unused; kept
+                for symmetry).
+            truncation_mode: Truncation mode (unused; kept for
+                symmetry).
 
         Returns:
-            Grain-compatible data collator.
+            The :class:`BCODataCollatorGrain` instance configured in
+            ``__init__``.
         """
         return self.input_data_collator_grain
 
@@ -511,25 +578,37 @@ class BCOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for TFDS data loading.
+        """Return the BCO TFDS-compatible data collator.
+
+        Both arguments are accepted for API symmetry with the base
+        trainer; the cached :class:`BCODataCollatorTFDS` already
+        encapsulates BCO-specific padding and label masking rules.
 
         Args:
-            max_sequence_length: Maximum sequence length.
-            truncation_mode: How to truncate sequences.
+            max_sequence_length: Maximum sequence length (unused).
+            truncation_mode: Truncation mode (unused).
 
         Returns:
-            TFDS-compatible data collator.
+            The :class:`BCODataCollatorTFDS` instance configured in
+            ``__init__``.
         """
         return self.input_data_collator_tfds
 
     def compute_reference_log_probs(self, batch: dict[str, np.ndarray]) -> jax.Array:
-        """Compute reference model log probabilities for a batch.
+        """Score the reference model on ``batch`` and return completion logps.
+
+        Uses ``self.reference_state.model`` when available, falling back
+        to the policy itself when no reference state is configured.
+        Runs through the compiled :attr:`concatenated_forward` so the
+        same tokenization and chunking knobs apply.
 
         Args:
-            batch: Input batch.
+            batch: BCO batch with the ``prompt_*``/``completion_*``
+                fields expected by :func:`concatenated_forward`.
 
         Returns:
-            Completion log probabilities from reference model.
+            ``[batch]`` array of summed completion log probabilities
+            under the reference model.
         """
         if self.reference_state is None:
             reference_model = self.model_state.model
@@ -544,15 +623,36 @@ class BCOTrainer(Trainer):
         batch: dict[str, np.ndarray],
         is_train: bool,
     ) -> tuple[dict[str, np.ndarray], dict[str, tp.Any]]:
-        """Preprocess batch by adding running moments and UDM weights.
+        """Inject the running BCO ``delta`` and optional UDM weights into the batch.
+
+        Pipeline:
+
+        1. Purify the (possibly list-of-dict) batch into a flat
+           ``dict[str, array]``.
+        2. Stash ``self.running.mean`` as ``running_mean`` (the BCO
+           ``delta`` threshold) so the JIT-compiled step can consume it
+           as a scalar tensor.
+        3. When the UDM classifier has been fitted, embed each prompt,
+           compute the logistic density ratio
+           ``p / (1 - p) clipped to [min_density_ratio,
+           max_density_ratio]``, and broadcast it into ``udm_weights``
+           for the undesirable rows (desirable rows are forced to
+           weight 1.0).
 
         Args:
-            state: Current model state.
-            batch: Input batch.
-            is_train: Whether this is a training step.
+            state: Current model state (passed through; not mutated
+                here).
+            batch: Input batch produced by the collator.
+            is_train: Whether this is a training step. Accepted for
+                interface compatibility; BCO behaves the same way for
+                training and evaluation.
 
         Returns:
-            Processed batch with additional fields and metrics dictionary.
+            Tuple ``(processed_batch, informations)`` where
+            ``processed_batch`` carries the extra ``running_mean`` and
+            optional ``udm_weights`` fields, and ``informations`` is a
+            dict of scalar diagnostics (currently the mean UDM ratio
+            when UDM is active).
         """
         # Purify batch first to handle list of dicts (uncollated batch)
         batch = self._purify_batch(batch)

@@ -74,24 +74,34 @@ logger = get_logger("RayTrainer")
 
 @Registry.register("trainer", "ray_dist")
 class RayDistributedConfig(BaseModel):
-    """
-    Configuration for RayDistributedTrainer that can be persisted to JSON.
+    """JSON-persistable configuration payload for :class:`RayDistributedTrainer`.
 
-    This class handles serialization and deserialization of distributed training
-    configurations, with special handling for JAX dtypes and PartitionAxis objects.
+    Captures the minimum identifying state of a Ray-orchestrated trainer (model
+    identity, scaling variables, fixed runtime knobs) so that a checkpoint of
+    the trainer object itself can be round-tripped through disk. Two preprocess
+    hooks (:meth:`_saving_preprocess` and :meth:`_loading_postprocess`) bridge
+    the JAX-native runtime types (JAX dtypes, :class:`PartitionAxis`) to and
+    from the JSON-safe primitives that Pydantic can serialise natively.
 
     Attributes:
-        pretrained_model_name_or_path: Path or identifier for the pretrained model
-        model_task: The task type for the model (e.g., CAUSAL_LM, SEQ2SEQ)
-        model_type: The model architecture type (e.g., 'llama', 'gpt2')
-        offload_backend: Backend device for offloading (e.g., 'cpu', 'gpu')
-        config_scaling_variables: Variables to scale by scaling_index (e.g., hidden_size)
-        config_variables: Fixed configuration variables (e.g., dtype, precision)
+        pretrained_model_name_or_path (str): Path or identifier for the
+            pretrained model.
+        model_task (TaskType | None): Task type for the model (for example
+            ``CAUSAL_LM``, ``SEQ2SEQ``).
+        model_type (str | None): Model architecture type (for example
+            ``'llama'``, ``'gpt2'``).
+        offload_backend (str | None): Backend device for offloading (for
+            example ``'cpu'``, ``'gpu'``).
+        config_scaling_variables (dict[str, int] | None): Variables to scale
+            by ``scaling_index`` (for example ``hidden_size``).
+        config_variables (dict[str, tp.Any] | None): Fixed configuration
+            variables (for example ``dtype``, ``precision``).
 
-    Notes:
-        - JAX dtype fields are converted to/from strings for JSON serialization
-        - PartitionAxis objects are converted to/from dictionary representation
-        - Use _saving_preprocess() before saving and _loading_postprocess() after loading
+    Note:
+        JAX dtype fields are converted to/from strings for JSON serialization,
+        and :class:`PartitionAxis` objects are converted to/from a dictionary
+        representation. Use :meth:`_saving_preprocess` before saving and
+        :meth:`_loading_postprocess` after loading.
     """
 
     pretrained_model_name_or_path: str
@@ -172,34 +182,42 @@ class RayDistributedConfig(BaseModel):
 
 
 class RayDistributedTrainer:
-    """
-    Distributed trainer for Ray-based training with EasyDeL models.
+    """Lightweight Ray-aware wrapper that drives a stock EasyDeL :class:`Trainer`.
 
-    This class provides a lightweight wrapper for distributed training that:
-    - Manages model configuration and scaling for different nodes
-    - Handles model/state initialization and checkpoint loading
-    - Delegates actual training to the underlying Trainer implementation
+    This class is intentionally *not* a :class:`BaseTrainer` subclass; it
+    composes one. Its responsibility is the small set of decisions that must
+    happen before training begins -- selecting the model class from the
+    registry, building / scaling a model config, materialising a state (either
+    fresh or from a checkpoint at ``bucket_path``), and constructing the
+    underlying :class:`Trainer` once. After that, all loop logic, resume
+    handling, and sharding decisions live on the inner trainer.
 
-    The trainer supports:
-    - Dynamic model scaling based on scaling_index
-    - Automatic tokenizer/processor setup with padding configuration
-    - Flexible checkpoint loading from various sources
-    - Integration with Ray for distributed training orchestration
+    Design choices encoded here:
 
-    Key Design Principles:
-    - Resume logic is handled by BaseTrainer (set arguments.resume_if_possible=True)
-    - State sharding is deferred to the main Trainer according to partition rules
-    - Explicit checkpoint paths are used without automatic run-* resolution
+    * Resume logic is owned by :class:`BaseTrainer` (set
+      ``arguments.resume_if_possible=True``); this class does not perform
+      ``run-*`` directory resolution.
+    * State sharding is deferred to the inner trainer according to its
+      ``PartitionAxis`` rules; no manual ``with_sharding_constraint`` here.
+    * Checkpoint paths must be explicit -- the wrapper does no automatic
+      directory probing.
 
     Attributes:
-        model_task: The task type for the model (e.g., CAUSAL_LM)
-        model_type: The model architecture type (e.g., 'llama')
-        model_class: The EasyDeL model class to instantiate
-        state_class: The state class for model checkpointing
-        offload_backend: Backend for memory offloading
-        trainer_module: The trainer class to use for actual training
-        CONFIG_SCALING_VARIABLES: Variables that scale with scaling_index
-        CONFIG_VARIABLES: Fixed configuration variables
+        model_task (TaskType): Task type for the model (for example
+            ``CAUSAL_LM``).
+        model_type (str): Model architecture type (for example ``'llama'``).
+        model_class (type[EasyDeLBaseModule]): The EasyDeL model class to
+            instantiate.
+        state_class (type[EasyDeLState]): State class used for
+            checkpointing and to wrap the freshly built model.
+        offload_backend (str): Backend identifier for memory offloading.
+        trainer_module (type[BaseTrainer | Trainer]): Trainer class used to
+            run the actual loop.
+        CONFIG_SCALING_VARIABLES (ClassVar[dict[str, int]]): Defaults for
+            the per-axis size knobs that get multiplied by
+            ``scaling_index``.
+        CONFIG_VARIABLES (ClassVar[dict[str, tp.Any]]): Fixed configuration
+            variables that do not scale with ``scaling_index``.
     """
 
     # Model identity
@@ -252,23 +270,40 @@ class RayDistributedTrainer:
         config_scaling_variables: dict[str, int] | None = None,
         config_variables: dict[str, tp.Any] | None = None,
     ):
-        """
-        Initialize the RayDistributedTrainer.
+        """Initialize the Ray-distributed trainer wrapper.
 
         Args:
-            pretrained_model_name_or_path: Path or identifier for the pretrained model
-            bucket_path: Optional path to load checkpoints from cloud storage
-            model_task: Task type (inferred from model_class if not provided)
-            model_type: Model architecture type (inferred from model_class if not provided)
-            model_class: EasyDeL model class to use (auto-resolved if not provided)
-            state_class: State class for checkpointing (defaults to EasyDeLState)
-            offload_backend: Backend for memory offloading (defaults to 'cpu')
-            trainer_module: Trainer class to use (defaults to Trainer)
-            config_scaling_variables: Variables to scale with scaling_index
-            config_variables: Fixed configuration variables
+            pretrained_model_name_or_path: Path or identifier for the pretrained
+                model.
+            bucket_path: Optional path used to load a checkpoint from cloud
+                storage (or any :class:`ePath`-resolvable location) when
+                neither ``model`` nor ``state`` is supplied to :meth:`train`.
+            model_task: Task type. Inferred from ``model_class`` when omitted;
+                must then be ``None`` together with ``model_type``.
+            model_type: Model architecture type. Inferred from ``model_class``
+                when omitted; must then be ``None`` together with ``model_task``.
+            model_class: EasyDeL model class to instantiate. When omitted, the
+                class is resolved through :func:`get_modules_by_type` using
+                ``model_type`` and ``model_task``.
+            state_class: State class used for checkpointing and ``model.to_state``
+                conversion. Defaults to :class:`EasyDeLState`.
+            offload_backend: Backend identifier used when offloading parameters
+                (passed to :func:`jax.devices` / :func:`jax.local_devices`).
+                Defaults to ``'cpu'``.
+            trainer_module: Inner trainer class to instantiate at
+                :meth:`create_trainer`. Defaults to :class:`Trainer`.
+            config_scaling_variables: Per-axis size knobs that override the
+                class-level ``CONFIG_SCALING_VARIABLES`` defaults; values get
+                multiplied by ``scaling_index`` at :meth:`create_config`.
+            config_variables: Fixed configuration variables overriding the
+                class-level ``CONFIG_VARIABLES`` defaults.
 
         Raises:
-            ValueError: If model class cannot be resolved or parameters are inconsistent
+            ValueError: If exactly one of ``model_task``/``model_type`` is
+                ``None``, or if ``model_class`` is ``None`` while
+                ``model_task``/``model_type`` are also ``None``.
+            RuntimeError: If :func:`get_modules_by_type` cannot locate a model
+                class for ``model_type``/``model_task``.
         """
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
@@ -318,17 +353,22 @@ class RayDistributedTrainer:
         state_class: type[EasyDeLState] | None = None,
         trainer_module: type[BaseTrainer | Trainer] | None = None,
     ):
-        """
-        Create a RayDistributedTrainer from a saved configuration file.
+        """Construct a :class:`RayDistributedTrainer` from a saved JSON config.
+
+        Reads the file via :class:`ePath`, parses it into
+        :class:`RayDistributedConfig`, runs :meth:`_loading_postprocess` to
+        restore live JAX dtypes and :class:`PartitionAxis`, then instantiates
+        the trainer with the recovered fields plus any per-call overrides.
 
         Args:
-            path: Path to the JSON configuration file
-            model_class: Optional model class override
-            state_class: Optional state class override
-            trainer_module: Optional trainer module override
+            path: Path to the JSON configuration file.
+            model_class: Optional model class override applied after the
+                config is parsed.
+            state_class: Optional state class override.
+            trainer_module: Optional trainer-module override.
 
         Returns:
-            RayDistributedTrainer: Initialized trainer instance
+            RayDistributedTrainer: Initialized trainer instance.
         """
         cfg = RayDistributedConfig(**json.loads(ePath(path).read_text()))
         cfg._loading_postprocess()
@@ -345,11 +385,16 @@ class RayDistributedTrainer:
         )
 
     def save_config(self, path: str | os.PathLike):
-        """
-        Save the current configuration to a JSON file.
+        """Serialise the trainer's configuration to a JSON file.
+
+        Builds a :class:`RayDistributedConfig` from the trainer's current
+        fields, runs :meth:`_saving_preprocess` to coerce JAX dtypes and
+        :class:`PartitionAxis` into JSON-safe primitives, and writes the
+        indented JSON dump to ``path`` via :class:`ePath`.
 
         Args:
-            path: Path where the configuration will be saved
+            path: Destination path where the JSON configuration will be
+                written.
         """
         cfg = RayDistributedConfig(
             pretrained_model_name_or_path=self.pretrained_model_name_or_path,
@@ -363,15 +408,17 @@ class RayDistributedTrainer:
         ePath(path).write_text(cfg.model_dump_json(indent=2))
 
     def load_processor(self) -> PreTrainedTokenizer:
-        """
-        Load the tokenizer/processor for the model.
+        """Load the tokenizer/processor for the wrapped model.
+
+        Uses ``_processor_loader_class.from_pretrained`` (defaults to
+        :class:`AutoTokenizer`) against
+        ``self.pretrained_model_name_or_path``. When the resulting tokenizer
+        has no ``pad_token_id`` but does expose ``eos_token_id``, the EOS
+        token id is reused for padding and a warning is logged.
 
         Returns:
-            PreTrainedTokenizer: Loaded tokenizer with padding configuration
-
-        Notes:
-            - Automatically sets pad_token to eos_token if not defined
-            - Logs a warning when falling back to eos_token for padding
+            PreTrainedTokenizer: Loaded tokenizer with a guaranteed padding
+            configuration.
         """
         tok_cls = self._processor_loader_class
         tokenizer = tok_cls.from_pretrained(self.pretrained_model_name_or_path)
@@ -398,14 +445,18 @@ class RayDistributedTrainer:
 
     @staticmethod
     def extract_column_names(dataset: Dataset) -> list[str] | None:
-        """
-        Extract column names from a dataset.
+        """Return the column names of a dataset, falling back to a sample probe.
+
+        Prefers ``dataset.column_names`` when defined. If not, materialises the
+        first sample to probe its keys. Returns ``None`` for empty or
+        opaque datasets.
 
         Args:
-            dataset: The dataset to extract column names from
+            dataset: The dataset to inspect.
 
         Returns:
-            list[str] | None: Column names if available, None otherwise
+            list[str] | None: List of column names when discoverable; ``None``
+            when the dataset is empty or exposes no schema.
         """
         if hasattr(dataset, "column_names") and dataset.column_names:
             return list(dataset.column_names)
@@ -419,16 +470,22 @@ class RayDistributedTrainer:
         max_length: int,
         padding_side: str = "left",
     ) -> dict[str, jax.Array]:
-        """
-        Process a text sample into model inputs.
+        """Tokenize and pad a raw text sample into flat model inputs.
+
+        Runs :attr:`processor` with ``padding="max_length"`` and truncation,
+        then flattens any returned 2-D arrays to 1-D so a single sample fits
+        into the per-step batch layout expected by the trainer.
 
         Args:
-            sample: Raw text sample to process
-            max_length: Maximum sequence length
-            padding_side: Side to pad sequences ('left' or 'right')
+            sample: Raw text sample (or sequence of samples) to process.
+            max_length: Maximum sequence length used for both padding and
+                truncation.
+            padding_side: Side to pad sequences on (``'left'`` or
+                ``'right'``).
 
         Returns:
-            dict[str, jax.Array]: Tokenized and padded inputs with flattened shapes
+            dict[str, jax.Array]: Tokenizer outputs with values reshaped to
+            ``(-1,)`` when the original value carries a ``shape`` attribute.
         """
         out = self.processor(
             sample,
@@ -447,16 +504,23 @@ class RayDistributedTrainer:
         max_length: int,
         padding_side: str = "left",
     ) -> dict[str, jax.Array]:
-        """
-        Process chat messages using the tokenizer's chat template.
+        """Apply the chat template and flatten the resulting tensor inputs.
+
+        Calls ``processor.apply_chat_template`` with ``return_dict=True`` so
+        the chat-formatted text is tokenised in one pass, then flattens any
+        returned 2-D arrays to 1-D so a single sample fits into the per-step
+        batch layout.
 
         Args:
-            messages: Chat messages to process
-            max_length: Maximum sequence length
-            padding_side: Side to pad sequences ('left' or 'right')
+            messages: Chat messages (list of role/content dicts) to process.
+            max_length: Maximum sequence length used for both padding and
+                truncation.
+            padding_side: Side to pad sequences on (``'left'`` or
+                ``'right'``).
 
         Returns:
-            dict[str, jax.Array]: Tokenized and padded inputs with flattened shapes
+            dict[str, jax.Array]: Tokenizer outputs with values reshaped to
+            ``(-1,)`` when the original value carries a ``shape`` attribute.
         """
         out = self.processor.apply_chat_template(
             messages,
@@ -470,19 +534,24 @@ class RayDistributedTrainer:
         return {k: v.reshape(-1) if hasattr(v, "shape") else v for k, v in out.items()}
 
     def create_config(self, scaling_index: int) -> EasyDeLBaseConfig:
-        """
-        Create a model configuration with scaled dimensions.
+        """Build a config object whose width axes scale linearly with an index.
+
+        Multiplies each entry of ``self.config_scaling_variables`` by
+        ``scaling_index`` and merges the result with the fixed entries of
+        ``self.config_variables`` (excluding ``precision``, ``dtype``, and
+        ``param_dtype``, which are reserved for the model-builder call). The
+        chosen config class is taken from ``self.model_class.config_class`` and
+        falls back to :func:`get_modules_by_type` resolution when the class
+        attribute is unset.
 
         Args:
-            scaling_index: Multiplier for scaling variables (e.g., hidden_size)
+            scaling_index: Multiplier applied to every entry of
+                ``config_scaling_variables`` (for example to fan out
+                ``hidden_size``).
 
         Returns:
-            EasyDeLBaseConfig: Configuration with scaled and fixed variables
-
-        Notes:
-            - Scaling variables are multiplied by scaling_index
-            - Fixed variables remain unchanged
-            - Useful for creating different model sizes in distributed training
+            EasyDeLBaseConfig: Configuration object populated with scaled
+            width parameters and the fixed runtime entries.
         """
         not_allowed = ["precision", "dtype", "param_dtype"]
         scaled = {k: v * scaling_index for k, v in copy.deepcopy(self.config_scaling_variables).items()}
@@ -493,15 +562,17 @@ class RayDistributedTrainer:
         return config_class(**config_kwargs)
 
     def _get_offload_device(self):
-        """
-        Get the device for memory offloading.
+        """Return the JAX device to use for parameter offloading.
+
+        Prefers ``jax.local_devices(backend=self.offload_backend)[0]`` because
+        local devices avoid extra cross-host transfers. Any failure (no local
+        devices, backend unsupported) falls back to
+        ``jax.devices(self.offload_backend)[0]``.
 
         Returns:
-            Device: Preferred local device or first available global device
-
-        Notes:
-            - Attempts to use local devices first for better performance
-            - Falls back to global devices if local unavailable
+            jax.Device: Preferred local device, or the first available global
+            device for ``self.offload_backend`` when no local device is
+            present.
         """
         try:
             devs = jax.local_devices(backend=self.offload_backend)
@@ -520,19 +591,24 @@ class RayDistributedTrainer:
         seed: int = 684,
         lazy: bool = False,
     ) -> EasyDeLBaseModule:
-        """
-        Create a model instance from configuration.
+        """Instantiate the wrapped model class from a configuration object.
+
+        Dispatches to ``self.model_class.lazy_init`` (when ``lazy=True``) or
+        ``sequential_init`` otherwise. ``precision`` defaults to
+        :attr:`lax.Precision.DEFAULT` when ``None``.
 
         Args:
-            config: Model configuration
-            dtype: Computation dtype
-            param_dtype: Parameter dtype
-            precision: JAX precision setting
-            seed: Random seed for initialization
-            lazy: Whether to use lazy initialization (memory efficient)
+            config: Model configuration consumed by the model class.
+            dtype: Computation dtype.
+            param_dtype: Parameter storage dtype.
+            precision: JAX precision setting. ``None`` is normalised to
+                ``Precision.DEFAULT``.
+            seed: Random seed used to build ``spx.Rngs``.
+            lazy: When True, build the module with lazy initialisation
+                (parameters are :class:`jax.ShapeDtypeStruct`).
 
         Returns:
-            EasyDeLBaseModule: Initialized model instance
+            EasyDeLBaseModule: Initialised model instance.
         """
         if precision is None:
             precision = lax.Precision.DEFAULT
@@ -550,30 +626,35 @@ class RayDistributedTrainer:
         return self.model_class.sequential_init(**init_kwargs)
 
     def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
-        """
-        Convert a model module to a state object.
+        """Wrap a model module in an :class:`EasyDeLState` using ``state_class``.
+
+        Sharding is deliberately *not* applied here; the inner :class:`Trainer`
+        owns sharding decisions according to its partition rules.
+        ``self.arguments.trainable_selector`` is forwarded so non-trainable
+        leaves are routed correctly.
 
         Args:
-            model: The model to convert
+            model: The model module to convert.
 
         Returns:
-            EasyDeLState: State object for checkpointing
-
-        Notes:
-            - Does NOT perform sharding (handled by trainer)
-            - Uses the configured state_class for conversion
+            EasyDeLState: State object built via
+            ``model.to_state(self.state_class, ...)``.
         """
         return model.to_state(self.state_class, trainable_selector=self.arguments.trainable_selector)
 
     def create_model_from_config(self, scaling_index: int) -> EasyDeLBaseModule:
-        """
-        Create a model with configuration scaled by the given index.
+        """Convenience helper that chains :meth:`create_config` and :meth:`create_model`.
+
+        Reads ``dtype``, ``param_dtype``, ``precision`` and ``seed`` from
+        ``self.config_variables`` so the model is built with the same runtime
+        settings that the saved config encodes.
 
         Args:
-            scaling_index: Multiplier for scaling variables
+            scaling_index: Multiplier applied to the width-related entries of
+                ``config_scaling_variables``.
 
         Returns:
-            EasyDeLBaseModule: Initialized model with scaled configuration
+            EasyDeLBaseModule: Initialised model built from the scaled config.
         """
         return self.create_model(
             config=self.create_config(scaling_index=scaling_index),
@@ -591,18 +672,22 @@ class RayDistributedTrainer:
         data_collator: tp.Callable | None = None,
         state: EasyDeLState | None = None,
     ) -> BaseTrainer | Trainer:
-        """
-        Create a trainer instance for model training.
+        """Instantiate the inner trainer class with the given training inputs.
+
+        Forwards ``arguments``, datasets, collator, and ``state`` to
+        ``self.trainer_module(...)`` without further preprocessing -- the inner
+        trainer owns sharding, scheduling, and resume.
 
         Args:
-            arguments: Training configuration and hyperparameters
-            dataset_train: Training dataset
-            dataset_eval: Optional evaluation dataset
-            data_collator: Optional data collator for batching
-            state: Model state to train
+            arguments: Training configuration and hyperparameters.
+            dataset_train: Training dataset.
+            dataset_eval: Optional evaluation dataset.
+            data_collator: Optional data collator for batching.
+            state: Model state to train.
 
         Returns:
-            BaseTrainer | Trainer: Configured trainer instance
+            BaseTrainer | Trainer: Configured trainer instance ready to call
+            ``.train()`` on.
         """
         return self.trainer_module(
             arguments=arguments,
@@ -622,37 +707,42 @@ class RayDistributedTrainer:
         model: EasyDeLBaseModule | None = None,
         state: EasyDeLState | None = None,
     ):
-        """
-        Execute distributed training with the configured model.
+        """Resolve a training state from available sources and launch training.
 
-        This method handles model/state initialization from various sources:
-        1. Provided state (highest priority)
-        2. Provided model (converted to state)
-        3. Checkpoint from bucket_path
-        4. New model creation with scaling_index
+        Model/state acquisition follows this priority order:
+
+        1. Provided ``state`` (used directly).
+        2. Provided ``model`` (converted to state via
+           :meth:`convert_model_to_state`).
+        3. Checkpoint loaded from ``self.bucket_path`` via
+           ``state_class.load_state`` when set.
+        4. Freshly built model from :meth:`create_model_from_config` with the
+           given ``scaling_index``.
+
+        For automatic resume from interruption, set
+        ``arguments.resume_if_possible = True`` and ``arguments.save_directory``
+        on the inner trainer; this method does not perform run-directory
+        probing.
 
         Args:
-            scaling_index: Multiplier for model scaling (used if creating new model)
-            arguments: Training configuration
-            dataset_train: Training dataset
-            dataset_eval: Optional evaluation dataset
-            data_collator: Optional data collator
-            model: Optional pre-initialized model
-            state: Optional pre-initialized state
+            scaling_index: Multiplier used by :meth:`create_model_from_config`
+                when a new model needs to be created.
+            arguments: Training configuration forwarded to the inner trainer.
+            dataset_train: Training dataset.
+            dataset_eval: Optional evaluation dataset.
+            data_collator: Optional data collator.
+            model: Optional pre-initialised model (converted to state when
+                ``state`` is also ``None``).
+            state: Optional pre-initialised state taking highest priority.
 
         Returns:
-            Training results from the underlying trainer
-
-        Notes:
-            - For automatic resume from interruptions, set:
-                - arguments.resume_if_possible = True
-                - arguments.save_directory = "path/to/checkpoints"
-            - State sharding is handled by the trainer based on partition rules
-            - Checkpoint loading respects the priority order above
+            The return value of ``self.create_trainer(...).train()``.
 
         Raises:
-            RuntimeError: If no valid model state can be obtained
+            RuntimeError: If no valid model state can be obtained from any of
+                the four sources.
         """
+        self.arguments = arguments
         if state is None and model is None:
             if self.bucket_path is not None:
                 import easydel as ed

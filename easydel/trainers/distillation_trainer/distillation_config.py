@@ -101,6 +101,13 @@ class DistillationConfig(TrainingArguments):
             per chunk in the backward pass) for an ``O(L)`` -> ``O(chunk)``
             peak memory reduction. Recommended values 128-512 for
             large vocabularies; ``None`` disables chunking.
+        checkpoint_kl_loss: When ``True`` (default) and the chunked
+            path is active, wrap each chunk's KL/CE body in
+            ``jax.checkpoint`` so its vocab-sized logits are
+            recomputed during the backward pass instead of being kept
+            live. Set ``False`` for a faster backward at the cost of
+            holding every chunk's logits simultaneously -- only viable
+            for small effective batch / chunk_size.
     """
 
     trainer_prefix: str | None = field(

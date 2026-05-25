@@ -49,31 +49,35 @@ class RLVRConfig(GRPOConfig):
     and updates the policy — all without a critic network.
 
     Attributes:
-        answer_key: Optional column name in the dataset containing
-            gold answers for math verification. Set to ``None`` to
-            disable the built-in math verifier and rely entirely on
-            external rewarders.
-        test_key: Column name containing code test cases for
+        trainer_prefix (str | None): Default prefix name for the trainer.
+            Default: ``"RLVR"``.
+        answer_key (str | None): Optional column name in the dataset
+            containing gold answers for math verification. Set to
+            ``None`` to disable the built-in math verifier and rely
+            entirely on external rewarders.
+        test_key (str): Column name containing code test cases for
             code verification.
-        format_pattern: Optional regex pattern that completions
-            must match to receive a format reward.
-        format_reward_weight: Weight for the format compliance
+        format_pattern (str | None): Optional regex pattern that
+            completions must match to receive a format reward.
+        format_reward_weight (float): Weight for the format compliance
             reward (combined with content rewards).
-        length_penalty_target: Target completion length for
+        length_penalty_target (int | None): Target completion length for
             the length penalty verifier. Set to ``None`` to disable;
-            ``0`` is accepted for backward compatibility.
-        length_penalty_weight: Weight for the length penalty
+            ``0`` is accepted for backward compatibility and coerced to
+            ``None`` in :meth:`__post_init__`.
+        length_penalty_weight (float): Weight for the length penalty
             reward component.
-        max_len_mask: If True, mask out completions that hit
-            the maximum length (no EOS token) from the loss.
-        reward_clip_range: Clip raw rewards to
-            ``[-reward_clip_range, reward_clip_range]``.
-            Set to ``None`` to disable clipping; ``0`` is accepted for
-            backward compatibility.
-        difficulty_key: Optional column name for per-sample
+        max_len_mask (bool): If True, mask out completions that hit the
+            maximum length (no EOS token) from the loss.
+        reward_clip_range (float | None): Clip raw rewards to
+            ``[-reward_clip_range, reward_clip_range]``. Set to ``None``
+            to disable clipping; ``0`` is accepted for backward
+            compatibility and coerced to ``None`` in
+            :meth:`__post_init__`.
+        difficulty_key (str | None): Optional column name for per-sample
             difficulty scores used in weighted loss computation.
-        difficulty_loss_weight: If True, weight the loss by
-            the difficulty score of each sample.
+        difficulty_loss_weight (bool): If True, weight the loss by the
+            difficulty score of each sample.
 
     Example:
         >>> config = RLVRConfig(

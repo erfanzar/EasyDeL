@@ -61,13 +61,18 @@ def _ensure_state(
     *,
     trainable_selector: tp.Any = "parameters",
 ) -> EasyDeLState | None:
-    """Convert model to EasyDeLState if needed.
+    """Convert a module to an ``EasyDeLState`` if needed.
 
     Args:
-        model: Model or state to convert.
+        model: An :class:`EasyDeLBaseModule`, an :class:`EasyDeLState`,
+            or ``None``. Already-promoted states are returned as-is.
+        trainable_selector: Selector forwarded to
+            :meth:`EasyDeLBaseModule.to_state` when promoting a raw
+            module into a state.
 
     Returns:
-        EasyDeLState or None.
+        The corresponding :class:`EasyDeLState`, or ``None`` when
+        ``model`` is ``None``.
     """
     if model is None:
         return None
@@ -171,14 +176,22 @@ class NashMDTrainer(GRPOTrainer):
                 raise ValueError("NashMDTrainer only supports a single reward function/model.")
 
     def _schedule_value(self, schedule: tp.Any, default: float) -> float:
-        """Get current value from schedule based on training epoch.
+        """Resolve the current value of an epoch-wise schedule.
+
+        Scalars are returned as ``float(schedule)``. Sequences are
+        indexed by the current epoch (estimated from
+        ``state.step // steps_per_epoch``) and clamped to the last
+        entry once training overruns the schedule. Empty sequences
+        and ``None`` fall back to ``default``.
 
         Args:
-            schedule: Single value or sequence of per-epoch values.
-            default: Default value if schedule is None.
+            schedule: Either a scalar value, a non-empty sequence of
+                per-epoch values, or ``None``.
+            default: Value returned when ``schedule`` is ``None`` or
+                an empty sequence.
 
         Returns:
-            Current scheduled value.
+            The float-valued current schedule entry.
         """
         if isinstance(schedule, collections.abc.Sequence):
             if not schedule:
@@ -372,12 +385,34 @@ class NashMDTrainer(GRPOTrainer):
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Compute reward scores for prompt-completion pairs.
 
+        Iterates over each registered reward function (or
+        :class:`EasyDeLState` reward model), routes the prompt /
+        completion strings through the configured tokenizer when
+        scoring with a model, and accumulates a per-function score plus
+        a name-keyed breakdown for logging.
+
         Args:
             prompts: List of prompt strings.
             completions: List of completion strings.
+            raw_text: Optional raw (pre-decoded) completion strings to
+                forward to reward functions that consume them
+                directly. Defaults to ``None``.
+            reasoning: Optional per-completion reasoning traces (one
+                per completion, ``None`` when unavailable).
+            tool_calls: Optional per-completion tool-call metadata.
+            batch: Optional original batch dict (forwarded to reward
+                functions that accept it).
 
         Returns:
-            Tuple of (total_rewards, reward_breakdown_dict).
+            Tuple ``(total_rewards, reward_breakdown)`` where
+            ``total_rewards`` is a ``[batch]`` float32 array summed
+            across reward functions and ``reward_breakdown`` maps each
+            reward function's name to its ``[batch]`` score array.
+
+        Raises:
+            ValueError: If an :class:`EasyDeLState` reward model is
+                supplied without a matching
+                ``reward_processing_class``.
         """
         rewards = []
         breakdown: dict[str, jnp.ndarray] = {}
@@ -441,15 +476,39 @@ class NashMDTrainer(GRPOTrainer):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
-        """Generate model and mixture completions, compute rewards and probabilities.
+        """Generate policy and mixture completions, score them, and assemble the loss batch.
+
+        Runs three logical phases:
+
+        1. Generate a policy completion for each prompt; when
+           ``mixture_coef < 1.0`` also generate a reference completion
+           and pick between the two per-row using a step-derived RNG.
+        2. Score both the policy completion and the chosen mixture
+           completion with the oracle reward function, apply the
+           optional missing-EOS penalty, and convert the score
+           difference into a Bradley-Terry preference probability via
+           :func:`jax.nn.sigmoid`.
+        3. Compute reference per-token logps over the
+           prompt+completion sequence and package the all-gathered
+           tensors that :func:`nash_md_step` consumes.
+
+        Also logs per-source completions to W&B and records the
+        current ``beta`` / ``mixture_coef`` schedule values.
 
         Args:
-            state: Current model state.
-            batch: Input batch with prompts.
-            is_train: Whether this is a training step.
+            state: Current policy ``EasyDeLState``.
+            batch: Input batch containing ``input_ids`` and
+                ``attention_mask`` for the prompts.
+            is_train: Whether this is a training step (unused
+                directly, kept for API parity with the GRPO base).
 
         Returns:
-            Processed batch with completions and rewards, and metrics dictionary.
+            Tuple ``(processed_batch, metrics_dict)`` where
+            ``processed_batch`` is the dict fed to
+            :func:`nash_md_step` (prompts, completions, masks,
+            ``ref_token_logps``, ``probabilities``) and
+            ``metrics_dict`` carries reward/length/timing diagnostics
+            for the trainer's logger.
         """
         batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:

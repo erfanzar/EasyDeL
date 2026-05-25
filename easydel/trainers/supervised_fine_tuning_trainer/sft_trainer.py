@@ -171,7 +171,7 @@ class SFTTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
-        """Get SFT preprocessing transform for ShardedDataSource.
+        """Build the lazy SFT preprocessing transform for the data source.
 
         Returns a transform that handles:
         - Formatting function application
@@ -179,8 +179,17 @@ class SFTTrainer(Trainer):
         - Chat template application
         - Tokenization with optional completion masking
 
+        The transform is skipped (``None`` returned) when the bound
+        training source already exposes an ``"input_ids"`` field, as
+        reported by :meth:`_is_pretokenized`. The ``mask_prompt`` flag
+        on the returned transform combines ``assistant_only_loss`` and
+        the legacy ``completion_only_loss`` setting, with the latter
+        taking precedence when explicitly set.
+
         Returns:
-            SFTPreprocessTransform or None if data is already tokenized.
+            SFTPreprocessTransform | None: The configured preprocessing
+            transform, or ``None`` when the dataset is already
+            tokenized.
         """
 
         # Skip if already tokenized

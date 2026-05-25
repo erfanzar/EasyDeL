@@ -56,15 +56,25 @@ def _compute_policy_logps(
 ) -> jax.Array:
     """Compute policy log probabilities for completion tokens.
 
+    Concatenates the prompt and completion ids/masks into a single
+    ``[batch, prompt_len + completion_len]`` sequence, runs the policy
+    forward, and returns per-token log-probabilities sliced to the
+    completion region via :func:`get_per_token_logps`.
+
     Args:
         module: Policy model module.
-        prompt_ids: Prompt token IDs.
-        prompt_mask: Prompt attention mask.
-        completion_ids: Completion token IDs.
-        completion_mask: Completion attention mask.
+        prompt_ids: Prompt token IDs of shape ``[batch, prompt_len]``.
+        prompt_mask: Prompt attention mask of shape
+            ``[batch, prompt_len]``.
+        completion_ids: Completion token IDs of shape
+            ``[batch, completion_len]``.
+        completion_mask: Completion attention mask of shape
+            ``[batch, completion_len]``.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for the
+            chunked log-prob computation. ``None`` disables chunking.
 
     Returns:
-        Per-token log probabilities for completions.
+        Per-token log probabilities of shape ``[batch, completion_len]``.
     """
 
     input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)

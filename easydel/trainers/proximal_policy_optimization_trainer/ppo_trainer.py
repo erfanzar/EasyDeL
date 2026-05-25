@@ -136,25 +136,49 @@ class PPOTrainer(Trainer):
         reward_processing_classes: ProcessingClassType | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
-        """Initialize the PPO trainer.
+        """Initialize a PPO trainer with value-head and reference-model wiring.
+
+        Wraps the policy in :class:`CausalLMWithValueHead` when no value
+        head is attached, deep-copies the wrapped state to form the
+        frozen reference policy ``self.ref_state``, normalises the
+        reward-function list (including JITting reward-model forwards),
+        and finally chains into the base :class:`Trainer`.
 
         Args:
-            arguments: PPOConfig instance with training hyperparameters.
-            model: The policy model to train. Will be wrapped with a value head
-                if not already present.
-            reward_funcs: Reward function(s) for scoring completions. Can be:
-                - A callable taking (prompts, completions) and returning scores
-                - An EasyDeLBaseModule/EasyDeLState reward model
-                - A list of multiple reward functions
-            train_dataset: Training dataset with prompt examples.
-            eval_dataset: Optional evaluation dataset(s).
-            processing_class: Tokenizer for encoding prompts and completions.
-            reward_processing_classes: Optional separate tokenizers for reward models.
-            data_tokenize_fn: Optional custom tokenization function.
+            arguments (PPOConfig): Training hyperparameters.
+            model (EasyDeLBaseModule | EasyDeLState | None): Policy model
+                to train. Wrapped with a value head when needed and
+                converted to an :class:`EasyDeLState`.
+            reward_funcs (RewardFunc | list[RewardFunc]): Reward
+                source(s) for scoring completions. Each entry is either
+                a callable accepting ``(prompts, completions, ...)`` and
+                returning a list of floats, or an
+                :class:`EasyDeLBaseModule` / :class:`EasyDeLState`
+                reward model whose last logit acts as the scalar score.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Prompt-only training dataset.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation
+                dataset(s).
+            processing_class (ProcessingClassType | None): Tokenizer
+                used both for prompt encoding and rollout decoding.
+                Defaults to an :class:`AutoTokenizer` derived from
+                ``model.config._name_or_path`` when ``None``.
+            reward_processing_classes (ProcessingClassType | None):
+                Optional per-reward-function tokenizers. When ``None``,
+                each reward model defaults to its own
+                :class:`AutoTokenizer`.
+            data_tokenize_fn (tp.Callable | None): Optional custom
+                tokenisation function used by reward-side data
+                pipelines.
 
         Raises:
-            ValueError: If arguments is None or model is None or reward weights don't match reward funcs.
-            TypeError: If arguments is not a PPOConfig.
+            ValueError: If ``arguments`` is ``None``, ``model`` is
+                ``None``, or :attr:`PPOConfig.reward_weights` length
+                does not match the number of reward functions.
+            TypeError: If ``arguments`` is not a :class:`PPOConfig`, or
+                if ``reward_processing_classes`` cannot be normalised to
+                a list.
         """
         if arguments is None:
             raise ValueError("PPOTrainer requires `arguments`.")
@@ -397,19 +421,40 @@ class PPOTrainer(Trainer):
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure and JIT-compile training and evaluation step functions.
+        """Build and JIT-compile the PPO step plus rollout-time helpers.
 
-        Sets up the sharded training and evaluation functions with proper
-        JIT compilation and sharding specifications for distributed training.
-        Also configures helper functions for computing reference model log
-        probabilities and rollout statistics.
+        Wires four compiled artefacts that the training loop consumes:
+
+        * **Sharded training step** -- :func:`ppo_step` partial-applied
+          with ``prompt_length``, the clipped-loss coefficients
+          (``cliprange``, ``vf_coef``, ``cliprange_value``,
+          ``entropy_coef``), the optional ``logprob_vocab_chunk_size``,
+          ``loss_config``, scheduler, partition spec, gradient
+          accumulation count, the ``is_train=True`` flag, and the
+          resolved straight-through emulator. The state is donated.
+        * **Sharded eval step** -- :func:`ppo_step` compiled with the
+          same statics but ``is_train=False`` and no state donation.
+        * **``compute_refmodel_logps``** -- compiled helper used by
+          :meth:`_preprocess_batch_input` to score the rollout under the
+          frozen reference policy and return per-token completion log
+          probabilities. The reference graphdef is curried in as a
+          static argument so the same compile cache is reused.
+        * **``compute_rollout_logps_values``** -- compiled helper that
+          scores a rollout under the *current* policy and returns both
+          per-token log probabilities and the value-head predictions
+          used as ``V_old`` for GAE.
+
+        Both helpers detect the headless-LM-head path via
+        :func:`resolve_lmhead_chunksize` and project through the LM head
+        in token/vocab chunks when ``logprob_vocab_chunk_size`` is set,
+        avoiding materialising ``[batch, seq, vocab]`` logit tensors on
+        very large vocabularies.
 
         Returns:
-            TrainerConfigureFunctionOutput containing:
-                - sharded_training_step_function: JIT-compiled training step
-                - sharded_evaluation_step_function: JIT-compiled eval step
-                - mesh: Device mesh for sharding
-                - checkpoint_manager: For saving checkpoints
+            TrainerConfigureFunctionOutput: Container with
+            ``sharded_training_step_function``,
+            ``sharded_evaluation_step_function``, the active ``mesh``,
+            and the streaming ``checkpoint_manager``.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
@@ -780,25 +825,53 @@ class PPOTrainer(Trainer):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
-        """Preprocess a batch for PPO training.
+        """Roll out a PPO batch (generate, score, build advantages) outside the gradient.
 
-        Performs the full PPO rollout preprocessing:
-        1. Generate completions from prompts
-        2. Compute log probabilities and values from policy
-        3. Compute reference model log probabilities
-        4. Score completions with reward functions
-        5. Compute per-token rewards with KL penalty
-        6. Compute GAE advantages and returns
+        Executes the full PPO rollout pipeline that the JITted
+        :func:`ppo_step` consumes:
+
+        1. Generate completions from the prompt batch via
+           :meth:`generate_unified` using the *current* policy.
+        2. Build the completion mask (optionally zeroing out completions
+           that hit ``max_completion_length`` without an EOS when
+           ``mask_truncated_completions`` is enabled).
+        3. Score every position under both the frozen reference
+           (:attr:`compute_refmodel_logps`) and the rollout policy
+           (:attr:`compute_rollout_logps_values`) to capture
+           ``ref_per_token_logps``, ``old_logps`` and ``old_values``.
+        4. Run each registered reward function (callable or
+           :class:`EasyDeLState`) and combine the results with
+           :attr:`reward_weights` to a scalar ``score`` per completion,
+           subtracting :attr:`PPOConfig.missing_eos_penalty` when no EOS
+           is emitted.
+        5. Build per-token rewards as
+           ``r_t = -kl_coef * KL_t`` (with the chosen ``kl_estimator``)
+           and add the scalar score at the last completion position.
+           Optionally whiten the rewards.
+        6. Compute GAE advantages and returns with :meth:`_compute_gae`
+           and optionally whiten the advantages.
+        7. All-gather every output tensor so the downstream JIT receives
+           a replicated, well-formed batch.
 
         Args:
-            state: Current model state for generation.
-            batch: Input batch with prompt input_ids and attention_mask.
-            is_train: Whether this is for training (affects conversational format).
+            state (EasyDeLState): Current PPO state used both as the
+                rollout policy and as the source of value-head
+                predictions.
+            batch (dict[str, jax.Array]): Tokenised prompt-only batch
+                with ``input_ids`` / ``attention_mask`` and (when
+                present) reward-function side-channels.
+            is_train (bool): When ``True`` use the train-side
+                conversational-mode detection, otherwise the eval-side
+                flag.
 
         Returns:
-            Tuple of (processed_batch, metrics):
-                - processed_batch: Dictionary with all tensors needed for PPO step.
-                - metrics: Dictionary with timing and reward statistics.
+            tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+            Pair of ``(prepared_batch, metrics_dict)`` where
+            ``prepared_batch`` holds ``input_ids``, ``attention_mask``,
+            ``completion_mask``, ``old_logps``, ``old_values``,
+            ``advantages`` and ``returns``; ``metrics_dict`` carries
+            wall-clock stats and aggregate score / KL diagnostics, plus
+            one entry per reward function.
         """
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)

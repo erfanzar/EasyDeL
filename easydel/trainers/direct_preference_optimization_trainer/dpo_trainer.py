@@ -300,7 +300,14 @@ class DPOTrainer(Trainer):
         return source.transform(self._build_preprocess_transform())
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has DPO tokenized fields."""
+        """Check whether the training source already carries DPO tokenized fields.
+
+        Returns:
+            ``True`` if the training :class:`ShardedDataSource` exposes
+            ``prompt_input_ids`` (and is therefore pre-tokenized);
+            ``False`` if the dataset is raw text and needs a
+            :class:`DPOPreprocessTransform`.
+        """
         return self._source_is_pretokenized(self._train_source)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
@@ -435,7 +442,20 @@ class DPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collection function for Grain batching."""
+        """Return the pre-built Grain preference collator.
+
+        Args:
+            max_sequence_length: Maximum sequence length (accepted for
+                interface parity with the base trainer; the collator is
+                already configured at construction time).
+            truncation_mode: Truncation strategy (``"keep_end"`` /
+                ``"keep_start"``); also unused here because the collator
+                applies the trainer's configured mode.
+
+        Returns:
+            The cached :class:`DataCollatorForPreferenceGrain` instance
+            wired up in :meth:`__init__`.
+        """
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -443,7 +463,18 @@ class DPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collection function for TFDS batching."""
+        """Return the pre-built TFDS preference collator.
+
+        Args:
+            max_sequence_length: Maximum sequence length (unused;
+                see :meth:`create_grain_collect_function`).
+            truncation_mode: Truncation strategy (unused for the same
+                reason).
+
+        Returns:
+            The cached :class:`DataCollatorForPreferenceTFDS` instance
+            wired up in :meth:`__init__`.
+        """
         return self.input_data_collator_tfds
 
     def configure_dataloaders(self):
@@ -621,7 +652,23 @@ class DPOTrainer(Trainer):
         metrics: MetricsType,
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
-        """Hook called at the end of each step for reference model sync."""
+        """Sync the reference model from the policy at the configured cadence.
+
+        When ``arguments.sync_ref_model`` is enabled and ``step`` is a
+        multiple of ``arguments.ref_model_sync_steps``, the reference
+        state's ``graphstate`` is replaced by a deep-copied snapshot of
+        the current policy ``graphstate``. This implements the periodic
+        target-network style sync used by some DPO variants.
+
+        Args:
+            state: Current policy state after the step's optimizer update.
+            metrics: Training metrics collected this step.
+            step: Global training step index.
+
+        Returns:
+            ``(state, metrics)`` -- both forwarded unchanged; the
+            reference state is mutated in place on ``self``.
+        """
         if (
             self.arguments.sync_ref_model
             and self.reference_state is not None

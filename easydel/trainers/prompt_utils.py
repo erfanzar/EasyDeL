@@ -88,7 +88,28 @@ def normalize_message_payload(
     *,
     allow_plain_text: bool = False,
 ) -> list[dict[str, tp.Any]] | None:
-    """Normalize chat payloads into ``[{role, content, ...}, ...]`` form."""
+    """Normalize chat payloads into ``[{role, content, ...}, ...]`` form.
+
+    Coalesces the many shapes a dataset row may use for chat messages
+    (OpenAI ``role``/``content`` dicts, ChatML ``from``/``value`` pairs,
+    JSON-encoded strings, lists thereof) into the canonical
+    ``[{"role": ..., "content": ...}, ...]`` representation. Returns
+    ``None`` when the payload cannot be interpreted as a message list.
+
+    Args:
+        payload: Raw value from the dataset (string, dict, list, or
+            ``None``).
+        allow_plain_text: When ``True``, bare strings and dicts that only
+            carry a ``content`` field are wrapped as a single user
+            message. When ``False`` (the default), bare strings are
+            rejected because they are unambiguously plain text rather
+            than a chat list.
+
+    Returns:
+        A list of normalized message dictionaries, or ``None`` when the
+        payload cannot be parsed (e.g. plain-text input with
+        ``allow_plain_text=False`` or unsupported types).
+    """
 
     def _normalize_single(item: tp.Any) -> list[dict[str, tp.Any]] | None:
         """Normalize a single message payload to a list of role/content dicts.
@@ -153,7 +174,21 @@ def normalize_message_payload(
 
 
 def normalize_tool_payload(payload: tp.Any) -> tp.Any:
-    """Normalize stringified JSON tool payloads into dict/list form."""
+    """Normalize stringified JSON tool payloads into dict/list form.
+
+    Tool/function schemas are sometimes stored as serialized JSON in
+    dataset columns. This helper attempts to ``json.loads`` strings that
+    look like JSON, recursively flattens nested lists/tuples, and copies
+    dicts so downstream mutations do not leak into the dataset cache.
+
+    Args:
+        payload: Raw tool value (string, list, tuple, dict, or ``None``).
+
+    Returns:
+        The decoded tool payload. Strings that do not decode are
+        returned unchanged; tuples are coerced to lists; dicts are
+        shallow-copied.
+    """
     if isinstance(payload, str):
         parsed = _maybe_json_load(payload)
         if parsed is not payload:
@@ -183,7 +218,22 @@ def resolve_example_tools(
     example: dict[str, tp.Any],
     fallback_tools: list | None = None,
 ) -> list | None:
-    """Return per-example tool schemas when available, otherwise ``fallback_tools``."""
+    """Return per-example tool schemas when available, otherwise ``fallback_tools``.
+
+    Looks up ``example["tools"]``, normalizes it via
+    :func:`normalize_tool_payload`, wraps single-dict entries as a
+    one-element list, and writes the normalized value back onto
+    ``example`` so subsequent callers see the same shape.
+
+    Args:
+        example: Dataset row dict; may contain a ``tools`` key.
+        fallback_tools: Default list of tool schemas to use when the
+            example does not carry tools.
+
+    Returns:
+        The example's normalized tool list, ``fallback_tools`` when the
+        example carries no tools, or ``None`` when neither is available.
+    """
 
     example_tools = normalize_tool_payload(example.get("tools"))
     if isinstance(example_tools, dict):
@@ -907,7 +957,24 @@ def keep_arrays_map(
     array_fields: list[str] | None = None,
     drop_fields: list[str] | None = None,
 ) -> dict[str, tp.Any]:
-    """Keep only array fields and convert them to numpy arrays for HF datasets compatibility."""
+    """Keep only array fields and convert them to numpy arrays.
+
+    Filters a dataset example to fields that are safe to pass through
+    Apache Arrow / HuggingFace datasets (and ultimately into JAX
+    collation), converting list/JAX-array leaves into ``np.ndarray``
+    along the way. Lists whose first element is a dict are skipped (they
+    cannot be cast into an array). Explicit array names always survive;
+    explicit drop names never do.
+
+    Args:
+        example: A single dataset row.
+        array_fields: Optional names that should always be kept and
+            forced to ``np.ndarray``.
+        drop_fields: Optional names that should always be removed.
+
+    Returns:
+        A new dict mapping only array-typed fields to their NumPy form.
+    """
     results = {}
     if array_fields is None:
         array_fields = []
@@ -931,7 +998,22 @@ def keep_arrays_map(
 
 
 def _unpair_row(examples: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
-    """Convert a batch of paired preference rows into unpaired rows."""
+    """Convert a batch of paired preference rows into unpaired rows.
+
+    Maps ``[(prompt, chosen, rejected), ...]`` into
+    ``[(prompt, chosen, True), (prompt, rejected, False), ...]`` by
+    concatenating the chosen and rejected branches and labelling them
+    accordingly. Designed for use with ``datasets.Dataset.map(..., batched=True)``.
+
+    Args:
+        examples: Columnar batch with ``chosen``, ``rejected``, and an
+            optional ``prompt`` list.
+
+    Returns:
+        A new columnar batch with ``completion``, ``label``, and (when
+        the input had ``prompt``) ``prompt`` arrays sized
+        ``2 * len(examples["chosen"])``.
+    """
 
     batch_size = len(examples["chosen"])
     new_rows = {

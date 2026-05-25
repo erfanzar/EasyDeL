@@ -264,7 +264,18 @@ class KTOTrainer(Trainer):
         return dataset
 
     def _get_preprocess_transform(self) -> KTOPreprocessTransform | None:
-        """Get KTO preprocessing transform for ShardedDataSource."""
+        """Build the KTO preprocessing transform for a :class:`ShardedDataSource`.
+
+        Skips transform construction when the underlying data source
+        is already pretokenized (carries ``prompt_input_ids``), in
+        which case the trainer consumes the batch as-is.
+
+        Returns:
+            A :class:`KTOPreprocessTransform` configured with the
+            tokenizer, prompt/completion budgets, label pad id, and
+            optional tools spec; ``None`` when the dataset is
+            pretokenized.
+        """
 
         if self._is_pretokenized():
             return None
@@ -277,7 +288,18 @@ class KTOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Detect whether the training :class:`ShardedDataSource` is pre-tokenized.
+
+        Opens the first shard, peeks at one sample, and checks for the
+        ``prompt_input_ids`` key. Used to short-circuit transform
+        construction when the dataset already carries tokenized
+        prompts and completions.
+
+        Returns:
+            ``True`` when the first sample exposes
+            ``prompt_input_ids``; ``False`` when no train source is
+            attached, the shard is empty, or the key is missing.
+        """
         if self._train_source is None:
             return False
         try:
@@ -408,14 +430,23 @@ class KTOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for Grain data loading.
+        """Return the Grain-compatible KTO data collator.
+
+        The collator was already constructed during :meth:`__init__`
+        with the trainer's prompt/completion budgets and pad-token
+        configuration, so the ``max_sequence_length`` and
+        ``truncation_mode`` arguments are accepted only for protocol
+        parity with :class:`Trainer`.
 
         Args:
-            max_sequence_length: Maximum sequence length.
-            truncation_mode: How to truncate sequences.
+            max_sequence_length: Ignored. Retained for base-class
+                signature compatibility.
+            truncation_mode: Ignored. Retained for base-class
+                signature compatibility.
 
         Returns:
-            Grain-compatible data collator.
+            The :class:`BCODataCollatorGrain` instance stashed on the
+            trainer.
         """
         return self.input_data_collator_grain
 
@@ -424,13 +455,19 @@ class KTOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for TFDS data loading.
+        """Return the TFDS-compatible KTO data collator.
+
+        Same contract as :meth:`create_grain_collect_function`; the
+        collator is already built in :meth:`__init__`.
 
         Args:
-            max_sequence_length: Maximum sequence length.
-            truncation_mode: How to truncate sequences.
+            max_sequence_length: Ignored. Retained for base-class
+                signature compatibility.
+            truncation_mode: Ignored. Retained for base-class
+                signature compatibility.
 
         Returns:
-            TFDS-compatible data collator.
+            The :class:`BCODataCollatorTFDS` instance stashed on the
+            trainer.
         """
         return self.input_data_collator_tfds

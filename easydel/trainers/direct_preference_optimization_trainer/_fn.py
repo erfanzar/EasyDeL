@@ -308,7 +308,23 @@ def _compute_dpo_outputs_from_hidden_states(
 
 
 def _get_reference_logps_from_batch(batch: dict[str, tp.Any]) -> tuple[tp.Any | None, tp.Any | None]:
-    """Read reference log-prob columns from either the canonical or legacy keys."""
+    """Read reference log-prob columns from either the canonical or legacy keys.
+
+    DPO batches may carry precomputed reference log-probabilities under
+    one of two naming conventions: the canonical ``ref_chosen_logps`` /
+    ``ref_rejected_logps`` or the legacy ``reference_chosen_log_probs`` /
+    ``reference_rejected_log_probs``. This helper checks both so the
+    downstream training and evaluation steps stay agnostic to the
+    convention used by the dataset.
+
+    Args:
+        batch: Preference minibatch dictionary.
+
+    Returns:
+        ``(ref_chosen_logps, ref_rejected_logps)``; either value is
+        ``None`` when the batch does not provide that column under
+        either convention.
+    """
     ref_chosen_logps = batch.get("ref_chosen_logps")
     if ref_chosen_logps is None:
         ref_chosen_logps = batch.get("reference_chosen_log_probs")
@@ -324,28 +340,37 @@ def concatenated_inputs(
     batch: dict[str, list | Array],
     padding_value: int,
 ) -> dict[str, Array]:
-    """
-    Concatenates chosen and rejected examples from the batch, and pads the inputs to a uniform length.
+    """Concatenate chosen/rejected examples into a single batch for a fused forward pass.
 
-    This function is used to merge paired inputs (e.g. chosen vs. rejected examples)
-    so that the model can process them in one forward pass. It concatenates the prompt inputs,
-    attention masks, and (if present) image-related arrays. The completion inputs (and their attention masks)
-    are padded to the length of the longest completion among the chosen and rejected examples.
+    Used by :func:`concatenated_forward` to halve the number of model
+    calls per preference pair: instead of running the model twice
+    (once for chosen, once for rejected), the prompt is duplicated and
+    the chosen and rejected completions are stacked along the batch
+    axis. Completion ids and attention masks are padded to the max
+    completion length so both halves share the same time dimension.
+    Any multimodal side-inputs (``pixel_values``,
+    ``pixel_attention_mask``, ``image_sizes``) are likewise duplicated
+    along the batch axis.
 
     Args:
-        batch (tp.Dict[str, tp.Union[tp.List, Array]]):
-            A dictionary containing the batch of data. Expected keys include:
-            - "prompt_input_ids", "prompt_attention_mask"
-            - "chosen_input_ids", "rejected_input_ids"
-            - "chosen_attention_mask", "rejected_attention_mask"
-            Optionally, keys like "pixel_values", "pixel_attention_mask", and "image_sizes" may be present.
-        padding_value (int): The padding value to use when padding completion inputs.
+        batch: Preference batch. Expected keys:
+
+            * ``prompt_input_ids`` / ``prompt_attention_mask``
+            * ``chosen_input_ids`` / ``chosen_attention_mask``
+            * ``rejected_input_ids`` / ``rejected_attention_mask``
+            * Optionally ``pixel_values``,
+              ``pixel_attention_mask``, ``image_sizes`` for VLM
+              trainings.
+        padding_value: Padding token id used to right-pad
+            completions to the maximum completion length.
 
     Returns:
-        tp.Dict[str, Array]: A dictionary with concatenated arrays under keys such as:
-            - "prompt_input_ids", "prompt_attention_mask"
-            - "completion_input_ids", "completion_attention_mask"
-            and optionally image-related keys.
+        A dictionary keyed by ``prompt_input_ids`` /
+        ``prompt_attention_mask`` /
+        ``completion_input_ids`` /
+        ``completion_attention_mask`` (and the optional image side
+        keys), each of length ``2 * batch`` with chosen examples in
+        the first half and rejected examples in the second.
     """
     output = {}
     # Concatenate the prompt-related arrays (duplicated for chosen and rejected).
@@ -945,32 +970,67 @@ def concatenated_forward(
     logprob_vocab_chunk_size: int | None = None,
     vocab_shard_stage: int | None = None,
 ) -> dict[str, Array]:
-    """
-    Runs the model on concatenated chosen/rejected inputs for efficiency.
+    """Run the model on concatenated chosen/rejected inputs and produce DPO log-probs.
 
-    This function first concatenates inputs (using the `concatenated_inputs` function) and then runs
-    a forward pass through the model. It handles both encoder-decoder and decoder-only architectures,
-    applies truncation if required, and computes per-token log probabilities.
+    Workflow:
+
+    1. Concatenate chosen and rejected halves with
+       :func:`concatenated_inputs` so they can be processed by a
+       single forward pass.
+    2. Build the model call kwargs differently for encoder-decoder vs
+       decoder-only models. Decoder-only models additionally apply
+       paired truncation via :func:`apply_paired_truncation` so the
+       prompt-and-completion concatenation respects ``max_length``.
+    3. When the LM head can be chunked (via ``apply_lm_head=False`` +
+       ``last_hidden_state``), defer logit materialisation to
+       :func:`_compute_dpo_outputs_from_hidden_states` to avoid the
+       ``O(B * L * V)`` peak logit memory.
+    4. Otherwise compute per-token log-probabilities directly through
+       :func:`_compute_token_logps_chunked` and sum them per example.
+    5. For ``loss_type == "ipo"``, length-normalise the per-example
+       log-probabilities as required by the IPO objective.
+    6. Compute per-half mean logits for diagnostic logging (without
+       materialising the full logits tensor when the chunked path is
+       used).
 
     Args:
-        model (EasyDeLBaseModule): The model to run.
-        batch (tp.Dict[str, tp.Union[tp.List, Array]]): The input batch of data.
-        is_encoder_decoder (bool): Flag indicating whether the model is an encoder-decoder.
-        label_pad_token_id (int): Token id used to mark padded tokens in the labels.
-        padding_value (int): Padding value for inputs.
-        max_length (int | None, optional): Maximum sequence length for truncation. Defaults to None.
-        truncation_mode (str, optional): Truncation strategy ("keep_end" or "keep_start"). Defaults to "keep_end".
-        aux_loss_enabled (bool, optional): If True, enables auxiliary loss computation. Defaults to False.
-        loss_type (str, optional): The type of loss function to be used. Defaults to "sigmoid".
+        model: Module to run -- typically a policy or reference model.
+        batch: Preference batch with at least
+            ``prompt_input_ids`` / ``chosen_input_ids`` /
+            ``rejected_input_ids`` and their attention masks.
+        is_encoder_decoder: Whether the model is encoder-decoder
+            (changes how labels and the forward kwargs are built).
+        label_pad_token_id: Token id used to mark padded label
+            positions (encoder-decoder path).
+        padding_value: Padding token id passed to
+            :func:`concatenated_inputs`.
+        max_length: Total sequence length cap for the decoder-only
+            path. ``None`` disables truncation.
+        truncation_mode: ``"keep_end"`` or ``"keep_start"``.
+        aux_loss_enabled: When ``True``, request and forward the
+            model's ``aux_loss`` field (e.g. MoE load-balancing).
+        loss_type: DPO variant key; only ``"ipo"`` triggers
+            length-normalisation here.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for
+            :func:`compute_token_logps_and_entropies_chunked`. ``None``
+            disables chunking.
+        vocab_shard_stage: Optional MPMD pipeline stage rank used when
+            sharding the LM head; forwarded to ``make_lm_head_fn``.
 
     Returns:
-        tp.Dict[str, Array]: A dictionary containing:
-            - "chosen_logps": Log probabilities for chosen examples.
-            - "rejected_logps": Log probabilities for rejected examples.
-            - "mean_chosen_logits": Mean logits over tokens for chosen examples.
-            - "mean_rejected_logits": Mean logits over tokens for rejected examples.
-            Optionally, if `aux_loss_enabled` is True and the model output contains "aux_loss",
-            it is included in the output dictionary.
+        Dictionary with:
+
+        * ``chosen_logps`` / ``rejected_logps`` -- per-example summed
+          (or length-normalised) log-probabilities for each half.
+        * ``mean_chosen_logits`` / ``mean_rejected_logits`` -- scalar
+          diagnostic averages over loss-bearing tokens.
+        * ``aux_loss`` -- forwarded from the model output when
+          ``aux_loss_enabled`` and present.
+
+    Raises:
+        TypeError: If the model is invoked with ``apply_lm_head=False``
+            but does not return ``last_hidden_state``, or returns
+            neither logits nor a hidden state on the standard path.
     """
     num_examples = batch["prompt_input_ids"].shape[0]
     concatenated_batch = concatenated_inputs(batch=batch, padding_value=padding_value)

@@ -328,7 +328,18 @@ class DistillationTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
-        """Tokenize raw text examples for distillation when needed."""
+        """Build the SFT-style tokenisation transform when the dataset is raw text.
+
+        Uses ``dataset_text_field`` to pick the input column and the
+        legacy ``completion_only_loss`` flag (with
+        ``assistant_only_loss`` as the canonical fallback) to decide
+        whether the prompt portion should be masked out.
+
+        Returns:
+            An :class:`SFTPreprocessTransform` wired with the
+            tokenizer and configured max length, or ``None`` when the
+            source is already pretokenised.
+        """
         if self._is_pretokenized():
             return None
         text_field = getattr(self.arguments, "dataset_text_field", None) or "text"
@@ -344,7 +355,13 @@ class DistillationTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check whether the source already yields token IDs."""
+        """Detect whether the training source already yields tokenised samples.
+
+        Returns:
+            ``True`` when the first sample of the first shard exposes
+            an ``input_ids`` column; ``False`` when the source is
+            absent or the shard is empty.
+        """
         if self._train_source is None:
             return False
         try:

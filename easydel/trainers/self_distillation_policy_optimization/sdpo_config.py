@@ -58,6 +58,25 @@ class SDPOConfig(GRPOConfig):
       completion in the teacher context.
     - ``beta``: optional KL penalty toward a frozen reference model (same as
       GRPO; default 0 because the self-teacher already acts as a regulariser).
+
+    Attributes:
+        trainer_prefix (str | None): Default prefix for trainer logs,
+            checkpoints, and wandb runs. Defaults to ``"SDPO"``.
+        max_feedback_length (int): Maximum number of tokens reserved for the
+            feedback separator inserted between the original prompt and the
+            original completion in the teacher context. Longer feedback is
+            truncated; shorter feedback is right-padded with the tokenizer's
+            pad token. Defaults to ``256``.
+        distillation_type (str): Loss used to match the student to the
+            self-teacher. Either ``"kl"`` (forward KL approximated at the
+            sampled token) or ``"jsd"`` (symmetric JSD approximated at the
+            sampled token, bounded in ``[-log 2, 0]`` and more stable than
+            KL). Defaults to ``"jsd"``.
+        beta (float): KL-divergence penalty toward the frozen reference
+            model (inherited from :class:`GRPOConfig`). Defaults to ``0.0``
+            because the self-distillation objective already regularises the
+            policy; set ``> 0`` to additionally penalise deviation from the
+            initial model.
     """
 
     trainer_prefix: str | None = field(

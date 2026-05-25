@@ -44,30 +44,32 @@ class ORPOConfig(TrainingArguments):
 
     Attributes:
         trainer_prefix (str | None): Prefix for trainer logs and checkpoints.
-            Default: "orpotrainer"
+            Default: "ORPO".
         learning_rate (float): Learning rate for the optimizer.
-            Default: 1e-6
+            Default: 1e-6.
         max_length (int | None): Maximum total sequence length (prompt + completion).
-            Default: 1024
+            Default: 1024.
         max_prompt_length (int | None): Maximum length for prompt sequences.
-            Default: 512
+            Default: 512.
         max_completion_length (int | None): Maximum length for completion sequences.
-            Automatically calculated as max_length - max_prompt_length if None.
+            Automatically calculated as ``max_length - max_prompt_length`` when
+            left unset.
+        logprob_vocab_chunk_size (int | None): Vocabulary chunk size used when
+            computing selected-token log probabilities. ``None`` disables
+            chunking.
         beta (float): Temperature parameter controlling the strength of preference
             optimization. Higher values make the model more selective between
-            chosen and rejected responses. Default: 0.1
+            chosen and rejected responses. Default: 0.1.
         disable_dropout (bool): Whether to disable dropout during training for
-            deterministic behavior. Default: True
-        label_pad_token_id (int): Token ID used for padding labels in loss computation.
-            Default: -100 (ignored by PyTorch/JAX loss functions)
+            deterministic behavior. Default: True.
+        label_pad_token_id (int): Token ID used for padding labels in loss
+            computation. Default: -100 (ignored by EasyDeL loss helpers).
         padding_value (int | None): Value used for padding input sequences.
             If None, uses the tokenizer's pad_token_id.
         generate_during_eval (bool): Whether to generate sample outputs during
-            evaluation for qualitative assessment. Default: False
+            evaluation for qualitative assessment. Default: False.
         is_encoder_decoder (bool | None): Whether the model is encoder-decoder
             architecture. Auto-detected if None.
-        model_init_kwargs (dict | None): Additional keyword arguments for model
-            initialization.
         dataset_num_proc (int | None): Number of processes for parallel dataset
             preprocessing. None uses sequential processing.
 
@@ -150,15 +152,20 @@ class ORPOConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
-        """
-        Post-initialization processing.
+        """Resolve derived ORPO length budgets and forward to the base class.
 
-        This method is automatically called after the dataclass __init__ method.
-        It sets the 'max_completion_length' if it is not provided by subtracting the
-        'max_prompt_length' from 'max_length'.
+        Called automatically by the dataclass machinery after ``__init__``.
+        Handles the deprecated ``max_sequence_length`` alias, derives
+        ``max_completion_length`` as ``max_length - max_prompt_length`` when
+        unset, and normalises ``logprob_vocab_chunk_size`` so non-positive
+        values disable chunking.
 
-        Returns:
-            The result of the superclass __post_init__ method.
+        Args:
+            max_sequence_length (int | None): Deprecated alias for
+                ``max_length`` forwarded to the base class for backward
+                compatibility.
+            quantization_block (int | None): Optional quantization block size
+                forwarded to the base ``TrainingArguments`` post-init.
         """
         # If max_completion_length is not provided, derive it from max_length and max_prompt_length.
         self._handle_deprecated_max_sequence_length(max_sequence_length)

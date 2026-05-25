@@ -31,6 +31,14 @@ def normalize_logprob_vocab_chunk_size(value: int | None) -> int | None:
     non-positive values disable chunking; positive values are kept as-is.
     Centralising it here means a future change to chunk-size semantics only
     touches one file.
+
+    Args:
+        value: Raw config value. ``None`` or any integer ``<= 0`` disables
+            chunking; positive integers are returned coerced to ``int``.
+
+    Returns:
+        The coerced positive ``int`` when chunking is enabled, or ``None``
+        when chunking should be disabled.
     """
     if value is None:
         return None

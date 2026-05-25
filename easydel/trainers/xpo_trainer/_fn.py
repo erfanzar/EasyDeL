@@ -67,18 +67,27 @@ def _compute_logps(
 ) -> jax.Array:
     """Compute per-token log probabilities for completion tokens.
 
-    Concatenates prompts and completions, then extracts log probabilities
-    for tokens in the completion portion only.
+    Concatenates prompts and completions along the sequence axis, calls
+    :func:`get_per_token_logps`, and slices the returned tensor so only
+    log-probs aligned to completion tokens are returned. The prompt
+    length is recovered from ``prompt_ids.shape[-1]`` so the function
+    works for arbitrary prompt and completion lengths.
 
     Args:
         module: The language model module to evaluate.
-        prompt_ids: Token IDs for the prompt portion.
-        prompt_mask: Attention mask for the prompt.
-        completion_ids: Token IDs for the completion portion.
-        completion_mask: Attention mask for the completion.
+        prompt_ids: Token IDs for the prompt portion of shape ``[B, P]``.
+        prompt_mask: Attention mask for the prompt of shape ``[B, P]``.
+        completion_ids: Token IDs for the completion portion of shape
+            ``[B, C]``.
+        completion_mask: Attention mask for the completion of shape
+            ``[B, C]``.
+        logprob_vocab_chunk_size: Optional vocabulary-axis chunk size
+            forwarded to :func:`get_per_token_logps` to bound peak
+            memory. ``None`` disables chunking.
 
     Returns:
-        Per-token log probabilities for completion tokens.
+        jax.Array: Per-token log probabilities aligned to the completion
+        tokens, shaped ``[B, C]``.
     """
     input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
     attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)
@@ -144,12 +153,20 @@ def _compute_pair_logps(
 def _sum_logps(token_logps: jax.Array, completion_mask: jax.Array) -> jax.Array:
     """Sum log probabilities over completion tokens, respecting the attention mask.
 
+    Multiplies the per-token log-probs by the completion mask (cast to
+    the log-prob dtype to avoid silent integer promotion) and reduces
+    along the sequence axis, producing one sequence-level log-prob per
+    batch element.
+
     Args:
-        token_logps: Per-token log probabilities.
-        completion_mask: Attention mask indicating valid completion tokens.
+        token_logps: Per-token log probabilities of shape ``[B, C]``.
+        completion_mask: Attention mask indicating valid completion
+            tokens, shape ``[B, C]``. Cast to the log-prob dtype before
+            multiplication.
 
     Returns:
-        Sum of log probabilities for each sequence in the batch.
+        jax.Array: Sum of log probabilities for each sequence, shape
+        ``[B]``.
     """
     mask = completion_mask.astype(token_logps.dtype)
     return (token_logps * mask).sum(axis=1)

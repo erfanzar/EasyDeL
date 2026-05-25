@@ -53,7 +53,17 @@ logger = get_logger(__name__)
 
 
 def _coerce_mapping_like(value: tp.Any) -> tp.Any:
-    """Coerce JSON-string payloads into mapping-like objects when possible."""
+    """Coerce JSON-string payloads into mapping-like objects when possible.
+
+    Args:
+        value: Arbitrary payload; if it is a JSON-encoded string, the
+            decoded object is returned, otherwise ``value`` passes through
+            unchanged.
+
+    Returns:
+        The decoded JSON object when ``value`` is a parseable JSON string,
+        else the original ``value``.
+    """
 
     if isinstance(value, str):
         try:
@@ -64,7 +74,22 @@ def _coerce_mapping_like(value: tp.Any) -> tp.Any:
 
 
 def _normalize_tool_call_payloads(tool_calls: tp.Any) -> list[dict[str, tp.Any]]:
-    """Normalize tool calls for HF/Jinja chat-template compatibility."""
+    """Normalize tool calls for HF/Jinja chat-template compatibility.
+
+    Flattens dicts, ``model_dump``-able pydantic models, and objects with
+    ``function`` attributes into a list of dicts with a guaranteed
+    ``function.arguments`` mapping so chat templates can render them
+    without crashing on string-encoded arguments.
+
+    Args:
+        tool_calls: Optional payload emitted by the generator; expected
+            to be a list of tool-call descriptors but any non-list input
+            is treated as empty.
+
+    Returns:
+        A list of normalized tool-call dicts. Empty when the input is not
+        a recognisable list of tool calls.
+    """
 
     if not isinstance(tool_calls, list):
         return []
@@ -163,6 +188,15 @@ def turn_record_to_message(turn: TurnRecord) -> dict[str, tp.Any]:
     markup. In that case, rebuild the message from visible assistant content
     plus ``tool_calls`` so downstream chat templates can serialize the call
     instead of silently dropping it.
+
+    Args:
+        turn: The :class:`TurnRecord` to convert.
+
+    Returns:
+        A chat-template message dict with ``role`` / ``content`` and, for
+        assistant turns with structured tool calls, an extra
+        ``tool_calls`` list normalised via
+        :func:`_normalize_tool_call_payloads`.
     """
 
     message: dict[str, tp.Any] = {"role": turn.role, "content": turn.content}
@@ -225,12 +259,15 @@ class RolloutManager:
     (one per prompt). The trainer wraps ``generate_unified`` to provide
     this batched interface.
 
-    Args:
-        tokenizer: Tokenizer for encoding/decoding text.
+    Attributes:
+        tokenizer: Tokenizer used for chat-template formatting and
+            encoding/decoding text.
         max_steps: Maximum interaction steps per episode.
-        max_seq_length: Maximum total sequence length for the trajectory.
+        max_seq_length: Maximum total sequence length for the trajectory
+            (longer trajectories are truncated when tokenized).
         system_prompt: Optional system prompt prepended to conversations.
-        tool_schemas: Optional tool schemas for chat template formatting.
+        tool_schemas: Optional list of tool schemas threaded through every
+            ``apply_chat_template`` call.
     """
 
     def __init__(
@@ -558,6 +595,15 @@ class RolloutManager:
 
         Tokenizes each turn individually to track prompt vs response
         boundaries accurately, then concatenates into a single sequence.
+
+        Args:
+            ep: The completed mutable :class:`_EpisodeState` whose turns
+                and reward history should be packed into the trajectory.
+
+        Returns:
+            A :class:`TrajectoryResult` with token IDs, attention /
+            prompt / response masks, reward summaries, and the turn
+            history copied from ``ep``.
         """
         messages = [{"role": t.role, "content": t.content} for t in ep.turns]
         full_text = self.tokenizer.apply_chat_template(

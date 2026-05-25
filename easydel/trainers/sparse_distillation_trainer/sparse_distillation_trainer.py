@@ -82,6 +82,22 @@ class SparseDistillationTrainer(Trainer):
         3. Teacher scores the full sequences → top-k logprobs
         4. Student minimises partial KL on the generated tokens
 
+    Attributes:
+        arguments (SparseDistillationConfig): Resolved sparse-distillation
+            configuration carried from initialisation.
+        teacher_state (EasyDeLState | None): In-process teacher state
+            whose top-k logprobs are computed locally; ``None`` when an
+            external ``teacher_fn`` is used instead.
+        teacher_fn (SparseTeacherFn | None): External callable mapping
+            ``(input_ids, attention_mask, prompt_texts)`` to
+            ``(top_k_indices, top_k_logprobs)`` for API-based teachers;
+            ``None`` when ``teacher_state`` is used instead.
+        processing_class (ProcessingClassType): Tokenizer / processor
+            used for prompt encoding and (for the callable teacher
+            mode) prompt-text decoding.
+        padding_value (int): Pad token id used by the collators; falls
+            back to ``0`` when the tokenizer exposes no pad token.
+
     Example:
         >>> config = SparseDistillationConfig(
         ...     top_k_teacher=20,

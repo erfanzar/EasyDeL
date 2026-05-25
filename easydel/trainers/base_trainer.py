@@ -296,7 +296,8 @@ class BaseTrainer(BaseTrainerProtocol):
             **details: Arbitrary key/value pairs. ``None`` values are skipped; long
                 ``repr``s are truncated to 500 chars.
         """
-        if not logger.isEnabledFor(logging.DEBUG):
+        is_debug_enabled = getattr(logger, "isEnabledFor", None)
+        if callable(is_debug_enabled) and not is_debug_enabled(logging.DEBUG):
             return
         try:
             detail_parts = []
@@ -4829,7 +4830,7 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         if not is_package_available("tensorflow"):
             raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
-        import tensorflow as tf  # type:ignore
+        import tensorflow as tf  # type: ignore
 
         try:
             # Disable all GPUS

@@ -302,7 +302,22 @@ class AgenticMoshPitTrainer(GRPOTrainer):
 
     @staticmethod
     def _env_reward_placeholder(prompts, completions, **kwargs) -> list[float]:
-        """Placeholder reward function — actual rewards come from environments."""
+        """Placeholder reward function — actual rewards come from environments.
+
+        Used as a sentinel reward callable so the underlying GRPO trainer
+        sees a non-empty ``reward_funcs`` list even when all real rewards
+        originate inside the environment.
+
+        Args:
+            prompts: Batch prompts (ignored).
+            completions: Batch completions; used only to derive the
+                output length.
+            **kwargs: Unused additional context forwarded by the GRPO
+                trainer's reward dispatch.
+
+        Returns:
+            A list of zeros with the same length as ``completions``.
+        """
         return [0.0] * len(completions)
 
     def _make_generate_fn(
@@ -595,7 +610,16 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         return aux_rewards, reward_breakdown
 
     def _wrap_env_with_tools(self, env: AgenticEnvironment) -> AgenticEnvironment:
-        """Wrap environment with tool support if tools are configured."""
+        """Wrap environment with tool support if tools are configured.
+
+        Args:
+            env: Underlying environment instance.
+
+        Returns:
+            ``env`` unchanged when no tools are registered, otherwise a
+            :class:`ToolEnvWrapper` carrying the trainer's tool dispatch
+            configuration.
+        """
         if not self._tools:
             return env
         return ToolEnvWrapper(
@@ -626,7 +650,13 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             is_train: Whether this is a training step.
 
         Returns:
-            Tuple of (processed batch dict, metrics dict).
+            Tuple ``(batch_dict, metrics_dict)``. ``batch_dict`` carries
+            ``prompt_ids``, ``prompt_mask``, ``completion_ids``,
+            ``completion_mask``, ``ref_per_token_logps``, ``advantages``,
+            and ``num_items_in_batch`` ready for the GRPO loss.
+            ``metrics_dict`` reports reward statistics, completion
+            length, rollout/advantage/ref-logps timings, and any
+            auxiliary reward breakdowns.
         """
         with capture_time() as total_time_fn:
             with capture_time() as rollout_time_fn:
@@ -838,6 +868,12 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         full multi-turn conversation, reward, number of steps, and
         episode metadata. This gives full visibility into what the
         agent is doing at each training step.
+
+        Args:
+            trajectories: Rollout trajectories produced by the rollout
+                manager.
+            state: Current trainer state, used to obtain the global step
+                for the wandb log entry.
         """
         if (
             not self.arguments.use_wandb
@@ -903,6 +939,15 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         Since agentic training generates data through rollouts rather
         than from a dataset, the collator is minimal — it just passes
         through seed/index information if present.
+
+        Args:
+            max_sequence_length: Unused, kept for API compatibility with
+                the base trainer interface.
+            truncation_mode: Unused, kept for API compatibility.
+
+        Returns:
+            A minimal :class:`GRPODataCollatorTFDS` callable suitable for
+            the dummy dataset used by agentic training.
         """
         from ..utils import GRPODataCollatorTFDS
 
@@ -916,7 +961,16 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create a Grain data collator for agentic training."""
+        """Create a Grain data collator for agentic training.
+
+        Args:
+            max_sequence_length: Unused, kept for API compatibility.
+            truncation_mode: Unused, kept for API compatibility.
+
+        Returns:
+            A minimal :class:`GRPODataCollatorGrain` callable suitable for
+            Grain-based agentic training.
+        """
         from ..utils import GRPODataCollatorGrain
 
         return GRPODataCollatorGrain(

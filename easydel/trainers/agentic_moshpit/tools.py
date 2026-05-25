@@ -254,7 +254,12 @@ def make_tool(name: str, **kwargs: tp.Any) -> Tool:
 
 
 def list_tools() -> list[str]:
-    """Return names of all registered tools."""
+    """Return names of all registered tools.
+
+    Returns:
+        Sorted list of registered tool names usable with
+        :func:`make_tool`.
+    """
     return sorted(_TOOL_REGISTRY.keys())
 
 
@@ -305,6 +310,14 @@ class Tool(abc.ABC):
         (typed parameters, docstring with param descriptions).
         The base class uses this method's signature to auto-generate
         the tool schema and to dispatch ``execute()`` calls.
+
+        Args:
+            **kwargs: Tool-specific keyword arguments parsed from the
+                model's JSON arguments payload.
+
+        Returns:
+            A string result that becomes the tool observation appended
+            to the rollout conversation.
         """
 
     @property
@@ -312,6 +325,11 @@ class Tool(abc.ABC):
         """Tool name, derived from the registry or class name.
 
         Override this property to provide a custom name.
+
+        Returns:
+            The registered tool name when the class is in
+            :data:`_TOOL_REGISTRY`, otherwise the lowercased class name
+            with a trailing ``"tool"`` suffix stripped.
         """
         for reg_name, cls in _TOOL_REGISTRY.items():
             if cls is type(self):
@@ -365,6 +383,10 @@ class Tool(abc.ABC):
 
         This is what gets passed to
         ``tokenizer.apply_chat_template(messages, tools=[tool.chat_schema, ...])``.
+
+        Returns:
+            The ``"function"`` payload of :meth:`schema`, ready for
+            chat-template tool injection.
         """
         return self.schema()["function"]
 
@@ -568,7 +590,11 @@ class BashTool(Tool):
 
 @register_tool("regex")
 class RegexTool(Tool):
-    """Regular expression search and extraction."""
+    """Regular expression search and extraction.
+
+    Wraps :func:`re.findall` so the agent can pull substrings or capture
+    groups out of arbitrary text without writing any code.
+    """
 
     def call(self, pattern: str, text: str) -> str:
         """Search text with a Python regular expression and return all matches as a JSON array. Uses re.findall(), so if the pattern contains capture groups, only the captured portions are returned. Supports the full Python regex syntax including lookaheads, named groups, etc.
@@ -587,7 +613,12 @@ class RegexTool(Tool):
 
 @register_tool("json_processor")
 class JSONProcessorTool(Tool):
-    """JSON parsing, querying, and inspection."""
+    """JSON parsing, querying, and inspection.
+
+    Exposes pretty-printing, key listing, and dotted-path querying via
+    a single ``operation`` switch so the agent can navigate structured
+    payloads it receives from other tools.
+    """
 
     def call(self, operation: str, data: str, path: str = "") -> str:
         """Process JSON data. Three operations are available: 'parse' validates and pretty-prints the JSON; 'query' extracts a nested value by dot-separated key path (use numeric indices for arrays, e.g. 'results.0.name'); 'keys' lists all top-level keys of a JSON object.
@@ -844,7 +875,12 @@ class UnitConverterTool(Tool):
 
 @register_tool("notepad")
 class NotepadTool(Tool):
-    """Persistent scratch-pad that survives across turns within an episode."""
+    """Persistent scratch-pad that survives across turns within an episode.
+
+    Holds a single text buffer mutable via ``write`` / ``append`` /
+    ``clear`` and readable via ``read`` so the agent can stash plans or
+    intermediate computations between turns without re-deriving them.
+    """
 
     def __init__(self):
         """Initialize the notepad with an empty buffer."""
@@ -893,15 +929,34 @@ class FunctionTool(Tool):
 
     @property
     def name(self) -> str:
-        """Return the configured tool name (overrides registry detection)."""
+        """Return the configured tool name (overrides registry detection).
+
+        Returns:
+            The ``tool_name`` set on construction.
+        """
         return self.tool_name
 
     def call(self, **kwargs: tp.Any) -> str:
-        """Delegate to the wrapped function."""
+        """Delegate to the wrapped function.
+
+        Args:
+            **kwargs: Keyword arguments forwarded verbatim to
+                ``self.func``.
+
+        Returns:
+            The string result produced by ``self.func``.
+        """
         return self.func(**kwargs)
 
     def execute(self, arguments: str) -> str:
-        """Parse JSON and call the wrapped function."""
+        """Parse JSON and call the wrapped function.
+
+        Args:
+            arguments: JSON-encoded argument string from the model.
+
+        Returns:
+            The string result produced by ``self.func``.
+        """
         try:
             parsed = json.loads(arguments)
             if not isinstance(parsed, dict):
@@ -912,7 +967,13 @@ class FunctionTool(Tool):
         return self.func(**parsed)
 
     def schema(self) -> dict[str, tp.Any]:
-        """Return schema from explicit override or auto-extract from ``func``."""
+        """Return schema from explicit override or auto-extract from ``func``.
+
+        Returns:
+            The explicit ``tool_schema`` when one was provided, otherwise
+            an OpenAI function-calling schema derived from ``func`` with
+            its name forced to :attr:`name`.
+        """
         if self.tool_schema is not None:
             return self.tool_schema
         result = function_to_json(self.func)

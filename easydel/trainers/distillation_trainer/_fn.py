@@ -67,7 +67,21 @@ def _constrain_distillation_input_batch(
     *,
     mesh: tp.Any,
 ) -> dict[str, tp.Any]:
-    """Constrain distillation batch inputs for the active mesh."""
+    """Apply a sharding constraint to every leaf of a distillation batch.
+
+    Wraps :func:`spectrax.with_sharding_constraint` with
+    ``ignore_mpmd=True`` so the constraint is a no-op when the trainer
+    is running under an MPMD scheduler that owns its own placement.
+
+    Args:
+        batch: Distillation input mapping.
+        partition_spec: Target partition spec; ``None`` is a no-op.
+        mesh: Active JAX/spectrax mesh.
+
+    Returns:
+        A new ``dict`` whose leaves are constrained to
+        ``partition_spec`` on ``mesh``.
+    """
     return tp.cast(
         dict[str, tp.Any],
         dict(with_sharding_constraint(batch, partition_spec, mesh=mesh, ignore_mpmd=True)),
@@ -75,7 +89,28 @@ def _constrain_distillation_input_batch(
 
 
 def _chunk_sequence_for_scan(value: Array, chunk_size: int, *, context: str) -> Array:
-    """Reshape ``(B, L, ...)`` to ``(chunks, B, chunk, ...)`` without losing layout."""
+    """Reshape ``(B, L, ...)`` to ``(chunks, B, chunk, ...)`` while preserving sharding.
+
+    Used by :func:`chunked_distillation_loss` to feed
+    sequence-chunked tensors into :func:`jax.lax.scan`. The function
+    propagates the input's :class:`~jax.sharding.NamedSharding`
+    through the reshape and the leading-axis transpose so that the
+    chunked tensor stays consistent with the rest of the mesh layout
+    (otherwise jax inserts implicit reshards that defeat the chunking
+    memory win).
+
+    Args:
+        value: Tensor shaped ``(batch, seq_len, ...)``. ``seq_len``
+            must be a multiple of ``chunk_size``.
+        chunk_size: Number of sequence positions per chunk.
+        context: Debug label used when constructing the propagated
+            ``NamedSharding`` (helpful for spectrax error messages).
+
+    Returns:
+        A tensor shaped
+        ``(n_chunks, batch, chunk_size, ...)`` ready to be scanned
+        over the leading axis.
+    """
     bsz, seq_len = value.shape[:2]
     n_chunks = seq_len // chunk_size
     source_sharding = getattr(value, "sharding", None)
@@ -141,11 +176,28 @@ def _per_token_xent(
 ) -> tuple[Array, Array]:
     """Compute per-token distillation cross-entropy and teacher entropy.
 
+    Computes
+    ``H(p_t, p_s) = -sum_v p_t(v) * log p_s(v)`` and
+    ``H(p_t) = -sum_v p_t(v) * log p_t(v)``
+    over the vocabulary axis for every token position, where
+    ``p_t`` / ``p_s`` are the temperature-softened teacher /
+    student distributions. The KL contribution at token ``i`` is
+    then ``H(p_t, p_s)_i - H(p_t)_i``.
+
     Teacher logits are processed first so their scaled intermediates can be
-    freed before student intermediates are materialised — peak vocab-sized
+    freed before student intermediates are materialised -- peak vocab-sized
     float32 tensors drops from 3x to 2x ``[..., V]``.
 
-    Returns ``(per_token_distill_xent, per_token_teacher_entropy)``.
+    Args:
+        teacher_logits: Teacher logits ``[..., vocab]``. Stop-gradient
+            is applied internally.
+        student_logits: Student logits ``[..., vocab]``.
+        temperature: Softmax temperature.
+        dtype: Output dtype for the per-token tensors.
+
+    Returns:
+        ``(per_token_distill_xent, per_token_teacher_entropy)``: two
+        tensors of shape ``[...]`` (i.e. without the vocab axis).
     """
     teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32) / temperature)
     teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True)
@@ -168,10 +220,31 @@ def _compute_kl_and_ce(
     temperature: float,
     dtype: jnp.dtype,
 ) -> tuple[Array, Array, Array, Array]:
-    """Per-token distillation sums for one chunk of logits.
+    """Reduce per-token KL/CE contributions over one chunk of logits.
 
-    Returns ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``,
-    where all values are scalar accumulators.
+    Wraps :func:`_per_token_xent` with mask-weighted summation and the
+    optional hard-label cross-entropy on the student logits. Returns
+    scalars so the caller (``jax.lax.scan`` in
+    :func:`chunked_distillation_loss`) can accumulate cheaply.
+
+    Args:
+        student_logits: Student logits ``[..., vocab]`` for the chunk.
+        teacher_logits: Teacher logits with the same shape (already
+            stop-gradient'd upstream).
+        mask: Per-token loss mask matching the leading axes of the
+            logits.
+        safe_labels: Integer labels with ``-100`` replaced by ``0``
+            (so the CE path is safe to gather even on masked
+            positions).
+        use_hard_labels: Whether to also accumulate the supervised
+            CE term against ``safe_labels``.
+        temperature: Softmax temperature forwarded to
+            :func:`_per_token_xent`.
+        dtype: Output dtype.
+
+    Returns:
+        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``;
+        ``ce_sum`` is zero when ``use_hard_labels`` is ``False``.
     """
     per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
         teacher_logits,
@@ -205,7 +278,33 @@ def _finalize_distillation_metrics(
     use_hard_labels: bool,
     dtype: jnp.dtype,
 ) -> tuple[Array, dict[str, Array]]:
-    """Normalise accumulated distillation/CE sums into final scalar metrics/loss."""
+    """Normalise accumulated distillation/CE sums into the final loss and metrics.
+
+    Divides the scan-accumulated sums by the total mask weight,
+    multiplies the distillation half by ``temperature**2`` (the
+    canonical Hinton rescaling), and mixes the soft-target term with
+    the supervised CE via ``alpha``.
+
+    Args:
+        distill_xent_sum: Accumulated masked sum of per-token
+            distillation cross-entropy.
+        teacher_entropy_sum: Accumulated masked sum of per-token
+            teacher entropy.
+        ce_sum: Accumulated masked sum of supervised CE
+            (``0`` when ``use_hard_labels`` is ``False``).
+        mask_sum: Total mask weight across all processed tokens.
+        temperature: Softmax temperature (used to rescale the KL term
+            by ``T^2``).
+        alpha: KL / CE mixing weight; ``1.0`` is pure distillation.
+        use_hard_labels: Whether the CE term should be folded into the
+            total loss.
+        dtype: Output dtype.
+
+    Returns:
+        ``(total_loss, metrics)`` where ``metrics`` is a dict carrying
+        ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
+        and ``ce_loss`` as scalar arrays.
+    """
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
     normalizer = jnp.maximum(mask_sum, jnp.ones((), dtype=dtype))
@@ -237,9 +336,28 @@ def _build_mask_and_labels(
     seq_len: int,
     batch_size: int,
 ) -> tuple[Array, Array, bool]:
-    """Build a combined per-token mask and safe labels array.
+    """Compose the per-token loss mask and produce a safe-label tensor.
 
-    Returns (mask, safe_labels, has_labels).
+    Priority for the base mask: ``loss_mask`` > ``attention_mask`` >
+    all-ones. When ``labels`` are provided, positions with
+    ``label == -100`` are zeroed out of the mask and the labels are
+    cloned with ``-100`` replaced by ``0`` so they remain safe to
+    gather even on masked positions.
+
+    Args:
+        attention_mask: Optional ``[batch, seq_len]`` padding mask.
+        loss_mask: Optional task-specific token mask (takes precedence
+            over ``attention_mask``).
+        labels: Optional integer label tensor.
+        dtype: Output dtype for the mask.
+        seq_len: Sequence length (used for the all-ones fallback).
+        batch_size: Batch size (used for the all-ones fallback).
+
+    Returns:
+        ``(mask, safe_labels, has_labels)``: combined per-token mask,
+        a label tensor safe for the CE gather (zeros where
+        ``has_labels`` is ``False``), and a Python bool indicating
+        whether labels were supplied.
     """
     if loss_mask is not None:
         mask = loss_mask.astype(dtype)
@@ -386,9 +504,9 @@ def chunked_distillation_loss(
 
     Instead of receiving pre-computed ``[B, L, V]`` logits, this function takes
     the last hidden states from both models and their lm_head projection
-    functions.  It processes the sequence in chunks of *chunk_size* tokens,
+    functions. It processes the sequence in chunks of ``chunk_size`` tokens,
     projecting each chunk to vocab logits on-the-fly and immediately reducing
-    to scalar KL / CE contributions.  Peak logit memory drops from
+    to scalar KL / CE contributions. Peak logit memory drops from
     ``O(B * L * V)`` to ``O(B * chunk_size * V)``.
 
     When ``checkpoint_chunks`` is ``True`` (default) the per-chunk body is
@@ -401,6 +519,40 @@ def chunked_distillation_loss(
     ``distill_xent_loss = E_t[-log p_s] * T^2``,
     ``teacher_entropy_loss = E_t[-log p_t] * T^2``,
     ``kl_loss = distill_xent_loss - teacher_entropy_loss``.
+
+    Args:
+        student_hidden: Student last-layer hidden states
+            ``[B, L, hidden_dim]``.
+        teacher_hidden: Teacher last-layer hidden states with the
+            same shape (already stop-gradient'd by the caller).
+        student_lm_head_fn: Callable projecting student hidden states
+            to vocab logits.
+        teacher_lm_head_fn: Callable projecting teacher hidden states
+            to vocab logits.
+        attention_mask: Optional ``[B, L]`` padding mask.
+        loss_mask: Optional ``[B, L]`` task-specific token mask
+            (takes precedence over ``attention_mask`` for masking).
+        labels: Optional ``[B, L]`` integer labels for the supervised
+            CE term.
+        use_hard_labels: Whether to fold the supervised CE term into
+            the total loss (gated additionally by ``labels`` being
+            non-``None``).
+        temperature: Softmax temperature.
+        alpha: KL / CE mixing weight.
+        chunk_size: Number of sequence positions per scan iteration.
+        checkpoint_chunks: When ``True``, ``jax.checkpoint`` the
+            per-chunk body so vocab-sized logits are recomputed in
+            the backward pass.
+        hidden_partition_spec: Optional sharding spec applied to the
+            hidden-state slice before the LM-head projection (used to
+            pin the slice to the LM-head's mesh).
+        hidden_shard_stage: Optional MPMD stage rank used with the
+            hidden-state sharding constraint.
+
+    Returns:
+        ``(total_loss, metrics)`` where ``metrics`` is a dict with
+        ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
+        and ``ce_loss``.
     """
     dtype = student_hidden.dtype
     B, L = student_hidden.shape[:2]
@@ -606,6 +758,10 @@ def _normalize_attention(tensor: jax.Array) -> jax.Array:
 
 def _stop_gradient_tree(tree):
     """Apply :func:`jax.lax.stop_gradient` to every JAX array leaf.
+
+    Used to detach the teacher forward outputs from the autograd
+    graph before they enter the student loss. Python leaves are left
+    untouched so model output objects with non-array members survive.
 
     Args:
         tree: Pytree of JAX-array and Python-leaf mixed values.

@@ -267,6 +267,16 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to pin memory for the dataloader."},
     )
+    dataloader_prefetch: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to overlap trainer-level batch fetching and collation with the current "
+                "compiled train step using a single host worker. JAX preprocessing and execution "
+                "remain on the main training thread."
+            )
+        },
+    )
     do_eval: bool = field(
         default=False,
         metadata={"help": "Whether to run evaluation during training."},

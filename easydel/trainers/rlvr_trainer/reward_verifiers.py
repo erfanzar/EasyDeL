@@ -104,9 +104,11 @@ class MathVerifier:
     The gold answer is read from ``batch["answer"]`` which should
     contain the GSM8K-style answer string (ending with ``#### <num>``).
 
-    Args:
-        answer_key: Key in the batch dict containing gold answers.
-        tolerance: Absolute tolerance for numeric comparison.
+    Attributes:
+        _answer_key (str): Key in the batch dict carrying the gold
+            answer column.
+        _tolerance (float): Absolute tolerance used when comparing the
+            predicted and gold numeric values.
     """
 
     def __init__(self, answer_key: str = "answer", tolerance: float = 1e-6):
@@ -217,9 +219,10 @@ class CodeVerifier:
     The verifier looks for code inside markdown code blocks
     (`` ```python ... ``` ``) or ``<code>...</code>`` tags.
 
-    Args:
-        timeout: Maximum execution time per test case in seconds.
-        test_key: Key in the batch dict containing test case strings.
+    Attributes:
+        _timeout (float): Hard time budget (seconds) per test case.
+        _test_key (str): Key in the batch dict carrying the test source
+            column.
     """
 
     def __init__(self, timeout: float = 10.0, test_key: str = "tests"):
@@ -372,10 +375,11 @@ class FormatVerifier:
     Useful for enforcing output formats like ``\\boxed{}``,
     JSON output, or specific answer templates.
 
-    Args:
-        pattern: Regex pattern the completion must match.
-        require_full_match: If True, the entire completion must
-            match. If False (default), a partial match suffices.
+    Attributes:
+        _pattern (re.Pattern[str]): Compiled regex pattern (with
+            ``re.DOTALL``).
+        _full (bool): When True, require ``fullmatch`` instead of
+            ``search`` when scoring.
     """
 
     def __init__(self, pattern: str, require_full_match: bool = False):
@@ -426,10 +430,13 @@ class LengthPenaltyVerifier:
     The reward is ``max(0, 1 - |len - target| / target)``, giving
     1.0 at the target length and decaying linearly to 0.
 
-    Args:
-        target_length: Ideal completion length in characters.
-        min_length: Minimum length; completions shorter get 0.0.
-        max_length: Maximum length; completions longer get 0.0.
+    Attributes:
+        _target (int): Ideal completion length (characters); produces
+            reward 1.0 when ``len(text) == target``.
+        _min (int): Lower bound; completions shorter than this receive
+            ``0.0``.
+        _max (int): Upper bound; completions longer than this receive
+            ``0.0``.
     """
 
     def __init__(

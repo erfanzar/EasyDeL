@@ -412,9 +412,9 @@ def _collate_batch(
     )
     for i, example in enumerate(examples):
         if processing_class.padding_side == "right":
-            result[i, : example.shape[0]] = example
+            result = result.at[i, : example.shape[0]].set(example)
         else:
-            result[i, -example.shape[0] :] = example
+            result = result.at[i, -example.shape[0] :].set(example)
     return result
 
 
@@ -448,7 +448,23 @@ def _attach_tools_sidechannel(
     batch: dict[str, tp.Any],
     features: list[dict[str, tp.Any]] | dict[str, tp.Any],
 ) -> dict[str, tp.Any]:
-    """Preserve per-example tool schemas through collation when present."""
+    """Preserve per-example tool schemas through collation when present.
+
+    The data collators only stack tensor-typed columns; tool schemas are
+    Python lists that should still reach the trainer step (for chat
+    template rendering or reward computation). This helper copies the
+    ``tools`` column from raw features into ``batch`` so it survives the
+    collation pass.
+
+    Args:
+        batch: The output batch dict being assembled by a data collator.
+        features: Either a list of per-example feature dicts (TFDS
+            collators) or a single Grain-style feature dict.
+
+    Returns:
+        ``batch``, with a ``tools`` key added when at least one feature
+        carries non-``None`` tool schemas.
+    """
 
     if isinstance(features, dict):
         tools = features.get("tools")
@@ -601,7 +617,23 @@ class DataCollatorForCompletionOnlyLM:
         return mask_labels
 
     def jax_mask_tokens(self, inputs: tp.Any, special_tokens_mask: tp.Any | None = None) -> tuple[tp.Any, tp.Any]:
-        """Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original."""
+        """Prepare masked tokens inputs/labels for masked language modeling.
+
+        Applies the BERT-style MLM masking recipe: ~15% of non-special
+        positions are selected, of which 80% are replaced with the
+        ``[MASK]`` token, 10% are replaced with a random vocab token,
+        and the remaining 10% are left unchanged. Non-selected positions
+        receive label ``-100`` so they do not contribute to the loss.
+
+        Args:
+            inputs: NumPy-like batch of token ids (mutated in-place).
+            special_tokens_mask: Optional boolean mask flagging positions
+                that must never be masked (specials). When ``None``,
+                derived from the tokenizer.
+
+        Returns:
+            A ``(inputs, labels)`` tuple with masking applied.
+        """
         labels = np.copy(inputs)
         probability_matrix = np.full(labels.shape, 0.15)
         if special_tokens_mask is None:
@@ -1386,7 +1418,16 @@ class _BCODataCollatorMixin:
         return pad(arrays, self.max_completion_length, padding_value=padding_value, padding_side="right")
 
     def _pad_full_sequence(self, arrays: list[np.ndarray], padding_value: int, side: str = "right") -> jnp.ndarray:
-        """Pad full sequence (prompt + completion) to max_length."""
+        """Pad a full prompt+completion sequence batch to ``max_length``.
+
+        Args:
+            arrays: List of 1-D token id / mask / label arrays.
+            padding_value: Value used for padding shorter sequences.
+            side: ``"left"`` or ``"right"`` (default ``"right"``).
+
+        Returns:
+            A batched JAX array of shape ``(len(arrays), max_length)``.
+        """
         return pad(arrays, self.max_length, padding_value=padding_value, padding_side=side)
 
     def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:

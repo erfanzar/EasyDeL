@@ -69,6 +69,22 @@ class SeqKDTrainer(Trainer):
         3. Build training batch with teacher completions as labels
         4. Student trains with standard CE loss (same as SFT)
 
+    Attributes:
+        arguments (SeqKDConfig): Resolved SeqKD configuration carried
+            from initialisation.
+        teacher_state (EasyDeLState | None): In-process teacher state
+            used when generation runs locally; ``None`` for the
+            external-callable mode.
+        teacher_fn (Callable[[list[str]], list[str]] | None): External
+            teacher callable mapping a list of prompt strings to a list
+            of completion strings; ``None`` when ``teacher_state`` is
+            used instead.
+        processing_class (ProcessingClassType): Tokenizer / processor
+            used for prompt encoding and (for the callable teacher
+            mode) decoding/re-encoding of completions.
+        padding_value (int): Pad token id used by the collators; falls
+            back to ``0`` when the tokenizer exposes no pad token.
+
     Example:
         >>> config = SeqKDConfig(
         ...     max_prompt_length=512,

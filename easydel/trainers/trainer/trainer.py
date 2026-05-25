@@ -32,6 +32,7 @@ and multimodal architectures.
 """
 
 import collections.abc
+import concurrent.futures
 import typing as tp
 
 import jax
@@ -50,6 +51,135 @@ from ..training_utils import compile_trainer_step, resolve_straight_through_emul
 from ._fn import evaluation_step, training_step
 
 logger = get_logger(__name__)
+
+
+class _TrainBatchPrefetcher:
+    """One-batch lookahead for host-side dataloader fetch and collation.
+
+    Hides the latency of fetching and collating the *next* training
+    batch by running it on a background thread while the device is busy
+    with the current step. Maintains a single pending future at a time
+    so memory usage stays bounded; callers explicitly opt in to
+    scheduling the next batch via ``schedule_next``.
+
+    Attributes:
+        _trainer: Owning :class:`Trainer` (used to call
+            ``_get_next_batch``).
+        _data_iter: Active dataloader iterator; replaced after each
+            successful fetch so the iterator can advance.
+        _dataloader: Source dataloader (Grain or TFDS), kept for
+            iterator re-creation when an iterator is exhausted.
+        _data_collator: Callable applied to the raw batch before
+            returning it to the trainer.
+        _executor: Single-worker thread pool that runs ``_load``.
+        _future: Pending fetch future or ``None`` between submissions.
+        _closed: Sticky flag that suppresses further submissions after
+            :meth:`close` is called.
+    """
+
+    def __init__(
+        self,
+        trainer: "Trainer",
+        data_iter: collections.abc.Iterator[tp.Any],
+        dataloader: collections.abc.Iterable[tp.Any],
+        data_collator: tp.Callable[[tp.Any], tp.Any],
+    ) -> None:
+        """Initialize the prefetcher and submit the first fetch.
+
+        Args:
+            trainer: Owning :class:`Trainer` instance.
+            data_iter: Active dataloader iterator to read the next batch
+                from.
+            dataloader: Source dataloader; used to re-create the
+                iterator when needed.
+            data_collator: Callable applied to each raw batch to produce
+                the collated batch returned by :meth:`next`.
+        """
+        self._trainer = trainer
+        self._data_iter = data_iter
+        self._dataloader = dataloader
+        self._data_collator = data_collator
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="easydel-train-batch-prefetch",
+        )
+        self._future: concurrent.futures.Future[tuple[tp.Any, collections.abc.Iterator[tp.Any], float]] | None = None
+        self._closed = False
+        self._submit()
+
+    def _load(
+        self,
+        data_iter: collections.abc.Iterator[tp.Any],
+    ) -> tuple[tp.Any, collections.abc.Iterator[tp.Any], float]:
+        """Fetch and collate one batch on the background thread.
+
+        Args:
+            data_iter: Iterator to pull the next batch from.
+
+        Returns:
+            Tuple ``(batch, data_iter, elapsed_seconds)`` containing the
+            collated batch, the (possibly updated) iterator, and the
+            wall time of the fetch + collate.
+        """
+        with capture_time() as data_collection_time:
+            batch, data_iter = self._trainer._get_next_batch(data_iter, self._dataloader)
+            batch = self._data_collator(batch)
+        return batch, data_iter, float(data_collection_time())
+
+    def _submit(self) -> None:
+        """Submit a new fetch future if the prefetcher is still open."""
+        if self._closed:
+            return
+        self._future = self._executor.submit(self._load, self._data_iter)
+
+    def next(self, *, schedule_next: bool) -> tuple[tp.Any, float, float]:
+        """Return the prefetched batch, optionally scheduling the next fetch.
+
+        Args:
+            schedule_next: When ``True``, submit a new fetch future
+                immediately after retrieving the current one so the
+                next call overlaps with device work.
+
+        Returns:
+            Tuple ``(batch, wait_seconds, data_time)`` where
+            ``wait_seconds`` is the wall time spent blocking on the
+            future result and ``data_time`` is the producer-side time
+            spent inside :meth:`_load`.
+
+        Raises:
+            RuntimeError: If the prefetcher has been closed before a
+                batch was made available.
+        """
+        if self._future is None:
+            self._submit()
+        if self._future is None:
+            raise RuntimeError("Batch prefetcher was closed before a batch was available.")
+
+        with capture_time() as wait_time:
+            batch, self._data_iter, data_time = self._future.result()
+        wait_seconds = float(wait_time())
+        self._future = None
+        if schedule_next:
+            self._submit()
+        return batch, wait_seconds, data_time
+
+    @property
+    def data_iter(self) -> collections.abc.Iterator[tp.Any]:
+        """The current dataloader iterator (advanced after each fetch)."""
+        return self._data_iter
+
+    def close(self) -> None:
+        """Cancel any pending fetch and shut down the background executor.
+
+        Idempotent; subsequent calls are no-ops. The captured iterator
+        remains accessible through :attr:`data_iter` so callers can
+        resume reading from it after closing the prefetcher.
+        """
+        self._closed = True
+        if self._future is not None:
+            self._future.cancel()
+            self._future = None
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 @Registry.register("trainer", "base")
@@ -340,21 +470,8 @@ class Trainer(BaseTrainer):
     ):
         """Execute the main training loop across all epochs.
 
-        Coordinates training epochs, evaluation runs, and checkpointing.
-        Handles early stopping and training interruptions.
+        Orchestrates the entire training process, managing:
 
-        Args:
-            state: Current model state.
-            metrics_tracker: Tracker for training metrics.
-            step_metrics: Metrics for individual training steps.
-
-        Returns:
-            Final model state after training.
-        """
-        """
-        Execute the main training loop across all epochs.
-
-        This method orchestrates the entire training process, managing:
         - Epoch iteration with proper resumption handling
         - Progress tracking and reporting
         - Batch processing and gradient updates
@@ -366,19 +483,20 @@ class Trainer(BaseTrainer):
         count and continues from the correct point inside the current epoch.
 
         Args:
-            state: Initial model state with parameters and optimizer state
-            metrics_tracker: Accumulates metrics across training steps
-            step_metrics: Calculates per-step metrics like throughput
+            state: Initial model state with parameters and optimizer state.
+            metrics_tracker: Accumulates metrics across training steps.
+            step_metrics: Calculates per-step metrics like throughput.
 
         Returns:
-            tuple: (TrainerOutput, exception) where:
-                - TrainerOutput contains final state and checkpoint info
-                - exception is any error that caused training to stop
+            tuple: ``(TrainerOutput, exception)`` where ``TrainerOutput``
+            contains final state and checkpoint info and ``exception``
+            is any error that caused training to stop (``None`` on
+            normal completion).
 
         Note:
-            - Progress bar is disabled on non-primary processes by default
-            - Training can be interrupted with Ctrl+C and will save state
-            - Automatic resumption updates the progress bar to show continuation
+            - Progress bar is disabled on non-primary processes by default.
+            - Training can be interrupted with Ctrl+C and will save state.
+            - Automatic resumption updates the progress bar to show continuation.
         """
         disabled = False
         if jax.process_index() != 0 and not self.arguments.log_all_workers:
@@ -473,28 +591,20 @@ class Trainer(BaseTrainer):
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
     ):
-        """Run evaluation on the validation dataset.
+        """Run the core evaluation loop on the validation dataset.
 
-        Performs a complete evaluation pass and logs metrics.
-
-        Args:
-            state: Current model state.
-            metrics_tracker: Tracker for evaluation metrics.
-            step_metrics: Metrics for individual evaluation steps.
-        """
-        """
-        Implements the core evaluation loop.
-
-        Iterates over the evaluation dataset, performing evaluation steps, updating metrics, and yielding metrics
-        for each evaluation step. A progress bar is used to indicate evaluation progress.
+        Iterates over the evaluation dataset, performs evaluation steps,
+        updates metrics, and yields metrics for each step. A progress
+        bar is used to indicate evaluation progress.
 
         Args:
-            state (EasyDeLState): The model state used for evaluation.
-            metrics_tracker (MetricsTracker): Tracker for accumulating evaluation metrics.
-            step_metrics (StepMetrics): Object to calculate metrics per evaluation step.
+            state: The model state used for evaluation.
+            metrics_tracker: Tracker for accumulating evaluation metrics.
+            step_metrics: Object to calculate metrics per evaluation step.
 
         Yields:
-            dict: A dictionary containing evaluation metrics for each step.
+            dict: A dictionary of evaluation metrics for each evaluation
+            step.
         """
         disabled = False
         if jax.process_index() != 0 and not self.arguments.log_all_workers:
@@ -531,58 +641,48 @@ class Trainer(BaseTrainer):
         epoch_start_step: int | None = None,
         epoch_end_step: int | None = None,
     ):
-        """Execute a single training epoch.
+        """Execute training for a single epoch.
 
-        Processes all training batches, computes gradients, updates model parameters,
-        and tracks metrics throughout the epoch.
+        Processes batches within an epoch, handling:
+
+        - Batch fetching and collation (with optional host-side prefetch).
+        - Forward and backward passes.
+        - Gradient accumulation if configured.
+        - Metrics computation and logging.
+        - Checkpoint saving at specified intervals.
+        - Optional evaluation during training.
+        - Training hooks for customization.
+
+        Robust error handling lets training be gracefully interrupted
+        (Ctrl+C, timeout, TPU preemption) and the current state /
+        iterator are returned so the caller can persist them.
 
         Args:
-            state: Current model state.
-            train_dataset: Training dataset.
+            state: Current model state with parameters and optimizer.
+            train_dataset: Training data source (dataset or dataloader).
             train_iter: Iterator over training batches.
-            metrics_tracker: Tracker for training metrics.
-            step_metrics: Metrics for individual training steps.
-            pbar: Progress bar for tracking progress.
-            epoch: Current epoch number.
+            metrics_tracker: Accumulates loss and accuracy metrics.
+            step_metrics: Computes per-step performance metrics.
+            pbar: Progress bar for visual feedback.
+            epoch: Current epoch number (0-indexed).
+            epoch_start_step: Optional pre-computed global step at which
+                this epoch starts; falls back to
+                :meth:`_get_epoch_step_bounds` when omitted.
+            epoch_end_step: Optional pre-computed global step at which
+                this epoch ends.
 
         Returns:
-            Updated model state after the epoch.
-        """
-        """
-        Execute training for a single epoch.
-
-        This method processes batches within an epoch, handling:
-        - Batch fetching and collation
-        - Forward and backward passes
-        - Gradient accumulation if configured
-        - Metrics computation and logging
-        - Checkpoint saving at specified intervals
-        - Optional evaluation during training
-        - Training hooks for customization
-
-        The method includes robust error handling to gracefully handle
-        interruptions and save state before exiting.
-
-        Args:
-            state: Current model state with parameters and optimizer
-            train_dataset: Training data source (dataset or dataloader)
-            train_iter: Iterator over training batches
-            metrics_tracker: Accumulates loss and accuracy metrics
-            step_metrics: Computes per-step performance metrics
-            pbar: Progress bar for visual feedback
-            epoch: Current epoch number (0-indexed)
-
-        Returns:
-            tuple: (updated_state, exception, iterator) where:
-                - updated_state: Model state after the epoch
-                - exception: Any exception that interrupted training
-                - iterator: Updated batch iterator for next epoch
+            tuple: ``(updated_state, exception, iterator)`` where
+            ``updated_state`` is the model state after the epoch,
+            ``exception`` is any exception that interrupted training
+            (``None`` on normal completion), and ``iterator`` is the
+            updated batch iterator to use for the next epoch.
 
         Note:
-            - Implements on_step_start and on_step_end hooks
-            - Applies training hooks for loss validation
-            - Saves checkpoints based on save_steps configuration
-            - Runs evaluation based on evaluation_steps configuration
+            - Implements ``on_step_start`` and ``on_step_end`` hooks.
+            - Applies training hooks for loss validation.
+            - Saves checkpoints based on ``save_steps`` configuration.
+            - Runs evaluation based on ``evaluation_steps`` configuration.
         """
         data_collator = self.data_collator
         if data_collator is None:
@@ -611,6 +711,24 @@ class Trainer(BaseTrainer):
             epoch_end_step=epoch_end_step,
             epoch_total_steps=epoch_total_steps,
         )
+        prefetcher: _TrainBatchPrefetcher | None = None
+
+        def close_prefetcher() -> collections.abc.Iterator[tp.Any]:
+            nonlocal prefetcher, train_iter
+            if prefetcher is not None:
+                train_iter = prefetcher.data_iter
+                prefetcher.close()
+                prefetcher = None
+            return train_iter
+
+        if bool(getattr(self.arguments, "dataloader_prefetch", False)):
+            prefetcher = _TrainBatchPrefetcher(
+                trainer=self,
+                data_iter=train_iter,
+                dataloader=train_dataset,
+                data_collator=data_collator,
+            )
+            self._runtime_trace("train_epoch.prefetch.enabled", epoch=epoch, buffer_size=1)
 
         while True:
             with capture_time() as iteration_time:
@@ -626,21 +744,44 @@ class Trainer(BaseTrainer):
                     break
                 try:
                     self._runtime_trace("train_step.batch_fetch.begin", epoch=epoch, current_step=current_step)
+                    prefetch_wait_time: float | None = None
+                    prefetch_producer_time: float | None = None
                     with capture_time() as data_collection_time:
-                        batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                        self._runtime_trace(
-                            "train_step.batch_fetch.end",
-                            epoch=epoch,
-                            current_step=current_step,
-                            batch=self._runtime_batch_summary(batch),
-                        )
-                        self._runtime_trace("train_step.collate.begin", epoch=epoch, current_step=current_step)
-                        batch = data_collator(batch)
+                        if prefetcher is None:
+                            batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                            self._runtime_trace(
+                                "train_step.batch_fetch.end",
+                                epoch=epoch,
+                                current_step=current_step,
+                                batch=self._runtime_batch_summary(batch),
+                                prefetch=False,
+                            )
+                            self._runtime_trace("train_step.collate.begin", epoch=epoch, current_step=current_step)
+                            batch = data_collator(batch)
+                        else:
+                            schedule_next = (
+                                current_step + 1 < self.max_training_steps and current_step + 1 < epoch_end_step
+                            )
+                            batch, prefetch_wait_time, prefetch_producer_time = prefetcher.next(
+                                schedule_next=schedule_next
+                            )
+                            train_iter = prefetcher.data_iter
+                            self._runtime_trace(
+                                "train_step.batch_fetch.end",
+                                epoch=epoch,
+                                current_step=current_step,
+                                batch=self._runtime_batch_summary(batch),
+                                prefetch=True,
+                                prefetch_wait_time=prefetch_wait_time,
+                                prefetch_producer_time=prefetch_producer_time,
+                                prefetch_next_scheduled=schedule_next,
+                            )
                         self._runtime_trace(
                             "train_step.collate.end",
                             epoch=epoch,
                             current_step=current_step,
                             batch=self._runtime_batch_summary(batch),
+                            prefetch=prefetcher is not None,
                         )
                     step_metrics.start_step()
                     self._runtime_trace("train_step.on_step_start.begin", epoch=epoch, current_step=current_step)
@@ -654,7 +795,7 @@ class Trainer(BaseTrainer):
                         exc_type=type(exc).__name__,
                         exc=str(exc),
                     )
-                    return state, exc, train_iter
+                    return state, exc, close_prefetcher()
 
                 # Execute training step
                 self._runtime_trace("train_step.execute.begin", epoch=epoch, current_step=current_step)
@@ -678,7 +819,7 @@ class Trainer(BaseTrainer):
                         exc_type=type(run_exception).__name__,
                         exc=str(run_exception),
                     )
-                    return state, run_exception, train_iter
+                    return state, run_exception, close_prefetcher()
                 # Start the JAX profiler once step 1 has fully completed.
                 # The first step's wall-time is dominated by JIT compile;
                 # skipping it gives a profile of steady-state training.
@@ -708,6 +849,10 @@ class Trainer(BaseTrainer):
                         mode="train",
                     )
                     train_metrics["performance/data_collection_time"] = float(data_collection_time())
+                    if prefetch_wait_time is not None:
+                        train_metrics["performance/data_prefetch_wait_time"] = float(prefetch_wait_time)
+                    if prefetch_producer_time is not None:
+                        train_metrics["performance/data_prefetch_producer_time"] = float(prefetch_producer_time)
                     train_step_time = train_metrics.get("performance/train_step_time")
                     if train_step_time is not None:
                         remaining_steps = max(self.max_training_steps - current_step, 0)
@@ -732,7 +877,7 @@ class Trainer(BaseTrainer):
                                 f"TPU preemption sync point reached at step {current_step}. Saving coordinated checkpoint."
                             )
                         self._save_tpu_preemption_checkpoint(state=state, step=current_step)
-                        return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), train_iter
+                        return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), close_prefetcher()
                     with capture_time() as weight_distribution_time:
                         self.log_weight_distribution(state=state, step=current_step)
                     with capture_time() as watchers_time:
@@ -787,7 +932,7 @@ class Trainer(BaseTrainer):
                         exc_type=type(exc).__name__,
                         exc=str(exc),
                     )
-                    return state, exc, train_iter
+                    return state, exc, close_prefetcher()
                 except TypeError as exc:
                     self._runtime_trace(
                         "train_step.host_metrics.type_error",
@@ -796,9 +941,10 @@ class Trainer(BaseTrainer):
                         exc_type=type(exc).__name__,
                         exc=str(exc),
                     )
-                    return state, exc, train_iter
+                    return state, exc, close_prefetcher()
                 if run_exception is not None:
                     break
+        close_prefetcher()
         self._runtime_trace(
             "train_epoch.end",
             epoch=epoch,
@@ -818,35 +964,28 @@ class Trainer(BaseTrainer):
     ):
         """Execute a single evaluation epoch.
 
-        Processes all evaluation batches without updating model parameters,
-        collecting metrics for model performance assessment.
+        Iterates over the evaluation dataset, processes each batch
+        through the compiled evaluation step, updates and logs metrics,
+        and yields the per-step evaluation metrics. Does not update
+        model parameters.
 
         Args:
-            state: Current model state.
-            eval_dataset: Evaluation dataset.
+            state: The model state used for evaluation.
+            eval_dataset: The evaluation dataset (or an iterator over
+                it).
             eval_iter: Iterator over evaluation batches.
-            metrics_tracker: Tracker for evaluation metrics.
-            step_metrics: Metrics for individual evaluation steps.
-            pbar: Progress bar for tracking progress.
-
-        Returns:
-            Unchanged model state (evaluation doesn't modify parameters).
-        """
-        """
-        Performs evaluation over one epoch.
-
-        Iterates over the evaluation dataset, processes each batch through the evaluation step,
-        updates and logs metrics, and yields the evaluation metrics.
-
-        Args:
-            state (EasyDeLState): The model state used for evaluation.
-            eval_dataset: The evaluation dataset (or an iterator over it).
-            metrics_tracker (MetricsTracker): Tracker for accumulating evaluation metrics.
-            step_metrics (StepMetrics): Object to calculate step-level metrics.
-            pbar (BaseProgressBar): Progress bar instance for displaying evaluation progress.
+            metrics_tracker: Tracker for accumulating evaluation
+                metrics.
+            step_metrics: Object to calculate step-level metrics.
+            pbar: Progress bar instance for displaying evaluation
+                progress.
 
         Yields:
-            dict: A dictionary of evaluation metrics for each evaluation step.
+            dict: A dictionary of evaluation metrics for each evaluation
+            step.
+
+        Raises:
+            ValueError: If ``eval_dataset`` is ``None``.
         """
         if eval_dataset is None:
             raise ValueError("Make sure to pass eval dataset to trainer or set `do_eval` to `False`.")

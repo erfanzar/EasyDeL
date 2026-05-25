@@ -80,34 +80,58 @@ def on_policy_distillation_step(
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
     logits_chunk_size: int | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """Training/evaluation step for on-policy distillation.
+    """Run one on-policy distillation step (forward, KL loss, optional update).
 
-    This step function receives a batch containing prompt+completion sequences
-    (generated outside the gradient computation) and computes the KL divergence
-    distillation loss between teacher and student on the generated tokens.
+    Wraps the teacher forward in a hard rematerialisation barrier (no
+    residuals saved, no CSE across the boundary, all outputs detached) so
+    the teacher's intermediates can be freed as soon as their last
+    consumer is done; the student forward then runs through the
+    differentiable parameter tree. The KL distillation loss is masked to
+    the ``completion_mask`` so only the *generated* tokens contribute,
+    matching the on-policy distribution. In training mode the function
+    runs gradient accumulation via :func:`minibatch_call` and applies the
+    optimizer update; in eval mode it returns metrics only.
 
     The batch is expected to contain:
-        - input_ids: Full sequences (prompt + completion). [B, L]
-        - attention_mask: Mask for the full sequences. [B, L]
-        - completion_mask: Mask indicating which tokens are generated completions. [B, L]
+
+    * ``input_ids``: full prompt + completion sequences, shape ``[B, L]``.
+    * ``attention_mask``: mask covering the full sequences, shape
+      ``[B, L]``.
+    * ``completion_mask``: 1s at positions corresponding to generated
+      tokens, 0s elsewhere; shape ``[B, L]``.
 
     Args:
-        student_state: Current student model state.
-        batch: Batch of generated sequences with masks.
-        teacher_state: Frozen teacher model state.
-        loss_config: Optional loss configuration.
-        learning_rate_fn: Learning rate schedule function.
-        partition_spec: Sharding specification for the batch.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
-        is_training: Whether this is a training step (True) or eval (False).
-        temperature: Temperature for softening distributions in KL loss.
-        alpha: Weight for distillation loss (1.0 = pure distillation).
-        straight_through_emulator: Optional quantization emulator.
-        logits_chunk_size: If set, compute loss in chunks to save memory.
+        student_state (EasyDeLState): Current student model state.
+        batch (collections.abc.Mapping[str, jax.Array]): Batch of generated
+            sequences with masks (see above).
+        teacher_state (EasyDeLState): Frozen teacher model state.
+        loss_config (LossConfig | None): Optional loss configuration
+            consumed by :func:`update_state_respectfully`.
+        learning_rate_fn (optax.Schedule): Learning-rate schedule used
+            for metric reporting.
+        partition_spec (PartitionSpec | None): Sharding specification
+            applied to the input batch.
+        gradient_accumulation_steps (int): Number of microbatches whose
+            gradients are accumulated per optimizer step. Defaults to
+            ``1``.
+        is_training (bool): When ``True`` differentiate and update; when
+            ``False`` only compute eval metrics. Defaults to ``True``.
+        temperature (float): Temperature used to soften logits in the KL
+            term. Defaults to ``4.0``.
+        alpha (float): Weight applied to the distillation loss
+            (``1.0`` = pure distillation). Defaults to ``0.9``.
+        straight_through_emulator (tp.Callable | None): Optional STE
+            wrapper applied to the parameter tree to simulate quantised
+            forward passes during training.
+        logits_chunk_size (int | None): When positive, evaluate the
+            distillation loss in vocabulary chunks driven by the
+            (headless) student LM head to bound peak memory; ``None``
+            disables chunking.
 
     Returns:
-        If training: (updated_state, metrics)
-        If evaluation: metrics
+        tuple[EasyDeLState, LossMetrics] | LossMetrics: In training mode
+        returns ``(updated_student_state, metrics)``; in eval mode
+        returns only :class:`LossMetrics`.
     """
     scope_root = "easydel/trainer/on_policy_distillation/" + ("train_step" if is_training else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):

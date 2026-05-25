@@ -73,13 +73,61 @@ def concatenated_forward(
     loss_type: LOSS_TYPES = "sigmoid",
     logprob_vocab_chunk_size: int | None = None,
 ) -> dict[str, jax.Array]:
-    """Runs the policy model on concatenated chosen/rejected sequences.
+    """Run the policy on concatenated chosen/rejected sequences.
 
-    This mirrors the behaviour of TRL's CPO forward helper while leveraging the
-    JAX-specific utilities already used by the DPO trainer. We concatenate the
-    chosen and rejected completions to share a single forward pass, compute
-    per-token log-probabilities and expose additional statistics required by the
-    CPO objective (raw log-prob sums and token lengths).
+    Mirrors TRL's CPO forward helper while leveraging the JAX
+    utilities used by the DPO trainer. The chosen and rejected
+    completions are stacked into the leading batch dimension so the
+    model sees one tensor and a single forward pass produces both
+    halves; per-token log-probabilities are then gathered, masked to
+    the completion span, and aggregated under ``loss_type``'s scaling
+    convention (length-averaged for IPO/SimPO, raw sums otherwise).
+
+    Branches on architecture:
+
+    - **Encoder-decoder**: prompt feeds the encoder, completion as
+      decoder labels.  The full ``[batch, completion_len]`` logits are
+      kept and the loss mask is the completion attention mask.
+    - **Causal LM**: prompt + completion are concatenated then
+      :func:`apply_paired_truncation` is applied. When the model
+      exposes a positive ``lmhead_chunksize`` the forward runs with
+      ``apply_lm_head=False`` and per-sequence scores are gathered via
+      :func:`compute_sequence_scores_from_hidden_states` to bound
+      vocab-axis memory; otherwise the dense path through
+      :func:`compute_token_logps_and_entropies_chunked` is used.
+
+    Args:
+        model: Policy model exposing the EasyDeL forward interface.
+        batch: Preference batch with ``prompt_*`` / ``completion_*``
+            tensors and any multimodal keys.
+        is_encoder_decoder: Selects the encoder-decoder branch when
+            ``True``.
+        label_pad_token_id: Token id used to mask non-completion
+            positions in the encoder-decoder branch.
+        padding_value: Padding token id forwarded to
+            :func:`concatenated_inputs`.
+        max_length: Maximum total sequence length used by the causal LM
+            branch's truncation.
+        truncation_mode: ``"keep_end"`` or ``"keep_start"`` truncation
+            policy.
+        aux_loss_enabled: When ``True``, forward the model's auxiliary
+            (router) loss under the ``aux_loss`` key.
+        vocab_shard_stage: Optional terminal-stage rank used by
+            :func:`compute_sequence_scores_from_hidden_states` for MPMD
+            vocabulary sharding.
+        loss_type: Selects whether ``scaled_logps`` are length-averaged
+            (``"ipo"``, ``"simpo"``) or kept as raw sums.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for
+            :func:`compute_token_logps_and_entropies_chunked`. ``None``
+            disables chunking.
+
+    Returns:
+        Dict carrying ``chosen_logps`` and ``rejected_logps`` (the
+        ``loss_type``-aware aggregates), the raw summed logps under
+        ``chosen_logps_raw`` / ``rejected_logps_raw``, per-example
+        token counts under ``chosen_lengths`` / ``rejected_lengths``,
+        the chosen / rejected mean logits for diagnostics, and
+        optionally ``aux_loss``.
     """
 
     num_examples = batch["prompt_input_ids"].shape[0]

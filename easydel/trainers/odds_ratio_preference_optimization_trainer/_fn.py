@@ -75,33 +75,50 @@ def concatenated_forward(
     logprob_vocab_chunk_size: int | None = None,
     vocab_shard_stage: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
-    """
-    Computes log-probabilities and logits for both chosen and rejected examples by concatenating
-    the inputs and performing a forward pass through the model.
+    """Compute concatenated chosen/rejected log-probs, logits, NLL, and accuracy.
 
-    The function processes the batch by concatenating the chosen and rejected examples. It then
-    calls the model (stored in `state`) to obtain the logits, computes the negative log-likelihood
-    loss for the chosen examples using a dynamic cross entropy loss function, and splits the logits
-    and log-probabilities into those corresponding to the chosen and rejected examples.
+    Concatenates the chosen and rejected batches along the batch axis,
+    performs a single forward pass through the policy, then splits the
+    per-sequence statistics back into chosen and rejected halves. When the
+    model exposes an ``lmhead_chunksize`` the forward is run in headless
+    mode and per-token log probabilities are recomputed from the hidden
+    states with vocabulary chunking to avoid materialising
+    ``[2 * batch, seq, vocab]`` logit tensors.
 
     Args:
-        state (EasyDeLState): The current state of the model containing parameters and the model itself.
-        batch (collections.abc.Mapping[str, tp.Union[tp.List, Array]]): A dictionary containing input arrays for
-            chosen and rejected examples as well as other necessary inputs.
-        is_encoder_decoder (bool): Flag indicating whether the model is an encoder-decoder.
-        label_pad_token_id (int): The token ID used to mark padding positions in the labels.
-        padding_value (Any): The value used for padding. Must not be None.
-        max_length (int | None, optional): Maximum length for the inputs (if applicable). Defaults to None.
+        state (EasyDeLState): Current model state holding parameters and the
+            bound policy module.
+        batch (collections.abc.Mapping[str, list | Array]): Mapping with input
+            arrays for chosen and rejected examples (keys prefixed by
+            ``chosen``/``rejected``) plus any extra fields required for an
+            encoder-decoder model.
+        is_encoder_decoder (bool): Whether the model is an encoder-decoder
+            architecture.
+        label_pad_token_id (int): Token ID used to mark padding positions in
+            the labels; ignored by the loss and accuracy reductions.
+        padding_value (Any): Pad token value used by the collator. Must not
+            be ``None``.
+        max_length (int | None): Maximum sequence length used by the
+            encoder-decoder branches when reconciling label shapes; defaults
+            to ``None``.
+        logprob_vocab_chunk_size (int | None): Vocabulary chunk size used by
+            the chunked log-prob path. ``None`` disables vocabulary
+            chunking.
+        vocab_shard_stage (int | None): Optional MPMD pipeline stage rank
+            forwarded to the chunked LM-head projection so the vocab shard
+            lands on the terminal stage.
 
     Returns:
-        tp.Tuple[Array, Array, Array, Array, Array, Array]:
-            A tuple containing:
-                - chosen_log_probs: Log probabilities for the chosen examples.
-                - rejected_log_probs: Log probabilities for the rejected examples.
-                - chosen_logits: Per-example mean logit summaries for the chosen examples.
-                - rejected_logits: Per-example mean logit summaries for the rejected examples.
-                - chosen_nll_loss: Negative log-likelihood loss for the chosen examples.
-                - chosen_accuracy: Accuracy metric computed on the chosen examples.
+        tuple[Array, Array, Array, Array, Array, Array]: Tuple of
+        ``(chosen_log_probs, rejected_log_probs, chosen_logits,
+        rejected_logits, chosen_nll_loss, chosen_accuracy)`` where the
+        logit entries are per-example mean logit summaries and the NLL /
+        accuracy are reduced scalars over chosen examples.
+
+    Raises:
+        ValueError: If ``padding_value`` is ``None``.
+        TypeError: If the model returns neither ``logits`` nor
+            ``last_hidden_state`` when the chunked path is active.
     """
     if padding_value is None:
         raise ValueError("`padding_value` can not be set as `None` it must be an integer.")
@@ -158,17 +175,21 @@ def concatenated_forward(
                 effective_labels = jnp.concatenate((effective_labels, pad_values), axis=1)
 
     def cross_entropy_loss(logits, labels):
-        """
-        Computes the cross entropy loss and accuracy between the logits and labels.
+        """Compute cross-entropy loss and token-level accuracy.
 
-        For non encoder-decoder models, the logits and labels are shifted appropriately.
+        For decoder-only models the logits/labels are causally shifted
+        (drop the last logit, drop the first label) before scoring.
 
         Args:
-            logits (Array): Logits produced by the model.
-            labels (Array): Ground truth labels.
+            logits (Array): Logits produced by the model with shape
+                ``(batch, seq_len, vocab_size)``.
+            labels (Array): Ground-truth label ids with shape
+                ``(batch, seq_len)``.
 
         Returns:
-            tp.Tuple[Array, Array]: The computed loss and accuracy.
+            tuple[Array, Array]: ``(loss, accuracy)`` -- scalar
+            cross-entropy averaged over non-padding tokens and the
+            corresponding masked top-1 accuracy.
         """
         if not is_encoder_decoder:
             logits = logits[..., :-1, :]
@@ -277,23 +298,34 @@ def get_batch_logps(
     is_encoder_decoder: bool = False,
     logprob_vocab_chunk_size: int | None = None,
 ) -> Array:
-    """
-    Computes the log probabilities for a batch of sequences given the model logits and labels.
+    """Compute per-sequence log probabilities from logits and labels.
 
-    The function applies a log-softmax over the logits and extracts the log probability of each
-    token corresponding to the label. It also masks out the padding tokens using `label_pad_token_id`.
+    Applies a log-softmax over the vocabulary, gathers the log probability of
+    each realised label token, and masks out positions marked with
+    ``label_pad_token_id``. For decoder-only models the logits/labels are
+    causally shifted before reduction.
 
     Args:
-        logits (Array): The logits output by the model with shape (..., sequence_length, vocab_size).
-        labels (Array): The ground truth labels with shape matching logits except for the vocabulary dimension.
-        average_log_prob (bool, optional): If True, returns the average log probability per sequence.
-            Otherwise, returns the sum of log probabilities per sequence. Defaults to False.
-        label_pad_token_id (int, optional): The token ID used for padding in the labels. Defaults to -100.
-        is_encoder_decoder (bool, optional): Flag indicating whether the model is an encoder-decoder.
-            Defaults to False.
+        logits (Array): Logits output by the model with shape
+            ``(..., sequence_length, vocab_size)``.
+        labels (Array): Ground-truth labels with shape matching ``logits``
+            except for the vocabulary dimension.
+        average_log_prob (bool): If ``True`` return the average log
+            probability per sequence; otherwise return the sum. Defaults to
+            ``False``.
+        label_pad_token_id (int): Token id marking padding positions in the
+            labels. Defaults to ``-100``.
+        is_encoder_decoder (bool): Whether the model is an encoder-decoder
+            architecture. Defaults to ``False``.
+        logprob_vocab_chunk_size (int | None): Vocabulary chunk size used by
+            the chunked log-prob reduction. ``None`` disables chunking.
 
     Returns:
-        Array: An array of log probabilities for each sequence in the batch.
+        Array: Per-sequence log-probability scores with shape ``(batch,)``.
+
+    Raises:
+        ValueError: If the batch / sequence-length dimensions of ``logits``
+            (ignoring the vocab axis) do not match ``labels``.
     """
     if logits.shape[:-1] != labels.shape:
         raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
@@ -382,23 +414,26 @@ def concatenated_inputs(
     batch: dict[str, list | Array],
     is_encoder_decoder: bool = False,
 ) -> dict[str, Array]:
-    """
-    Concatenates chosen and rejected examples from the batch into unified arrays.
+    """Concatenate chosen and rejected entries of a preference batch.
 
-    For each key in the batch that starts with "chosen" or "rejected", the function creates a new key
-    starting with "concatenated" and combines the corresponding arrays. In the case of an encoder-decoder
-    model, the prompt inputs and attention masks are also repeated accordingly.
+    Pairs every ``chosen<suffix>`` array with the matching
+    ``rejected<suffix>`` array and emits a single ``concatenated<suffix>``
+    entry that stacks them along the batch axis. For encoder-decoder
+    models the prompt inputs and attention masks are additionally
+    repeated twice along the batch axis so each branch sees its prompt.
 
     Args:
-        batch (tp.Dict[str, tp.Union[tp.List, Array]]): A dictionary containing the batch of data.
-            Expected keys include those starting with "chosen", "rejected", "prompt_input_ids", and
-            "prompt_attention_mask".
-        is_encoder_decoder (bool, optional): Indicates whether the model is encoder-decoder.
-            Defaults to False.
+        batch (dict[str, list | Array]): Mapping carrying the preference
+            batch. Expected keys include those prefixed by ``"chosen"`` and
+            ``"rejected"`` (and, for encoder-decoder models,
+            ``"prompt_input_ids"`` and ``"prompt_attention_mask"``).
+        is_encoder_decoder (bool): Whether the model is encoder-decoder.
+            Defaults to ``False``.
 
     Returns:
-        tp.Dict[str, Array]: A dictionary containing concatenated arrays with keys prefixed with
-            "concatenated".
+        dict[str, Array]: Mapping whose keys are prefixed with
+        ``"concatenated"``, containing the stacked chosen+rejected
+        tensors.
     """
     concatenated_batch = {}
 
@@ -428,27 +463,32 @@ def odds_ratio_loss(
     policy_chosen_logps: Array,
     policy_rejected_logps: Array,
 ) -> tuple[Array, Array, Array, Array, Array]:
-    """
-    Computes the odds ratio loss used for training based on the log probabilities of chosen and rejected examples.
+    """Compute the ORPO odds-ratio loss and accompanying reward statistics.
 
-    The odds ratio is calculated as the difference between the chosen and rejected log probabilities
-    (with a correction term for numerical stability). The sigmoid of this log odds is then taken, and the
-    log of this sigmoid forms the basis of the loss. The function also computes reward values for both
-    chosen and rejected examples, as well as summary statistics.
+    The log-odds quantity is
+
+    ``log_odds = (logp_chosen - logp_rejected)
+                  - (log1mexp(logp_chosen) - log1mexp(logp_rejected))``
+
+    where ``log1mexp(x) = log(1 - exp(x))``. The base loss is
+    ``beta * log_sigmoid(log_odds)`` (negated by the caller before adding
+    the NLL term). Detached ``beta * logp_*`` quantities are returned as
+    per-sample implicit rewards for diagnostic reporting.
 
     Args:
-        beta (float): A scaling hyperparameter applied to the loss and rewards.
-        policy_chosen_logps (Array): Log probabilities for the chosen examples.
-        policy_rejected_logps (Array): Log probabilities for the rejected examples.
+        beta (float): Scaling hyperparameter applied to both the loss term
+            and the implicit rewards.
+        policy_chosen_logps (Array): Per-sequence log probabilities of the
+            chosen branch.
+        policy_rejected_logps (Array): Per-sequence log probabilities of
+            the rejected branch.
 
     Returns:
-        tp.Tuple[Array, Array, Array, Array, Array]:
-            A tuple containing:
-                - losses: The computed odds ratio loss.
-                - chosen_rewards: Rewards computed from the chosen log probabilities (detached).
-                - rejected_rewards: Rewards computed from the rejected log probabilities (detached).
-                - mean_ratio: The mean of the log sigmoid ratio.
-                - mean_log_odds: The mean log odds difference.
+        tuple[Array, Array, Array, Array, Array]: ``(losses, chosen_rewards,
+        rejected_rewards, mean_ratio, mean_log_odds)`` where ``losses`` is
+        per-example, the reward tensors are detached from the gradient,
+        ``mean_ratio`` is the mean ``log_sigmoid`` summary, and
+        ``mean_log_odds`` is the mean ``log_odds`` value.
     """
     log_odds = (policy_chosen_logps - policy_rejected_logps) - (
         jnp.log1p(-jnp.exp(policy_chosen_logps)) - jnp.log1p(-jnp.exp(policy_rejected_logps))
@@ -475,34 +515,43 @@ def orpo_step(
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
-    """
-    Performs a single training or evaluation step for the ORPO method.
+    """Execute a single ORPO training or evaluation step.
 
-    The function handles both forward and backward passes (when in training mode) and computes
-    the loss metrics. It supports minibatch processing and gradient accumulation. In training mode,
-    the model state is updated based on the computed gradients, while in evaluation mode, only loss
-    metrics are returned.
+    Builds the chosen/rejected log probabilities via ``concatenated_forward``,
+    composes the ORPO loss ``policy_nll_loss - mean(odds_ratio_loss)``, and
+    either runs gradient accumulation + optimizer update (``mode == "train"``)
+    or returns the diagnostic metrics only (``mode == "eval"``).
 
     Args:
-        state (EasyDeLState): The current model state containing parameters, optimizer state, etc.
-        batch (dict): The input batch data.
-        concatenated_forward (tp.Callable): A callable that performs the forward pass and returns
-            logits and loss values for chosen and rejected examples.
-        beta (float, optional): Scaling factor used in the odds ratio loss. Defaults to 0.1.
-        learning_rate_fn (tp.Optional[tp.Callable], optional): A callable to compute the learning rate
-            at the current step. Defaults to None.
-        mode (tp.Literal["train", "eval"], optional): Specifies whether the step is for training or evaluation.
-            Defaults to "train".
-        loss_config (tp.Optional[LossConfig], optional): Configuration for the loss computation. Defaults to None.
-        partition_spec (tp.Optional[PartitionSpec], optional): Specification for sharding the batch data.
-            Defaults to None.
-        gradient_accumulation_steps (int, optional): Number of steps to accumulate gradients
-            (only relevant in training mode). Defaults to 1.
+        state (EasyDeLState): Current model state containing parameters and
+            optimizer state.
+        batch (dict): Input batch data carrying chosen/rejected tensors and
+            (optionally) prompt arrays.
+        concatenated_forward (tp.Callable): Callable returning
+            ``(chosen_logps, rejected_logps, chosen_logits, rejected_logits,
+            nll_loss, accuracy)`` for the merged chosen+rejected batch.
+        beta (float): Scaling factor used in the odds-ratio loss. Defaults
+            to ``0.1``.
+        learning_rate_fn (tp.Callable | None): Optional callable mapping
+            step -> learning rate used for metric reporting. Defaults to
+            ``None``.
+        mode (tp.Literal["train", "eval"]): Selects the train or eval
+            branch. Defaults to ``"train"``.
+        loss_config (LossConfig | None): Optional loss configuration
+            forwarded to :func:`update_state_respectfully`.
+        partition_spec (PartitionSpec | None): Sharding specification
+            applied to the input batch.
+        gradient_accumulation_steps (int): Number of microbatches whose
+            gradients are accumulated per optimizer update (training only).
+            Defaults to ``1``.
+        straight_through_emulator (tp.Callable | None): Optional STE
+            wrapper applied to the parameter tree inside the loss closure
+            to simulate quantised forward passes during training.
 
     Returns:
-        tp.Union[tp.Tuple[EasyDeLState, LossMetrics], LossMetrics]:
-            - In "train" mode: A tuple containing the updated model state and the computed loss metrics.
-            - In "eval" mode: The computed loss metrics.
+        tuple[EasyDeLState, LossMetrics] | LossMetrics: In ``"train"`` mode
+        returns ``(updated_state, metrics)``; in ``"eval"`` mode returns
+        only the :class:`LossMetrics`.
     """
     scope_root = "easydel/trainer/orpo/" + ("train_step" if mode == "train" else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):
@@ -516,19 +565,21 @@ def orpo_step(
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: spx.State, batch: dict):
-        """
-        Computes the loss and metrics for a given minibatch.
+        """Compute the ORPO scalar loss and metrics for a minibatch.
 
-        This inner function performs a forward pass using the concatenated_forward function,
-        computes the odds ratio loss, and aggregates various metrics.
+        Runs the policy forward via ``concatenated_forward``, computes the
+        odds-ratio loss, and assembles the diagnostic metrics dictionary
+        (rewards, log-probs, logit summaries, NLL/accuracy, log-odds).
 
         Args:
-            tree (spx.State): The current state of the model graph.
-            batch (tp.Dict): The input batch data.
+            tree (spx.State): Current graph state for the differentiable
+                policy parameters.
+            batch (dict): Minibatch with chosen/rejected tensors.
 
         Returns:
-            tp.Tuple[Array, LossMetrics]: The computed loss and a LossMetrics object containing
-            additional metrics.
+            tuple[Array, LossMetrics]: Scalar loss value plus a
+            :class:`LossMetrics` instance containing the per-step metrics
+            (prefixed with ``"eval_"`` in eval mode).
         """
         with jax.named_scope(scope_root + "/loss_fn"):
             if mode == "train" and straight_through_emulator is not None:

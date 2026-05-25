@@ -188,7 +188,18 @@ class CPOTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> CPOPreprocessTransform | None:
-        """Get CPO preprocessing transform for ShardedDataSource."""
+        """Build the lazy preprocessing transform for ``ShardedDataSource``.
+
+        Returns ``None`` when the dataset is already pre-tokenised (it
+        carries ``prompt_input_ids`` keys), otherwise builds a
+        :class:`CPOPreprocessTransform` that handles chat-template
+        application, prompt/completion tokenisation, and preference-pair
+        formatting on the fly during iteration.
+
+        Returns:
+            A :class:`CPOPreprocessTransform` instance, or ``None`` if
+            the dataset is already tokenised.
+        """
 
         if self._is_pretokenized():
             return None
@@ -201,7 +212,18 @@ class CPOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Return ``True`` when the train dataset already carries token ids.
+
+        Peeks at the first sample of the first shard and checks for the
+        presence of ``prompt_input_ids``. Used to short-circuit the
+        preprocessing transform when callers feed in an
+        already-tokenised dataset.
+
+        Returns:
+            ``True`` if the dataset is pre-tokenised, ``False`` if not
+            (including when ``_train_source`` is missing or the first
+            shard is empty).
+        """
         if self._train_source is None:
             return False
         try:
@@ -335,14 +357,22 @@ class CPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for Grain data loading.
+        """Return the preference-pair Grain-compatible data collator.
+
+        Both arguments are accepted for API symmetry with the base
+        trainer; the cached :class:`DataCollatorForPreferenceGrain`
+        already encapsulates CPO-specific padding and label masking
+        rules and is returned unchanged.
 
         Args:
-            max_sequence_length: Maximum sequence length.
-            truncation_mode: How to truncate sequences.
+            max_sequence_length: Maximum sequence length (unused; kept
+                for symmetry).
+            truncation_mode: Truncation mode (unused; kept for
+                symmetry).
 
         Returns:
-            Grain-compatible data collator.
+            The :class:`DataCollatorForPreferenceGrain` instance set up
+            in ``__init__``.
         """
         return self.input_data_collator_grain
 
@@ -351,25 +381,31 @@ class CPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for TFDS data loading.
+        """Return the preference-pair TFDS-compatible data collator.
+
+        Both arguments are accepted for API symmetry with the base
+        trainer; the cached :class:`DataCollatorForPreferenceTFDS`
+        already encapsulates CPO-specific padding and label masking
+        rules.
 
         Args:
-            max_sequence_length: Maximum sequence length.
-            truncation_mode: How to truncate sequences.
+            max_sequence_length: Maximum sequence length (unused).
+            truncation_mode: Truncation mode (unused).
 
         Returns:
-            TFDS-compatible data collator.
+            The :class:`DataCollatorForPreferenceTFDS` instance set up
+            in ``__init__``.
         """
         return self.input_data_collator_tfds
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[()]:
-        """CPO does not require any extra positional args at training time."""
+        """Empty tuple -- CPO needs no extra positional args at training time."""
         return ()
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[()]:
-        """CPO does not require any extra positional args at evaluation time."""
+        """Empty tuple -- CPO needs no extra positional args at evaluation time."""
         return ()
 
     def on_step_end(
@@ -380,12 +416,18 @@ class CPOTrainer(Trainer):
     ) -> tuple[EasyDeLState, MetricsType]:
         """Called at the end of each training step.
 
+        Default CPO implementation is a no-op pass-through; subclasses
+        may override to inject per-step bookkeeping (e.g. running mean
+        updates, scheduler resets, custom metric folding) without
+        touching the compiled step itself.
+
         Args:
             state: Current model state.
-            metrics: Step metrics.
-            step: Current step number.
+            metrics: Per-step metrics collected by the trainer.
+            step: Current global step index.
 
         Returns:
-            Potentially modified state and metrics.
+            ``(state, metrics)`` -- the (possibly modified) state and
+            metrics to propagate to the rest of the training loop.
         """
         return state, metrics

@@ -155,11 +155,17 @@ class EmbeddingTrainer(Trainer):
             )
 
     def _get_preprocess_transform(self) -> EmbeddingPreprocessTransform | None:
-        """Tokenize query/positive/negative text columns.
+        """Build the lazy tokenisation transform for raw-text embedding datasets.
 
-        Returns a transform that converts raw text columns into tokenized
-        input_ids and attention_mask tensors with the ``query_``/``positive_``/
-        ``negative_`` prefixes.
+        Skipped when :meth:`_is_pretokenized` already detects tokenised
+        ``query_input_ids`` columns on the training source.
+
+        Returns:
+            An :class:`EmbeddingPreprocessTransform` that tokenises the
+            configured query / positive / negative text columns into
+            ``input_ids`` and ``attention_mask`` tensors with the
+            ``query_`` / ``positive_`` / ``negative_`` prefixes, or
+            ``None`` when the source is already pretokenised.
         """
         if self._is_pretokenized():
             return None
@@ -173,7 +179,13 @@ class EmbeddingTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if the dataset is already tokenized."""
+        """Detect whether the training source already exposes tokenised fields.
+
+        Returns:
+            ``True`` when the first sample of the first shard carries
+            a ``query_input_ids`` column; ``False`` on any exception
+            (missing source, empty shard, missing column).
+        """
         try:
             sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
             return "query_input_ids" in sample
@@ -181,10 +193,19 @@ class EmbeddingTrainer(Trainer):
             return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """Configure JIT-compiled training/eval step functions.
+        """Build the JIT-compiled training and evaluation step functions.
 
-        Overrides the default ``training_step`` with
-        ``embedding_training_step`` which handles the contrastive loss.
+        Overrides the base trainer's ``training_step`` with a partial
+        of :func:`embedding_training_step` that captures the
+        contrastive-objective knobs (loss type, temperature, margin,
+        Matryoshka dims, normalisation flag) so the compiled function
+        only takes the model state and the batch. The evaluation step
+        re-uses the base trainer's :func:`evaluation_step`.
+
+        Returns:
+            :class:`TrainerConfigureFunctionOutput` carrying the
+            sharded train/eval step callables, the model mesh, and
+            the streaming checkpoint manager.
         """
         empty_sharding = replicated_named_sharding(self.model.mesh)
 
@@ -245,7 +266,20 @@ class EmbeddingTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create a data collator for embedding training."""
+        """Build the TFDS contrastive collator.
+
+        Args:
+            max_sequence_length: Accepted for interface parity; the
+                collator uses ``arguments.max_length`` (with a 512
+                fallback).
+            truncation_mode: Accepted for interface parity; ignored by
+                this collator.
+
+        Returns:
+            A freshly-constructed :class:`EmbeddingDataCollatorTFDS`
+            wired with the trainer's padding token, max length, and
+            negative-column presence flag.
+        """
         return EmbeddingDataCollatorTFDS(
             pad_token_id=self.padding_value,
             max_length=self.arguments.max_length or 512,
@@ -257,7 +291,20 @@ class EmbeddingTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create a Grain data collator for embedding training."""
+        """Build the Grain contrastive collator.
+
+        Args:
+            max_sequence_length: Accepted for interface parity; the
+                collator uses ``arguments.max_length`` (with a 512
+                fallback).
+            truncation_mode: Accepted for interface parity; ignored by
+                this collator.
+
+        Returns:
+            A freshly-constructed :class:`EmbeddingDataCollatorGrain`
+            wired with the trainer's padding token, max length, and
+            negative-column presence flag.
+        """
         return EmbeddingDataCollatorGrain(
             pad_token_id=self.padding_value,
             max_length=self.arguments.max_length or 512,

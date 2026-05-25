@@ -159,11 +159,21 @@ class GFPOTrainer(GRPOTrainer):
         )
 
     def configure_functions(self):
-        """Configure training functions with filtered generation count.
+        """Build the JIT-compiled GFPO step functions with the filtered group size.
 
-        Overrides the parent method to use num_remains_in_group instead of
-        num_generations in the static args passed to grpo_step. This ensures
-        the loss function uses the correct repeat count after filtering.
+        Delegates to :meth:`GRPOTrainer.configure_functions` for the
+        actual compilation, then patches the static-argument tuples of
+        the resulting training / evaluation step so that ``grpo_step``
+        sees ``num_remains_in_group`` instead of ``num_generations``.
+        Without this swap the loss would mis-shape the per-prompt
+        reshape after the GFPO filter discards rollouts. When
+        ``num_remains_in_group`` is ``None`` (filtering disabled) the
+        parent output is returned unchanged.
+
+        Returns:
+            :class:`TrainerConfigureFunctionOutput` mirroring the
+            parent's, with the static-arg tuples updated in place to
+            reflect the filtered group size.
         """
         output = super().configure_functions()
         straight_through_emulator = self._train_shared_fn_static_args[-1]
@@ -336,10 +346,41 @@ class GFPOTrainer(GRPOTrainer):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
-        """Preprocess batch with GFPO filtering.
+        """Generate, score, and *filter* rollouts before the GRPO step.
 
-        This method extends GRPO's preprocessing by adding a filtering step
-        after reward computation to keep only the most efficient samples.
+        Drop-in replacement for :meth:`GRPOTrainer._preprocess_batch_input`
+        that inserts the GFPO filtering stage after reward computation
+        but before group-relative advantages are derived. The pipeline:
+
+        1. Run :meth:`generate_unified` to sample ``num_generations``
+           completions per prompt.
+        2. Build ``completion_mask`` (optionally zeroing out
+           non-EOS-terminated completions).
+        3. Compute reference per-token log-probabilities under the
+           frozen reference policy.
+        4. Decode completions, run every registered reward function /
+           model, and combine rewards into a single scalar per
+           completion.
+        5. **GFPO filtering:** when ``num_remains_in_group`` is set,
+           call :meth:`_filter_completions` to keep only the top-K
+           completions per prompt (ranked by
+           :meth:`_default_filter_func` or the user-provided
+           ``group_filter_func``). Subsequent advantages and metrics
+           are computed on the filtered subset.
+        6. All-gather across data-parallel ranks and standardise
+           rewards (group / batch / none).
+
+        Args:
+            state: Current policy state.
+            batch: Raw prompt batch from the dataloader plus any
+                per-prompt side-channels.
+            is_train: ``True`` for training, ``False`` for evaluation.
+
+        Returns:
+            ``(batch, info)`` where ``batch`` is the JAX-friendly dict
+            consumed by ``grpo_step`` (with the post-filter group size)
+            and ``info`` carries reward / timing / filter-time metrics
+            including ``filter_time`` for the filtering step.
         """
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)

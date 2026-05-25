@@ -53,13 +53,21 @@ def _ensure_state(
     *,
     trainable_selector: tp.Any = "parameters",
 ) -> EasyDeLState:
-    """Convert a model to EasyDeLState if it isn't already.
+    """Convert a model to :class:`EasyDeLState` if it isn't already.
 
     Args:
-        model: Either an EasyDeLBaseModule or EasyDeLState instance.
+        model: Either an :class:`EasyDeLBaseModule` or an existing
+            :class:`EasyDeLState` instance. Modules are converted via
+            :meth:`EasyDeLBaseModule.to_state`; states pass through
+            unchanged.
+        trainable_selector: Selector forwarded to
+            :meth:`EasyDeLBaseModule.to_state` to decide which subtree
+            of parameters is trainable (e.g. ``"parameters"`` for full
+            fine-tuning, a LoRA selector for adapter training).
 
     Returns:
-        EasyDeLState instance.
+        An :class:`EasyDeLState` carrying the model's parameters and
+        optimiser scaffolding.
     """
     return model if isinstance(model, EasyDeLState) else model.to_state(trainable_selector=trainable_selector)
 
@@ -126,19 +134,49 @@ class XPOTrainer(GRPOTrainer):
     ):
         """Initialize the XPO trainer.
 
+        Materialises the frozen reference state (when supplied), caches
+        the ``beta`` / ``alpha`` schedules and the integer ``loss_type``
+        id consumed by :func:`xpo_step`, validates that a single reward
+        function is provided, and forwards everything else to the GRPO
+        base initializer.
+
         Args:
-            arguments: XPO configuration containing hyperparameters and training settings.
-            model: The policy model to train (either module or state).
-            reward_funcs: Reward function(s) for scoring completions. Can be callable or EasyDeLState.
-            reference_model: Optional frozen reference model. If None, initialized from policy model.
-            train_dataset: Training dataset containing prompts.
-            eval_dataset: Optional evaluation dataset(s).
-            processing_class: Tokenizer or processor for encoding text.
-            reward_processing_classes: Optional processing class(es) for reward model inputs.
+            arguments: :class:`XPOConfig` carrying hyperparameters and
+                training settings. The ``beta`` and ``alpha`` schedules
+                are cached on the instance and re-resolved each step.
+            model: Policy model to train. Either an
+                :class:`EasyDeLBaseModule` or an :class:`EasyDeLState`.
+                Modules are converted to a state via
+                :meth:`EasyDeLBaseModule.to_state` using
+                ``arguments.trainable_selector``.
+            reward_funcs: Single reward function or singleton sequence
+                used to score completions. May be a plain callable or an
+                :class:`EasyDeLState` reward model. XPO is restricted to
+                exactly one reward signal.
+            reference_model: Optional frozen reference policy. When
+                supplied, it is converted to a state and stored on
+                ``self.ref_state``; when omitted, the base class
+                allocates the reference from a deep copy of the policy.
+            train_dataset: Training dataset of prompts. Required for
+                training, optional otherwise.
+            eval_dataset: Optional evaluation dataset(s); a dictionary
+                value enables multi-suite evaluation.
+            processing_class: Tokenizer or processor for encoding
+                prompts / decoding completions.
+            reward_processing_classes: Optional processing class(es)
+                for reward-model inputs. Falls back to
+                ``processing_class`` per reward function when ``None``.
+
+        Raises:
+            ValueError: If ``reward_funcs`` resolves to anything other
+                than a single function/model.
         """
 
-        if reference_model is not None:
-            self.ref_state = _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
+        reference_state = (
+            _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
+            if reference_model is not None
+            else None
+        )
 
         self._beta_schedule = arguments.beta
         self._alpha_schedule = arguments.alpha
@@ -159,9 +197,23 @@ class XPOTrainer(GRPOTrainer):
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
         )
+        if reference_state is not None:
+            self.ref_state = reference_state
 
     def _get_reward_processing_classes(self) -> list[ProcessingClassType | None]:
-        """Normalize reward processing classes to a list aligned to reward functions."""
+        """Normalize reward processing classes to a list aligned to reward functions.
+
+        Resolves the user-facing ``reward_processing_classes`` attribute
+        (which may be ``None``, a single processor, or a sequence of
+        processors) into a list of the same length as
+        ``self.reward_funcs``. A single processor is broadcast to every
+        reward function; ``None`` produces an all-``None`` list so
+        callers can branch on per-function tokenization.
+
+        Returns:
+            list[ProcessingClassType | None]: One processor (or
+            ``None``) per reward function, aligned by index.
+        """
         reward_processing_classes: list | None = self.reward_processing_classes
         if reward_processing_classes is None:
             return [None] * len(self.reward_funcs)

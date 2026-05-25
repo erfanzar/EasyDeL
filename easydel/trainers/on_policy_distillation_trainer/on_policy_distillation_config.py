@@ -44,19 +44,30 @@ class OnPolicyDistillationConfig(DistillationConfig):
     controlling the online generation process during training.
 
     Attributes:
+        trainer_prefix: Prefix used for trainer logs, checkpoints, and W&B
+            runs. Defaults to ``"OnPolicyDistillation"``.
+        remove_unused_columns: Whether the base trainer should drop columns
+            not consumed by the trainer. Defaults to ``False`` to keep raw
+            metadata available to reward / generation hooks.
         max_prompt_length: Maximum number of tokens for prompts.
-        max_completion_length: Maximum number of new tokens to generate per prompt.
-        num_generations_per_prompt: How many completions to sample per prompt.
+        max_completion_length: Maximum number of new tokens to generate per
+            prompt.
+        num_generations_per_prompt: How many completions to sample per
+            prompt.
         temperature_sampling: Sampling temperature for generation (separate
-            from distillation temperature).
-        top_k: Top-k sampling parameter for generation.
+            from the distillation temperature used to soften logits for the
+            KL loss).
+        top_k: Top-k sampling parameter for generation; ``None`` disables
+            top-k.
         top_p: Top-p (nucleus) sampling parameter for generation.
-        presence_penalty: Presence penalty for generation.
-        frequency_penalty: Frequency penalty for generation.
-        repetition_penalty: Repetition penalty for generation.
-        generate_with_teacher: If True, teacher generates completions instead
-            of student.
-        skip_apply_chat_template: Whether to skip chat template application.
+        presence_penalty: Presence penalty applied during generation.
+        frequency_penalty: Frequency penalty applied during generation.
+        repetition_penalty: Repetition penalty applied during generation.
+        generate_with_teacher: If ``True``, the teacher model generates
+            completions instead of the student. Useful for comparison or
+            curriculum-style distillation.
+        skip_apply_chat_template: Whether to skip chat template application
+            on prompts.
     """
 
     trainer_prefix: str | None = field(

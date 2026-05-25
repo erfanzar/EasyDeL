@@ -97,10 +97,14 @@ class DPOConfig(TrainingArguments):
             Default: 64
         rpo_alpha (float | None): Alpha parameter for Relative Preference Optimization.
             None disables RPO. Default: None
-        logprob_vocab_chunk_size (int): Vocabulary chunk size used when computing
-            selected-token log probabilities for DPO. Set to 0 to disable
-            chunking and use the full vocab in one pass. Default: 4096
+        logprob_vocab_chunk_size (int | None): Vocabulary chunk size used when
+            computing selected-token log probabilities for DPO. Set to ``None``
+            to disable chunking and use the full vocab in one pass.
+            Normalised via :func:`normalize_logprob_vocab_chunk_size` in
+            ``__post_init__``. Default: ``None``.
         tools (list[dict | Callable] | None): Additional tools for training process
+            (e.g. function-calling schemas threaded through the prompt
+            transform). ``None`` disables tool injection. Default: ``None``.
 
     Example:
         >>> config = DPOConfig(
@@ -227,7 +231,26 @@ class DPOConfig(TrainingArguments):
         max_sequence_length: int | None,
         quantization_block: int | None,
     ):
-        """Post-initialization processing to derive dependent parameters."""
+        """Finalize DPO-specific config invariants.
+
+        Performs the following derivations and validations:
+
+        * Maps the deprecated ``max_sequence_length`` alias onto
+          ``max_length`` via :meth:`_handle_deprecated_max_sequence_length`.
+        * Defaults ``max_completion_length`` to
+          ``max_length - max_prompt_length`` when omitted.
+        * Normalises ``logprob_vocab_chunk_size`` (``0`` / negative / very
+          small values are coerced according to
+          :func:`normalize_logprob_vocab_chunk_size`).
+        * Delegates to the base :class:`TrainingArguments.__post_init__`
+          for any remaining shared housekeeping.
+
+        Args:
+            max_sequence_length: Deprecated alias for ``max_length``;
+                forwarded to the legacy handler.
+            quantization_block: Legacy alias for the quantization
+                group/block size, forwarded to the base class.
+        """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None:
             self.max_completion_length = self.max_length - self.max_prompt_length

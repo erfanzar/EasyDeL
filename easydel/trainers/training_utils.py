@@ -906,7 +906,23 @@ def bind_scheduled_module(
     *,
     straight_through_field: str = "straight_through_emulator",
 ) -> tp.Any:
-    """Merge a scheduled trainable tree and sync its PP marker config."""
+    """Merge a scheduled trainable tree and sync its PP marker config.
+
+    Materialises the model module from the scheduled-step state tree,
+    applying an optional straight-through quantization emulator and
+    synchronising the resulting module's pipeline-stage configuration
+    with the active MPMD schedule so subsequent stage markers match.
+
+    Args:
+        call: Live :class:`ScheduledStepCall` for this scheduled step.
+        tree: Differentiable parameter pytree to merge into ``call.state``.
+        straight_through_field: Name of the bound argument that, when
+            present and non-``None``, is applied to ``tree`` as a
+            quantization STE before merging.
+
+    Returns:
+        The materialised model module ready for the scheduled forward.
+    """
 
     straight_through = call.get(straight_through_field)
     if straight_through is not None:
@@ -921,7 +937,23 @@ def constrain_scheduled_batch(
     batch: collections.abc.Mapping[str, tp.Any],
     partition_spec: tp.Any,
 ) -> dict[str, tp.Any]:
-    """Apply the standard EasyDeL scheduled batch sharding constraint."""
+    """Apply the standard EasyDeL scheduled batch sharding constraint.
+
+    Forwards every leaf of ``batch`` through
+    ``spx.with_sharding_constraint(..., ignore_mpmd=True)`` so the
+    scheduled VJP path can see the intended data-parallel partitioning
+    even when the MPMD scheduler would otherwise rewrite the constraint.
+
+    Args:
+        module: The materialised model module (its ``mesh`` attribute
+            is used as the constraint mesh).
+        batch: Input batch dict.
+        partition_spec: The ``PartitionSpec`` to apply per leaf.
+
+    Returns:
+        A new dict with the same keys as ``batch`` and constrained
+        sharding annotations on every leaf.
+    """
 
     return tp.cast(
         dict[str, tp.Any],
@@ -948,6 +980,15 @@ def _aux_slice_tree_leading_axis(value: tp.Any, start: int, size: int, full: int
     """Slice every array leaf of ``value`` whose leading axis equals ``full`` to ``[start:start+size]``."""
 
     def _slice(leaf: tp.Any) -> tp.Any:
+        """Slice a single pytree leaf along axis 0 when it carries the full leading dim.
+
+        Args:
+            leaf: A pytree leaf (typically a JAX array).
+
+        Returns:
+            ``lax.slice_in_dim(leaf, start, start + size, axis=0)`` when
+            ``leaf.shape[0] == full``; otherwise ``leaf`` unchanged.
+        """
         shape = getattr(leaf, "shape", None)
         if shape is None or len(shape) == 0 or int(shape[0]) != full:
             return leaf
@@ -967,6 +1008,17 @@ def _aux_concat_microbatch_outputs(microbatch_outputs: list[tp.Any], chunk: int)
     """
 
     def _concat(*leaves: tp.Any) -> tp.Any:
+        """Concatenate aligned pytree leaves along axis 0 when they carry the chunk dim.
+
+        Args:
+            *leaves: One leaf from each microbatch's output tree at the same
+                pytree position.
+
+        Returns:
+            ``jnp.concatenate(leaves, axis=0)`` for leaves whose leading
+            axis equals ``chunk``; otherwise ``leaves[0]`` (treated as a
+            shared scalar/metadata leaf).
+        """
         first = leaves[0]
         shape = getattr(first, "shape", None)
         if shape is None or len(shape) == 0 or int(shape[0]) != chunk:
@@ -1017,6 +1069,33 @@ def cached_scheduled_auxiliary(
 
     @functools.wraps(fn)
     def _microbatched(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        """Run the compiled forward once per microbatch and reassemble outputs.
+
+        Slices each batched positional argument named by ``batch_argnums_t``
+        along axis 0 into ``microbatches`` equal chunks, dispatches the
+        ``spx.jit``-compiled forward per chunk (preferring the cached
+        :class:`spx.MpmdPipelineExecutor` for wavefront overlap when
+        available, otherwise sequential ``spx.jit`` calls), and concatenates
+        per-microbatch real-array outputs along axis 0 with
+        :func:`_aux_concat_microbatch_outputs`.
+
+        Args:
+            *args: Positional arguments forwarded to the compiled forward.
+                Entries at indices in ``batch_argnums_t`` are sliced
+                per-microbatch; all others are passed through unchanged.
+            **kwargs: Keyword arguments forwarded verbatim. Note: the
+                wavefront ``dispatch_many`` path is only used when there
+                are no kwargs.
+
+        Returns:
+            The reassembled forward output with the same pytree structure
+            as a single full-batch call.
+
+        Raises:
+            ValueError: If ``batch_argnums`` references positions outside
+                ``args``, if batched arguments disagree on leading size,
+                or if the batch size is not divisible by ``microbatches``.
+        """
         batch_sizes: list[int] = []
         for argnum in batch_argnums_t:
             if argnum >= len(args):
@@ -1098,7 +1177,21 @@ def cached_scheduled_auxiliary(
 
 
 def stop_gradient_tree(value: tp.Any) -> tp.Any:
-    """Stop gradients for array leaves while preserving non-array metadata."""
+    """Stop gradients for array leaves while preserving non-array metadata.
+
+    Applies :func:`jax.lax.stop_gradient` to each leaf that exposes a
+    ``shape`` attribute (i.e. JAX arrays), leaving Python scalars,
+    strings, and other static metadata untouched. Used by scheduled
+    reference forwards so that frozen-teacher outputs do not leak
+    gradients back into the policy graph.
+
+    Args:
+        value: Arbitrary pytree.
+
+    Returns:
+        A pytree with the same structure as ``value`` and gradients
+        cut on every array leaf.
+    """
 
     return jax.tree_util.tree_map(
         lambda leaf: jax.lax.stop_gradient(leaf) if hasattr(leaf, "shape") else leaf,
@@ -2299,7 +2392,25 @@ def compile_trainer_auxiliary(
     out_shardings: tp.Any = _UNSPECIFIED,
     **jit_kwargs,
 ) -> tp.Callable[..., tp.Any]:
-    """Compile nested trainer helpers through the same SpectraX jit surface."""
+    """Compile a nested trainer helper through the shared SpectraX jit surface.
+
+    Convenience wrapper around :func:`compile_trainer_step` for helpers
+    that are not primary training/evaluation step functions (e.g.
+    teacher/reference forwards, sample generators).
+
+    Args:
+        fn: The auxiliary helper callable.
+        mesh: Optional device mesh override forwarded to ``spx.jit``.
+        arguments: Optional :class:`TrainingArguments` instance used to
+            inherit MPMD schedule configuration.
+        in_shardings: Optional input sharding override.
+        out_shardings: Optional output sharding override.
+        **jit_kwargs: Additional keyword arguments forwarded verbatim
+            to ``spx.jit``.
+
+    Returns:
+        A jit-compiled callable wrapping ``fn``.
+    """
 
     return compile_trainer_step(
         fn,
@@ -2312,7 +2423,22 @@ def compile_trainer_auxiliary(
 
 
 def _infer_batch_size(batch: tp.Any) -> int:
-    """Infer batch size from the most common leading dimension in the batch pytree."""
+    """Infer batch size from the most common leading dimension in the batch pytree.
+
+    Walks the leaves of ``batch``, collects each leaf's leading axis
+    size, and returns the mode. Robust to extra leaves whose first
+    dimension does not represent the batch (e.g. scalar metadata or
+    multimodal tensors with their own leading axis).
+
+    Args:
+        batch: Batch pytree (typically a dict of JAX arrays).
+
+    Returns:
+        The most frequent leading-axis size across array leaves.
+
+    Raises:
+        ValueError: If no array-typed leaf exposes a leading dimension.
+    """
 
     leading_dims = [
         int(leaf.shape[0])

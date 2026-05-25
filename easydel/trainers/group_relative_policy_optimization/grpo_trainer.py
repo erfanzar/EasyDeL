@@ -329,7 +329,18 @@ class GRPOTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
-        """Get GRPO preprocessing transform for ShardedDataSource."""
+        """Return the GRPO preprocessing transform for sharded sources.
+
+        Skips transform construction when the underlying dataset is
+        already tokenised (i.e. carries ``input_ids``); otherwise builds
+        a :class:`GRPOPreprocessTransform` wired with this trainer's
+        tokenizer, ``max_prompt_length``, ``tools`` registry, and
+        chat-template policy.
+
+        Returns:
+            A :class:`GRPOPreprocessTransform` instance, or ``None`` if
+            the dataset is already tokenised.
+        """
 
         if self._is_pretokenized():
             return None
@@ -341,7 +352,17 @@ class GRPOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Return ``True`` when the training source already exposes ``input_ids``.
+
+        Peeks at the first record of the first training shard to decide
+        whether GRPO preprocessing (tokenisation, chat-template
+        application, prompt truncation) is required or can be skipped.
+
+        Returns:
+            ``True`` if the sample carries an ``input_ids`` field;
+            ``False`` otherwise (including when the source is empty or
+            missing).
+        """
         if self._train_source is None:
             return False
         try:
@@ -355,7 +376,18 @@ class GRPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for Grain data loading."""
+        """Build the Grain-side collator for GRPO prompt batches.
+
+        Args:
+            max_sequence_length: Unused for GRPO collation (kept for
+                interface parity with other trainers).
+            truncation_mode: Unused for GRPO collation (kept for
+                interface parity).
+
+        Returns:
+            A :class:`GRPODataCollatorGrain` instance configured with
+            the trainer's ``max_prompt_length`` and padding value.
+        """
         from ..utils import GRPODataCollatorGrain
 
         return GRPODataCollatorGrain(
@@ -368,7 +400,18 @@ class GRPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for TFDS data loading."""
+        """Build the TFDS-side collator for GRPO prompt batches.
+
+        Args:
+            max_sequence_length: Unused for GRPO collation (kept for
+                interface parity with other trainers).
+            truncation_mode: Unused for GRPO collation (kept for
+                interface parity).
+
+        Returns:
+            A :class:`GRPODataCollatorTFDS` instance configured with
+            the trainer's ``max_prompt_length`` and padding value.
+        """
         from ..utils import GRPODataCollatorTFDS
 
         return GRPODataCollatorTFDS(

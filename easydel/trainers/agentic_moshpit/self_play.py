@@ -61,6 +61,14 @@ def _deterministic_variety(seed: int | None, index: int = 0) -> int:
     Uses SHA-256 hashing so the result is identical across all JAX
     devices/hosts for the same ``(seed, index)`` pair — no Python
     ``random`` module involved.
+
+    Args:
+        seed: Optional integer seed; ``None`` is hashed literally.
+        index: Position offset within the seed group (defaults to 0).
+
+    Returns:
+        An integer in ``[0, 1_000_000)`` derived from the SHA-256 prefix
+        of ``f"{seed}:{index}"``.
     """
     raw = f"{seed}:{index}".encode()
     return int(hashlib.sha256(raw).hexdigest()[:8], 16) % 1_000_000
@@ -168,6 +176,10 @@ class QuestionGenerator:
         Called by ``SelfPlayEnvironment`` before rollouts start.
         Only used by ``LocalQuestionGenerator``; other backends
         ignore this.
+
+        Args:
+            generate_fn: Callable accepting a list of prompt strings and
+                returning a list of completions of the same length.
         """
 
 
@@ -287,7 +299,24 @@ class LocalQuestionGenerator(QuestionGenerator):
         topics: list[str],
         seeds: list[int | None],
     ) -> list[GeneratedQuestion]:
-        """Batch-generate questions with a single ``generate_fn`` call."""
+        """Batch-generate questions with a single ``generate_fn`` call.
+
+        Args:
+            topics: Topic prompts forwarded to the questioner; one per
+                generated question.
+            seeds: Optional seeds matched positionally with ``topics``.
+                ``None`` entries are hashed literally for the variety
+                value.
+
+        Returns:
+            A list of :class:`GeneratedQuestion`, same length as the
+            inputs, with deterministic variety metadata attached.
+
+        Raises:
+            RuntimeError: If ``generate_fn`` has not been injected via
+                :meth:`set_generate_fn` (typically because the generator
+                is being used outside of :class:`SelfPlayEnvironment`).
+        """
         if self._generate_fn is None:
             raise RuntimeError(
                 "generate_fn not set. LocalQuestionGenerator must be used "
@@ -348,7 +377,22 @@ class LocalQuestionGenerator(QuestionGenerator):
         answers: list[str],
         metadatas: list[dict[str, tp.Any] | None],
     ) -> list[float]:
-        """Batch-verify answers with a single ``generate_fn`` call."""
+        """Batch-verify answers with a single ``generate_fn`` call.
+
+        Strips reasoning blocks from each answer, builds verifier prompts
+        in parallel, runs one generate call, and parses scores.
+
+        Args:
+            questions: Original questions, one per item.
+            answers: Solver answers aligned positionally with
+                ``questions``.
+            metadatas: Optional per-item metadata (unused by the local
+                backend but kept for interface symmetry).
+
+        Returns:
+            A list of rewards in ``[0, 1]``, one per item. Returns all
+            zeros when ``generate_fn`` has not been injected.
+        """
         if self._generate_fn is None:
             return [0.0] * len(questions)
 
@@ -724,6 +768,15 @@ class SelfPlayEnvironment(AgenticEnvironment):
         If ``reset_with_question`` was called beforehand (batched path),
         the pre-generated question is used. Otherwise falls back to
         calling ``generator.generate()`` directly (single-env path).
+
+        Args:
+            seed: Optional seed forwarded to the question generator when
+                generating a fresh question.
+
+        Returns:
+            A :class:`ResetResult` whose observation is the (possibly
+            cached) question and whose info carries the topic and any
+            generator metadata.
         """
         if self._question and self._step_count == 0:
             return ResetResult(
@@ -742,7 +795,16 @@ class SelfPlayEnvironment(AgenticEnvironment):
         )
 
     def reset_with_question(self, question: GeneratedQuestion) -> ResetResult:
-        """Reset with a pre-generated question (used by batched rollout)."""
+        """Reset with a pre-generated question (used by batched rollout).
+
+        Args:
+            question: A :class:`GeneratedQuestion` already produced by a
+                batched call to the generator.
+
+        Returns:
+            A :class:`ResetResult` whose observation is the pre-generated
+            question text and whose info reflects the question metadata.
+        """
         self._question = question.question
         self._metadata = question.metadata
         self._solver_turns = []
@@ -807,7 +869,12 @@ class SelfPlayEnvironment(AgenticEnvironment):
         )
 
     def set_generate_fn(self, generate_fn: tp.Callable[[list[str]], list[str]]) -> None:
-        """Propagate the trainer's generate_fn to the question generator."""
+        """Propagate the trainer's generate_fn to the question generator.
+
+        Args:
+            generate_fn: Callable accepting a list of prompts and
+                returning a list of completions of the same length.
+        """
         self._generator.set_generate_fn(generate_fn)
 
     def _do_verify(self, answer: str) -> float:

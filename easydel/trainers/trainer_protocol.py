@@ -593,15 +593,30 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def _get_current_step(self, state):
-        """
-        Get the current step number.
+        """Return the integer step counter held by ``state``.
+
+        Subclasses must unwrap the JAX-traced ``step`` field of
+        :class:`EasyDeLState` into a Python ``int`` so progress bars,
+        evaluation gating, and checkpoint policies can compare it.
+
+        Args:
+            state: The current trainer state.
+
+        Returns:
+            int: The host-side current step number.
         """
         ...
 
     @abstractmethod
     def _save_readme(self, checkpoint_dir):
-        """
-        Saves a README file with model and training information.
+        """Emit a Markdown README into a checkpoint directory.
+
+        Subclasses should render a human-readable model card summarising
+        the trainer class, model architecture, dataset, and any other
+        information useful for reproducibility.
+
+        Args:
+            checkpoint_dir: Destination directory for the README file.
         """
         ...
 
@@ -619,8 +634,13 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def save_information(self, output_path: str | ePathLike) -> None:
-        """
-        Save the generated information to a markdown file.
+        """Persist the trainer's generated information block as Markdown.
+
+        Subclasses delegate to :meth:`_get_information` to render the
+        report body and write it to ``output_path``.
+
+        Args:
+            output_path: Destination file path.
         """
         ...
 
@@ -633,8 +653,19 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
     ):
-        """
-        Saves the model state as a checkpoint file or to a Torch compatible directory.
+        """Save the model state to disk in either EasyDeL or Torch format.
+
+        Args:
+            state: Current trainer state to serialize.
+            save_directory: Destination directory; ``None`` defers to the
+                argument-configured save directory.
+            to_torch: When ``True`` convert the state to a HuggingFace
+                Torch-compatible directory layout instead of EasyDeL's
+                native checkpoint format.
+            easystate_to_huggingface_model_kwargs: Optional overrides
+                forwarded to the EasyDeL -> HuggingFace conversion helper.
+            torch_save_pretrained_kwargs: Optional overrides forwarded to
+                the Torch model's ``save_pretrained`` call.
         """
         ...
 
@@ -646,8 +677,15 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
     ):
-        """
-        Saves the model state to a Torch compatible directory.
+        """Convert the state to a Torch-compatible directory.
+
+        Args:
+            state: Current trainer state.
+            save_directory: Destination directory for the Torch model.
+            easystate_to_huggingface_model_kwargs: Optional overrides for
+                the EasyDeL -> HuggingFace bridge.
+            torch_save_pretrained_kwargs: Optional overrides forwarded to
+                ``Model.save_pretrained``.
         """
         ...
 
@@ -658,14 +696,30 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         model_config,
         model_type,
     ):
-        """
-        Creates a Hugging Face model config from the current state
+        """Build a HuggingFace-style config object from the live model state.
+
+        Args:
+            state: Current trainer state.
+            model_config: The EasyDeL config to translate.
+            model_type: HuggingFace ``model_type`` string for the
+                resulting config.
+
+        Returns:
+            A populated HuggingFace ``PretrainedConfig`` instance.
         """
         ...
 
     @abstractmethod
     def specs_to_name_sharding(self, tree, mesh=None):
-        """Convert specs to named sharding."""
+        """Convert ``PartitionSpec`` pytrees to ``NamedSharding`` annotations.
+
+        Args:
+            tree: A pytree of ``PartitionSpec`` leaves.
+            mesh: Optional mesh override; defaults to the trainer's mesh.
+
+        Returns:
+            A pytree of ``jax.sharding.NamedSharding`` leaves.
+        """
         ...
 
     @staticmethod
@@ -1147,26 +1201,53 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def start_training_hook(self):
-        """Hook to run before training starts."""
+        """Run subclass-defined setup logic immediately before the training loop.
+
+        Use this hook to register custom callbacks, warm caches, prepare
+        reference-model forward passes, or perform any other one-time
+        action that must run after dataloader/state initialization but
+        before the first step.
+        """
 
     @abstractmethod
     def start_evaluation_hook(self):
-        """Hook to run before evaluation starts."""
+        """Run subclass-defined setup logic immediately before evaluation.
+
+        Mirror of :meth:`start_training_hook` for evaluation phases:
+        invoked once per ``.eval(...)`` call.
+        """
         ...
 
     @abstractmethod
     def _setup_static_metrics(self):
-        """Setup static metrics for logging."""
+        """Log non-time-varying metadata about the run (devices, FLOPS budget, ...).
+
+        Called once before training begins. Subclasses fill in trainer-
+        specific static config (e.g. policy/reference parameter counts
+        for preference trainers) on top of the base trainer's standard
+        device/parameter metadata.
+        """
         ...
 
     @abstractmethod
     def compile_aot(self) -> bool:
-        """Compile the state ahead of time for faster execution."""
+        """Trigger ahead-of-time compilation of train/eval step functions.
+
+        Returns:
+            ``True`` when AOT compilation actually ran, ``False`` when
+            it was skipped (already compiled, or disabled by config).
+        """
         ...
 
     @abstractmethod
     def finish(self):
-        """Finalize the training process."""
+        """Release trainer resources and finalize external logging backends.
+
+        Closes progress bars, flushes TensorBoard writers, finishes the
+        active W&B run (if any), and releases any held generation/eSurge
+        runtime. Idempotent: safe to call from interruption handlers as
+        well as the normal exit path.
+        """
         ...
 
     @abstractmethod
@@ -1175,7 +1256,19 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         state: EasyDeLState,
         step: int,
     ) -> EasyDeLState:
-        """hook process to call in start of the step."""
+        """Hook fired immediately before a step is executed.
+
+        Subclasses may inspect or transform ``state`` (e.g. inject
+        scheduled hyperparameters) and must return the state to use for
+        the upcoming step.
+
+        Args:
+            state: Current trainer state.
+            step: Current step number.
+
+        Returns:
+            The (possibly modified) state to use for this step.
+        """
         ...
 
     @abstractmethod
@@ -1185,7 +1278,19 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         metrics: MetricsType,
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
-        """hook process to call in start of the step."""
+        """Hook fired immediately after a step has been executed.
+
+        Subclasses may mutate the returned state or augment the metrics
+        dict (e.g. adding custom logged quantities).
+
+        Args:
+            state: Trainer state after the step.
+            metrics: Metrics dict produced by the step.
+            step: The step number that just completed.
+
+        Returns:
+            The (possibly modified) ``(state, metrics)`` tuple.
+        """
         ...
 
     @abstractmethod
@@ -1195,11 +1300,32 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
-        """hook call before passing data to function (called in `_execute` functions)"""
+        """Hook to massage a batch before it is forwarded to the compiled step.
+
+        Called inside the trainer's ``_execute_*_step`` wrappers, this
+        gives subclasses a chance to add/remove fields from the batch
+        and surface auxiliary scalar metrics that are merged into the
+        step's metrics output.
+
+        Args:
+            state: Current trainer state.
+            batch: Raw batch from the dataloader.
+            is_train: ``True`` for training-mode invocation, ``False``
+                during evaluation.
+
+        Returns:
+            A ``(processed_batch, extra_metrics)`` tuple.
+        """
 
     @abstractmethod
     def _ensure_functions_compiled(self):
-        """Ensure functions are compiled."""
+        """Ensure train/eval step functions have been JIT-compiled.
+
+        Idempotent guard called from the eager training/evaluation
+        entrypoints. Subclasses must arrange for
+        ``sharded_training_step_function`` (and the matching evaluation
+        function when applicable) to be ready before returning.
+        """
         ...
 
     @abstractmethod
@@ -1214,5 +1340,18 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def calculate_number_total_flops(self, params, is_training=True):
-        """Calculate total FLOPs for the model."""
+        """Estimate per-token FLOPs for the model based on its parameter count.
+
+        Used by :class:`StepMetrics` to derive throughput and TFLOPS
+        figures during training.
+
+        Args:
+            params: Model parameter pytree.
+            is_training: When ``True`` include the backward-pass multiplier
+                (typically 2x forward); ``False`` returns inference-only
+                FLOPs.
+
+        Returns:
+            int: Estimated FLOPs per token.
+        """
         ...

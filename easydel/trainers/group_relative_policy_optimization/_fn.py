@@ -65,7 +65,24 @@ RewardFunc = EasyDeLState | tp.Callable[[list, list], list[float]]
 
 
 def _masked_sum_and_count(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Return numerator/denominator matching the masked_mean semantics used below."""
+    """Return the (numerator, denominator) used by the chunked masked mean.
+
+    Mirrors the ``masked_mean`` helper defined inside :func:`grpo_step`:
+    when ``x`` has a trailing-singleton sequence axis (the sequence-level
+    importance-sampling path) the per-row mask is ignored and the numerator
+    is the plain sum; otherwise both numerator and denominator are taken
+    against the completion mask.
+
+    Args:
+        x: Per-token tensor of shape ``[batch, seq]`` (or ``[batch, 1]``
+            for sequence-level diagnostics).
+        mask: Completion mask of shape ``[batch, seq]``. Ignored when the
+            sequence axis is singleton.
+
+    Returns:
+        ``(numerator, denominator)`` where ``denominator`` is always
+        clamped to ``>= 1`` to avoid divide-by-zero downstream.
+    """
 
     if x.shape[1] == 1:
         return jnp.sum(x), jnp.array(x.shape[0], dtype=jnp.float32)
@@ -303,7 +320,35 @@ def _maybe_extend_inputs_embeds_for_scoring(
     *,
     prompt_length: int,
 ):
-    """Extend prompt-side embeddings so GRPO scores the same prompt representation it sampled from."""
+    """Pad ``inputs_embeds`` to cover the completion when scoring multimodal prompts.
+
+    GRPO generation may carry ``inputs_embeds`` only for the prompt
+    (e.g. when the prompt embeds visual tokens). When the policy is
+    later scored on the prompt+completion sequence we need a matching
+    embedding tensor; this helper concatenates the model's own token
+    embeddings for the completion ids onto the existing prompt
+    embeddings. If ``inputs_embeds`` is absent or already full-length
+    the kwargs are returned untouched.
+
+    Args:
+        model: Bound module exposing :meth:`compute_embedding` for the
+            completion-side ids.
+        input_ids: Full ``[batch, prompt + completion]`` id array used
+            to derive the completion ids.
+        model_kwargs: Generation kwargs that may carry ``inputs_embeds``.
+        prompt_length: Number of prompt tokens at the start of
+            ``input_ids``; used to slice the completion segment.
+
+    Returns:
+        A possibly-updated ``model_kwargs`` dict with ``inputs_embeds``
+        extended to length ``input_ids.shape[-1]``.
+
+    Raises:
+        ValueError: If ``inputs_embeds`` has a length that is neither
+            the prompt length nor the target full length, or if the
+            model returns embeddings with a different rank than the
+            existing prompt embeddings.
+    """
 
     inputs_embeds = model_kwargs.get("inputs_embeds", None)
     if inputs_embeds is None:
@@ -878,7 +923,22 @@ def grpo_step(
 
 
 def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
-    """Build the scheduled-loss cache key for GRPO-family trainers."""
+    """Build the scheduled-loss cache key for GRPO-family trainers.
+
+    The key fingerprints all algorithmic knobs that change the loss
+    graph (``num_generations``, ``beta``, ``loss_type``, clip bounds,
+    importance-sampling level, chunk sizes) plus the object identities
+    of the loss config, learning-rate schedule, and any QAT
+    straight-through emulator so that recompilation is triggered only
+    when those actually change.
+
+    Args:
+        call: The :class:`ScheduledStepCall` being compiled by the
+            SpectraX VJP pipeline.
+
+    Returns:
+        A tuple suitable for use as a SpectraX scheduled-loss cache key.
+    """
 
     return scheduled_loss_cache_key(
         call,
@@ -902,7 +962,24 @@ def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
 
 def _make_grpo_scheduled_loss(call):
-    """Create the scalar GRPO loss used by the SpectraX scheduled VJP path."""
+    """Build a SpectraX-scheduled scalar GRPO-loss closure for ``call``.
+
+    Captures the algorithmic hyperparameters (``num_generations``,
+    ``beta``, ``loss_type``, clip bounds, importance-sampling level,
+    chunk sizes, ...) and any QAT straight-through emulator from the
+    :class:`ScheduledStepCall`, then returns a function
+    ``(tree, batch) -> scalar`` which evaluates :func:`grpo_step` in
+    eval-mode and returns only the loss field. Used by the MPMD
+    pipeline scheduler to obtain a differentiable scalar.
+
+    Args:
+        call: The :class:`ScheduledStepCall` carrying loss config and
+            hyperparameters.
+
+    Returns:
+        A closure ``loss_fn(tree, batch) -> jax.Array`` returning the
+        scalar GRPO loss for one scheduled microbatch.
+    """
 
     num_generations = call.get("num_generations")
     beta = call.get("beta")
@@ -922,7 +999,21 @@ def _make_grpo_scheduled_loss(call):
     straight_through_emulator = call.get("straight_through_emulator")
 
     def scheduled_loss(tree, batch):
-        """Return the scalar GRPO loss for one scheduled microbatch."""
+        """Compute the scalar GRPO loss inside the SpectraX scheduled VJP.
+
+        Applies the optional straight-through emulator to the policy
+        graphstate, rebuilds an :class:`EasyDeLState` for ``grpo_step``,
+        and dispatches in eval mode so only the metrics path runs.
+
+        Args:
+            tree: Policy graphstate to differentiate against.
+            batch: Scheduled microbatch dict consumed by ``grpo_step``
+                (``prompt_ids`` / ``completion_ids`` / ``advantages`` /
+                ``ref_per_token_logps`` / generation kwargs).
+
+        Returns:
+            The scalar GRPO loss for the microbatch.
+        """
 
         with jax.named_scope("easydel/trainer/grpo/scheduled_loss"):
             if straight_through_emulator is not None:
