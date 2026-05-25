@@ -88,9 +88,16 @@ class eLoRA(nn.LoRA):
                 is exactly the base-module output.
             dtype: Computation dtype. When ``None`` no casting is performed.
 
-        Returns:
-            None.
+        Raises:
+            NotImplementedError: If ``base_module`` is a fused-projection
+                linear (``base_module.layout is not None``); LoRA over fused
+                projections is not yet supported.
         """
+        if base_module is not None and getattr(base_module, "layout", None) is not None:
+            raise NotImplementedError(
+                "LoRA adapters for fused projection layouts are not implemented yet. "
+                "Load or target the unfused projection names, or add a layout-aware LoRA-B fuser."
+            )
         super().__init__(
             d_in=d_in,
             rank=rank,
@@ -126,6 +133,21 @@ class eLoRA(nn.LoRA):
         ``w=...`` when reusing embedding weights for tied LM-head projection.
         Forwarding the extra arguments here keeps the wrapped base module's API
         intact while still adding the LoRA residual.
+
+        Args:
+            x: Input tensor of shape ``(..., d_in)``.
+            *args: Extra positional arguments forwarded verbatim to the base
+                module's call (e.g. positional weight overrides).
+            **kwargs: Extra keyword arguments forwarded verbatim to the base
+                module's call (most commonly ``w=...`` for tied projection).
+
+        Returns:
+            Tensor of shape ``(..., d_out)`` equal to the LoRA delta
+            ``x @ A @ B`` plus, when ``base_module`` is set, the base
+            module's own output.
+
+        Raises:
+            ValueError: If ``self.base_module`` is not callable.
         """
         x = self._maybe_cast(x, self.dtype)
         lora_a = self._maybe_cast(self.lora_a[...], self.dtype)

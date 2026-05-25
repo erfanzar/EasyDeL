@@ -128,13 +128,18 @@ M = tp.TypeVar("M")
 
 
 def int_key_to_string(xs):
-    """Convert all integer keys in a (possibly nested) dictionary to strings.
+    """Cast every integer key in a (possibly nested) dictionary to a string.
+
+    Useful before joining flattened paths with a separator, since otherwise
+    the integer container indices can't be ``str.join``ed.
 
     Args:
-        xs: Dictionary, possibly nested or already flattened.
+        xs: Dictionary, possibly nested or already flattened via
+            :func:`flatten_dict`.
 
     Returns:
-        Dictionary with the same structure but all integer keys cast to strings.
+        A dictionary with the same structure as ``xs`` where every integer
+        path segment has been replaced by its string form.
     """
     flatten = False
     if not is_flatten(xs):
@@ -149,13 +154,17 @@ def int_key_to_string(xs):
 
 
 def string_key_to_int(xs):
-    """Convert digit-only string keys in a dictionary back to integers.
+    """Promote digit-only string segments in path keys back to integers.
+
+    The inverse of :func:`int_key_to_string`; restores indexable integer
+    segments after a flatten/unflatten round trip.
 
     Args:
         xs: Dictionary, possibly nested or already flattened.
 
     Returns:
-        Dictionary with digit-string keys converted to ``int`` where possible.
+        A dictionary with the same structure as ``xs`` where every digit-only
+        string path segment has been converted to ``int``.
     """
     flatten = False
     if not is_flatten(xs):
@@ -289,20 +298,31 @@ def flatten_dict(
     sep: str | None = None,
     fumap: bool = False,
 ) -> dict[tuple | str, tp.Any]:
-    """
-    Enhanced dictionary flattening with better type handling and validation.
+    """Flatten a nested dictionary into a single-level path-keyed mapping.
+
+    Each leaf in ``xs`` ends up under a key that is either the tuple of path
+    segments leading to it or, when ``sep`` is provided, the string joined by
+    ``sep``. Integer keys are pre-converted to strings when ``sep`` is set so
+    the joined path remains well-defined.
 
     Args:
-        xs: Dictionary or mapping to flatten
-        keep_empty_nodes: Whether to keep empty dictionary nodes
-        is_leaf: Optional function to determine leaf nodes
-        sep: Optional separator for string keys
+        xs: Dictionary or mapping to flatten.
+        keep_empty_nodes: Whether to retain empty sub-dicts as ``empty_node``
+            sentinels so a later :func:`unflatten_dict` can restore them.
+        is_leaf: Optional ``(path, value) -> bool`` predicate that aborts the
+            recursion when it returns ``True``, treating ``value`` as a leaf.
+        sep: When provided, joins path tuples into strings using this
+            separator instead of returning tuple keys.
+        fumap: When ``True``, accept non-dict top-level inputs and treat them
+            as already-leaves.
 
     Returns:
-        Flattened dictionary
+        A flat dict whose keys are tuples (or separator-joined strings) and
+        whose values are the leaves of ``xs``.
 
     Raises:
-        TypeError: If input is not a dictionary or mapping
+        TypeError: If ``xs`` is not a dictionary or mapping and ``fumap`` is
+            ``False``.
     """
     if sep is not None:
         xs = int_key_to_string(xs)
@@ -316,30 +336,37 @@ def flatten_dict(
 
 
 def unflatten_dict(xs, sep=None):
-    """Reconstruct a nested dictionary from a flattened one.
+    """Reconstruct a nested dictionary from a flat path-keyed mapping.
+
+    Inverse of :func:`flatten_dict`; ``empty_node`` sentinels become empty
+    sub-dicts so structural round-trips with ``keep_empty_nodes=True`` are
+    lossless.
 
     Args:
-        xs: Flattened dictionary with tuple or separated-string keys.
+        xs: Flattened dictionary with tuple keys (or string keys when
+            ``sep`` is provided).
         sep: Separator used in string keys, or ``None`` for tuple keys.
 
     Returns:
-        Nested dictionary.
+        A nested dictionary reflecting the original tree structure.
     """
     return _dict_unflatten_dict(xs=xs, sep=sep)
 
 
 def is_flatten(tree: dict) -> bool:
-    """Checks if a dictionary represents a flattened tree.
+    """Check whether a dictionary already represents a flattened tree.
 
-    A flattened tree is a dictionary where the keys are tuples representing
-    the path to the leaf nodes. This function checks if any of the keys in the
-    input dictionary is a tuple, indicating a flattened tree.
+    A flattened tree is a dictionary whose keys are tuples representing the
+    path to leaf nodes. This helper returns ``True`` when at least one key in
+    ``tree`` is a tuple, mirroring the convention used by
+    :func:`flatten_dict`.
 
     Args:
-        tree: The dictionary to check.
+        tree: Dictionary to inspect.
 
     Returns:
-        bool: True if the dictionary is a flattened tree, False otherwise.
+        ``True`` when ``tree`` looks like the output of :func:`flatten_dict`,
+        ``False`` otherwise (including for empty dicts).
     """
     return True in set(isinstance(k, tuple) for k in tree.keys())
 
@@ -421,34 +448,50 @@ def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
 
 
 def specs_to_name_sharding(tree: dict, mesh: MeshLike | None = None) -> dict:
-    """Convert a PyTree of PartitionSpecs to a PyTree of NamedShardings."""
+    """Convert a PyTree of ``PartitionSpec``s to a PyTree of ``NamedSharding``s.
+
+    Thin wrapper around :func:`easydel.infra.sharding.specs_to_named_sharding`
+    kept for historic naming compatibility.
+
+    Args:
+        tree: PyTree whose leaves are ``PartitionSpec`` instances.
+        mesh: Optional mesh to bind the resulting ``NamedSharding`` objects
+            to; defaults to the active EasyDeL mesh.
+
+    Returns:
+        A PyTree with the same structure whose leaves are ``NamedSharding``.
+    """
     return specs_to_named_sharding(tree, mesh)
 
 
 def tree_apply(fns: FnDict, tree: TreeDict) -> TreeDict:
-    """
-    Apply a dictionary of functions to a corresponding PyTree.
+    """Apply a dictionary of functions to a corresponding PyTree.
 
     Args:
-            fns: A dictionary where keys match the PyTree structure and values are functions.
-            tree: The PyTree to apply functions to.
+        fns: A PyTree-shaped dict whose leaves are unary callables applied to
+            the matching leaf in ``tree``.
+        tree: The PyTree of values to transform.
 
     Returns:
-            A new PyTree with the same structure as `tree`, but with values modified by the functions in `fns`.
+        A new PyTree with the same structure as ``tree``, with each leaf
+        replaced by ``fns[leaf_path](tree[leaf_path])``.
     """
     return jax.tree_util.tree_map(lambda fn, x: fn(x), fns, tree)
 
 
 def tree_path_to_string(path: Path, sep: str | None = None) -> str | tuple[str, ...]:
-    """
-    Convert a JAX tree path to a string representation.
+    """Convert a JAX tree path tuple to a string-friendly representation.
 
     Args:
-            path: The JAX tree path tuple.
-            sep: Separator to use when joining path elements.
+        path: JAX path tuple as produced by ``tree_flatten_with_path``;
+            elements may be ``SequenceKey``/``DictKey``/``GetAttrKey``/
+            ``FlattenedIndexKey`` instances.
+        sep: Separator to join path elements into a single string; when
+            ``None`` (default) the segments are returned as a tuple.
 
     Returns:
-            The string representation of the path.
+        A joined string when ``sep`` is provided, otherwise a tuple of the
+        stringified path segments.
     """
     keys = []
     for key in path:
@@ -472,16 +515,22 @@ def flatten_tree(
     is_leaf: tp.Callable[[tp.Any], bool] | None = None,
     sep: str | None = None,
 ) -> dict[str, tp.Any]:
-    """
-    Flatten a JAX tree and convert paths to strings.
+    """Flatten a JAX PyTree into a dict keyed by stringified paths.
+
+    Unlike :func:`flatten_dict` (which only walks regular dicts), this helper
+    uses ``jax.tree_util.tree_flatten_with_path`` so it understands any
+    registered PyTree node type and turns the resulting paths into strings
+    via :func:`tree_path_to_string`.
 
     Args:
-            xs: The JAX tree to flatten.
-            is_leaf: Optional function to determine leaf nodes.
-            sep: Separator to use when joining path elements.
+        xs: The JAX PyTree to flatten.
+        is_leaf: Optional predicate forwarded to ``tree_flatten_with_path``
+            to stop descent on custom node types.
+        sep: Separator used when joining path elements; ``None`` returns
+            tuple-of-strings keys.
 
     Returns:
-            A flattened dictionary with string keys representing the tree paths.
+        A flattened ``dict`` mapping path keys to the original leaves.
     """
     flattened, _ = jax.tree_util.tree_flatten_with_path(xs, is_leaf=is_leaf)
     output = {}
@@ -497,21 +546,25 @@ def named_tree_map(
     is_leaf: tp.Callable[[tp.Any], bool] | None = None,
     sep: str | None = None,
 ) -> PyTree:
-    """
-    An extended version of `jax.tree_util.tree_map`.
+    """Map ``f`` over ``tree`` leaves with the path passed as the first argument.
 
-    This function extends `jax.tree_util.tree_map` by providing the path
-    (as a string) to the current leaf node as an argument to the mapped function `f`.
+    Extends ``jax.tree_util.tree_map`` by exposing the path (as a string or
+    tuple, depending on ``sep``) to the current leaf, useful for utilities
+    that want to dispatch on parameter names.
 
     Args:
-            f: The function to apply to each leaf node, taking the path and value as input.
-            tree: The JAX tree to map over.
-            *rest: Additional arguments to be passed to `f`.
-            is_leaf: Optional function to determine leaf nodes.
-            sep: Separator to use when joining path elements.
+        f: Callable invoked as ``f(path, leaf, *rest_leaves)``.
+        tree: PyTree whose leaves drive the mapping.
+        *rest: Additional PyTrees that must share ``tree``'s structure; each
+            leaf is forwarded positionally to ``f``.
+        is_leaf: Optional predicate forwarded to
+            ``tree_map_with_path`` to stop descent.
+        sep: Separator used when stringifying the path; ``None`` passes a
+            tuple of path segments instead.
 
     Returns:
-            A new tree with the same structure as `tree` but with the values modified by `f`.
+        A new PyTree with the same structure as ``tree`` whose leaves are the
+        return values of ``f``.
     """
     return jax.tree_util.tree_map_with_path(
         lambda path, x, *r: f(tree_path_to_string(path, sep=sep), x, *r),
@@ -522,20 +575,19 @@ def named_tree_map(
 
 
 def deepcopy_model(model):
-    """
-    Creates a deep copy of a JAX model.
+    """Deep-copy a JAX-registered model by copying its leaves.
 
-    This function takes a JAX model, extracts its leaves (the individual
-    components of the model), deep copies them, and then reconstructs the
-    model with the copied leaves.
+    Extracts the model's leaves, ``copy.deepcopy``s each, then rebuilds the
+    tree using the original ``tree_structure``. Compared with a plain
+    ``copy.deepcopy`` this avoids touching non-leaf objects (mesh references,
+    sharding metadata, etc.) and works for any registered PyTree type.
 
     Args:
-            model: A JAX model to be deep copied. This can be any nested structure
-                             of JAX arrays, lists, tuples, dicts, etc.
+        model: PyTree-shaped object to clone (typically a Spectrax module or
+            a parameter dict).
 
     Returns:
-            A deep copy of the input model with the same structure but with all
-            leaves deep copied.
+        A deep copy with identical structure and independent leaf storage.
     """
     leaves = deepcopy(jax.tree_util.tree_leaves(model))
     struct = jax.tree_util.tree_structure(model)
@@ -543,15 +595,20 @@ def deepcopy_model(model):
 
 
 def recursive_merge(full_tree, updates):
-    """
-    Recursively merge two PyTrees where updates may have fewer parameters.
+    """Recursively merge ``updates`` into ``full_tree`` skipping missing nodes.
+
+    Useful for restoring a checkpoint that only contains a subset of the live
+    model's parameters; values not present in ``updates`` are taken verbatim
+    from ``full_tree``. ``updates`` of ``None`` is a no-op.
 
     Args:
-        full_tree: The complete parameter tree
-        updates: Tree with updated values (subset of full_tree)
+        full_tree: Complete reference tree whose structure is preserved.
+        updates: Tree (or sub-tree) of values that override entries in
+            ``full_tree``. May omit keys/indices.
 
     Returns:
-        Merged tree with updated values where available
+        A merged tree with the same structure as ``full_tree`` where matching
+        nodes from ``updates`` have been substituted in.
     """
     if updates is None:
         return full_tree
@@ -577,17 +634,22 @@ def recursive_merge(full_tree, updates):
 
 
 def iter_module_search(model: spx.Module, instance: type[T] | None = None) -> Generator[tuple[tp.Any, T], None, None]:
-    """
-    Iterates through a model and yields paths and modules of a specific type.
+    """Iterate over a Spectrax module tree yielding modules of a given type.
+
+    Wraps ``spectrax.iter_modules`` to (a) split dotted paths into tuples so
+    they're directly usable for index-based set/get, and (b) skip
+    ``spx.Rngs`` containers which are visited by the underlying iterator but
+    are uninteresting for almost every EasyDeL use site.
 
     Args:
-        model: The root module to search through.
-        instance: The type of module to search for.
+        model: Root module to search.
+        instance: Concrete class to filter by; when ``None`` every non-Rngs
+            module is yielded.
 
     Yields:
-        tp.Tuple containing:
-            - Path to the module as a tuple of strings/integers
-            - The module instance matching the specified type
+        ``(path_tuple, module)`` pairs where ``path_tuple`` is the tuple-form
+        navigation path consumable by :func:`get_module_from_path` /
+        :func:`set_module_from_path`.
 
     Example:
         >>> for path, module in iter_module_search(model, ParallelLinear):
@@ -607,18 +669,23 @@ def iter_module_search(model: spx.Module, instance: type[T] | None = None) -> Ge
 
 
 def get_module_from_path(model: spx.Module, path: ModulePath) -> spx.Module | None:
-    """
-    Retrieves a module from a model given its path.
+    """Retrieve a sub-module by walking ``path`` from ``model``.
+
+    Mixed integer/string paths are supported: integer segments index into
+    sequence containers and string segments use ``getattr`` (with a fallback
+    to ``int(seg)`` indexing when the attribute does not exist).
 
     Args:
-        model: The root module to traverse.
-        path: tp.Tuple of strings/integers representing the path to the module.
+        model: Root module to traverse.
+        path: Tuple of path segments to walk.
 
     Returns:
-        The module at the specified path, or None if path is empty.
+        The module at ``path``, or ``None`` when ``path`` is empty.
 
-    Example:
-        >>> module = get_module_from_path(model, ("encoder", "layer1", "attention"))
+    Raises:
+        AttributeError: When a string segment is neither an attribute nor
+            convertible to a valid container index.
+        IndexError: When an integer segment is out of range.
     """
     if not path:
         return None
@@ -641,17 +708,20 @@ def get_module_from_path(model: spx.Module, path: ModulePath) -> spx.Module | No
 
 
 def set_module_from_path(model: spx.Module, path: ModulePath, new_value: tp.Any) -> None:
-    """
-    Sets a module at a specific path in the model.
+    """Install ``new_value`` at ``path`` inside ``model``.
+
+    Navigates to the parent of ``path`` using the same rules as
+    :func:`get_module_from_path`, then writes ``new_value`` into the final
+    segment. Empty paths are a no-op.
 
     Args:
-        model: The root module to modify.
-        path: tp.Tuple of strings/integers representing the path to the module.
-        new_value: The new value/module to set at the specified path.
+        model: Root module to mutate.
+        path: Tuple of path segments identifying the slot to overwrite.
+        new_value: Replacement module or value.
 
     Raises:
-        AttributeError: If the path is invalid.
-        IndexError: If trying to access an invalid index.
+        AttributeError: When a path segment is invalid.
+        IndexError: When an integer segment is out of range.
 
     Example:
         >>> new_layer = ParallelLinear(64, 128)

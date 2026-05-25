@@ -201,12 +201,12 @@ def quantize(
     group_size: int | None = None,
     simulate: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-    """Quantize an array using the specified quantization format.
+    """Quantize ``array`` using the requested format and return packed weights or a simulation.
 
-    This is the primary quantization interface for EasyDeL. It dispatches to
-    the appropriate quantization implementation based on the specified dtype
-    and returns either an implicit array (memory-efficient) or a materialized
-    array (for simulation mode).
+    The primary array-level quantization entry point. Dispatches to the
+    appropriate implementation based on ``dtype`` and returns either an
+    ejkernel-packed tuple (memory-efficient) or a materialized array (the
+    simulation path or the ``jax_native`` cast path).
 
     Args:
         array: Input array to quantize. Typically model weights in float32
@@ -365,7 +365,7 @@ class EasyQuantizer:
     """
 
     def __init__(self, quantization_config: QuantizationConfig | None = None) -> None:
-        """Initialize the EasyQuantizer with a configuration.
+        """Initialize the quantizer with an optional :class:`QuantizationConfig`.
 
         Args:
             quantization_config: Configuration specifying quantization dtype,
@@ -377,26 +377,20 @@ class EasyQuantizer:
 
     @property
     def config(self) -> QuantizationConfig | QuantizationConfig | None:
-        """Get the quantization configuration.
-
-        Returns:
-            The QuantizationConfig object used by this quantizer, or None
-            if quantization is disabled.
-        """
+        """Return the underlying :class:`QuantizationConfig`, or ``None`` when disabled."""
         return self._config
 
     @property
     def pattern(self) -> str | None:
-        """Get the regex pattern for layer selection.
+        """Return the regex used to select quantizable layer paths.
 
-        The pattern is used to determine which layers should be quantized
-        based on their path names in the model.
+        Falls back to :data:`DEFAULT_QUANTIZATION_PATTERN` (which excludes
+        embeddings, normalization, and the LM head) when the config is
+        ``None`` or carries no pattern.
 
         Returns:
-            Regex pattern string. Returns the config's pattern if available,
-            otherwise returns the default pattern that excludes embedding,
-            normalization, and output head layers. May return None if the
-            config's pattern is None.
+            Regex pattern string, or ``None`` when the config explicitly
+            stores ``pattern=None``.
         """
         if self._config is None:
             return DEFAULT_QUANTIZATION_PATTERN
@@ -410,11 +404,12 @@ class EasyQuantizer:
         array: jax.Array,
         path: str | tuple[str] | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-        """Quantize an array with optional path-based filtering.
+        """Quantize ``array`` with optional path-based filtering.
 
-        This method allows using the quantizer as a callable for convenient
-        array quantization. When a path is provided, it is matched against
-        the quantization pattern to determine if quantization should be applied.
+        When ``path`` is supplied it is normalized into a dotted string and
+        matched against :attr:`pattern`; mismatching paths return the
+        original array unchanged. The whole call is wrapped in a JAX named
+        scope ``"easydel-easyquantize-call"`` for profile attribution.
 
         Args:
             array: The array to quantize. Typically model weights in float32
@@ -466,10 +461,10 @@ class EasyQuantizer:
         array: jax.Array,
         simulate: bool = False,
     ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-        """Quantize a single array using the configured quantization method.
+        """Quantize a single array using the bound config (no path filtering).
 
-        This is a convenience method that applies the quantizer's configuration
-        to a single array without path-based filtering.
+        Convenience method that forwards to :func:`quantize` without the
+        path-based pattern matching that :meth:`__call__` performs.
 
         Args:
             array: The array to quantize. Typically model weights in float32
@@ -507,12 +502,13 @@ class EasyQuantizer:
         quantization_pattern: str | None = None,
         **kwargs,
     ) -> spx.Module:
-        """Quantize compatible modules in a model to lower precision.
+        """Walk the model and swap every quantizable submodule for its quantized twin.
 
-        This method traverses the model and converts modules that support
-        quantization (those with a `to_quantized` method) to their quantized
-        equivalents. This is the recommended approach for production deployment
-        as it replaces entire layer implementations with optimized versions.
+        Iterates every submodule path matching :attr:`pattern`, then for each
+        whose class exposes a ``to_quantized(config, **qmm_kwargs)`` method,
+        rebinds the submodule to the result. ``**kwargs`` may contain
+        ``qmm_*`` runtime overrides (or any of the legacy aliases) that are
+        forwarded only to the layers whose signature accepts them.
 
         Args:
             model: The spectrax model to quantize. Positional-only argument.
@@ -589,11 +585,12 @@ class EasyQuantizer:
         return model
 
     def dequantize_modules(self, model: spx.Module) -> spx.Module:
-        """Restore quantized modules to their full-precision equivalents.
+        """Walk the model and restore every quantized submodule to its float twin.
 
-        This method traverses the model and converts quantized modules back
-        to their full-precision implementations. It is the inverse operation
-        of `apply_quantization`.
+        Inverse of :meth:`apply_quantization`: each submodule exposing a
+        ``from_quantized(config)`` method is replaced with the float-precision
+        layer it returns. Useful when continuing to fine-tune after a
+        quantized inference pass or for debugging.
 
         Args:
             model: The model with quantized layers to restore.
@@ -632,12 +629,7 @@ class EasyQuantizer:
         return model
 
     def __str__(self) -> str:
-        """Return a string representation of the quantizer.
-
-        Returns:
-            Formatted string showing the quantizer class name and its
-            configuration settings.
-        """
+        """Return a developer-friendly ``ClassName(config=...)`` representation."""
         return self.__class__.__name__ + f"(\n\tconfig = {self.config}\n)"
 
     __repr__ = __str__

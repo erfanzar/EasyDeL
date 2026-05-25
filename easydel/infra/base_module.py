@@ -354,7 +354,21 @@ class EasyDeLLayerStackMixin:
         enabled: bool,
         cache: tp.Any = None,
     ) -> tp.Any:
-        """Read a mutable per-layer cache view for trace/cache execution."""
+        """Read a mutable per-layer cache view for trace/cache execution.
+
+        Args:
+            cache_views: Mutable per-layer cache views handle (None when
+                cache plumbing is not in use).
+            layer_idx: Index into the cache view container.
+            enabled: When ``False`` cache plumbing is bypassed and ``None``
+                is returned without indexing.
+            cache: Optional flat cache to prefer over ``cache_views`` (used
+                during trace paths).
+
+        Returns:
+            Any | None: The cache view for ``layer_idx`` or ``None`` when
+            disabled / unavailable.
+        """
         if not enabled:
             return None
         if cache is not None:
@@ -372,7 +386,19 @@ class EasyDeLLayerStackMixin:
         enabled: bool,
         cache: tp.Any = None,
     ) -> tp.Any:
-        """Update mutable per-layer cache views only on cache/trace paths."""
+        """Update mutable per-layer cache views only on cache/trace paths.
+
+        Args:
+            cache_views: Existing mutable per-layer cache views container.
+            layer_idx: Index of the layer being updated.
+            new_view: Replacement cache view (skipped when ``None``).
+            enabled: When ``False`` the update is a no-op.
+            cache: Optional flat cache to update instead of ``cache_views``.
+
+        Returns:
+            Any: The (possibly mutated) ``cache_views`` handle, returned for
+            functional-style chaining inside layer loops.
+        """
         if not enabled or new_view is None:
             return cache_views
         if cache is not None:
@@ -382,15 +408,31 @@ class EasyDeLLayerStackMixin:
         return cache_views
 
     def _pipeline_stage_count(self: Self) -> int:
-        """Return the logical pipeline width from the canonical SpectraX mesh."""
+        """Return the logical pipeline width (physical PP * virtual stages).
+
+        Returns:
+            int: Total logical pipeline width derived from
+            ``config.mesh.shape['pp']`` multiplied by
+            ``config.pipeline_virtual_stages``.
+        """
         return int(self.config.mesh.shape["pp"]) * int(self.config.pipeline_virtual_stages)
 
     def _pipeline_physical_stage_count(self: Self) -> int:
-        """Return the physical pipeline width from the canonical SpectraX mesh."""
+        """Return the number of physical pipeline ranks.
+
+        Returns:
+            int: ``config.mesh.shape['pp']`` cast to ``int``.
+        """
         return int(self.config.mesh.shape["pp"])
 
     def _pipeline_stage_regions_enabled(self: Self) -> bool:
-        """Whether this module should emit SpectraX stage-region markers."""
+        """Return whether this module should emit SpectraX stage-region markers.
+
+        Returns:
+            bool: ``True`` only when ``config.pipeline_stage_regions`` is
+            enabled *and* the resolved logical pipeline width is greater
+            than one.
+        """
         if not bool(getattr(self.config, "pipeline_stage_regions", False)):
             return False
         try:
@@ -399,7 +441,12 @@ class EasyDeLLayerStackMixin:
             return False
 
     def _pipeline_stage_region_name(self: Self) -> str:
-        """Return a stable human-readable region name for this module call."""
+        """Return a stable human-readable region name for this module call.
+
+        Returns:
+            str: ``_model_type`` if set; otherwise ``base_model_prefix``;
+            otherwise the class name.
+        """
         model_type = getattr(self, "_model_type", None) or getattr(self.config, "model_type", None)
         if model_type:
             return str(model_type)
@@ -409,17 +456,40 @@ class EasyDeLLayerStackMixin:
         return type(self).__name__
 
     def _pipeline_stage_region(self: Self):
-        """Build the SpectraX region wrapper used by EasyDeL module calls."""
+        """Build the SpectraX region wrapper used by EasyDeL module calls.
+
+        Returns:
+            Any: A :func:`spx.sxstage_region` wrapper named per
+            :meth:`_pipeline_stage_region_name`, ready to wrap a callable.
+        """
         return spx.sxstage_region(self._pipeline_stage_region_name())
 
     def _pipeline_layer_position(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
-        """Map a stack-local layer index into the model-wide PP layer order."""
+        """Map a stack-local layer index into the model-wide PP layer order.
+
+        Args:
+            layer_idx: Index of the layer within this module's stack.
+            total_layers: Default total layer count for the model.
+
+        Returns:
+            tuple[int, int]: ``(global_layer_index, global_total_layers)``,
+            using ``pipeline_layer_offset`` / ``pipeline_layer_total`` when
+            set on the config.
+        """
         offset = int(getattr(self.config, "pipeline_layer_offset", 0) or 0)
         total = int(getattr(self.config, "pipeline_layer_total", total_layers) or total_layers)
         return offset + int(layer_idx), max(1, total)
 
     def _pipeline_logical_stage(self: Self, layer_idx: int, total_layers: int) -> int:
-        """Resolve a stack-local layer index to a model-wide logical PP stage."""
+        """Resolve a stack-local layer index to a model-wide logical PP stage.
+
+        Args:
+            layer_idx: Index of the layer within this module's stack.
+            total_layers: Default total layer count for the model.
+
+        Returns:
+            int: Logical pipeline stage index in ``[0, _pipeline_stage_count)``.
+        """
         logical_pp = self._pipeline_stage_count()
         global_idx, global_total = self._pipeline_layer_position(layer_idx, total_layers)
         return min(logical_pp - 1, (global_idx * logical_pp) // global_total)
@@ -431,6 +501,15 @@ class EasyDeLLayerStackMixin:
         default SpectraX virtual schedules. Parameter metadata stores the
         physical owner so creation-time sharding matches the schedule instead
         of requiring runtime cross-rank parameter moves.
+
+        Args:
+            layer_idx: Index of the layer within this module's stack.
+            total_layers: Default total layer count for the model.
+
+        Returns:
+            tuple[int, int]: ``(physical_rank, physical_pp)``, with the rank
+            picked according to the configured ``pipeline_stage_layout``
+            (``"contiguous"``, ``"loop"``, or the default interleaved layout).
         """
         physical_pp = self._pipeline_physical_stage_count()
         if physical_pp <= 1:
@@ -471,7 +550,20 @@ class EasyDeLLayerStackMixin:
         layers: tp.Sized | None = None,
         total_layers: int | None = None,
     ):
-        """Enter the physical PP owner context for executing a concrete layer."""
+        """Enter the physical PP owner context for executing a concrete layer.
+
+        Args:
+            layer_idx: Concrete (non-traced) layer index. Passing a tracer
+                falls back to a no-op yield.
+            layers: Optional sized container used to derive ``total_layers``
+                when omitted.
+            total_layers: Optional explicit total layer count.
+
+        Yields:
+            None: Inside the ``with`` block, SpectraX assigns the resolved
+            physical PP rank for the layer; if pipeline parallelism is not
+            in use the block runs unchanged.
+        """
         try:
             idx = int(layer_idx)
         except (TypeError, ValueError, jax.errors.ConcretizationTypeError):
@@ -496,7 +588,29 @@ class EasyDeLLayerStackMixin:
         cache_views: tp.Iterable[tp.Any] | None = None,
         extra: bool = False,
     ) -> bool:
-        """Resolve whether a repeated-layer stack must use the Python trace path."""
+        """Resolve whether a repeated-layer stack must use the Python trace path.
+
+        ``jax.lax.scan`` cannot honour any of the EasyDeL features that need
+        per-iteration Python control (hidden-state aggregation, paged-cache
+        views, pipeline parallelism). This helper centralises that decision
+        so each stack just reads a single bool to choose between scan and
+        explicit Python iteration.
+
+        Args:
+            trace: Caller's explicit "trace this stack" override.
+            output_hidden_states: When ``True`` forces Python iteration so
+                per-layer hidden states can be collected.
+            output_attentions: When ``True`` forces Python iteration so
+                per-layer attention probabilities can be collected.
+            cache: Reserved for symmetry with caller signatures; ignored.
+            cache_views: Iterable of per-layer cache views. Any non-``None``
+                entry forces Python iteration.
+            extra: Arbitrary caller-supplied flag that should always force
+                Python iteration.
+
+        Returns:
+            bool: ``True`` when the stack must run in Python (no scan).
+        """
         del cache
         has_cache_views = cache_views is not None and any(view is not None for view in cache_views)
         return (
@@ -516,7 +630,22 @@ class EasyDeLLayerStackMixin:
         *,
         layers: tp.Sized | None = None,
     ) -> tp.Any:
-        """Mark dynamic pipeline stage boundaries for repeated layer stacks."""
+        """Mark dynamic pipeline stage boundaries for repeated layer stacks.
+
+        When the next layer lives on a different pipeline stage, emits an
+        :func:`spx.sxstage_iter` marker on ``hidden_states`` so SpectraX
+        inserts the appropriate cross-stage transfer.
+
+        Args:
+            hidden_states: Activation tensor returned by the current layer.
+            layer_idx: Index of the current layer.
+            layers: Optional sized container used to derive the total layer
+                count when ``layer_idx`` is a concrete int.
+
+        Returns:
+            Any: ``hidden_states`` either unchanged (no boundary crossing or
+            traced index) or wrapped with the stage-transfer marker.
+        """
         try:
             idx = int(layer_idx)
         except (TypeError, ValueError):
@@ -534,7 +663,20 @@ class EasyDeLLayerStackMixin:
         return hidden_states
 
     def _layer_stage_boundary_sharding(self: Self, hidden_states: tp.Any) -> PartitionSpec | None:
-        """Resolve the activation sharding contract for PP stage edges."""
+        """Resolve the activation sharding contract for PP stage edges.
+
+        Picks the right ``HiddenStateSharding`` axes for prefill vs decode
+        by inspecting the sequence length, then maps them onto a
+        :class:`PartitionSpec` through the runtime sharding resolver.
+
+        Args:
+            hidden_states: Activation tensor about to cross a PP stage
+                boundary.
+
+        Returns:
+            PartitionSpec | None: The resolved sharding spec, or ``None``
+            when the activation has no shape attribute or resolution fails.
+        """
         if not hasattr(hidden_states, "shape"):
             return None
         try:
@@ -713,21 +855,179 @@ class EasyDeLBaseModule(
         _ = self.model_type
 
     def __call__(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
-        """Call the module, optionally annotated as a SpectraX stage region."""
+        """Call the module, optionally annotated as a SpectraX stage region.
+
+        Args:
+            *args: Positional arguments forwarded to the underlying
+                ``spx.Module.__call__``.
+            **kwargs: Keyword arguments forwarded to the underlying
+                ``spx.Module.__call__``.
+
+        Returns:
+            Any: Whatever the module's forward path returns, optionally
+            wrapped in an :func:`spx.sxstage_region` when pipeline-region
+            annotation is enabled.
+        """
         if self._pipeline_stage_regions_enabled():
             return self._pipeline_stage_region()(super().__call__)(*args, **kwargs)
         return super().__call__(*args, **kwargs)
 
+    def drafter(
+        self,
+        method: str = "auto",
+        *,
+        num_draft_tokens: int = 2,
+        assistant_model: tp.Any | None = None,
+        target_embed_module: tp.Any | None = None,
+        layer_mapping: list[int] | None = None,
+        target_config: tp.Any | None = None,
+        **kwargs: tp.Any,
+    ) -> tp.Any:
+        """Build a speculative-decoding drafter owned by this model.
+
+        Examples:
+            >>> drafter = model.drafter(method="mtp", num_draft_tokens=4)
+            >>> drafter = model.drafter(
+            ...     method="gemma4_assistant",
+            ...     assistant_model=assistant,
+            ...     num_draft_tokens=4,
+            ... )
+
+        Args:
+            method: Drafter family. ``"auto"`` picks ``"mtp"`` when this
+                model exposes an inline MTP head. Supported values today are
+                ``"mtp"`` and ``"gemma4_assistant"``.
+            num_draft_tokens: Speculative tokens proposed per verify window.
+            assistant_model: Standalone assistant model for assistant-based
+                drafting.
+            target_embed_module: Optional target token embedding module for
+                assistant drafting. If omitted, it is resolved from ``self``.
+            layer_mapping: Optional assistant-layer to target-layer mapping.
+            target_config: Optional target config. Defaults to ``self.config``.
+            **kwargs: Extra drafter-specific constructor arguments.
+
+        Returns:
+            A drafter implementing :class:`easydel.inference.speculative.DrafterProtocol`.
+        """
+        method_key = re.sub(r"[^a-z0-9]+", "_", str(method or "auto").strip().lower()).strip("_")
+        method_aliases = {
+            "qwen3_5_mtp": "mtp",
+            "qwen35_mtp": "mtp",
+            "inline_mtp": "mtp",
+            "assistant": "gemma4_assistant",
+            "gemma4": "gemma4_assistant",
+            "gemma4_assistant_drafter": "gemma4_assistant",
+        }
+        method_key = method_aliases.get(method_key, method_key)
+
+        if method_key == "auto":
+            if bool(getattr(self, "has_mtp", lambda: False)()):
+                method_key = "mtp"
+            elif assistant_model is not None:
+                method_key = "gemma4_assistant"
+            else:
+                raise ValueError(
+                    f"{type(self).__name__} cannot infer a drafter. Pass method='mtp' or method='gemma4_assistant'."
+                )
+
+        if method_key == "mtp":
+            if not bool(getattr(self, "has_mtp", lambda: False)()):
+                raise ValueError(f"{type(self).__name__} does not expose an inline MTP head.")
+            from easydel.inference.speculative import Qwen3_5MTPDrafter
+
+            return Qwen3_5MTPDrafter(
+                self,
+                num_draft_tokens=num_draft_tokens,
+                **kwargs,
+            )
+
+        if method_key == "gemma4_assistant":
+            if assistant_model is None:
+                raise ValueError("method='gemma4_assistant' requires assistant_model=...")
+            from easydel.inference.speculative import Gemma4AssistantDrafter
+
+            drafter = Gemma4AssistantDrafter(
+                assistant_model=assistant_model,
+                target_embed_module=target_embed_module or self._resolve_drafter_target_embedding(),
+                layer_mapping=layer_mapping,
+                target_config=target_config if target_config is not None else getattr(self, "config", None),
+                **kwargs,
+            )
+            drafter.num_draft_tokens = max(1, int(num_draft_tokens))
+            return drafter
+
+        if method_key in {"dflash", "eagle", "eagle3", "medusa", "mlp_speculator"}:
+            raise NotImplementedError(
+                f"model.drafter(method={method!r}) is not wired in EasyDeL yet. "
+                "Use method='mtp' or method='gemma4_assistant' for now."
+            )
+
+        raise ValueError(f"Unknown drafter method {method!r}.")
+
+    def _resolve_drafter_target_embedding(self) -> tp.Any:
+        """Resolve this model's token embedding module for assistant drafters.
+
+        Walks several conventional accessors (``get_embedding``,
+        ``get_input_embeddings``, ``get_language_model``, ``base_model``,
+        ``model``) to find a usable token embedding module for an assistant
+        drafter.
+
+        Returns:
+            Any: The discovered embedding module.
+
+        Raises:
+            ValueError: When no embedding module can be located.
+        """
+        for getter_name in ("get_embedding", "get_input_embeddings"):
+            getter = getattr(self, getter_name, None)
+            if callable(getter):
+                with contextlib.suppress(NotImplementedError):
+                    embedding = getter()
+                    if embedding is not None:
+                        return embedding
+        get_language_model = getattr(self, "get_language_model", None)
+        if callable(get_language_model):
+            language_model = get_language_model()
+            getter = getattr(language_model, "get_embedding", None)
+            if callable(getter):
+                embedding = getter()
+                if embedding is not None:
+                    return embedding
+        base_model = getattr(self, "base_model", None) or getattr(self, "model", None)
+        if base_model is not None:
+            getter = getattr(base_model, "get_embedding", None)
+            if callable(getter):
+                embedding = getter()
+                if embedding is not None:
+                    return embedding
+        raise ValueError(f"Could not resolve target token embedding module for {type(self).__name__}.")
+
     @property
     def trainable_selector(self: Self) -> spx.SelectorSugar:
-        """Return the canonical default trainable selector for this module."""
+        """Return the canonical default trainable selector for this module.
+
+        Subclasses (e.g. LoRA-only training) override this property to
+        return a narrower selector.
+
+        Returns:
+            spx.SelectorSugar: The string ``"parameters"`` by default,
+            usable with ``spx.split``/``spx.as_selector``.
+        """
         return "parameters"
 
     def resolve_trainable_selector(
         self: Self,
         trainable_selector: spx.SelectorSugar | None = None,
     ) -> spx.SelectorSugar:
-        """Resolve ``trainable_selector`` against the module default."""
+        """Resolve ``trainable_selector`` against the module default.
+
+        Args:
+            trainable_selector: Optional explicit selector. When ``None``
+                the module's :attr:`trainable_selector` is returned.
+
+        Returns:
+            spx.SelectorSugar: The resolved selector.
+        """
         return self.trainable_selector if trainable_selector is None else trainable_selector
 
     def _partition_trainable_state(
@@ -736,7 +1036,18 @@ class EasyDeLBaseModule(
         *,
         trainable_selector: spx.SelectorSugar | None = None,
     ) -> tuple[spx.State, spx.State]:
-        """Partition ``state`` into selected trainables and the remaining state."""
+        """Partition ``state`` into selected trainables and the remaining state.
+
+        Args:
+            state: A SpectraX state container produced by :func:`spx.export`.
+            trainable_selector: Optional override for the trainable
+                selector; defaults to the module's
+                :attr:`trainable_selector`.
+
+        Returns:
+            tuple[spx.State, spx.State]: ``(graphstate, graphother)`` — the
+            selected trainable subtree and its complement.
+        """
         selector = spx.as_selector(self.resolve_trainable_selector(trainable_selector))
         return selector.partition_state(self, state)
 
@@ -747,7 +1058,20 @@ class EasyDeLBaseModule(
         extract_fn: tp.Callable | None = None,
         remove_none: bool = True,
     ) -> dict[str, tp.Any]:
-        """Return a flat ``path -> array`` mapping for the selected trainables."""
+        """Return a flat ``path -> array`` mapping for the selected trainables.
+
+        Args:
+            selector: Optional override for the trainable selector.
+            extract_fn: Optional callable applied to each leaf, useful for
+                unwrapping :class:`spx.Parameter` boxes or materialising
+                quantized weights.
+            remove_none: When ``True`` (default), drop entries whose value
+                is ``None`` after extraction.
+
+        Returns:
+            dict[str, Any]: Flat mapping from dotted parameter path to the
+            (extracted) leaf value.
+        """
         flat_values: dict[str, tp.Any] = {}
         for _collection, path, value in self.split_parameters(selector).items():
             leaf = extract_fn(value) if extract_fn is not None else value
@@ -762,7 +1086,18 @@ class EasyDeLBaseModule(
         *,
         selector: spx.SelectorSugar | None = None,
     ) -> tuple[tuple[str, str, tuple[tp.Any, ...], tp.Any], ...]:
-        """Return selected trainable leaves that are still abstract placeholders."""
+        """Return selected trainable leaves still represented as ``ShapeDtypeStruct``.
+
+        Useful to detect checkpoints that have not finished materialising
+        on the live model.
+
+        Args:
+            selector: Optional override for the trainable selector.
+
+        Returns:
+            tuple: Tuple of ``(collection, path, shape, dtype)`` tuples,
+            one per abstract leaf still present in the selected state.
+        """
         missing: list[tuple[str, str, tuple[tp.Any, ...], tp.Any]] = []
         for collection, path, value in self.split_parameters(selector).items():
             leaf = value.value if hasattr(value, "value") else value
@@ -776,7 +1111,20 @@ class EasyDeLBaseModule(
         selector: spx.SelectorSugar | None = None,
         context: str = "parameter materialization",
     ) -> Self:
-        """Fail if a real-weight path still contains lazy ShapeDtypeStruct leaves."""
+        """Fail if a real-weight path still contains lazy ``ShapeDtypeStruct`` leaves.
+
+        Args:
+            selector: Optional override for the trainable selector.
+            context: Human-readable phase name used in the error message.
+
+        Returns:
+            Self: The module itself when every selected leaf is concrete,
+            enabling chained calls.
+
+        Raises:
+            ValueError: If any selected leaf is still a
+                :class:`jax.ShapeDtypeStruct` placeholder.
+        """
         missing = self.abstract_parameter_leaves(selector=selector)
         if not missing:
             return self
@@ -798,7 +1146,21 @@ class EasyDeLBaseModule(
         *,
         trainable_selector: spx.SelectorSugar | None = None,
     ) -> tuple[spx.GraphDef, spx.State, spx.State]:
-        """Split the module into graph definition, selected trainables, and the remainder."""
+        """Split the module into graph definition, selected trainables, and remainder.
+
+        Args:
+            trainable_selector: Optional override for the trainable
+                selector; defaults to the module's
+                :attr:`trainable_selector`.
+
+        Returns:
+            tuple[spx.GraphDef, spx.State, spx.State]: A triple of
+            ``(graphdef, graphstate, graphother)`` suitable for
+            :meth:`merge_module` and :class:`EasyDeLState` construction.
+            ``graphother`` has its meta-leaves materialised so the result
+            can be passed through JAX transformations without further
+            preprocessing.
+        """
         gdef, state = spx.export(self)
         graphstate, graphother = self._partition_trainable_state(state, trainable_selector=trainable_selector)
         graphother = materialize_meta_leaves(graphother, seed=42)
@@ -866,12 +1228,21 @@ class EasyDeLBaseModule(
 
     @property
     def graphstate(self: Self) -> spx.State:
-        """Return the default selected trainable state for the module."""
+        """Return the default selected trainable state for the module.
+
+        Returns:
+            spx.State: The graphstate component of :meth:`split_module`.
+        """
         return self.split_module()[1]
 
     @property
     def graphother(self: Self) -> spx.State:
-        """Return the complement of :attr:`graphstate` in the exported module state."""
+        """Return the complement of :attr:`graphstate` in the exported module state.
+
+        Returns:
+            spx.State: All non-trainable variables (buffers, RNG state,
+            etc.) carried by the module.
+        """
         return self.split_module()[-1]
 
     @property
@@ -887,17 +1258,32 @@ class EasyDeLBaseModule(
 
     @property
     def parameters_shape(self: Self) -> spx.State:
-        """Compute shape metadata for the default selected trainable state."""
+        """Compute shape metadata for :attr:`parameters` via :func:`jax.eval_shape`.
+
+        Returns:
+            spx.State: A pytree of :class:`jax.ShapeDtypeStruct` leaves
+            mirroring the structure of :attr:`parameters`.
+        """
         return jax.eval_shape(lambda: self.parameters)
 
     @property
     def graphstate_shape(self: Self) -> spx.State:
-        """Compute shape metadata for the default selected trainable state."""
+        """Compute shape metadata for :attr:`graphstate` via :func:`jax.eval_shape`.
+
+        Returns:
+            spx.State: A pytree of :class:`jax.ShapeDtypeStruct` leaves
+            mirroring the structure of :attr:`graphstate`.
+        """
         return jax.eval_shape(lambda: self.graphstate)
 
     @property
     def graphother_shape(self: Self) -> spx.State:
-        """Compute shape metadata for the default selected trainable state."""
+        """Compute shape metadata for :attr:`graphother` via :func:`jax.eval_shape`.
+
+        Returns:
+            spx.State: A pytree of :class:`jax.ShapeDtypeStruct` leaves
+            mirroring the structure of :attr:`graphother`.
+        """
         return jax.eval_shape(lambda: self.graphother)
 
     @property
@@ -1096,7 +1482,14 @@ class EasyDeLBaseModule(
 
     @cached_property
     def loss_strategy(self: Self):
-        """Get the planning-aware loss strategy for the resolved loss function."""
+        """Return the planning-aware strategy wrapper for :attr:`loss_function`.
+
+        Returns:
+            Any: Whatever :func:`resolve_loss_strategy` produces — typically
+            a strategy object responsible for choosing the right execution
+            path (chunked LM head, normal materialised path, etc.) for the
+            resolved loss type.
+        """
 
         return resolve_loss_strategy(self.loss_function)
 
@@ -2140,23 +2533,37 @@ class EasyDeLBaseModule(
             This is an internal method used during model conversion.
         """
         from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
 
         reform_param = {}
         for path, module in traversals.iter_module_search(self, spx.Module):
-            if hasattr(module, "reform_param") and module.reform_param:
+            module_reform_param = getattr(module, "reform_param", None)
+            if module_reform_param:
+                if not isinstance(module_reform_param, Mapping):
+                    path_str = ".".join(map(str, path)) or module.__class__.__name__
+                    raise TypeError(
+                        f"{path_str}.reform_param must be a mapping of reform rules, "
+                        f"got {type(module_reform_param).__name__}"
+                    )
                 path_str = ".".join(map(str, path))
-                for key, value in module.reform_param.items():
+                for key, value in module_reform_param.items():
                     full_key = f"{path_str}.{key}" if path_str else key
                     new_value = value.copy()
-                    new_splits = []
-                    for split in value["splits"]:
-                        new_split = split.copy()
-                        split_name = split["name"]
-                        new_split["name"] = f"{path_str}.{split_name}" if path_str else split_name
-                        new_splits.append(new_split)
-                    new_value["splits"] = new_splits
+                    if "splits" in value:
+                        new_splits = []
+                        for split in value["splits"]:
+                            new_split = split.copy()
+                            split_name = split["name"]
+                            new_split["name"] = f"{path_str}.{split_name}" if path_str else split_name
+                            new_splits.append(new_split)
+                        new_value["splits"] = new_splits
+                    if "sources" in value:
+                        new_value["sources"] = tuple(
+                            f"{path_str}.{source}" if path_str else source for source in value["sources"]
+                        )
 
                     reform_param[full_key] = new_value
+        StateDictConverter.validate_reform_param_schema(reform_param)
         return reform_param
 
     def _build_transform_fn(self, shard_fns=None):
@@ -2269,13 +2676,34 @@ class EasyDeLBaseModule(
         *,
         selector: spx.SelectorSugar | None = None,
     ) -> Self:
-        """Merge a selected trainable state tree back into the module."""
+        """Merge a selected trainable state tree back into the module.
+
+        Args:
+            tree: New trainable state tree (typically produced by
+                :meth:`split_parameters`) to install on this module.
+            selector: Optional override for the trainable selector; defaults
+                to :attr:`trainable_selector`.
+
+        Returns:
+            Self: A new module instance with ``tree`` in place of the
+            previous trainable state and the existing non-trainable state
+            preserved.
+        """
         gdef, _graphstate, gother = self.split_module(trainable_selector=selector)
         self = self.merge_module(gdef, tree, gother)
         return self
 
     def split_parameters(self, selector: spx.SelectorSugar | None = None) -> spx.State:
-        """Return the selected trainable state as an :class:`spx.State`."""
+        """Return the selected trainable state as an :class:`spx.State`.
+
+        Args:
+            selector: Optional override for the trainable selector; defaults
+                to :attr:`trainable_selector`.
+
+        Returns:
+            spx.State: Just the trainable subtree (``graphstate``) of the
+            full module state.
+        """
         _, state = spx.export(self)
         graphstate, _graphother = self._partition_trainable_state(state, trainable_selector=selector)
         return graphstate
@@ -2286,7 +2714,21 @@ class EasyDeLBaseModule(
         *,
         selector: spx.SelectorSugar | None = None,
     ) -> Self:
-        """Merge a flat or nested parameter-values mapping into the selected state."""
+        """Merge a flat or nested ``path -> value`` mapping into the selected state.
+
+        Args:
+            parameter_values: Mapping of parameter paths (flat tuples or
+                nested dicts) to replacement values.
+            selector: Optional override for the trainable selector.
+
+        Returns:
+            Self: A new module instance with the matching trainable leaves
+            replaced by ``parameter_values``.
+
+        Raises:
+            KeyError: If ``parameter_values`` contains a key not present in
+                the current selected state.
+        """
         current_state = self.split_parameters(selector).flat_state()
         if not is_flatten(parameter_values):
             parameter_values = flatten_dict(parameter_values)
@@ -2802,6 +3244,14 @@ class EasyDeLBaseModule(
         We intentionally avoid ``dir(config)`` + ``getattr(config, ...)`` here,
         because that can evaluate computed properties (for example mesh accessors)
         and trigger side effects during graph-def rebuild.
+
+        Args:
+            config: Parent :class:`EasyDeLBaseConfig` instance to scan.
+
+        Returns:
+            tuple[EasyDeLBaseConfig, ...]: De-duplicated nested config
+            instances discovered via ``sub_configs`` or direct ``__dict__``
+            attributes.
         """
         config_dict = getattr(config, "__dict__", None)
         if not isinstance(config_dict, dict):
@@ -2831,7 +3281,18 @@ class EasyDeLBaseModule(
 
     @staticmethod
     def _apply_recursive_config_updates(config: EasyDeLBaseConfig, updates: Mapping[str, tp.Any]) -> None:
-        """Apply overrides to nested configs discovered from concrete attributes."""
+        """Apply overrides to nested configs discovered from concrete attributes.
+
+        For each child returned by :meth:`_recursive_config_children`,
+        applies every override that the child either already holds on its
+        instance ``__dict__`` or declares on its class. Read-only attributes
+        are skipped silently.
+
+        Args:
+            config: Parent config whose nested configs should receive
+                updates.
+            updates: Mapping of attribute names to replacement values.
+        """
         for sub_cfg in EasyDeLBaseModule._recursive_config_children(config):
             sub_cfg_dict = getattr(sub_cfg, "__dict__", None)
             for key, value in updates.items():

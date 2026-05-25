@@ -751,11 +751,24 @@ class BatchNorm(spx.Module):
         use_running_average: bool | None = None,
         **kwargs,
     ) -> dict:
-        """Class method used by ``spx.set_mode``.
+        """Update layer mode flags from a ``spx.set_mode`` call.
+
+        Invoked by ``spx.set_mode`` to flip BatchNorm between training and
+        inference behaviour without reconstructing the module. Any unknown
+        kwargs are passed through unchanged so a single ``set_mode`` call can
+        be routed to multiple modules.
 
         Args:
-          use_running_average: if True, the stored batch statistics will be
-            used instead of computing the batch statistics on the input.
+            use_running_average: If ``True``, subsequent forward passes use
+                the stored running statistics instead of computing fresh
+                batch statistics. ``None`` leaves the current setting in
+                place.
+            **kwargs: Additional mode flags ignored by ``BatchNorm`` itself
+                but forwarded back to the caller.
+
+        Returns:
+            Dict of unconsumed kwargs, ready to be forwarded to other
+            modules registered with ``spx.set_mode``.
         """
         if use_running_average is not None:
             self.use_running_average = use_running_average

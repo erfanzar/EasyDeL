@@ -39,7 +39,7 @@ Example Workflow:
     >>> # Complete MoE FFN example with row/column parallelism
     >>> from easydel.layers import ColumnParallelMoELinear, RowParallelMoELinear
     >>> import spectrax as spx
-from spectrax import nn
+    >>> from spectrax import nn
     >>>
     >>> # Column-parallel layers (W_i and W_u)
     >>> wi_layer = ColumnParallelMoELinear(8, 768, 3072, rngs=rngs)
@@ -148,70 +148,70 @@ def _moe_parameter_layout(
 class ParallelMoELinear(spx.Module):
     """A batched linear transformation layer for Mixture of Experts (MoE) models.
 
-        This layer applies separate linear transformations for each expert in a MoE setup.
-        The inputs are assumed to be sorted and grouped by expert, with `group_sizes`
-        specifying how many tokens belong to each expert. It supports:
-        - **Ragged Matrix Multiplication** via `jax.lax.ragged_dot_general`.
-        - **Grouped Matrix Multiplication (GMM)** via a Pallas kernel for TPUs.
+    This layer applies separate linear transformations for each expert in a MoE setup.
+    The inputs are assumed to be sorted and grouped by expert, with `group_sizes`
+    specifying how many tokens belong to each expert. It supports:
+    - **Ragged Matrix Multiplication** via `jax.lax.ragged_dot_general`.
+    - **Grouped Matrix Multiplication (GMM)** via a Pallas kernel for TPUs.
 
-        Can optionally integrate with a runtime sharding resolver to shard parameters and
-        use `shard_map` for distributed execution.
+    Can optionally integrate with a runtime sharding resolver to shard parameters and
+    use `shard_map` for distributed execution.
 
-        **Distributed Execution:**
+    **Distributed Execution:**
 
-            This layer supports multiple parallelism strategies:
+        This layer supports multiple parallelism strategies:
 
-            - **Expert Parallelism (EP)**: Partition experts across devices on the expert axis
-            - **Tensor Parallelism (TP)**: Partition weight matrices within each expert
-            - **Data Parallelism (DP)**: Replicate across data batches
-            - **Row/Column Parallelism**: Control which dimension is partitioned (input vs output)
+        - **Expert Parallelism (EP)**: Partition experts across devices on the expert axis
+        - **Tensor Parallelism (TP)**: Partition weight matrices within each expert
+        - **Data Parallelism (DP)**: Replicate across data batches
+        - **Row/Column Parallelism**: Control which dimension is partitioned (input vs output)
 
-            The sharding strategy is controlled by:
-            1. `direction`: "row" or "column" determines which dimension is partitioned
-            2. `use_expert_tensor_mode`: Whether experts are on TP axis (True) or EP axis (False)
-            3. `runtime_sharding_resolver`: Provides mesh and axis resolution for sharding
+        The sharding strategy is controlled by:
+        1. `direction`: "row" or "column" determines which dimension is partitioned
+        2. `use_expert_tensor_mode`: Whether experts are on TP axis (True) or EP axis (False)
+        3. `runtime_sharding_resolver`: Provides mesh and axis resolution for sharding
 
-        Attributes:
-            num_experts: Number of experts.
-            in_features: Input feature dimension.
-            out_features: Output feature dimension.
-            out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
-                otherwise `(num_experts, in_features, out_features)`.
-            dtype: Data type for computation. None means inherits from inputs.
-            param_dtype: Data type for parameters (weights, biases).
-            kernel_init: Initializer function for the kernel weights.
-            bias_init: Initializer function for the bias.
-            kernel: Weight matrix parameter for the transformation.
-                Shape: (num_experts, out_features, in_features) if out_first else
-                (num_experts, in_features, out_features).
-            bias: Optional bias parameter. Shape: (num_experts, out_features) if out_first
-                else (num_experts, in_features). None if use_bias=False.
-            runtime_sharding_resolver: Handles sharding metadata for distributed execution.
-            _direction: Sharding direction for ALT sharding ("row", "column", or None).
+    Attributes:
+        num_experts: Number of experts.
+        in_features: Input feature dimension.
+        out_features: Output feature dimension.
+        out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
+            otherwise `(num_experts, in_features, out_features)`.
+        dtype: Data type for computation. None means inherits from inputs.
+        param_dtype: Data type for parameters (weights, biases).
+        kernel_init: Initializer function for the kernel weights.
+        bias_init: Initializer function for the bias.
+        kernel: Weight matrix parameter for the transformation.
+            Shape: (num_experts, out_features, in_features) if out_first else
+            (num_experts, in_features, out_features).
+        bias: Optional bias parameter. Shape: (num_experts, out_features) if out_first
+            else (num_experts, in_features). None if use_bias=False.
+        runtime_sharding_resolver: Handles sharding metadata for distributed execution.
+        _direction: Sharding direction for ALT sharding ("row", "column", or None).
 
 
-        Example:
-            >>> from easydel.layers import ParallelMoELinear
-            >>> import spectrax as spx
-    from spectrax import nn
-            >>>
-            >>> # Create a column-parallel MoE linear layer
-            >>> layer = ParallelMoELinear(
-            ...     num_experts=8,
-            ...     in_features=768,
-            ...     out_features=3072,
-            ...     direction="column",
-            ...     rngs=rngs
-            ... )
-            >>>
-            >>> # Inputs are sorted tokens grouped by expert
-            >>> sorted_tokens = jnp.ones((1024, 768))  # 1024 tokens, 768 features
-            >>> group_sizes = jnp.array([128, 132, 125, 130, 127, 129, 126, 127])  # per expert
-            >>> sorted_experts = jnp.repeat(jnp.arange(8), group_sizes)
-            >>>
-            >>> # Apply expert FFN
-            >>> output = layer(sorted_tokens, group_sizes, sorted_experts)
-            >>> # output.shape = (1024, 3072)
+    Example:
+        >>> from easydel.layers import ParallelMoELinear
+        >>> import spectrax as spx
+        >>> from spectrax import nn
+        >>>
+        >>> # Create a column-parallel MoE linear layer
+        >>> layer = ParallelMoELinear(
+        ...     num_experts=8,
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     direction="column",
+        ...     rngs=rngs
+        ... )
+        >>>
+        >>> # Inputs are sorted tokens grouped by expert
+        >>> sorted_tokens = jnp.ones((1024, 768))  # 1024 tokens, 768 features
+        >>> group_sizes = jnp.array([128, 132, 125, 130, 127, 129, 126, 127])  # per expert
+        >>> sorted_experts = jnp.repeat(jnp.arange(8), group_sizes)
+        >>>
+        >>> # Apply expert FFN
+        >>> output = layer(sorted_tokens, group_sizes, sorted_experts)
+        >>> # output.shape = (1024, 3072)
     """
 
     _direction: typing.Literal["row", "column"] | None = None
@@ -319,31 +319,42 @@ class ParallelMoELinear(spx.Module):
 
     @property
     def direction(self) -> typing.Literal["row", "column"] | None:
-        """Returns the parallelism direction for this layer.
+        """Return the parallelism direction configured for this layer.
 
         Returns:
-            "row" for row-wise parallelism (input dimension partitioned),
-            "column" for column-wise parallelism (output dimension partitioned),
-            or None if no parallelism direction is set.
+            ``"row"`` for row-wise parallelism (input dimension partitioned),
+            ``"column"`` for column-wise parallelism (output dimension
+            partitioned), or ``None`` if no parallelism direction is set.
         """
         return self._direction
 
     @property
     def can_use_shard_map(self) -> bool:
-        """Checks if this layer can use shard_map for distributed execution.
+        """Report whether this layer is ready for ``shard_map`` execution.
 
         Returns:
-            True if both a runtime sharding resolver and parallelism direction are configured,
-            indicating the layer is ready for distributed execution with shard_map.
+            ``True`` if both a runtime sharding resolver and a parallelism
+            direction are configured, indicating the layer can lower under
+            ``shard_map`` for distributed execution.
         """
         return self.runtime_sharding_resolver is not None and self._direction is not None
 
     @property
     def alt_sharding(self) -> PartitionSpec | None:
-        """Returns the ALT (Alternative) sharding configuration for this layer.
+        """Resolve the ALT (Alternative) sharding configuration for this layer.
 
         ALT sharding provides pre-defined sharding patterns for common parallelism
-        strategies, simplifying the configuration of distributed execution.
+        strategies, simplifying the configuration of distributed execution. The
+        layout depends on the configured ``direction`` and on whether experts are
+        distributed on the TP axis (``use_expert_tensor_mode``).
+
+        Returns:
+            A :class:`PartitionSpec` describing the parameter layout, or
+            ``None`` when ``direction`` is unset (no parallelism configured).
+
+        Raises:
+            NotImplementedError: If ``direction`` is not ``None``, ``"row"``,
+                or ``"column"``.
         """
 
         from easydel.layers.moe._communication_utils import get_moe_partition_spec
@@ -362,11 +373,12 @@ class ParallelMoELinear(spx.Module):
 
     @property
     def alt_sharding_axis(self) -> list[str] | None:
-        """Returns the axis names for ALT sharding configuration.
+        """Return the axis names from the layer's ALT sharding spec.
 
         Returns:
-            List of axis names (e.g., ["expert", "tp", "dp"]) for the configured
-            ALT sharding pattern, or None if no ALT sharding is configured.
+            List of axis names (e.g. ``["expert", "tp", "dp"]``) for the
+            configured ALT sharding pattern, or ``None`` if no ALT sharding
+            is configured.
         """
         if self.alt_sharding is None:
             return None
@@ -374,34 +386,40 @@ class ParallelMoELinear(spx.Module):
 
     @property
     def expert_axis(self) -> str:
-        """Semantic axis name representing the expert dimension."""
+        """Return the semantic mesh-axis name carrying the expert dimension.
+
+        Returns:
+            ``"tp"`` when ``use_expert_tensor_mode`` places experts on the
+            tensor-parallel axis, otherwise the canonical ``"ep"`` expert
+            mesh axis.
+        """
         return TP if self.use_expert_tensor_mode else EP
 
     def _group_axes(self) -> list[str | None]:
-        """Returns sharding axes for expert group sizes array.
+        """Return sharding axes for the expert ``group_sizes`` array.
 
         Group sizes specify how many tokens are assigned to each expert and are
         typically replicated across all devices.
 
         Returns:
-            List containing [EMPTY], indicating group_sizes are replicated.
+            List containing ``[EMPTY]``, indicating ``group_sizes`` are replicated.
         """
         return [EMPTY]
 
     def _input_axes(self) -> list[str | None]:
-        """Returns sharding axes for input activations based on parallelism direction.
+        """Return sharding axes for input activations based on parallelism direction.
 
         The input sharding depends on whether this is a row-parallel or column-parallel layer:
-        - Row-parallel: Inputs are sharded on the feature dimension [DP, TP]
+        - Row-parallel: Inputs are sharded on the feature dimension ``[DP, TP]``
             because different devices hold different input features
-        - Column-parallel: Inputs are replicated on the feature dimension [DP, EMPTY]
+        - Column-parallel: Inputs are replicated on the feature dimension ``[DP, EMPTY]``
             because all devices need the full input to compute their output slice
 
         Returns:
-            List of axis names defining input sharding pattern:
-            - Row direction: [DP, TP] - data parallel and tensor parallel sharded
-            - Column direction: [DP, EMPTY] - only data parallel sharded
-            - No direction: [DP, EMPTY] - default to replicated features
+            List of axis names defining the input sharding pattern:
+            - Row direction: ``[DP, TP]`` — data parallel and tensor parallel sharded
+            - Column direction: ``[DP, EMPTY]`` — only data parallel sharded
+            - No direction: ``[DP, EMPTY]`` — default to replicated features
         """
         if self.direction == "row":
             return [DP, TP]
@@ -410,21 +428,21 @@ class ParallelMoELinear(spx.Module):
         return [DP, EMPTY]
 
     def _output_axes(self) -> list[str | list[str] | None]:
-        """Returns sharding axes for output activations based on parallelism direction.
+        """Return sharding axes for output activations based on parallelism direction.
 
         The output sharding depends on the parallelism strategy:
-        - Row-parallel: Outputs are fully reduced and replicated [DP, EMPTY]
+        - Row-parallel: Outputs are fully reduced and replicated ``[DP, EMPTY]``
             because all devices contribute partial results that are summed
         - Column-parallel: Outputs are sharded on the feature dimension
             because each device produces a different slice of the output
-            - In expert tensor mode: [DP, TP]
-            - In standard mode: [DP, [EP, TP]] (combined expert+tensor parallel)
+            - In expert tensor mode: ``[DP, TP]``
+            - In standard mode: ``[DP, [EP, TP]]`` (combined expert+tensor parallel)
 
         Returns:
-            List of axis names defining output sharding pattern:
-            - Row direction: [DP, EMPTY] - replicated after all-reduce
-            - Column direction: [DP, TP] or [DP, [EP, TP]] - sharded features
-            - No direction: [DP, EMPTY] - default to replicated
+            List of axis names defining the output sharding pattern:
+            - Row direction: ``[DP, EMPTY]`` — replicated after all-reduce
+            - Column direction: ``[DP, TP]`` or ``[DP, [EP, TP]]`` — sharded features
+            - No direction: ``[DP, EMPTY]`` — default to replicated
         """
         if self.direction == "row":
             return [DP, EMPTY]
@@ -440,19 +458,25 @@ class ParallelMoELinear(spx.Module):
         group_sizes: Int[Array, "num_groups"],  # noqa
         sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
     ) -> Float[Array, "tokens_ragged out_dim"]:
-        """Applies the batched linear transformation.
+        """Apply the per-expert batched linear transformation.
+
+        Casts both operands through :func:`promote_dtype`, runs an ejkernel
+        ``grouped_matmul`` (with ``transpose_rhs`` driven by ``out_first``),
+        and adds the per-expert bias expanded along the ragged token batch
+        when ``use_bias`` is true. Float8 weights are promoted to float4 so
+        the kernel can consume them.
 
         Args:
             inputs: The input array, which is a batch of tokens sorted and grouped
-                by expert. Shape: `(total_tokens, in_features)`.
+                by expert. Shape: ``(total_tokens, in_features)``.
             group_sizes: An array indicating the number of tokens assigned to each
-                expert. Shape: `(num_experts,)`.
-            sorted_experts: Optional expert ids aligned with `inputs`. Required when
-                `use_expert_tensor_mode` so tokens can be localized per shard.
+                expert. Shape: ``(num_experts,)``.
+            sorted_experts: Optional expert ids aligned with ``inputs``. Required when
+                ``use_expert_tensor_mode`` so tokens can be localized per shard.
 
         Returns:
             The output array after the linear transformation.
-            Shape: `(total_tokens, out_features)`.
+            Shape: ``(total_tokens, out_features)``.
         """
         weight = self.weight.value
         if self.weight_modif_fn is not None:
@@ -488,7 +512,7 @@ class ParallelMoELinear(spx.Module):
         group_sizes: Int[Array, "num_groups"],  # noqa
         sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
     ) -> Float[Array, "tokens_ragged out_dim"]:
-        """Expands bias to match the ragged token batch structure.
+        """Expand the per-expert bias to match the ragged token batch structure.
 
         This method aligns the per-expert bias with the ragged token layout by
         repeating each expert's bias according to how many tokens are assigned to it.

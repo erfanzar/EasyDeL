@@ -226,18 +226,20 @@ def compute_basic_frequencies(
     rotary_dim: int,
     max_position_embeddings: int,
 ):
-    """
-    Computes the basic RoPE frequencies (cos and sin values) for all positions.
+    """Compute the unscaled RoPE cos/sin cache for all positions.
+
+    Builds the frequency table by outer-producing positions ``[0, max_position)``
+    with :func:`compute_basic_inv_frequencies` and concatenating ``[cos, sin]``
+    along the last axis — the layout consumed by :func:`apply_basic_rope`.
 
     Args:
-        base (int): The base value for the geometric progression of frequencies.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        max_position_embeddings (int): The maximum sequence length.
+        base: Geometric-progression base ``θ`` (typically 10 000).
+        rotary_dim: Rotary feature dimension (must be even).
+        max_position_embeddings: Maximum sequence length to pre-compute.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor of shape
-                     (max_position_embeddings, rotary_dim). Contains concatenated
-                     cos and sin values.
+        Float32 array of shape ``(max_position_embeddings, rotary_dim)``
+        whose first half is ``cos`` and second half is ``sin``.
     """
     inv = compute_basic_inv_frequencies(base, rotary_dim)
     freqs = jnp.einsum("i,j -> ij", jnp.arange(max_position_embeddings, dtype=jnp.float32), inv)
@@ -252,25 +254,34 @@ def compute_linear_frequencies(
     max_position_embeddings: int,
     scaling_factors: list[float],
 ):
-    """
-    Computes RoPE frequencies using linear scaling for potentially multiple factors.
+    """Compute linearly-scaled RoPE frequencies (Position Interpolation).
 
-    This function computes frequency caches for each scaling factor and concatenates them.
-    Note: This implementation seems designed for a specific use case where different
-    parts of a sequence might use different scaling factors, determined by offsets.
-    If only one scaling factor is used, it behaves like standard linear scaling.
+    Applies Chen et al.'s 2023 Position-Interpolation trick: each position is
+    divided by ``scaling_factor`` before the outer product with the unscaled
+    inverse frequencies, slowing every rotation plane uniformly so a model
+    trained with ``max_position_embeddings`` can be evaluated on
+    ``scaling_factor * max_position_embeddings`` tokens.
+
+    When ``scaling_factors`` is a list, the frequency cache is built once per
+    factor and the results are concatenated along the position axis — used by
+    consumers that store multiple scaling regimes back-to-back (e.g. for
+    routing different parts of the sequence to different factors).
 
     Args:
-        base (int): The base value for the geometric progression of frequencies.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        max_position_embeddings (int): The base maximum sequence length before scaling.
-        scaling_factors (tp.Union[tp.List[float], float]): A single scaling factor or a list
-                                                            of scaling factors.
+        base: Geometric-progression base ``θ``.
+        rotary_dim: Rotary feature dimension (must be even).
+        max_position_embeddings: Pre-scaling context length.
+        scaling_factors: A single scaling factor or a list of factors; each
+            factor contributes ``max_position_embeddings * factor`` positions
+            to the concatenated cache.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor. If multiple scaling factors are provided,
-                     the caches are concatenated along the position dimension. Shape
-                     is (total_scaled_length, rotary_dim).
+        Float32 array of shape ``(sum_i max_position_embeddings * factor_i,
+        rotary_dim)`` with the concatenated ``[cos | sin]`` layout.
+
+    Raises:
+        ValueError: If the per-factor offsets list and ``scaling_factors``
+            list disagree in length (an internal-invariant safeguard).
     """
     if not isinstance(scaling_factors, list):
         scaling_factors = [scaling_factors]
@@ -309,20 +320,24 @@ def compute_dynamic_frequencies(
     max_position_embeddings: int,
     scaling_factor: float,
 ):
-    """
-    Computes RoPE frequencies using Dynamic NTK scaling.
+    """Compute Dynamic-NTK-scaled RoPE frequencies.
 
-    Adjusts the 'base' dynamically based on the scaling factor.
+    Implements the NTK-aware scaling from the original blog post: instead of
+    shrinking the *positions* (linear/PI) the *base* itself is increased so
+    that the high-frequency dimensions are perturbed less than the
+    low-frequency ones. The adjusted base is
+    ``base * (scaling_factor**(rotary_dim/(rotary_dim-2)))`` derived from the
+    requirement that the largest wavelength matches the new context length.
 
     Args:
-        base (int): The initial base value before dynamic adjustment.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        max_position_embeddings (int): The base maximum sequence length before scaling.
-        scaling_factor (float): The scaling factor applied to the sequence length.
+        base: Pre-adjustment base ``θ``.
+        rotary_dim: Rotary feature dimension (must be even).
+        max_position_embeddings: Pre-scaling context length.
+        scaling_factor: Target context-length multiplier.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor of shape
-                     (max_position_embeddings * scaling_factor, rotary_dim).
+        Float32 array of shape ``(max_position_embeddings * scaling_factor,
+        rotary_dim)`` containing the ``[cos | sin]`` cache.
     """
     max_length = max_position_embeddings * scaling_factor
     base = base * ((scaling_factor * max_length / max_position_embeddings) - (scaling_factor - 1)) ** (
@@ -345,24 +360,29 @@ def compute_yarn_frequencies(
     extrapolation_factor: float,
     attn_factor: float,
 ) -> jnp.ndarray:
-    """
-    Computes RoPE frequencies using the YaRN scaling method.
+    """Compute YaRN-scaled RoPE frequencies with the attention magnitude rescaling.
 
-    Includes adjustments based on YaRN parameters and applies an mscale factor.
+    Wraps :func:`compute_yarn_inv_frequencies` (interpolation/extrapolation
+    blend) with the YaRN ``mscale`` factor — a log-derived scalar that
+    rescales the cos/sin magnitudes to keep attention-score variance roughly
+    constant as the context grows. The result is the position-outer-producted
+    cache.
 
     Args:
-        base (float): The base value for positional encoding.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        beta_fast (float): YaRN parameter for faster rotating dimensions.
-        beta_slow (float): YaRN parameter for slower rotating dimensions.
-        max_position_embeddings (int): Original maximum sequence length before scaling.
-        scaling_factor (float): The factor by which the context length is scaled.
-        extrapolation_factor (float): YaRN parameter controlling extrapolation strength.
-        attn_factor (float): YaRN parameter scaling the attention outputs.
+        base: Base ``θ`` for the unscaled spectrum.
+        rotary_dim: Rotary feature dimension (must be even).
+        beta_fast: YaRN fast-band boundary (typical 32).
+        beta_slow: YaRN slow-band boundary (typical 1).
+        max_position_embeddings: Original (pre-extension) training context.
+        scaling_factor: Target context-length multiplier.
+        extrapolation_factor: Scalar in ``[0, 1]`` weighting the
+            extrapolation branch.
+        attn_factor: User-tunable multiplier composed with the YaRN mscale.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor of shape
-                     (max_position_embeddings * scaling_factor, rotary_dim).
+        Float32 array of shape ``(max_position_embeddings * scaling_factor,
+        rotary_dim)`` with the ``[cos | sin]`` layout, each half already
+        multiplied by ``mscale * attn_factor``.
     """
     inv_freq = compute_yarn_inv_frequencies(
         base=base,
@@ -391,29 +411,34 @@ def compute_phi3_frequencies(
     short_factor,
     long_factor,
 ):
-    """
-    Computes RoPE frequencies using the Phi-3 LongRoPE scaling method.
+    """Compute Phi-3 LongRoPE frequencies (per-dimension scaling factors).
 
-    Applies different scaling factors based on whether the target length is
-    shorter or longer than the original max length. Includes a scaling factor
-    adjustment based on the ratio of target length to original length.
+    Phi-3's RoPE extension does not use a smooth ramp like YaRN; instead it
+    multiplies each inverse-frequency element by a learned scalar from
+    either ``short_factor`` or ``long_factor`` (chosen by comparing the
+    target context length to the original training context). After the
+    multiplied cos/sin cache is built, an additional
+    ``sqrt(1 + log(scale)/log(orig_max))`` magnitude rescale is applied to
+    compensate for the larger effective rotation budget.
 
     Args:
-        base (float): The base value for positional encoding.
-        head_size (int): The dimension of each attention head.
-        rotary_dim (int): The dimension of the rotary embeddings. Must equal head_size for Phi-3.
-        max_position_embeddings (int): The target maximum sequence length after scaling.
-        original_max_position_embeddings (int): Original maximum sequence length before scaling.
-        short_factor (tp.List[float]): Scaling factors for frequencies when
-                                        max_position_embeddings <= original_max_position_embeddings.
-        long_factor (tp.List[float]): Scaling factors for frequencies when
-                                       max_position_embeddings > original_max_position_embeddings.
+        base: Base ``θ`` for the unscaled spectrum.
+        head_size: Per-head dimension; must equal ``rotary_dim`` for Phi-3.
+        rotary_dim: Rotary feature dimension.
+        max_position_embeddings: Post-scaling target context length.
+        original_max_position_embeddings: Original training context.
+        short_factor: Per-pair scaling vector used when the target context
+            is not larger than the original.
+        long_factor: Per-pair scaling vector used when the target context
+            exceeds the original.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor of shape (1, max_position_embeddings, rotary_dim).
+        Float32 array of shape ``(1, max_position_embeddings, 2*rotary_dim)``
+        with the ``[cos | sin]`` layout pre-scaled by the LongRoPE
+        magnitude factor.
 
     Raises:
-        ValueError: If rotary_dim does not equal head_size.
+        ValueError: If ``rotary_dim != head_size``.
     """
     if rotary_dim != head_size:
         raise ValueError(f"rotary_dim != head_size ({rotary_dim}!={head_size})")
@@ -451,21 +476,24 @@ def compute_llama3_frequencies(
     scaling_factor,
     max_position_embeddings: int,
 ):
-    """
-    Computes RoPE frequencies using the Llama3 scaling method.
+    """Compute Llama-3 wavelength-piecewise RoPE frequencies.
+
+    Builds the cos/sin cache by outer-producing positions with
+    :func:`compute_llama3_inv_frequencies` (wavelength-piecewise scaled
+    inverse frequencies).
 
     Args:
-        base (float): The base value for positional encoding.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        low_freq_factor (float): Factor for adjusting low-frequency components.
-        high_freq_factor (float): Factor for adjusting high-frequency components.
-        scaling_factor (float): The overall scaling factor applied.
-        max_position_embeddings (int): Original maximum sequence length (referred to as
-                                       `orig_max_position` in `compute_llama3_inv_frequencies`).
-                                       This defines the length of the frequency cache.
+        base: Base ``θ`` for the unscaled spectrum (Llama-3 uses 500 000).
+        rotary_dim: Rotary feature dimension (must be even).
+        low_freq_factor: Low-frequency boundary parameter (Llama-3 uses 1).
+        high_freq_factor: High-frequency boundary parameter (Llama-3 uses 4).
+        scaling_factor: Target context-length multiplier.
+        max_position_embeddings: Original training context length, doubling
+            as the length of the produced cache.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor of shape (max_position_embeddings, rotary_dim).
+        Float32 array of shape ``(max_position_embeddings, rotary_dim)``
+        with the standard ``[cos | sin]`` layout.
     """
     inv = compute_llama3_inv_frequencies(
         base,
@@ -497,26 +525,31 @@ def compute_deepseek_frequencies(
     mscale_all_dim,
     attn_factor,
 ) -> jnp.ndarray:
-    """
-    Computes RoPE frequencies using the Deepseek-YaRN scaling method.
+    """Compute DeepSeek-YaRN-scaled RoPE frequencies with two-mscale rescaling.
 
-    Similar to YaRN but potentially uses different mscale calculation parameters.
+    Same interpolation/extrapolation blend as standard YaRN, but the attention
+    magnitude factor is computed as the *ratio* of two ``yarn_get_mscale``
+    evaluations parameterised by ``mscale`` and ``mscale_all_dim`` — a
+    DeepSeek-specific tweak that decouples the per-dim and all-dim YaRN
+    correction curves.
 
     Args:
-        base (float): The base value for positional encoding.
-        rotary_dim (int): The dimension of the rotary embeddings.
-        scaling_factor (float): The factor by which the context length is scaled.
-        extrapolation_factor (float): YaRN parameter controlling extrapolation strength.
-        beta_fast (int): YaRN parameter for faster rotating dimensions.
-        beta_slow (int): YaRN parameter for slower rotating dimensions.
-        max_position_embeddings (int): Original maximum sequence length before scaling.
-        mscale (float): Parameter for `yarn_get_mscale` calculation.
-        mscale_all_dim (float): Parameter for `yarn_get_mscale` calculation.
-        attn_factor (float): Scaling factor applied to attention outputs.
+        base: Base ``θ`` for the unscaled spectrum.
+        rotary_dim: Rotary feature dimension (must be even).
+        scaling_factor: Target context-length multiplier.
+        extrapolation_factor: Scalar in ``[0, 1]`` weighting the
+            extrapolation branch.
+        beta_fast: YaRN fast-band boundary.
+        beta_slow: YaRN slow-band boundary.
+        max_position_embeddings: Original training context length.
+        mscale: Per-dim mscale exponent.
+        mscale_all_dim: All-dim mscale exponent (denominator of the ratio).
+        attn_factor: User-tunable multiplier composed with the YaRN mscale.
 
     Returns:
-        jnp.ndarray: A frequency cache tensor of shape
-                     (max_position_embeddings * scaling_factor, rotary_dim).
+        Float32 array of shape ``(max_position_embeddings * scaling_factor,
+        rotary_dim)`` with the ``[cos | sin]`` layout, magnitudes rescaled
+        by the DeepSeek attention factor.
     """
     pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
     inv_freq_extrapolation = 1.0 / pos_freqs
@@ -554,22 +587,25 @@ def apply_phi3_rope(
     offsets: jax.Array | None = None,
     dtype: jnp.dtype = jnp.float32,
 ):
-    """
-    Applies Phi-3 LongRoPE to query and key tensors.
+    """Apply Phi-3 LongRoPE rotation to query and key tensors.
 
-    Uses a specific rotation application style (`_rotate_neox`) assumed by Phi-3.
+    Looks up the precomputed Phi-3 cos/sin cache at ``positions`` (plus
+    optional ``offsets``), splits the cached embedding into cos/sin halves,
+    and applies Neox-style rotation (``x * cos + rotate_neox(x) * sin``) under
+    a ``float32`` matmul-precision context to preserve numerical fidelity.
 
     Args:
-        query (jax.Array): Query tensor. Shape [batch_size, sequence_length, num_heads, head_dim].
-        key (jax.Array): Key tensor. Shape [batch_size, sequence_length, num_heads, head_dim].
-        positions (jax.Array): Array of positions. Shape [sequence_length].
-        frequencies (jax.Array): Precomputed Phi-3 frequency cache.
-                                 Shape [1, max_length, rotary_dim].
-        offsets (jax.Array, optional): Optional offsets to add to positions. Defaults to None.
-        dtype (jnp.dtype, optional): Output dtype. Defaults to jnp.float32.
+        query: Query tensor of shape
+            ``[batch_size, sequence_length, num_heads, head_dim]``.
+        key: Key tensor with the same shape as ``query``.
+        positions: Position indices of shape ``[sequence_length]``.
+        frequencies: Phi-3 cache produced by
+            :func:`compute_phi3_frequencies`; shape ``[1, max_length, 2*rotary_dim]``.
+        offsets: Optional per-position offset to add before look-up.
+        dtype: Output dtype (cast applied at the end).
 
     Returns:
-        tp.Tuple[jax.Array, jax.Array]: The rotated query and key tensors with the specified dtype.
+        Tuple ``(query_rot, key_rot)`` cast to ``dtype``.
     """
     positions = positions
     if offsets is not None:
@@ -597,25 +633,32 @@ def apply_basic_rope(
     offsets: jax.Array | None = None,
     dtype: jnp.dtype = jnp.float32,
 ):
-    """
-    Applies standard or partially applied RoPE to query and key tensors.
+    """Apply (optionally partial) RoPE rotation to query and key tensors.
 
-    Selects frequencies based on positions (and optional offsets), then applies
-    the rotation using `_apply_rotary_emb`. Handles cases where RoPE is
-    applied only to a subset of the head dimension (`rotary_dim < query.shape[-1]`).
+    Looks up the cos/sin cache at ``positions + offsets``, then applies
+    :func:`_apply_rotary_emb` to the first ``rotary_dim`` channels. When
+    ``rotary_dim < head_dim``, the un-rotated tail is concatenated back so
+    callers can use the partial-RoPE pattern (rotate only the lower portion
+    of each head, leave NoPE channels at the end).
 
     Args:
-        query (jax.Array): Query tensor. Shape [..., sequence_length, num_heads, head_dim].
-        key (jax.Array): Key tensor. Shape [..., sequence_length, num_heads, head_dim].
-        positions (jax.Array): Array of positions for lookup in the frequency cache. Shape [sequence_length].
-        frequencies (jax.Array): Precomputed frequency cache. Shape [max_length, rotary_dim_freq].
-        rotary_dim (int): The dimension up to which RoPE is applied.
-        is_neox_style (bool): Whether to use Neox-style rotation.
-        offsets (jax.Array, optional): Optional offsets to add to positions. Defaults to None.
-        dtype (jnp.dtype, optional): Output dtype. Defaults to jnp.float32.
+        query: Query tensor of shape
+            ``[..., sequence_length, num_heads, head_dim]``.
+        key: Key tensor with the same shape as ``query``.
+        positions: Position indices of shape ``[sequence_length]``.
+        frequencies: Precomputed cos/sin cache with ``[cos | sin]`` layout
+            along the last axis.
+        rotary_dim: Number of channels (from index 0) to rotate. Must be
+            even.
+        is_neox_style: When ``True`` use Neox interleaving (pair adjacent
+            halves), otherwise the GPT-J pairing.
+        offsets: Optional per-position offset to add before look-up.
+        dtype: Note: this argument is currently *unused*; the returned
+            arrays inherit the dtype of ``query`` / ``key``. Kept for API
+            parity with :func:`apply_phi3_rope`.
 
     Returns:
-        tp.Tuple[jax.Array, jax.Array]: The rotated query and key tensors with the specified dtype.
+        Tuple ``(query, key)`` with the same shape as the inputs.
     """
     if offsets is not None:
         positions = positions + offsets

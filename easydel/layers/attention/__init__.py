@@ -14,10 +14,23 @@
 
 """Attention mechanisms and decoder layer utilities.
 
-This subpackage consolidates:
-- FlexibleAttentionModule, AttentionModule and AttentionMechanisms
-- UnifiedAttention base class
-- BaseDecoderLayer and block_wise_ffn
+Public entry point for everything attention-related in EasyDeL. The
+subpackage owns three layers of abstraction stacked on top of each other:
+
+* :class:`AttentionMechanisms` and :class:`FlexibleAttentionModule` — the
+  thin dispatcher that routes Q/K/V plus a bag of optional knobs (mask,
+  bias, sliding-window, soft-caps, ...) to the appropriate registered
+  kernel (FlashAttention 2, Splash, Ring, ragged-page, MLA, etc.).
+* :class:`AttentionModule` — abstract sharding / mask / cache helper used
+  by concrete attention implementations.
+* :class:`UnifiedAttention` — the canonical base class used by ~70 model
+  attention implementations across the repository. Subclasses override a
+  handful of ``_create_*`` / ``_postprocess_qkv`` hooks instead of
+  reimplementing the full forward path.
+
+Decoder-layer helpers (:class:`BaseDecoderLayer`, :func:`block_wise_ffn`)
+live alongside attention because the canonical pre-LN ``h + sublayer(norm(h))``
+patterns are tightly coupled to the attention module's outputs.
 """
 
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]

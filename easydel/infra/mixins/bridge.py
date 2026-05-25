@@ -12,43 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bridge mixin for EasyDeL-HuggingFace interoperability.
+"""HuggingFace bridge mixin layered onto :class:`EasyDeLBaseModule`.
 
-This module provides the EasyBridgeMixin class that enables seamless integration
-between EasyDeL models and the HuggingFace ecosystem. It handles model serialization,
-loading from various formats, conversion between frameworks, and integration with
-the HuggingFace Hub.
+This module owns :class:`EasyBridgeMixin`, the single point of truth for moving
+weights into and out of EasyDeL. It handles five intertwined concerns that
+every model in the repo needs but no single model wants to re-implement:
 
-The bridge supports:
-- Loading models from HuggingFace Hub or local paths
-- Converting between PyTorch and JAX/spectrax formats
-- Saving models in EasyDeL or HuggingFace formats
-- Pushing models to HuggingFace Hub
-- Automatic weight format detection and loading
-- Quantization during loading
-- Distributed loading with sharding
+* **EasyDeL-native save / load** (:meth:`EasyBridgeMixin.save_pretrained`,
+  :meth:`EasyBridgeMixin.from_pretrained`) — writes/reads a SpectraX
+  graphstate alongside a transformers-compatible ``config.json``, lazy
+  initialises the module under the configured mesh, then shards the
+  weights using the resolver from :class:`EasyDeLBaseConfig`.
+* **PyTorch checkpoint ingestion** — both eager (load everything, convert
+  once) and streaming (one safetensors shard at a time) via
+  :class:`TorchLoadOptions` and :class:`StreamingCheckpointInfo`. The
+  streaming path keeps host memory bounded so larger-than-RAM HF
+  checkpoints can be converted in place.
+* **MoE expert grouping** — collects per-expert weight shards into the
+  consolidated EasyDeL ``ParallelMoELinear`` layouts and validates that
+  every group is complete before declaring success.
+* **LoRA-aware re-instantiation** — when a checkpoint contains LoRA
+  adapter leaves but the live model is plain, the loader rebuilds the
+  matching :class:`eLoRA` wrappers on the fly so the parameter merge
+  lands on the correct paths.
+* **HuggingFace Hub publishing** — inherits ``transformers.PushToHubMixin``
+  and adds concurrency controls, async uploads, ``ePath`` remote-write
+  support, and an auto-generated model card via
+  :class:`easydel.utils.readme_generator.ReadmeGenerator`.
 
-Classes:
-    EasyBridgeMixin: Main mixin class providing bridge functionality
+Module exports:
+    - :class:`EasyBridgeMixin`: The mixin itself.
+    - :class:`TorchLoadOptions`: Parsed ``torch_load_mode`` settings.
+    - :class:`StreamingCheckpointInfo`: Streaming-conversion handle.
 
 Constants:
-    SAFE_WEIGHTS_NAME: Standard name for SafeTensors weights
-    CANDIDATE_FILENAMES: List of possible weight file names to search
-
-Example:
-    >>> from easydel.infra.mixins import EasyBridgeMixin
-    >>>
-    >>> class MyModel(EasyDeLBaseModule, EasyBridgeMixin):
-    ...     pass
-    >>>
-    >>> # Load from HuggingFace
-    >>> model = MyModel.from_pretrained("gpt2")
-    >>>
-    >>> # Save locally
-    >>> model.save_pretrained("./my_model")
-    >>>
-    >>> # Push to Hub
-    >>> model.push_to_hub("username/my-model")
+    ``SAFE_WEIGHTS_NAME``, ``SAFE_WEIGHTS_INDEX_NAME``,
+    ``ED_SAFE_WEIGHTS_INDEX_NAME``, ``TENSORSTORE_INDEX_NAME``,
+    ``CONFIG_NAME``, ``GENERATION_CONFIG_NAME`` and the older
+    ``WEIGHTS_NAME`` / ``TF2_WEIGHTS_NAME`` legacy filenames.
+    ``CANDIDATE_FILENAMES`` enumerates the weight-index/payload filenames
+    EasyDeL probes when discovering a checkpoint.
 """
 
 from __future__ import annotations
@@ -185,7 +188,20 @@ def _tree_key_to_path(key: tp.Any) -> str:
 
 
 def _path_match_variants(path: str) -> tuple[str, ...]:
-    """Build exact-match path variants for different checkpoint key prefixes."""
+    """Build exact-match path variants for different checkpoint key prefixes.
+
+    Checkpoints written by EasyDeL vs HuggingFace use different prefixes
+    (``model/parameters/...``, ``parameters/...``, ``model/...``, or bare
+    leaf paths). This helper expands a canonical path into all the common
+    aliases so :class:`Checkpointer` lookups can match on the first hit.
+
+    Args:
+        path: Slash-delimited canonical path from the live model.
+
+    Returns:
+        tuple[str, ...]: Sorted, deduplicated path variants including both
+        slash- and dot-delimited forms.
+    """
     normalized = path.strip("/")
     slash_variants = {normalized}
 
@@ -203,7 +219,16 @@ def _path_match_variants(path: str) -> tuple[str, ...]:
 
 
 def _checkpoint_cpu_device() -> jax.Device | None:  # pyright: ignore[reportInvalidTypeForm] #type: ignore
-    """Resolve a host CPU device for checkpoint-time array normalization."""
+    """Resolve a host CPU device for checkpoint-time array normalization.
+
+    Used by checkpoint loaders to materialize tensors on CPU first so
+    accelerator HBM is not consumed by stray temporaries while a checkpoint
+    is being assembled.
+
+    Returns:
+        jax.Device | None: The first available CPU device, or ``None`` when
+        none can be enumerated.
+    """
     try:
         cpu_devices = jax.devices("cpu")
     except Exception:
@@ -216,7 +241,19 @@ def _normalize_checkpoint_leaf_to_jax(
     *,
     cpu_device: jax.Device | None,  # pyright: ignore[reportInvalidTypeForm]
 ) -> tp.Any:
-    """Convert NumPy leaves into JAX arrays without consuming accelerator HBM."""
+    """Convert NumPy leaves into JAX arrays without consuming accelerator HBM.
+
+    Args:
+        value: Pytree leaf. Only ``numpy.ndarray`` and ``numpy.generic``
+            scalars are transformed; everything else passes through.
+        cpu_device: Optional target CPU device. When supplied the leaf is
+            placed there via :func:`jax.device_put`; otherwise it is wrapped
+            with :func:`jnp.asarray` (default placement).
+
+    Returns:
+        Any: The original value, or a JAX array on the requested CPU device
+        when the input was NumPy-backed.
+    """
     if not isinstance(value, (np.ndarray, np.generic)):
         return value
     if cpu_device is not None:
@@ -400,7 +437,17 @@ class StreamingCheckpointInfo:
 
 
 def _save_generation_config(generation_config: tp.Any, save_directory: ePathLike) -> None:
-    """Persist generation config with EasyDeL path handling (local and remote filesystems)."""
+    """Persist a generation config to ``save_directory`` using EasyDeL path I/O.
+
+    Handles dict, ``transformers.GenerationConfig``, and legacy
+    ``save_pretrained``-style values transparently and works against both
+    local filesystems and remote ePath targets (GCS, S3, ...).
+
+    Args:
+        generation_config: The generation config to persist. ``None``
+            short-circuits to a no-op.
+        save_directory: Destination directory (local or remote).
+    """
     if generation_config is None:
         return
 
@@ -433,7 +480,27 @@ def _load_generation_config(
     log_missing: bool = False,
     **hf_kwargs,
 ):
-    """Load generation config with ePath-first lookup (supports GCS paths)."""
+    """Load a ``GenerationConfig`` with ePath-first lookup (supports GCS paths).
+
+    Tries ePath candidates inside *pretrained_model_name_or_path* first so
+    remote checkpoints (GCS/S3) don't require an HF Hub roundtrip, then
+    falls back to ``GenerationConfig.from_pretrained``.
+
+    Args:
+        pretrained_model_name_or_path: Local path, ePath URI, or HF repo id.
+        subfolder: Optional sub-directory inside the model location to
+            search before the root.
+        trust_remote_code: Forwarded to ``GenerationConfig.from_pretrained``
+            when the ePath path fails.
+        log_missing: When ``True``, emit a warning if no generation config
+            is found anywhere.
+        **hf_kwargs: Additional kwargs forwarded to the HF loader fallback
+            (``revision``, ``token``, ``proxies``, ...).
+
+    Returns:
+        GenerationConfig | None: A loaded config, or ``None`` when no
+        generation config exists for this model.
+    """
     from transformers import GenerationConfig
 
     model_path = ePath(str(pretrained_model_name_or_path))
@@ -478,7 +545,23 @@ def _load_generation_config(
 
 
 def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
-    """Parse torch_load_mode related kwargs and return a TorchLoadOptions struct."""
+    """Parse ``torch_load_mode`` related kwargs into a :class:`TorchLoadOptions`.
+
+    Removes (via ``pop``) the relevant entries from ``kwargs`` and consolidates
+    them into a typed options struct so the streaming/eager PyTorch loader
+    paths don't have to re-parse them.
+
+    Args:
+        kwargs: Caller-supplied ``from_pretrained`` kwargs. The function
+            mutates this dict to extract ``torch_load_mode``,
+            ``torch_streaming_cache``, ``torch_streaming_tmp_dir`` and any
+            Hub-related kwargs.
+
+    Returns:
+        TorchLoadOptions: Normalized options including the resolved mode,
+        streaming-cache policy, optional temp dir, and a filtered HF Hub
+        kwargs dict.
+    """
     torch_load_mode = str(kwargs.pop("torch_load_mode", "full")).lower()
     if torch_load_mode not in {"full", "streaming"}:
         warnings.warn(
@@ -860,12 +943,34 @@ class EasyBridgeMixin(PushToHubMixin):
         commit_description: str | None = None,
         upload_num_threads: int | None = None,
     ):
-        """
-        Uploads all modified files under `working_dir` to `repo_id`, at arbitrary depth, based on `files_timestamps`.
+        """Upload modified files under ``working_dir`` to ``repo_id`` on the Hub.
 
-        files_timestamps should ideally map each file's relative POSIX path from `working_dir` (e.g. "a/b/c.txt")
-        to the last-uploaded mtime (float). For backward compatibility, if a full relative path key is missing,
-        this function falls back to a top-level key (first path segment) if present.
+        Walks the directory recursively, batches new/modified files into a
+        single :func:`huggingface_hub.create_commit` call, and applies the
+        EasyDeL-resolved concurrency limit so large checkpoints don't
+        oversubscribe HF's upload endpoint.
+
+        Args:
+            working_dir: Directory containing the files to upload.
+            repo_id: Target Hugging Face Hub repository id.
+            files_timestamps: Mapping of relative POSIX paths under
+                ``working_dir`` to their last-known mtime. Backward-compatible
+                with legacy callers that supplied only the top-level path
+                segment.
+            commit_message: Optional explicit commit message. Inferred from
+                the class name when ``None``.
+            token: Hugging Face auth token override.
+            create_pr: When ``True``, create a pull request instead of
+                committing directly to the branch.
+            revision: Optional target branch / revision.
+            commit_description: Optional long-form commit description.
+            upload_num_threads: Optional explicit concurrency cap. ``None``
+                lets :meth:`_resolve_upload_num_threads` pick a default.
+
+        Returns:
+            Any: Whatever :func:`huggingface_hub.create_commit` returns
+            (typically the commit info object) when something was actually
+            uploaded; ``None`` when there were no modified files.
         """
         if commit_message is None:
             if "Model" in self.__class__.__name__:
@@ -942,7 +1047,22 @@ class EasyBridgeMixin(PushToHubMixin):
 
     @staticmethod
     def _resolve_upload_num_threads(upload_num_threads: int | None, operation_count: int) -> int:
-        """Resolve Hub upload concurrency with a conservative automatic default."""
+        """Resolve Hub upload concurrency with a conservative automatic default.
+
+        Capped at 16 (or the actual CPU count, whichever is smaller) so we
+        don't overwhelm the HF Hub endpoint when committing very large
+        checkpoints.
+
+        Args:
+            upload_num_threads: Optional caller-specified thread count.
+            operation_count: Number of files about to be uploaded; used to
+                shrink the cap below the system maximum when the commit is
+                small.
+
+        Returns:
+            int: A safe positive thread count to forward to
+            :func:`huggingface_hub.create_commit`.
+        """
         if upload_num_threads is not None:
             return max(int(upload_num_threads), 1)
 
@@ -1904,6 +2024,15 @@ class EasyBridgeMixin(PushToHubMixin):
         passed_shard_fns = shard_fns
 
         if load_options.mode == "full":
+            cls._maybe_restore_mtp_tensors_to_full_state_dict(
+                state_dict=state_dict,
+                model=model,
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=load_options.hub_kwargs,
+                kwargs=kwargs,
+                clear_fn=_clear,
+            )
             params = model.pure_transform_fn(
                 state_dict,
                 config=hf_config,
@@ -2286,6 +2415,15 @@ class EasyBridgeMixin(PushToHubMixin):
         for target_path in moe_groups:
             consolidated_moe_keys.add(f"{target_path}.weight")
 
+        getattr(model, "config", hf_config)
+        reform_fusion_groups, reform_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
+            ckpt_key_to_filename.keys(),
+            reform_param,
+        )
+        reform_fusion_source_keys = {
+            source_key for source_keys in reform_fusion_groups.values() for source_key in source_keys
+        }
+
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
         converter_config = {
             "embedding_layer_names": set(embedding_layer_names or []),
@@ -2388,7 +2526,19 @@ class EasyBridgeMixin(PushToHubMixin):
             for key, fname in ckpt_key_to_filename.items():
                 if key in moe_expert_keys:
                     continue
+                if key in reform_fusion_source_keys:
+                    continue
                 file_to_non_moe_keys.setdefault(fname, []).append(key)
+
+            file_to_reform_fusion_groups: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
+            multi_file_reform_fusion_groups: dict[str, tuple[str, ...]] = {}
+            for fused_key, source_keys in reform_fusion_groups.items():
+                files = {ckpt_key_to_filename[k] for k in source_keys if k in ckpt_key_to_filename}
+                if len(files) == 1:
+                    fname = next(iter(files))
+                    file_to_reform_fusion_groups.setdefault(fname, []).append((fused_key, source_keys))
+                else:
+                    multi_file_reform_fusion_groups[fused_key] = source_keys
 
             file_to_moe_groups: dict[str, list[tuple[str, dict[int, str]]]] = {}
             multi_file_moe_groups: dict[str, dict[int, str]] = {}
@@ -2404,8 +2554,9 @@ class EasyBridgeMixin(PushToHubMixin):
 
             for fname in all_files:
                 non_moe_keys = file_to_non_moe_keys.get(fname, [])
+                reform_fusion_groups_for_file = file_to_reform_fusion_groups.get(fname, [])
                 moe_groups_for_file = file_to_moe_groups.get(fname, [])
-                if not non_moe_keys and not moe_groups_for_file:
+                if not non_moe_keys and not reform_fusion_groups_for_file and not moe_groups_for_file:
                     continue
 
                 with _with_resolved_shard(fname) as resolved_path:
@@ -2413,6 +2564,15 @@ class EasyBridgeMixin(PushToHubMixin):
                         with safe_open(resolved_path, framework="pt", device="cpu") as f:
                             for k in sorted(non_moe_keys):
                                 _process_tensor(k, f.get_tensor(k))
+
+                            for fused_key, source_keys in reform_fusion_groups_for_file:
+                                fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                                    reform_fusion_rules[fused_key],
+                                    [f.get_tensor(source_key) for source_key in source_keys],
+                                )
+                                _process_tensor(fused_key, fused_tensor)
+                                del fused_tensor
+                                clear_fn()
 
                             for target_path, expert_key_by_idx in moe_groups_for_file:
                                 expert_indices = sorted(expert_key_by_idx.keys())
@@ -2442,6 +2602,15 @@ class EasyBridgeMixin(PushToHubMixin):
                         for k in sorted(non_moe_keys):
                             _process_tensor(k, shard[k])
 
+                        for fused_key, source_keys in reform_fusion_groups_for_file:
+                            fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                                reform_fusion_rules[fused_key],
+                                [shard[source_key] for source_key in source_keys],
+                            )
+                            _process_tensor(fused_key, fused_tensor)
+                            del fused_tensor
+                            clear_fn()
+
                         for target_path, expert_key_by_idx in moe_groups_for_file:
                             expert_indices = sorted(expert_key_by_idx.keys())
                             if not expert_indices:
@@ -2463,6 +2632,34 @@ class EasyBridgeMixin(PushToHubMixin):
 
                         del shard
                         clear_fn()
+
+            if multi_file_reform_fusion_groups:
+                for fused_key, source_keys in sorted(multi_file_reform_fusion_groups.items()):
+                    tensors = []
+                    for source_key in source_keys:
+                        fname = ckpt_key_to_filename[source_key]
+                        with _with_resolved_shard(fname) as resolved_path:
+                            if ckpt_weight_format == "safetensors":
+                                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                                    tensors.append(f.get_tensor(source_key))
+                            else:
+                                shard = None
+                                try:
+                                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                                except TypeError:
+                                    shard = torch.load(resolved_path, map_location="cpu")
+                                tensors.append(shard[source_key])
+                                del shard
+                                clear_fn()
+
+                    fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                        reform_fusion_rules[fused_key],
+                        tensors,
+                    )
+                    _process_tensor(fused_key, fused_tensor)
+                    del tensors
+                    del fused_tensor
+                    clear_fn()
 
             if multi_file_moe_groups:
                 if torch_streaming_cache == "temp":
@@ -2535,6 +2732,114 @@ class EasyBridgeMixin(PushToHubMixin):
             _run_streaming_conversion()
 
         return parameters_flat
+
+    @classmethod
+    def _maybe_restore_mtp_tensors_to_full_state_dict(
+        cls,
+        *,
+        state_dict: dict[str, tp.Any] | None,
+        model: tp.Any,
+        pretrained_model_name_or_path: str,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        kwargs: dict[str, tp.Any],
+        clear_fn: tp.Callable[[], None],
+    ) -> None:
+        """Restore top-level ``mtp.*`` tensors lost by HF full-model loading.
+
+        Some Qwen3.5 checkpoints store MTP-head weights as top-level
+        ``mtp.*`` tensors while the corresponding Transformers model may mark
+        those keys as unexpected and omit them from ``hf_model.state_dict()``.
+        EasyDeL still materializes ``self.mtp`` for configs with an MTP head,
+        so re-read only those raw checkpoint tensors before conversion.
+        """
+        if state_dict is None:
+            return
+        if any(key.startswith("mtp.") for key in state_dict):
+            return
+
+        has_mtp = False
+        try:
+            model_has_mtp = getattr(model, "has_mtp", None)
+            has_mtp = bool(model_has_mtp()) if callable(model_has_mtp) else getattr(model, "mtp", None) is not None
+        except Exception:
+            has_mtp = getattr(model, "mtp", None) is not None
+        if not has_mtp:
+            return
+
+        try:
+            ckpt_info = cls._resolve_streaming_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=hub_kwargs,
+                kwargs=kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Model has an MTP head, but raw checkpoint shards could not be resolved to restore mtp.* tensors: %s",
+                exc,
+            )
+            return
+
+        try:
+            import torch
+            from safetensors.torch import safe_open
+        except ModuleNotFoundError:
+            return
+
+        ckpt_key_to_filename = ckpt_info.ckpt_key_to_filename
+        ckpt_filename_to_path = ckpt_info.ckpt_filename_to_path
+
+        if not ckpt_key_to_filename:
+            filename = next(iter(ckpt_filename_to_path.keys()))
+            resolved_path = ckpt_filename_to_path[filename]
+            if ckpt_info.ckpt_weight_format == "safetensors":
+                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        ckpt_key_to_filename[key] = filename
+            else:
+                try:
+                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(resolved_path, map_location="cpu")
+                for key in shard.keys():
+                    ckpt_key_to_filename[key] = filename
+                del shard
+                clear_fn()
+
+        mtp_keys = sorted(key for key in ckpt_key_to_filename if key.startswith("mtp."))
+        if not mtp_keys:
+            return
+
+        restored = 0
+        keys_by_file: dict[str, list[str]] = {}
+        for key in mtp_keys:
+            keys_by_file.setdefault(ckpt_key_to_filename[key], []).append(key)
+
+        for filename, keys in keys_by_file.items():
+            resolved_path = ckpt_filename_to_path.get(filename)
+            if resolved_path is None or not os.path.isfile(resolved_path):
+                resolved_path = ckpt_info.resolve_shard(filename, None)
+                ckpt_filename_to_path[filename] = resolved_path
+
+            if ckpt_info.ckpt_weight_format == "safetensors":
+                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                    for key in keys:
+                        state_dict[key] = f.get_tensor(key)
+                        restored += 1
+            else:
+                try:
+                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(resolved_path, map_location="cpu")
+                for key in keys:
+                    state_dict[key] = shard[key]
+                    restored += 1
+                del shard
+                clear_fn()
+
+        if restored:
+            logger.info("Restored %d top-level MTP tensor(s) from raw checkpoint shards.", restored)
 
     @classmethod
     def _load_full_torch_checkpoint(

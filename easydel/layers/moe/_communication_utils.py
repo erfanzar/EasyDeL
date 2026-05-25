@@ -86,11 +86,11 @@ class MoEMethods(enum.StrEnum):
 
 
 def rsum_scatter(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
-    """Performs reduce-scatter collective operation with float32 accumulation.
+    """Perform reduce-scatter along ``axis_name`` returning per-device tiles.
 
-    This function wraps `jax.lax.psum_scatter` to provide a reduce-scatter operation,
-    which combines reduction (sum) across devices with scattering of results. Each
-    device receives a different slice of the reduced result.
+    Thin wrapper around :func:`jax.lax.psum_scatter` that combines an
+    all-reduce sum with a scatter so each device ends up with a different
+    slice of the reduced result along ``scatter_dimension``.
 
     Args:
         x: Input array to reduce and scatter.
@@ -114,10 +114,10 @@ def rsum_scatter(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bo
 
 
 def argsort(x: jax.Array) -> jax.Array:
-    """Returns indices that would sort the input array along its last axis.
+    """Return indices that would sort ``x`` along its last axis.
 
-    Convenience wrapper around `jnp.argsort` for sorting along the last dimension,
-    commonly used in MoE routing to sort tokens by expert assignment.
+    Convenience wrapper around :func:`jnp.argsort` (fixed ``axis=-1``);
+    used throughout the MoE pipeline to sort tokens by expert assignment.
 
     Args:
         x: Input array to sort. Can have any number of dimensions.
@@ -136,9 +136,10 @@ def argsort(x: jax.Array) -> jax.Array:
 
 
 def take1d(x: jax.Array, idx: jax.Array) -> jax.Array:
-    """Indexes an array along axis 0 using the provided indices.
+    """Gather along axis 0 using ``idx``.
 
-    Convenience wrapper for extracting rows from a 2D array or elements from a 1D array.
+    Convenience wrapper around :func:`jnp.take` for extracting rows from a
+    2-D array (or elements from a 1-D array).
 
     Args:
         x: Input array to index. Shape: (N, ...).
@@ -159,7 +160,7 @@ def take1d(x: jax.Array, idx: jax.Array) -> jax.Array:
 
 
 def repeat_take_sorted(x: jax.Array, sort_idx: jax.Array, k: int) -> jax.Array:
-    """Repeats and reorders rows of an array based on sorted indices.
+    """Replicate rows of ``x`` k times implicitly, then reorder by ``sort_idx``.
 
     This function is used in MoE to replicate token representations k times
     (once per selected expert) and then sort them by expert assignment.
@@ -186,10 +187,11 @@ def repeat_take_sorted(x: jax.Array, sort_idx: jax.Array, k: int) -> jax.Array:
 
 
 def bincount(x: jax.Array, length: int) -> jax.Array:
-    """Counts occurrences of non-negative integers in an array.
+    """Count occurrences of each non-negative integer in ``x`` up to ``length``.
 
-    Wrapper around `jnp.bincount` with explicit output length specification.
-    Used in MoE to count how many tokens are assigned to each expert.
+    Thin wrapper around :func:`jnp.bincount` with the output length passed
+    explicitly. Used in MoE to count how many tokens are assigned to each
+    expert.
 
     Args:
         x: Integer array to count. Shape: (N,). Values should be in range [0, length).
@@ -209,11 +211,12 @@ def bincount(x: jax.Array, length: int) -> jax.Array:
 
 
 def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp: bool = True) -> jax.Array:
-    """Reorders activations using provided sort indices with optional custom gradient.
+    """Reorder ``inputs[sort_indices]`` along axis 0 with an optional custom VJP.
 
-    This function permutes the first dimension of `inputs` according to `sort_indices`.
-    When `use_custom_vjp=True`, it uses a memory-efficient custom VJP that avoids
-    materializing the full permutation matrix during backpropagation.
+    Permutes the first dimension of ``inputs`` according to ``sort_indices``.
+    With ``use_custom_vjp=True`` the operation uses
+    :func:`sort_activations_custom`, which stores only the indices for the
+    backward pass rather than the full permutation matrix.
 
     Args:
         inputs: Input activations to sort. Shape: (N, ...).
@@ -227,7 +230,7 @@ def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp:
         Shape: same as `inputs`.
 
     Raises:
-        AssertionError: If inputs.shape[0] != sort_indices.shape[0].
+        ValueError: If ``inputs.shape[0] != sort_indices.shape[0]``.
 
     Example:
         >>> x = jnp.array([[1, 2], [3, 4], [5, 6]])
@@ -450,11 +453,10 @@ class MoeFusedHooks:
 
 
 def canon_dim(ndim: int, dim: int) -> int:
-    """Canonicalizes a dimension index to be non-negative.
+    """Canonicalize a (possibly negative) dimension index into ``[0, ndim)``.
 
-    Converts negative dimension indices (counting from the end) to their
-    equivalent positive indices, following NumPy/JAX conventions where
-    -1 refers to the last dimension, -2 to second-to-last, etc.
+    Follows NumPy/JAX convention: ``-1`` becomes ``ndim - 1``, ``-2`` becomes
+    ``ndim - 2``, etc. Non-negative inputs pass through unchanged.
 
     Args:
         ndim: Total number of dimensions in the array.
@@ -481,11 +483,12 @@ def psum_maybe(
     mesh: MeshLike,
     dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array:
-    """Conditionally performs parallel sum across specified axes if they exist in mesh.
+    """Reduce-sum ``x`` only across axes that actually exist on ``mesh``.
 
-    This function filters the requested axes to only include those that exist in
-    the mesh and have size > 1, then performs a psum reduction. If no valid axes
-    are found, returns the input unchanged.
+    Filters the requested axes down to those that exist in the mesh *and*
+    have size > 1, runs the ``psum`` in ``dtype`` for numerical stability,
+    and casts back to the input dtype. When no axis qualifies the input is
+    returned unchanged.
 
     Args:
         x: Input array to reduce.
@@ -506,10 +509,11 @@ def psum_maybe(
 def rsum_scatter_maybe(
     x: jax.Array, axis_name: str, dim: int, mesh: MeshLike, dtype: jnp.dtype = jnp.float32
 ) -> jax.Array:
-    """Conditionally performs reduce-scatter if the axis exists and has size > 1.
+    """Reduce-scatter ``x`` along ``axis_name`` only when that axis is non-trivial.
 
-    This function checks if the specified axis exists in the mesh with size > 1,
-    and if so, performs a reduce-scatter operation. Otherwise, returns input unchanged.
+    Checks that ``axis_name`` is present in ``mesh`` and has size > 1; if so,
+    runs :func:`jax.lax.psum_scatter` in ``dtype`` and casts back. Otherwise
+    returns ``x`` unchanged.
 
     Args:
         x: Input array to reduce-scatter.
@@ -532,12 +536,15 @@ def rsum_scatter_maybe(
 def slice_k_for_param_shards(
     x_mat: jax.Array, chunk: int, axes: tuple[str, ...], mesh: MeshLike, axis: int = 1
 ) -> jax.Array:
-    """Slices activation tensor to match the chunk size of parameter shards.
+    """Slice the local ``chunk`` of activations matching multi-axis param sharding.
 
-    When parameters are sharded across multiple axes (e.g., sequence parallel + FSDP),
-    this function computes which chunk of the activation tensor should be used by
-    each device based on its multi-dimensional position in the mesh. The axes are
-    linearized in row-major order to compute a single index.
+    When parameters are sharded across several mesh axes (e.g. SP + FSDP),
+    the local rank's slice is identified by the row-major linearisation of
+    its per-axis indices over ``axes``. This helper computes that linear
+    index, multiplies by ``chunk``, and returns the matching dynamic slice
+    of ``x_mat`` along ``axis``. Returns ``x_mat`` unchanged when no axis
+    contributes (stride 1) or when the requested ``chunk`` equals the full
+    axis length.
 
     Args:
         x_mat: Activation tensor to slice.
@@ -607,11 +614,12 @@ def get_all_to_all_params(
     num_expert_parallelism: int,
     is_batch_sharded: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Computes parameters for ragged all-to-all communication in expert parallelism.
+    """Compute send/receive offsets and sizes for a ragged expert-parallel all-to-all.
 
-    This function calculates the offsets and sizes needed for ragged all-to-all
-    communication when distributing tokens across expert-parallel devices. It handles
-    both batch-sharded and non-batch-sharded configurations.
+    Builds the four index vectors required by :func:`jax.lax.ragged_all_to_all`
+    when expert-parallel ranks redistribute tokens that were assigned to
+    experts owned by different shards. Handles the two layouts of
+    ``all_shards_group_sizes`` (per-(batch_shard, expert) vs per-expert).
 
     Args:
         all_shards_group_sizes: Array containing the number of tokens assigned to each
@@ -690,15 +698,15 @@ def get_all_to_all_params(
 
 
 def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.Array, jax.Array]:
-    """Computes global top-k selection across tensor-parallel shards.
+    """Compute global top-k across tensor-parallel shards with minimal communication.
 
-    This function performs top-k selection across multiple tensor-parallel shards by:
-    1. Computing local top-k on each shard's expert subset
-    2. Gathering local top-k results from all shards
-    3. Computing global top-k from the gathered results
+    Pipeline:
 
-    This is more communication-efficient than gathering all logits and then computing top-k,
-    as it only communicates k*tp values instead of E values per token.
+    1. Local ``lax.top_k`` over this shard's expert subset.
+    2. ``all_gather`` of the per-shard top-k values and indices along ``tp_axis``.
+    3. Final ``lax.top_k`` on the gathered tile.
+
+    Communicates ``k * tp_size`` values per token instead of ``E`` values.
 
     Args:
         logits_shard: Local router logits for experts on this shard.
@@ -976,11 +984,14 @@ def local_permute(
     global_sorted_experts: jax.Array | None = None,
     use_custom_sort_vjp: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Performs local permutation of tokens to group them by expert on a single shard.
+    """Reorder tokens on a single shard so tokens for the same local expert are contiguous.
 
-    This function reorders tokens on a local shard so that all tokens assigned to
-    the same expert are grouped together. This is a crucial step after all-to-all
-    communication in expert parallel execution.
+    Used after an expert-parallel all-to-all has delivered tokens to the
+    shard that owns their target expert. Computes the local expert id per
+    token (either from ``global_sorted_experts`` when ``is_offset=True`` or
+    by reproducing the group order from ``global_group_sizes`` otherwise)
+    and argsorts so the per-expert groups are contiguous for the subsequent
+    grouped matmul.
 
     Args:
         inputs: Local token representations. Shape: (tokens_local, hidden_dim).
@@ -1161,12 +1172,14 @@ def _coerce_axis_manager(manager: object | None) -> RuntimeShardingResolver | ob
 
 
 def resolve_eformer_axis(axis: str | list[str], manager: object | None):
-    """Resolves logical axis name(s) to physical mesh axis names.
+    """Resolve logical axis name(s) (TP/EP/DP/FSDP/SP) to physical mesh axis names.
 
-    This convenience wrapper resolves symbolic axis names (like "tp", "ep", "fsdp")
-    to their actual names in the device mesh for training mode. This is necessary
-    because EFormer's PartitionManager may map logical parallelism axes to different
-    physical mesh axes depending on configuration.
+    Symbolic axis names like ``"tp"`` / ``"ep"`` are mapped onto their
+    actual mesh-axis names via the supplied EFormer runtime sharding
+    resolver (or compatible legacy axis manager). Different deployments
+    can map the same logical axis onto different mesh axes, so this
+    indirection is needed wherever the MoE pipeline talks about a
+    parallelism axis by its EFormer name.
 
     Args:
         axis: A single axis name or list of axis names to resolve. Common values:
@@ -1210,16 +1223,14 @@ def get_moe_partition_spec(
     sp_is_ep_bound: bool = True,
     module_view: bool = False,
 ) -> jax.sharding.PartitionSpec:
-    """Generate JAX PartitionSpec for MoE expert weight tensors.
+    """Build the :class:`PartitionSpec` for an MoE expert weight or bias tensor.
 
-    This function creates appropriate sharding specifications for expert FFN
-    weight matrices based on the parallelism configuration. It handles both
-    standard expert parallelism (experts on EP axis) and expert tensor mode
-    (experts on TP axis).
+    Supports both standard expert parallelism (experts laid out along the EP
+    axis, tensor dim along TP) and "expert tensor" mode (experts spread
+    across TP). Two weight orientations are supported:
 
-    The function supports two weight orientations:
-        - Column-wise (wi/wu kernels): Output dimension is partitioned
-        - Row-wise (wd kernel): Input dimension is partitioned
+    * Column-wise (wi/wu kernels) — partitions the intermediate (output) dim.
+    * Row-wise (wd kernel) — partitions the intermediate (input) dim.
 
     Args:
         runtime_sharding_resolver: Runtime sharding resolver providing semantic

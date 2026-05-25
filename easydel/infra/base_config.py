@@ -779,7 +779,21 @@ class EasyDeLBaseConfig(PretrainedConfig):
         *,
         rope_theta: float | int | None = None,
     ) -> dict[str, tp.Any]:
-        """Normalize a single RoPE parameter dictionary to HF v5-style keys."""
+        """Normalize a single RoPE parameter dictionary to HF v5-style keys.
+
+        Bridges the historical ``type``/``rope_type`` naming and backfills
+        ``rope_theta`` when supplied.
+
+        Args:
+            rope_parameters: A flat dict of RoPE parameters as read from an
+                HF config (may use legacy ``type`` instead of ``rope_type``).
+            rope_theta: Optional explicit RoPE base frequency to insert when
+                missing.
+
+        Returns:
+            dict[str, Any]: A new dict with both ``type`` and ``rope_type``
+            keys populated and ``rope_theta`` filled when provided.
+        """
         normalized = dict(rope_parameters)
         if "type" in normalized and "rope_type" not in normalized:
             normalized["rope_type"] = normalized["type"]
@@ -825,7 +839,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return normalized
 
     def _backfill_rope_parameters(self) -> None:
-        """Ensure rope parameters remain usable after late attribute mutations."""
+        """Ensure rope parameters remain usable after late attribute mutations.
+
+        Triggered from :meth:`__setattr__` whenever one of the rope-relevant
+        attributes (``rope_parameters``, ``rope_scaling``, ``rope_theta``,
+        ``partial_rotary_factor``, ``layer_types``) changes. Rebuilds and
+        re-stores ``self.rope_parameters`` in HF v5 layout (flat or per
+        layer-type) so downstream rope helpers stay consistent.
+        """
         rope_theta = getattr(self, "rope_theta", None)
         partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
         layer_types = getattr(self, "layer_types", None)
@@ -887,7 +908,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         super().__setattr__("rope_parameters", normalized)
 
     def _ensure_hf_compat_fields(self, kwargs: dict[str, tp.Any]) -> None:
-        """Populate fields commonly expected by HF model implementations."""
+        """Populate fields commonly expected by HF model implementations.
+
+        Reads from :attr:`_hf_compat_defaults` to ensure attributes such as
+        ``pad_token_id`` / ``tie_word_embeddings`` exist on the instance, and
+        keeps the various MoE expert-count aliases (``num_experts``,
+        ``n_routed_experts``, ``num_local_experts``) in sync.
+
+        Args:
+            kwargs: Raw constructor kwargs; values present here override the
+                compatibility defaults.
+        """
         for key, default_value in self._hf_compat_defaults.items():
             if key in kwargs:
                 setattr(self, key, kwargs[key])
@@ -902,7 +933,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 self.num_local_experts = self.n_routed_experts
 
     def _ensure_rope_context_fields(self, kwargs: dict[str, tp.Any]) -> None:
-        """Ensure fields needed by HF rope standardization exist before super().__init__."""
+        """Ensure fields needed by HF rope standardization exist before super().__init__.
+
+        HF's ``PretrainedConfig.__init__`` runs early rope normalisation that
+        reads ``max_position_embeddings`` directly. This method populates that
+        attribute from any plausible source (kwargs, freq/mask overrides,
+        rope-scaling metadata) so the upstream init path does not crash.
+
+        Args:
+            kwargs: Raw constructor kwargs inspected for length hints.
+        """
         if hasattr(self, "max_position_embeddings"):
             return
 
@@ -924,7 +964,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
 
     def _ensure_rope_parameters(self, kwargs: dict[str, tp.Any]) -> None:
-        """Bridge legacy rope fields to `rope_parameters` expected by HF v5."""
+        """Bridge legacy rope fields to ``rope_parameters`` expected by HF v5.
+
+        Merges any legacy ``rope_scaling`` / ``rope_theta`` /
+        ``partial_rotary_factor`` arguments into a normalized
+        ``rope_parameters`` dict that downstream EasyDeL and HF code can
+        rely on.
+
+        Args:
+            kwargs: Raw constructor kwargs, possibly containing the legacy
+                rope field names.
+        """
         rope_theta = kwargs.get("rope_theta", getattr(self, "rope_theta", None))
         partial_rotary_factor = kwargs.get("partial_rotary_factor", getattr(self, "partial_rotary_factor", None))
         _layer_types = kwargs.get("layer_types", getattr(self, "layer_types", None))
@@ -1428,7 +1478,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return mpmd.submesh(owner).devices.flatten()
 
     def _build_expert_mesh(self, axis_types: tuple[jax.sharding.AxisType, ...]) -> spx.SpxMesh:
-        """Construct the (dp, ep, tp) expert mesh on the current stage's sub-mesh."""
+        """Construct the ``(dp, ep, tp)`` expert mesh on the current stage's sub-mesh.
+
+        Args:
+            axis_types: 3-tuple of :class:`jax.sharding.AxisType` values
+                (one per axis: dp, ep, tp) describing the desired axis
+                semantics (Auto / Explicit / Manual).
+
+        Returns:
+            spx.SpxMesh: An SpectraX mesh sized for the current pipeline
+            stage's SPMD sub-mesh with experts folded according to
+            ``fsdp_is_ep_bound`` / ``sp_is_ep_bound``.
+        """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
             self.runtime_sharding_resolver,
@@ -1538,12 +1599,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
         attr_name_on_self: str,
         setter_method_name: str,
     ):
-        """Propagate a mesh to all sub-configurations.
+        """Propagate a mesh to ``self`` and all declared sub-configurations.
+
+        Cascades a mesh assignment through any ``sub_configs`` (e.g. text /
+        vision sub-configs on multimodal models) so all parts of a composite
+        config agree on the active device topology.
 
         Args:
-            mesh: JAX device mesh to propagate.
-            attr_name_on_self: The hidden attribute name to set (e.g. '_hidden_mesh').
-            setter_method_name: The setter method name on sub-configs (e.g. 'set_model_mesh').
+            mesh: JAX device mesh (or compatible value) to propagate.
+            attr_name_on_self: Hidden cache attribute to update on this
+                config and its sub-configs (e.g. ``"_hidden_mesh"``).
+            setter_method_name: Public setter to invoke on sub-configs when
+                present (e.g. ``"set_model_mesh"``).
         """
         spx_mesh = self._as_spx_mesh(mesh)
         setattr(self, attr_name_on_self, spx_mesh)
@@ -1605,7 +1672,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @classmethod
     def _set_token_in_kwargs(cls, kwargs: dict[str, tp.Any], token: str | bool | None = None) -> None:
-        """Normalize auth token arguments for Hugging Face Hub utilities."""
+        """Normalize auth token arguments for Hugging Face Hub utilities.
+
+        Args:
+            kwargs: Keyword-argument dictionary that will be forwarded to a
+                Hugging Face Hub call; mutated in place to hold a canonical
+                ``token`` key.
+            token: Optional explicit token override. When ``None``, an
+                existing legacy ``use_auth_token`` entry is promoted to
+                ``token`` for downstream HF compatibility.
+        """
         if token is not None:
             kwargs["token"] = token
             return
@@ -2146,7 +2222,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def _is_dtype_like(value: tp.Any) -> bool:
-        """Return True for JAX/NumPy dtype objects and scalar type classes."""
+        """Return True for JAX/NumPy dtype objects and scalar type classes.
+
+        Args:
+            value: Arbitrary value to probe.
+
+        Returns:
+            bool: ``True`` when ``value`` looks like a dtype object or a
+            scalar-type class exposed by numpy/ml_dtypes/jax/torch.
+        """
         if isinstance(value, np.dtype):
             return True
         value_module = getattr(value.__class__, "__module__", "")
@@ -2164,13 +2248,29 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def _is_torch_dtype_instance(value: tp.Any) -> bool:
-        """Return True for concrete ``torch.dtype`` objects without importing torch eagerly."""
+        """Return True for concrete ``torch.dtype`` objects without importing torch eagerly.
+
+        Args:
+            value: Arbitrary value to probe.
+
+        Returns:
+            bool: ``True`` when ``value`` is a torch dtype instance.
+        """
         value_module = getattr(value.__class__, "__module__", "")
         return value_module.startswith("torch") and value.__class__.__name__ == "dtype"
 
     @staticmethod
     def _dtype_name(value: tp.Any) -> str:
-        """Convert framework-specific dtype objects into a stable string name."""
+        """Convert framework-specific dtype objects into a stable string name.
+
+        Args:
+            value: Any dtype-like value (NumPy / JAX dtype, torch.dtype,
+                or string).
+
+        Returns:
+            str: Canonical name (e.g. ``"bfloat16"``, ``"float32"``) suitable
+            for round-tripping through JSON.
+        """
         try:
             return np.dtype(value).name
         except TypeError:
@@ -2182,7 +2282,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @classmethod
     def _coerce_dtype_spec(cls, value: tp.Any) -> tp.Any:
-        """Convert persisted dtype strings back into runtime dtype objects."""
+        """Convert persisted dtype strings back into runtime dtype objects.
+
+        Accepts JSON-serialised dtype names (``"bf16"``, ``"float32"``,
+        ``"fp8_e4m3"`` etc.) plus their aliases and converts them back into
+        :class:`jnp.dtype` instances. Native torch/NumPy dtype objects are
+        passed through unchanged.
+
+        Args:
+            value: Persisted dtype representation.
+
+        Returns:
+            Any: A runtime dtype object when ``value`` resolves to a known
+            spec, otherwise the original ``value``.
+        """
         if value is None:
             return None
         if cls._is_torch_dtype_instance(value):
@@ -2225,7 +2338,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return value
 
     def _coerce_runtime_dtype_fields(self) -> None:
-        """Rehydrate known dtype config fields after loading from serialized JSON."""
+        """Rehydrate known dtype config fields after loading from serialized JSON.
+
+        Iterates over the canonical dtype attributes
+        (``dtype``, ``attn_dtype``, ``kvdtype``, ``attn_softmax_dtype``,
+        ``mla_attn_dtype``, ``mla_attn_softmax_dtype``) and replaces any
+        serialised string with the corresponding runtime dtype object.
+        """
         for field_name in (
             "dtype",
             "attn_dtype",
@@ -2239,7 +2358,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @classmethod
     def _normalize_json_value(cls, value: tp.Any) -> tp.Any:
-        """Recursively normalize dtype-like values into JSON-safe primitives."""
+        """Recursively normalize dtype-like values into JSON-safe primitives.
+
+        Args:
+            value: Arbitrary nested Python object pulled from
+                :meth:`to_dict` / :meth:`to_diff_dict`.
+
+        Returns:
+            Any: A structurally identical value with dtype-like leaves
+            converted to canonical strings and numpy scalars unwrapped to
+            Python primitives.
+        """
         if isinstance(value, dict):
             return {k: cls._normalize_json_value(v) for k, v in value.items()}
         if isinstance(value, list):
@@ -2257,7 +2386,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return value
 
     def dict_dtype_to_str(self, d: dict[str, Any]) -> None:
-        """Normalize dtype-like values anywhere in the config tree."""
+        """Normalize dtype-like values anywhere in the config tree in-place.
+
+        Args:
+            d: Mutable dictionary representation of the config; mutated so
+                that every leaf produced by :meth:`_normalize_json_value` is
+                JSON-safe.
+        """
         for key, value in list(d.items()):
             d[key] = self._normalize_json_value(value)
 
@@ -2561,7 +2696,22 @@ class EasyDeLBaseConfig(PretrainedConfig):
         ePath(json_file_path).write_text(self.to_json_string(use_diff=use_diff))
 
     def to_json_string(self, use_diff: bool = True) -> str:
-        """Serialize the config to JSON with a dtype-aware fallback."""
+        """Serialize the config to a JSON string.
+
+        Applies dtype normalisation and float-encoding before delegating to
+        :func:`json.dumps` so the output round-trips through
+        :meth:`from_pretrained`.
+
+        Args:
+            use_diff: When ``True`` (default), emit only fields that differ
+                from :class:`PretrainedConfig` defaults via
+                :meth:`to_diff_dict`. Otherwise dump the full
+                :meth:`to_dict` payload.
+
+        Returns:
+            str: A JSON document (indented, sorted keys) terminated by a
+            newline.
+        """
         config_dict = self.to_diff_dict() if use_diff else self.to_dict()
         config_dict = self._encode_special_floats(config_dict)
         config_dict = self._normalize_json_value(config_dict)
@@ -3145,7 +3295,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @property
     def runtime_sharding_resolver(self) -> RuntimeShardingResolver:
-        """Return the canonical runtime sharding resolver for this config."""
+        """Build the canonical :class:`RuntimeShardingResolver` for this config.
+
+        Synthesises a resolver from the config's :class:`AxisPolicy` and live
+        mesh, including a :class:`PipelineStageRankResolver` when virtual
+        pipeline stages are in play.
+
+        Returns:
+            RuntimeShardingResolver: A resolver bound to the current mesh and
+            capable of mapping logical axes to mesh axes for the current
+            execution mode.
+        """
         if not isinstance(getattr(self, "axis_policy", None), AxisPolicy):
             self.axis_policy = AxisPolicy.from_partition_axis(getattr(self, "partition_axis", None))
         if not isinstance(getattr(self, "partition_axis", None), PartitionAxis):
@@ -3173,7 +3333,25 @@ class EasyDeLBaseConfig(PretrainedConfig):
         shape: tuple[int, ...] | object = NOT_GIVEN,
         overrides: LogicalAxisRules | None = None,
     ):
-        """Open a spectrax logical-axis-rules scope derived from ``axis_policy``."""
+        """Open a SpectraX logical-axis-rules scope for this config's policy.
+
+        Convenience pass-through to
+        :meth:`RuntimeShardingResolver.logical_axis_rules` that scopes
+        SpectraX logical-axis-rule rewrites to the current mesh and
+        :class:`AxisPolicy`.
+
+        Args:
+            mode: Execution mode passed to the resolver (defaults to
+                ``MODE_TRAIN``); selects between train/inference axis maps.
+            shape: Tensor shape used to disambiguate axis-binding rules for
+                shape-dependent policies.
+            overrides: Optional ad-hoc additions or replacements to the
+                resolved logical-axis rules.
+
+        Returns:
+            ContextManager: A SpectraX context manager that activates the
+            resolved logical-axis-rule set for its scope.
+        """
         return self.runtime_sharding_resolver.logical_axis_rules(mode=mode, shape=shape, overrides=overrides)
 
     @property

@@ -91,21 +91,27 @@ def _yarn_find_correction_range(  # pyright: ignore[reportUnusedFunction]
     base: float = 10000,
     max_position_embeddings: int = 2048,
 ) -> tuple[int | Array, int | Array]:
-    """
-    Finds the correction range for YaRN scaling based on low and high rotation frequencies.
+    """Compute the integer YaRN correction band ``[low, high]`` from rotation budgets.
 
-    Internal helper function for YaRN.
+    Calls :func:`_yarn_find_correction_dim` once per rotation budget
+    (``low_rot``, ``high_rot``), then floors the low end and ceils the high
+    end so the band covers every plane *fully* extrapolated and *fully*
+    interpolated. Result is clipped to ``[0, dim - 1]`` to keep downstream
+    indexing safe.
 
     Args:
-        low_rot (int): Lower rotation frequency boundary.
-        high_rot (int): Higher rotation frequency boundary.
-        dim (int): The dimension of the embeddings.
-        base (float, optional): The base value for positional encoding. Defaults to 10000.
-        max_position_embeddings (int, optional): The maximum sequence length. Defaults to 2048.
+        low_rot: Lower rotation budget (rotations within the original
+            context that still count as "slow").
+        high_rot: Upper rotation budget (rotations beyond which the plane
+            is "fast").
+        dim: Total rotary feature dimension.
+        base: RoPE base period.
+        max_position_embeddings: Original training context length.
 
     Returns:
-        tp.Tuple[int, int]: A tuple containing the lower and upper bounds of the correction range,
-                            clipped between 0 and dim-1.
+        Tuple ``(low, high)`` with ``low <= high``, both clipped to
+        ``[0, dim - 1]``, ready to be consumed by
+        :func:`_yarn_linear_ramp_mask`.
     """
     hr = jnp.ceil(
         _yarn_find_correction_dim(
@@ -133,21 +139,23 @@ def _yarn_linear_ramp_mask(  # pyright: ignore[reportUnusedFunction]
     dim: int,
     dtype: jnp.dtype,
 ) -> jnp.ndarray:
-    """
-    Creates a linear ramp mask for YaRN scaling.
+    """Build the YaRN linear ramp blending interpolation and extrapolation.
 
-    Internal helper function for YaRN. Generates a mask that ramps linearly from 0 to 1
-    between the `low` and `high` dimension indices.
+    Produces a length-``dim`` vector that is ``0`` for indices below
+    ``low``, ``1`` for indices above ``high``, and linearly interpolates in
+    between. YaRN multiplies this mask against the per-plane extrapolation
+    weight so the blend transitions smoothly from "purely interpolated" on
+    the slow dims to "purely extrapolated" on the fast dims. A tiny epsilon
+    is added when ``low == high`` to avoid a divide-by-zero.
 
     Args:
-        low (float): The starting dimension index for the ramp.
-        high (float): The ending dimension index for the ramp.
-        dim (int): The total dimension of the mask.
-        dtype (jnp.dtype): The data type for the mask array.
+        low: Ramp start (output is ``0`` at and below this index).
+        high: Ramp end (output is ``1`` at and above this index).
+        dim: Length of the produced 1-D mask.
+        dtype: Output dtype.
 
     Returns:
-        jnp.ndarray: A 1D array of shape (dim,) representing the linear ramp mask,
-                     clipped between 0 and 1.
+        1-D array of shape ``(dim,)`` containing values in ``[0, 1]``.
     """
     high = jax.lax.cond(low == high, lambda x: x + 0.001, lambda x: x, high)
     linear_func = (jnp.arange(dim, dtype=dtype) - low) / (high - low)
@@ -181,17 +189,20 @@ def _yarn_get_mscale(scale: float = 1) -> float | Array:  # pyright: ignore[repo
 
 @jax.named_scope("easydel-rotary-rotate-neox")
 def _rotate_neox(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:  # pyright: ignore[reportUnusedFunction]
-    """
-    Applies the Neox-style rotation to the input array.
+    """Apply the Neox-style 90-degree rotation to the last axis.
 
-    Splits the last dimension in half and concatenates the negated second half
-    with the first half.
+    Splits the last axis into two halves and returns
+    ``concat(-second_half, first_half)`` — the Neox / Llama convention used
+    by most published RoPE implementations. Combined with element-wise
+    ``x * cos + rotate_neox(x) * sin`` this realises the planar rotation
+    where each pair ``(x_i, x_{i + d/2})`` is treated as one complex number.
 
     Args:
-        x (jnp.ndarray): The input array.
+        x: Tensor whose last axis is split and rotated.
 
     Returns:
-        jnp.ndarray: The rotated array.
+        Tensor with the same shape as ``x``, rotated 90° in each pairwise
+        plane.
     """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -200,16 +211,20 @@ def _rotate_neox(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... s
 
 @jax.named_scope("easydel-rotary-rotate-gptj")
 def _rotate_gptj(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:  # pyright: ignore[reportUnusedFunction]
-    """
-    Applies the GPT-J-style rotation to the input array.
+    """Apply the GPT-J-style 90-degree rotation to the last axis.
 
-    Interleaves the negated odd-indexed elements with the even-indexed elements.
+    The GPT-J convention pairs adjacent elements ``(x_{2k}, x_{2k+1})``
+    rather than the halves; this helper produces
+    ``interleave(-x_odd, x_even)`` so that downstream
+    ``x * cos + rotate_gptj(x) * sin`` realises the same planar rotation as
+    Neox-style, just with a different physical interleaving.
 
     Args:
-        x (jnp.ndarray): The input array.
+        x: Tensor whose last axis is split into even/odd lanes and rotated.
 
     Returns:
-        jnp.ndarray: The rotated array.
+        Tensor with the same shape as ``x``, rotated 90° in each pairwise
+        plane.
     """
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
@@ -224,23 +239,29 @@ def _apply_rotary_emb(  # pyright: ignore[reportUnusedFunction]
     sin: jnp.ndarray,
     is_neox_style: bool,
 ) -> jnp.ndarray:
-    """
-    Applies rotary positional embedding to the input tensor.
+    """Apply RoPE to a query- or key-shaped tensor.
+
+    Splits ``x`` into two halves according to ``is_neox_style`` (halved for
+    Neox, even/odd lanes for GPT-J), then computes the standard 2-D rotation
+    ``(x1*cos - x2*sin, x2*cos + x1*sin)`` and re-assembles into the
+    original layout. ``cos`` / ``sin`` are gathered up to the heads axis via
+    ``cos[:, :, None]`` so they broadcast across all heads.
 
     Args:
-        x (jnp.ndarray): Input tensor, e.g., query or key. Expected shape
-                         [..., num_tokens, head_size] or similar.
-        cos (jnp.ndarray): Cosine components of the embedding. Expected shape
-                           compatible for broadcasting with `x` after rotation,
-                           e.g., [..., num_tokens, head_size//2].
-        sin (jnp.ndarray): Sine components of the embedding. Expected shape
-                           compatible for broadcasting with `x` after rotation,
-                           e.g., [..., num_tokens, head_size//2].
-        is_neox_style (bool): Whether to use Neox-style rotation (`_rotate_neox`)
-                              or GPT-J-style rotation (`_rotate_gptj`).
+        x: Query or key tensor; the last axis is rotated.
+        cos: Pre-gathered cosine components for the active positions.
+        sin: Pre-gathered sine components for the active positions.
+        is_neox_style: ``True`` splits the last axis into halves (Neox),
+            ``False`` interleaves even/odd lanes (GPT-J). Must match the
+            layout of ``cos`` / ``sin``.
 
     Returns:
-        jnp.ndarray: The tensor with rotary embeddings applied.
+        Tensor with the same shape as ``x`` carrying RoPE-rotated values
+        in the rotated axis.
+
+    Raises:
+        ValueError: If ``sin.ndim`` does not match ``x.ndim`` after the
+            broadcast-axis expansion (sanity check).
     """
     cos = cos[:, :, None].astype(x.dtype)
     sin = sin[:, :, None].astype(x.dtype)

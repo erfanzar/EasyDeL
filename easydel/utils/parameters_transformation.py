@@ -310,6 +310,63 @@ class StateDictConverter:
     """
 
     @staticmethod
+    def validate_reform_param_schema(reform_param: Mapping[str, Mapping[str, tp.Any]] | None) -> None:
+        """Validate the structural contract used by ``reform_param`` rules.
+
+        Checks rule shape and callable presence, not tensor shapes. Rules
+        that merge multiple checkpoint tensors into one EasyDeL tensor must be
+        bidirectional so export cannot accidentally write runtime-only layouts.
+
+        Args:
+            reform_param: Mapping of target-key pattern to rule mapping. May
+                be ``None`` or empty (treated as no-op).
+
+        Raises:
+            TypeError: If a rule entry, its ``sources`` list, or one of its
+                callables has the wrong type.
+            ValueError: If a fusion rule is missing one of ``sources``,
+                ``fuser`` or ``inverse_fuser``; or if a split rule omits
+                ``inverse_spliter``.
+        """
+        if not reform_param:
+            return
+        for key, rule in reform_param.items():
+            if not isinstance(rule, Mapping):
+                raise TypeError(f"reform_param[{key!r}] must be a mapping, got {type(rule).__name__}")
+
+            has_sources = "sources" in rule
+            has_fuser = "fuser" in rule
+            has_inverse_fuser = "inverse_fuser" in rule
+            if has_sources or has_fuser or has_inverse_fuser:
+                if not has_sources or not has_fuser or not has_inverse_fuser:
+                    raise ValueError(
+                        f"reform_param[{key!r}] fusion rules must define 'sources', 'fuser', and 'inverse_fuser'"
+                    )
+                sources = rule["sources"]
+                if not isinstance(sources, tuple | list) or not all(isinstance(source, str) for source in sources):
+                    raise TypeError(f"reform_param[{key!r}]['sources'] must be a sequence of strings")
+                if not callable(rule["fuser"]):
+                    raise TypeError(f"reform_param[{key!r}]['fuser'] must be callable")
+                if not callable(rule["inverse_fuser"]):
+                    raise TypeError(f"reform_param[{key!r}]['inverse_fuser'] must be callable")
+
+            if "splits" in rule:
+                splits = rule["splits"]
+                if not isinstance(splits, tuple | list):
+                    raise TypeError(f"reform_param[{key!r}]['splits'] must be a sequence")
+                if "inverse_spliter" not in rule:
+                    raise ValueError(f"reform_param[{key!r}] split rules must define 'inverse_spliter'")
+                if not callable(rule["inverse_spliter"]):
+                    raise TypeError(f"reform_param[{key!r}]['inverse_spliter'] must be callable")
+                for split in splits:
+                    if not isinstance(split, Mapping):
+                        raise TypeError(f"reform_param[{key!r}] split entries must be mappings")
+                    if not isinstance(split.get("name"), str):
+                        raise TypeError(f"reform_param[{key!r}] split entries must define string 'name'")
+                    if not callable(split.get("spliter")):
+                        raise TypeError(f"reform_param[{key!r}] split entries must define callable 'spliter'")
+
+    @staticmethod
     def match_keywords(string: str, required: list[str], forbidden: list[str]) -> bool:
         """Check if a string contains all required keywords and none of the forbidden ones.
 
@@ -323,6 +380,157 @@ class StateDictConverter:
             keyword appears.
         """
         return all(t in string for t in required) and not any(n in string for n in forbidden)
+
+    @staticmethod
+    def collect_reform_param_fusion_groups(
+        keys: tp.Iterable[str],
+        reform_param: dict | None,
+    ) -> tuple[dict[str, tuple[str, ...]], dict[str, dict[str, tp.Any]]]:
+        """Find multi-source ``reform_param`` fusion groups present in *keys*.
+
+        Existing ``reform_param`` entries split one incoming HF tensor into one
+        or more EasyDeL leaves via ``splits``. Fusion entries are the inverse
+        load-time shape: they provide ``sources`` and a ``fuser`` callable to
+        materialize a target tensor before the normal per-tensor conversion
+        path runs.
+
+        Args:
+            keys: Iterable of state-dict keys present in the incoming
+                checkpoint.
+            reform_param: Mapping of target-key pattern to rule mapping;
+                ``None`` returns empty results.
+
+        Returns:
+            A pair ``(groups, rules_by_fused_key)`` where ``groups`` maps each
+            fused target key to the tuple of source keys it consumes, and
+            ``rules_by_fused_key`` maps the same target keys to their full
+            rule mapping (for ``fuser`` lookup downstream).
+        """
+        if not reform_param:
+            return {}, {}
+        StateDictConverter.validate_reform_param_schema(reform_param)
+
+        key_set = set(keys)
+        groups: dict[str, tuple[str, ...]] = {}
+        rules_by_fused_key: dict[str, dict[str, tp.Any]] = {}
+        sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
+
+        for key_check, value in sorted_items:
+            if "sources" not in value or "fuser" not in value:
+                continue
+            target_key = key_check[:-1] if key_check.endswith("$") else key_check
+            source_keys = tuple(value["sources"])
+            if not source_keys:
+                continue
+            skip_substrings = tuple(value.get("skip_substrings", ()))
+            if any(any(skip in source_key for skip in skip_substrings) for source_key in source_keys):
+                continue
+            if all(source_key in key_set for source_key in source_keys):
+                groups[target_key] = source_keys
+                rules_by_fused_key[target_key] = value
+
+        return groups, rules_by_fused_key
+
+    @staticmethod
+    def fuse_reform_param_tensors(rule: dict[str, tp.Any], tensors: list[tp.Any]) -> tp.Any:
+        """Apply a ``reform_param`` multi-source fusion rule.
+
+        Detects whether the rule's ``fuser`` callable wants the ``torch``
+        module as its first positional argument and dispatches accordingly.
+
+        Args:
+            rule: Rule mapping containing a ``"fuser"`` callable.
+            tensors: Per-source tensors in the order declared by
+                ``rule["sources"]``.
+
+        Returns:
+            The fused tensor returned by the ``fuser`` callable.
+        """
+        fuser = rule["fuser"]
+        torch = TensorConverter.get_torch()
+        accepted = [
+            p
+            for p in inspect.signature(fuser).parameters.values()
+            if p.kind in {p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL}
+        ]
+        if accepted and accepted[0].name in {"torch", "pt"}:
+            return fuser(torch, *tensors)
+        return fuser(*tensors)
+
+    @staticmethod
+    def inverse_fuse_reform_param_tensor(rule: dict[str, tp.Any], tensor: tp.Any) -> tp.Any:
+        """Apply a ``reform_param`` inverse fusion rule.
+
+        Used during EasyDeL -> HuggingFace export to recover the original
+        per-source tensors from a fused EasyDeL leaf. Dispatches with or
+        without a leading ``torch`` argument based on the callable signature.
+
+        Args:
+            rule: Rule mapping containing an ``"inverse_fuser"`` callable.
+            tensor: The fused EasyDeL tensor to split back into its sources.
+
+        Returns:
+            Either a tuple/list of per-source tensors or a mapping of source
+            name to tensor, as produced by the configured ``inverse_fuser``.
+        """
+        inverse_fuser = rule["inverse_fuser"]
+        torch = TensorConverter.get_torch()
+        accepted = [
+            p
+            for p in inspect.signature(inverse_fuser).parameters.values()
+            if p.kind in {p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL}
+        ]
+        if accepted and accepted[0].name in {"torch", "pt"}:
+            return inverse_fuser(torch, tensor)
+        return inverse_fuser(tensor)
+
+    @staticmethod
+    def apply_reform_param_fusions(
+        state_dict: dict[str, tp.Any] | None,
+        reform_param: dict | None,
+    ) -> dict[str, int]:
+        """Materialize all present ``reform_param`` fusion groups in-place.
+
+        For each fusion group whose source keys are all present in
+        ``state_dict``, computes the fused tensor via
+        :meth:`fuse_reform_param_tensors`, writes it under the target key, and
+        drops the original source entries.
+
+        Args:
+            state_dict: HuggingFace-style state dict to mutate. ``None`` is a
+                no-op.
+            reform_param: Mapping of rules (see :meth:`validate_reform_param_schema`).
+
+        Returns:
+            Mapping of human-readable fusion label to the number of fused
+            tensors materialized for that label.
+        """
+        if state_dict is None:
+            return {}
+
+        groups, rules_by_fused_key = StateDictConverter.collect_reform_param_fusion_groups(
+            state_dict.keys(),
+            reform_param,
+        )
+        if not groups:
+            return {}
+
+        fused_counts: dict[str, int] = {}
+        source_keys_to_drop: set[str] = set()
+        for fused_key, source_keys in groups.items():
+            if fused_key in state_dict:
+                continue
+            rule = rules_by_fused_key[fused_key]
+            tensors = [state_dict[source_key] for source_key in source_keys]
+            state_dict[fused_key] = StateDictConverter.fuse_reform_param_tensors(rule, tensors)
+            source_keys_to_drop.update(source_keys)
+            label = str(rule.get("log_label", fused_key))
+            fused_counts[label] = fused_counts.get(label, 0) + 1
+
+        for source_key in source_keys_to_drop:
+            state_dict.pop(source_key, None)
+
+        return fused_counts
 
     @staticmethod
     def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
@@ -348,6 +556,22 @@ class StateDictConverter:
         if reform_param:
             sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
             for key_check, value in sorted_items:
+                if value.get("already_converted", False):
+                    anchor_to_end = key_check.endswith("$")
+                    match_target = key_check[:-1] if anchor_to_end else key_check
+                    match_index = key.find(match_target)
+                    if match_index != -1:
+                        after_match = key[match_index + len(match_target) :]
+                        if anchor_to_end and after_match:
+                            continue
+                        if not after_match or after_match.startswith("."):
+                            before_match = key[:match_index]
+                            if not before_match or before_match.endswith("."):
+                                config = config.copy()
+                                config["_reform_processed"] = True
+                                break
+                if "splits" not in value:
+                    continue
                 anchor_to_end = key_check.endswith("$")
                 match_target = key_check[:-1] if anchor_to_end else key_check
 
@@ -538,6 +762,7 @@ class StateDictConverter:
         moe_path: list[str] | None = None,
         tensor_transform: tp.Callable | None = None,
         reform_param: dict | None = None,
+        debug: bool = False,
     ) -> tuple[dict[str, tp.Any], set[str]]:
         """
         Transform MoE weights from HuggingFace format (separate experts) to EasyDel format (stacked experts).
@@ -595,13 +820,27 @@ class StateDictConverter:
             f"{block_path}.{expected_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
         }
         reform_param = reform_param or {}
+        reform_fusion_source_paths = {
+            (source[:-7] if source.endswith(".weight") else source)
+            for value in reform_param.values()
+            if "sources" in value
+            for source in value["sources"]
+            if f".{expected_expert_name}." in source
+        }
+        stackable_moe_paths = moe_stacked_paths | reform_fusion_source_paths
+        if debug:
+            logger.info("MoE converter stackable paths: %s", sorted(stackable_moe_paths))
+            if reform_fusion_source_paths:
+                logger.info("MoE converter reform source paths: %s", sorted(reform_fusion_source_paths))
         fallback_reform_keys = {
-            key[:-1] if key.endswith("$") else key for key in reform_param if f".{expected_expert_name}." in key
+            key[:-1] if key.endswith("$") else key
+            for key, value in reform_param.items()
+            if "splits" in value and f".{expected_expert_name}." in key
         }
         sibling_expert_parents = {path.rsplit(".", 1)[0] for path in moe_path if f".{expected_expert_name}." in path}
 
         new_state_dict = {}
-        moe_groups = {path: {} for path in moe_stacked_paths}
+        moe_groups = {path: {} for path in stackable_moe_paths}
         consolidated_moe_keys = set()
 
         for key in tqdm(list(state_dict.keys()), desc="Applying MoE Transformations"):
@@ -628,8 +867,8 @@ class StateDictConverter:
                     moe_name_part = remainder[dot_idx + 1 :]
                     moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
 
-                    if moe_name in moe_names_set:
-                        target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
+                    target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
+                    if moe_name in moe_names_set or target_path in stackable_moe_paths:
                         moe_groups[target_path][expert_idx] = value
                         is_moe_expert = True
                         break
@@ -640,12 +879,16 @@ class StateDictConverter:
                     expert_parent, expert_idx_str, moe_name = match.groups()
                     target_path = f"{expert_parent}.{moe_name}"
                     if expert_parent in sibling_expert_parents and (
-                        moe_name in moe_names_set or target_path in fallback_reform_keys
+                        moe_name in moe_names_set
+                        or target_path in fallback_reform_keys
+                        or target_path in stackable_moe_paths
                     ):
                         moe_groups.setdefault(target_path, {})[int(expert_idx_str)] = value
                         is_moe_expert = True
 
             if not is_moe_expert:
+                if debug and expert_prefix in key:
+                    logger.info("MoE converter left expert key unclaimed: %s", key)
                 new_state_dict[key] = value
         for target_path, expert_dict in moe_groups.items():
             if not expert_dict:
@@ -742,6 +985,7 @@ class StateDictConverter:
             Nested EasyDeL parameter dictionary.
         """
         consolidated_moe_keys = set()
+        debug = bool(kwargs.pop("debug", False))
         if moe_block_names is not None and moe_names is not None:
             state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
                 state_dict=state_dict,
@@ -750,7 +994,12 @@ class StateDictConverter:
                 moe_block_names=moe_block_names,
                 moe_block_path=moe_block_path,
                 reform_param=reform_param,
+                debug=debug,
             )
+
+        fused_counts = StateDictConverter.apply_reform_param_fusions(state_dict, reform_param)
+        for label, count in sorted(fused_counts.items()):
+            logger.info("Fused %d reform_param %s into runtime merged weights.", count, label)
 
         return StateDictConverter._base_huggingface_to_easydel(
             state_dict,
@@ -956,7 +1205,10 @@ class StateDictConverter:
 
         reform_param = kwargs.get("reform_param", None)
         if reform_param:
+            StateDictConverter.validate_reform_param_schema(reform_param)
             for key_check, value_check in reform_param.items():
+                if "splits" not in value_check:
+                    continue
                 inverse_spliter = value_check.get("inverse_spliter", None)
                 if inverse_spliter:
                     anchor_to_end = key_check.endswith("$")
@@ -1003,20 +1255,65 @@ class StateDictConverter:
                             positional_params = [
                                 p
                                 for p in inspect.signature(inverse_spliter).parameters.values()
-                                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
                             ]
-                            wants_torch = (
-                                len(positional_params) > len(tensors_to_merge) and positional_params[0].name == "torch"
-                            )
+                            wants_torch = bool(positional_params) and positional_params[0].name == "torch"
                             if wants_torch:
                                 merged_tensor = inverse_spliter(torch_module, *tensors_to_merge)
                             else:
                                 merged_tensor = inverse_spliter(*tensors_to_merge)
                             original_key = f"{prefix}{match_target}{suffix}"
                             torch_state_dict[original_key] = merged_tensor
+                            if original_key in keys_to_remove:
+                                keys_to_remove.remove(original_key)
 
                     for key in keys_to_remove:
                         del torch_state_dict[key]
+
+            for key_check, value_check in reform_param.items():
+                if "sources" not in value_check or "inverse_fuser" not in value_check:
+                    continue
+                anchor_to_end = key_check.endswith("$")
+                match_target = key_check[:-1] if anchor_to_end else key_check
+                source_names = tuple(value_check["sources"])
+                if not source_names:
+                    continue
+
+                additions: dict[str, tp.Any] = {}
+                keys_to_remove: set[str] = set()
+                for key, tensor in list(torch_state_dict.items()):
+                    match_index = key.find(match_target)
+                    if match_index == -1:
+                        continue
+                    after_match = key[match_index + len(match_target) :]
+                    if anchor_to_end and after_match:
+                        continue
+                    if after_match and not after_match.startswith("."):
+                        continue
+                    before_match = key[:match_index]
+                    if before_match and not before_match.endswith("."):
+                        continue
+
+                    outputs = StateDictConverter.inverse_fuse_reform_param_tensor(value_check, tensor)
+                    if isinstance(outputs, Mapping):
+                        source_tensors = {str(name): value for name, value in outputs.items()}
+                    else:
+                        if not isinstance(outputs, tuple | list):
+                            outputs = (outputs,)
+                        if len(outputs) != len(source_names):
+                            raise ValueError(
+                                f"inverse_fuser for {match_target} returned {len(outputs)} tensors, "
+                                f"expected {len(source_names)}."
+                            )
+                        source_tensors = dict(zip(source_names, outputs, strict=True))
+
+                    for source_name, source_tensor in source_tensors.items():
+                        additions[f"{before_match}{source_name}{after_match}"] = source_tensor
+                    keys_to_remove.add(key)
+
+                for key in keys_to_remove:
+                    torch_state_dict.pop(key, None)
+                torch_state_dict.update(additions)
 
         return torch_state_dict
 

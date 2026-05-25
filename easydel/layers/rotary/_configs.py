@@ -136,16 +136,21 @@ class RopeConfig:
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, tp.Any]) -> RopeConfig:
-        """
-        Create a RopeConfig instance from a dictionary.
+        """Construct a :class:`RopeConfig` from a HuggingFace-style dict.
 
-        Handles potential alias 'type' for 'rope_type'.
+        Accepts both the modern (``rope_type``, ``factor``) and legacy
+        (``type``, ``scaling_factor``) field names; the legacy names are
+        silently translated. Missing fields are left as ``None`` so the
+        downstream dispatcher only sees what the active scaling method
+        actually needs.
 
         Args:
-            config_dict (tp.Dict[str, tp.Any]): Dictionary containing RoPE configuration.
+            config_dict: Mapping of RoPE configuration keys to values; may
+                include either naming convention plus any of the per-method
+                fields enumerated in the class docstring.
 
         Returns:
-            RopeConfig: An instance populated from the dictionary.
+            New :class:`RopeConfig` populated from ``config_dict``.
         """
 
         rope_type = config_dict.get("rope_type")
@@ -257,7 +262,7 @@ class RopeConfig:
         from easydel.utils.compiling_utils import hash_fn
 
         class rope_scaling(dict):
-            """A dictionary subclass that is hashable."""
+            """Hashable ``dict`` subclass so the result can be a JIT static arg."""
 
             __hash__ = hash_fn
 

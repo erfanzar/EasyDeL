@@ -88,31 +88,36 @@ def get_rope(
     dtype: jnp.dtype | None = None,
     partial_rotary_factor: float = 1.0,
 ) -> RotaryEmbedding:
-    """
-    Factory function to create and return a RotaryEmbedding instance based on configuration.
+    """Build the rotary-embedding module specified by ``rope_scaling``.
 
-    Selects the appropriate RoPE class (standard, linear, dynamic, YaRN, Llama3, Phi3, Deepseek)
-    based on the `rope_scaling` dictionary.
+    Reads ``rope_scaling["rope_type"]`` and dispatches to the matching
+    :class:`spx.Module` subclass in :mod:`._modules`. Also detects the
+    HuggingFace Qwen2-VL convention where ``rope_type="default"`` is paired
+    with an ``mrope_section`` field and rewrites it to ``"mrope"``. When
+    ``rope_scaling is None`` returns the unscaled :class:`RotaryEmbedding`.
 
     Args:
-        head_size (int): Dimension of each attention head.
-        rotary_dim (int): Base dimension for rotary embedding (before partial factor).
-        max_position (int): Maximum sequence length the model should support (target length).
-        base (int): Base value for frequency calculation.
-        is_neox_style (bool, optional): Use Neox rotation style. Defaults to True.
-        rope_scaling (tp.Optional[tp.Dict[str, tp.Any]], optional): Dictionary specifying the
-            type and parameters of RoPE scaling. If None or 'rope_type' is 'default',
-            uses standard RoPE. Keys like 'rope_type', 'factor',
-            'original_max_position_embeddings', etc., are used. Defaults to None.
-        dtype (tp.Optional[jnp.dtype], optional): Data type for embeddings. Defaults to jnp.float32.
-        partial_rotary_factor (float, optional): Factor to reduce the rotary dimension
-            (e.g., 0.5 applies RoPE to half the dimensions). Defaults to 1.0.
+        head_size: Per-head attention dimension.
+        rotary_dim: Rotary feature dimension before applying
+            ``partial_rotary_factor``.
+        max_position: Target (post-extension) context length.
+        base: Geometric-progression base ``θ``.
+        is_neox_style: Neox vs GPT-J rotation layout. Defaults to ``True``.
+        rope_scaling: Configuration dict carrying ``rope_type`` plus the
+            per-method fields (factor, original_max_position_embeddings,
+            beta_fast/slow, mscale, short/long factor, mrope_section, …).
+            ``None`` means unscaled.
+        dtype: Output dtype of the embeddings. Defaults to ``float32``.
+        partial_rotary_factor: Scalar in ``(0, 1]`` shrinking ``rotary_dim``
+            (e.g. ``0.5`` rotates only the lower half of each head).
 
     Returns:
-        RotaryEmbedding: An instance of the configured RotaryEmbedding subclass.
+        Configured :class:`RotaryEmbedding` subclass instance.
 
     Raises:
-        ValueError: If `rope_scaling` specifies an unknown `rope_type`.
+        ValueError: If ``rope_scaling["rope_type"]`` is not one of the
+            registered names, or if a YaRN entry omits both ``factor`` and
+            ``scaling_factor``.
     """
     if dtype is None:
         dtype = jnp.float32  # Default JAX dtype
@@ -274,31 +279,33 @@ def get_frequencies(
     rope_scaling: dict[str, tp.Any] | None = None,
     partial_rotary_factor: float = 1.0,
 ) -> jax.Array:
-    """
-    Computes and returns the RoPE frequency cache based on configuration.
+    """Compute the cos/sin frequency cache for the configured RoPE variant.
 
-    Selects the appropriate frequency computation function (basic, linear, dynamic,
-    YaRN, Llama3, Phi3, Deepseek) based on the `rope_scaling` dictionary.
-    This function is JIT-compiled for performance, with relevant parameters marked static.
+    Reads ``rope_scaling["rope_type"]`` and dispatches to the matching
+    ``compute_*_frequencies`` function in :mod:`._compute_fns`. The Qwen2-VL
+    ``rope_type="default" + mrope_section`` convention is auto-rewritten to
+    ``"mrope"`` (which falls back to the basic cache; the MRoPE module
+    performs the THW interleaving at call time). Wrapped in :func:`ejit` with
+    the heavy fields marked static so a JIT cache miss only happens when
+    geometry changes.
 
     Args:
-        head_size (int): Dimension of each attention head (needed for some scaling types like Phi3).
-        rotary_dim (int): Base dimension for rotary embedding (before partial factor).
-        max_position (int): Maximum sequence length for which to compute frequencies.
-                            This might be the original or target length depending on scaling type.
-        base (int): Base value for frequency calculation.
-        rope_scaling (tp.Optional[tp.Dict[str, tp.Any]], optional): Dictionary specifying the
-            type and parameters of RoPE scaling. Determines which frequency function to call.
-            Defaults to None (uses `compute_basic_frequencies`).
-        partial_rotary_factor (float, optional): Factor to reduce the rotary dimension.
-            Defaults to 1.0.
+        head_size: Per-head attention dimension (needed by the Phi-3 path).
+        rotary_dim: Rotary feature dimension before applying
+            ``partial_rotary_factor``.
+        max_position: Length of the produced cache (target context for the
+            length-extending variants).
+        base: Geometric-progression base ``θ``.
+        rope_scaling: Configuration dict; ``None`` means unscaled.
+        partial_rotary_factor: Scalar in ``(0, 1]`` shrinking ``rotary_dim``.
 
     Returns:
-        jax.Array: The computed frequency cache tensor. Shape depends on the scaling method,
-                   typically [computed_length, rotary_dim_effective].
+        Frequency cache as a JAX array. Layout is
+        ``[length, 2*rotary_dim_effective]`` with ``[cos | sin]`` along the
+        last axis (except Phi-3 which prepends a leading axis of size 1).
 
     Raises:
-        ValueError: If `rope_scaling` specifies an unknown `rope_type`.
+        ValueError: If ``rope_scaling["rope_type"]`` is not registered.
     """
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
@@ -452,28 +459,31 @@ def get_inv_frequencies(
     rope_scaling: dict[str, tp.Any] | None = None,
     partial_rotary_factor: float = 1.0,
 ) -> jax.Array:
-    """
-    Computes and returns just the inverse frequencies for RoPE based on configuration.
+    """Compute the inverse-frequency vector for the configured RoPE variant.
 
-    Similar to `get_frequencies` but returns only the inverse frequencies without
-    computing the full frequency cache (no cos/sin transformation).
+    Like :func:`get_frequencies` but stops *before* the outer product with
+    positions and the cos/sin transformation. Some callers (notably ones that
+    apply RoPE on-the-fly inside a fused attention kernel) want just the
+    ``θ_i`` vector and build the cache themselves. The Phi-3 (``longrope``)
+    branch uses ``head_size`` rather than ``rotary_dim`` to size the inverse-
+    frequency layout, matching :func:`compute_phi3_frequencies`.
 
     Args:
-        head_size (int): Dimension of each attention head (needed for some scaling types like Phi3).
-        rotary_dim (int): Base dimension for rotary embedding (before partial factor).
-        max_position (int): Maximum sequence length the model should support.
-        base (int): Base value for frequency calculation.
-        rope_scaling (tp.Optional[tp.Dict[str, tp.Any]], optional): Dictionary specifying the
-            type and parameters of RoPE scaling. Determines which frequency function to call.
-            Defaults to None (uses basic inverse frequencies).
-        partial_rotary_factor (float, optional): Factor to reduce the rotary dimension.
-            Defaults to 1.0.
+        head_size: Per-head attention dimension (needed by the Phi-3 path).
+        rotary_dim: Rotary feature dimension before applying
+            ``partial_rotary_factor``.
+        max_position: Used by the ``longrope`` branch to choose between
+            ``short_factor`` and ``long_factor``.
+        base: Geometric-progression base ``θ``.
+        rope_scaling: Configuration dict; ``None`` means unscaled.
+        partial_rotary_factor: Scalar in ``(0, 1]`` shrinking ``rotary_dim``.
 
     Returns:
-        jax.Array: The computed inverse frequencies. Shape is typically (rotary_dim // 2,).
+        Float32 JAX array of inverse frequencies, typically of shape
+        ``(rotary_dim // 2,)`` (Phi-3 uses ``head_size // 2``).
 
     Raises:
-        ValueError: If `rope_scaling` specifies an unknown `rope_type`.
+        ValueError: If ``rope_scaling["rope_type"]`` is not registered.
     """
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)

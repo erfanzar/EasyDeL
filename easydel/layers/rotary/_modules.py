@@ -111,29 +111,31 @@ def _promote_rotary_operands(*operands: jax.Array) -> tuple[jax.Array, ...]:
 
 
 def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
-    """
-    A decorator factory that registers a RotaryEmbedding class under a specific type name.
+    """Build a decorator that registers a rotary class under ``type`` in :data:`AVAILABLE_ROPE_TYPES`.
 
-    This allows retrieving RoPE configurations by type name later. It also sets
-    basic __str__ and __repr__ for the decorated class.
+    The decorator captures the class's ``__dict__`` so callers can introspect
+    the registered RoPE without instantiating it, sets simple ``__str__`` /
+    ``__repr__`` returning the class name, and stashes the chosen ``type``
+    name on ``cls._type`` for round-tripping. Used to populate the
+    name-to-class table consumed by :func:`get_rope` / :func:`get_frequencies`.
 
     Args:
-        type (str): The name to register the RoPE class under (e.g., "linear", "yarn").
+        type: Registry key (e.g. ``"linear"``, ``"yarn"``, ``"llama3"``).
 
     Returns:
-        Callable: A decorator function that takes a RotaryEmbedding class, registers it,
-                  and returns the class.
+        Decorator that takes the rotary class, registers it, and returns
+        it unchanged (apart from the dunders / ``_type`` patch).
     """
 
     def w(rope: _T) -> _T:
-        """
-        Decorator function that registers the RoPE class.
+        """Apply the registration side-effect to ``rope`` and return it.
 
         Args:
-            rope: The RotaryEmbedding class to register.
+            rope: The rotary class being registered.
 
         Returns:
-            The registered RotaryEmbedding class.
+            The same class object, now reachable via
+            ``AVAILABLE_ROPE_TYPES[type]``.
         """
         properties = {k: v for k, v in rope.__dict__.items()}
         AVAILABLE_ROPE_TYPES[type] = properties
@@ -147,16 +149,24 @@ def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
 
 @rope_wrapper("default")
 class RotaryEmbedding(spx.Module):
-    """
-    Standard Rotary Positional Embedding (RoPE) module.
+    """Vanilla (un-scaled) Rotary Position Embedding module.
+
+    Base class registered under ``"default"`` in :data:`AVAILABLE_ROPE_TYPES`;
+    all other RoPE variants in this module extend it. The class owns just the
+    geometric parameters (``base`` / ``rotary_dim`` / ``max_position_embeddings``)
+    and delegates frequency computation to :func:`compute_basic_frequencies`
+    and rotation application to :func:`apply_basic_rope`. Subclasses override
+    one or both halves.
 
     Attributes:
-        head_size (int): The dimension size of each attention head.
-        rotary_dim (int): The dimension size of the rotary embeddings applied. Can be <= head_size.
-        max_position_embeddings (int): The maximum sequence length the model can handle.
-        base (int): The base value for calculating frequencies.
-        is_neox_style (bool): Flag indicating whether to use Neox-style rotation.
-        dtype (jnp.dtype): Data type for computations.
+        head_size (int): Per-head attention dimension.
+        rotary_dim (int): Number of channels rotated; remaining ``head_size -
+            rotary_dim`` channels (NoPE tail) pass through untouched.
+        max_position_embeddings (int): Length of the precomputed cos/sin cache.
+        base (int): Geometric-progression base ``θ`` for the unscaled spectrum.
+        is_neox_style (bool): ``True`` for Neox interleaving, ``False`` for the
+            GPT-J pairing.
+        dtype (jnp.dtype): Output dtype of the rotated query/key.
     """
 
     def __init__(
@@ -524,14 +534,20 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
 
 @rope_wrapper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
-    """
-    RotaryEmbedding extended with Linear Scaling.
+    """RoPE variant using Position Interpolation (linear position scaling).
 
-    Linearly scales the position indices before calculating frequencies.
+    Implements the Chen et al. 2023 Position-Interpolation context extension:
+    positions are divided by the scaling factor so a model trained at
+    ``max_position_embeddings`` keeps the same rotation angles when evaluated
+    at ``max_position_embeddings * scaling_factor`` tokens. Frequency
+    construction is delegated to :func:`compute_linear_frequencies`.
 
     Attributes:
-        scaling_factors (tp.Union[tp.List[float], float]): The factor(s) to scale positions by.
-        Inherits other attributes from RotaryEmbedding.
+        scaling_factors (list[float] | float): Single factor (the usual
+            case) or a list of factors used to build a concatenated cache
+            with multiple scaling regimes.
+
+    Plus all attributes inherited from :class:`RotaryEmbedding`.
     """
 
     def __init__(
@@ -618,14 +634,19 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 
 @rope_wrapper("dynamic")
 class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
-    """
-    RotaryEmbedding extended with Dynamic NTK scaling.
+    """RoPE variant using Dynamic NTK-aware scaling.
 
-    Dynamically adjusts the `base` parameter based on the scaling factor.
+    Adjusts the ``base`` (frequency progression base) rather than the
+    positions, so high-frequency dimensions are perturbed less than
+    low-frequency ones. See :func:`compute_dynamic_frequencies` for the
+    closed-form adjustment.
 
     Attributes:
-        scaling_factor (float): The scaling factor applied to sequence length and base calculation.
-        Inherits other attributes from RotaryEmbedding.
+        scaling_factor (float | list[float]): Target context-length
+            multiplier. Lists are accepted for API parity but the dynamic
+            variant uses a single scalar.
+
+    Plus all attributes inherited from :class:`RotaryEmbedding`.
     """
 
     def __init__(
@@ -713,19 +734,25 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 
 @rope_wrapper("yarn")
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
-    """
-    RotaryEmbedding extended with the YaRN (Yet another RoPE extensioN method) scaling.
+    """RoPE variant using YaRN (Yet another RoPE extensioN) scaling.
 
-    Combines interpolation and extrapolation with frequency correction and magnitude scaling.
+    Blends Position Interpolation (slow dims) with raw extrapolation (fast
+    dims) via a smooth ramp on the rotation-count axis, and applies a
+    log-derived ``mscale`` correction to the cos/sin magnitudes so attention
+    score variance stays roughly constant. Defers frequency construction to
+    :func:`compute_yarn_frequencies`.
 
     Attributes:
-        scaling_factor (tp.Union[float, int]): The primary scaling factor for context length.
-        extrapolation_factor (float): Controls the strength of extrapolation correction.
-        attn_factor (float): Scales the output attention values.
-        beta_fast (int): YaRN parameter for high-frequency dimensions correction range.
-        beta_slow (int): YaRN parameter for low-frequency dimensions correction range.
-        Inherits other attributes from RotaryEmbedding. Note: `max_position_embeddings`
-        in the parent init likely refers to the *original* max length for YaRN calculations.
+        scaling_factor (float | int): Target context-length multiplier.
+        extrapolation_factor (float): Scalar in ``[0, 1]`` weighting the
+            extrapolation branch (``1.0`` is full YaRN).
+        attn_factor (float): User-tunable multiplier composed with the YaRN
+            mscale and applied to cos/sin.
+        beta_fast (int): Fast-band boundary in rotations-per-original-context
+            (typical 32).
+        beta_slow (int): Slow-band boundary (typical 1).
+
+    Plus all attributes inherited from :class:`RotaryEmbedding`.
     """
 
     def __init__(
@@ -837,27 +864,33 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
 @rope_wrapper("deepseek_yarn")
 class DeepseekScalingRotaryEmbedding(spx.Module):
-    """
-    RotaryEmbedding implementing a YaRN-like scaling method, potentially from Deepseek models.
+    """RoPE variant for DeepSeek models: YaRN with a two-mscale rescaling.
 
-    Uses YaRN parameters (`beta_fast`, `beta_slow`, `extrapolation_factor`) and includes
-    additional m-scale parameters (`mscale`, `mscale_all_dim`). This version has a custom
-    `forward` method differing slightly from `apply_basic_rope`.
+    Same interpolation/extrapolation blend as YaRN, but the attention-magnitude
+    correction is a *ratio* of two ``yarn_get_mscale`` evaluations
+    (``mscale`` numerator, ``mscale_all_dim`` denominator), as used by the
+    DeepSeek-V2/V3 series. Unlike :class:`YaRNScalingRotaryEmbedding`, this
+    class implements its own ``forward`` rather than delegating to
+    :func:`apply_basic_rope` because DeepSeek's rotation uses a ``repeat``
+    layout for cos/sin that differs from the canonical concat layout.
+
+    Note that this class inherits directly from :class:`spx.Module` (not
+    :class:`RotaryEmbedding`) and therefore re-declares the geometric fields.
 
     Attributes:
-        head_size (int): Dimension of each attention head.
-        rotary_dim (int): Dimension subjected to rotary embedding.
-        max_position_embeddings (int): Original maximum sequence length before scaling.
-        base (int): Base for frequency calculation.
-        is_neox_style (bool): Use Neox rotation if True, GPT-J otherwise.
-        dtype (jnp.dtype): Data type for embeddings.
-        scaling_factor (float): Primary scaling factor.
-        extrapolation_factor (float): YaRN extrapolation factor.
-        attn_factor (float): Attention scaling factor.
-        beta_fast (int): YaRN parameter.
-        beta_slow (int): YaRN parameter.
-        mscale (float): Parameter for m-scale calculation.
-        mscale_all_dim (float): Parameter for m-scale calculation.
+        head_size (int): Per-head attention dimension.
+        rotary_dim (int): Rotary feature dimension.
+        max_position_embeddings (int): Original (pre-extension) context.
+        base (int): Geometric-progression base ``θ``.
+        is_neox_style (bool): Neox vs GPT-J rotation layout.
+        dtype (jnp.dtype): Output dtype.
+        scaling_factor (float): Target context-length multiplier.
+        extrapolation_factor (float): YaRN extrapolation mix factor.
+        attn_factor (float): User-tunable multiplier composed with mscale.
+        beta_fast (int): YaRN fast-band boundary.
+        beta_slow (int): YaRN slow-band boundary.
+        mscale (float): Per-dim mscale exponent.
+        mscale_all_dim (float): All-dim mscale exponent (denominator).
     """
 
     def __init__(
@@ -983,23 +1016,30 @@ class DeepseekScalingRotaryEmbedding(spx.Module):
 
 @rope_wrapper("longrope")
 class Phi3LongRoPEScaledRotaryEmbedding(spx.Module):
-    """
-    RotaryEmbedding using the Phi-3 LongRoPE scaling method.
+    """RoPE variant implementing Phi-3 LongRoPE per-dimension scaling.
 
-    Applies different frequency scaling factors (`short_factor`, `long_factor`)
-    depending on the target sequence length relative to the original maximum.
-    Requires `rotary_dim` to be equal to `head_size`.
+    Phi-3 ships two learned per-frequency scaling vectors: ``short_factor``
+    (used when the runtime context fits in the original training window) and
+    ``long_factor`` (used when extending). The selected vector multiplies the
+    raw ``base**(2i/d)`` denominators before the cos/sin cache is built, and
+    a ``sqrt(1 + log(scale)/log(orig_max))`` magnitude rescale is applied
+    afterwards. Implementation differs from the YaRN family in that there is
+    no smooth ramp — the selection is binary on context length. Requires
+    ``rotary_dim == head_size``.
 
     Attributes:
-        head_size (int): Dimension of each attention head. Must equal rotary_dim.
-        rotary_dim (int): Dimension subjected to rotary embedding. Must equal head_size.
-        max_position_embeddings (int): The target maximum sequence length after scaling.
-        original_max_position_embeddings (int): Original maximum sequence length before scaling.
-        base (int): Base for frequency calculation.
-        is_neox_style (bool): Flag indicating whether Neox-style rotation is assumed (used by `apply_phi3_rope`).
-        dtype (jnp.dtype): Data type for computations.
-        short_factor (tp.List[float]): Scaling factors applied when target length <= original max length.
-        long_factor (tp.List[float]): Scaling factors applied when target length > original max length.
+        head_size (int): Per-head attention dimension; must equal ``rotary_dim``.
+        rotary_dim (int): Rotary feature dimension.
+        max_position_embeddings (int): Post-scaling target context length.
+        original_max_position_embeddings (int): Original training context.
+        base (int): Geometric-progression base ``θ``.
+        is_neox_style (bool): Forwarded into :func:`apply_phi3_rope`; Phi-3
+            assumes the Neox interleaving.
+        dtype (jnp.dtype): Output dtype.
+        short_factor (list[float]): Per-pair scalar applied when the runtime
+            context does not exceed ``original_max_position_embeddings``.
+        long_factor (list[float]): Per-pair scalar applied when the runtime
+            context exceeds ``original_max_position_embeddings``.
     """
 
     def __init__(
@@ -1098,18 +1138,24 @@ class Phi3LongRoPEScaledRotaryEmbedding(spx.Module):
 
 @rope_wrapper("llama3")
 class Llama3RotaryEmbedding(RotaryEmbedding):
-    """
-    RotaryEmbedding implementing the Llama-3 scaling method.
+    """RoPE variant implementing Llama-3's wavelength-piecewise scaling.
 
-    Adjusts frequencies based on wavelength thresholds (`low_freq_factor`, `high_freq_factor`)
-    and applies an overall scaling factor.
+    Llama-3 partitions inverse-frequencies by their wavelength
+    ``λ = 2π / θ_i`` relative to the original context and applies
+    Position-Interpolation only to the long-wavelength dims while leaving
+    short-wavelength dims alone, with a linear blend in between. See
+    :func:`compute_llama3_frequencies`.
 
     Attributes:
-        scaling_factor (float): Overall scaling factor.
-        low_freq_factor (float): Factor related to low frequency wavelength threshold.
-        high_freq_factor (float): Factor related to high frequency wavelength threshold.
-        orig_max_position (int): Original maximum sequence length before scaling.
-        Inherits other attributes from RotaryEmbedding.
+        scaling_factor (float): Target context-length multiplier (8 for the
+            Llama-3 8K→64K extension).
+        low_freq_factor (float): Low-frequency boundary parameter (1 in
+            Llama-3).
+        high_freq_factor (float): High-frequency boundary parameter (4 in
+            Llama-3).
+        orig_max_position (int): Original training context length (8192).
+
+    Plus all attributes inherited from :class:`RotaryEmbedding`.
     """
 
     def __init__(

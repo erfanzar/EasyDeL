@@ -196,10 +196,11 @@ class QuantizationConfig:
     pattern: str = field(default=DEFAULT_QUANTIZATION_PATTERN)
 
     def __post_init__(self):
-        """Post-initialization processing to normalize dtype values.
+        """Coerce string ``dtype`` values and integer-cast optional knobs.
 
-        Converts string dtype values to their corresponding QuantizationType
-        enum values for consistent internal representation.
+        Normalizes ``dtype`` and ``runtime_dtype`` from their HuggingFace-style
+        string form into :class:`QuantizationType`, and ensures
+        ``group_size`` / ``bits`` are ``int`` when present.
         """
         if isinstance(self.dtype, str):
             self.dtype = QuantizationType(self.dtype)

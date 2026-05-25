@@ -166,11 +166,11 @@ def _straight_through_cast(weights: jax.Array, *, dtype: jnp.dtype) -> jax.Array
 
 
 def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
-    """Apply straight-through estimation with MXFP8 microscaling quantization.
+    """STE-quantize ``weights`` to MXFP8 (E4M3 codes + shared E8M0 exponent per 32-wide group).
 
-    Quantizes weights using ejkernel's microscaling FP8 format in the forward
-    pass while passing gradients through unchanged in the backward pass. This
-    mode uses E4M3 codes with a shared E8M0 exponent per group.
+    Forward returns the ejkernel pack/unpack round-trip; backward passes the
+    gradient through to the source ``weights`` unchanged thanks to the inner
+    ``@ste`` decorator.
 
     Args:
         weights: Input array to quantize. Typically model weights in float32
@@ -194,11 +194,11 @@ def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
 
 
 def straight_through_nvfp8(weights: jax.Array) -> jax.Array:
-    """Apply straight-through estimation with NVIDIA FP8 (E4M3) quantization.
+    """STE-quantize ``weights`` to NVIDIA FP8 (E4M3) with per-16-element group scales.
 
-    Quantizes weights using ejkernel's NVIDIA FP8 (E4M3) mode in the forward
-    pass while passing gradients through unchanged in the backward pass. This
-    mode uses per-group E4M3 scales.
+    Forward returns the ejkernel round-trip in NVIDIA FP8; backward passes
+    the gradient through to the source ``weights`` unchanged via the inner
+    ``@ste`` decorator. This is the tensor-core-friendly variant.
 
     Args:
         weights: Input array to quantize. Typically model weights in float32
@@ -221,11 +221,10 @@ def straight_through_nvfp8(weights: jax.Array) -> jax.Array:
 
 
 def straight_through_mxfp4(weights: jax.Array) -> jax.Array:
-    """Apply straight-through estimation with MXFP4 (E2M1) quantization.
+    """STE-quantize ``weights`` to MXFP4 (E2M1 codes + shared E8M0 exponent per 32-wide group).
 
-    Quantizes weights using ejkernel's microscaling FP4 format in the forward
-    pass while passing gradients through unchanged in the backward pass. This
-    mode uses E2M1 codes with a shared E8M0 exponent per group.
+    Aggressive 4-bit microscaling format; forward returns the round-trip
+    output, backward is straight-through via the inner ``@ste``.
 
     Args:
         weights: Input array to quantize. Typically model weights in float32
@@ -340,15 +339,16 @@ def straight_through(
     dtype: QuantizationType | str | None = None,
     group_size: int | None = None,
 ) -> jax.Array:
-    """Unified straight-through estimator for all supported quantization types.
+    """Dispatch to the appropriate STE quantization for ``dtype`` (the QAT entry point).
 
-    This is the main entry point for quantization-aware training (QAT). It applies
-    quantization in the forward pass to simulate inference behavior while allowing
-    gradients to flow through unchanged in the backward pass to enable optimization
-    of the original full-precision weights.
+    Main entry point for quantization-aware training. The forward pass
+    discretizes ``array`` using the requested scheme so the model sees
+    inference-style noise; the backward pass is identity, so gradients
+    flow back to the float master weights. Dispatch order:
 
-    The function dispatches to the appropriate type-specific STE implementation
-    based on the specified quantization format.
+    1. Binary / ternary → :func:`straight_through_1bit`.
+    2. ``config.jax_native`` schemes with a backing JAX dtype → cast STE.
+    3. Affine / int8 / nf4 / mxfp4 / mxfp8 / nvfp8 → ejkernel STE.
 
     Args:
         array: Input array to quantize. Typically trainable model weights in

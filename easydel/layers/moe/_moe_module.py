@@ -109,26 +109,58 @@ SP = common_types.SP
 
 
 class BaseMoeModule(spx.Module, ABC):
-    """An abstract base class for Mixture of Experts (MoE) modules.
+    """Abstract base class shared by every Mixture-of-Experts module in EasyDeL.
 
-    This class provides a foundational structure and common utilities for
-    implementing various MoE architectures. It includes methods for token routing,
-    data permutation for efficient expert computation, load balancing loss
-    calculation, and sharding for distributed environments. Subclasses are
-    expected to implement the `forward` method to define the specific MoE forward
-    pass.
+    This is THE base class consumed by ~15 MoE model implementations (DeepSeek,
+    Qwen, Mixtral, Llama4, Arctic, Falcon-H1, GLM, GPT-OSS, etc.). It owns the
+    bulk of the MoE machinery so that concrete models only need to define their
+    own gate/router and expert kernels and then dispatch to :meth:`moe_call`.
+    Responsibilities provided here:
+
+    * Token routing helpers (``_replicate_and_sort_tokens``, capacity masking,
+      expert-group masks for hierarchical routing).
+    * Three execution paths: fused grouped-matmul (:meth:`_sparse_moe_call`),
+      dense per-token einsum (:meth:`_moe_call_dense`), and the standard
+      permute / call-expert-layer / unpermute path (:meth:`_moe_call_standard`).
+    * Distributed sharding plumbing: expert-mesh construction
+      (3D ``(dp, expert, tp)`` or stage-local 5D fall-through), partition-spec
+      generation via :meth:`get_moe_spec`, and shard-map orchestration for
+      ring-of-experts and ragged-all-to-all expert parallelism.
+    * Loss & metrics computation (load-balancing loss, router z-loss,
+      utilization, entropy) aggregated into :class:`MoeMetrics`.
+    * Per-routing-strategy default hook auto-configuration via
+      :meth:`_configure_hooks_for_routing_strategy`.
+
+    Subclasses must implement :meth:`forward` (decorated ``@abstractmethod``)
+    and are responsible for owning their own gate layer and expert kernels.
 
     Attributes:
-        config: The configuration object for the MoE module.
-        mesh: The JAX device mesh for distributed computation.
-        n_routed_experts: The total number of experts available for routing.
-        num_experts_per_tok: The number of experts each token is routed to (k).
-        hidden_size: The dimension of the hidden states.
-        lbl_coef: The coefficient for the load balancing loss.
-        rzl_coef: The coefficient for the router z-loss.
-        routing_strategy: The strategy used for routing tokens to experts.
-        load_balancing_strategy: The strategy used for calculating the load
-            balancing loss.
+        config (EasyDeLBaseConfig): Model configuration; carries MoE-related
+            knobs (`moe_method`, `use_ring_of_experts`, `use_expert_tensor_mode`,
+            `fsdp_is_ep_bound`, `sp_is_ep_bound`, etc.).
+        runtime_sharding_resolver: Resolver used to translate logical axis
+            names (DP/FSDP/EP/TP/SP) into physical mesh axis names.
+        n_routed_experts (int): Total number of routable experts.
+        num_experts_per_tok (int): Top-k width used by routing.
+        hidden_size (int): Hidden dimension of inputs and outputs.
+        lbl_coef (float | None): Coefficient for the load-balancing loss
+            (``None`` disables it).
+        rzl_coef (float | None): Coefficient for the router z-loss
+            (``None`` disables it).
+        routing_strategy (MoeRoutingStrategy): Top-k / Switch / Expert-Choice /
+            Hash strategy applied at the gate.
+        load_balancing_strategy (MoeLoadBalancingStrategy): Which aux-loss
+            formulation to apply when ``lbl_coef`` is set.
+        moe_hooks (MoeFusedHooks): Hook bundle invoked at fixed pipeline
+            points; defaults to an empty bundle.
+        module_moe_method (MoEMethods): Cached value of ``config.moe_method``;
+            picks the execution path inside :meth:`moe_call`.
+        expert_mesh / auto_expert_mesh / expert_abstract_mesh: Pre-computed
+            expert meshes pulled from the config and used as fallbacks when
+            the stage-local mesh cannot be resolved.
+        dtype (jnp.dtype): Compute dtype, defaulting to ``bfloat16``.
+        _mesh: The raw JAX mesh stored from ``config.mesh`` (used via the
+            :attr:`mesh` property after stage resolution).
     """
 
     def __init__(
@@ -143,22 +175,29 @@ class BaseMoeModule(spx.Module, ABC):
         load_balancing_strategy: MoeLoadBalancingStrategy = MoeLoadBalancingStrategy.STANDARD,
         moe_hooks: MoeFusedHooks | None = None,
     ):
-        """Initializes the BaseMoeModule.
+        """Initialize the shared MoE state from the model config.
+
+        Mostly a cache of config-derived values plus a default empty
+        :class:`MoeFusedHooks` bundle. No parameters are created here; expert
+        kernels and gate weights belong to the concrete subclass.
 
         Args:
-            config: The configuration object for this MoE module.
-            n_routed_experts: The total number of experts. If None, it's taken
-                from `config.n_routed_experts`.
-            num_experts_per_tok: The number of experts to route each token to. If
-                None, it's taken from `config.num_experts_per_tok`.
-            hidden_size: The hidden dimension of the input and output. If None,
-                it's taken from `config.hidden_size`.
-            lbl_coef: The coefficient for the load balancing loss.
-            rzl_coef: The coefficient for the router z-loss.
-            routing_strategy: The strategy for routing tokens to experts.
-            load_balancing_strategy: The strategy for load balancing.
-            moe_hooks: Hook system for custom interventions during MoE execution.
-                If None, uses default MoeFusedHooks with no custom hooks.
+            config: Configuration object exposing mesh, partition resolver,
+                and ``moe_*`` knobs (method, ring-of-experts flag, expert mesh).
+            n_routed_experts: Total expert count. Falls back to
+                ``config.n_routed_experts`` when ``None``.
+            num_experts_per_tok: Top-k width per token. Falls back to
+                ``config.num_experts_per_tok`` when ``None``.
+            hidden_size: Hidden dimension of MoE inputs/outputs. Falls back to
+                ``config.hidden_size`` when ``None``.
+            lbl_coef: Coefficient on the load-balancing aux loss; ``None``
+                disables it.
+            rzl_coef: Coefficient on the router z-loss; ``None`` disables it.
+            routing_strategy: Strategy used to map tokens to experts.
+            load_balancing_strategy: Formulation used by
+                :meth:`_compute_load_balancing_loss`.
+            moe_hooks: Optional bundle of pipeline hooks. ``None`` instantiates
+                an empty :class:`MoeFusedHooks`.
         """
         super().__init__()
         self.config = config
@@ -338,10 +377,10 @@ class BaseMoeModule(spx.Module, ABC):
         tensors_are_expert: bool,
         is_bias: bool = False,
     ) -> PartitionSpec:
-        """Generate partition spec for MoE weight tensors.
+        """Generate the :class:`PartitionSpec` for an expert weight or bias tensor.
 
-        This helper creates appropriate partition specs for MoE expert weights
-        based on the sharding strategy and tensor properties.
+        Thin wrapper over :func:`get_moe_partition_spec` that fills in the
+        module-bound configuration (resolver, FSDP/SP-bound flags).
 
         Args:
             direction: Weight matrix orientation:
@@ -377,11 +416,12 @@ class BaseMoeModule(spx.Module, ABC):
         )
 
     def _get_sharding_status(self):
-        """Resolves and returns all parallelism axis names and sizes for this MoE layer.
+        """Resolve all parallelism axis names and their sizes for this MoE layer.
 
-        This method queries the partition manager to resolve logical axis names to
-        physical mesh axis names, and retrieves their sizes from the device mesh.
-        It handles both standard and expert-tensor parallelism modes.
+        Queries the runtime sharding resolver to translate the logical axes
+        (DP/FSDP/EP/TP/SP) into physical mesh axis names, then reads the
+        per-axis sizes from the active stage mesh. Handles both standard
+        and expert-tensor parallelism modes:
 
         In standard mode:
             - Expert axis → EP (expert parallel)
@@ -448,7 +488,7 @@ class BaseMoeModule(spx.Module, ABC):
         selected_experts: jax.Array,
         use_custom_sort_vjp: bool = True,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """Replicates tokens k times and sorts them by assigned expert ID.
+        """Replicate each token k times and sort the replicas by assigned expert id.
 
         This function prepares tokens for expert computation by:
         1. Replicating each token k times (once per selected expert)
@@ -500,7 +540,7 @@ class BaseMoeModule(spx.Module, ABC):
         weights: jax.Array,
         capacity_factor: float,
     ) -> jax.Array:
-        """Applies soft capacity constraints to expert assignments.
+        """Zero out per-token weights for experts that have exceeded their capacity.
 
         This method limits the number of tokens each expert can process by zeroing out
         weights for tokens that exceed the expert's capacity. This helps prevent expert
@@ -543,7 +583,7 @@ class BaseMoeModule(spx.Module, ABC):
         return weights * keep_for_slot
 
     def _expert_group_mask(self, gate_logits: jax.Array, n_groups: int, topk_groups: int) -> jax.Array:
-        """Creates a mask for hierarchical routing with grouped experts.
+        """Build a binary mask selecting only experts within the top-k groups.
 
         This method implements hierarchical or grouped routing where experts are organized
         into groups, and tokens first select top-k groups, then select experts within
@@ -764,12 +804,13 @@ class BaseMoeModule(spx.Module, ABC):
         return metrics
 
     def _apply_expert_sharding(self, tensor: Float[Array, ...], tensor_type: str = "weight") -> Float[Array, ...]:
-        """Applies expert parallel sharding to a tensor for distributed training.
+        """Place an expert parameter onto the device mesh using a per-type sharding spec.
 
-        This method determines the appropriate sharding specification for expert parameters
-        based on the tensor type and shape, then places the tensor on devices according
-        to that specification. The sharding is currently set to replicate all dimensions
-        (EMPTY) but can be extended to support expert-parallel sharding.
+        Selects a partition spec keyed on ``tensor_type`` and the tensor's
+        rank/shape, then calls :func:`jax.device_put` against the resolved
+        sharding. The current implementation uses fully-replicated specs
+        (every axis ``EMPTY``); the dispatch shell is in place for future
+        EP-sharded layouts.
 
         Args:
             tensor: The tensor to shard. Can be weights, biases, or activations.
@@ -848,10 +889,11 @@ class BaseMoeModule(spx.Module, ABC):
         return jax.device_put(tensor, sharding)
 
     def _get_gate_layer_sharding(self, weight_shape: tuple) -> PartitionSpec:
-        """Returns the partition specification for gate/router layer weights.
+        """Build the :class:`PartitionSpec` for the router/gate weight matrix.
 
-        The gate layer maps hidden states to expert logits, producing routing decisions.
-        This method determines how the gate weight matrix should be sharded across devices.
+        The gate maps hidden states to expert logits; the matrix is small
+        relative to the expert FFNs, so the default spec replicates it
+        across every mesh axis.
 
         Args:
             weight_shape: Shape of the gate weight matrix, typically (hidden_dim, n_experts).
@@ -867,7 +909,7 @@ class BaseMoeModule(spx.Module, ABC):
         return self.runtime_sharding_resolver.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=weight_shape)
 
     def _get_gate_layer_bias_sharding(self, bias_shape: tuple) -> PartitionSpec:
-        """Returns the partition specification for gate/router layer bias.
+        """Build the :class:`PartitionSpec` for the router/gate bias vector.
 
         Args:
             bias_shape: Shape of the gate bias vector, typically (n_experts,).
@@ -992,10 +1034,10 @@ class BaseMoeModule(spx.Module, ABC):
         selected_experts: Int[Array, "batch_seq k"],
         expert_id: int,
     ) -> Bool[Array, "batch_seq"]:  # noqa: F821
-        """Creates a boolean mask identifying tokens assigned to a specific expert.
+        """Build a boolean mask of tokens routed to ``expert_id``.
 
-        This utility method is useful for per-expert analysis, debugging, or when
-        processing experts individually rather than in batched/grouped fashion.
+        Convenience helper for per-expert analysis, debugging, or processing
+        a single expert outside the batched/grouped path.
 
         Args:
             selected_experts: Expert assignments per token. Shape: (batch*seq, k)
@@ -1017,12 +1059,14 @@ class BaseMoeModule(spx.Module, ABC):
         self,
         hidden_state: jax.Array,  # [B, S, H]
         gate_layer: spx.Module,  # [H, E]
-        wi_kernel: jax.Array,  # [E, H, M]
-        wu_kernel: jax.Array,  # [E, H, M]
-        wd_kernel: jax.Array,  # [E, M, H]
+        wi_kernel: jax.Array | None,  # [E, H, M]
+        wu_kernel: jax.Array | None,  # [E, H, M]
+        wd_kernel: jax.Array | None = None,  # [E, M, H]
         wi_bias: jax.Array | None = None,  # [E, H]
         wu_bias: jax.Array | None = None,  # [E, H]
         wd_bias: jax.Array | None = None,  # [E, M]
+        gate_up_kernel: jax.Array | None = None,  # [E, H, 2M]
+        gate_up_bias: jax.Array | None = None,  # [E, 2M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
         gate_hidden_state: jax.Array | None = None,  # [B, S, H]
         hooks: MoeFusedHooks | None = None,
@@ -1103,6 +1147,8 @@ class BaseMoeModule(spx.Module, ABC):
             >>> # logits.shape = (1024, 8)  # batch*seq, n_experts
         """
 
+        if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
+            raise ValueError("MoE requires either gate_up_kernel or both wi_kernel and wu_kernel.")
         hooks = self.moe_hooks if hooks is None else hooks
         select_hook = hooks.select_hook if hooks else None
         refine_weights_hook = hooks.refine_weights_hook if hooks else None
@@ -1181,12 +1227,26 @@ class BaseMoeModule(spx.Module, ABC):
         # Generate weight sharding specs using helper function
         use_expert_tensor = self.config.use_expert_tensor_mode
 
-        wikps = self.get_moe_spec("column", use_expert_tensor, is_bias=False)
-        wukps = self.get_moe_spec("column", use_expert_tensor, is_bias=False)
+        wikps = self.get_moe_spec("column", use_expert_tensor, is_bias=False) if gate_up_kernel is None else None
+        wukps = self.get_moe_spec("column", use_expert_tensor, is_bias=False) if gate_up_kernel is None else None
+        wgukps = self.get_moe_spec("column", use_expert_tensor, is_bias=False) if gate_up_kernel is not None else None
         wdkps = self.get_moe_spec("row", use_expert_tensor, is_bias=False)
 
-        wibps = self.get_moe_spec("column", use_expert_tensor, is_bias=True) if wi_bias is not None else None
-        wubps = self.get_moe_spec("column", use_expert_tensor, is_bias=True) if wu_bias is not None else None
+        wibps = (
+            self.get_moe_spec("column", use_expert_tensor, is_bias=True)
+            if gate_up_kernel is None and wi_bias is not None
+            else None
+        )
+        wubps = (
+            self.get_moe_spec("column", use_expert_tensor, is_bias=True)
+            if gate_up_kernel is None and wu_bias is not None
+            else None
+        )
+        wgubps = (
+            self.get_moe_spec("column", use_expert_tensor, is_bias=True)
+            if gate_up_kernel is not None and gate_up_bias is not None
+            else None
+        )
         wdbps = self.get_moe_spec("row", use_expert_tensor, is_bias=True) if wd_bias is not None else None
 
         preferred_element_type = jnp.bfloat16
@@ -1219,7 +1279,7 @@ class BaseMoeModule(spx.Module, ABC):
         @partial(
             shard_map,
             mesh=expert_mesh.jax_mesh,
-            in_specs=(input_ps, glps, wikps, wukps, wdkps, wibps, wubps, wdbps),
+            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps),
             out_specs=output_ps,
             check_vma=False,
         )
@@ -1228,9 +1288,11 @@ class BaseMoeModule(spx.Module, ABC):
             gate_logits: jax.Array,
             wi_kernel: jax.Array,
             wu_kernel: jax.Array,
+            gate_up_kernel: jax.Array | None,
             wd_kernel: jax.Array,
             wi_bias: jax.Array | None,
             wu_bias: jax.Array | None,
+            gate_up_bias: jax.Array | None,
             wd_bias: jax.Array | None,
         ):
             """Per-shard fused-MoE body executed under :func:`jax.shard_map`.
@@ -1322,17 +1384,24 @@ class BaseMoeModule(spx.Module, ABC):
                         use_custom_sort_vjp=True,
                     )
 
-            layer_w0 = grouped_matmul(x, wi_kernel, group_sizes, **gmm_kws)
+            if gate_up_kernel is not None:
+                layer_gate_up = grouped_matmul(x, gate_up_kernel, group_sizes, **gmm_kws)
+                layer_gate_up = checkpoint_name(layer_gate_up, "mlp_gate_up")
+                if gate_up_bias is not None:
+                    layer_gate_up = layer_gate_up + gate_up_bias[selected_experts]
+                layer_w0, layer_w1 = jnp.split(layer_gate_up, 2, axis=-1)
+            else:
+                layer_w0 = grouped_matmul(x, wi_kernel, group_sizes, **gmm_kws)
 
-            layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
-            if wi_bias is not None:
-                layer_w0 = layer_w0 + wi_bias[selected_experts]
+                layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
+                if wi_bias is not None:
+                    layer_w0 = layer_w0 + wi_bias[selected_experts]
 
-            layer_w1 = grouped_matmul(x, wu_kernel, group_sizes, **gmm_kws)
+                layer_w1 = grouped_matmul(x, wu_kernel, group_sizes, **gmm_kws)
 
-            layer_w1 = checkpoint_name(layer_w1, "mlp_up")
-            if wu_bias is not None:
-                layer_w1 = layer_w1 + wu_bias[selected_experts]
+                layer_w1 = checkpoint_name(layer_w1, "mlp_up")
+                if wu_bias is not None:
+                    layer_w1 = layer_w1 + wu_bias[selected_experts]
 
             intermediate_layer = ffn_activation(layer_w0, layer_w1)
 
@@ -1421,9 +1490,11 @@ class BaseMoeModule(spx.Module, ABC):
             gate_logits,
             wi_kernel,
             wu_kernel,
+            gate_up_kernel,
             wd_kernel,
             wi_bias,
             wu_bias,
+            gate_up_bias,
             wd_bias,
         )
 
@@ -1447,12 +1518,14 @@ class BaseMoeModule(spx.Module, ABC):
         hidden_state: jax.Array,  # [B, S, H]
         gate_layer: spx.Module,
         expert_layer: spx.Module,
-        wi_kernel: jax.Array,  # [E, H, M]
-        wu_kernel: jax.Array,  # [E, H, M]
-        wd_kernel: jax.Array,  # [E, M, H]
+        wi_kernel: jax.Array | None = None,  # [E, H, M]
+        wu_kernel: jax.Array | None = None,  # [E, H, M]
+        wd_kernel: jax.Array | None = None,  # [E, M, H]
         wi_bias: jax.Array | None = None,  # [E, H]
         wu_bias: jax.Array | None = None,  # [E, H]
         wd_bias: jax.Array | None = None,  # [E, M]
+        gate_up_kernel: jax.Array | None = None,  # [E, H, 2M]
+        gate_up_bias: jax.Array | None = None,  # [E, 2M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
         reform_router_probs_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
         hooks: MoeFusedHooks | None = None,
@@ -1462,47 +1535,74 @@ class BaseMoeModule(spx.Module, ABC):
         output_metrics: bool = False,
         layer_idx: int | None = None,
     ):
-        """Wrapper for fused MoE call with automatic hook configuration.
+        """Dispatch to the configured MoE execution path with auto-configured hooks.
 
-        This method dispatches to either standard or fused MoE based on config, and
-        automatically configures hooks based on the routing strategy to ensure correct
-        expert weight handling.
+        Reads ``self.module_moe_method`` and routes to one of three engines:
+        :meth:`_moe_call_standard`, :meth:`_sparse_moe_call` (the fused
+        grouped-matmul path, recommended), or :meth:`_moe_call_dense`. Before
+        dispatch, :meth:`_configure_hooks_for_routing_strategy` installs the
+        default ``select_hook`` for the active routing strategy if the user
+        has not already supplied one. The whole call is wrapped in the
+        auto-resharding 3-D expert mesh.
 
         **Hook Auto-Configuration:**
-            Before calling the fused MoE path, this method automatically configures
-            default hooks for the routing strategy if they're not already set by the user:
-
             - **TOP_K**: Normalizes weights by their sum (softmax-like distribution).
             - **TOP_K_NDIV**: Passes weights through unchanged (raw logit values).
             - **SWITCH**: Enforces hard assignment with weight = 1.0.
             - **EMPTY_CHOICE**: Uniform weights across expert selections.
             - **HASH**: Uniform weights for deterministic assignments.
 
-            Each strategy gets an appropriate default `select_hook` that ensures
-            correct weight handling without requiring manual setup. Users can override
-            defaults by setting custom hooks on `self.moe_hooks` before calling the layer.
+            User-provided hooks on ``self.moe_hooks`` are preserved and override
+            the defaults.
 
         Args:
-            hidden_state: Input tensor. Shape: [B, S, H].
-            gate_layer: Router/gate module mapping H -> E (produces logits).
-            expert_layer: Expert layer module.
-            wi_kernel: Expert W_i (down/first) kernel. Shape: [E, H, M].
-            wu_kernel: Expert W_u (up/second) kernel. Shape: [E, H, M].
-            wd_kernel: Expert W_d (output/down) kernel. Shape: [E, M, H].
-            wi_bias: Optional bias for W_i. Shape: [E, H].
-            wu_bias: Optional bias for W_u. Shape: [E, H].
-            wd_bias: Optional bias for W_d. Shape: [E, M].
-            ffn_activation: Optional custom activation combining (w0, w1) -> output.
-            reform_router_probs_fn: Optional function to modify router probabilities
-                (used in standard MoE mode only).
-            act_fn: Activation function used when `ffn_activation` is not provided.
-            output_metrics: Whether to return metrics in standard MoE mode.
+            hidden_state: Input hidden states fed to the expert FFNs.
+                Shape ``[B, S, H]``.
+            gate_layer: Router/gate module mapping ``H -> E`` (produces logits).
+            expert_layer: Expert layer module consumed by the standard
+                (non-fused) path.
+            wi_kernel: Expert gate-projection kernel. Shape ``[E, H, M]``.
+                ``None`` when ``gate_up_kernel`` is provided instead.
+            wu_kernel: Expert up-projection kernel. Shape ``[E, H, M]``.
+                ``None`` when ``gate_up_kernel`` is provided instead.
+            wd_kernel: Expert down-projection kernel. Shape ``[E, M, H]``.
+                Required.
+            wi_bias: Optional bias for the gate projection. Shape ``[E, H]``.
+            wu_bias: Optional bias for the up projection. Shape ``[E, H]``.
+            wd_bias: Optional bias for the down projection. Shape ``[E, M]``.
+            gate_up_kernel: Optional fused gate/up kernel of shape
+                ``[E, H, 2M]``; mutually exclusive with the split
+                ``wi_kernel`` / ``wu_kernel`` pair.
+            gate_up_bias: Optional bias for the fused gate/up projection.
+                Shape ``[E, 2M]``.
+            ffn_activation: Optional custom activation combining
+                ``(w0, w1) -> output``. Defaults to ``act_fn(w0) * w1``.
+            reform_router_probs_fn: Optional callable applied to router
+                probabilities; used by the standard path only.
+            hooks: Optional override for ``self.moe_hooks``.
+            gate_hidden_state: Optional alternate hidden state fed to the
+                gate (e.g. for "shared expert as router" architectures).
+                Defaults to ``hidden_state``.
+            act_fn: Activation function used when ``ffn_activation`` is
+                ``None``.
+            output_metrics: When ``True`` and the standard path is taken,
+                returns :class:`MoeMetrics` instead of raw logits.
+            layer_idx: Optional layer index used by the standard path for
+                ``jax.debug.print`` logging.
 
         Returns:
-            Tuple of (output, logits) where:
-            - output: MoE layer output. Shape: [B, S, H].
-            - logits: Router logits for auxiliary loss computation. Shape: [B*S, E].
+            Tuple ``(output, aux)`` where ``output`` has shape ``[B, S, H]``
+            and ``aux`` is the pre-softmax router logits of shape ``[B*S, E]``
+            (or :class:`MoeMetrics` when ``output_metrics`` is requested via
+            the standard path).
+
+        Raises:
+            ValueError: If ``wd_kernel`` is ``None``.
+            NotImplementedError: If ``self.module_moe_method`` is not one of
+                the three known :class:`MoEMethods` values.
         """
+        if wd_kernel is None:
+            raise ValueError("MoE requires wd_kernel.")
         self._configure_hooks_for_routing_strategy()
         with self._active_auto_expert_mesh(hidden_state):
             match self.module_moe_method:
@@ -1531,6 +1631,8 @@ class BaseMoeModule(spx.Module, ABC):
                         wi_bias=wi_bias,
                         wu_bias=wu_bias,
                         wd_bias=wd_bias,
+                        gate_up_kernel=gate_up_kernel,
+                        gate_up_bias=gate_up_bias,
                         act_fn=act_fn,
                         ffn_activation=ffn_activation,
                         hooks=hooks,
@@ -1549,6 +1651,8 @@ class BaseMoeModule(spx.Module, ABC):
                         wi_bias=wi_bias,
                         wu_bias=wu_bias,
                         wd_bias=wd_bias,
+                        gate_up_kernel=gate_up_kernel,
+                        gate_up_bias=gate_up_bias,
                         act_fn=act_fn,
                         ffn_activation=ffn_activation,
                         hooks=hooks,
@@ -1560,12 +1664,14 @@ class BaseMoeModule(spx.Module, ABC):
         self,
         hidden_state: jax.Array,  # [B, S, H]
         gate_layer: spx.Module,
-        wi_kernel: jax.Array,  # [E, H, M]
-        wu_kernel: jax.Array,  # [E, H, M]
+        wi_kernel: jax.Array | None,  # [E, H, M]
+        wu_kernel: jax.Array | None,  # [E, H, M]
         wd_kernel: jax.Array,  # [E, M, H]
         wi_bias: jax.Array | None = None,  # [E, M]
         wu_bias: jax.Array | None = None,  # [E, M]
         wd_bias: jax.Array | None = None,  # [E, H]
+        gate_up_kernel: jax.Array | None = None,  # [E, H, 2M]
+        gate_up_bias: jax.Array | None = None,  # [E, 2M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
         gate_hidden_state: jax.Array | None = None,  # [B, S, H]
         hooks: MoeFusedHooks | None = None,
@@ -1632,6 +1738,8 @@ class BaseMoeModule(spx.Module, ABC):
             This method is slower than fused MoE but useful for debugging
             and as a fallback when grouped matmul kernels are unavailable.
         """
+        if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
+            raise ValueError("MoE requires either gate_up_kernel or both wi_kernel and wu_kernel.")
         self._configure_hooks_for_routing_strategy()
         hooks = self.moe_hooks if hooks is None else hooks
 
@@ -1691,15 +1799,22 @@ class BaseMoeModule(spx.Module, ABC):
         precision = getattr(self, "precision", None)
         hidden_expanded = hidden_flat[:, None, :]
 
-        wi_sel = jnp.take(wi_kernel.astype(self.dtype), experts, axis=0)
-        w0 = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, wi_sel, precision=precision)
-        if wi_bias is not None:
-            w0 = w0 + jnp.take(wi_bias.astype(self.dtype), experts, axis=0)
+        if gate_up_kernel is not None:
+            gate_up_sel = jnp.take(gate_up_kernel.astype(self.dtype), experts, axis=0)
+            gate_up = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, gate_up_sel, precision=precision)
+            if gate_up_bias is not None:
+                gate_up = gate_up + jnp.take(gate_up_bias.astype(self.dtype), experts, axis=0)
+            w0, w1 = jnp.split(gate_up, 2, axis=-1)
+        else:
+            wi_sel = jnp.take(wi_kernel.astype(self.dtype), experts, axis=0)
+            w0 = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, wi_sel, precision=precision)
+            if wi_bias is not None:
+                w0 = w0 + jnp.take(wi_bias.astype(self.dtype), experts, axis=0)
 
-        wu_sel = jnp.take(wu_kernel.astype(self.dtype), experts, axis=0)
-        w1 = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, wu_sel, precision=precision)
-        if wu_bias is not None:
-            w1 = w1 + jnp.take(wu_bias.astype(self.dtype), experts, axis=0)
+            wu_sel = jnp.take(wu_kernel.astype(self.dtype), experts, axis=0)
+            w1 = jnp.einsum("tkh,tkhm->tkm", hidden_expanded, wu_sel, precision=precision)
+            if wu_bias is not None:
+                w1 = w1 + jnp.take(wu_bias.astype(self.dtype), experts, axis=0)
 
         intermediate = ffn_activation(w0, w1)
         if hooks.before_wo is not None:
@@ -2001,19 +2116,20 @@ class BaseMoeModule(spx.Module, ABC):
         hidden_states: Float[Array, "batch seq hidden_dim"],
         **kwargs,
     ) -> tuple[Float[Array, "batch seq hidden_dim"], MoeMetrics]:
-        """Performs the forward pass of the MoE module.
+        """Run the MoE forward pass; concrete subclasses must implement this.
 
-        Subclasses must implement this method to define the specific logic of their
-        MoE layer.
+        Subclasses are expected to own their gate layer and expert kernels
+        and to dispatch into :meth:`moe_call` (or build a custom routing
+        pipeline on top of the helpers provided by :class:`BaseMoeModule`).
 
         Args:
-            hidden_states: The input tensor.
-            **kwargs: Additional keyword arguments that may be required by the
-                specific implementation.
+            hidden_states: Input hidden states of shape ``[B, S, H]``.
+            **kwargs: Subclass-specific extra arguments (e.g. attention
+                outputs that get summed back in via a shared-expert path).
 
         Returns:
-            A tuple containing:
-                - output: The output tensor from the MoE layer.
-                - metrics: A `MoeMetrics` object containing metrics and auxiliary losses.
+            Tuple ``(output, metrics)`` where ``output`` has the same shape
+            as ``hidden_states`` and ``metrics`` is a :class:`MoeMetrics`
+            holding routing diagnostics and auxiliary losses.
         """
         pass

@@ -86,7 +86,20 @@ logger = get_logger(__name__)
 
 
 def _attention_mesh_context(config: EasyDeLBaseConfig):
-    """Use the active stage mesh inside MPMD pipeline stages."""
+    """Resolve the active stage mesh as a context manager.
+
+    Forwards to :func:`easydel.infra.sharding.resolve_stage_mesh` so that
+    inside MPMD pipeline stages the attention call binds to the local
+    stage submesh rather than the global model mesh.
+
+    Args:
+        config: Owning model config. Its ``mesh`` attribute is the only
+            field consulted.
+
+    Returns:
+        Context manager activating the stage-local mesh; entering it is
+        a no-op when no MPMD stage is active.
+    """
     return resolve_stage_mesh(config.mesh)
 
 
@@ -315,19 +328,36 @@ class FlexibleAttentionModule(spx.Module):
         attn_mechanism: AttentionMechanisms | None = None,
         requires_cache: bool | None = None,
     ):
-        """
-        Initializes the AttentionModule.
+        """Resolve the attention backend(s) and bind them to ``base_config``.
+
+        On construction the module reads ``base_config.attn_mechanism``
+        (or the explicit ``attn_mechanism`` override) and builds a single
+        :class:`Operation` instance from :class:`OperationRegistry`. When
+        the mechanism is ``"auto"``, :func:`get_optimal_config` is consulted
+        and both the chosen mechanism and the resolved ``attn_dtype`` are
+        written back into ``base_config`` so downstream sharding/cache code
+        observes the same choice. If ``base_config.decode_attn_mechanism``
+        is set, a second backend is created for the decode phase.
 
         Args:
-            base_config (EasyDeLBaseConfig): Configuration object containing attention settings
-                                             (mechanism, dtype, sharding, etc.).
-            softmax_scale (float): The scaling factor to apply before the softmax function.
-            dropout_prob (float, optional): The dropout probability for attention weights.
-                                             Defaults to 0.0.
-            requires_cache (bool | None, optional): Override for cache requirements.
-                - None: Use the operation's class-level default (default).
-                - False: Disable cache (useful for encoder-only models like vision encoders).
-                - True: Force cache requirement.
+            base_config: Configuration object carrying attention settings
+                (mechanism, dtype, mesh, sharding, optional decode backend).
+            softmax_scale: Pre-softmax scale applied to QK^T (conventionally
+                ``1 / sqrt(head_dim)``; muP / DeepSeek MLA override).
+            dropout_prob: Attention dropout probability. Stored but ignored
+                by the forward pass which currently forces deterministic
+                attention.
+            rngs: SpecTrax RNG container; unused by the dispatcher itself
+                but accepted for signature parity with other modules.
+            attn_mechanism: Optional per-instance override of the backend
+                chosen from :class:`AttentionMechanisms`. ``None`` defers to
+                ``base_config.attn_mechanism``.
+            requires_cache: Override for the backend's cache requirement.
+
+                - ``None``: use the operation's class-level default.
+                - ``False``: disable cache (encoder-only paths such as
+                  vision encoders).
+                - ``True``: force cache requirement on.
         """
 
         if attn_mechanism is None:
@@ -407,49 +437,83 @@ class FlexibleAttentionModule(spx.Module):
         policy: tp.Any | None = None,
         **extra_op_kwargs: tp.Any,
     ) -> AttentionOutput:
-        """
-        Performs the attention computation using the selected backend implementation.
+        """Dispatch the attention computation to the resolved backend.
+
+        Validates ``cache_view`` against the active backend, fills in
+        defaults from ``self``/``self.config``, routes around a known
+        multi-host-TPU bug in vanilla variable-length attention, calls the
+        chosen :class:`Operation`, and casts the leaf arrays of the
+        returned :class:`AttentionOutput` to ``self.impl.metadata.runtime_dtype``.
+        ``cache_view`` is *not* cast — quantized cache pages (e.g.
+        TurboQuant uint8) must keep their original dtype.
 
         Args:
-            query_states (Array): Query tensor [batch, seq_q, heads, dim].
-            key_states (Array): Key tensor [batch, seq_k, heads, dim].
-            value_states (Array): Value tensor [batch, seq_v, heads, dim].
-            mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (TRAIN, PREFILL, DECODE).
-            mask_info (MaskInfo, optional): Container for attention masks and segment IDs. Defaults to None.
-                If provided, contains:
-                - attention_mask: Boolean mask [batch, 1, seq_q, seq_k]
-                - q_segment_ids: Query segment IDs [batch, seq_q]
-                - kv_segment_ids: Key/Value segment IDs [batch, seq_k]
-                - q_positions: Query position indices [batch, seq_q]
-                - kv_positions: Key/Value position indices [batch, seq_k]
-            bias (Array, optional): Optional attention bias [batch, heads, seq_q, seq_k]. Defaults to None.
-            sliding_window (int | tuple[int, int], optional): Sliding window size for attention. Defaults to None.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Cache metadata. Defaults to None.
-            cache_view (TransformerCacheView | RaggedPagesCacheView, optional): View into KV cache. Defaults to None.
-            init_bias (Callable, optional): Function to initialize bias tensor. Defaults to None.
-            causal (bool, optional): Apply causal masking. Defaults to True.
-            softmax_aux (Array, optional): Auxiliary tensor for softmax (e.g., sink tokens). Defaults to None.
-            softmax_scale (float, optional): Scaling factor for attention logits. Defaults to None.
-            logits_soft_cap (float, optional): Soft capping value for attention logits. Defaults to None.
-            dropout_prob (float, optional): Dropout probability for attention weights. Defaults to None.
-            dropout_rng (PRNGKey, optional): PRNG key for dropout. Defaults to None.
-            deterministic (bool, optional): If True, disables dropout. Defaults to None (uses self.deterministic).
-            output_attentions (bool, optional): If True, materialize and return attention weights.
-            precision (lax.PrecisionLike, optional): JAX precision setting. Defaults to None.
-            prevent_cse (bool, optional): Prevent common subexpression elimination. Defaults to True.
-            cum_seqlens_q (Array, optional): Cumulative sequence lengths for queries. Defaults to None.
-            cum_seqlens_k (Array, optional): Cumulative sequence lengths for keys. Defaults to None.
-            normalize_output (bool, optional): Normalize attention output. Defaults to True.
-            fused_backward (bool, optional): Use fused backward pass. Defaults to False.
-            compute_dtype (jnp.dtype, optional): Computation dtype. Defaults to None.
-            optimized (bool, optional): Use optimized kernel variant. Defaults to False.
-            mask_value (float, optional): Value for masked positions. Defaults to None.
-            vmem_limit_bytes (int, optional): VMEM limit in bytes for paged attention. Defaults to None.
-            policy (Any, optional): Checkpoint policy for gradients. Defaults to None.
+            query_states: Query tensor ``[batch, seq_q, heads, dim]``.
+            key_states: Key tensor ``[batch, seq_k, heads, dim]``.
+            value_states: Value tensor ``[batch, seq_v, heads, dim]``.
+            mode: Runtime mode (TRAIN, PREFILL, DECODE); selects between
+                ``self.impl`` and ``self.impl_decode``.
+            mask_info: Container with the attention mask plus per-token
+                segment IDs and positions; ``None`` for full visibility.
+            bias: Additive attention bias ``[batch, heads, seq_q, seq_k]``.
+            sliding_window: Local-window size (int for symmetric, tuple
+                for asymmetric ``(left, right)``).
+            cache_metadata: Companion metadata for the cache view (page
+                tables, cumulative lengths). Auto-derived from ``cache_view``
+                when ``None``.
+            cache_view: KV cache view (transformer / ragged-pages / unified).
+                Mutated in place by the backend in inference modes.
+            init_bias: Optional zero-argument callable that materializes
+                the additive bias on demand.
+            causal: Apply causal masking. Defaults to ``True``.
+            softmax_aux: Optional auxiliary tensor blended into softmax
+                normaliser (e.g. attention sinks, learnable bias tokens).
+            softmax_scale: Override for the pre-softmax scale. Defaults to
+                ``self.softmax_scale`` when ``None``.
+            logits_soft_cap: Optional soft-cap value
+                (``tanh(logits / cap) * cap``).
+            dropout_prob: Override for attention dropout probability;
+                ignored in the current build (forced to ``0.0``).
+            dropout_rng: PRNG key for dropout (unused — see ``dropout_prob``).
+            deterministic: If ``True`` disables dropout. Defaults to
+                ``self.deterministic`` when ``None``.
+            output_attentions: When ``True`` instructs the backend to
+                materialise softmax weights. Falls back to
+                ``config.output_attentions`` when ``None``.
+            precision: JAX matmul precision. Defaults to
+                ``lax.Precision.DEFAULT`` when ``None``.
+            prevent_cse: Whether to prevent common-subexpression elimination
+                inside the kernel.
+            cum_seqlens_q: Optional cumulative sequence lengths for query
+                packing (``[batch + 1]``).
+            cum_seqlens_k: Optional cumulative sequence lengths for key
+                packing (``[batch + 1]``).
+            normalize_output: Normalize the attention output by the softmax
+                denominator. Set ``False`` for log-sum-exp pathways.
+            fused_backward: Use the fused backward pass when available.
+            compute_dtype: Compute dtype override for the kernel.
+            optimized: Use the optimized kernel variant when the backend
+                exposes one.
+            mask_value: Float value applied to masked positions (defaults
+                to a backend-specific large negative number).
+            vmem_limit_bytes: VMEM budget for paged attention on TPU.
+            policy: Optional gradient-checkpoint policy forwarded to the
+                kernel. Defaults to ``jax.checkpoint_policies.nothing_saveable``
+                when ``None``.
+            **extra_op_kwargs: Additional backend-specific keyword arguments
+                forwarded verbatim to the underlying operation (used by
+                MLA backends for ``queries_nope`` / ``keys_values`` / ...).
 
         Returns:
-            AttentionOutput: An object containing the attention output tensor and potentially
-                             attention weights (depending on the backend).
+            :class:`AttentionOutput` carrying the attention output tensor,
+            optional materialised attention weights (``None`` when
+            ``output_attentions`` is False), and the updated cache view.
+
+        Raises:
+            ValueError: When ``cache_view`` is incompatible with the active
+                backend (e.g. a ragged cache view paired with a dense kernel)
+                or when ``mode == MODE_DECODE`` is requested without a
+                ``cache_view``.
         """
         if isinstance(cache_view, RaggedPagesCacheView):
             # Check the actual impl name rather than the global config.attn_mechanism
@@ -584,6 +648,20 @@ class FlexibleAttentionModule(spx.Module):
             return ScaledDotProductAttn(metadata=self.metadata)
 
         def _call_attention(callable_attn: tp.Any, input_kwargs: dict[str, tp.Any]) -> AttentionOutput:
+            """Invoke ``callable_attn`` with the right keyword argument set.
+
+            Vanilla / Splash / BlockSparse kernels accept a
+            ``return_attention_weights`` flag that the other backends do not
+            understand; this helper opts those backends into materialising
+            weights only when ``output_attentions_computed`` is ``True``.
+
+            Args:
+                callable_attn: Concrete attention :class:`Operation` to call.
+                input_kwargs: Base keyword arguments destined for the kernel.
+
+            Returns:
+                :class:`AttentionOutput` returned by ``callable_attn``.
+            """
             call_kwargs = input_kwargs
             impl_names = _get_impl_names(callable_attn)
             weight_aware_impls = {
@@ -675,10 +753,15 @@ class FlexibleAttentionModule(spx.Module):
     # Operation access properties for dynamic discovery
     @property
     def operation_executor(self):
-        """Get an OperationExecutor for mode-bound operation access.
+        """Return an :class:`OperationExecutor` bundling prefill + decode backends.
+
+        Built lazily on every access (cheap) so that ``self.impl`` /
+        ``self.impl_decode`` swaps performed by tests or autotuning are
+        immediately visible.
 
         Returns:
-            OperationExecutor wrapping prefill and decode operations.
+            :class:`OperationExecutor` wrapping the prefill (``self.impl``)
+            and decode (``self.impl_decode``) operations with no mixin.
         """
         from easydel.operations.executor import OperationExecutor
 
@@ -711,10 +794,16 @@ class FlexibleAttentionModule(spx.Module):
 
     @property
     def operation_requirements(self):
-        """Get combined requirements from both prefill and decode operations.
+        """Return the combined metadata/cache requirements of both backends.
+
+        Delegates to the underlying :class:`OperationExecutor` and merges
+        the requirements that the prefill and (optional) decode kernels
+        impose on the caller — e.g. whether a paged cache view is required,
+        which metadata pytree fields must be populated, etc.
 
         Returns:
-            OperationRequirements with combined metadata/cache requirements.
+            :class:`OperationRequirements` aggregating prefill and decode
+            requirements.
         """
         return self.operation_executor.get_combined_requirements()
 
@@ -744,23 +833,33 @@ Cfg = tp.TypeVar("Cfg", bound=EasyDeLBaseConfig)
 
 
 class AttentionModule(spx.Module, tp.Generic[Cfg]):
-    """Base class for attention modules in EasyDeL, providing common utilities.
+    """Shared sharding / mask / cache helpers for concrete attention layers.
 
-    Offers helpers for sharding, mask manipulation, and head manipulation that
-    concrete attention implementations inherit. KV caching itself is handled
-    by the cache backends in :mod:`easydel.caching`, not by this class.
+    This abstract intermediate sits between :class:`spx.Module` and
+    :class:`UnifiedAttention` (and any custom attention implementations).
+    It does not own QKV projections or define a ``forward``; it instead
+    bundles the small set of geometry-aware utilities every attention
+    implementation needs — RoPE application, Q/K/KV sharding constraint
+    application, GQA repeat, KV cache concatenation, sliding-window
+    extraction, and KV-cache quantizer construction.
+
+    Subclasses are expected to override ``__init__`` (calling
+    ``super().__init__(config)``) and provide a ``forward`` method that
+    composes the helpers below.
 
     Attributes:
-        config: Configuration object for the attention module.
+        config (Cfg): Owning model config. Used for sharding axis names,
+            partition manager, KV-cache quantization config, mesh resolution,
+            and attention dtype.
     """
 
     def __init__(self, config: Cfg):
-        """
-        Initializes the AttentionModule.
+        """Bind the configuration object.
 
         Args:
-            config (Cfg): The configuration object for this attention module.
-                         It should conform to or include attributes from EasyDeLBaseConfig.
+            config: Model configuration that conforms to (or extends)
+                :class:`easydel.infra.base_config.EasyDeLBaseConfig`.
+                Cached on ``self.config`` for use by every helper method.
         """
         super().__init__()
         self.config = config
@@ -896,17 +995,27 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | None = None,
     ) -> Int[JArray, "batch seq"]:
-        """
-        Calculates the position indices within the sequence for cache-aware operations.
+        """Compute per-token absolute positions for cache-aware attention.
+
+        Builds the position index that RoPE / ALiBi will consume:
+        a cumulative-sum of the per-token mask along the query axis, offset
+        by the cache cursor in decode mode. The mask is reduced along the
+        K axis first, so padded tokens contribute zero to the cumulative
+        position.
 
         Args:
-            attention_mask (jax.Array): The attention mask (typically [batch, heads, q_len, k_len]).
-            mode (common_types.RUNTIME_MODE_TYPES): The runtime mode.
-            cache_view (TransformerCacheView, optional): The current KV cache view. Defaults to None.
+            attention_mask: Boolean mask of shape
+                ``[batch, heads, q_len, k_len]``. Only the last head's row
+                is used (heads are assumed to agree on masking).
+            mode: SpecTrax runtime mode marker; in
+                :data:`common_types.MODE_DECODE` the cache cursor is added
+                to the cumulative positions.
+            cache_view: Optional transformer-style cache view; consulted
+                for its ``indexes`` (per-batch cursor) only in decode mode.
 
         Returns:
-            jax.Array: An array representing the position of each token in the sequence,
-                       adjusted by the cache index if provided. Shape usually [batch, q_len].
+            Integer position array of shape ``[batch, q_len]`` suitable
+            for RoPE/ALiBi position lookups.
         """
         end_index: int | Int[JArray, "batch 1"] = 0
         is_decode: bool = mode == common_types.MODE_DECODE
@@ -926,15 +1035,16 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
 
     @cached_property
     def quantizer(self) -> EasyQuantizer:
-        """
-        Provides an EasyQuantizer instance based on the module's configuration.
+        """Lazy :class:`EasyQuantizer` for KV-cache write paths.
 
-        Used for quantizing KV cache entries if enabled in the config.
-        For TurboQuant configs, returns a no-op quantizer since TurboQuant
-        handles compression inside the kernel.
+        Reads ``config.kv_cache_quantization_config``: configurations of
+        type :class:`TurboQuantConfig` return a no-op quantizer because
+        TurboQuant compresses inside the kernel, while every other
+        configuration constructs a real quantizer that the cache views
+        apply on writes.
 
         Returns:
-            EasyQuantizer: The quantizer instance.
+            :class:`EasyQuantizer` instance to use for KV-cache writes.
         """
         kv_quant_cfg = self.config.kv_cache_quantization_config
 
@@ -948,13 +1058,15 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
 
     @property
     def default_key_value_sharding(self) -> NamedSharding:
-        """
-        Defines the default JAX sharding for key and value tensors.
+        """Build the default :class:`NamedSharding` for K/V tensors.
 
-        Uses the partition specifications defined in the configuration's `partition_axis`.
+        Uses ``config.partition_axis`` to build a 4-D partition spec
+        ``(batch, key_sequence, head, attention_dim)`` on the resolved
+        stage mesh. Used as the fallback by :meth:`get_sharding_safely`.
 
         Returns:
-            NamedSharding: The default sharding configuration for K/V tensors.
+            :class:`NamedSharding` to apply to KV tensors when no other
+            sharding is available.
         """
         paxis: tp.Any = self.config.partition_axis
         mesh: StageMesh = resolve_stage_mesh(self.config.mesh)
@@ -971,14 +1083,16 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         return sharding
 
     def get_sharding_safely(self, tensor: Float[JArray, "..."]) -> PartitionSpec:
-        """
-        Retrieves the PartitionSpec of a tensor, falling back to the default KV sharding.
+        """Return ``tensor.sharding.spec``, falling back to KV defaults.
 
         Args:
-            tensor (jax.Array): The tensor whose sharding spec is needed.
+            tensor: Array whose partition spec is needed. Lacking a
+                ``sharding`` attribute (e.g. during eager-mode tracing)
+                triggers the fallback.
 
         Returns:
-            PartitionSpec: The sharding specification of the tensor.
+            :class:`PartitionSpec` of ``tensor`` or, when absent, the
+            spec of :attr:`default_key_value_sharding`.
         """
         return getattr(tensor, "sharding", self.default_key_value_sharding).spec
 
@@ -986,17 +1100,16 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
     def _transpose_sequence_head(
         *args: Float[JArray, "batch seq heads dim"],
     ) -> collections.abc.Iterator[Float[JArray, "batch heads seq dim"]]:
-        """
-        Transposes the sequence and head dimensions of input tensors.
+        """Swap the sequence and head axes of every input tensor.
 
-        Typically used to change tensors from [Batch, Seq, Heads, Dim] to
-        [Batch, Heads, Seq, Dim] or vice-versa.
+        Converts BTHD layout (``[batch, seq, heads, dim]``) to BHTD layout
+        (``[batch, heads, seq, dim]``) — the layout some kernels expect.
 
         Args:
-            *args: A variable number of arrays, each expected to have at least 4 dimensions.
+            *args: Variable number of 4-D attention tensors.
 
         Returns:
-            map: A map object yielding the transposed arrays.
+            Lazy iterator yielding each input tensor transposed to BHTD.
         """
 
         def transpose_array(x: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch heads seq dim"]:
@@ -1237,41 +1350,61 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None,
         TransformerMetadata | RaggedPagesMetadata | None,
     ]:
-        """
-        Prepares inputs for attention calculation, handling KV caching and mask merging.
+        """Stitch current Q/K/V to the cache and resolve the attention mask.
 
-        This function combines the current query, key, and value with cached states (if applicable),
-        merges various masks (attention, causal, FCM, sliding window), and returns the final
-        key, value, attention mask, and a function to initialize the attention bias.
+        Central preparation step for every cache-aware forward pass: handles
+        cache concatenation (transformer / ragged / unified), creates
+        cache metadata when the caller did not supply it, applies optional
+        sliding-window slicing to KV (and the mask), and returns a lazy
+        ``init_attention_bias`` closure so that kernels that consume
+        :class:`MaskInfo` directly never materialize the float bias.
+
+        Mode resolution:
+
+        * ``mode`` defaults to :data:`common_types.NOT_GIVEN`; in that case
+          the routine infers ``MODE_TRAIN`` when no cache is present,
+          ``MODE_PREFILL`` for multi-token query, and ``MODE_DECODE`` for
+          single-token query.
+
+        Cache path selection:
+
+        * :class:`RaggedPagesCacheView` and :class:`UnifiedAttentionCacheView`
+          (and ragged :class:`ParallelHybridCacheView`) take the ragged path:
+          the kernel handles the cache internally and ``init_attention_bias``
+          returns zeros.
+        * Otherwise the transformer-style path runs
+          :meth:`_handle_cache_concat` to write new K/V into the cache view
+          and update the mask, then optionally slides the window via
+          :meth:`_apply_sliding_window`.
 
         Args:
-            query (Array): Current query states [Batch, q_len, Heads, Dim].
-            key (Array): Current key states [Batch, kv_len, Heads, Dim].
-            value (Array): Current value states [Batch, kv_len, Heads, Dim].
-            attention_mask (Array): Base attention mask (e.g., padding mask) [Batch, kv_len] or compatible.
-            mode (common_types.RUNTIME_MODE_TYPES): The runtime mode (TRAIN, PREFILL, DECODE). Required.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): View into the KV cache.
-                If None, caching is disabled. Defaults to None.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
-                Defaults to None.
-            causal_mask (tp.Optional[Array], optional): Causal mask [1, 1, q_len, kv_len]. Defaults to None.
-                Defaults to None.
-            fcm_mask (tp.Optional[Array], optional): Fused-Context-Mask [Batch, 1, q_len, kv_len].
-                Defaults to None.
-            sliding_window (tp.Optional[int], optional): Size of the sliding attention window. If None, not applied.
-                Defaults to None.
+            query: Current query states ``[batch, q_len, heads, dim]``.
+            key: Current key states ``[batch, kv_len, heads, dim]``.
+            value: Current value states ``[batch, kv_len, heads, dim]``.
+            mask_info: ejkernel :class:`MaskInfo` carrying the attention
+                mask plus segment/position metadata.
+            mode: Runtime mode. Pass :data:`common_types.NOT_GIVEN` to let
+                this method infer it from ``cache_view`` and ``query``
+                shape.
+            cache_view: Optional KV cache view. ``None`` disables caching
+                (training path).
+            cache_metadata: Optional companion metadata; auto-derived from
+                ``cache_view.starts`` / ``cache_view.indexes`` when ``None``.
+            sliding_window: Optional sliding-window size. When provided
+                (or when the cache marks the layer sliding) keys, values
+                and mask are sliced to a trailing window.
 
         Returns:
-            tp.Tuple[Array, Array, Array, tp.Callable[[], Array], tp.Optional[tp.Union[TransformerCacheView, RaggedPagesCacheView]]]:
-                - key_states (Array): Final key states (potentially from cache).
-                - value_states (Array): Final value states (potentially from cache).
-                - attention_mask (Array): The final combined attention mask [Batch, Heads, q_len, kv_len].
-                - init_attention_bias (Callable): Function to create the attention bias tensor.
-                - updated_cache_view: The updated cache view (or None if no cache).
-                - updated_cache_metadata: The updated cache metadata (or None if no metadata).
+            Six-tuple ``(key_states, value_states, mask_info,
+            init_attention_bias, cache_view, cache_metadata)`` where the
+            arrays reflect the post-concat / post-slide state and
+            ``init_attention_bias`` is a zero-argument callable that
+            materializes the additive bias on demand.
 
         Raises:
-            ValueError: If shapes are mismatched.
+            AssertionError: If the query batch dimension does not match
+                an existing transformer-style cache view's batch.
+            ValueError: If the supplied ``sliding_window`` is negative.
         """
 
         query_length: int = query.shape[1]
@@ -1412,18 +1545,20 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]
     ) -> Float[JArray, "batch seq heads dim"]:
-        """
-        Applies sharding constraints to the attention output tensor.
+        """Constrain the attention output to the model's hidden-state sharding.
 
-        This is typically done before projecting the attention output back to the
-        hidden dimension size.
+        Applied before and after the output projection so the residual
+        stream stays in the canonical :data:`common_types.HiddenStateSharding`
+        layout regardless of internal kernel sharding choices.
 
         Args:
-            attn_output (jax.Array): The output from the attention mechanism, usually
-                                     with shape [Batch, SeqLen, NumHeads * DimPerHead].
+            attn_output: Attention output tensor, typically of shape
+                ``[batch, seq, num_heads * head_dim]`` (post-merge) or
+                ``[batch, seq, hidden]`` (post-output-projection).
 
         Returns:
-            jax.Array: The input tensor with applied sharding constraints based on the config.
+            ``attn_output`` re-constrained to the configured hidden-state
+            sharding spec.
         """
         return tp.cast(
             JArray,
@@ -1435,16 +1570,17 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         )
 
     def _merge_heads(self, hidden_states: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch seq hidden"]:
-        """
-        Merges the attention heads into a single hidden state tensor.
+        """Collapse the head and head-dim axes into a single hidden axis.
 
-        Reshapes [Batch, SeqLen, NumHeads, DimPerHead] -> [Batch, SeqLen, NumHeads * DimPerHead].
+        Reshape ``[batch, seq, num_heads, head_dim]`` -> ``[batch, seq,
+        num_heads * head_dim]``. The leading two axes are preserved
+        verbatim so the operation is shape-polymorphic.
 
         Args:
-            hidden_states (jax.Array): The hidden states with separate head dimensions.
+            hidden_states: Attention output with separate head/dim axes.
 
         Returns:
-            jax.Array: The hidden states with merged head dimensions.
+            Hidden states with the head axes merged.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], -1))
 
@@ -1452,20 +1588,22 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
     def repeat_key_value(
         key: Float[JArray, "batch seq kv_heads dim"], value: Float[JArray, "batch seq kv_heads dim"], num_reps: int
     ) -> tuple[Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]]:
-        """
-        Repeats key and value tensors for Grouped Query Attention (GQA).
+        """Broadcast K/V along the head axis for Grouped-Query Attention.
 
-        Expands the head dimension by repeating `num_reps` times.
-        Uses einops for concise repetition.
+        Each KV head is repeated ``num_reps`` times so that ``num_kv_heads
+        * num_reps == num_attention_heads`` and the kernel can compute
+        attention as if it were vanilla MHA. Used by kernels that do not
+        implement GQA broadcasting internally.
 
         Args:
-            key (Array): Key tensor [Batch, Seq, NumKVHeads, Dim].
-            value (Array): Value tensor [Batch, Seq, NumKVHeads, Dim].
-            num_reps (int): The number of times to repeat each KV head (num_attention_heads / num_kv_heads).
+            key: KV-head key tensor ``[batch, seq, num_kv_heads, dim]``.
+            value: KV-head value tensor ``[batch, seq, num_kv_heads, dim]``.
+            num_reps: Repeat factor; equal to
+                ``num_attention_heads // num_kv_heads``.
 
         Returns:
-            tp.Tuple[Array, Array]: Repeated key and value tensors, each with shape
-                                    [Batch, Seq, NumKVHeads * num_reps, Dim].
+            Tuple ``(key_expanded, value_expanded)`` each of shape
+            ``[batch, seq, num_kv_heads * num_reps, dim]``.
         """
         with jax.named_scope("easydel-attention-repeat-kvheads"):
             key = einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps)

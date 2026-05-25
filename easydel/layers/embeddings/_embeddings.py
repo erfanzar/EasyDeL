@@ -98,8 +98,8 @@ class Embed(spx.Module):
     used in weight-tied language model heads.
 
     The embedding weight is registered as a column-wise sharded
-    :class:`spectrax.Parameter` so that vocabulary-parallel embedding tables
-    work transparently across model-parallel meshes.
+    :class:`spectrax.Parameter`, which shards the feature axis while keeping
+    the vocabulary axis directly gatherable by the plain ``jnp.take`` forward.
 
     Attributes:
         weight: Parameter of shape ``(num_embeddings, features)`` holding the

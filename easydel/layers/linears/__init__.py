@@ -23,6 +23,7 @@ Modules:
     _linear: Core parallel linear layers (ParallelLinear, Row/ColumnParallelLinear).
     _linear_moe: MoE-specific linear layers with grouped matmul support.
     _linear_quantized: Quantized linear layers (INT8, NF4, MXFP formats).
+    _lora: EasyDeL-specific LoRA wrapper preserving the linear-layer call contract.
     _utils: Low-level utilities for quantized operations.
 
 Classes:
@@ -35,6 +36,7 @@ Classes:
     ParallelMoELinear: Base MoE linear layer for expert-grouped computation.
     RowParallelMoELinear: Row-parallel MoE linear.
     ColumnParallelMoELinear: Column-parallel MoE linear.
+    eLoRA: LoRA wrapper that preserves the EasyDeL linear-layer call contract.
 
 Parallelism Strategies:
     **Row Parallelism**: The input dimension is partitioned across devices.

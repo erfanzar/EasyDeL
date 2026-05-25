@@ -581,6 +581,22 @@ def sanitize_partition_spec_for_shape(
     mesh_shape = getattr(mesh, "shape", None)
 
     def _mesh_has_axis(axis_name: tp.Any) -> bool:
+        """Return whether the active mesh declares ``axis_name``.
+
+        Treats ``None`` / ``EMPTY`` and a missing mesh shape as "present"
+        so callers can short-circuit benign cases. Otherwise probes the
+        mesh shape via membership and indexed lookup (with both the raw
+        key and its string form) to tolerate the various shape-mapping
+        types SpectraX exposes.
+
+        Args:
+            axis_name: Candidate mesh axis name (or sentinel) to look up.
+
+        Returns:
+            bool: ``True`` if the axis is unambiguously present on the
+            active mesh; ``False`` only when the mesh exists and the axis
+            cannot be resolved.
+        """
         if axis_name is None or axis_name is EMPTY:
             return True
         if mesh_shape is None:
@@ -603,6 +619,22 @@ def sanitize_partition_spec_for_shape(
             return False
 
     def _drop_missing_mesh_axes(axis_spec: tp.Any) -> tuple[tp.Any, bool]:
+        """Strip mesh axes from ``axis_spec`` that aren't present on the mesh.
+
+        Used while sanitizing a :class:`PartitionSpec` against a concrete
+        mesh: any axis name the active mesh doesn't expose is removed so
+        downstream JAX calls don't raise on unknown axis names. Compound
+        ``(axis_a, axis_b)`` entries collapse to a single name when only
+        one survives the filter, and to ``None`` when all are dropped.
+
+        Args:
+            axis_spec: A single axis name, tuple of axis names, ``None``,
+                ``EMPTY``, or ``PartitionSpec.UNCONSTRAINED``.
+
+        Returns:
+            tuple: ``(filtered_axis_spec, changed)`` where ``changed`` is
+            ``True`` if any axis was removed.
+        """
         if axis_spec is None or axis_spec is EMPTY:
             return axis_spec, False
         if axis_spec is PartitionSpec.UNCONSTRAINED:
@@ -1368,6 +1400,15 @@ class RuntimeShardingResolver:
             return str(resolved)
 
         def _flatten_axis_entry(entry: AxisEntry) -> tuple[str, ...]:
+            """Flatten an :data:`AxisEntry` into a tuple of axis-name strings.
+
+            Args:
+                entry: ``None``, a single axis name, or a tuple of axis names.
+
+            Returns:
+                tuple[str, ...]: Empty tuple for ``None`` inputs, otherwise a
+                tuple of stringified axis names with ``None`` entries dropped.
+            """
             if entry is None:
                 return ()
             if isinstance(entry, tuple):

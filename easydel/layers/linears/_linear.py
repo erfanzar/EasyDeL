@@ -55,6 +55,23 @@ from spectrax.common_types import ColumnWise, Replicated, RowWise, SRowWise
 from easydel.infra.sharding import TensorLayout, sharding_for_layout
 from easydel.layers.quantization._configs import QuantizationConfig
 
+if tp.TYPE_CHECKING:
+    from easydel.infra.base_config import EasyDeLBaseConfig
+
+
+class FusedProjectionLayout(tp.Protocol):
+    """Minimal protocol carried by fused projection linears."""
+
+    def split(self, x: Array, *, config: "EasyDeLBaseConfig | None" = None) -> tuple[Array, ...]: ...
+
+    def reform_param(
+        self,
+        target_prefix: str,
+        *,
+        config: "EasyDeLBaseConfig | None" = None,
+        include_bias: bool = False,
+    ) -> dict: ...
+
 
 def promote_dtype(values, *, dtype=None):
     """Cast a tuple of arrays to a shared dtype.
@@ -122,8 +139,8 @@ class ParallelLinear(spx.Module):
         in_features (int): Size of the input feature axis.
         out_features (int | Sequence[int]): Size of the output feature axis.
             When passed as a sequence, the kernel is built with width
-            ``sum(out_features)`` and ``tp_merged`` records the segmentation —
-            used for fused QKV / gate-up projections that are split downstream.
+            ``sum(out_features)`` for fused QKV / gate-up projections that are
+            split downstream by the optional fused projection layout.
         use_bias (bool): Whether the layer carries a learnable bias.
         dtype (Dtype | None): Compute dtype. ``None`` defers to the input.
         param_dtype (Dtype): Storage dtype for ``weight`` and ``bias``.
@@ -136,8 +153,6 @@ class ParallelLinear(spx.Module):
         bias (spx.Parameter[Array] | None): Bias of shape ``(out_features,)``,
             ``None`` when ``use_bias=False``. Sharded ``SRowWise`` for
             column-parallel layers, ``Replicated`` otherwise.
-        tp_merged (int): Number of fused output segments
-            (``len(out_features)`` if it is a sequence, else 1).
         distributed_matmul (Any | None): Optional injectable matmul backend
             (e.g. an all-gather-fused matmul); ``None`` means "use the
             jit-compiler default", which is correct in almost every case.
@@ -159,7 +174,7 @@ class ParallelLinear(spx.Module):
     def __init__(
         self,
         in_features: int,
-        out_features: int,
+        out_features: int | collections.abc.Sequence[int],
         *,
         scale: float | tp.Literal["fan_in", "fan_out"] = 1.0,
         use_bias: bool = True,
@@ -169,6 +184,7 @@ class ParallelLinear(spx.Module):
         kernel_init: Initializer = default_kernel_init,
         bias_init: Initializer = default_bias_init,
         rngs: spx.Rngs | None = None,
+        layout: FusedProjectionLayout | None = None,
     ):
         """Initialize a parallel linear layer.
 
@@ -205,13 +221,19 @@ class ParallelLinear(spx.Module):
         else:
             rngs_computed = rngs
 
+        out_features_sum: int
+        if isinstance(out_features, collections.abc.Sequence):
+            out_features_sum = sum(out_features)
+        else:
+            out_features_sum = out_features
+
         scale_computed: float
         scale_is_fan_in: bool = scale == "fan_in"
         scale_is_fan_out: bool = scale == "fan_out"
         if scale_is_fan_in:
             scale_computed = in_features**-0.5
         elif scale_is_fan_out:
-            scale_computed = out_features**-0.5
+            scale_computed = out_features_sum**-0.5
         else:
             scale_computed = scale
 
@@ -229,7 +251,8 @@ class ParallelLinear(spx.Module):
 
         self._scale_operator: tp.Callable[[Array], Array] = _scale_operator
         self.in_features: int = in_features
-        self.out_features: int = out_features
+        self.out_features: int | collections.abc.Sequence[int] = out_features
+        self.layout: FusedProjectionLayout | None = layout
 
         self.use_bias: bool = use_bias
         self.dtype: Dtype | None = dtype
@@ -237,21 +260,6 @@ class ParallelLinear(spx.Module):
         self.precision: PrecisionLike = precision
         self.kernel_init: Initializer = kernel_init
         self.bias_init: Initializer = bias_init
-
-        out_features_is_sequence: bool = isinstance(out_features, collections.abc.Sequence)
-        tp_merged: int
-        if out_features_is_sequence:
-            tp_merged = len(out_features)
-        else:
-            tp_merged = 1
-        self.tp_merged: int = tp_merged
-
-        tp_merged_gt_one: bool = self.tp_merged > 1
-        out_features_sum: int
-        if tp_merged_gt_one:
-            out_features_sum = sum(out_features)
-        else:
-            out_features_sum = out_features
 
         weight_key: tp.Any = rngs_computed.parameters
         weight_shape: tuple[int, int] = (in_features, out_features_sum)
@@ -265,7 +273,7 @@ class ParallelLinear(spx.Module):
 
         if use_bias:
             bias_key: tp.Any = rngs_computed.parameters
-            bias_shape: tuple[int] = (out_features,)
+            bias_shape: tuple[int] = (out_features_sum,)
             bias_initialized: Array = bias_init(bias_key, bias_shape, param_dtype)
             # Bias sharding must match the weight's output-axis sharding:
             #  * column-parallel weight is ([FSDP,SP], TP) — output (column)
@@ -286,6 +294,28 @@ class ParallelLinear(spx.Module):
         else:
             self.bias = None
         self.distributed_matmul: tp.Any | None = None
+
+    def split(self, outputs: Array, *, config: "EasyDeLBaseConfig | None" = None) -> tuple[Array, ...]:
+        """Split outputs with the projection's fused layout."""
+        if self.layout is None:
+            raise ValueError("This linear layer does not carry a fused projection layout.")
+        return self.layout.split(outputs, config=config)
+
+    def build_reform_param(
+        self,
+        target_prefix: str,
+        *,
+        config: "EasyDeLBaseConfig | None" = None,
+        include_bias: bool | None = None,
+    ) -> dict:
+        """Build checkpoint reform rules from the projection's fused layout."""
+        if self.layout is None:
+            raise ValueError("This linear layer does not carry a fused projection layout.")
+        return self.layout.reform_param(
+            target_prefix,
+            config=config,
+            include_bias=self.use_bias if include_bias is None else include_bias,
+        )
 
     def forward(
         self, inputs: Shaped[Array, "... in_features"], w: Array | None = None
