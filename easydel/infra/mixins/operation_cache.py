@@ -12,27 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Operation cache requirements mixin for EasyDeL modules.
+"""Operation-cache requirement discovery layered onto :class:`EasyDeLBaseModule`.
 
-This module provides mixins and data classes for discovering and managing
-operation cache requirements in EasyDeL neural network models. It enables
-dynamic discovery of cache types needed by different layer operations,
-supporting both standard transformer attention and recurrent/linear
-attention mechanisms.
+This module owns the machinery that lets EasyDeL pick the right KV-cache
+implementation for an arbitrary model — Transformer KV cache, RaggedPages
+(paged-attention), Recurrent (Mamba/SSM/RWKV) state cache, or a
+:class:`HybridCache` that mixes all three for models like Qwen3-Next that
+interleave attention with linear/state-space blocks inside the same stack.
 
-The primary components are:
+The mixin discovers cache requirements *dynamically* by walking the model's
+SpecTrax module graph, locating each cache-bearing block (either through
+:class:`FlexibleAttentionModule` or a stored :class:`BaseOperation` such as
+``gdr_op``), and intersecting their declared
+:class:`OperationRequirements`. The result is an
+:class:`OperationsCacheInfo` snapshot that downstream code (engines,
+runners, paged-attention initialisers) uses to allocate the correct cache
+tensors and configure metadata flags.
 
-- ``LayerOperationInfo``: Information about a single layer's operation and cache needs.
-- ``OperationsCacheInfo``: Aggregated cache requirements for all model layers.
-- ``OperationCacheMixin``: Mixin class providing cache discovery methods for models.
-
-Example:
-    Discovering cache requirements for a model::
-
-        >>> model = AutoEasyDeLModelForCausalLM.from_pretrained("model-name")
-        >>> cache_info = model.get_operations_cache_info()
-        >>> print(f"Recommended cache: {cache_info.get_recommended_cache_type()}")
-        >>> print(f"Supports ragged pages: {cache_info.supports_ragged_pages}")
+Module exports:
+    - :class:`LayerOperationInfo`: Per-layer/slot discovered op + cache info.
+    - :class:`OperationsCacheInfo`: Aggregated, model-wide cache snapshot.
+    - :class:`OperationCacheMixin`: Methods plugged into ``EasyDeLBaseModule``.
 """
 
 from __future__ import annotations

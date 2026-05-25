@@ -163,7 +163,14 @@ def capture_time():
     is_active = True
 
     def get_elapsed():
-        """Get elapsed time in seconds."""
+        """Return seconds elapsed since the context was entered.
+
+        While the context is active the reading is taken live; after the
+        context exits the value is frozen at the exit timestamp.
+
+        Returns:
+            Elapsed time in seconds as a ``float``.
+        """
         current = time.perf_counter_ns() if is_active else end
         return (current - start) / 1e9
 

@@ -12,35 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generation mixin for text generation capabilities.
+"""Text-generation surface (sampling, beam search, eSurge) for EasyDeL modules.
 
-Provides text generation functionality through the EasyGenerationMixin class,
-which can be combined with EasyDeL models to enable various generation strategies
-including greedy search, sampling, beam search, and more.
+This module is the heart of EasyDeL's inference path. It contains
+:class:`EasyGenerationMixin` plus the supporting machinery used by every
+generation entry point in the project:
 
-Classes:
-    GreedyState: State container for greedy generation
-    SampleState: State container for sampling generation
-    BeamSearchState: State container for beam search
-    EasyGenerationMixin: Mixin class providing generation methods
+* KV-cache lifecycle for transformer / paged-attention / hybrid /
+  Mamba / RWKV models (``init_cache``, ``init_ragged_pages``,
+  ``init_unified_attention_cache``), including the mixed-architecture
+  fast paths for models that interleave MLA, standard attention and SSM
+  blocks.
+* Per-layer cache-config builders
+  (:meth:`create_transformer_cache_config`,
+  :meth:`create_recurrent_cache_config`,
+  :meth:`create_ragged_page_cache_config`, and friends) wired into the
+  :class:`OperationCacheMixin` discovery results so each layer gets the
+  view class it requires.
+* JAX-jitted generation loops
+  (:meth:`_greedy_search`, :meth:`_sample`, :meth:`_beam_search`) plus
+  the typed search-state containers :class:`GreedyState`,
+  :class:`SampleState`, :class:`BeamSearchState`.
+* Logits-processor / warper plumbing
+  (:meth:`_get_logits_processor`, :meth:`_get_logits_warper`,
+  :meth:`_merge_criteria_processor_list`) that maps a
+  ``GenerationConfig`` onto EasyDeL's
+  :mod:`easydel.inference.logits_process` classes.
+* eSurge integration (``esurge_*``) that lets a model lend its weights to
+  the paged-attention server with cache scoping, graph-def fingerprints
+  and live weight-refresh handshakes.
 
-Key Features:
-    - Multiple generation strategies (greedy, sampling, beam search)
-    - Logits processing and warping
-    - Support for generation constraints
-    - Integration with HuggingFace generation configs
-    - Efficient JAX implementations
-
-Example:
-    >>> from easydel.infra.mixins import EasyGenerationMixin
-    >>> # Model class inherits from EasyGenerationMixin
-    >>> output = model.generate(
-    ...     input_ids=input_ids,
-    ...     max_length=100,
-    ...     temperature=0.8,
-    ...     top_p=0.95,
-    ...     do_sample=True
-    ... )
+The public surface exported by this module is
+:class:`EasyGenerationMixin`; the helper classes and module-level
+functions are implementation details consumed by the mixin and by
+:class:`OperationCacheMixin`.
 """
 
 from __future__ import annotations
@@ -108,7 +113,16 @@ logger = get_logger(__name__)
 
 
 def _normalize_attn_mechanism_value(attn_mechanism: tp.Any) -> str | None:
-    """Normalize attention mechanism enum/string to plain string."""
+    """Normalize an attention-mechanism field to a plain string.
+
+    Args:
+        attn_mechanism: Raw value from the config (may be ``None``, an enum,
+            or a string).
+
+    Returns:
+        str | None: ``None`` when the input is ``None``; otherwise the
+        canonical string name of the mechanism.
+    """
     if attn_mechanism is None:
         return None
     if hasattr(attn_mechanism, "value"):
@@ -117,7 +131,19 @@ def _normalize_attn_mechanism_value(attn_mechanism: tp.Any) -> str | None:
 
 
 def _text_config_uses_mla(text_config: tp.Any) -> bool:
-    """Best-effort detection for MLA architectures from text config."""
+    """Best-effort detection for MLA (Multi-Latent Attention) architectures.
+
+    Looks at the active attention mechanism, an optional ``attention_type``
+    marker, an ``is_mla`` flag or method, and finally the structural KV-LoRA
+    fields (``kv_lora_rank`` / ``qk_rope_head_dim`` / ``qk_nope_head_dim``)
+    introduced by DeepSeek-V2/V3 style models.
+
+    Args:
+        text_config: The model's text configuration object. May be ``None``.
+
+    Returns:
+        bool: ``True`` when MLA can be detected; otherwise ``False``.
+    """
     if text_config is None:
         return False
 
@@ -182,7 +208,21 @@ def _uses_gradient_checkpointing(config: tp.Any) -> bool:
 
 
 def _detect_mla_attention_mix(model: tp.Any, text_config: tp.Any = None) -> tuple[bool, bool]:
-    """Detect whether a model has MLA and/or non-MLA UnifiedAttention blocks."""
+    """Detect whether a model contains MLA and/or non-MLA UnifiedAttention blocks.
+
+    Walks the live module graph for :class:`UnifiedAttention` instances and
+    inspects each one's ``attention_type``. Falls back to
+    :func:`_text_config_uses_mla` when the model does not expose
+    ``UnifiedAttention`` directly.
+
+    Args:
+        model: Live EasyDeL module (or compatible graph) to inspect.
+        text_config: Optional text-only sub-config used by the fallback.
+
+    Returns:
+        tuple[bool, bool]: ``(has_mla, has_non_mla)`` indicating which
+        flavours of attention are present.
+    """
     has_mla_attention = False
     has_non_mla_attention = False
 
@@ -209,7 +249,19 @@ def _detect_mla_attention_mix(model: tp.Any, text_config: tp.Any = None) -> tupl
 
 
 def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
-    """Return True if a `layer_type` consumes KV pages."""
+    """Return ``True`` when ``layer_type`` corresponds to a KV-consuming block.
+
+    Used while sizing paged caches to decide how many layers actually need
+    KV pages allocated for them.
+
+    Args:
+        layer_type: Layer-type label from a config (string-like enum or
+            string).
+
+    Returns:
+        bool: ``True`` for ``"full"``, ``"sliding"``, ``"attention"``,
+        ``"hybrid"``, and ``"parallel_hybrid"`` family labels.
+    """
     layer_type_norm = str(layer_type).lower()
     return (
         "full" in layer_type_norm
@@ -440,6 +492,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
     from easydel.caching.ragged_page.cache import (
         _canonicalize_dtype,
         _dtype_to_string,
+        _pad_v3_kv_heads_to_shards,
         _resolve_ragged_cache_layout,
         cdiv,
         get_num_slices_per_kv_cache_update_page,
@@ -455,9 +508,25 @@ def _create_mixed_standard_ragged_page_cache_configs(
     data_parallel_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
     physical_kv_head_shards = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
     effective_kv_head_shards = physical_kv_head_shards
+    storage_geometries: dict[int, tuple[int, int]] = {}
+    for layer_idx, (num_kv_heads, head_dim) in geometries.items():
+        storage_num_kv_heads = (
+            _pad_v3_kv_heads_to_shards(int(num_kv_heads), physical_kv_head_shards)
+            if version == "v3"
+            else int(num_kv_heads)
+        )
+        if storage_num_kv_heads != int(num_kv_heads):
+            logger.info(
+                "Padding mixed ragged-page v3 layer %s KV heads from %s to %s to shard the cache across %s TP shards.",
+                layer_idx,
+                num_kv_heads,
+                storage_num_kv_heads,
+                physical_kv_head_shards,
+            )
+        storage_geometries[int(layer_idx)] = (int(storage_num_kv_heads), int(head_dim))
 
     if version == "v3":
-        for num_kv_heads, head_dim in sorted(set(geometries.values())):
+        for num_kv_heads, head_dim in sorted(set(storage_geometries.values())):
             next_kvdtype, next_kv_head_shards = _resolve_ragged_cache_layout(
                 kvdtype,
                 version=version,
@@ -520,7 +589,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
         if stage_layer_groups is None:
-            charged_geometries = list(geometries.values())
+            charged_geometries = list(storage_geometries.values())
             charged_layer_count = len(charged_geometries)
             page_bytes = (
                 2
@@ -532,7 +601,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
             charged_layer_count = 1
             page_bytes = 0
             for group in stage_layer_groups:
-                group_geometries = [geometries[int(idx)] for idx in group if int(idx) in geometries]
+                group_geometries = [storage_geometries[int(idx)] for idx in group if int(idx) in geometries]
                 if not group_geometries:
                     continue
                 charged_layer_count = max(charged_layer_count, len(group_geometries))
@@ -544,7 +613,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
                 )
                 page_bytes = max(page_bytes, group_page_bytes)
             if page_bytes <= 0:
-                charged_geometries = list(geometries.values())
+                charged_geometries = list(storage_geometries.values())
                 charged_layer_count = len(charged_geometries)
                 page_bytes = (
                     2
@@ -570,7 +639,11 @@ def _create_mixed_standard_ragged_page_cache_configs(
     else:
         num_pages = int(num_pages_override)
 
-    def _build_config(num_kv_heads: int, head_dim: int) -> RaggedPagesCacheConfig:
+    def _build_config(
+        logical_num_kv_heads: int,
+        storage_num_kv_heads: int,
+        head_dim: int,
+    ) -> RaggedPagesCacheConfig:
         """Create a ``RaggedPagesCacheConfig`` for one layer geometry.
 
         Captures ``num_pages``, ``page_size``, ``kvdtype``, and other
@@ -586,7 +659,8 @@ def _create_mixed_standard_ragged_page_cache_configs(
         return RaggedPagesCacheConfig(
             num_hidden_layers=max(1, int(charged_layer_count)),
             max_model_length=int(max_length),
-            num_kv_heads=int(num_kv_heads),
+            num_kv_heads=int(storage_num_kv_heads),
+            logical_num_kv_heads=int(logical_num_kv_heads),
             k_headdim=int(head_dim),
             v_headdim=int(head_dim),
             hbm_utilization=float(hbm_utilization),
@@ -598,7 +672,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
             num_slices_per_kv_cache_update_page=get_num_slices_per_kv_cache_update_page(
                 get_page_size_bytes(
                     page_size=int(page_size),
-                    num_kv_heads=int(num_kv_heads),
+                    num_kv_heads=int(storage_num_kv_heads),
                     head_size=int(head_dim),
                     kv_cache_dtype=kvdtype,
                 )
@@ -608,15 +682,20 @@ def _create_mixed_standard_ragged_page_cache_configs(
         )
 
     per_layer_configs = {
-        layer_idx: _build_config(num_kv_heads=num_kv_heads, head_dim=head_dim)
+        layer_idx: _build_config(
+            logical_num_kv_heads=num_kv_heads,
+            storage_num_kv_heads=storage_geometries[layer_idx][0],
+            head_dim=head_dim,
+        )
         for layer_idx, (num_kv_heads, head_dim) in geometries.items()
     }
-    representative_num_kv_heads, representative_head_dim = max(
-        geometries.values(),
-        key=lambda geometry: int(geometry[0]) * int(geometry[1]),
+    representative_layer_idx, (representative_num_kv_heads, representative_head_dim) = max(
+        storage_geometries.items(),
+        key=lambda item: int(item[1][0]) * int(item[1][1]),
     )
     representative = _build_config(
-        num_kv_heads=representative_num_kv_heads,
+        logical_num_kv_heads=geometries[representative_layer_idx][0],
+        storage_num_kv_heads=representative_num_kv_heads,
         head_dim=representative_head_dim,
     )
     representative._mixed_layer_configs = dict(per_layer_configs)
@@ -948,7 +1027,24 @@ def _get_cached_mixed_standard_ragged_configs(
     *,
     layer_indices: collections.abc.Iterable[int] | None = None,
 ) -> dict[int, RaggedPagesCacheConfig] | None:
-    """Return cached mixed-geometry ragged configs when they cover the request."""
+    """Return cached mixed-geometry ragged configs when they cover the request.
+
+    The mixed-geometry helpers stamp the chosen per-layer configs onto the
+    representative config so subsequent calls can reuse them without
+    re-running the budgeting math.
+
+    Args:
+        config: Representative ``RaggedPagesCacheConfig`` returned by the
+            mixed-geometry builder, or ``None``.
+        layer_indices: Optional iterable narrowing the response. When given,
+            ``None`` is returned if any requested layer is missing from the
+            cached mapping.
+
+    Returns:
+        dict[int, RaggedPagesCacheConfig] | None: A copy of the cached
+        per-layer configs (filtered by ``layer_indices`` when provided), or
+        ``None`` if no cache is attached.
+    """
     if config is None:
         return None
 
@@ -1131,7 +1227,16 @@ def _safepick(config, pickname):  # pyright: ignore[reportUnusedFunction]
 
 
 def _resolve_backend_for_esurge(config: EasyDeLBaseConfig) -> str:
-    """Resolve backend safely for eSurge helpers when runtime backend probing fails."""
+    """Resolve the JAX backend label for eSurge helpers, with safe fallbacks.
+
+    Args:
+        config: Active EasyDeL config used as a fallback when
+            :func:`jax.default_backend` raises.
+
+    Returns:
+        str: ``"tpu"``, ``"gpu"`` or ``"cpu"``-style backend label; defaults
+        to ``"cpu"`` when nothing else can be determined.
+    """
     try:
         return jax.default_backend()
     except Exception as err:
@@ -1146,8 +1251,14 @@ def _count_kv_layers(text_config) -> int:
     """Count layers that consume KV cache pages.
 
     For hybrid models (mixed attention + linear/recurrent), only attention
-    layers consume KV cache pages.  Returns the total ``num_hidden_layers``
+    layers consume KV cache pages. Returns the total ``num_hidden_layers``
     when no ``layer_types`` attribute is present.
+
+    Args:
+        text_config: Text-only model configuration.
+
+    Returns:
+        int: Number of layers that need KV pages allocated.
     """
     num_hidden_layers = int(getattr(text_config, "num_hidden_layers", 1) or 1)
     layer_types = getattr(text_config, "layer_types", None)
@@ -1246,7 +1357,19 @@ class EasyGenerationMixin:
         *,
         total_layers: int,
     ) -> list[list[int]]:
-        """Group cache-bearing layers by physical PP owner for capacity sizing."""
+        """Group cache-bearing layers by their physical PP owner for sizing.
+
+        Args:
+            layer_indices: Iterable of cache-bearing layer indices to
+                partition.
+            total_layers: Total layer count used to map an index to a
+                physical PP rank.
+
+        Returns:
+            list[list[int]]: One list of layer indices per physical PP rank
+            that owns at least one cache-bearing layer; a single bucket when
+            pipeline parallelism is not in use.
+        """
         indices = [int(idx) for idx in layer_indices]
         if not indices:
             return []
@@ -1264,14 +1387,37 @@ class EasyGenerationMixin:
         *,
         total_layers: int,
     ) -> int:
-        """Return the max number of cache-bearing layers owned by one PP stage."""
+        """Return the worst-case cache-bearing layer count per physical PP stage.
+
+        Used to size paged-cache pools so the busiest stage still fits in its
+        HBM budget.
+
+        Args:
+            layer_indices: Iterable of cache-bearing layer indices.
+            total_layers: Total layer count used to map an index to a
+                physical PP rank.
+
+        Returns:
+            int: Maximum number of cache-bearing layers assigned to any
+            single physical PP rank; ``0`` when ``layer_indices`` is empty.
+        """
         groups = self._pp_stage_groups_for_cache_budget(layer_indices, total_layers=total_layers)
         if not groups:
             return 0
         return max(len(group) for group in groups)
 
     def _standard_ragged_layer_indices_for_cache_budget(self) -> list[int]:
-        """Return layers whose attention cache is backed by standard ragged pages."""
+        """Return layers whose attention cache is backed by standard ragged pages.
+
+        Used while computing the per-stage cache budget so that mixed-cache
+        models (e.g. parallel attention + recurrent state) only account for
+        the layers that actually consume paged KV pages.
+
+        Returns:
+            list[int]: Sorted, de-duplicated list of layer indices that own
+            a :class:`RaggedPagesCacheView` (directly or as part of a
+            :class:`ParallelHybridCacheView`).
+        """
         from easydel.caching import ParallelHybridCacheView, RaggedPagesCacheView
 
         cache_view_mapping = self.get_operations_cache_view()
@@ -1978,7 +2124,27 @@ class EasyGenerationMixin:
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
     ):
-        """Create a non-MLA RaggedPagesCacheConfig."""
+        """Create a non-MLA :class:`RaggedPagesCacheConfig` for this model.
+
+        Detects mixed standard-ragged geometries (e.g. Gemma4 layers with
+        different KV heads) and dispatches to the mixed-geometry builder
+        when needed.
+
+        Args:
+            max_length: Maximum sequence length the cache must support.
+            page_size: Number of tokens per cache page.
+            hbm_utilization: Fraction of free HBM to allocate to the page
+                pool.
+            dtype: KV dtype override. ``None`` defers to the model's
+                ``kvdtype``.
+            num_hidden_layers_override: Forces a specific number of cache
+                layers (used by callers that already know the per-stage
+                layer count).
+
+        Returns:
+            RaggedPagesCacheConfig: Ready-to-use config sized for the
+            current model and mesh.
+        """
         from easydel.caching import RaggedPagesCacheConfig
 
         text_config = self.config.get_text_config()
@@ -2049,7 +2215,29 @@ class EasyGenerationMixin:
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
     ):
-        """Create an MLA-specific MLARaggedPagesCacheConfig."""
+        """Create an MLA-specific :class:`MLARaggedPagesCacheConfig`.
+
+        Reads the compressed-KV layout (``kv_lora_rank`` / ``kv_lora_dim`` /
+        legacy ``qk_nope_head_dim`` fallback) plus the RoPE branch
+        (``qk_rope_head_dim``) from the text config.
+
+        Args:
+            max_length: Maximum sequence length the cache must support.
+            page_size: Number of tokens per cache page.
+            hbm_utilization: Fraction of free HBM to allocate to the page
+                pool.
+            dtype: KV dtype override. ``None`` defers to the model's
+                ``kvdtype``.
+            num_hidden_layers_override: Forces a specific number of cache
+                layers (used by per-stage callers).
+
+        Returns:
+            MLARaggedPagesCacheConfig: Ready-to-use MLA cache config.
+
+        Raises:
+            ValueError: If the MLA-specific dimensions cannot be inferred
+                from the text config.
+        """
         from easydel.caching import MLARaggedPagesCacheConfig
 
         text_config = self.config.get_text_config()
@@ -2111,7 +2299,22 @@ class EasyGenerationMixin:
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
     ):
-        """Create paged-cache config for the active attention mechanism."""
+        """Create the paged-cache config matching the active attention mechanism.
+
+        Dispatches between the MLA and standard ragged-page builders based
+        on the configured ``attn_mechanism``.
+
+        Args:
+            max_length: Maximum sequence length the cache must support.
+            page_size: Number of tokens per cache page.
+            hbm_utilization: Fraction of free HBM to allocate to the page pool.
+            dtype: Cache dtype override. ``None`` defers to the model's
+                ``kvdtype``.
+
+        Returns:
+            RaggedPagesCacheConfig | MLARaggedPagesCacheConfig: A
+            ready-to-use config matching the model's attention mechanism.
+        """
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
 
@@ -2139,10 +2342,29 @@ class EasyGenerationMixin:
         dtype: jnp.dtype | None = None,
         layer_indices: tp.Iterable[int] | None = None,
     ):
-        """Create UnifiedAttentionCacheConfig for vLLM-style unified attention.
+        """Create :class:`UnifiedAttentionCacheConfig` for vLLM-style unified attention.
 
         This cache layout matches ejkernel's Triton UnifiedAttention kernel:
-        `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
+        ``[num_blocks, block_size, num_kv_heads, head_dim]`` for both K and V.
+
+        Routes through the mixed-geometry builder when the model has layers
+        with differing KV widths so each layer still gets a config matching
+        its real shape.
+
+        Args:
+            max_length: Maximum sequence length the cache must support.
+            page_size: Number of tokens per cache page.
+            hbm_utilization: Fraction of free HBM to allocate to the page
+                pool.
+            dtype: KV dtype override. ``None`` defers to the model's
+                ``kvdtype``.
+            layer_indices: Optional iterable of layer indices to consider.
+                ``None`` means "all KV-bearing layers".
+
+        Returns:
+            UnifiedAttentionCacheConfig: Either a representative config
+            (mixed-geometry path) or one sized from the canonical KV
+            geometry.
         """
         text_config = self.config.get_text_config()
 
@@ -3268,7 +3490,22 @@ class EasyGenerationMixin:
         return prepared_kwargs
 
     def _call_generation_model_step(self, model, running_token, call_kwargs):
-        """Run one generation step without forwarding incompatible prompt embeddings."""
+        """Run one generation step without forwarding incompatible prompt embeddings.
+
+        Refreshes the decode-step ``mask_info`` based on the live cache
+        position, switches the module into inference mode, and then dispatches
+        through the model honouring the ``inputs_embeds`` short-circuit used
+        for prompt-only models.
+
+        Args:
+            model: Live or bound model to invoke for this step.
+            running_token: ``(batch, 1)`` next-token tensor to feed in.
+            call_kwargs: Mutable kwargs forwarded to ``model.__call__``.
+
+        Returns:
+            Any: Whatever the model's forward returns for this step (logits
+            + updated cache).
+        """
         call_kwargs = self._prepare_mask_info_for_generation_step(running_token, call_kwargs)
         with set_inference_mode():
             if call_kwargs.get("inputs_embeds", None) is not None:
@@ -4725,7 +4962,23 @@ class EasyGenerationMixin:
         return BeamSearchOutput(sequences=sequences, scores=scores)
 
     def _esurge_graphdef_from_graphdef(self, gdef):
-        """Adapt a graph definition to the eSurge-compatible attention setup."""
+        """Adapt a graph definition to the eSurge-compatible attention setup.
+
+        eSurge requires backend-specific paged-attention kernels (ragged
+        page v2/v3 on TPU/CPU, unified or paged-flash on GPU,
+        multi-latent variants for MLA models). If ``gdef`` already uses a
+        compatible mechanism the method returns it unchanged; otherwise it
+        rebuilds the graph def with the right ``attn_mechanism`` (and MLA
+        overrides when applicable).
+
+        Args:
+            gdef: The graph definition produced by the user-facing model
+                build path.
+
+        Returns:
+            spx.GraphDef: A graph definition that eSurge can consume
+            directly.
+        """
         backend = _resolve_backend_for_esurge(self.config)
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(self.config, "attn_mechanism", None))
@@ -4889,7 +5142,14 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _esurge_engine_has_model_state(engine) -> bool:
-        """Check whether an engine still has runner model state attached."""
+        """Check whether an engine still has runner model state attached.
+
+        Args:
+            engine: A cached eSurge engine instance.
+
+        Returns:
+            bool: ``True`` when ``engine.runner.model`` is still bound.
+        """
         try:
             return getattr(getattr(engine, "runner", None), "model", None) is not None
         except Exception:
@@ -4897,7 +5157,15 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _esurge_engine_graphdef(engine):
-        """Return the graphdef already attached to a cached eSurge engine, if available."""
+        """Return the graphdef already attached to a cached eSurge engine, if available.
+
+        Args:
+            engine: A cached eSurge engine instance.
+
+        Returns:
+            spx.GraphDef | None: The graphdef bound to the engine's executor
+            manager, or ``None`` when the attribute chain is incomplete.
+        """
         try:
             return getattr(getattr(engine, "runner", None), "executor_manager", None).graphdef
         except Exception:
@@ -4905,7 +5173,18 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _graphdef_layout_fingerprint(graphdef) -> int | None:
-        """Return a stable fingerprint for an SpecTrax graph layout when possible."""
+        """Return a stable fingerprint for an SpecTrax graph layout when possible.
+
+        Used to detect when a cached eSurge engine's graph layout has drifted
+        from the live model's layout and a re-bind is required.
+
+        Args:
+            graphdef: SpecTrax graph definition to fingerprint.
+
+        Returns:
+            int | None: A stable hash for the layout, or ``None`` when the
+            graphdef does not expose enough information to compute one.
+        """
         if graphdef is None:
             return None
         try:
@@ -4915,7 +5194,15 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _esurge_engine_source_graphdef_fingerprint(engine) -> int | None:
-        """Return the cached source-graph fingerprint associated with an engine."""
+        """Return the cached source-graph fingerprint associated with an engine.
+
+        Args:
+            engine: A cached eSurge engine.
+
+        Returns:
+            int | None: The fingerprint stamped onto the engine by a previous
+            weight-refresh call, or ``None`` when absent.
+        """
         try:
             return getattr(engine, "_easydel_source_graphdef_fingerprint", None)
         except Exception:
@@ -4923,7 +5210,15 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _esurge_engine_source_layout_signature(engine) -> str | None:
-        """Return the cached source-layout signature associated with an engine."""
+        """Return the cached source-layout signature associated with an engine.
+
+        Args:
+            engine: A cached eSurge engine.
+
+        Returns:
+            str | None: The layout signature stamped onto the engine by a
+            previous weight-refresh call, or ``None`` when absent.
+        """
         try:
             return getattr(engine, "_easydel_source_layout_signature", None)
         except Exception:
@@ -4932,10 +5227,15 @@ class EasyGenerationMixin:
     def _source_layout_signature_for_esurge_metadata(self) -> str | None:
         """Return a stable, cheap layout signature for cached eSurge refreshes.
 
-        Raw ``graphdef`` hashes can differ across equivalent reconstructed model
-        objects in long training loops. Keep a second signature that captures the
-        aspects of model layout we care about for safe graphdef reuse: wrapper
-        delegation, LoRA enablement, default trainable selector, and config shape.
+        Raw ``graphdef`` hashes can differ across equivalent reconstructed
+        model objects in long training loops. This second signature captures
+        the aspects of model layout we care about for safe graphdef reuse:
+        wrapper delegation, LoRA enablement, default trainable selector, and
+        config shape.
+
+        Returns:
+            str | None: A hex md5 digest summarising the relevant layout
+            information, or ``None`` when fingerprinting fails.
         """
         payload: dict[str, tp.Any] = {
             "model_class": f"{type(self).__module__}.{type(self).__qualname__}",
@@ -4982,7 +5282,21 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _normalize_esurge_cache_value(value):
-        """Normalize cache-key values so equivalent processor instances hash the same."""
+        """Normalize cache-key values so equivalent processor instances hash alike.
+
+        Recursively coerces tokenizers, processors and similar objects to a
+        small dict carrying their type + ``name_or_path`` so that two
+        distinct-but-equivalent processor instances produce the same engine
+        cache key.
+
+        Args:
+            value: Arbitrary cache-key value (scalar, container, or tokenizer/
+                processor instance).
+
+        Returns:
+            Any: A hashable, structurally-equivalent representation of
+            ``value``.
+        """
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         if isinstance(value, tuple):
@@ -5011,7 +5325,14 @@ class EasyGenerationMixin:
 
     @staticmethod
     def _sync_esurge_processor_references(engine, processor_or_tokenizer) -> None:
-        """Keep cached engine processor/tokenizer refs aligned with the current caller."""
+        """Keep cached engine processor/tokenizer refs aligned with the current caller.
+
+        Args:
+            engine: Cached eSurge engine to update.
+            processor_or_tokenizer: New processor (or tokenizer) to mirror
+                onto the engine's ``processor`` / ``tokenizer`` attributes.
+                String identifiers and ``None`` are ignored.
+        """
         if processor_or_tokenizer is None or isinstance(processor_or_tokenizer, str):
             return
         try:
@@ -5029,7 +5350,16 @@ class EasyGenerationMixin:
             pass
 
     def _remember_esurge_engine_source_graphdef(self, engine, graphdef) -> None:
-        """Remember which source-model graph layout a cached engine matches."""
+        """Remember which source-model graph layout a cached engine matches.
+
+        Stamps the engine with the model's current graphdef fingerprint and
+        layout signature so the next refresh can detect drift and decide
+        whether the cached graphdef may be reused.
+
+        Args:
+            engine: Cached eSurge engine to annotate.
+            graphdef: Source graph definition that produced ``engine``.
+        """
         fingerprint = self._graphdef_layout_fingerprint(graphdef)
         layout_signature = self._source_layout_signature_for_esurge_metadata()
         if fingerprint is None and layout_signature is None:
@@ -5046,7 +5376,12 @@ class EasyGenerationMixin:
         """Best-effort source graphdef for cache metadata.
 
         Lightweight EasyGenerationMixin users are not required to expose a
-        ``graphdef`` property, so fingerprint bookkeeping must stay optional.
+        ``graphdef`` property, so fingerprint bookkeeping must stay
+        optional. Failures are swallowed and reported as ``None``.
+
+        Returns:
+            spx.GraphDef | None: ``self.graphdef`` if available, otherwise
+            ``None``.
         """
         try:
             return self.graphdef
@@ -5054,7 +5389,19 @@ class EasyGenerationMixin:
             return None
 
     def _refresh_esurge_engine_weights(self, engine, *, restart_scheduler: bool = True) -> None:
-        """Refresh cached engine weights while tolerating older adapter signatures."""
+        """Refresh cached engine weights while tolerating older adapter signatures.
+
+        Inspects the engine's ``update_model_weights`` signature so callers
+        can pass ``restart_scheduler`` and the active graphdef when they are
+        accepted, and falls back gracefully when they are not. Also rewires
+        the engine's source-graphdef fingerprint after a successful refresh.
+
+        Args:
+            engine: Cached eSurge engine to refresh.
+            restart_scheduler: Whether to also restart the engine's
+                scheduler after the weight update (forwarded when accepted
+                by the engine).
+        """
         update_model_weights = engine.update_model_weights
         update_kwargs: dict[str, tp.Any] = {}
 

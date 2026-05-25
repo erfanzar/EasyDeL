@@ -606,8 +606,36 @@ EasyDeL is released under the Apache-2.0 license. The license for this model's w
 
 @dataclass
 class ModelInfo:
-    """
-    Model information container. Used to pass data to the Jinja template.
+    """Dataclass payload consumed by :class:`ReadmeGenerator` Jinja templates.
+
+    Holds the user-visible fields rendered into a HuggingFace Hub README:
+    name, repo id, task / attention mechanism, and optional free-form
+    description/features. Display-time helpers expose canonical task name,
+    pipeline tag, EasyDeL ``Auto*`` class name, and the matching
+    ``AttentionMechanisms`` enum value derived from the configured attention
+    kernel.
+
+    Attributes:
+        name (str): User-facing model name (used as the page title).
+        type (str): Generic family label shown when ``model_type`` is unset.
+        repo_id (str): Repository identifier (``"user/model"``) or local path.
+        description (str | None): One-paragraph description placed under the
+            page title; ``None`` falls back to a generic blurb.
+        model_type (str | None): Architecture-specific label (e.g.
+            ``"llama"``). Takes precedence over ``type``.
+        model_task (str): EasyDeL task name (``"CausalLM"`` etc.) used to
+            pick the right ``Auto*`` class and HF ``pipeline_tag``.
+        attn_mechanism (str): Attention kernel key resolved to an
+            ``AttentionMechanisms`` enum name via ``_ATTN_ENUM_BY_MECHANISM_KEY``.
+        features (list[str] | None): Optional bullet list of model-specific
+            features rendered under the "Features" heading.
+        supported_tasks (list[str] | None): Optional list of tasks shown under
+            "Supported Tasks". Defaults to the resolved task name.
+        limitations (list[str] | None): Optional list of caveats rendered
+            under "Limitations".
+        version (str): EasyDeL version string surfaced in the footer.
+        overview (str | None): Custom multi-paragraph overview replacing the
+            default blurb.
     """
 
     name: str = field(metadata={"help": "The name of the model."})
@@ -732,17 +760,30 @@ class ModelInfo:
 
 
 class ReadmeGenerator:
-    """Generate README files for EasyDeL models."""
+    """Render a HuggingFace-style README from a :class:`ModelInfo` payload.
+
+    Wraps a Jinja2 ``Environment`` that searches user-provided template
+    directories first, then the module's own directory, and finally falls back
+    to the in-module ``JINJA_TEMPLATE`` string. Used by ``EasyBridgeMixin``
+    when pushing checkpoints to the Hub and by training runs that produce a
+    run summary README.
+
+    Attributes:
+        template_name (str | None): Explicit template filename, if provided.
+        env (jinja2.Environment): Configured Jinja environment used for
+            template loading and rendering.
+    """
 
     def __init__(self, template_dir: str | None = None, *, template_name: str | None = None):
-        """
-        Initialize the README generator.
+        """Initialize the README generator.
 
         Args:
-            template_dir: Optional directory to search for templates.
-            template_name: Optional template filename to load from `template_dir`.
-                If omitted, `README.md.jinja` will be tried before falling back
-                to the built-in template string.
+            template_dir: Optional directory to search for templates. When
+                provided and existing, it is searched before the module's own
+                directory.
+            template_name: Optional template filename to load from
+                ``template_dir``. If omitted, ``README.md.jinja`` is tried
+                before falling back to the built-in template string.
         """
 
         self.template_name = template_name
@@ -791,15 +832,22 @@ class ReadmeGenerator:
         model_info: ModelInfo,
         output_path: str | None = None,
     ) -> str:
-        """
-        Generate README content for a model.
+        """Render the README template using ``model_info`` and optionally save it.
 
         Args:
-            model_info: Model information
-            output_path: Optional path to save the README
+            model_info: Populated :class:`ModelInfo` payload fed to the
+                template under the ``model`` variable.
+            output_path: Optional filesystem or ``ePath`` URI; when provided,
+                the rendered content is written there (parent directories are
+                created on demand).
 
         Returns:
-            Generated README content
+            The rendered README as a string with collapsed blank lines and a
+            single trailing newline.
+
+        Raises:
+            Exception: Any error raised during template rendering or file
+                writing is logged and re-raised unchanged.
         """
         try:
             template = self._get_template()

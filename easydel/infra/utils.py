@@ -90,7 +90,27 @@ def _select_checkpoint_names_by_regex(
     include_patterns: Sequence[re.Pattern[str]] | None = None,
     exclude_patterns: Sequence[re.Pattern[str]] | None = None,
 ) -> list[str]:
-    """Resolve known checkpoint names using include/exclude regex filters."""
+    """Filter the registry of checkpoint target names by include/exclude regex.
+
+    Walks the canonical ``GRADIENT_CHECKPOINT_TARGETS`` list, keeping the
+    names whose strings match any *include_patterns* (when provided) and do
+    not match any *exclude_patterns*. Used by the family-based gradient
+    checkpointing policies (e.g. ``mlp_notsaveable``) to derive their
+    ``save_only_these_names`` argument lists.
+
+    Args:
+        include_patterns: Optional sequence of compiled regex patterns; if
+            provided, only target names matched by at least one pattern are
+            kept.
+        exclude_patterns: Optional sequence of compiled regex patterns; any
+            target name matched by at least one pattern is dropped.
+
+    Returns:
+        list[str]: Filtered checkpoint target names.
+
+    Raises:
+        ValueError: If filtering leaves the empty set.
+    """
     names = [str(name) for name in GRADIENT_CHECKPOINT_TARGETS]
     if include_patterns:
         names = [name for name in names if any(pattern.search(name) for pattern in include_patterns)]
@@ -102,15 +122,18 @@ def _select_checkpoint_names_by_regex(
 
 
 def quick_gelu(x):
-    """Quick GELU activation function.
+    """Quick GELU activation: ``x * sigmoid(1.702 * x)``.
 
-    A faster approximation of GELU using sigmoid.
+    Cheaper approximation of the true GELU. The constant ``1.702`` was
+    introduced in the original BERT codebase and is the variant exposed by
+    HuggingFace under the name ``"quick_gelu"``; CLIP and several CLIP-derived
+    vision encoders depend on this exact form.
 
     Args:
-        x: Input array.
+        x: Input array (any shape, any floating dtype).
 
     Returns:
-        Activated array.
+        Array of the same shape and dtype as ``x``.
     """
     return x * jax.nn.sigmoid(1.702 * x)
 
@@ -146,22 +169,31 @@ def canonicalize_dtype(
     dtype: jax.numpy.dtype | None = None,
     inexact: bool = True,
 ) -> jax.numpy.dtype:
-    """Canonicalize an optional dtype to the definitive dtype.
+    """Canonicalize an optional dtype to a definitive JAX dtype.
 
-    Infers or validates the dtype for JAX operations. If dtype is None,
-    infers from input arguments. Otherwise validates and returns the
-    specified dtype.
+    Infers or validates the dtype for JAX operations. When ``dtype`` is
+    ``None`` the result is the common ``jnp.result_type`` of the supplied
+    ``*args`` (with ``None`` arguments ignored); otherwise the supplied
+    ``dtype`` is returned (after the inexact check, if enabled).
 
     Args:
-        *args: JAX array compatible values (None values ignored).
-        dtype: Optional dtype override. If specified, arguments are
-            cast to this dtype and inference is disabled.
-      inexact: When True, the output dtype must be a subdtype
-      of `jnp.inexact`. Inexact dtypes are real or complex floating points. This
-      is useful when you want to apply operations that don'position_ids work directly on
-      integers like taking a mean for example.
+        *args: JAX-array-compatible values used for dtype inference when
+            ``dtype`` is ``None``. ``None`` values are skipped.
+        dtype: Optional dtype override. When provided, dtype inference is
+            disabled and this value is returned (subject to the inexact
+            check).
+        inexact: When ``True``, the output dtype must be a subdtype of
+            ``jnp.inexact`` (real or complex floating point). This is useful
+            when the caller will apply operations that don't make sense on
+            integer dtypes (e.g. taking a mean). If inference yields an
+            integer dtype, it is promoted with ``jnp.float32``.
+
     Returns:
-      The dtype that *args should be cast to.
+        jax.numpy.dtype: The dtype that ``*args`` should be cast to.
+
+    Raises:
+        ValueError: If ``inexact`` is ``True`` and the supplied ``dtype``
+            is not an inexact subdtype.
     """
     if dtype is None:
         args_filtered = [jax.numpy.asarray(x) for x in args if x is not None]
@@ -342,17 +374,21 @@ def create_transformer_checkpoint_policy(
 
 
 def add_start_docstrings(*docstr):
-    """The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
-    The add_start_docstrings function takes in an arbitrary number of strings and returns a decorator.
-    The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring
-    for fn is set equal to the concatenation of all the strings passed into add_start_docstrings
-    plus (if it exists) the original docstring for fn.
+    """Decorator factory that prepends docstring fragments to a function's ``__doc__``.
+
+    Useful for sharing leading documentation (argument boilerplate, model
+    description blocks, copyright notes) across multiple related functions
+    without duplication. The decorator returned by ``add_start_docstrings``
+    concatenates *docstr* in order and prepends the result to the existing
+    function docstring (if any).
 
     Args:
-        *docstr: Pass in a variable number of arguments to the function
+        *docstr: Variable number of docstring fragments to prepend to the
+            decorated function's ``__doc__``.
 
     Returns:
-        A decorator that adds the docstrings to the function
+        Callable: A decorator that mutates the decorated function's
+        ``__doc__`` in-place and returns the same function.
     """
 
     def docstring_decorator(fn):
@@ -424,15 +460,20 @@ def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -
 
 
 def is_flatten(pytree: dict):
-    """The is_flatten function checks if the pytree is flattened.
-        If it is, then the first key in the dictionary will be a tuple of (mpl, mpl_id).
-        Otherwise, it will be an integer representing mpl_id.
+    """Return whether *pytree* uses flat tuple-path keys instead of nested dicts.
+
+    EasyDeL routinely round-trips parameter trees through
+    :func:`easydel.utils.traversals.flatten_dict`, which keys each leaf by
+    its full path tuple (e.g. ``("model", "layers", 0, "weight")``). This
+    helper peeks at the first key to tell whether *pytree* is already in
+    that flattened form so callers can avoid double-flattening.
 
     Args:
-        pytree: dict: Pass the pytree to the function
+        pytree: A possibly-nested or possibly-flat parameter dict.
 
     Returns:
-        True if the pytree is a flattened tree, and false otherwise
+        bool: ``True`` if the first key is a tuple (flat form), ``False``
+        otherwise (nested form).
     """
     mpl = next(iter(pytree.keys()))
     return isinstance(mpl, tuple)
@@ -445,16 +486,25 @@ def quantize_linear_layers(
     quantization_config: QuantizationConfig | None = None,
     verbose: bool = True,
 ) -> spx.Module:
-    """
-    Quantize parameters to requested precision, excluding specified layers.
+    """Quantize matching ``ParallelLinear`` layers in *model* in place.
+
+    Thin wrapper around :class:`EasyQuantizer` that swaps the weight
+    parameters of selected linear layers for quantized counterparts
+    (NF4, INT8, MXFP8, etc.) according to *quantization_config*. When
+    *quantization_config* is ``None`` the model is returned unchanged so
+    callers can opt out by passing through a config value of ``None``.
 
     Args:
-        model: The model to quantize.
-        quantization_config: Quantization config specifying dtype, group_size, and pattern.
-        verbose: Whether to use tqdm for logging.
+        model: EasyDeL model whose linear layers should be quantized.
+        quantization_config: Configuration selecting the quantization
+            dtype, group size, and layer-name regex. ``None`` short-circuits
+            and returns *model* unchanged.
+        verbose: When ``True`` render a tqdm progress bar while iterating
+            over candidate layers.
 
     Returns:
-        Quantized parameters in the same structure as the input.
+        spx.Module: The same *model* instance with quantized weights
+        installed on the matching layers.
     """
     if quantization_config is None:
         return model
@@ -529,13 +579,20 @@ def apply_lora_to_layers(
 
 
 def split_lora_parameters(model: spx.Module) -> tp.Any:
-    """
-    get LoRA (Low-Rank Adaptation) from layers within a model.
+    """Extract the ``lora_a`` / ``lora_b`` adapter weights from every LoRA layer.
+
+    Walks *model* looking for ``nn.LoRA`` wrappers and harvests their two
+    adapter parameter slots into a nested dict keyed by the module path. This
+    is the inverse of :func:`merge_lora_parameters` and is used by checkpoint
+    pipelines that want to store the adapter weights separately from the
+    frozen base model.
 
     Args:
-        model: The EasyDeL model.
+        model: EasyDeL model containing LoRA-wrapped linear layers.
+
     Returns:
-        LoRA Layer Weights.
+        Any: A nested dict where each leaf is ``{"lora_a": ..., "lora_b": ...}``
+        for one LoRA module, keyed by the module's traversal path.
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search
 
@@ -552,13 +609,23 @@ def split_lora_parameters(model: spx.Module) -> tp.Any:
 
 
 def merge_lora_parameters(model: spx.Module, lora_tree: dict) -> spx.Module:
-    """
-    get LoRA (Low-Rank Adaptation) from layers within a model.
+    """Restore LoRA adapter weights from *lora_tree* back onto *model*.
+
+    Inverse of :func:`split_lora_parameters`: walks every ``nn.LoRA`` wrapper
+    in *model* and overwrites its ``lora_a`` and ``lora_b`` slots with the
+    values stored under the corresponding path in *lora_tree*. Accepts both
+    nested and pre-flattened lora trees.
 
     Args:
-        model: The EasyDeL model.
+        model: EasyDeL model containing LoRA-wrapped layers whose adapters
+            should be restored.
+        lora_tree: Mapping from module path tuples to dicts of
+            ``{"lora_a": ..., "lora_b": ...}``. May be in nested or
+            ``flatten_dict`` form.
+
     Returns:
-        LoRA Layer Weights.
+        spx.Module: The same *model* with LoRA adapter values updated
+        in-place.
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search
 
@@ -582,8 +649,22 @@ def unwrap_lora_to_layers(
     *,
     verbose: bool = True,
 ) -> spx.Module:
-    """
-    UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model.
+    """Merge LoRA adapters into their base linear layers and drop the wrappers.
+
+    Walks *model* finding every ``nn.LoRA`` wrapper, computes the merged
+    weight ``W + A @ B`` (using ``float32`` matmul precision so the merge
+    is numerically faithful regardless of the storage dtype), writes the
+    result back onto the underlying linear's ``weight``, and replaces the
+    wrapper in the module tree with its unwrapped ``base_module``.
+
+    Args:
+        model: EasyDeL model with LoRA-wrapped linear layers.
+        verbose: When ``True`` render a tqdm progress bar while iterating
+            over LoRA wrappers.
+
+    Returns:
+        spx.Module: The same *model* with all LoRA wrappers replaced by
+        their merged base linear modules.
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
@@ -715,14 +796,24 @@ def apply_sparsity_to_params(
 
 
 def extract_static_parameters(module):
-    """
-    Extract static_argnums for specified parameters across functions in a module.
+    """Resolve ``static_argnums`` for a module's ``forward`` / ``__call__``.
+
+    Inspects *module* for a ``forward`` (preferred) or ``__call__`` method
+    and scans its signature for parameter names that EasyDeL treats as
+    JIT-static (``causal_mask``, ``frequencies``, ``output_attentions``,
+    ``output_hidden_states``, ``output_router_logits``, ``mode``). The
+    returned tuple of positional indices is suitable for passing to
+    :func:`jax.jit` as ``static_argnums``.
 
     Args:
-        module (types.ModuleType): The module to inspect
+        module: An EasyDeL module class or instance whose call signature
+            should be analyzed.
 
     Returns:
-        dict: A dictionary mapping function names to their static parameter indices
+        tuple[int, ...] | None: Tuple of positional argument indices that
+        should be treated as static, an empty tuple when the signature
+        can't be inspected, or ``None`` if neither ``forward`` nor
+        ``__call__`` is a Python function.
     """
 
     # Predefined list of parameters to check for static status
@@ -890,7 +981,27 @@ def auto_remat(
 
 # Main FLOP counting function
 def count_flop_jaxpr(jaxpr) -> int:
-    """Count flops in a Jaxpr."""
+    """Estimate the FLOP count of a JAX ``Jaxpr`` by traversing its equations.
+
+    Dispatches each equation's primitive through a hand-written cost table
+    (``primitive_flops``) that knows how to estimate FLOPs for the common
+    JAX primitives — element-wise binary/unary ops, ``dot_general``,
+    convolutions, reductions, the fused attention primitive, and so on. Higher
+    cost-order operations like ``log``, ``exp``, ``sqrt``, ``erf_inv`` and
+    activation surrogates are charged a fixed multiplicative cost per element.
+    Unknown primitives emit a warning and contribute zero FLOPs. Subjaxprs
+    (e.g. inside ``scan`` / ``cond`` / ``custom_vjp_call_jaxpr`` /
+    ``remat2``) are visited recursively.
+
+    Args:
+        jaxpr: A ``jax.core.Jaxpr`` (typically obtained from
+            ``jax.make_jaxpr(fn)(*args).jaxpr``).
+
+    Returns:
+        int: Aggregate FLOP estimate. Memory ops (reshape, broadcast,
+        gather, scatter metadata, sharding constraints, etc.) contribute
+        zero.
+    """
 
     def get_shape_size(shape) -> int:
         """Calculate total size of an array shape."""
@@ -1432,7 +1543,21 @@ class ActivationType(StrEnum):
 
 
 def flop_activation(activation_type: ActivationType, dim: int) -> float:
-    """Calculate FLOPs for different activation functions."""
+    """Estimate FLOPs for applying an activation across ``dim`` elements.
+
+    Uses a fixed per-element cost table that approximates how many
+    floating-point operations a given activation costs on common
+    accelerators (e.g. ReLU = 1, GELU = 8, TANH = 5). The total is the
+    per-element cost multiplied by ``dim``.
+
+    Args:
+        activation_type: Activation kind from :class:`ActivationType`.
+            Unknown values fall back to a per-element cost of ``1``.
+        dim: Number of elements the activation is applied to.
+
+    Returns:
+        float: Estimated total FLOP count.
+    """
 
     # FLOPs per element for different activation functions
     flops_per_element = {
@@ -1680,7 +1805,24 @@ def flop_linear_attention(
     head_dim: int | None,
     seq_len: int,
 ) -> float:
-    """Estimate per-token FLOPs for linear-recurrent attention/state-space blocks."""
+    """Estimate per-token FLOPs for linear-recurrent attention / state-space blocks.
+
+    Models attention variants whose cost is linear in ``seq_len`` rather
+    than quadratic — linear attention, Mamba-style SSMs, gated delta nets,
+    etc. Includes QKV projections, the output dense projection, and a
+    recurrent-state update term that scales with ``seq_len``.
+
+    Args:
+        hidden_dim: Model hidden size.
+        num_heads: Number of query heads.
+        num_kv_heads: Number of key/value heads (for GQA/MQA).
+        head_dim: Per-head dim, or ``None`` to derive ``hidden_dim //
+            num_heads``.
+        seq_len: Effective sequence length.
+
+    Returns:
+        float: FLOP estimate for the block.
+    """
     if head_dim is None:
         head_dim = hidden_dim // num_heads
     qkv_proj = 2 * hidden_dim * (num_heads * head_dim + 2 * num_kv_heads * head_dim)
@@ -1720,7 +1862,21 @@ def flop_dense_mlp(
     hidden_dim: int,
     intermediate_dim: int,
 ) -> float:
-    """Estimate FLOPs for a dense FFN block."""
+    """Estimate FLOPs for a dense FFN block (up + activation + down, optional gate).
+
+    GLU-style MLPs (``cfg.glu=True``) include a gate projection in addition
+    to the up/down projections, so the matmul cost picks up an extra
+    ``hidden_dim * intermediate_dim`` term.
+
+    Args:
+        cfg: Full FLOP-calc configuration (provides ``glu`` flag and
+            activation type).
+        hidden_dim: Hidden dimension entering the MLP.
+        intermediate_dim: FFN intermediate dimension.
+
+    Returns:
+        float: Estimated FLOPs for the block.
+    """
     factor = 3 if cfg.glu else 2
     matmuls = 2 * factor * hidden_dim * intermediate_dim
     activation_flops = flop_activation(cfg.activation_type, intermediate_dim)
@@ -1732,7 +1888,24 @@ def flop_moe_mlp(
     hidden_dim: int,
     intermediate_dim: int,
 ) -> float:
-    """Estimate FLOPs for the active experts of an MoE FFN block."""
+    """Estimate FLOPs for a Mixture-of-Experts FFN block.
+
+    Sums the active-expert FFN cost (each per-token activation hits
+    ``num_experts_per_tok`` experts), the optional shared-expert cost
+    (executed for every token, ``num_shared_experts`` times), and the
+    router projection cost (``2 * hidden_dim * num_experts`` when MoE is
+    enabled).
+
+    Args:
+        cfg: Full FLOP-calc configuration with MoE topology fields.
+        hidden_dim: Hidden dimension entering the MLP.
+        intermediate_dim: Default FFN intermediate dim used when
+            ``cfg.moe_intermediate_dim`` and
+            ``cfg.shared_expert_intermediate_dim`` are not set.
+
+    Returns:
+        float: Estimated FLOPs for the block.
+    """
     expert_dim = cfg.moe_intermediate_dim or intermediate_dim
     active_expert_cost = flop_dense_mlp(cfg, hidden_dim, expert_dim) * max(cfg.num_experts_per_tok, 1)
 
@@ -1744,6 +1917,19 @@ def flop_moe_mlp(
 
 
 def _num_moe_layers(cfg: FlopCalcConfig, layers: int) -> int:
+    """Return the number of MoE FFN layers contained in a trunk of ``layers`` blocks.
+
+    Falls back to ``0`` when MoE is disabled (``num_experts <= 1``). When
+    ``cfg.num_moe_layers`` is set explicitly, the result is clamped to
+    ``[0, layers]``; otherwise every block is considered MoE.
+
+    Args:
+        cfg: FLOP-calc configuration carrying MoE topology fields.
+        layers: Total number of transformer blocks in the trunk.
+
+    Returns:
+        int: Number of MoE-bearing layers (the remainder is dense FFN).
+    """
     if cfg.num_experts <= 1:
         return 0
     if cfg.num_moe_layers is not None:
@@ -1757,6 +1943,24 @@ def _attention_flops_for_layer(
     seq_len: int,
     layer_type: str | None,
 ) -> float:
+    """Estimate attention FLOPs for one layer, honoring its layer-type marker.
+
+    Dispatches between :func:`flop_attention` (standard self-attention) and
+    :func:`flop_linear_attention` (linear / Mamba / gated-delta blocks),
+    and shortens ``seq_len`` to ``cfg.sliding_window`` for sliding-window
+    layers so the per-token cost reflects the bounded receptive field.
+
+    Args:
+        cfg: Full FLOP-calc configuration.
+        hidden_dim: Model hidden dimension.
+        seq_len: Effective sequence length before sliding-window clamping.
+        layer_type: Optional HuggingFace-style layer-type marker
+            (e.g. ``"sliding_attention"``, ``"linear_attention"``); ``None``
+            and unrecognized strings fall through to dense attention.
+
+    Returns:
+        float: Per-layer attention FLOPs.
+    """
     layer_type = (layer_type or "").lower()
     if "sliding" in layer_type and cfg.sliding_window:
         seq_len = min(seq_len, cfg.sliding_window)

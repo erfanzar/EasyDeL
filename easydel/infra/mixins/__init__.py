@@ -12,33 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mixin classes for EasyDeL modules.
+"""Mixin classes layered onto :class:`EasyDeLBaseModule`.
 
-Provides reusable functionality through mixin classes that can be combined
-with base modules to add specific capabilities.
+This package decomposes the very large surface area of an EasyDeL model
+module into focused mixins, each owning one cross-cutting concern. They are
+all composed by :class:`easydel.infra.base_module.EasyDeLBaseModule`, so
+model authors normally do not need to import them directly — subclass
+``EasyDeLBaseModule`` and the capabilities below are present automatically.
 
-Classes:
-    BaseModuleProtocol: Protocol defining the interface for base modules
-    EasyBridgeMixin: Mixin for bridging between EasyDeL and HuggingFace
-    EasyGenerationMixin: Mixin for text generation capabilities
+Mixin roster:
+    - :class:`BaseModuleProtocol`: Structural protocol that every mixin
+      relies on (config, dtype, mesh accessors, parameter helpers). Acts as
+      the typing contract between mixins so they can be combined without
+      cyclic class-level imports.
+    - :class:`EasyBridgeMixin`: HuggingFace ↔ EasyDeL parameter bridge —
+      loading ``from_pretrained``, saving ``save_pretrained``, weight name
+      remapping, and ``pytorch_model.bin`` / safetensors shard streaming.
+    - :class:`EasyGenerationMixin`: ``generate``, ``prefill``/``decode``
+      loops, sampling controllers, and the per-model logits-processor /
+      stopping-criteria plumbing.
+    - :class:`OperationCacheMixin`: Compiled-function cache keyed by mesh,
+      input shapes and dtype, so re-issuing the same forward/decode call
+      hits a warm executable.
+    - :class:`EasyShardingMixin`: NamedSharding / partition-spec utilities,
+      mesh-aware ``shard``/``gather`` helpers.
 
-Key Features:
-    - Protocol-based interface definitions
-    - Model conversion and compatibility
-    - Text generation with various strategies
-    - Seamless integration with base modules
-
-Example:
-    >>> from easydel.infra.mixins import EasyGenerationMixin
-    >>> class MyModel(EasyDeLBaseModule, EasyGenerationMixin):
-    ...     # Model implementation
-    ...     pass
-    >>>
-    >>> # Now MyModel has generation capabilities
-    >>> output = model.generate(
-    ...     input_ids=input_ids,
-    ...     max_length=100
-    ... )
+Re-exports:
+    :class:`BaseModuleProtocol`, :class:`EasyBridgeMixin`,
+    :class:`EasyGenerationMixin`, :class:`EasyShardingMixin`,
+    :class:`LayerOperationInfo`, :class:`OperationCacheMixin`,
+    :class:`OperationsCacheInfo`.
 """
 
 from .bridge import EasyBridgeMixin

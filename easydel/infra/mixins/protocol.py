@@ -12,60 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Protocol definitions for EasyDeL base modules.
+"""Structural protocol every EasyDeL model module must satisfy.
 
-This module defines the protocol (interface) that all EasyDeL models must implement.
-It provides the BaseModuleProtocol abstract base class which specifies the required
-methods and properties for model implementations, along with utility functions for
-module representation and formatting.
+This module declares :class:`BaseModuleProtocol`, the ABC that pins down the
+common surface area shared by every model implementation in EasyDeL — from
+decoder-only LMs to encoder-decoders, vision-language hybrids, MoEs, audio
+and recurrent state-space models. The other mixins under
+``easydel.infra.mixins`` rely on this protocol so they can read ``config``,
+``parameters``, ``mesh`` and friends from a model without importing the
+concrete base class and causing cycles.
 
-The protocol ensures consistency across different model implementations and provides
-type hints for better IDE support and type checking. It combines interfaces from the
-base module, bridge functionality (EasyBridgeMixin), and generation capabilities
-(EasyGenerationMixin).
+The bulk of the file is a long sequence of ``@tp.overload``-decorated
+``__call__`` / ``mesh_call`` signatures — one per supported task/architecture
+shape — which exist purely to drive IDE auto-complete and static type
+checking; the runtime ``__call__`` itself is provided by
+:class:`EasyDeLBaseModule`.
 
-Classes:
-    BaseModuleProtocol: Abstract base class defining the interface for EasyDeL modules
+Module exports:
+    - :class:`BaseModuleProtocol`: Abstract contract for model modules.
+    - :func:`return_type_adjuster`: Decorator that narrows the static return
+      type of a SpectraX module factory for downstream callers.
 
-Functions:
-    return_type_adjuster: Decorator to adjust return types for type checking
-
-
-Type Aliases:
-    PartitionLike: Type for partition rule specifications
-    Self: Type variable for self-referencing types
-
-The protocol includes methods for:
-- Model forward passes and loss computation (overloaded for different model types)
-- Parameter management (sharding, gathering, quantization, LoRA)
-- Model I/O (saving, loading, HuggingFace Hub integration)
-- Text generation (greedy search, sampling, beam search)
-- Cache management (standard and paged attention)
-- Framework conversion (PyTorch ↔ JAX/spectrax)
-
-Supported model types:
-- Causal Language Models
-- Sequence Classification
-- Mixture of Experts (MoE)
-- Vision models (CLIP)
-- Multi-modal models
-
-Example:
-    >>> from easydel.infra.mixins.protocol import BaseModuleProtocol
-    >>>
-    >>> class MyModel(BaseModuleProtocol):
-    ...     # Implement required methods
-    ...     def __call__(self, input_ids, ...):
-    ...         # Forward pass implementation
-    ...         pass
-    ...
-    ...     def compute_loss(self, input_ids, labels, ...):
-    ...         # Loss computation
-    ...         pass
-    ...
-    ...     def generate(self, input_ids, ...):
-    ...         # Generation implementation
-    ...         pass
+Type aliases used throughout (all jaxtyping-shaped ``Array`` views):
+``Tokens``, ``TokenEmbeds``, ``AttentionMask``, ``PositionIds``,
+``SegmentIds``, ``HeadMask``, ``EncoderHiddenStates``,
+``DecoderInputIds``/``DecoderAttentionMask``/``DecoderPositionIds``,
+``PixelValues``/``VideoPixelValues``, ``AudioFeatures``, ``RecurrentState``.
 """
 
 # pyright: reportOverlappingOverload=false, reportNoOverloadImplementation=false, reportInconsistentOverload=false
@@ -2804,13 +2776,30 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @property
     @abstractmethod
     def trainable_selector(self) -> spx.SelectorSugar:
-        """Returns the canonical selector used for ``graphstate`` extraction."""
+        """Return the SpectraX selector used to extract trainable state.
+
+        The selector is forwarded to ``spx.split``/``spx.merge`` when
+        materialising :attr:`graphstate` and the complementary
+        :attr:`graphother`. Subclasses override this to expose LoRA-only,
+        non-frozen, or otherwise filtered parameter views.
+
+        Returns:
+            spx.SelectorSugar: A selector usable with ``spx.split`` to keep
+            trainable parameters and drop the rest.
+        """
         ...
 
     @property
     @abstractmethod
     def parameters(self) -> spx.State:
-        """Returns the default selected trainable state of the model."""
+        """Return the trainable state subtree selected by :attr:`trainable_selector`.
+
+        Equivalent to :attr:`graphstate`; provided as a stable public alias
+        that mirrors the PyTorch ``model.parameters()`` ergonomics.
+
+        Returns:
+            spx.State: The trainable portion of the model's state tree.
+        """
         ...
 
     @property
@@ -2946,7 +2935,17 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @property
     @abstractmethod
     def _shard_fns(self):
-        """property shard functions for model state and parameters."""
+        """Return the per-parameter sharding callable map.
+
+        The mapping is keyed by dotted parameter path and produces JAX
+        sharding callables consumed by :meth:`shard_model`. Subclasses
+        usually build this from the model's :class:`PartitionAxis` rules and
+        the configured mesh.
+
+        Returns:
+            Mapping[str, Callable]: Sharding callables ready to be applied
+            to the corresponding leaves of the parameter tree.
+        """
 
     @abstractmethod
     def quantize(
@@ -3153,7 +3152,21 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         extract_fn: tp.Callable | None = None,
         remove_none: bool = True,
     ) -> dict[str, tp.Any]:
-        """Return a flat ``path -> array`` mapping for the selected trainables."""
+        """Return a flat ``path -> array`` mapping for the selected trainables.
+
+        Args:
+            selector: Optional selector overriding :attr:`trainable_selector`
+                to filter which leaves are extracted.
+            extract_fn: Optional callable applied to each parameter leaf,
+                useful for unwrapping :class:`spx.Parameter` boxes or
+                materialising quantized weights.
+            remove_none: When ``True`` (default), drop leaves that resolve
+                to ``None`` after extraction.
+
+        Returns:
+            dict[str, Any]: Flat mapping from dotted parameter path to its
+            (extracted) value.
+        """
         ...
 
     @abstractmethod

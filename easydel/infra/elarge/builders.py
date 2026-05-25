@@ -63,6 +63,7 @@ from easydel.inference.esurge.config import (
     eSurgeCacheRuntimeConfig,
     eSurgeContextConfig,
     eSurgeDistributedConfig,
+    eSurgeDrafterConfig,
     eSurgeParsingConfig,
     eSurgeRuntimeConfig,
     eSurgeVisionConfig,
@@ -175,6 +176,17 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "distributed_verify_sampling_digest",
         }
     ),
+    "drafter": frozenset(
+        {
+            "enabled",
+            "method",
+            "num_draft_tokens",
+            "assistant_model",
+            "target_embed_module",
+            "layer_mapping",
+            "kwargs",
+        }
+    ),
 }
 _ESURGE_FIELD_TO_SECTION = {field: section for section, fields in _ESURGE_SECTION_FIELDS.items() for field in fields}
 _ESURGE_INT_FIELDS = frozenset(
@@ -194,6 +206,7 @@ _ESURGE_INT_FIELDS = frozenset(
         "distributed_world_size",
         "distributed_rank",
         "distributed_control_port",
+        "num_draft_tokens",
     }
 )
 _ESURGE_FLOAT_FIELDS = frozenset(
@@ -227,6 +240,7 @@ _ESURGE_BOOL_FIELDS = frozenset(
         "silent_mode",
         "distributed_mode",
         "distributed_verify_sampling_digest",
+        "enabled",
     }
 )
 
@@ -258,6 +272,10 @@ def _coerce_esurge_value(key: str, value: Any) -> Any:
         return int(value)
     if key == "extra_eos_token_ids":
         return [int(v) for v in value] if value is not None else None
+    if key == "layer_mapping":
+        return [int(v) for v in value] if value is not None else None
+    if key == "kwargs":
+        return dict(value) if value is not None else None
     if key == "extra_stops" and not isinstance(value, str):
         if isinstance(value, (list, tuple, set)):
             return list(value)
@@ -278,7 +296,25 @@ def _coerce_esurge_value(key: str, value: Any) -> Any:
 
 
 def normalize_esurge_sections(esurge: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
-    """Normalize nested and legacy flat eSurge config into section dictionaries."""
+    """Normalize nested and legacy flat eSurge config into section dictionaries.
+
+    Accepts both the modern sectioned layout (``{"runtime": {...}, "cache": {...}}``)
+    and the legacy flat layout (``{"max_model_len": 4096, "hbm_utilization": 0.9}``),
+    routing every recognized field to its canonical section via
+    :data:`_ESURGE_FIELD_TO_SECTION` and coercing each value to its declared
+    Python type with :func:`_coerce_esurge_value`. ``None`` values are dropped
+    except for keys that explicitly accept ``None`` (e.g. ``tool_parser``).
+    The legacy ``verbose`` flag is rewritten as ``runtime.runner_verbose``.
+
+    Args:
+        esurge: Raw mapping pulled from ``cfg["esurge"]``; ``None`` is treated
+            as an empty dict.
+
+    Returns:
+        Mapping of ``section_name -> {field: coerced_value}`` with one entry
+        for every section in :data:`_ESURGE_SECTION_FIELDS`. Sections without
+        any configured fields appear as empty dicts.
+    """
     source = dict(esurge or {})
     sections: dict[str, dict[str, Any]] = {}
     explicit_null_fields = {"tool_parser", "reasoning_parser"}
@@ -588,7 +624,7 @@ def build_model(cfg_like: eLMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
 def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert eLM configuration into per-section eSurge kwargs.
 
-    Reads the seven sectioned sub-configs from :class:`eSurgeCfg`
+    Reads the sectioned sub-configs from :class:`eSurgeCfg`
     (``cfg["esurge"]``) and returns them as typed-config instances ready to
     spread into :class:`~easydel.inference.esurge.eSurge`::
 
@@ -600,7 +636,8 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
 
     Returns:
         Mapping with keys ``runtime``, ``cache``, ``context``, ``workers``,
-        ``parsing``, ``vision``, ``distributed`` — each a typed-config instance.
+        ``parsing``, ``vision``, ``distributed``, and ``drafter_config`` —
+        each a typed-config instance.
 
     Example:
         >>> cfg = {
@@ -634,6 +671,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         "parsing": eSurgeParsingConfig.coerce_config(es["parsing"]),
         "vision": eSurgeVisionConfig.coerce_config(es["vision"]),
         "distributed": eSurgeDistributedConfig.coerce_config(es["distributed"]),
+        "drafter_config": eSurgeDrafterConfig.coerce_config(es["drafter"]),
     }
 
 

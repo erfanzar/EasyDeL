@@ -259,12 +259,27 @@ def _optimizer_state_shardings_from_params(
     as aux data, so placeholder init has empty aux while real init has one id
     per parameter. In that case, keep the optimizer metadata intact and mirror
     any subtree shaped like the parameter tree by structure.
+
+    Args:
+        tx: The optax gradient transformation whose state should receive
+            shardings.
+        opt_state: A live ``tx.init`` pytree to be annotated.
+        param_shardings: A NamedSharding pytree shaped like ``graphstate``
+            (parameter shardings to mirror onto opt-state slots).
+        replicated: Fallback NamedSharding used for non-parameter optax
+            substates (counters, scales, ...).
+
+    Returns:
+        Any: A pytree mirroring ``opt_state`` whose leaves are ``NamedSharding``
+        instances, ready for ``spx.place_setup_tree_with_shardings``.
     """
 
     def _is_sharding_leaf(value: tp.Any) -> bool:
+        """Return ``True`` if ``value`` should be treated as a leaf during walk."""
         return isinstance(value, jax.sharding.Sharding) or value is None
 
     def _normalize_sharding(value: tp.Any) -> jax.sharding.NamedSharding:
+        """Coerce non-NamedSharding values to the replicated fallback."""
         return value if isinstance(value, jax.sharding.NamedSharding) else replicated
 
     param_slot_shardings = jax.tree_util.tree_map(
@@ -290,12 +305,14 @@ def _optimizer_state_shardings_from_params(
     param_treedef = jax.tree_util.tree_structure(param_shardings, is_leaf=_is_sharding_leaf)
 
     def _matches_param_tree(value: tp.Any) -> bool:
+        """Return whether ``value`` has the same tree structure as ``param_shardings``."""
         try:
             return jax.tree_util.tree_structure(value) == param_treedef
         except Exception:
             return False
 
     def _state_sharding(value: tp.Any) -> tp.Any:
+        """Pick the right sharding subtree for one optimizer-state slot."""
         if _matches_param_tree(value):
             return param_slot_shardings
         return replicated
@@ -316,9 +333,19 @@ def _materialize_replicated_setup_scalars(tree: tp.Any, shardings: tp.Any) -> tp
     them replicated mesh shardings. Materialize those scalar values on that
     target sharding here so the generic setup placement helper does not have to
     repair a ``SingleDeviceSharding`` -> full-mesh mismatch.
+
+    Args:
+        tree: Optimizer-state pytree to inspect.
+        shardings: Matching pytree of NamedShardings produced by
+            :func:`_optimizer_state_shardings_from_params`.
+
+    Returns:
+        Any: A pytree mirroring ``tree`` with replicated scalar leaves
+        ``device_put`` onto their target NamedSharding when needed.
     """
 
     def _place_scalar(leaf: tp.Any, sharding: tp.Any) -> tp.Any:
+        """Move scalar arrays whose current sharding disagrees with the target."""
         if not isinstance(leaf, jax.Array) or not isinstance(sharding, jax.sharding.NamedSharding):
             return leaf
         if tuple(getattr(leaf, "shape", ())) != ():
@@ -339,7 +366,16 @@ def _materialize_replicated_setup_scalars(tree: tp.Any, shardings: tp.Any) -> tp
 
 
 def _read_checkpoint_metadata(load_directory: str | os.PathLike | ePathLike) -> dict[str, tp.Any]:
-    """Best-effort read of the checkpoint discovery metadata."""
+    """Best-effort read of the checkpoint discovery metadata.
+
+    Args:
+        load_directory: Path to the checkpoint directory potentially holding
+            a ``metadata.json``.
+
+    Returns:
+        dict[str, Any]: The parsed metadata dictionary, or an empty dict
+        when the file is missing or malformed.
+    """
     metadata_path = ePath(load_directory) / "metadata.json"
     if not metadata_path.exists():
         return {}
@@ -392,7 +428,15 @@ def _has_resume_model(load_directory: str | os.PathLike | ePathLike) -> bool:
 
 
 def _get_checkpoint_step(load_directory: str | os.PathLike | ePathLike) -> int | None:
-    """Return the recorded checkpoint step from ``metadata.json`` when available."""
+    """Return the recorded checkpoint step from ``metadata.json`` when available.
+
+    Args:
+        load_directory: Path to the checkpoint directory.
+
+    Returns:
+        int | None: The integer step value if present and parseable, else
+        ``None``.
+    """
     metadata = _read_checkpoint_metadata(load_directory)
     step = metadata.get("step")
     if step is None:
@@ -405,7 +449,16 @@ def _get_checkpoint_step(load_directory: str | os.PathLike | ePathLike) -> int |
 
 
 def _is_optimizer_template_incompatibility(exc: Exception) -> bool:
-    """Return whether an optimizer restore error signals a template mismatch."""
+    """Return whether an optimizer restore error signals a template mismatch.
+
+    Args:
+        exc: Exception raised while restoring an optimizer pytree from
+            checkpoint.
+
+    Returns:
+        bool: ``True`` if the message matches the well-known shape/key
+        mismatch signatures emitted by SpectraX/TensorStore restores.
+    """
     message = str(exc)
     return (isinstance(exc, KeyError) and "Missing array for key" in message) or (
         isinstance(exc, ValueError) and "Array shape mismatch for key" in message
@@ -759,7 +812,19 @@ class EasyDeLState(_PyTreeNode):
         *,
         mesh: MeshLike | None = None,
     ) -> tp.Any:
-        """Derive optimizer-state sharding from parameter metadata when possible."""
+        """Derive optimizer-state PartitionSpecs from parameter metadata.
+
+        Falls back to a fully-replicated rule when ``optax.tree_map_params``
+        is unavailable or its template mismatch heuristic raises.
+
+        Args:
+            opt_state: The live optimizer-state pytree to annotate.
+            mesh: Optional mesh override (defaults to the model's mesh).
+
+        Returns:
+            Any: A PartitionSpec pytree shaped like ``opt_state``, sanitized
+            against the target mesh and shapes.
+        """
         mesh = mesh or self.model._get_mesh(None)
 
         if self.tx is not None and hasattr(optax, "tree_map_params"):
@@ -935,7 +1000,6 @@ class EasyDeLState(_PyTreeNode):
         before saving checkpoints in a portable format or when transitioning from
         distributed to single-device execution.
 
-        Args:
         Returns:
             Self: A new EasyDeLState instance with the gathered (non-sharded)
             `opt_state`.
@@ -1116,7 +1180,16 @@ class EasyDeLState(_PyTreeNode):
         """
 
         def calculate_size(pytree):
-            """Calculate total size of JAX arrays in a pytree."""
+            """Sum ``size * itemsize`` over all JAX arrays in ``pytree``.
+
+            Args:
+                pytree: A pytree whose JAX array leaves should be accounted
+                    for. May be ``None``.
+
+            Returns:
+                int: Total bytes contributed by JAX arrays; ``0`` when the
+                pytree is ``None`` or contains no arrays.
+            """
             if pytree is None:
                 return 0
             leaves, _ = jax.tree_util.tree_flatten(pytree)
@@ -1690,7 +1763,12 @@ class EasyDeLState(_PyTreeNode):
         model_task = AutoEasyDeLConfig.bind_model_task(model_task, config.architectures)
 
         class _BaseModuleLoader(EasyDeLBaseModule):
-            """Internal loader class for binding model task."""
+            """One-shot ``EasyDeLBaseModule`` subclass that pins ``_model_task``.
+
+            Used as an entry-point so :meth:`EasyDeLBaseModule.from_pretrained`
+            knows which task head (causal LM, sequence classification, ...) to
+            bind without modifying the global class.
+            """
 
             _model_task = model_task
 

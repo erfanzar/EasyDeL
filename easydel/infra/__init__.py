@@ -97,16 +97,21 @@ if tp.TYPE_CHECKING:  # pragma: no cover
 
 
 def init_cluster():
-    """
-    Initialize the distributed computing cluster for EasyDeL.
+    """Initialize the JAX distributed cluster for EasyDeL.
 
-    This function sets up the distributed configuration for JAX-based distributed
-    computing. It attempts to initialize the JAX distributed runtime using the
-    DistributedConfig from eformer.
+    Bootstraps the JAX distributed runtime by enabling the preemption service
+    and delegating coordinator discovery to :class:`eformer.executor.DistributedConfig`.
+    Safe to call multiple times — re-initialization is detected and skipped
+    rather than raised.
 
-    Note:
-        This function should be called once at the beginning of your program
-        before any distributed operations.
+    This should be called exactly once at program start, before any operation
+    that materialises arrays on remote devices (model loading, optimizer state
+    creation, mesh construction). On single-host runs the underlying
+    ``DistributedConfig`` becomes a no-op.
+
+    Raises:
+        RuntimeError: Re-raised from ``jax.distributed.initialize`` when
+            initialization fails for reasons other than "already initialized".
     """
     import os as _os
 
@@ -154,7 +159,22 @@ __all__ = (
 
 
 def __getattr__(name: str):  # pragma: no cover
-    """Lazy attribute loader to avoid import cycles in core modules."""
+    """Lazily resolve heavy public symbols on first access.
+
+    The base config/module/state classes pull in spectrax, optax and the loss
+    utilities transitively, which can trigger import cycles when this package
+    is imported during core-module initialization. Each branch performs the
+    deferred import only when its symbol is requested.
+
+    Args:
+        name: Attribute name being looked up on the package.
+
+    Returns:
+        The requested symbol (class or function) resolved from its submodule.
+
+    Raises:
+        AttributeError: If ``name`` is not a known lazily-exposed symbol.
+    """
     if name in {"EasyDeLBaseConfig", "EasyDeLBaseConfigDict"}:
         from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 

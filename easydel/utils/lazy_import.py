@@ -36,9 +36,19 @@ IMPORT_STRUCTURE_T = dict[BACKENDS_T, dict[str, set[str]]]
 
 
 class DummyObject(type):
-    """Metaclass for lazy placeholders whose optional backends are missing."""
+    """Metaclass for lazy placeholders whose optional backends are missing.
+
+    Used by :class:`LazyModule` to manufacture stub classes whose every
+    attribute access or instantiation raises an :class:`ImportError`
+    describing the optional dependency that should be installed.
+    """
 
     def _missing_backend_message(cls) -> str:
+        """Build the human-readable optional-backend error message.
+
+        Returns:
+            A string listing the missing backends recorded on ``cls._backends``.
+        """
         backends = getattr(cls, "_backends", ())
         if isinstance(backends, str):
             backend_names = backends
@@ -47,13 +57,33 @@ class DummyObject(type):
         return f"{cls.__name__} requires missing optional backend(s): {backend_names}."
 
     def __getattribute__(cls, name: str) -> tp.Any:
-        """Raise a clear optional-dependency error on placeholder use."""
+        """Raise a clear optional-dependency error on placeholder use.
+
+        Args:
+            name: Attribute being accessed.
+
+        Returns:
+            The dunder attribute when ``name`` starts with ``_`` or is one of
+            the safe introspection attributes.
+
+        Raises:
+            ImportError: When any non-dunder attribute is accessed on the
+                placeholder, listing the missing optional backend(s).
+        """
         if name.startswith("_") or name in {"__class__", "__doc__", "__module__", "__name__", "__qualname__"}:
             return super().__getattribute__(name)
         raise ImportError(cls._missing_backend_message())
 
     def __call__(cls, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
-        """Prevent instantiating placeholders for missing optional backends."""
+        """Prevent instantiating placeholders for missing optional backends.
+
+        Args:
+            *args: Ignored.
+            **kwargs: Ignored.
+
+        Raises:
+            ImportError: Always, listing the missing optional backend(s).
+        """
         del args, kwargs
         raise ImportError(cls._missing_backend_message())
 
@@ -231,13 +261,17 @@ class LazyModule(ModuleType):
 
 
 def is_package_available(package_name: str) -> bool:
-    """
-    Checks if a package is available in the current Python environment.
+    """Check if a package can be imported in the current environment.
+
+    Distribution names containing dashes are normalised to underscores
+    (``"my-pkg"`` -> ``"my_pkg"``) before the lookup so PyPI-style names work
+    too.
 
     Args:
-        package_name: The name of the package to check (e.g., "numpy").
+        package_name: Importable name of the package (e.g. ``"numpy"``).
 
     Returns:
-        True if the package is available, False otherwise.
+        ``True`` if a module spec exists for ``package_name``, ``False`` if
+        not.
     """
     return importlib.util.find_spec(package_name.replace("-", "_")) is not None

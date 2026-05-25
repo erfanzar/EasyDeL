@@ -462,7 +462,26 @@ class _CodeEvalMetricProxy:
         self._timeout = None if timeout is None else float(timeout)
 
     def compute(self, *args: Any, **kwargs: Any) -> Any:
-        """Run code-eval in a clean subprocess while injecting override kwargs."""
+        """Run ``code_eval`` in a clean subprocess while injecting overrides.
+
+        Replaces the wrapped metric's in-process ``compute`` with a call to
+        :func:`_run_code_eval_metric_compute`, which serializes the inputs and
+        runs the metric in a separate Python interpreter. Per-call
+        ``num_workers`` and ``timeout`` kwargs that were captured on this
+        proxy are stamped onto ``kwargs`` first so that lm-eval's defaults are
+        overridden.
+
+        Args:
+            *args: Positional arguments; forwarded but generally unused —
+                ``code_eval.compute`` is keyword-only.
+            **kwargs: Keyword arguments expected by HuggingFace's
+                ``code_eval.compute`` (``references``, ``predictions``, ``k``,
+                ``num_workers``, ``timeout``).
+
+        Returns:
+            The pass-at-k dict produced by HuggingFace ``code_eval.compute``
+            inside the subprocess.
+        """
         if self._num_workers is not None:
             kwargs["num_workers"] = self._num_workers
         if self._timeout is not None:
@@ -521,7 +540,26 @@ def _estimate_code_eval_timeout(
     num_workers: int | None,
     timeout: float | None,
 ) -> float | None:
-    """Estimate a generous wall clock bound for a full code-eval compute call."""
+    """Estimate a generous wall-clock bound for a full ``code_eval`` invocation.
+
+    The HF ``code_eval`` metric runs ``len(predictions) * k`` candidate
+    completions across ``num_workers`` processes, each guarded by
+    ``timeout`` seconds. Multiplying those out and adding generous slack
+    yields the outer subprocess timeout passed to ``subprocess.run`` so
+    that runaway code samples cannot hang the harness indefinitely.
+
+    Args:
+        predictions: List of candidate-completion groups (one group per
+            problem, possibly multiple candidates per group).
+        num_workers: Worker-process count the metric will use; ``None``
+            defaults to ``4``.
+        timeout: Per-sample execution timeout in seconds; ``None`` defaults
+            to ``3.0``.
+
+    Returns:
+        A floating-point wall-clock budget in seconds (always at least
+        ``60.0``) suitable for passing to ``subprocess.run(..., timeout=...)``.
+    """
     if not predictions:
         return 60.0
     sample_timeout = 3.0 if timeout is None else float(timeout)
@@ -532,7 +570,30 @@ def _estimate_code_eval_timeout(
 
 
 def _run_code_eval_metric_compute(*args: Any, **kwargs: Any) -> Any:
-    """Execute Hugging Face ``code_eval.compute`` in a standalone Python process."""
+    """Execute Hugging Face ``code_eval.compute`` in a standalone Python process.
+
+    Pickles ``references``, ``predictions``, and execution kwargs into a
+    base64 payload, spawns a fresh ``sys.executable`` running
+    :data:`_CODE_EVAL_METRIC_RUNNER`, and decodes the pickled result from
+    its stdout. The subprocess is launched with ``HF_ALLOW_CODE_EVAL=1``,
+    ``JAX_PLATFORMS=cpu``, and ``ENABLE_DISTRIBUTED_INIT=0`` so model-generated
+    code cannot corrupt the host's JAX/TPU state.
+
+    Args:
+        *args: Positional arguments — not supported; an error is raised when
+            any are passed.
+        **kwargs: Must include ``references`` and ``predictions``; may include
+            ``k`` (defaults to ``[1, 10, 100]``), ``num_workers``, and
+            ``timeout``.
+
+    Returns:
+        The pass-at-k dict produced by HuggingFace ``code_eval.compute`` in the
+        subprocess (typically ``({...}, [...])``).
+
+    Raises:
+        TypeError: If positional arguments are supplied.
+        RuntimeError: If the subprocess exits with a non-zero status.
+    """
     if args:
         raise TypeError("code_eval.compute is expected to be called with keyword arguments only")
     payload = {
@@ -573,7 +634,27 @@ def _patch_loaded_code_eval_metric(
     patched: list[tuple[Any, str, Any]],
     patched_code_eval_modules: set[tuple[str, str]],
 ) -> Any:
-    """Wrap a loaded Hugging Face ``code_eval`` metric with isolated execution."""
+    """Wrap a loaded Hugging Face ``code_eval`` metric with isolated execution.
+
+    Substitutes the metric instance with a :class:`_CodeEvalMetricProxy` that
+    forwards attribute access but routes ``compute(...)`` through a subprocess
+    runner with optional ``num_workers``/``timeout`` overrides.
+
+    Args:
+        metric: Original HF ``code_eval`` metric (or compatible callable) to
+            wrap.
+        num_workers: Optional override forwarded to the proxy.
+        timeout: Optional per-sample timeout override forwarded to the proxy.
+        patched: Mutable list of ``(target, attr_name, original_value)``
+            tuples used by :func:`override_lm_eval_code_exec` to reverse the
+            patch on context exit. Currently unused by this helper but kept in
+            the signature for symmetry with other patch sites.
+        patched_code_eval_modules: Mutable set tracking which lm-eval modules
+            have already been patched. Unused here but retained for symmetry.
+
+    Returns:
+        A :class:`_CodeEvalMetricProxy` wrapping *metric*.
+    """
     del patched
     del patched_code_eval_modules
     return _CodeEvalMetricProxy(metric, num_workers=num_workers, timeout=timeout)
@@ -587,10 +668,22 @@ def override_lm_eval_code_exec(
 ):
     """Temporarily override lm-eval code-task execution settings.
 
-    This patches the local `lm_eval` Humaneval/MBPP helpers to use custom
-    `code_eval.compute(num_workers=..., timeout=...)` values without editing
-    the installed package. The override is process-local and reverted when the
-    context exits.
+    Monkey-patches the locally imported ``evaluate.load`` and the relevant
+    lm-eval helpers (``lm_eval.tasks.humaneval.utils.compute_`` and
+    ``lm_eval.tasks.mbpp.utils.pass_at_k``) to substitute their HF
+    ``code_eval`` metric with :class:`_CodeEvalMetricProxy`. The proxy injects
+    explicit ``num_workers`` / ``timeout`` overrides and routes execution
+    through a subprocess, so model-generated Python never runs in the host's
+    JAX/TPU process. All patches are restored when the context exits.
+
+    Args:
+        num_workers: Optional explicit worker count for the metric. ``None``
+            keeps the existing lm-eval default.
+        timeout: Optional per-sample execution timeout in seconds. ``None``
+            keeps the existing lm-eval default.
+
+    Yields:
+        Nothing — the context manager is purely a side-effect scope.
     """
     if num_workers is None and timeout is None:
         yield
@@ -665,7 +758,19 @@ def override_lm_eval_code_exec(
 
 
 def _stringify_callable(obj: Any) -> str:
-    """Return a stable, human-readable identifier for a callable-like object."""
+    """Return a stable, human-readable identifier for a callable-like object.
+
+    Used by :func:`make_serializable` so callables embedded in eLarge
+    configurations end up as deterministic strings in saved JSON/YAML
+    artifacts.
+
+    Args:
+        obj: Any object — typically a function, method, or class.
+
+    Returns:
+        ``"{module}.{qualname}"`` when both attributes are present, the
+        qualified name alone when only it exists, otherwise ``repr(obj)``.
+    """
     module = getattr(obj, "__module__", None)
     qualname = getattr(obj, "__qualname__", None) or getattr(obj, "__name__", None)
     if module and qualname:
@@ -678,10 +783,25 @@ def _stringify_callable(obj: Any) -> str:
 def make_serializable(obj: Any) -> Any:
     """Convert arbitrary config-like objects into JSON/YAML-safe primitives.
 
-    This recursively normalizes common configuration value types used in ELM:
-    mappings, sequences, dataclasses, enums, PathLike objects, callables,
-    array-like objects exposing ``tolist``, raw bytes, and objects with
-    ``to_dict``/``model_dump`` methods.
+    Recursively normalizes the value types that appear in eLarge
+    configurations so they can be passed to ``json.dumps`` / ``yaml.safe_dump``
+    without custom encoders. The conversion rules are applied in priority
+    order: enums (unwrap ``value``), primitives (passthrough), mappings
+    (string keys + recursive value conversion), sequences (list +
+    recursive), dataclasses (``asdict``), pydantic-style ``model_dump`` /
+    HF-style ``to_dict``, PathLike (``os.fspath``), callables
+    (:func:`_stringify_callable`), array-likes exposing ``tolist``, and
+    bytes (UTF-8 decode with replacement).
+
+    Args:
+        obj: Arbitrary value drawn from an eLarge configuration tree.
+
+    Returns:
+        A JSON/YAML-safe value built from primitives, lists, and dicts.
+
+    Raises:
+        TypeError: If *obj* does not match any of the supported conversion
+            rules.
     """
     if isinstance(obj, Enum):
         return make_serializable(obj.value)
@@ -709,10 +829,23 @@ def make_serializable(obj: Any) -> Any:
 
 
 def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encoding: str = "utf-8") -> None:
-    """Atomically write text to a file.
+    """Atomically write text to a file via temp-file-then-rename.
 
-    Writes data to a temporary file in the same directory and then replaces
-    the target path with ``os.replace`` to avoid partial writes.
+    Creates parent directories as needed, writes *data* to a hidden temporary
+    file in the destination directory, and finally replaces the target path
+    with ``os.replace`` so readers never observe a partial write. On error the
+    temporary file is removed and the original exception is re-raised.
+
+    Args:
+        path: Destination file path. Accepts ``str``, ``os.PathLike``, or
+            ``ePathLike``.
+        data: Full text contents to write.
+        encoding: Text encoding used when writing the temporary file. Defaults
+            to UTF-8.
+
+    Raises:
+        OSError: Propagated from filesystem operations (mkdir, mkstemp,
+            write, replace). The temporary file is unlinked on failure.
     """
     target = ePath(path)
     target.parent.mkdir(parents=True, exist_ok=True)

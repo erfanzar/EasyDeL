@@ -12,25 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sharding mixin for EasyDeL modules.
+"""Sharding/gather surface that :class:`EasyDeLBaseModule` composes in.
 
-Provides sharding and partitioning functionality through the EasyShardingMixin
-class, which can be combined with EasyDeL models to enable distributed training
-and inference across multiple devices.
+This module hosts :class:`EasyShardingMixin`, the bridge between an EasyDeL
+model's *variable metadata* (annotated through ``spectrax.Parameter``
+shardings) and JAX's :class:`NamedSharding` / device placement APIs. It also
+provides the canonical mesh accessors (``mesh``, ``explicit_mesh``,
+``manual_mesh``) and the ``mesh_call`` helper used everywhere we need to
+enter the model's sharding context before invoking the forward pass.
 
-Classes:
-    EasyShardingMixin: Mixin class providing sharding and partitioning methods
+Two important code-paths live here:
 
-Key Features:
-    - Automatic sharding rule resolution from variable metadata
-    - Model sharding and gathering for distributed training
-    - Output sharding application via JIT compilation
+* :meth:`EasyShardingMixin.resolve_shardings_regex` produces a list of
+  ``(regex, NamedSharding)`` rules from the live variable metadata, *one
+  rule per variable*. Layer indices are intentionally not collapsed to
+  ``\\d+`` so per-stage submeshes (pipeline parallelism) can be honoured.
+* :meth:`EasyShardingMixin.apply_sharding_for_tree` consumes those rules
+  via :func:`device_put_if_sharding_mismatch` to actually move arrays onto
+  their target devices, skipping any leaf that is already correctly
+  sharded.
 
-Example:
-    >>> from easydel.infra.mixins import EasyShardingMixin
-    >>> # Model class inherits from EasyShardingMixin
-    >>> model = model.shard_model()
-    >>> gathered = model.gather_model()
+Module exports:
+    :class:`EasyShardingMixin`.
 """
 
 from __future__ import annotations
@@ -67,6 +70,14 @@ def _tree_is_already_named_sharded(tree: tp.Any) -> bool:
     startup then calls the same sharding path again through ``EasyDeLState``.
     In that case rebuilding regex rules and walking every large parameter leaf
     is pure overhead.
+
+    Args:
+        tree: Arbitrary pytree whose array leaves should be inspected.
+
+    Returns:
+        bool: ``True`` if at least one array leaf is present and every array
+        leaf already has a :class:`NamedSharding`; ``False`` if any array
+        leaf lacks one, or the tree contains no arrays at all.
     """
     saw_array = False
     for leaf in jax.tree_util.tree_leaves(tree):
@@ -125,17 +136,32 @@ class EasyShardingMixin:
 
     @property
     def parameters_sharding(self: Self) -> spx.State:
-        """Compute shape metadata for the default selected trainable state."""
+        """Return the resolved :class:`NamedSharding` pytree for :attr:`parameters`.
+
+        Returns:
+            spx.State: A pytree of NamedSharding objects mirroring the
+            structure of the trainable parameter tree.
+        """
         return self.resolve_sharding_for_tree(self.parameters)
 
     @property
     def graphstate_sharding(self: Self) -> spx.State:
-        """Compute shape metadata for the default selected trainable state."""
+        """Return the resolved :class:`NamedSharding` pytree for :attr:`graphstate`.
+
+        Returns:
+            spx.State: A pytree of NamedSharding objects mirroring the
+            structure of the selected trainable state.
+        """
         return self.resolve_sharding_for_tree(self.graphstate)
 
     @property
     def graphother_sharding(self: Self) -> spx.State:
-        """Compute shape metadata for the default selected trainable state."""
+        """Return the resolved :class:`NamedSharding` pytree for :attr:`graphother`.
+
+        Returns:
+            spx.State: A pytree of NamedSharding objects mirroring the
+            structure of the non-trainable state subtree.
+        """
         return self.resolve_sharding_for_tree(self.graphother)
 
     @property
@@ -438,7 +464,13 @@ class EasyShardingMixin:
 
     @property
     def runtime_sharding_resolver(self):
-        """Return the model's runtime sharding resolver."""
+        """Return the model's :class:`RuntimeShardingResolver`, bound to ``config.mesh``.
+
+        Returns:
+            RuntimeShardingResolver: A resolver pre-bound to the current
+            mesh, ready to map variable metadata into ``NamedSharding``
+            instances.
+        """
         return self.config.runtime_sharding_resolver.with_mesh(self.config.mesh)
 
     @property
@@ -593,7 +625,16 @@ class EasyShardingMixin:
         return self
 
     def _make_shard_fns(self: Self):
-        """Build sanitized shard functions from partition specs."""
+        """Build the per-parameter shard callable map for the current mesh.
+
+        Resolves NamedShardings for the default graphstate-shape tree and
+        feeds them to ``spx.make_shard_and_gather_fns`` to produce the
+        callable map consumed by :meth:`_apply_sharding_fns`.
+
+        Returns:
+            Mapping: A pytree-shaped mapping from parameter paths to shard
+            callables that place each leaf onto its target devices.
+        """
         mesh = self._get_mesh(None)
         partition_specs = self.resolve_sharding_for_tree(mesh=mesh)
         shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)

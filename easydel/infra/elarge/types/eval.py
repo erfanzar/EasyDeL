@@ -12,7 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluation and benchmark TypedDicts."""
+"""Evaluation, benchmark, and lm-evaluation-harness TypedDict schemas.
+
+This module owns the per-field schemas consumed by the eLarge evaluation
+surface in :mod:`easydel.infra.elarge.benchmarking` and the
+:meth:`eLargeModel.eval` / :meth:`eLargeModel.run_benchmarks` entry points.
+Together they cover the full kwarg surface of
+``lm_eval.evaluator.simple_evaluate`` plus EasyDeL-specific extensions
+(sampling overrides, code-eval isolation, math normalization, thinking
+tokens), and the per-benchmark suite descriptor that eLarge resolves into a
+:class:`ResolvedBenchmarkConfig` before dispatching.
+
+Public types:
+    - :data:`BenchmarkTask`: single-task specification union (string, mapping, or object).
+    - :data:`BenchmarkTasks`: single task or sequence of tasks.
+    - :class:`EvalKwargs`: lm-eval ``simple_evaluate`` kwargs plus EasyDeL extras.
+    - :class:`BenchmarkConfig`: named benchmark suite (``EvalKwargs`` + ``name`` + ``tasks``).
+    - :class:`ResolvedBenchmarkConfig`: validated, dispatch-ready dataclass form.
+"""
 
 from __future__ import annotations
 

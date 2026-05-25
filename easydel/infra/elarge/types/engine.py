@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BaseCfg and eSurgeCfg TypedDicts."""
+"""TypedDict schemas for base model overrides and eSurge inference engine sections.
+
+This module owns the two top-level schemas that bridge eLarge configurations
+with the underlying EasyDeL model and the eSurge inference engine: one
+container for ``EasyDeLBaseConfig`` overrides plus per-operation kernel
+overrides, and one sectioned mapping mirroring the eSurge sub-configs.
+
+Public types:
+    - :class:`BaseCfg`: ``base_config`` section schema (model config overrides
+      and ejkernel operation_configs).
+    - :class:`eSurgeCfg`: per-sub-system eSurge engine configuration with one
+      ``NotRequired`` field per typed eSurge config class.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +34,7 @@ from easydel.inference.esurge.config import (
     eSurgeCacheRuntimeConfig,
     eSurgeContextConfig,
     eSurgeDistributedConfig,
+    eSurgeDrafterConfig,
     eSurgeParsingConfig,
     eSurgeRuntimeConfig,
     eSurgeVisionConfig,
@@ -73,6 +86,8 @@ class eSurgeCfg(TypedDict, total=False):
             vision_cache_capacity_mb).
         distributed: Multi-host serving (distributed_mode, distributed_role,
             world_size, rank, control plane settings).
+        drafter: Speculative drafter construction settings passed through to
+            ``model.drafter(...)`` by eSurge.
     """
 
     runtime: NotRequired[eSurgeRuntimeConfig]
@@ -82,3 +97,4 @@ class eSurgeCfg(TypedDict, total=False):
     parsing: NotRequired[eSurgeParsingConfig]
     vision: NotRequired[eSurgeVisionConfig]
     distributed: NotRequired[eSurgeDistributedConfig]
+    drafter: NotRequired[eSurgeDrafterConfig]

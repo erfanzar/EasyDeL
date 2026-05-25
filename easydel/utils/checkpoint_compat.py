@@ -82,6 +82,16 @@ def legacy_checkpoint_key_aliases(key: str) -> tuple[str, ...]:
             collection_variants.add((*parts[:idx], "parameters", *parts[idx + 1 :]))
 
     def with_value_suffix(candidate: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        """Return ``candidate`` and an optional ``+ ('value',)`` variant.
+
+        Args:
+            candidate: A candidate flat-path tuple.
+
+        Returns:
+            A one-tuple containing the candidate when it already ends in
+            ``"value"``; otherwise a pair with the candidate followed by a
+            copy that has ``"value"`` appended.
+        """
         if candidate and candidate[-1] == "value":
             return (candidate,)
         return (candidate, (*candidate, "value"))
@@ -218,7 +228,18 @@ def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]
 
 
 def _leaf_shape(leaf: tp.Any) -> tuple[int, ...] | None:
-    """Return a tuple shape for array-like leaves and state wrappers."""
+    """Return a tuple shape for array-like leaves and state wrappers.
+
+    Handles both raw arrays (with a ``.shape`` attribute) and Spectrax
+    ``Parameter`` style wrappers that expose ``.value.shape``.
+
+    Args:
+        leaf: Array-like value or wrapper to inspect.
+
+    Returns:
+        A tuple of integer dimensions, or ``None`` when no shape information
+        can be extracted from ``leaf``.
+    """
     shape = getattr(leaf, "shape", None)
     if shape is None and hasattr(leaf, "value"):
         shape = getattr(leaf.value, "shape", None)
@@ -228,12 +249,34 @@ def _leaf_shape(leaf: tp.Any) -> tuple[int, ...] | None:
 
 
 def _is_lm_head_weight_key(key: tuple[tp.Any, ...], lm_head_names: tuple[str, ...]) -> bool:
-    """Check whether a flat state key names an lm-head weight leaf."""
+    """Check whether a flat state key names an lm-head weight leaf.
+
+    Args:
+        key: Flat path tuple ``(collection, ...module_path, leaf_name)``.
+        lm_head_names: Module names that should be treated as lm-head modules.
+
+    Returns:
+        ``True`` when ``key`` is of the form
+        ``("parameters", ..., <lm_head_name>, "weight")``.
+    """
     return len(key) >= 3 and str(key[0]) == "parameters" and str(key[-1]) == "weight" and str(key[-2]) in lm_head_names
 
 
 def _embedding_candidate_score(key: tuple[tp.Any, ...]) -> int:
-    """Rank likely token embedding leaves over unrelated vision/projector embeddings."""
+    """Rank likely token embedding leaves over unrelated vision/projector embeddings.
+
+    Awards positive points for module names typically used for the text token
+    embedding table (``embed_tokens``, ``wte``, etc.) and deducts points for
+    vision/patch embedding paths so that tied lm-head materialization picks
+    the right source tensor.
+
+    Args:
+        key: Flat path tuple of the candidate parameter leaf.
+
+    Returns:
+        Heuristic score; higher means more likely to be a token embedding.
+        Non-positive values are filtered out by the caller.
+    """
     parts = tuple(str(part).lower() for part in key)
     joined = "/".join(parts)
     score = 0

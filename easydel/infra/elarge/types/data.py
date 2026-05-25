@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dataset, tokenization, and mixture TypedDicts."""
+"""Dataset, tokenization, and mixture TypedDict schemas for the ELM data plane.
+
+Owns the per-field schema that the eLarge data builders consume to assemble
+:class:`~easydel.data.DatasetMixture` / :class:`~easydel.data.transforms`
+pipelines. Each TypedDict here is intentionally ``total=False`` so callers can
+provide a partial mapping and let :mod:`easydel.infra.elarge.processing`
+fill in defaults.
+
+Public types:
+    - :class:`TextDatasetInformCfg`: single text source descriptor.
+    - :class:`VisualDatasetInformCfg`: single image/multimodal source descriptor.
+    - :class:`TokenizationCfg`: post-load tokenization knobs.
+    - :class:`DatasetSaveCfg`: output-location and format settings for materialized datasets.
+    - :class:`DatasetMixtureCfg`: mixing/packing/streaming knobs across multiple sources.
+    - :class:`DataMixtureCfg`: superset of :class:`DatasetMixtureCfg` adding eLarge-specific extras.
+"""
 
 from __future__ import annotations
 

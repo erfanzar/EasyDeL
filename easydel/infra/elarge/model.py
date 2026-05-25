@@ -259,7 +259,27 @@ class eLargeModel:
 
     @staticmethod
     def _load_yaml_config(yaml_path: str | os.PathLike | ePathLike) -> dict[str, Any]:
-        """Load raw ELM config mapping from a YAML file."""
+        """Load a raw ELM config mapping from a YAML file.
+
+        Reads the YAML file, accepting either a flat mapping at the root or a
+        wrapped mapping under one of ``config`` / ``elarge_model`` / ``elm``.
+        Any top-level ``actions`` key (used by ``easydel.scripts.elarge``) is
+        ignored when no explicit wrapper key is present.
+
+        Args:
+            yaml_path: Path to the YAML configuration file. Accepts ``str``,
+                ``os.PathLike``, or ``ePathLike`` arguments.
+
+        Returns:
+            Dictionary form of the YAML config mapping, ready to be passed to
+            :func:`normalize` for eLargeModel ingestion.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            FileNotFoundError: If *yaml_path* does not exist.
+            ValueError: If the file contents are not valid YAML.
+            TypeError: If the YAML root or extracted config is not a mapping.
+        """
         try:
             import yaml
         except ImportError as e:
@@ -746,6 +766,9 @@ class eLargeModel:
                   See ``ReasoningParserManager`` for available parsers.
                 - extra_stops: Global stop strings (e.g., ["<|user|>"]) merged
                   into request SamplingParams.stop at runtime.
+                - drafter: Declarative drafter config, e.g.
+                  {"method": "mtp", "num_draft_tokens": 4}. eSurge passes this
+                  through to model.drafter(...) after loading the target model.
 
         Returns:
             Self for method chaining
@@ -1416,7 +1439,25 @@ class eLargeModel:
         return build_sharded_source(self._config)
 
     def _build_training_arguments_for_type(self, trainer_type: str | None = None):
-        """Build trainer arguments while normalizing defaults for a requested trainer."""
+        """Build a fresh TrainingArguments instance for the requested trainer family.
+
+        Normalizes the ``trainer`` section against the (optionally overridden)
+        trainer flavor, resolves the matching TrainingArguments class via
+        :func:`get_training_arguments_class`, and instantiates it. Falls back
+        to a parameter-filtered constructor call when the resolved class does
+        not accept every key present in the normalized config — useful when the
+        eLarge config carries trainer-agnostic overrides.
+
+        Args:
+            trainer_type: Optional override for the trainer family. When
+                ``None``, the value from ``self._config["trainer"]["trainer_type"]``
+                is used (or ``"sft"`` if missing).
+
+        Returns:
+            Tuple ``(normalized_trainer_cfg, training_arguments)`` containing
+            the normalized config dict (including the resolved
+            ``trainer_type``) and the constructed TrainingArguments instance.
+        """
         trainer_cfg = dict(self._config.get("trainer", {}))
         if trainer_type is not None:
             trainer_cfg["trainer_type"] = trainer_type
@@ -1439,7 +1480,27 @@ class eLargeModel:
         trainer_type: str | None = None,
         formatting_func: typing.Callable | None = None,
     ) -> "Transform | ExpandTransform":
-        """Resolve the same raw-data preprocessing transform used by trainer data loaders."""
+        """Resolve the trainer-flavor-specific preprocessing transform.
+
+        Mirrors the per-trainer-type tokenization that each :class:`Trainer`
+        applies inside its data loader (SFT, DPO, KTO, GRPO, embedding, …)
+        and exposes it as a standalone transform so the data mixture can be
+        pre-tokenized to disk and reused later. The returned transform expects
+        the same raw row layout that the matching trainer would consume.
+
+        Args:
+            trainer_type: Optional override for the trainer family. When
+                ``None``, the active trainer config's ``trainer_type`` is used.
+            formatting_func: SFT-only callable that converts a raw row into the
+                rendered ``text`` string; ignored by every non-SFT branch.
+
+        Returns:
+            A :class:`Transform` (or :class:`ExpandTransform`) configured with
+            the active tokenizer and the trainer-specific length/masking knobs.
+
+        Raises:
+            ValueError: If *trainer_type* is not one of the supported families.
+        """
         import easydel.trainers  # noqa: F401
         from easydel.trainers.prompt_transforms import (
             BCOPreprocessTransform,
@@ -1560,7 +1621,23 @@ class eLargeModel:
 
     @staticmethod
     def _sanitize_pre_tokenize_path_part(value: Any, default: str = "NA") -> str:
-        """Make one generated pre-tokenization folder segment path-safe."""
+        """Make one generated pre-tokenization folder segment path-safe.
+
+        Coerces *value* to a string, replaces any run of non-``[A-Za-z0-9._-]``
+        characters with a single underscore, and strips leading/trailing
+        ``._-`` separators. Used to assemble deterministic folder names for
+        pre-tokenized output directories from arbitrary inputs such as dataset
+        names, sequence lengths, or tokenizer class names.
+
+        Args:
+            value: Raw value to sanitize; ``None`` and the empty string both
+                collapse to *default*.
+            default: Fallback string returned when *value* is empty or sanitizes
+                to an empty string.
+
+        Returns:
+            A safe filename fragment containing only ``[A-Za-z0-9._-]``.
+        """
         import re
 
         if value is None:
@@ -1579,7 +1656,28 @@ class eLargeModel:
         tokenizer: Any,
         dataset_name: Any | None = None,
     ) -> str:
-        """Build the deterministic child folder for pre-tokenized data."""
+        """Build the deterministic child folder name for pre-tokenized output.
+
+        Encodes the trainer flavor, tokenizer class, key length limits, and a
+        dataset identifier into a single path-safe segment of the form
+        ``{trainer_type}-{TokenizerClass}-MXL_{max_length}-PL_{max_prompt_length}-CL_{max_completion_length}-{dataset_name}``.
+        The deterministic layout lets repeated runs detect existing
+        pre-tokenized shards and skip re-encoding.
+
+        Args:
+            trainer_cfg: Normalized trainer config used to read ``trainer_type``.
+            arguments: TrainingArguments-like object whose ``max_length`` /
+                ``max_prompt_length`` / ``max_completion_length`` attributes are
+                folded into the folder name when present.
+            tokenizer: Active tokenizer; only its class name is used.
+            dataset_name: Optional explicit dataset label; when ``None``, the
+                folder name is derived from ``mixture.informs`` via
+                :func:`_extract_dataset_name`.
+
+        Returns:
+            A single, slash-free path segment safe to append to an output
+            directory.
+        """
         if dataset_name is None:
             mixture_cfg = self._config.get("mixture", {})
             informs = mixture_cfg.get("informs", [])
@@ -1608,7 +1706,35 @@ class eLargeModel:
         tokenizer: Any,
         dataset_name: Any | None = None,
     ) -> str:
-        """Resolve the pre-tokenized output path from a base path plus generated metadata."""
+        """Resolve the absolute output directory for pre-tokenized shards.
+
+        Combines an explicit *path_to_save*, ``mixture.save.output_path``, or
+        ``trainer.save_directory`` (in that priority order) with the
+        deterministic folder name produced by
+        :meth:`_build_pre_tokenize_folder_name`. When falling back to
+        ``trainer.save_directory``, a ``pretokenized/`` segment is inserted to
+        keep tokenized data separate from training checkpoints.
+
+        Args:
+            path_to_save: Optional explicit base directory provided by the
+                caller; takes precedence over both config-driven fallbacks.
+            trainer_cfg: Normalized trainer config consumed by the folder-name
+                builder.
+            arguments: TrainingArguments-like object consumed by the
+                folder-name builder for length metadata.
+            tokenizer: Active tokenizer; only its class name is used.
+            dataset_name: Optional explicit dataset label forwarded to the
+                folder-name builder.
+
+        Returns:
+            Absolute (or caller-relative) directory string ending with the
+            generated folder name.
+
+        Raises:
+            ValueError: If no explicit *path_to_save* is provided and neither
+                ``mixture.save.output_path`` nor ``trainer.save_directory`` is
+                configured.
+        """
         if path_to_save is not None:
             base_path = os.fspath(path_to_save)
             folder_name = self._build_pre_tokenize_folder_name(trainer_cfg, arguments, tokenizer, dataset_name)
