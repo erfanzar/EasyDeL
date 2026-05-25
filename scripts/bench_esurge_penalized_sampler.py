@@ -13,6 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Microbenchmark the eSurge penalized sampler legacy/optimized/compacted paths.
+
+Compares three sampling kernels on synthetic logits + token histories:
+
+* ``legacy_full_sampler`` — recomputes per-vocab token counts from the raw
+  ``token_history`` array every call (the original eSurge path).
+* ``optimized_full_sampler`` — reuses a precomputed ``token_counts`` matrix
+  (``[padded_reqs, vocab_size]``) and incrementally updates it after sampling.
+* ``compacted_full_sampler`` — like the optimized path but additionally
+  gather-compacts ``padded_reqs`` down to the active sub-batch before running
+  ``apply_history_penalties_from_counts`` / ``sample_tokens``, then scatters
+  results back out. Used by the runtime when most slots in the request pad are
+  inactive.
+
+All three are wrapped in ``jax.jit`` and warmed up before timing. Each path is
+exercised at two activity levels (1 active req out of ``padded_reqs``, and all
+``padded_reqs`` active) so the report shows both the compaction win and the
+steady-state cost. Results are printed as JSON to stdout including per-config
+mean/min/max latencies and a few speedup ratios.
+
+Usage:
+    python scripts/bench_esurge_penalized_sampler.py \\
+        --vocab-size 131072 --history-len 8192 --padded-reqs 128 --repeats 5
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -35,6 +60,14 @@ from easydel.inference.esurge.core.sampling_metadata import SamplingMetadata
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the sampler benchmark.
+
+    Returns:
+        argparse.Namespace: Parsed flags (``vocab_size``, ``history_len``,
+            ``padded_reqs``, ``repeats``, ``presence_penalty``,
+            ``frequency_penalty``, ``repetition_penalty``, ``temperature``,
+            ``top_p``, ``top_k``, ``min_p``, ``sampler_min_pad``, ``dtype``).
+    """
     parser = argparse.ArgumentParser(description="Benchmark legacy and optimized eSurge penalized sampler paths.")
     parser.add_argument("--vocab-size", type=int, default=131072)
     parser.add_argument("--history-len", type=int, default=8192)
@@ -53,6 +86,20 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _measure(fn, *args, repeats: int) -> dict[str, float | list[float]]:
+    """Time a callable ``repeats`` times and return latency statistics.
+
+    Blocks on the function output between iterations via ``jax.block_until_ready``
+    so the measured time reflects device-side execution, not just dispatch.
+
+    Args:
+        fn: Callable to benchmark. Typically a ``jax.jit``-compiled function.
+        *args: Positional arguments forwarded to ``fn`` on every invocation.
+        repeats: Number of timed iterations to collect.
+
+    Returns:
+        dict[str, float | list[float]]: Mapping with ``mean_ms``, ``min_ms``,
+            ``max_ms``, and the raw ``samples_ms`` list.
+    """
     samples_ms: list[float] = []
     for _ in range(repeats):
         start = time.perf_counter()
@@ -68,17 +115,63 @@ def _measure(fn, *args, repeats: int) -> dict[str, float | list[float]]:
 
 
 def _pad_reqs(num_reqs: int, upper_limit: int, min_input_pad: int) -> int:
+    """Round ``num_reqs`` up to a power-of-two pad bucket, clamped to ``upper_limit``.
+
+    Mirrors the bucket-padding policy used by the eSurge runner so the
+    benchmark can construct compacted shapes that line up with what would
+    actually be JIT-compiled at serving time.
+
+    Args:
+        num_reqs: Live request count to pad.
+        upper_limit: Maximum padded bucket size (typically ``padded_reqs``).
+        min_input_pad: Minimum bucket size; ``num_reqs <= min_input_pad`` snaps
+            straight to ``min_input_pad``.
+
+    Returns:
+        int: Padded bucket size in ``[min_input_pad, upper_limit]``.
+    """
     num_reqs = max(1, int(num_reqs))
     res = int(min_input_pad) if num_reqs <= int(min_input_pad) else 1 << (num_reqs - 1).bit_length()
     return min(int(upper_limit), res)
 
 
 def main() -> None:
+    """Run the eSurge penalized sampler benchmark and print results as JSON.
+
+    Builds synthetic logits, token-history matrices, and penalty vectors at the
+    configured ``vocab_size`` / ``history_len`` / ``padded_reqs``, then times
+    the legacy, optimized, and compacted sampler kernels for both the
+    one-active-slot and all-slots-active cases. The final JSON document
+    written to stdout contains the parsed config, per-case latency stats, and
+    a ``speedups`` block comparing the optimized/compacted paths against the
+    legacy baseline.
+
+    Args:
+        None. Reads CLI arguments via :func:`_parse_args`.
+
+    Returns:
+        None. The result document is printed to stdout.
+    """
     args = _parse_args()
     dtype = jnp.bfloat16 if args.dtype == "bf16" else jnp.float32
 
     @jax.jit
     def legacy_full_sampler(logits, token_history, seq_lens, active_mask, presence, frequency, repetition, rng):
+        """Legacy sampler: rebuild token counts from ``token_history`` per call.
+
+        Args:
+            logits: ``[padded_reqs, vocab_size]`` raw logits matrix.
+            token_history: ``[padded_reqs, history_len]`` token IDs seen so far.
+            seq_lens: Active history length per request (``[padded_reqs]``).
+            active_mask: Boolean mask of active request slots.
+            presence: Presence penalty per request.
+            frequency: Frequency penalty per request.
+            repetition: Repetition penalty per request.
+            rng: PRNG key for the sampling step.
+
+        Returns:
+            Sampled token IDs as a ``[padded_reqs]`` int array.
+        """
         adjusted = apply_history_penalties(
             logits,
             token_history=token_history,
@@ -105,6 +198,25 @@ def main() -> None:
     def optimized_full_sampler(
         logits, token_counts_full, row_indices, active_mask, presence, frequency, repetition, rng
     ):
+        """Optimized sampler: gather precomputed token counts and update in place.
+
+        Args:
+            logits: ``[padded_reqs, vocab_size]`` raw logits matrix.
+            token_counts_full: ``[padded_reqs, vocab_size]`` running token
+                frequency counters maintained across decode steps.
+            row_indices: Indices into ``token_counts_full`` selecting the row
+                that backs each request slot.
+            active_mask: Boolean mask of active request slots.
+            presence: Presence penalty per request.
+            frequency: Frequency penalty per request.
+            repetition: Repetition penalty per request.
+            rng: PRNG key for the sampling step.
+
+        Returns:
+            Tuple ``(sampled, updated_counts)`` where ``sampled`` is the
+            ``[padded_reqs]`` int array of sampled tokens and
+            ``updated_counts`` is the post-update token-count matrix.
+        """
         adjusted = apply_history_penalties_from_counts(
             logits,
             token_counts=token_counts_full[row_indices],
@@ -146,6 +258,34 @@ def main() -> None:
         repetition,
         rng,
     ):
+        """Compacted sampler: gather active slots, sample, then scatter back.
+
+        Mirrors the runtime fast path that pays attention only to the active
+        sub-batch and falls back to a full identity gather when the layouts
+        happen to match.
+
+        Args:
+            logits: ``[padded_reqs, vocab_size]`` raw logits matrix.
+            token_counts_full: ``[padded_reqs, vocab_size]`` running token
+                frequency counters.
+            gather_positions: Indices into the padded batch selecting the
+                active slots (``[sampler_padded_reqs]``).
+            sampling_seeds: Per-active-slot PRNG seeds used to derive sampler
+                keys.
+            scatter_positions: Output positions for writing sampled tokens
+                back into a ``padded_reqs + spill`` workspace.
+            active_mask: Active mask over the compacted layout.
+            presence: Presence penalty per active slot.
+            frequency: Frequency penalty per active slot.
+            repetition: Repetition penalty per active slot.
+            rng: PRNG key for the sampling step.
+
+        Returns:
+            Tuple ``(tokens, valid, updated_counts)`` where ``tokens`` is the
+            ``[padded_reqs]`` int array of scattered sampled tokens (``-1``
+            for inactive slots), ``valid`` is the matching boolean mask, and
+            ``updated_counts`` is the refreshed token-count matrix.
+        """
         sampler_padded_reqs = gather_positions.shape[0]
         if sampler_padded_reqs == args.padded_reqs:
             identity_layout = jnp.all(gather_positions == jnp.arange(sampler_padded_reqs, dtype=jnp.int32)) & jnp.all(
@@ -208,9 +348,11 @@ def main() -> None:
         if identity_layout is not None:
 
             def _identity_output(_):
+                """Return sampled tokens directly when gather/scatter are identity."""
                 return sampled, active_mask, updated_counts
 
             def _scatter_output(_):
+                """Scatter sampled tokens back into the full padded layout."""
                 full_tokens = jnp.full((args.padded_reqs + spill,), -1, dtype=jnp.int32)
                 full_valid = jnp.zeros((args.padded_reqs + spill,), dtype=jnp.bool_)
                 full_tokens_local = full_tokens.at[scatter_positions].set(jnp.where(active_mask, sampled, -1))

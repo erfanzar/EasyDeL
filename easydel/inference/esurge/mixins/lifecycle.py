@@ -226,6 +226,11 @@ class EngineLifecycleMixin:
         It keeps reasoning/tool/stop-string parsing from contending with the
         scheduler loop. Lightweight tests that do not define
         ``_parser_stop_queue`` fall back to the old inline behaviour.
+
+        Args:
+            stop_string_finishes: Mapping from request id to the matched
+                stop string; routed either onto ``_parser_stop_queue``
+                (when present) or applied inline under ``_scheduler_lock``.
         """
         if not stop_string_finishes:
             return

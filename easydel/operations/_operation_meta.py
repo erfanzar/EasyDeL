@@ -82,20 +82,29 @@ EMPTY = common_types.EMPTY
 
 
 class AttnShardingRules(NamedTuple):
-    """
-    Named tuple containing JAX PartitionSpecs for all attention tensors.
+    """Bundle of :class:`PartitionSpec` entries for every attention tensor.
+
+    Produced by :meth:`OperationMetadata.get_shardings` and consumed by the
+    attention kernels to ``shard_map`` / ``with_sharding_constraint`` the
+    intermediate tensors that flow through the operation.
 
     Attributes:
-        query3d: Sharding for a 3d query tensor which is [b, h, d].
-        query: Sharding for query tensor.
-        key: Sharding for key tensor.
-        value: Sharding for value tensor.
-        bias: Sharding for attention bias tensor.
-        mask: Sharding for attention mask tensor.
-        output: Sharding for attention output tensor.
-        q_segment_ids: Sharding for query segment IDs (for packed sequences).
-        kv_segment_ids: Sharding for key/value segment IDs (for packed sequences).
-        softmax_aux: Optional sharding for 2D softmax auxiliary outputs (e.g., LSE, max).
+        query3d (PartitionSpec): Sharding for the 3D query layout
+            ``(batch, head, head_dim)`` used by some decode kernels.
+        query (PartitionSpec): Sharding for the 4D query tensor.
+        key (PartitionSpec): Sharding for the 4D key tensor.
+        value (PartitionSpec): Sharding for the 4D value tensor.
+        bias (PartitionSpec): Sharding for an additive attention bias.
+        mask (PartitionSpec): Sharding for a boolean attention mask.
+        output (PartitionSpec): Sharding for the operation's output tensor;
+            mirrors ``query`` by construction.
+        q_segment_ids (PartitionSpec): Sharding for the query segment ids
+            used in packed-sequence training.
+        kv_segment_ids (PartitionSpec): Sharding for the key/value segment
+            ids used in packed-sequence training.
+        softmax_aux (PartitionSpec | None): Sharding for auxiliary softmax
+            outputs (e.g. log-sum-exp, row max). ``None`` when the kernel
+            does not expose them.
     """
 
     query3d: jax.sharding.PartitionSpec
@@ -112,34 +121,53 @@ class AttnShardingRules(NamedTuple):
 
 @auto_pytree
 class OperationMetadata:
-    """
-    Holds configuration, context, and metadata for attention operations.
+    """Runtime configuration shared across all attention operations.
 
-    This class centralizes various parameters needed by different attention
-    implementations, facilitating consistent behavior and configuration. It handles
-    default values and can be initialized from an `EasyDeLBaseConfig`.
+    Carries the dtype, mesh, sharding policy, backend/platform selection,
+    and per-operation ejkernel configs that every concrete
+    :class:`~easydel.operations.OperationImpl` consults at dispatch time.
+    Designed to be built once per model (commonly via :meth:`from_config`)
+    and then handed to every attention operator instance in that model so
+    they share identical runtime behaviour.
+
+    The ``@auto_pytree`` decoration makes instances usable directly inside
+    ``jax.jit`` / ``jax.vmap`` argument trees.
 
     Attributes:
-        runtime_dtype: The primary JAX dtype for computations (e.g., q, k, v).
-        runtime_softmax_dtype: Optional JAX dtype for the softmax computation,
-            allowing for higher precision if needed (e.g., float32).
-        sequence_axis_name: The name used for the sequence axis in JAX parallelism
-            (sharding_axis_names for pjit).
-        mesh: The JAX device mesh for distributed computation. Must be provided
-            or inferred from context.
-        platform: The target hardware platform (e.g., TPU, GPU).
-        backend: The specific JAX backend being used (e.g., TPU, CUDA, ROCM).
-        axis_policy: Semantic sharding configuration used for distributed settings.
-        base_config: An optional reference to the base model configuration object
-            for sourcing default values.
-        scan_ring_attention: Boolean flag indicating whether to use ring attention
-            via `jax.lax.scan`.
-        softmax_scale: The scaling factor applied before the softmax operation.
-            Often `1 / sqrt(head_dim)`.
-        dropout_prob: The dropout probability applied to attention weights.
-        blocksize_q: Block size for the query sequence dimension in blockwise attention.
-        blocksize_k: Block size for the key/value sequence dimension in blockwise attention.
-        blocksize_b: Block size for the batch dimension in blockwise attention (often 1).
+        runtime_dtype (jax.typing.DTypeLike): Primary compute dtype for the
+            attention QKV path. Defaults to ``float32`` when not pulled from
+            ``base_config.attn_dtype``.
+        runtime_softmax_dtype (jax.typing.DTypeLike | None): Dtype for the
+            softmax normalization, typically promoted (e.g. ``float32``) for
+            numerical stability.
+        sequence_axis_name (str): Mesh-axis name used to shard the sequence
+            dimension under pjit/shard_map; defaults to ``"sp"``.
+        platform (EasyDeLPlatforms): Target hardware platform tag, used by
+            kernel implementations to gate platform-specific code paths.
+        backend (EasyDeLBackends | None): Concrete JAX backend the operation
+            should dispatch into; consumed by
+            :meth:`BaseOperation.__call__`.
+        axis_policy (AxisPolicy | PartitionAxis): Semantic sharding policy
+            used to resolve tensor PartitionSpecs.
+        partition_axis (PartitionAxis): Per-axis partition specification,
+            kept in sync with ``axis_policy``.
+        runtime_sharding_resolver (RuntimeShardingResolver): Resolver that
+            translates semantic axis names into concrete PartitionSpecs;
+            built from ``axis_policy`` if not supplied.
+        base_config (EasyDeLBaseConfig | None): Optional reference to the
+            owning model config; lets ``mesh`` and other lookups follow the
+            config at runtime.
+        operation_configs (dict[str, BaseOperationConfig] | None): Optional
+            mapping from operation name to its ejkernel
+            :class:`BaseOperationConfig`. Consumed by
+            :meth:`get_operation_config`.
+        requires_cache (bool | None): Instance-level override for the
+            operation's KV-cache requirement. ``None`` defers to the
+            operation's class default; ``False`` disables caching (vision
+            encoders); ``True`` forces caching.
+        _stored_mesh (MeshLike | None): Fallback mesh used when
+            ``base_config`` is ``None``. Resolved through the :attr:`mesh`
+            property.
     """
 
     runtime_dtype: jax.typing.DTypeLike
@@ -165,14 +193,25 @@ class OperationMetadata:
     _stored_mesh: MeshLike | None = NOT_GIVEN
 
     def __post_init__(self) -> None:
-        """
-        Initializes default values and performs safety checks after dataclass creation.
+        """Fill in defaults, infer the mesh/backend, and run safety checks.
 
-        Sets reasonable defaults for various parameters if they are not provided
-        (or marked as Ellipsis). It attempts to source defaults from the `base_config`
-        if available. It also infers the JAX mesh and backend if not explicitly given.
-        Finally, it performs a safety check to ensure no essential attributes remain
-        uninitialized (as Ellipsis).
+        Walks every field that was left as ``NOT_GIVEN`` and resolves it
+        from either ``base_config`` (when available) or a hard-coded
+        default. Then:
+
+        * Coerces ``partition_axis`` from a dict if needed and rebuilds
+          ``axis_policy`` so the two stay in sync.
+        * Picks up the JAX mesh from ``spectrax.get_incontext_mesh`` or the
+          thread-local pxla resources when no ``base_config`` provides one.
+        * Constructs the :class:`RuntimeShardingResolver` from
+          ``axis_policy`` if the user did not supply one.
+        * Calls :meth:`_safety_check` to ensure no essential attribute is
+          still ``NOT_GIVEN``.
+        * Resolves ``backend`` to an :class:`EasyDeLBackends` enum value.
+
+        Raises:
+            ValueError: If no mesh can be resolved (no ``base_config``, no
+                in-context mesh, and no thread-local mesh).
         """
 
         from easydel.infra.etils import EasyDeLBackends
@@ -215,7 +254,13 @@ class OperationMetadata:
             self.backend = backend_enum
 
     def _safety_check(self) -> None:
-        """Ensures no essential attributes are left uninitialized (as NOT_GIVEN)."""
+        """Verify that every dataclass field has been resolved away from ``NOT_GIVEN``.
+
+        Raises:
+            ValueError: If any field still holds the sentinel
+                ``common_types.NOT_GIVEN``; the error message includes the
+                first offending field name.
+        """
         field: dataclasses.Field
         for field in dataclasses.fields(self):
             val: tp.Any = getattr(self, field.name)
@@ -287,27 +332,39 @@ class OperationMetadata:
         qkv_mni_sharding: bool = False,
         softmax_aux: jaxtyping.Array | None = None,
     ) -> AttnShardingRules:
-        """
-        Generates JAX PartitionSpecs for attention tensors based on runtime mode.
+        """Resolve PartitionSpecs for every attention tensor.
+
+        Uses ``self.runtime_sharding_resolver`` bound to ``self.mesh`` to
+        translate semantic axis names (``BATCH``, ``QUERY_LENGTH``, ...)
+        into concrete :class:`PartitionSpec` objects honouring the active
+        execution mode and tensor layout.
 
         Args:
-            mode: Runtime mode (e.g., training, inference) for partition resolution.
-            layout: Tensor layout format - "bthd" (batch, time, heads, dim) or
-                "bhtd" (batch, heads, time, dim).
-            qkv_mni_sharding: If True, use HEAD/HEAD_DIM for K/V instead of KV_HEAD/KV_HEAD_DIM.
-                Useful for multi-head attention (MHA) vs grouped-query attention (GQA/MQA).
-            softmax_aux: If provided, create sharding for softmax auxiliary outputs
-                (e.g., log-sum-exp, max values).
+            mode: Runtime mode (training, decode, etc.) used to pick the
+                mode-specific axis assignments inside the resolver.
+            layout: Tensor layout for Q/K/V:
+
+                * ``"bthd"`` — ``(batch, time, heads, dim)``.
+                * ``"bhtd"`` — ``(batch, heads, time, dim)``.
+
+                ``"thd"`` is reserved for future use.
+            qkv_mni_sharding: If True, use the ``HEAD``/``HEAD_DIM`` axes
+                for the K/V tensors instead of ``KV_HEAD``/``KV_HEAD_DIM``
+                — applicable for MHA where K and V share the query head
+                count rather than the smaller KV head count.
+            softmax_aux: Optional auxiliary softmax tensor (e.g. LSE or
+                row-max). When supplied, a sharding for it is added to the
+                returned rules (2D inputs get an ``[EMPTY, KV_HEAD]``
+                spec, higher rank inputs get an ``[HEAD]`` spec).
 
         Returns:
-            AttnShardingRules: Named tuple containing PartitionSpecs for all attention tensors:
-                - query, key, value: Main attention tensors
-                - bias: Attention bias tensor
-                - mask: Attention mask tensor
-                - output: Attention output tensor
-                - q_segment_ids: Query segment IDs (for packed sequences)
-                - kv_segment_ids: Key/value segment IDs (for packed sequences)
-                - softmax_aux: Optional 2D softmax auxiliary output sharding
+            AttnShardingRules: A populated NamedTuple of PartitionSpecs for
+            every attention tensor (queries, keys, values, bias, mask,
+            output, segment ids, optional softmax-aux).
+
+        Raises:
+            NotImplementedError: If ``layout`` is not one of the supported
+                values above.
         """
 
         resolver = self.runtime_sharding_resolver.with_mesh(self.mesh)
@@ -375,19 +432,22 @@ class OperationMetadata:
         pickup_name: str | None = None,
         use_base_config: bool = True,
     ) -> None:
-        """
-        Internal helper to set an attribute if it's not already set (or is Ellipsis).
+        """Resolve an attribute that may still hold the ``NOT_GIVEN`` sentinel.
 
-        Optionally retrieves the value from `self.base_config` using `pickup_name`
-        (or `attr_name` if `pickup_name` is None).
+        If ``self.<attr_name>`` is missing or equal to
+        :data:`common_types.NOT_GIVEN`, the value is filled in by reading
+        ``self.base_config.<pickup_name>`` (when ``use_base_config`` is
+        True and a config is attached) and finally falling back to
+        ``default``. Used pervasively from :meth:`__post_init__` to wire
+        defaults without overwriting user-supplied values.
 
         Args:
-            attr_name: The name of the attribute to set on `self`.
-            default: The default value to use if not found in `base_config` or
-                if `use_base_config` is False.
-            pickup_name: The name of the attribute to look for in `base_config`.
-                Defaults to `attr_name`.
-            use_base_config: Whether to attempt retrieving the value from `base_config`.
+            attr_name: Name of the attribute to set on ``self``.
+            default: Value used when no config-sourced value is available.
+            pickup_name: Attribute name to read from ``self.base_config``;
+                defaults to ``attr_name``.
+            use_base_config: When ``False``, skip the config lookup entirely
+                and use ``default``.
         """
         has_attr: bool = hasattr(self, attr_name)
         current_val: tp.Any = getattr(self, attr_name, NOT_GIVEN)

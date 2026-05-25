@@ -276,6 +276,16 @@ class EngineUtilsMixin:
 
         Some templates iterate on nested mapping fields (e.g. ``parameters.items()``).
         This helper hardens tool payloads by ensuring those fields are dictionaries.
+
+        Args:
+            tools: Raw tool definitions, either OpenAI-wrapped
+                (``{"type": "function", "function": {...}}``) or bare
+                function payloads. ``None`` and empty inputs pass through.
+
+        Returns:
+            Sanitized list of *unwrapped* function-payload dicts ready for
+            templates that iterate them directly, or ``None`` when there
+            is nothing usable to return.
         """
 
         if not tools:
@@ -341,6 +351,15 @@ class EngineUtilsMixin:
         function payload. This helper sanitizes the inner function schema using
         ``_normalize_chat_template_tools`` and wraps it back into the expected
         outer structure.
+
+        Args:
+            tools: Raw tool definitions as supplied by the caller.
+
+        Returns:
+            List of wrapped tool dicts of the form
+            ``{"type": "function", "function": {...}}`` ready for templates
+            that expect the OpenAI layout, or ``None`` when nothing usable
+            remained after sanitization.
         """
 
         normalized = EngineUtilsMixin._normalize_chat_template_tools(tools)
@@ -572,9 +591,17 @@ class EngineUtilsMixin:
                 default template. Should be a Jinja2 template string.
             tools: Optional list of tool/function definitions that the model can use.
                 Format depends on the specific model's tool calling conventions.
+            chat_template_kwargs: Optional extra keyword arguments forwarded
+                to ``tokenizer.apply_chat_template`` (e.g. template-specific
+                toggles like ``enable_thinking``).
 
         Returns:
             Formatted prompt string ready for tokenization and generation.
+
+        Raises:
+            Exception: Propagates :meth:`tokenizer.apply_chat_template`
+                failures that remain unrecoverable after the tool/messages
+                shape fallbacks have been exhausted.
 
         Example:
             >>> messages = [
@@ -761,6 +788,17 @@ class EngineUtilsMixin:
         Prefer exact prefix-diff semantics and avoid replaying stale fallback
         chunks when text has not advanced. If prefix alignment is lost, attempt
         suffix-prefix overlap recovery before falling back.
+
+        Args:
+            current_text: New accumulated text snapshot.
+            previous_text: Accumulated text snapshot recorded at the
+                previous yield.
+            fallback_delta: Delta to surface when prefix alignment cannot
+                be re-established between the two snapshots.
+
+        Returns:
+            Delta string safe to emit to the streaming consumer
+            (guaranteed monotonic with respect to ``previous_text``).
         """
         return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
@@ -992,9 +1030,21 @@ class EngineUtilsMixin:
         """Prepare sampling params with tool-token awareness.
 
         When no tools are active, tool-related special tokens are suppressed
-        via ``logit_bias`` and ``skip_special_tokens`` is enabled.  When tools
+        via ``logit_bias`` and ``skip_special_tokens`` is enabled. When tools
         are present, the protocol tokens are left untouched so the model can
         emit tool calls.
+
+        Args:
+            sampling_params: Caller-supplied sampling params; ``None``
+                produces a fresh :class:`SamplingParams` with engine defaults.
+            tools: Tool definitions for the current chat call; presence
+                gates whether tool-token suppression is applied.
+            tool_choice: Optional ``"auto"`` / ``"none"`` / ``"required"``
+                directive (reserved for downstream parsers).
+
+        Returns:
+            A fresh :class:`SamplingParams` clone configured for the
+            chat-with-tools (or chat-without-tools) regime.
         """
         if sampling_params is None:
             sampling_params = SamplingParams()

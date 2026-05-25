@@ -12,7 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mode-bound operation executor for dynamic discovery."""
+"""Mode-bound :class:`OperationExecutor` wrapper for prefill/decode dispatch.
+
+The executor bundles up to three :class:`BaseOperation` instances — a
+prefill implementation, a decode implementation, and a shared "mixin"
+implementation — and resolves which one services a given
+:class:`ExecutionMode` request. It centralises three concerns that
+otherwise pollute every caller of the attention layer:
+
+* **Mode dispatch.** :meth:`OperationExecutor.get_operation` returns the
+  right operation for ``PREFILL``, ``DECODE``, or ``MIXED`` with the
+  documented prefill→mixin and decode→prefill→mixin fallbacks.
+* **Requirement aggregation.** :meth:`OperationExecutor.get_requirements`
+  and :meth:`OperationExecutor.get_combined_requirements` apply
+  instance-level overrides (via
+  :meth:`OperationImpl.get_instance_requirements`) and combine prefill /
+  decode requirements (intersection of supported caches, union of
+  metadata fields).
+* **Discovery.** Constructed via either
+  :meth:`OperationExecutor.from_flexible_attention` or
+  :meth:`OperationExecutor.from_operations`, allowing
+  ``iter_module_search``-style traversals to find executors without
+  knowing the concrete attention module type.
+"""
 
 from __future__ import annotations
 
@@ -29,31 +51,37 @@ __all__ = ["OperationExecutor"]
 
 @dataclass
 class OperationExecutor:
-    """Mode-bound operation executor for dynamic discovery.
+    """Mode-bound bundle of attention operations with fallback resolution.
 
-    This class wraps prefill and decode operations, making it easy to:
-    1. Discover operations via iter_module_search
-    2. Get the right operation for a given execution mode
-    3. Combine requirements from both operations
+    Wraps up to three :class:`BaseOperation` instances and exposes a
+    uniform interface for selecting the right one for a given execution
+    mode and for combining their requirements.
 
-    Args:
-        prefill_impl: Operation for prefill mode (required if decode_impl is None)
-        decode_impl: Operation for decode mode (falls back to prefill_impl if None)
-        mixin_impl: Shared operation for both modes (used if prefill/decode are None)
+    Resolution rules:
 
-    Logic:
-        - If prefill_impl is set and decode_impl is None: decode uses prefill_impl
-        - If both prefill_impl and decode_impl are None but mixin_impl is set: both use mixin_impl
-        - prefill_impl and decode_impl take precedence over mixin_impl
+    * **Prefill.** :attr:`prefill_operation` returns ``prefill_impl`` if
+      set, otherwise ``mixin_impl``.
+    * **Decode.** :attr:`decode_operation` returns ``decode_impl`` if set;
+      otherwise ``prefill_impl``; otherwise ``mixin_impl``.
+    * **Mixed.** :meth:`get_operation` for ``ExecutionMode.MIXED``
+      delegates to :attr:`prefill_operation`.
+
+    Hence: explicit per-mode impls always take precedence over
+    ``mixin_impl``, and decode silently borrows the prefill operation when
+    no decode-specific one is registered.
 
     Example:
-        >>> # Create from FlexibleAttentionModule
         >>> executor = OperationExecutor.from_flexible_attention(flex_attn)
-        >>> # Get operation for specific mode
         >>> prefill_op = executor.get_operation(ExecutionMode.PREFILL)
         >>> decode_op = executor.get_operation(ExecutionMode.DECODE)
-        >>> # Get combined requirements
         >>> reqs = executor.get_combined_requirements()
+
+    Attributes:
+        prefill_impl (BaseOperation | None): Operation dedicated to prefill.
+        decode_impl (BaseOperation | None): Operation dedicated to decode;
+            falls back to ``prefill_impl`` when absent.
+        mixin_impl (BaseOperation | None): Shared operation used when no
+            per-mode impl is set.
     """
 
     prefill_impl: BaseOperation | None = None
@@ -88,13 +116,19 @@ class OperationExecutor:
         return self.mixin_impl
 
     def get_operation(self, mode: ExecutionMode) -> BaseOperation | None:
-        """Get operation for a specific execution mode.
+        """Return the operation that should service requests in ``mode``.
+
+        ``MIXED`` is treated as a request for the prefill operation, since
+        a prefill-capable operator can always also do a single decode step.
 
         Args:
-            mode: The execution mode (PREFILL, DECODE, or MIXED).
+            mode: Execution mode to resolve. One of ``ExecutionMode.PREFILL``,
+                ``ExecutionMode.DECODE``, or ``ExecutionMode.MIXED``.
 
         Returns:
-            The operation for that mode, or None if not available.
+            The resolved :class:`BaseOperation`, or ``None`` if no
+            operation has been registered for ``mode`` (after applying
+            the fallback rules described on the class).
         """
         if mode == ExecutionMode.PREFILL:
             return self.prefill_operation
@@ -104,16 +138,21 @@ class OperationExecutor:
             return self.prefill_operation  # Default to prefill for mixed
 
     def get_requirements(self, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
-        """Get requirements for the specified mode.
+        """Resolve the requirements declared by the operation for ``mode``.
 
-        Uses get_instance_requirements() to respect instance-level overrides
-        (e.g., requires_cache=False for vision encoders).
+        Prefers :meth:`OperationImpl.get_instance_requirements` so that
+        instance-level overrides (such as ``requires_cache=False`` on a
+        vision encoder) are honoured; falls back to the class-level
+        ``get_requirements`` when the operation does not implement the
+        instance variant.
 
         Args:
-            mode: The execution mode.
+            mode: Execution mode whose operation should be queried.
 
         Returns:
-            Requirements for the operation in that mode.
+            OperationRequirements describing what the resolved operation
+            needs. When no operation is registered for ``mode``,
+            :meth:`OperationRequirements.default` is returned.
         """
         op = self.get_operation(mode)
         if op is not None:
@@ -124,13 +163,21 @@ class OperationExecutor:
         return OperationRequirements.default()
 
     def get_combined_requirements(self) -> OperationRequirements:
-        """Get combined requirements from both prefill and decode operations.
+        """Merge prefill and decode requirements into a single declaration.
 
-        Uses get_instance_requirements() to respect instance-level overrides
-        (e.g., requires_cache=False for vision encoders).
+        Computes the intersection of supported cache types (the engine can
+        only pick a cache that both prefill and decode support) and the
+        union of required metadata fields (both stages must have what
+        they need). Instance-level overrides are honoured via
+        :meth:`OperationImpl.get_instance_requirements` when available.
 
         Returns:
-            Combined requirements (intersection of cache support, union of metadata).
+            OperationRequirements representing the merged needs.
+
+        Raises:
+            RuntimeError: Internal invariant violation when both per-stage
+                requirements end up ``None`` after the union step. This
+                indicates a logic error rather than user input.
         """
         prefill_reqs = None
         decode_reqs = None
@@ -199,13 +246,17 @@ class OperationExecutor:
         return self.prefill_impl is not None or self.decode_impl is not None or self.mixin_impl is not None
 
     def get_operation_name(self, mode: ExecutionMode = ExecutionMode.MIXED) -> str | None:
-        """Get the name of the operation for a specific mode.
+        """Return the registered name of the operation servicing ``mode``.
+
+        When an operation declares multiple aliases via
+        :meth:`BaseOperation.get_impl_name`, the first alias is returned.
 
         Args:
-            mode: The execution mode.
+            mode: Execution mode whose operation should be named.
 
         Returns:
-            The operation name, or None if no operation available.
+            The implementation name, or ``None`` if no operation is
+            registered for ``mode``.
         """
         op = self.get_operation(mode)
         if op is not None:
@@ -217,13 +268,20 @@ class OperationExecutor:
 
     @classmethod
     def from_flexible_attention(cls, flex_attn) -> OperationExecutor:
-        """Create from a FlexibleAttentionModule instance.
+        """Construct an executor from a ``FlexibleAttentionModule`` instance.
+
+        Reads ``flex_attn.impl`` as the prefill operation and
+        ``flex_attn.impl_decode`` as the decode operation; both default to
+        ``None`` so an executor can still be built from a partially
+        populated module.
 
         Args:
-            flex_attn: A FlexibleAttentionModule instance.
+            flex_attn: A ``FlexibleAttentionModule`` instance carrying
+                attention operation implementations on its ``impl`` /
+                ``impl_decode`` attributes.
 
         Returns:
-            An OperationExecutor wrapping the module's operations.
+            OperationExecutor wrapping the module's operations.
         """
         return cls(
             prefill_impl=getattr(flex_attn, "impl", None),
@@ -238,15 +296,18 @@ class OperationExecutor:
         decode: BaseOperation | None = None,
         mixin: BaseOperation | None = None,
     ) -> OperationExecutor:
-        """Create from individual operation instances.
+        """Construct an executor directly from operation instances.
 
         Args:
-            prefill: Operation for prefill mode.
-            decode: Operation for decode mode.
-            mixin: Shared operation for both modes.
+            prefill: Operation to use for prefill mode.
+            decode: Operation to use for decode mode (falls back to
+                ``prefill`` then ``mixin`` per the class-level resolution
+                rules).
+            mixin: Shared operation used for both modes when no per-mode
+                operation is supplied.
 
         Returns:
-            An OperationExecutor wrapping the operations.
+            OperationExecutor wrapping the supplied operations.
         """
         return cls(
             prefill_impl=prefill,

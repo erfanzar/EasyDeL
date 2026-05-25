@@ -60,6 +60,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 
+from easydel.infra.sharding import mesh_axis_size
+
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
@@ -69,6 +71,34 @@ from ..requirements import (
     RequirementsBuilder,
 )
 from ._gdn_policy import normalize_kernel_tile_policy
+from .fused_gdn_decode import fused_gdn_decode
+from .gdn_recurrent_scan_v2 import recurrent_scan
+
+
+def _reorder_concatenated_tensor_for_sharding(
+    concatenated_tensor: jax.Array,
+    split_sizes: tuple[int, ...],
+    n_shards: int,
+    dim: int,
+) -> jax.Array:
+    """Arrange fused [A|B|C] features as [A0|B0|C0|A1|B1|C1|...]."""
+    if dim < 0:
+        dim += concatenated_tensor.ndim
+    old_shape = concatenated_tensor.shape
+    new_shape = (*old_shape[:dim], int(n_shards), -1, *old_shape[dim + 1 :])
+    split_tensors = []
+    start_offset = 0
+    for split_size in split_sizes:
+        split_tensor = jax.lax.slice_in_dim(
+            concatenated_tensor,
+            start_offset,
+            start_offset + int(split_size),
+            axis=dim,
+        )
+        split_tensors.append(split_tensor.reshape(new_shape))
+        start_offset += int(split_size)
+    reordered_tensor = jnp.concatenate(split_tensors, axis=dim + 1)
+    return reordered_tensor.reshape(old_shape)
 
 
 def newton_schulz_inverse_ref(A, n=None):
@@ -834,7 +864,7 @@ def ragged_gated_delta_rule_mixed_prefill(
         valid_seq_mask[:, None, None, None],
         final_states.astype(recurrent_state.dtype),
         current_states,
-    )
+    ).astype(recurrent_state.dtype)
     updated_recurrent_state = recurrent_state.at[state_indices].set(states_to_set)
 
     return updated_recurrent_state, output
@@ -851,21 +881,39 @@ def _pallas_gdn_decode_kernel(
     out_ref,
     new_state_ref,
 ):
-    """Per-program: process `B_TOK` tokens (unrolled) with one slot's state each.
+    """Process ``B_TOK`` tokens (unrolled) with one slot's state each.
 
     Block layout (per program):
-        q, k:        (B_TOK, H, D_K)      bf16
-        v:           (B_TOK, H, D_V)      bf16
-        beta, exp_g: (B_TOK, H, 128)      bf16  (padded — lane-align)
-        state:       (B_TOK, H, D_K, D_V) bf16
-        valid:       (B_TOK, 1, 128)      int32 (padded)
+        q, k:        ``(B_TOK, H, D_K)``      bf16
+        v:           ``(B_TOK, H, D_V)``      bf16
+        beta, exp_g: ``(B_TOK, H, 128)``      bf16  (padded — lane-align)
+        state:       ``(B_TOK, H, D_K, D_V)`` bf16
+        valid:       ``(B_TOK, 1, 128)``      int32 (padded)
 
     Outputs:
-        out:         (B_TOK, H, D_V)       bf16
-        new_state:   (B_TOK, H, D_K, D_V)  bf16  (for invalid tokens: unchanged)
+        out:         ``(B_TOK, H, D_V)``      bf16
+        new_state:   ``(B_TOK, H, D_K, D_V)`` bf16  (unchanged for invalid tokens)
 
-    Assumes identity state mapping (token i → slot i) — which matches the
-    Qwen3-Next ragged decode path where ``state_indices = arange(num_slots)``.
+    Assumes identity state mapping (token ``i`` -> slot ``i``) — which matches
+    the Qwen3-Next ragged decode path where
+    ``state_indices = arange(num_slots)``.
+
+    Args:
+        q_ref: Pallas ref for queries, ``(B_TOK, H, D_K)`` bf16.
+        k_ref: Pallas ref for keys, ``(B_TOK, H, D_K)`` bf16.
+        v_ref: Pallas ref for values, ``(B_TOK, H, D_V)`` bf16.
+        beta_ref: Pallas ref for the gating coefficient broadcast to lane
+            width, ``(B_TOK, H, 128)``.
+        exp_g_ref: Pallas ref for the per-token decay (already
+            ``exp``-applied), ``(B_TOK, H, 128)``.
+        state_ref: Pallas ref for the per-slot recurrent state,
+            ``(B_TOK, H, D_K, D_V)``.
+        valid_ref: Pallas ref for the validity mask broadcast to lane width,
+            ``(B_TOK, 1, 128)`` int32.
+        out_ref: Pallas ref to write the per-token output,
+            ``(B_TOK, H, D_V)``.
+        new_state_ref: Pallas ref to write the updated state,
+            ``(B_TOK, H, D_K, D_V)``.
     """
     B = q_ref.shape[0]
     for b_idx in range(B):
@@ -913,9 +961,9 @@ def set_gdn_kernel_tile_policy(policy: str) -> None:
     variable.
 
     Args:
-        policy: One of ``"auto"``, ``"b16"``, ``"b8"`` or ``"b4"`` (case
-            insensitive). ``"auto"`` lets the kernel pick a tile size based
-            on VMEM-window heuristics.
+        policy: One of ``"auto"``, ``"b16"``, ``"b8"``, ``"b4"``,
+            ``"b2"`` or ``"b1"`` (case insensitive). ``"auto"`` lets the
+            kernel pick a tile size based on VMEM-window heuristics.
 
     Raises:
         ValueError: If ``policy`` is not one of the supported variants.
@@ -1150,6 +1198,27 @@ def ragged_gated_delta_rule_decode_only(
     g = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
     )
+
+    use_vllm_fused_decode = os.environ.get("EASYDEL_FUSED_GDN_DECODE", "0").lower() in {"1", "true", "yes"}
+    if use_vllm_fused_decode and jax.default_backend() == "tpu" and d_k == 128 and d_v == 128 and num_tokens <= max_reqs:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        g_tiled = jnp.broadcast_to(g[..., None], (num_tokens, n_v, d_k)).astype(jnp.float32)
+        b_tiled = jnp.broadcast_to(b_reshaped[..., None], (num_tokens, n_v, num_lanes)).astype(query.dtype)
+        fused_distribution = jnp.stack([distribution[2], distribution[2]]).astype(jnp.int32)
+        outputs_3d, updated_pool = fused_gdn_decode(
+            q=query,
+            k=key,
+            v=value,
+            g=g_tiled,
+            b=b_tiled,
+            state=recurrent_state,
+            state_indices=state_indices.astype(jnp.int32),
+            distribution=fused_distribution,
+        )
+        outputs = outputs_3d.reshape(num_tokens, -1)
+        outputs = jnp.where(valid_mask[:, None], outputs, 0.0)
+        return updated_pool.astype(recurrent_state.dtype), outputs
+
     exp_g = jnp.exp(g).astype(query.dtype)
 
     # Fast path: identity state map (token i → slot i) + shape-compatible.
@@ -1181,7 +1250,7 @@ def ragged_gated_delta_rule_decode_only(
         if num_tokens == max_reqs:
             updated_pool = new_state_prefix.astype(recurrent_state.dtype)
         else:
-            updated_pool = recurrent_state.at[:num_tokens].set(new_state_prefix)
+            updated_pool = recurrent_state.at[:num_tokens].set(new_state_prefix.astype(recurrent_state.dtype))
         return updated_pool.astype(recurrent_state.dtype), outputs
 
     # Generic fallback (non-identity state map, smaller D_K/D_V, or non-TPU):
@@ -1206,7 +1275,7 @@ def ragged_gated_delta_rule_decode_only(
 
     outputs = jnp.where(valid_mask[:, None, None], outputs, 0.0)
     outputs = outputs.reshape(num_tokens, -1)
-    states_to_set = jnp.where(valid_mask[:, None, None, None], new_states, state_f)
+    states_to_set = jnp.where(valid_mask[:, None, None, None], new_states, state_f).astype(recurrent_state.dtype)
     updated_recurrent_state = recurrent_state.at[req_state_indices].set(states_to_set)
 
     return updated_recurrent_state.astype(recurrent_state.dtype), outputs
@@ -1221,6 +1290,8 @@ def ragged_gated_delta_rule_decode_only(
         "d_v",
         "chunk_size",
         "use_qk_norm_in_gdn",
+        "apply_silu_in_gdr",
+        "use_recurrent_scan_prefill",
     ),
 )
 @jax.named_scope("ragged_gated_delta_rule_chunked")
@@ -1234,6 +1305,7 @@ def ragged_gated_delta_rule(
     query_start_loc: jnp.ndarray,
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
+    has_initial_state: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -1241,6 +1313,8 @@ def ragged_gated_delta_rule(
     d_v: int,
     chunk_size: int = 64,
     use_qk_norm_in_gdn: bool = True,
+    apply_silu_in_gdr: bool = False,
+    use_recurrent_scan_prefill: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies the gated delta rule over ragged seq lengths
 
@@ -1279,11 +1353,15 @@ def ragged_gated_delta_rule(
         ``(num_blocks, n_v, d_k, d_v)`` and output of shape
         ``(num_tokens, n_v * d_v)`` cast to ``mixed_qkv.dtype``.
     """
+    if has_initial_state is None:
+        has_initial_state = jnp.ones(state_indices.shape[0], dtype=jnp.bool_)
+
     num_tokens = mixed_qkv.shape[0]
+    mixed_qkv_post_silu = jax.nn.silu(mixed_qkv) if apply_silu_in_gdr else mixed_qkv
     key_dim = n_kq * d_k
-    query = mixed_qkv[..., :key_dim]
-    key = mixed_qkv[..., key_dim : key_dim * 2]
-    value = mixed_qkv[..., key_dim * 2 :]
+    query = mixed_qkv_post_silu[..., :key_dim]
+    key = mixed_qkv_post_silu[..., key_dim : key_dim * 2]
+    value = mixed_qkv_post_silu[..., key_dim * 2 :]
 
     q_reshaped = query.reshape(num_tokens, n_kq, d_k)
     k_reshaped = key.reshape(num_tokens, n_kq, d_k)
@@ -1340,21 +1418,64 @@ def ragged_gated_delta_rule(
             tuple: ``(updated_recurrent_state, output)`` produced by
             :func:`ragged_gated_delta_rule_mixed_prefill`.
         """
-        return ragged_gated_delta_rule_mixed_prefill(
-            query=q_reshaped,
-            key=k_reshaped,
-            value=v_reshaped,
-            b_reshaped=b_reshaped,
-            a_reshaped=a_reshaped,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            query_start_loc=query_start_loc,
-            recurrent_state=recurrent_state,
-            state_indices=state_indices,
-            distribution=distribution,
-            chunk_size=chunk_size,
-            use_qk_norm_in_gdn=use_qk_norm_in_gdn,
-        )
+        if use_recurrent_scan_prefill and jax.default_backend() == "tpu":
+
+            def recurrent_prefill_only(_):
+                return recurrent_scan(
+                    mixed_qkv=mixed_qkv,
+                    b=b,
+                    a=a,
+                    recurrent_state=recurrent_state,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    query_start_loc=query_start_loc,
+                    state_indices=state_indices,
+                    distribution=distribution,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    chunk_size=chunk_size,
+                    BT=chunk_size,
+                    use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                    has_initial_state=has_initial_state,
+                    prefill_only=True,
+                )
+
+            def jax_mixed_prefill(_):
+                return ragged_gated_delta_rule_mixed_prefill(
+                    query=q_reshaped,
+                    key=k_reshaped,
+                    value=v_reshaped,
+                    b_reshaped=b_reshaped,
+                    a_reshaped=a_reshaped,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    query_start_loc=query_start_loc,
+                    recurrent_state=recurrent_state,
+                    state_indices=state_indices,
+                    distribution=distribution,
+                    chunk_size=chunk_size,
+                    use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                )
+
+            return jax.lax.cond(distribution[0] == 0, recurrent_prefill_only, jax_mixed_prefill, operand=None)
+        else:
+            return ragged_gated_delta_rule_mixed_prefill(
+                query=q_reshaped,
+                key=k_reshaped,
+                value=v_reshaped,
+                b_reshaped=b_reshaped,
+                a_reshaped=a_reshaped,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=query_start_loc,
+                recurrent_state=recurrent_state,
+                state_indices=state_indices,
+                distribution=distribution,
+                chunk_size=chunk_size,
+                use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            )
 
     is_decode_only = distribution[0] == distribution[2]
 
@@ -1419,6 +1540,7 @@ class RaggedGatedDeltaRule(OperationImpl):
         query_start_loc: jnp.ndarray,
         state_indices: jnp.ndarray,
         distribution: jnp.ndarray,
+        has_initial_state: jnp.ndarray | None = None,
         *,
         n_kq: int,
         n_v: int,
@@ -1426,6 +1548,10 @@ class RaggedGatedDeltaRule(OperationImpl):
         d_v: int,
         chunk_size: int = 64,
         use_qk_norm_in_gdn: bool = True,
+        pre_sharded_mixed_qkv: bool = False,
+        flat_tp_shard: bool = False,
+        apply_silu_in_gdr: bool = False,
+        use_recurrent_scan_prefill: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Run :func:`ragged_gated_delta_rule` under a head-parallel ``shard_map``.
 
@@ -1472,21 +1598,115 @@ class RaggedGatedDeltaRule(OperationImpl):
         recurrent_state = recurrent_state.astype(runtime_dtype)
         A_log = A_log.astype(runtime_dtype)
         dt_bias = dt_bias.astype(runtime_dtype)
+        if has_initial_state is None:
+            has_initial_state = jnp.ones(state_indices.shape[0], dtype=jnp.bool_)
 
         mode = self.get_mode(query=jnp.expand_dims(mixed_qkv, 0), BTHD=False)
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
         head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
 
-        token_head_spec = PartitionSpec(None, head_axis, None)
+        mesh = self.metadata.mesh
+        tp_size = mesh_axis_size(mesh, head_axis)
+        num_tokens = mixed_qkv.shape[0]
+        key_dim = n_kq * d_k
+        value_dim = n_v * d_v
+        can_flat_shard = (
+            mesh is not None
+            and head_axis is not None
+            and int(tp_size) > 1
+            and n_kq % int(tp_size) == 0
+            and n_v % int(tp_size) == 0
+            and key_dim % int(tp_size) == 0
+            and value_dim % int(tp_size) == 0
+        )
+
         beta_spec = PartitionSpec(None, head_axis)
         state_spec = PartitionSpec(None, head_axis, None, None)
         head_param_spec = PartitionSpec(head_axis)
         Ps = PartitionSpec
 
+        if flat_tp_shard and can_flat_shard:
+            if not pre_sharded_mixed_qkv:
+                mixed_qkv = _reorder_concatenated_tensor_for_sharding(
+                    mixed_qkv,
+                    (key_dim, key_dim, value_dim),
+                    int(tp_size),
+                    -1,
+                )
+
+            mixed_spec = PartitionSpec(None, head_axis)
+            local_n_kq_static = n_kq // int(tp_size)
+            local_n_v_static = n_v // int(tp_size)
+
+            @partial(
+                jax.shard_map,
+                mesh=mesh,
+                in_specs=(
+                    mixed_spec,  # local [q | k | v] feature shard
+                    beta_spec,  # b
+                    beta_spec,  # a
+                    state_spec,  # recurrent_state
+                    head_param_spec,  # A_log
+                    head_param_spec,  # dt_bias
+                    Ps(),  # query_start_loc
+                    Ps(),  # state_indices
+                    Ps(),  # distribution
+                    Ps(),  # has_initial_state
+                ),
+                out_specs=(state_spec, mixed_spec),
+                check_vma=False,
+            )
+            def _mapped_flat(
+                local_mixed,
+                local_b,
+                local_a,
+                local_state,
+                local_A_log,
+                local_dt_bias,
+                local_qsl,
+                local_si,
+                local_dist,
+                local_has_initial_state,
+            ):
+                new_state, output = ragged_gated_delta_rule(
+                    mixed_qkv=local_mixed,
+                    b=local_b,
+                    a=local_a,
+                    recurrent_state=local_state,
+                    A_log=local_A_log,
+                    dt_bias=local_dt_bias,
+                    query_start_loc=local_qsl,
+                    state_indices=local_si,
+                    distribution=local_dist,
+                    has_initial_state=local_has_initial_state,
+                    n_kq=local_n_kq_static,
+                    n_v=local_n_v_static,
+                    d_k=d_k,
+                    d_v=d_v,
+                    chunk_size=chunk_size,
+                    use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                    apply_silu_in_gdr=apply_silu_in_gdr,
+                    use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+                )
+                return new_state, output
+
+            return _mapped_flat(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                A_log,
+                dt_bias,
+                query_start_loc,
+                state_indices,
+                distribution,
+                has_initial_state,
+            )
+
+        token_head_spec = PartitionSpec(None, head_axis, None)
+
         # Split flat mixed_qkv into separate Q/K/V head tensors so we can
         # shard on the head axis via shard_map.
-        num_tokens = mixed_qkv.shape[0]
-        key_dim = n_kq * d_k
         q = mixed_qkv[..., :key_dim].reshape(num_tokens, n_kq, d_k)
         k = mixed_qkv[..., key_dim : key_dim * 2].reshape(num_tokens, n_kq, d_k)
         v = mixed_qkv[..., key_dim * 2 :].reshape(num_tokens, n_v, d_v)
@@ -1511,6 +1731,7 @@ class RaggedGatedDeltaRule(OperationImpl):
                 Ps(),  # query_start_loc
                 Ps(),  # state_indices
                 Ps(),  # distribution
+                Ps(),  # has_initial_state
             ),
             out_specs=(state_spec, token_head_spec),
             check_vma=False,
@@ -1527,6 +1748,7 @@ class RaggedGatedDeltaRule(OperationImpl):
             local_qsl,
             local_si,
             local_dist,
+            local_has_initial_state,
         ):
             """Per-shard ragged GDR body executed under :func:`jax.shard_map`.
 
@@ -1577,12 +1799,15 @@ class RaggedGatedDeltaRule(OperationImpl):
                 query_start_loc=local_qsl,
                 state_indices=local_si,
                 distribution=local_dist,
+                has_initial_state=local_has_initial_state,
                 n_kq=local_n_kq,
                 n_v=local_n_v,
                 d_k=local_d_k,
                 d_v=local_d_v,
                 chunk_size=chunk_size,
                 use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                apply_silu_in_gdr=apply_silu_in_gdr,
+                use_recurrent_scan_prefill=use_recurrent_scan_prefill,
             )
             # ragged_gated_delta_rule returns output as 2D [tokens, n_v*d_v];
             # reshape to 3D [tokens, n_v, d_v] so it matches out_specs[1]'s rank.
@@ -1601,6 +1826,7 @@ class RaggedGatedDeltaRule(OperationImpl):
             query_start_loc,
             state_indices,
             distribution,
+            has_initial_state,
         )
         # Restore the flat [tokens, n_v*d_v] layout expected by callers.
         output = output.reshape(output.shape[0], -1)

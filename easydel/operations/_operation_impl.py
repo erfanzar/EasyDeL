@@ -101,37 +101,53 @@ class OperationOutput:
 
 
 class OperationImpl(BaseOperation):
-    """
-    Abstract Base Class for specific attention implementations.
+    """Attention-flavoured :class:`BaseOperation` with shared kernel helpers.
 
-    Inherits from `BaseOperation` to leverage backend-specific dispatching.
-    Subclasses must implement the core attention logic (`forward_native`) and
-    potentially provide optimized versions for TPU (`forward_tpu`), GPU (`forward_gpu`),
-    etc. They also need to declare their name and associated metadata.
+    Concrete attention operators in :mod:`easydel.operations.kernels`
+    subclass this rather than :class:`BaseOperation` directly to inherit:
 
-    Provides common helper methods for attention processing like mask manipulation,
-    head repeating (for GQA/MQA), and determining runtime mode.
+    * Backend-aware dispatch via :class:`BaseOperation.__call__`.
+    * The mask/segment/head-repeat utilities defined below
+      (:meth:`_split_attention_mask`, :meth:`_combine_query_kv_masks`,
+      :meth:`_create_causal_mask`, :meth:`repeat_kv_heads`,
+      :meth:`_handle_kvhead`).
+    * Mode discrimination via :meth:`get_mode` (decode vs train) and
+      sharding-spec construction via :meth:`create_stable_sharding`.
+
+    Subclass contract:
+
+    * MUST implement :meth:`forward_native` (inherited from
+      :class:`BaseOperation`) and :meth:`BaseOperation.get_impl_name`.
+    * MAY override :meth:`get_requirements` to declare per-operator
+      metadata / cache requirements.
+    * MAY override :meth:`forward_tpu`, :meth:`forward_gpu`, etc. for
+      hardware-specialised paths.
+
+    Attributes:
+        metadata (OperationMetadata): Runtime configuration assigned in
+            :meth:`__init__`; never ``None`` after construction.
     """
 
     def __init__(self, metadata: OperationMetadata) -> None:
-        """
-        Initializes the attention implementation with its metadata.
+        """Initialize the operator with its runtime metadata.
 
         Args:
-            metadata: An `OperationMetadata` instance containing configuration
-                and context for this attention operation.
+            metadata: Runtime configuration carrying dtype, mesh, sharding
+                policy, backend selection, and optional per-operation
+                ejkernel configs.
         """
         self.metadata = metadata
 
     def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
+        """Return the :class:`OperationMetadata` carried by this instance.
 
         Returns:
-            The `OperationMetadata` provided during initialization.
+            The metadata supplied to :meth:`__init__`.
 
         Raises:
-            RuntimeError: If metadata has not been set.
+            RuntimeError: If ``self.metadata`` is ``None`` — this indicates
+                the instance was constructed through a non-standard path
+                that bypassed :meth:`__init__`.
         """
         if self.metadata is None:
             raise RuntimeError("metadata must be set before calling this method")
@@ -141,21 +157,22 @@ class OperationImpl(BaseOperation):
         self,
         mode: ExecutionMode = ExecutionMode.MIXED,
     ) -> OperationRequirements:
-        """
-        Returns the operation requirements, applying instance-level overrides.
+        """Return :meth:`get_requirements` with instance overrides applied.
 
-        This method wraps the class-level `get_requirements()` and applies
-        any instance-level overrides from metadata (e.g., `requires_cache`).
-
-        This is the preferred method to call when you need requirements that
-        respect instance configuration, such as when determining cache needs
-        for vision encoders that don't need KV cache.
+        Wraps the class-level :meth:`BaseOperation.get_requirements` and
+        layers on the instance-specific ``requires_cache`` override taken
+        from :attr:`OperationMetadata.requires_cache`. Prefer this method
+        whenever you need the requirements that will actually be honoured
+        for a given instance — for example, when a vision-encoder
+        operation has been constructed with ``requires_cache=False``.
 
         Args:
-            mode: The execution mode (prefill, decode, or mixed).
+            mode: Execution mode (``PREFILL``, ``DECODE``, or ``MIXED``)
+                forwarded to :meth:`get_requirements`.
 
         Returns:
-            OperationRequirements with instance-level overrides applied.
+            OperationRequirements that reflect both the class-level
+            declaration and any instance-level overrides.
 
         Example:
             >>> op = GatedDeltaRuleOp(metadata)
@@ -174,21 +191,21 @@ class OperationImpl(BaseOperation):
         return reqs
 
     def get_mode(self, query: Float[Array, "batch ... num_heads head_dim"], BTHD: bool = True) -> RUNTIME_MODE_TYPES:  # type:ignore
-        """
-        Determines the runtime mode (normal or generation) based on query shape.
+        """Infer the runtime mode (train vs single-step decode) from query shape.
 
-        Assumes generation mode if the query sequence length dimension is 1.
+        Treats a query sequence length of 1 as single-step generation; any
+        other length is treated as training / prefill.
 
         Args:
-            query: The query tensor with either ``(B, T, H, D)`` or
-                ``(B, H, T, D)`` layout depending on ``BTHD``.
-            BTHD: If True, treat the second dimension as sequence length
-                (``B, T, H, D`` layout). If False, treat the third dimension as
-                sequence length (``B, H, T, D`` layout). Defaults to True.
+            query: Query tensor in either ``(B, T, H, D)`` or ``(B, H, T, D)``
+                layout depending on ``BTHD``.
+            BTHD: If True, the sequence length is read from axis 1
+                (``B, T, H, D`` layout). If False, it is read from axis 2
+                (``B, H, T, D`` layout). Defaults to True.
 
         Returns:
-            ``common_types.MODE_DECODE`` when the query length is 1 (single-step
-            generation) and ``common_types.MODE_TRAIN`` otherwise.
+            ``common_types.MODE_DECODE`` when the query length is 1, else
+            ``common_types.MODE_TRAIN``.
         """
         in_generation = query.shape[1] == 1 if BTHD else query.shape[2] == 1
         return common_types.MODE_DECODE if in_generation else common_types.MODE_TRAIN
@@ -197,22 +214,25 @@ class OperationImpl(BaseOperation):
     def _split_attention_mask(
         attn_mask: Bool[Array, "... seq_len seq_len"],
     ) -> tuple[Bool[Array, "... seq_len"], Bool[Array, "... seq_len"]]:
-        """
-        Splits a combined attention mask into separate query and key-value masks.
+        """Split a 2D attention mask into separate query and key-value masks.
 
-        Assumes the input mask `attn_mask` might be 4D (batch, head, q_seq, kv_seq)
-        or 3D (batch, q_seq, kv_seq). It derives the query mask by checking which
-        query positions can attend to *any* key position, and the key-value mask
-        by checking which key positions *can be attended to* by any query position.
+        For 4D inputs ``(batch, head, q_seq, kv_seq)`` only the last head
+        slice is used; 3D inputs ``(batch, q_seq, kv_seq)`` are consumed
+        directly. The query mask marks positions that can attend to *any*
+        key, and the kv mask marks positions that can be attended to by
+        *any* query.
 
         Args:
-            attn_mask: The combined attention mask (3D or 4D). If 4D, the last head dim
-                is used. Shape (..., q_seq, kv_seq).
+            attn_mask: Combined attention mask, shape ``(..., q_seq, kv_seq)``,
+                either 3D or 4D.
 
         Returns:
-            A tuple `(q_mask, kv_mask)`:
-                - `q_mask`: Boolean array of shape (..., q_seq). True for valid query tokens.
-                - `kv_mask`: Boolean array of shape (..., kv_seq). True for valid key/value tokens.
+            A tuple ``(q_mask, kv_mask)``:
+
+            * ``q_mask`` — bool array ``(..., q_seq)``, ``True`` for valid
+              query tokens.
+            * ``kv_mask`` — bool array ``(..., kv_seq)``, ``True`` for valid
+              key/value tokens.
         """
         if attn_mask.ndim == 4:
             attn_mask = attn_mask[:, -1, :, :]
@@ -222,18 +242,21 @@ class OperationImpl(BaseOperation):
     def _combine_query_kv_masks(
         q_mask: Bool[Array, "... q_seq"], kv_mask: Bool[Array, "... kv_seq"]
     ) -> Bool[Array, "... q_seq kv_seq"]:
-        """
-        Combines separate query and key-value masks into a standard attention mask.
+        """Combine separate query and key-value masks into a 2D attention mask.
 
-        Creates a broadcastable mask where `mask[b, i, j]` is True if both
-        `q_mask[b, i]` and `kv_mask[b, j]` are True.
+        Produces the outer-product-style mask where
+        ``mask[b, i, j] == q_mask[b, i] & kv_mask[b, j]``. Adds the missing
+        singleton axis on either input as needed before the product, so
+        callers can pass purely 2D ``q_mask``/``kv_mask`` without manual
+        broadcasting.
 
         Args:
-            q_mask: Boolean array of shape (..., q_seq). True for valid query tokens.
-            kv_mask: Boolean array of shape (..., kv_seq). True for valid key/value tokens.
+            q_mask: Bool array ``(..., q_seq)``. ``True`` for valid queries.
+            kv_mask: Bool array ``(..., kv_seq)``. ``True`` for valid
+                key/value tokens.
 
         Returns:
-            A boolean attention mask of shape (..., q_seq, kv_seq).
+            Bool attention mask of shape ``(..., q_seq, kv_seq)``.
         """
         if kv_mask.ndim == 2:
             kv_mask = kv_mask[:, None, :]
@@ -243,15 +266,15 @@ class OperationImpl(BaseOperation):
 
     @staticmethod
     def _create_causal_mask(qseq: int) -> Bool[Array, "seq_len seq_len"]:
-        """
-        Creates a causal attention mask (lower triangular).
+        """Build a square causal (lower-triangular) attention mask.
 
         Args:
-            qseq: The sequence length .
+            qseq: Sequence length on both axes.
 
         Returns:
-            A boolean array of shape (qseq, qseq) where `mask[i, j]` is
-            True if `j <= i`, representing causal visibility.
+            Bool array of shape ``(qseq, qseq)`` where ``mask[i, j]`` is
+            ``True`` iff ``j <= i`` — that is, position ``i`` can attend
+            to all positions up to and including itself.
         """
         return jnp.tril(jnp.ones((qseq, qseq), dtype="b1"))
 
@@ -261,19 +284,20 @@ class OperationImpl(BaseOperation):
         v: Float[Array, "batch seq_len num_kv_heads head_dim"],
         num_reps: int,
     ) -> tuple[Float[Array, "batch seq_len num_q_heads head_dim"], Float[Array, "batch seq_len num_q_heads head_dim"]]:
-        """
-        Repeats Key and Value heads for Grouped Query Operation (GQA) or Multi-Query Operation (MQA).
+        """Repeat K/V heads to match the query head count (GQA / MQA).
 
-        Expands the head dimension of K and V tensors to match the number of query heads.
+        Each KV head is duplicated ``num_reps`` times along the head axis so
+        the result has ``num_kv_heads * num_reps == num_q_heads`` heads.
 
         Args:
-            k: Key tensor, assumes shape (batch, seq_len, num_kv_heads, head_dim).
-            v: Value tensor, assumes shape (batch, seq_len, num_kv_heads, head_dim).
-            num_reps: The number of times to repeat each KV head (num_q_heads // num_kv_heads).
+            k: Key tensor of shape ``(batch, seq_len, num_kv_heads, head_dim)``.
+            v: Value tensor of shape ``(batch, seq_len, num_kv_heads, head_dim)``.
+            num_reps: Repetition factor, typically
+                ``num_q_heads // num_kv_heads``.
 
         Returns:
-            A tuple `(k_repeated, v_repeated)` with shapes
-            (batch, seq_len, num_q_heads, head_dim).
+            Tuple ``(k_repeated, v_repeated)`` both of shape
+            ``(batch, seq_len, num_q_heads, head_dim)``.
         """
         return (
             einops.repeat(k, "b s h d -> b s (h r) d", r=num_reps),
@@ -286,26 +310,32 @@ class OperationImpl(BaseOperation):
         num_q_heads: int,
         num_kv_heads: int,
     ) -> Float[Array, "batch num_q_heads q_seq kv_seq"] | None:
-        """
-        Processes an attention bias or similar array based on head configuration (GQA/MQA).
+        """Normalise an attention-bias-shaped array to ``num_q_heads`` heads.
 
-        If the array's head dimension matches `num_kv_heads`, it repeats the heads
-        to match `num_q_heads`. If it matches `num_q_heads` or is 1 (broadcastable),
-        it's returned as is.
+        Used by attention kernels to align an externally-supplied bias /
+        mask tensor with the query head count under GQA / MQA. The head
+        dimension is assumed to live at axis 1.
+
+        * If the head dimension already equals ``num_q_heads`` or is 1
+          (broadcastable), the input is returned unchanged.
+        * If it equals ``num_kv_heads``, each head is repeated
+          ``num_q_heads // num_kv_heads`` times.
+        * Otherwise a :class:`ValueError` is raised.
 
         Args:
-            array: The input array, typically an attention bias. Assumes head dimension
-                is at index 1. Shape (batch, num_heads, q_seq, kv_seq) or similar.
-                Can be None.
-            num_q_heads: The number of query heads.
-            num_kv_heads: The number of key/value heads.
+            array: Attention bias / mask of shape
+                ``(batch, num_heads, q_seq, kv_seq)``, or ``None``.
+            num_q_heads: Target number of query heads.
+            num_kv_heads: Number of key/value heads (used as the fallback
+                head count to expand from).
 
         Returns:
-            The processed array with head dimension matching `num_q_heads`, or None
-            if the input was None.
+            Array with head dimension equal to ``num_q_heads``, or ``None``
+            if the input was ``None``.
 
         Raises:
-            ValueError: If the array's head dimension is incompatible.
+            ValueError: If the array's head dimension is not ``num_q_heads``,
+                ``num_kv_heads``, or ``1``.
         """
         if array is None:
             return None
@@ -339,26 +369,32 @@ class OperationImpl(BaseOperation):
         dep: Ps | bool | None = True,
         tensor: Float[Array, "..."] | None = None,
     ) -> Ps | None:
-        """
-        Helper to create a PartitionSpec, potentially preserving only certain axes.
+        """Construct an axis-selective :class:`PartitionSpec` for an intermediate.
 
-        This might be used for ensuring intermediate tensors or states have compatible
-        sharding, possibly replicating across axes not specified in `preserved_indices`.
+        Used by attention kernels to derive a PartitionSpec for an internal
+        buffer that only preserves a subset of the input's axes (the rest
+        are replicated). Optionally corrects the resulting spec against a
+        concrete tensor shape via
+        :func:`spectrax.get_corrected_named_sharding`.
 
         Args:
-            state_ps: The base PartitionSpec to modify.
-            preserved_indices: A list of dimension indices whose partitioning should be
-                kept from `state_ps` (or `clone_ps` if provided). Other dimensions
-                will be set to None (replicated). If None, `state_ps` is returned.
-            clone_ps: An optional PartitionSpec to copy axis names from for the
-                preserved indices, instead of using `state_ps`.
-            dep: A dependency flag or PartitionSpec. If None, returns None. Defaults to True.
-                (The exact purpose might be context-specific, potentially for control flow).
-            tensor: Optional tensor to get corrected sharding for.
+            state_ps: The base PartitionSpec to slice axes out of.
+            preserved_indices: Axis indices to retain from ``state_ps`` (or
+                from ``clone_ps`` if given). All other axes are set to
+                ``None`` (replicated). If ``None``, ``state_ps`` is returned
+                unchanged (subject to ``tensor`` correction).
+            clone_ps: Alternate PartitionSpec to source axis names from for
+                the preserved indices. Defaults to ``state_ps``.
+            dep: Dependency gate — if ``None``, the function returns
+                ``None`` immediately. Lets callers conditionally suppress
+                sharding without an outer ``if`` branch.
+            tensor: Optional tensor used to correct the resulting spec for
+                the actual shape (handles axis-name → mesh-axis mapping).
 
         Returns:
-            A new PartitionSpec with only specified axes partitioned, or None based on `dep`.
-            Returns `state_ps` directly if `preserved_indices` is None.
+            A PartitionSpec with only the preserved axes partitioned, or
+            ``None`` when ``dep`` / ``state_ps`` / the metadata's mesh is
+            absent.
         """
         mesh = self.metadata.mesh
         if mesh is None:

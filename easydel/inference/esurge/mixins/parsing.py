@@ -502,11 +502,30 @@ class EngineParsingMixin:
         now: float,
         finished: bool,
     ) -> tuple[dict | None, str, str, bool, str | None]:
-        """Decode tokens and run parser pipeline.
+        """Decode tokens and run the parser pipeline for a single update.
+
+        Decides via the interval-based gating policy whether a decode pass
+        is due for this request, runs the detokenizer pipeline when so,
+        then forwards the result through
+        :meth:`_parse_with_stop_string_policy` to apply reasoning/tool
+        parsers and stop-string trimming.
+
+        Args:
+            request_id: Sample-level request id used to key into the
+                detokenizer client.
+            rd: Per-request bookkeeping dict; reads ``last_decoded_index``,
+                ``last_decode_time``, ``sampling_params``, and
+                ``prompt_token_ids``; updates ``last_decoded_index`` and
+                ``last_decode_time``.
+            decodable_tokens: EOS-filtered token-id stream for this sample.
+            now: Current scheduler timestamp used for interval-based gating.
+            finished: ``True`` when this is the terminal decode pass; forces
+                the parser/detokenizer to flush any held-back partial state.
 
         Returns:
-            (parsed, raw_accumulated_text, raw_delta_text, stop_hit, stop_reason)
-            or (None, "", "", False, None) if decode was skipped.
+            ``(parsed, raw_accumulated_text, raw_delta_text, stop_hit, stop_reason)``
+            or ``(None, "", "", False, None)`` if decode was skipped due to
+            interval gating.
         """
         last_idx = rd["last_decoded_index"]
         num_decodable = len(decodable_tokens)
@@ -566,6 +585,17 @@ class EngineParsingMixin:
         The detokenizer wants the same stream with EOS ids removed. Keeping
         ``rd["decodable_tokens"]`` incremental avoids re-filtering the full
         generated list on every streaming update.
+
+        Args:
+            rd: Per-request bookkeeping dict; ``decodable_tokens`` is
+                created on first access and extended in place.
+            new_tokens: Tokens just produced by the engine for this sample
+                (may contain EOS ids which are filtered out before
+                detokenization).
+
+        Returns:
+            The live ``decodable_tokens`` list after extension, suitable
+            for forwarding straight into the detokenizer.
         """
         decodable_tokens = rd.setdefault("decodable_tokens", [])
         eos_set = getattr(self, "_eos_set", None)
@@ -583,6 +613,14 @@ class EngineParsingMixin:
         Normal generation updates keep this list incrementally. The fallback
         preserves correctness for older request dictionaries or tests that
         construct ``rd`` directly without ``decodable_tokens``.
+
+        Args:
+            rd: Per-request bookkeeping dict; ``decodable_tokens`` is read
+                when present, otherwise rebuilt from ``generated_tokens``.
+
+        Returns:
+            EOS-filtered list of decoded token ids for the request's
+            final detokenizer pass.
         """
         decodable_tokens = rd.get("decodable_tokens")
         if decodable_tokens is not None:
@@ -832,7 +870,18 @@ class EngineParsingMixin:
 
         Decodes tokens, runs reasoning + tool parsers, updates metrics, and
         signals streaming consumers. Uses interval-based decoding to reduce
-        tokenizer overhead.
+        tokenizer overhead. Stop-string matches discovered during parsing
+        are forwarded back to the scheduler via the parser-stop queue (or
+        applied directly under ``_scheduler_lock`` when no queue is
+        configured) so the engine can mark the request finished on the
+        next iteration. Scheduler-side finished requests that arrive
+        without a terminal :class:`EngineCoreOutput` are closed out via
+        :meth:`_finish_request_from_scheduler_signal`.
+
+        Args:
+            engine_outputs: Mapping from client index to
+                :class:`EngineCoreOutputs` produced by the scheduler's
+                ``update_from_output``.
         """
         metrics_collector = get_metrics_collector()
         if engine_outputs:

@@ -124,6 +124,7 @@ class BatchMetadataPreparer:
         max_num_reqs: int,
         max_model_len: int,
         min_input_pad: int,
+        enable_spec_recurrent_commit: bool = False,
     ) -> None:
         """Initialize the BatchMetadataPreparer.
 
@@ -142,6 +143,9 @@ class BatchMetadataPreparer:
             min_input_pad: Minimum padding for request count bucketing.
                 Request counts are padded to powers of 2 starting from this
                 minimum.
+            enable_spec_recurrent_commit: If True, the host payload reserves a
+                slot for the speculative recurrent commit metadata. Required
+                when running the recurrent-drafter speculative decoding path.
 
         Note:
             This constructor preallocates all CPU buffers to avoid per-step
@@ -155,6 +159,7 @@ class BatchMetadataPreparer:
         self.max_num_reqs = int(max_num_reqs)
         self.max_model_len = int(max_model_len)
         self.min_input_pad = int(min_input_pad)
+        self._enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
 
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
@@ -181,6 +186,7 @@ class BatchMetadataPreparer:
         self._packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
         self._packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
         self._packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
+        self._spec_recurrent_commit_cpu = np.zeros((2, self.max_num_reqs), dtype=np.int32)
         self._arange_cpu = np.arange(self.max_num_tokens, dtype=np.int32)
         self._pages_tables_cpu = np.full(
             (self._num_reqs_max_model_len, self._max_pages_per_req),
@@ -211,6 +217,7 @@ class BatchMetadataPreparer:
         self._async_packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
         self._async_packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
         self._async_packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
+        self._async_spec_recurrent_commit_cpu = np.zeros((2, self.max_num_reqs), dtype=np.int32)
         self._async_pages_tables_cpu = np.full(
             (self._num_reqs_max_model_len, self._max_pages_per_req),
             PAGE_TABLE_PADDING_VAL,
@@ -360,6 +367,37 @@ class BatchMetadataPreparer:
             cached = jax.device_put(np.zeros(shape, dtype=dtype), self._empty_sharding)
             self._zero_dev_cache[key] = cached
         return cached
+
+    def _device_put_host_payload(self, host_payload: tuple) -> tuple:
+        """Transfer only host leaves to device, preserving already-device leaves.
+
+        Iterates over the input tuple and partitions entries into existing
+        ``jax.Array`` leaves (preserved as-is) and host-side values (collected
+        into a single ``jax.device_put`` call). This avoids redundant transfers
+        for cached device buffers like the page-table cache.
+
+        Args:
+            host_payload: Tuple of mixed host arrays and device arrays.
+
+        Returns:
+            Tuple of the same length where each element is device-resident.
+        """
+        outputs: list[object | None] = [None] * len(host_payload)
+        put_indices: list[int] = []
+        put_values: list[object] = []
+        for idx, value in enumerate(host_payload):
+            if isinstance(value, jax.Array):
+                outputs[idx] = value
+            else:
+                put_indices.append(idx)
+                put_values.append(value)
+
+        if put_values:
+            put_results = jax.device_put(tuple(put_values), self._empty_sharding)
+            for idx, value in zip(put_indices, put_results, strict=True):
+                outputs[idx] = value
+
+        return tuple(outputs)
 
     def _get_zero_dev_like(self, *, namespace: str, arr: np.ndarray) -> jax.Array:
         """Get a cached zero device array with shape/dtype matching an array.
@@ -530,6 +568,7 @@ class BatchMetadataPreparer:
         page_table_version: int | None,
         padded_num_reqs_in: int,
         copy_slot_mapping: bool,
+        spec_recurrent_commit_cpu: np.ndarray | None = None,
         use_async_buffers: bool = False,
     ) -> tuple[tuple, int, int, int]:
         """Build the host-side payload for device transfer.
@@ -554,6 +593,7 @@ class BatchMetadataPreparer:
             page_table_cpu: Page table [max_reqs, max_pages_per_req].
             page_table_version: Optional version for cache invalidation.
             padded_num_reqs_in: Requested padding for request count.
+            spec_recurrent_commit_cpu: Optional speculative recurrent commit metadata.
             copy_slot_mapping: If True, copy slot mapping to avoid aliasing.
             use_async_buffers: If True, use async staging buffers instead
                 of primary buffers.
@@ -598,6 +638,7 @@ class BatchMetadataPreparer:
             packed_i32_padded = self._async_packed_i32_padded_cpu
             packed_f32_padded = self._async_packed_f32_padded_cpu
             packed_misc_i32 = self._async_packed_misc_i32_cpu
+            spec_recurrent_commit = self._async_spec_recurrent_commit_cpu
             request_distribution = self._async_request_distribution_cpu
             num_kv_update_cpu = self._async_num_kv_update_cpu
             slot_mapping_buf = self._async_slot_mapping_cpu
@@ -613,6 +654,7 @@ class BatchMetadataPreparer:
             packed_i32_padded = self._packed_i32_padded_cpu
             packed_f32_padded = self._packed_f32_padded_cpu
             packed_misc_i32 = self._packed_misc_i32_cpu
+            spec_recurrent_commit = self._spec_recurrent_commit_cpu
             request_distribution = self._request_distribution_placeholder
             num_kv_update_cpu = self._num_kv_update_placeholder
             slot_mapping_buf = self._slot_mapping_cpu
@@ -754,31 +796,37 @@ class BatchMetadataPreparer:
         packed_misc_i32[1] = np.int32(padded_num_reqs)
         packed_misc_i32[2:5] = request_distribution
 
+        spec_recurrent_commit_payload = None
+        if self._enable_spec_recurrent_commit:
+            spec_recurrent_commit.fill(0)
+            if spec_recurrent_commit_cpu is not None:
+                rows = min(spec_recurrent_commit.shape[0], int(spec_recurrent_commit_cpu.shape[0]))
+                cols = min(spec_recurrent_commit.shape[1], int(spec_recurrent_commit_cpu.shape[1]))
+                spec_recurrent_commit[:rows, :cols] = spec_recurrent_commit_cpu[:rows, :cols]
+            spec_recurrent_commit_payload = spec_recurrent_commit
+
         # Keep the transferred payload to arrays used by compiled kernels. The
         # full scheduled/active vectors remain CPU-side scheduler state; the
         # model-step ABI receives cached device placeholders for those fields.
+        common_payload = (
+            input_ids,
+            positions,
+            packed_qsl_seqlens,
+            pages_tables_payload,
+            packed_i32_padded,
+            packed_f32_padded,
+            packed_misc_i32,
+        )
+        if self._enable_spec_recurrent_commit:
+            common_payload = (*common_payload, spec_recurrent_commit_payload)
         if self._use_slot_mapping:
             host_payload = (
-                input_ids,
-                positions,
-                packed_qsl_seqlens,
-                pages_tables_payload,
-                packed_i32_padded,
-                packed_f32_padded,
-                packed_misc_i32,
+                *common_payload,
                 slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
                 num_kv_update_cpu,
             )
         else:
-            host_payload = (
-                input_ids,
-                positions,
-                packed_qsl_seqlens,
-                pages_tables_payload,
-                packed_i32_padded,
-                packed_f32_padded,
-                packed_misc_i32,
-            )
+            host_payload = common_payload
 
         return host_payload, padded_num_reqs, num_requests, rows_to_copy
 
@@ -801,6 +849,7 @@ class BatchMetadataPreparer:
         repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        spec_recurrent_commit_cpu: np.ndarray | None = None,
         page_table_version: int | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: np.ndarray | None = None,
@@ -838,6 +887,9 @@ class BatchMetadataPreparer:
             repetition_penalties_cpu: Repetition penalty per request [max_num_reqs].
             page_table_cpu: Page table [max_num_reqs, max_pages_per_req].
             padded_num_reqs_in: Requested padding for request count bucketing.
+            spec_recurrent_commit_cpu: Optional speculative recurrent commit
+                metadata [2, max_num_reqs]. Row 0 is the active mask, row 1 is
+                the real prefix length before drafts.
             page_table_version: Optional version for page table caching.
             mrope_position_ids_cpu: Optional mRoPE positions [3, num_tokens].
             prefill_embeds_cpu: Optional prefill embeddings [num_tokens, hidden].
@@ -878,6 +930,7 @@ class BatchMetadataPreparer:
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
         )
         host_build_took = time.time() - host_build_start
 
@@ -890,30 +943,34 @@ class BatchMetadataPreparer:
 
             host_payload = multihost_utils.broadcast_one_to_all(host_payload)
 
+        device_payload = self._device_put_host_payload(host_payload)
+
+        payload_idx = 0
+        input_ids_buf = device_payload[payload_idx]
+        payload_idx += 1
+        position_ids_buf = device_payload[payload_idx]
+        payload_idx += 1
+        packed_qsl_seqlens_dev = device_payload[payload_idx]
+        payload_idx += 1
+        pages_tables_dev = device_payload[payload_idx]
+        payload_idx += 1
+        packed_i32_padded_dev = device_payload[payload_idx]
+        payload_idx += 1
+        packed_f32_padded_dev = device_payload[payload_idx]
+        payload_idx += 1
+        packed_misc_i32_dev = device_payload[payload_idx]
+        payload_idx += 1
+        spec_recurrent_commit_dev = None
+        if self._enable_spec_recurrent_commit:
+            spec_recurrent_commit_dev = device_payload[payload_idx]
+            payload_idx += 1
         slot_mapping_dev = None
         num_kv_update_dev = None
         if self._use_slot_mapping:
-            (
-                input_ids_buf,
-                position_ids_buf,
-                packed_qsl_seqlens_dev,
-                pages_tables_dev,
-                packed_i32_padded_dev,
-                packed_f32_padded_dev,
-                packed_misc_i32_dev,
-                slot_mapping_dev,
-                num_kv_update_dev,
-            ) = jax.device_put(host_payload, self._empty_sharding)
-        else:
-            (
-                input_ids_buf,
-                position_ids_buf,
-                packed_qsl_seqlens_dev,
-                pages_tables_dev,
-                packed_i32_padded_dev,
-                packed_f32_padded_dev,
-                packed_misc_i32_dev,
-            ) = jax.device_put(host_payload, self._empty_sharding)
+            slot_mapping_dev = device_payload[payload_idx]
+            payload_idx += 1
+            num_kv_update_dev = device_payload[payload_idx]
+            payload_idx += 1
         scheduled_full_dev = self._scheduled_full_placeholder_dev
         active_mask_full_dev = self._active_mask_full_placeholder_dev
         device_put_took = time.time() - device_put_start
@@ -1026,6 +1083,7 @@ class BatchMetadataPreparer:
             prefill_embeds_mask=prefill_embeds_mask_dev,
             visual_pos_masks=visual_pos_masks_dev,
             deepstack_visual_embeds=deepstack_visual_embeds_dev,
+            spec_recurrent_commit=spec_recurrent_commit_dev,
         )
 
         return (
@@ -1055,6 +1113,7 @@ class BatchMetadataPreparer:
         repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        spec_recurrent_commit_cpu: np.ndarray | None = None,
         page_table_version: int | None = None,
     ) -> None:
         """Start async device transfer for double-buffered batch preparation.
@@ -1085,6 +1144,8 @@ class BatchMetadataPreparer:
             repetition_penalties_cpu: Repetition penalty per request.
             page_table_cpu: Page table for all requests.
             padded_num_reqs_in: Requested padding for request count.
+            spec_recurrent_commit_cpu: Optional speculative recurrent commit
+                metadata [2, max_num_reqs].
             page_table_version: Optional version for page table caching.
 
         Raises:
@@ -1129,6 +1190,7 @@ class BatchMetadataPreparer:
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             use_async_buffers=True,
         )
         host_build_took = time.time() - host_build_start
@@ -1193,30 +1255,32 @@ class BatchMetadataPreparer:
         except Exception:
             host_build_took = 0.0
 
+        payload_idx = 0
+        input_ids_buf = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        position_ids_buf = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        packed_qsl_seqlens_dev = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        pages_tables_dev = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        packed_i32_padded_dev = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        packed_f32_padded_dev = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        packed_misc_i32_dev = self._pending_transfer[payload_idx]
+        payload_idx += 1
+        spec_recurrent_commit_dev = None
+        if self._enable_spec_recurrent_commit:
+            spec_recurrent_commit_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
         slot_mapping_dev = None
         num_kv_update_dev = None
         if self._use_slot_mapping:
-            (
-                input_ids_buf,
-                position_ids_buf,
-                packed_qsl_seqlens_dev,
-                pages_tables_dev,
-                packed_i32_padded_dev,
-                packed_f32_padded_dev,
-                packed_misc_i32_dev,
-                slot_mapping_dev,
-                num_kv_update_dev,
-            ) = self._pending_transfer
-        else:
-            (
-                input_ids_buf,
-                position_ids_buf,
-                packed_qsl_seqlens_dev,
-                pages_tables_dev,
-                packed_i32_padded_dev,
-                packed_f32_padded_dev,
-                packed_misc_i32_dev,
-            ) = self._pending_transfer
+            slot_mapping_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
+            num_kv_update_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
         scheduled_full_dev = self._scheduled_full_placeholder_dev
         active_mask_full_dev = self._active_mask_full_placeholder_dev
 
@@ -1268,6 +1332,7 @@ class BatchMetadataPreparer:
             ),
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
+            spec_recurrent_commit=spec_recurrent_commit_dev,
         )
 
         self._pending_transfer = None

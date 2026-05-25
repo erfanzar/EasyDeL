@@ -172,18 +172,23 @@ class eSurgeAdapter(InferenceEngineAdapter):
         sampling_params: SamplingParams,
         stream: bool = False,
     ) -> list[RequestOutput] | AsyncGenerator[RequestOutput, None]:
-        """Generate text using eSurge engine.
+        """Generate text using the wrapped eSurge engine.
+
+        Dispatches a synchronous ``esurge.generate`` call onto the running
+        event loop's default executor so the FastAPI thread is not blocked.
 
         Args:
-            prompts: Input prompt(s) for generation.
-            sampling_params: Generation parameters.
-            stream: Whether to stream results (not implemented).
+            prompts: Single prompt string or list of prompt strings.
+            sampling_params: Generation parameters (temperature, top-p, etc.).
+            stream: Whether to stream results. Streaming is not implemented
+                in this adapter — use the streaming code paths on
+                :class:`eSurgeApiServer` instead.
 
         Returns:
-            List of RequestOutput objects for batch generation.
+            List of :class:`RequestOutput` objects for batch generation.
 
         Raises:
-            NotImplementedError: If stream=True (streaming not supported here).
+            NotImplementedError: If ``stream=True``.
         """
         if stream:
             raise NotImplementedError()
@@ -453,14 +458,22 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     ) -> tuple[str, tp.Any]:
         """Create and register a new random API key with enhanced features.
 
+        Thin convenience wrapper around the underlying
+        :class:`EnhancedApiKeyManager.generate_api_key` that supplies a
+        sensible default role.
+
         Args:
             name: Human-readable name for the key.
-            role: Access control role (ApiKeyRole). Defaults to USER.
-            **kwargs: Additional arguments passed to auth_manager.generate_api_key()
-                (description, expires_in_days, rate_limits, quota, permissions, tags, metadata)
+            role: Access control role (``ApiKeyRole``). Defaults to
+                ``ApiKeyRole.USER`` when ``None``.
+            **kwargs: Additional arguments forwarded to
+                ``auth_manager.generate_api_key`` (``description``,
+                ``expires_in_days``, ``rate_limits``, ``quota``,
+                ``permissions``, ``tags``, ``metadata``).
 
         Returns:
-            Tuple of (raw_key, metadata). Store raw_key securely - it won't be retrievable later.
+            Tuple of ``(raw_key, metadata)``. Store ``raw_key`` securely —
+            it cannot be retrieved later.
         """
 
         if role is None:
@@ -732,7 +745,15 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _get_engine_tool_parser(esurge: eSurge) -> str | None:
-        """Return the parser name configured on the eSurge engine, if any."""
+        """Return the parser name configured on the eSurge engine, if any.
+
+        Args:
+            esurge: The eSurge engine instance to inspect.
+
+        Returns:
+            The trimmed tool-parser name, or ``None`` when the engine has no
+            non-empty ``tool_parser`` attribute.
+        """
 
         engine_name = getattr(esurge, "tool_parser", None)
         if isinstance(engine_name, str):
@@ -742,7 +763,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _example_tool_definitions() -> list[dict[str, tp.Any]]:
-        """Return placeholder tool definitions for discovery endpoints."""
+        """Return placeholder tool definitions for discovery endpoints.
+
+        Returns:
+            A list with a single sample function definition, suitable for
+            populating the ``/v1/tools`` discovery response.
+        """
 
         return [
             {
@@ -769,7 +795,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         ]
 
     def _create_tools_response(self) -> dict[str, tp.Any]:
-        """Describe tool-calling capabilities as reported by each eSurge engine."""
+        """Describe tool-calling capabilities as reported by each eSurge engine.
+
+        Returns:
+            Dictionary keyed by model name with each entry containing
+            example tool definitions and the engine-reported parser
+            metadata, plus a ``default_format`` field for the response root.
+        """
 
         tools_by_model: dict[str, dict[str, tp.Any]] = {}
         for model_name, adapter in self.adapters.items():
@@ -785,7 +817,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _create_tool_execution_placeholder_response() -> JSONResponse:
-        """Return the placeholder response for the unimplemented tool executor."""
+        """Return the placeholder response for the unimplemented tool executor.
+
+        Returns:
+            JSONResponse with HTTP 501 (Not Implemented) and a structured
+            error payload describing that tool execution is left to the
+            deployment-specific integration.
+        """
 
         return JSONResponse(
             {
@@ -891,7 +929,17 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _stream_debug_preview(text: tp.Any, *, max_chars: int = 160) -> str | None:
-        """Return a compact escaped preview for debug logging."""
+        """Return a compact escaped preview for debug logging.
+
+        Args:
+            text: Candidate value; only :class:`str` inputs produce a preview.
+            max_chars: Maximum number of escaped characters to keep before
+                truncating with an ellipsis.
+
+        Returns:
+            Escaped string with ``\\n`` / ``\\r`` rendered explicitly, or
+            ``None`` when ``text`` is not a string.
+        """
 
         if not isinstance(text, str):
             return None
@@ -902,7 +950,15 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _stream_debug_len(value: tp.Any) -> int | None:
-        """Return length for strings/sequences/mappings when available."""
+        """Return length for strings/sequences/mappings when available.
+
+        Args:
+            value: Candidate value to size.
+
+        Returns:
+            ``len(value)`` for strings, lists, tuples, and dicts. ``None``
+            for other types and for ``None``.
+        """
 
         if value is None:
             return None
@@ -921,7 +977,21 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         done_event: asyncio.Event,
         poll_interval_s: float = 0.1,
     ) -> None:
-        """Abort non-stream engine work when the HTTP client disconnects."""
+        """Abort non-stream engine work when the HTTP client disconnects.
+
+        Polls the request's disconnect state and, when set, asks the engine
+        to abort. The loop exits once ``done_event`` is set by the caller.
+
+        Args:
+            raw_request: FastAPI request whose disconnect state is polled.
+            esurge: eSurge engine to abort against.
+            request_id: Engine-side request identifier to abort.
+            endpoint: Endpoint path used only for log context.
+            model: Model name used only for log context.
+            done_event: Event the caller sets when the request finished and
+                disconnect polling should stop.
+            poll_interval_s: Seconds between disconnect probes.
+        """
 
         disconnect_logged = False
 
@@ -969,7 +1039,14 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         endpoint: str,
         model: str | None,
     ) -> None:
-        """Abort engine work when the HTTP handler itself is cancelled."""
+        """Abort engine work when the HTTP handler itself is cancelled.
+
+        Args:
+            esurge: eSurge engine to abort against.
+            request_id: Engine-side request identifier to abort.
+            endpoint: Endpoint path used only for log context.
+            model: Model name used only for log context.
+        """
 
         logger.warning(
             "HTTP handler cancelled; aborting engine request. endpoint=%s request_id=%s model=%s",
@@ -1008,7 +1085,42 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         tools: tp.Any = None,
         messages: tp.Any = None,
     ) -> dict[str, tp.Any]:
-        """Build a bounded debug payload for streaming failures."""
+        """Build a bounded debug payload for streaming failures.
+
+        Captures the endpoint, request/model identifiers, and previews of
+        the surrounding stream state (text deltas, token id counts, tool
+        call shapes, exception type/message, ...) into a single dict for
+        structured logging. All previews and lengths are size-bounded.
+
+        Args:
+            endpoint: Endpoint path being streamed.
+            request_id: Engine-side request identifier, if available.
+            model: Model name being served.
+            queue_kind: Last queue event kind observed (``data``/``error``/
+                ``end``) or ``None``.
+            disconnected: Whether the HTTP client had disconnected.
+            output: Most recent ``RequestOutput`` for the request.
+            last_output: Last completed ``RequestOutput``.
+            previous_text: Accumulated text up to the previous chunk.
+            current_text: Accumulated text including the current chunk.
+            delta_text: Incremental text emitted in the current chunk.
+            previous_token_ids: Tokens emitted up to the previous chunk.
+            current_token_ids: Tokens including the current chunk.
+            delta_token_ids: Tokens added by the current chunk.
+            raw_delta_message: Raw protocol message before any normalization.
+            delta_message: Normalised :class:`DeltaMessage`, when available.
+            delta_tool_calls_raw: Raw tool-call payload before normalization.
+            saw_tool_call_delta: Whether a tool-call delta was observed.
+            saw_function_call_delta: Whether a legacy function-call delta
+                was observed.
+            stream_error: Exception that triggered debug capture.
+            tools: Tools list from the original request (logged as type/len).
+            messages: Original message list (logged as type/len + tiny peek).
+
+        Returns:
+            Dictionary with bounded previews and counters suitable for
+            single-line structured log emission.
+        """
 
         observed_output = output or last_output
         primary_output = (
@@ -1112,7 +1224,18 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _normalize_stop_sequences(stop: tp.Any) -> list[str]:
-        """Normalize stop input into a de-duplicated list of non-empty strings."""
+        """Normalize stop input into a de-duplicated list of non-empty strings.
+
+        Accepts ``None``, a single string, or any iterable, and returns a
+        list of unique, non-empty strings preserving discovery order.
+        Non-string entries are stringified via ``str()``.
+
+        Args:
+            stop: Raw stop value supplied by the caller.
+
+        Returns:
+            Ordered list of unique non-empty stop strings.
+        """
 
         if stop is None:
             return []
@@ -1139,8 +1262,20 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     def _resolve_esurge_runtime_request_cap(esurge: eSurge) -> int:
         """Infer the effective request cap for one engine.
 
-        Prefers the runner/cache runtime cap when available, then falls back to
-        the configured ``max_num_seqs``. The smaller positive value wins.
+        Prefers the runner / cache runtime cap when available, then falls
+        back to the configured ``max_num_seqs``. The smaller positive value
+        wins so the server never schedules more than the engine can run.
+
+        Args:
+            esurge: eSurge engine instance to inspect.
+
+        Returns:
+            Positive request cap derived from runtime metadata or
+            configuration.
+
+        Raises:
+            ValueError: If neither the runtime cap nor ``max_num_seqs``
+                yields a positive integer.
         """
 
         configured_cap = 0
@@ -1169,7 +1304,19 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         return min(candidates)
 
     def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
-        """Merge server-level stop strings into request sampling parameters."""
+        """Merge server-level stop strings into request sampling parameters.
+
+        Combines the existing ``sampling_params.stop`` with the server's
+        configured ``_extra_stops`` while preserving order and removing
+        duplicates.
+
+        Args:
+            sampling_params: Sampling parameters to augment in-place.
+
+        Returns:
+            The same ``sampling_params`` object (returned for chaining)
+            with its ``stop`` field updated.
+        """
 
         if not self._extra_stops:
             return sampling_params
@@ -1335,19 +1482,25 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request) -> tp.Any:
         """Handle chat completion requests.
 
-        Main endpoint for /v1/chat/completions. Supports both streaming and
-        non-streaming responses, with optional function calling.
+        Main endpoint for ``/v1/chat/completions``. Supports both streaming
+        and non-streaming responses, with optional function calling. Applies
+        the configured chat-request refinement callback, authorizes against
+        the auth manager, and dispatches to the streaming or non-streaming
+        helper as requested.
 
         Args:
             request: Chat completion request (with or without tools).
+            raw_request: Raw FastAPI request used for auth and disconnect
+                detection.
 
         Returns:
-            ChatCompletionResponse for non-streaming.
-            StreamingResponse for streaming.
-            JSONResponse with error on failure.
+            ChatCompletionResponse for non-streaming requests, a
+            StreamingResponse for streaming requests, or a JSONResponse
+            wrapping the error on failure.
 
         Raises:
-            HTTPException: For client errors (400, 404).
+            HTTPException: For client errors (e.g. 400 empty messages, 404
+                model not found, 401/403/429 auth failures).
         """
         request_id = str(uuid.uuid4())
         if self._refine_chat_request_callback:
@@ -1448,7 +1601,19 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
     @staticmethod
     def _prepare_text_messages_for_chat(messages: list[dict[str, tp.Any]]) -> list[dict[str, tp.Any]]:
-        """Normalize text-only messages into plain string content for chat templates."""
+        """Normalize text-only messages into plain string content.
+
+        Walks each message and concatenates any list-of-parts text content
+        into a single space-joined string so the downstream chat template
+        sees uniform string content. Non-text parts are dropped because
+        this code path runs only when the request has no multimodal items.
+
+        Args:
+            messages: Pre-converted message dicts (post Pydantic dump).
+
+        Returns:
+            New list of messages with ``content`` normalized to ``str``.
+        """
 
         normalized: list[dict[str, tp.Any]] = []
         for msg in messages:
@@ -1866,7 +2031,23 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         output: RequestOutput,
         raw_request: Request,
     ) -> ChatCompletionResponse:
-        """Build a ChatCompletionResponse from a finalized RequestOutput snapshot."""
+        """Build a ChatCompletionResponse from a finalized RequestOutput.
+
+        Computes prompt/completion token counts, updates the rolling
+        tokens-per-second metric, builds one ``ChatCompletionResponseChoice``
+        per completion (mapping tool calls or text content appropriately),
+        and records per-API-key usage.
+
+        Args:
+            request: Original chat completion request.
+            esurge: eSurge engine that produced the output.
+            output: Finalized :class:`RequestOutput` snapshot.
+            raw_request: Raw FastAPI request, used to attribute usage to
+                the authenticated API key.
+
+        Returns:
+            Fully populated :class:`ChatCompletionResponse`.
+        """
 
         completion_tokens = int(output.num_generated_tokens or 0)
         prompt_tokens = self._prompt_token_count_from_output(output)
@@ -1928,7 +2109,29 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         request_id: str,
         raw_request: Request,
     ) -> ChatCompletionResponse:
-        """Handle non-streaming chat completion via eSurge.chat()."""
+        """Handle non-streaming chat completion via ``eSurge.chat()``.
+
+        Acquires a generation slot, dispatches the synchronous chat call to
+        the executor thread pool, and installs a background disconnect
+        watcher so the engine aborts if the HTTP client disappears.
+
+        Args:
+            request: Original chat completion request.
+            esurge: eSurge engine to run against.
+            messages: Pre-normalised message list ready for the chat template.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
+
+        Returns:
+            Fully populated :class:`ChatCompletionResponse`.
+
+        Raises:
+            HTTPException: HTTP 400 if the engine raises ``ValueError``
+                (typically invalid input).
+            asyncio.CancelledError: Re-raised after aborting the engine
+                request when the handler itself is cancelled.
+        """
 
         async with self._acquire_generation_slot(
             endpoint="/v1/chat/completions",
@@ -1993,7 +2196,24 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         request_id: str,
         raw_request: Request,
     ) -> StreamingResponse:
-        """Handle streaming chat completion via eSurge.chat()."""
+        """Handle streaming chat completion via ``eSurge.chat()``.
+
+        Returns a :class:`StreamingResponse` that emits SSE events as
+        ``ChatCompletionStreamResponse`` chunks become available, ending
+        with a terminal ``[DONE]`` marker.
+
+        Args:
+            request: Original chat completion request.
+            esurge: eSurge engine to run against.
+            messages: Pre-normalised message list ready for the chat template.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
+
+        Returns:
+            FastAPI :class:`StreamingResponse` configured for SSE with
+            cache and connection headers, plus ``X-Request-ID``.
+        """
 
         sampling_params = self._prepare_sampling_params(request, esurge)
         tools = self.extract_tools(request=request)
@@ -2094,18 +2314,22 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     async def completions(self, request: CompletionRequest, raw_request: Request) -> tp.Any:
         """Handle completion requests.
 
-        Endpoint for /v1/completions. Simpler text completion without
-        chat formatting.
+        Endpoint for ``/v1/completions``. Simpler text completion without
+        chat formatting. Authorizes the request, normalises the prompt,
+        and dispatches to the streaming or non-streaming helper.
 
         Args:
-            request: Completion request.
+            request: Completion request payload.
+            raw_request: Raw FastAPI request used for auth and disconnect
+                detection.
 
         Returns:
-            CompletionResponse or StreamingResponse.
-            JSONResponse with error on failure.
+            :class:`CompletionResponse`, :class:`StreamingResponse`, or
+            a :class:`JSONResponse` wrapping the error on failure.
 
         Raises:
-            HTTPException: For client errors.
+            HTTPException: For client errors (e.g. 400 empty prompt,
+                404 model not found, 401/403/429 auth failures).
         """
         request_id = str(uuid.uuid4())
         payload_api_keys = self._extract_payload_api_keys(request)
@@ -2149,19 +2373,28 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         request_id: str,
         raw_request: Request,
     ) -> CompletionResponse:
-        """Handle non-streaming completion.
+        """Handle non-streaming completion via ``eSurge.generate()``.
+
+        Acquires a generation slot, runs the synchronous generate call on
+        the executor thread pool, and installs a background disconnect
+        watcher so the engine aborts if the client disappears.
 
         Args:
             request: Original completion request.
             esurge: eSurge engine instance.
-            prompt: Text prompt.
-            request_id: Unique request ID.
+            prompt: Text prompt to feed the model.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
 
         Returns:
-            Complete response with generated text and usage.
+            Complete :class:`CompletionResponse` with generated text
+            and usage statistics.
 
         Raises:
-            RuntimeError: If generation fails.
+            RuntimeError: If generation returns no outputs.
+            asyncio.CancelledError: Re-raised after aborting the engine
+                request when the handler itself is cancelled.
         """
         async with self._acquire_generation_slot(
             endpoint="/v1/completions",
@@ -2251,16 +2484,22 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     ) -> StreamingResponse:
         """Handle streaming completion with delta chunks.
 
-        Similar to chat streaming but for raw text completion.
+        Similar to chat streaming but for raw text completion. Emits SSE
+        events with :class:`ChatCompletionStreamResponse` chunks carrying
+        incremental text and usage information; closes with a ``[DONE]``
+        marker.
 
         Args:
             request: Original completion request.
             esurge: eSurge engine instance.
-            prompt: Text prompt.
-            request_id: Unique request ID.
+            prompt: Text prompt to feed the model.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
 
         Returns:
-            StreamingResponse with incremental text chunks.
+            FastAPI :class:`StreamingResponse` configured for SSE with the
+            usual cache/connection headers and ``X-Request-ID``.
         """
 
         sampling_params = self._prepare_sampling_params(request, esurge)
@@ -2404,6 +2643,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         Returns server health status and model information.
 
+        Args:
+            raw_request: Raw FastAPI request used for optional auth check.
+
         Returns:
             JSONResponse with:
             - status: Current server status
@@ -2469,9 +2711,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     async def get_metrics(self, raw_request: Request) -> JSONResponse:
         """Get server performance metrics.
 
+        Args:
+            raw_request: Raw FastAPI request for endpoint-scoped auth.
+
         Returns:
             JSONResponse with comprehensive server metrics including
-            request counts, token statistics, throughput, and status.
+            request counts, token statistics, throughput, status, and the
+            embedded ``auth_stats`` block reported by the auth manager.
         """
         self._authorize_request(raw_request, endpoint="/v1/metrics")
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
@@ -2498,6 +2744,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """List available models.
 
         OpenAI-compatible model listing endpoint.
+
+        Args:
+            raw_request: Raw FastAPI request used for auth.
 
         Returns:
             JSONResponse with list of available models and their metadata.
@@ -2534,12 +2783,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         Args:
             model_id: Model identifier.
+            raw_request: Raw FastAPI request used for auth.
 
         Returns:
             JSONResponse with model metadata.
 
         Raises:
-            HTTPException: If model not found.
+            HTTPException: If model not found (404).
         """
         self._authorize_request(raw_request)
         adapter = self._get_adapter(model_id)
@@ -2564,6 +2814,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         Returns example tool definitions and engine-reported parser metadata.
 
+        Args:
+            raw_request: Raw FastAPI request used for auth.
+
         Returns:
             JSONResponse with tool definitions per model.
         """
@@ -2573,18 +2826,19 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     async def execute_tool(self, raw_request: Request) -> JSONResponse:
         """Execute a tool/function call.
 
-        Placeholder endpoint for tool execution. Implement this method
-        to integrate with actual tool execution systems.
+        Placeholder endpoint for tool execution. Override or replace this
+        method to integrate with deployment-specific tool execution
+        infrastructure.
 
         Args:
-            raw_request: Tool execution request.
+            raw_request: Raw FastAPI request describing the tool call.
 
         Returns:
-            JSONResponse with NOT_IMPLEMENTED status.
+            JSONResponse with HTTP 501 NOT_IMPLEMENTED status.
 
         Note:
-            This is a placeholder that should be implemented based on
-            specific tool execution requirements.
+            This is intentionally a placeholder; production deployments
+            should bind this endpoint to a real tool executor.
         """
         self._authorize_request(raw_request)
         return self._create_tool_execution_placeholder_response()

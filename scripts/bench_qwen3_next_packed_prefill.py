@@ -13,7 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark Qwen3Next packed prefill legacy vs refactored helpers."""
+"""Benchmark Qwen3Next packed prefill legacy vs refactored helpers.
+
+Times two implementations of the Qwen3Next packed-update kernel against each
+other on a synthetic packed-prefill workload:
+
+* :func:`_apply_qwen3_next_packed_updates_legacy` — the original
+  per-request loop that calls the gated delta-rule decode kernel inside a
+  Python-level scan.
+* :func:`_apply_qwen3_next_packed_updates` — the refactored single-call path
+  that does the same work using packed tensor ops.
+
+For each combination of synthetic schedule shape (``decode_like``, ``mixed``,
+``prefill_heavy``) and token bucket (``512``, ``2048``), the script measures
+mean latency and reports the unified path's speedup percentage along with an
+``allclose`` cross-check on the outputs. Logical mesh layout (``fsdp4`` or
+``tp4``) and the grouped-decode backend (``auto``, ``jax``, ``pallas``) are
+selectable via CLI.
+
+Usage:
+    python scripts/bench_qwen3_next_packed_prefill.py --layout tp4 \\
+        --gdr-backend auto --warmup 2 --repeats 5
+"""
 
 from __future__ import annotations
 
@@ -40,6 +61,23 @@ LAYOUT_AXIS_DIMS = {
 
 
 def _grouped_gdr_decode_jax_only(self, query, key, value, beta, decay, recurrent_state):
+    """Force :class:`GatedDeltaRuleOp` to use the pure-JAX grouped decode path.
+
+    Bound via ``MethodType`` to override ``GatedDeltaRuleOp.grouped_gdr_decode``
+    when ``--gdr-backend jax`` is selected.
+
+    Args:
+        self: The :class:`GatedDeltaRuleOp` instance.
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
+        beta: Per-step gating scalar tensor.
+        decay: Per-step decay tensor.
+        recurrent_state: Carried recurrent state.
+
+    Returns:
+        Result of :meth:`GatedDeltaRuleOp.grouped_gdr_decode_jax`.
+    """
     return GatedDeltaRuleOp.grouped_gdr_decode_jax(
         query,
         key,
@@ -51,6 +89,23 @@ def _grouped_gdr_decode_jax_only(self, query, key, value, beta, decay, recurrent
 
 
 def _grouped_gdr_decode_pallas_only(self, query, key, value, beta, decay, recurrent_state):
+    """Force :class:`GatedDeltaRuleOp` to use the Pallas grouped decode path.
+
+    Bound via ``MethodType`` to override ``GatedDeltaRuleOp.grouped_gdr_decode``
+    when ``--gdr-backend pallas`` is selected.
+
+    Args:
+        self: The :class:`GatedDeltaRuleOp` instance.
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
+        beta: Per-step gating scalar tensor.
+        decay: Per-step decay tensor.
+        recurrent_state: Carried recurrent state.
+
+    Returns:
+        Result of :meth:`GatedDeltaRuleOp.grouped_gdr_decode_shard_map_pallas`.
+    """
     return self.grouped_gdr_decode_shard_map_pallas(
         query,
         key,
@@ -62,6 +117,23 @@ def _grouped_gdr_decode_pallas_only(self, query, key, value, beta, decay, recurr
 
 
 def _make_gdr_op(layout: str, runtime_dtype=jnp.bfloat16, grouped_decode_backend: str = "auto"):
+    """Construct a configured :class:`GatedDeltaRuleOp` for the benchmark.
+
+    Builds a :class:`Qwen3NextConfig` with the chosen mesh layout, wraps it in
+    an :class:`OperationMetadata`, and optionally pins the grouped-decode
+    backend to either the pure-JAX or Pallas implementation.
+
+    Args:
+        layout: Mesh layout key from :data:`LAYOUT_AXIS_DIMS` (``"fsdp4"`` or
+            ``"tp4"``).
+        runtime_dtype: Runtime dtype for the op (default ``bfloat16``).
+        grouped_decode_backend: ``"auto"``, ``"jax"``, or ``"pallas"``. The
+            non-auto values monkey-patch ``grouped_gdr_decode`` on the
+            returned op.
+
+    Returns:
+        GatedDeltaRuleOp: Operation instance configured for the benchmark.
+    """
     axis_dims = LAYOUT_AXIS_DIMS[layout]
     base_config = Qwen3NextConfig(
         sharding_axis_dims=axis_dims,
@@ -84,6 +156,30 @@ def _make_gdr_op(layout: str, runtime_dtype=jnp.bfloat16, grouped_decode_backend
 
 
 def _build_schedule(case: str, bucket: int, num_slots: int) -> tuple[np.ndarray, int]:
+    """Build a synthetic packed schedule for the requested workload shape.
+
+    Three shapes are supported:
+
+    * ``decode_like`` — up to 32 requests, each contributing one token (the
+      "pure decode" extreme).
+    * ``mixed`` — about a quarter of the requests are single-token decodes
+      and the rest are multi-token chunks that approximately fill ``bucket``.
+    * ``prefill_heavy`` — every request contributes ``bucket / num_requests``
+      tokens (the prefill-dominated extreme).
+
+    Args:
+        case: One of ``"decode_like"``, ``"mixed"``, ``"prefill_heavy"``.
+        bucket: Target packed token budget.
+        num_slots: Number of physical request slots.
+
+    Returns:
+        tuple[np.ndarray, int]: ``(query_start_loc, num_requests)``. The
+            ``query_start_loc`` array has shape ``[num_slots + 1]`` with
+            inactive slots padded by repeating the last active offset.
+
+    Raises:
+        ValueError: If ``case`` is not a recognized workload shape.
+    """
     if case == "decode_like":
         num_requests = min(num_slots, 32)
         lengths = np.ones((num_requests,), dtype=np.int32)
@@ -114,6 +210,24 @@ def _build_schedule(case: str, bucket: int, num_slots: int) -> tuple[np.ndarray,
 
 
 def _make_inputs(case: str, bucket: int, num_slots: int, dtype: jnp.dtype) -> dict[str, object]:
+    """Generate synthetic tensors and shape metadata for one benchmark case.
+
+    Allocates conv / recurrent state tensors per slot, conv input / beta /
+    decay tensors over the packed bucket, and a conv kernel; together these
+    feed both ``_apply_qwen3_next_packed_updates_legacy`` and the unified
+    helper without further reshaping.
+
+    Args:
+        case: Workload shape forwarded to :func:`_build_schedule`.
+        bucket: Packed token budget.
+        num_slots: Number of physical request slots.
+        dtype: Storage dtype for state / activation tensors.
+
+    Returns:
+        dict[str, object]: Keyword-argument dictionary expected by both packed
+            update helpers, including state tensors, packed activations, the
+            per-slot ``query_start_loc``, head dims, and ``expand_ratio``.
+    """
     num_k_heads = 4
     head_k_dim = 128
     num_v_heads = 16
@@ -164,10 +278,32 @@ def _make_inputs(case: str, bucket: int, num_slots: int, dtype: jnp.dtype) -> di
 
 
 def _block_tree(tree):
+    """Block until every device-array leaf in ``tree`` finishes executing.
+
+    Args:
+        tree: Arbitrary pytree.
+
+    Returns:
+        Any: Same pytree with blocking-capable leaves resolved.
+    """
     return jax.tree_util.tree_map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, tree)
 
 
 def _time_callable(fn, *, warmup: int, repeats: int) -> tuple[object, float]:
+    """Warm up, then time a callable over ``repeats`` iterations.
+
+    Blocks on the output between iterations so the measured time reflects
+    device-side execution rather than dispatch only.
+
+    Args:
+        fn: Zero-argument callable returning a pytree of arrays.
+        warmup: Number of unmeasured warmup iterations.
+        repeats: Number of timed iterations to average over.
+
+    Returns:
+        tuple[object, float]: The last output produced by ``fn`` and the mean
+            iteration time in milliseconds.
+    """
     out = None
     for _ in range(warmup):
         out = fn()
@@ -182,11 +318,39 @@ def _time_callable(fn, *, warmup: int, repeats: int) -> tuple[object, float]:
 
 
 def _allclose_tree(lhs, rhs, *, rtol: float = 0.02, atol: float = 0.05) -> bool:
+    """Compare two array pytrees leaf-wise with ``jnp.allclose`` in float32.
+
+    Args:
+        lhs: First pytree of arrays.
+        rhs: Second pytree of arrays. Must have the same structure as ``lhs``.
+        rtol: Relative tolerance for :func:`jnp.allclose`.
+        atol: Absolute tolerance for :func:`jnp.allclose`.
+
+    Returns:
+        bool: ``True`` if every paired leaf is close within tolerance.
+    """
     leaves = zip(jax.tree_util.tree_leaves(lhs), jax.tree_util.tree_leaves(rhs), strict=True)
     return all(jnp.allclose(a.astype(jnp.float32), b.astype(jnp.float32), rtol=rtol, atol=atol) for a, b in leaves)
 
 
 def main() -> None:
+    """CLI entry point for the Qwen3Next packed-prefill benchmark.
+
+    Args:
+        --warmup: Warmup iterations per benchmark case.
+        --repeats: Timed iterations per case.
+        --num-slots: Packed slot count.
+        --layout: Mesh layout key (``fsdp4`` or ``tp4``).
+        --gdr-backend: Grouped decode backend (``auto``, ``jax``, ``pallas``).
+
+    Returns:
+        None. Prints a fixed-width table of per-case latency and the
+        ``outputs_match`` cross-check result to stdout.
+
+    Raises:
+        RuntimeError: If the constructed :class:`GatedDeltaRuleOp` lacks a
+            mesh in its metadata.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per case.")
     parser.add_argument("--repeats", type=int, default=5, help="Timed iterations per case.")

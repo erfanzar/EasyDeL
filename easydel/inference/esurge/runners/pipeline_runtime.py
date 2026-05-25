@@ -115,7 +115,21 @@ class PipelineStageRuntime:
         prepare_cache_key: tp.Hashable | None = None,
         runtime_static_argnums: tp.Iterable[int] | None = None,
     ) -> tp.Any:
-        """Run one prepared ``sxjit`` backbone call through the PP executor."""
+        """Run one prepared ``sxjit`` backbone call through the PP executor.
+
+        Args:
+            sxjit_fn: The prepared SpectraX-jitted function to dispatch.
+            *args: Positional arguments forwarded verbatim to ``sxjit_fn``.
+            prepare_cache_key: Optional hashable cache key used by SpectraX's
+                ``MpmdPipelineExecutor`` to reuse a previously-prepared plan
+                for the same input shapes / static config.
+            runtime_static_argnums: Optional iterable of argnums to treat as
+                runtime statics (compile constants); forwarded to SpectraX.
+
+        Returns:
+            The result of the dispatched call. Also updates
+            :attr:`last_stats` with per-stage and overall dispatch metrics.
+        """
         result = self._inline_executor.dispatch_many(
             sxjit_fn,
             (args,),
@@ -151,6 +165,23 @@ class PipelineStageRuntime:
         This is the building block for overlapped PP decode. The caller is
         still responsible for ensuring KV-cache updates are independent or
         stage-local before submitting multiple microbatches concurrently.
+
+        Args:
+            sxjit_fn: The prepared SpectraX-jitted function to dispatch.
+            arg_batches: Iterable of argument tuples, one per microbatch. All
+                batches must share the same flat input shape.
+            carry_input_output_map: Optional ``{stage_idx -> {input_leaf_idx ->
+                output_leaf_idx}}`` mapping that tells SpectraX to carry
+                stage-local cache leaves from one microbatch's output back to
+                the next microbatch's input.
+            prepare_cache_key: Optional hashable cache key used by SpectraX
+                to reuse a prepared wavefront plan across calls.
+            runtime_static_argnums: Optional iterable of argnums to treat as
+                runtime statics; forwarded to SpectraX.
+
+        Returns:
+            List of per-microbatch results in submission order. Also updates
+            :attr:`last_stats` with the executor's per-stage metrics.
         """
         arg_batches = tuple(arg_batches)
         executor = self._inline_executor if len(arg_batches) <= 1 else self._wavefront_executor

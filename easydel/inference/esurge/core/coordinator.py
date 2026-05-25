@@ -109,18 +109,21 @@ class CacheCoordinator(ABC):
         num_tokens: int,
         new_computed_pages: tuple[list[CachePage], ...],
     ) -> int:
-        """
-        Get the number of pages needed to be allocated for the request.
+        """Compute total new pages required across all cache groups.
+
+        Sums the per-group page demand from each underlying
+        :class:`SingleTypeCacheManager` to obtain the global allocation
+        budget for the next scheduling step.
 
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
             new_computed_pages: The new computed pages just hitting the
-                prefix caching.
+                prefix caching, one entry per cache group.
 
         Returns:
-            The number of pages.
+            The total number of new pages to allocate across all groups.
         """
         num_pages_to_allocate = 0
         for i, manager in enumerate(self.single_type_managers):
@@ -128,13 +131,12 @@ class CacheCoordinator(ABC):
         return num_pages_to_allocate
 
     def save_new_computed_pages(self, request_id: str, new_computed_pages: tuple[list[CachePage], ...]) -> None:
-        """
-        Add the new computed pages to the request.
+        """Attach new computed pages to the request across all cache groups.
 
         Args:
             request_id: The request ID.
             new_computed_pages: The new computed pages just hitting the
-                prefix cache.
+                prefix cache, one entry per cache group.
         """
         for i, manager in enumerate(self.single_type_managers):
             manager.save_new_computed_pages(request_id, new_computed_pages[i])
@@ -160,17 +162,22 @@ class CacheCoordinator(ABC):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
-        """
-        Allocate new pages for the request to give it at least `num_tokens`
-        token slots.
+        """Allocate new pages so the request reaches ``num_tokens`` slots.
+
+        Delegates to each underlying :class:`SingleTypeCacheManager` and
+        collects the per-group results.
 
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
+            dp_shard_hint: Optional DP shard hint used to restrict new page
+                allocations to that shard's page-ID range.
+            data_parallel_size: Total number of DP shards for shard-hint
+                interpretation.
 
         Returns:
-            The new allocated pages.
+            Tuple of newly allocated pages, one list per cache group.
         """
         return tuple(
             manager.allocate_new_pages(
@@ -183,38 +190,36 @@ class CacheCoordinator(ABC):
         )
 
     def cache_pages(self, request: EngineRequest, page_hashes: list[PageHash], num_computed_tokens: int) -> None:
-        """
-        Cache the pages for the request.
+        """Mark pages as prefix-cacheable across every cache group.
 
         Args:
-            request: The request.
+            request: The request whose pages should be cached.
             page_hashes: The page hashes of the request.
-            num_tokens: The total number of tokens that need to be cached
-                (including tokens that are already cached).
+            num_computed_tokens: The total number of tokens that need to be
+                cached (including tokens that are already cached).
         """
         for manager in self.single_type_managers:
             manager.cache_pages(request, page_hashes, num_computed_tokens)
 
     def free(self, request_id: str) -> None:
-        """
-        Free the pages for the request.
+        """Free all pages allocated to ``request_id`` across cache groups.
 
         Args:
-            request_id: The request ID.
+            request_id: The request ID whose pages should be freed.
         """
         for manager in self.single_type_managers:
             manager.free(request_id)
 
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> list[int]:
-        """
-        Get the number of common prefix pages for a request.
+        """Get the per-group count of pages forming a common scheduled prefix.
 
         Args:
-            request_id: The request ID.
-            page_hashes: The page hashes of the request.
+            request_id: The request ID used as the reference for prefix counting.
+            num_scheduled_requests: The total number of requests scheduled in
+                the current step.
 
         Returns:
-            The number of common prefix pages.
+            List of common prefix page counts, one per cache group.
         """
         num_pages_per_group = [
             manager.get_num_common_prefix_pages(request_id, num_scheduled_requests)
@@ -223,9 +228,12 @@ class CacheCoordinator(ABC):
         return num_pages_per_group
 
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
-        """
-        Remove the pages that are no longer needed from `pages` and replace
-        the removed pages with null_page.
+        """Remove no-longer-needed pages from each cache group.
+
+        Delegates to each underlying :class:`SingleTypeCacheManager`, which
+        replaces removed pages with ``null_page`` according to the attention
+        pattern (full attention keeps everything; sliding window and chunked
+        local drop pages outside the active window).
 
         Args:
             request_id: The request ID.
@@ -329,6 +337,8 @@ class CacheCoordinatorNoPrefixCache(CacheCoordinator):
         Args:
             page_hashes: List of page hashes (ignored).
             max_cache_hit_length: Maximum hit length (ignored).
+            dp_shard_hint: Optional DP shard hint (ignored).
+            data_parallel_size: Total number of DP shards (ignored).
 
         Returns:
             Empty page lists and zero hit length.
@@ -397,6 +407,9 @@ class UnitaryCacheCoordinator(CacheCoordinator):
         Args:
             page_hashes: List of page hashes to look up.
             max_cache_hit_length: Maximum number of tokens to consider.
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
             A tuple containing:
@@ -552,6 +565,9 @@ class HybridCacheCoordinator(CacheCoordinator):
         Args:
             page_hashes: List of page hashes to look up in the cache.
             max_cache_hit_length: Maximum number of tokens to consider.
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
             A tuple containing:

@@ -12,7 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Persistent storage for authentication data and usage tracking."""
+"""Persistent storage for authentication data and usage tracking.
+
+Wraps the on-disk layout used by
+:class:`~easydel.workers.esurge.auth.auth_manager.EnhancedApiKeyManager` so
+key state, audit logs, and aggregate usage statistics survive process
+restarts. Every write goes through an atomic write+rename sequence with a
+``.bak`` companion so a crash mid-flush cannot corrupt the live JSON file.
+
+Files written under ``storage_dir`` (default ``~/.cache/esurge-auth``):
+
+* ``keys.json`` — registered key metadata (only the SHA-256 hash, never
+  the raw secret) along with usage counters and rate-limit / quota /
+  permission configuration.
+* ``audit_logs.json`` — append-only audit history populated by
+  :meth:`EnhancedApiKeyManager._log_audit`.
+* ``usage_stats.json`` — periodic snapshot of
+  :meth:`EnhancedApiKeyManager.get_statistics`.
+"""
 
 from __future__ import annotations
 
@@ -95,7 +112,16 @@ class AuthStorage:
         logger.info(f"Auth storage initialized at: {self.storage_dir}")
 
     def _ensure_storage_dir(self) -> None:
-        """Create storage directory if it doesn't exist."""
+        """Create the storage directory tree if it doesn't already exist.
+
+        Idempotent — re-running on an existing directory is a no-op. Any
+        OS error during creation is logged at ``ERROR`` and re-raised so
+        the caller can decide whether to fall back to in-memory operation.
+
+        Raises:
+            OSError: Propagated from :meth:`pathlib.Path.mkdir` when the
+                directory cannot be created.
+        """
         try:
             self.storage_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Storage directory created/verified: {self.storage_dir}")

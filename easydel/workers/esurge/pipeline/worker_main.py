@@ -12,16 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Worker process entry point for tokenizer and detokenizer services.
+"""Subprocess entry points for the tokenizer / detokenizer ZMQ workers.
 
-This module implements the main worker processes that handle tokenization and
-detokenization requests via ZeroMQ. It provides both tokenizer and detokenizer
-worker implementations that can be spawned as separate processes.
+Hosts two single-purpose ZMQ ``REP`` loops in one script, selected by
+the positional ``mode`` argument:
+
+* ``tokenizer`` (:func:`_tokenizer_worker`) — runs a HuggingFace
+  ``AutoTokenizer`` and accepts ``tokenize`` / ``drain`` / ``shutdown``
+  commands, returning the token id list for each prompt.
+* ``detokenizer`` (:func:`_detokenizer_worker`) — drives a
+  :class:`FastIncrementalDecoder` and keeps a bounded
+  ``OrderedDict`` of per-request decoding state so the API server can
+  stream ``decode`` calls and only forward token deltas after the
+  first round-trip; supports ``decode`` / ``reset`` / ``drain`` /
+  ``shutdown`` commands.
+
+Both workers translate unknown commands to ``{"status": "error",
+"message": "Unknown cmd ..."}`` and use ``recv_pyobj`` /
+``send_pyobj`` for the wire format so any Python type can be carried
+on the bus without an explicit schema.
+
+Invocation:
+    The script is invoked via ``python -m
+    easydel.workers.esurge.pipeline.worker_main`` with::
+
+        <mode>                              tokenizer|detokenizer
+        --endpoint <zmq-endpoint>           (required)
+        --tokenizer-path <path-or-id>       (required)
+        --tokenizer-kwargs <json-object>    (required, may be ``"{}"``)
+        --max-states <int>                  (detokenizer only;
+                                             default 65536)
+
+    Before importing JAX-aware modules ``main()`` forces a CPU-only
+    placement so the tokenizer / detokenizer subprocesses never
+    compete with the model workers for accelerators.
 
 Note:
-    This module is for internal use only and is not part of EasyDeL's public API.
-    It is only accessible to EasyDeL modules that require external worker processes
-    to handle specific tasks.
+    This module is for internal use only and is not part of EasyDeL's
+    public API.
 """
 
 from __future__ import annotations
@@ -38,18 +66,31 @@ from transformers import AutoTokenizer
 
 
 class FastIncrementalDecoder:
-    """
-    Incrementally decode token streams while handling malformed UTF‑8
-    (the “�” replacement character).
+    """Streaming detokenizer with UTF-8 boundary handling and token context.
 
-    Public API matches the original `SimpleDecoder.decode` method:
+    Wraps a HuggingFace tokenizer to incrementally produce text deltas
+    as new token ids arrive. Two non-trivial behaviours sit on top of
+    a plain ``tokenizer.decode``:
 
-        delta, new_buffered_tokens, has_buffer = decoder.decode(
-            tokens,
-            previous_text="",
-            buffered=decoder.buffered,   # mutable list that the decoder updates
-            skip_special_tokens=False,
-        )
+    * **Context window**: ``context_window`` extra preceding tokens are
+      prepended to every decode call and the decoded context prefix is
+      then stripped from the result. This is required for SentencePiece
+      / WordPiece-style tokenizers where the decoding of a token
+      depends on its neighbours.
+    * **UTF-8 buffering**: when the decoded delta contains the U+FFFD
+      replacement character (i.e. a split multi-byte sequence) the
+      incoming tokens are kept as ``new_buffered`` and an empty delta
+      is returned; the next call re-decodes them together with the
+      following tokens once a clean boundary is reached.
+
+    Public API matches the original ``SimpleDecoder.decode`` method
+    used by previous versions of the detokenizer worker.
+
+    Attributes:
+        tokenizer: HuggingFace tokenizer driving the decode.
+        context_window (int): Number of preceding tokens included as
+            context on each decode call; ``0`` disables context
+            stripping.
     """
 
     def __init__(self, tokenizer, *, context_window: int = 4):
@@ -211,14 +252,27 @@ def _compute_suffix_delta(current_text: str, previous_text: str) -> str:
 
 
 def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
-    """Run the tokenizer worker process.
+    """Run the tokenizer REQ/REP loop until ``shutdown`` arrives.
 
-    This function starts a ZeroMQ server that handles tokenization requests.
+    Loads ``tokenizer_path`` via :func:`AutoTokenizer.from_pretrained`
+    (defaulting ``trust_remote_code`` from
+    ``ESURGE_WORKER_TRUST_REMOTE_CODE``) and serves one Pyobj request
+    per iteration. Supported commands:
+
+    * ``tokenize`` — encode ``message["prompt"]`` and return the flat
+      token id list under ``tokens``.
+    * ``drain`` — acknowledgement only; included so clients can flush
+      pending traffic before shutting down.
+    * ``shutdown`` — break out of the loop after replying ``ok``.
 
     Args:
-        endpoint: ZeroMQ endpoint to bind to.
-        tokenizer_path: Path or identifier for the tokenizer.
-        tokenizer_kwargs: Additional kwargs for loading the tokenizer.
+        endpoint: ZMQ endpoint to bind to (e.g.
+            ``ipc:///tmp/tokenizer.sock``).
+        tokenizer_path: Path or identifier passed to
+            ``AutoTokenizer.from_pretrained``.
+        tokenizer_kwargs: Extra keyword arguments for tokenizer
+            loading; mutated in place to seed ``trust_remote_code``
+            when missing.
     """
     if "trust_remote_code" not in tokenizer_kwargs.keys():
         tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
@@ -255,16 +309,34 @@ def _detokenizer_worker(
     tokenizer_kwargs: dict,
     max_states: int,
 ) -> None:
-    """Run the detokenizer worker process.
+    """Run the detokenizer REQ/REP loop with per-request streaming state.
 
-    This function starts a ZeroMQ server that handles detokenization requests
-    with support for incremental decoding and state management.
+    Each in-flight request is tracked in an :class:`OrderedDict` keyed
+    by ``request_id``; the oldest entries are evicted once the dict
+    grows past ``max_states``. State is updated incrementally so the
+    API server can send only token *deltas* (with ``tokens_delta`` and
+    ``token_offset``) after the initial round-trip, falling back to a
+    full ``tokens`` payload if the offset goes out of sync.
+
+    Supported commands:
+
+    * ``decode`` — feed new tokens into the request's
+      :class:`FastIncrementalDecoder`, returning ``accumulated_text``,
+      ``delta_text``, ``last_decoded_index`` and ``finished``. On
+      ``finished=True`` the full string is re-decoded once for
+      consistency and the per-request state is dropped.
+    * ``reset`` — drop the state for a single ``request_id``.
+    * ``drain`` — clear every state entry.
+    * ``shutdown`` — exit the loop after replying ``ok``.
 
     Args:
-        endpoint: ZeroMQ endpoint to bind to.
-        tokenizer_path: Path or identifier for the tokenizer.
-    tokenizer_kwargs: Additional kwargs for loading the tokenizer.
-    max_states: Maximum number of decoding states to maintain.
+        endpoint: ZMQ endpoint to bind to.
+        tokenizer_path: Path or identifier passed to
+            ``AutoTokenizer.from_pretrained``.
+        tokenizer_kwargs: Extra tokenizer loading kwargs (mutated in
+            place to seed ``trust_remote_code``).
+        max_states: Maximum number of concurrent per-request decoder
+            states retained in memory; older entries are evicted FIFO.
     """
     if "trust_remote_code" not in tokenizer_kwargs.keys():
         tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
@@ -411,10 +483,14 @@ def _detokenizer_worker(
 
 
 def main():
-    """Main entry point for worker processes.
+    """CLI entry point: parse arguments, force CPU JAX, dispatch by ``mode``.
 
-    Parses command-line arguments and starts either a tokenizer or detokenizer
-    worker process based on the specified mode.
+    Parses the positional ``mode`` and the worker arguments described
+    in the module docstring, sets ``JAX_PLATFORMS=cpu`` (plus
+    ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and
+    ``ENABLE_DISTRIBUTED_INIT=0``) so the tokenizer / detokenizer
+    subprocesses never touch accelerators, then runs the matching
+    worker loop until ``shutdown`` is received.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["tokenizer", "detokenizer"])

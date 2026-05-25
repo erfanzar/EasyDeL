@@ -76,7 +76,6 @@ References:
     - EasyDeL serving documentation
 """
 
-from dataclasses import replace as dataclass_replace
 from functools import partial
 
 import jax
@@ -85,6 +84,7 @@ from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     ragged_page_attention_v2,
     ragged_page_attention_v3,
 )
+from ejkernel.modules.operations.configs import RaggedPageAttentionv3Config
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
@@ -112,39 +112,6 @@ USE_SHARDMAP = True
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
-def _clamp_tpu_ragged_page_v3_block_config(query, cfg):
-    """Avoid TPU scoped-VMEM OOMs for wide-head ragged page attention.
-
-    Gemma4 uses 256-wide local sliding heads and 512-wide global heads on TPU.
-    The default Pallas autotuner can pick ``num_kv_pages_per_block=16`` for the
-    local 256-wide case, which exceeds the 16MB scoped VMEM limit on this path.
-    Capping KV pages per block at 8 keeps both geometries under the limit while
-    preserving the tuned query block size selection.
-
-    Args:
-        query: Query tensor whose last dimension (head dim) is checked against
-            the 256-wide threshold.
-        cfg: Existing ``RaggedPageAttentionv3Config`` or ``None``. When
-            ``None`` a new config capped at 8 pages per block is created.
-
-    Returns:
-        The original *cfg* unchanged on non-TPU backends or narrow heads, or
-        a (possibly new) config with ``num_kv_pages_per_block`` clamped to 8.
-    """
-    if jax.default_backend() != "tpu" or query.shape[-1] < 256:
-        return cfg
-
-    from ejkernel.modules.operations.configs import RaggedPageAttentionv3Config
-
-    if cfg is None:
-        return RaggedPageAttentionv3Config(num_kv_pages_per_block=8)
-
-    current_block = getattr(cfg, "num_kv_pages_per_block", None)
-    if current_block is None or int(current_block) > 8:
-        return dataclass_replace(cfg, num_kv_pages_per_block=8)
-    return cfg
-
-
 def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array:
     """Build the v3 request distribution ``[decode_end, prefill_end, total]``.
 
@@ -168,6 +135,216 @@ def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array
     decode = jnp.sum(is_decode).astype(jnp.int32)
     prefill_count = jnp.sum(has_tokens & (~is_decode)).astype(jnp.int32)
     return jnp.stack((decode, decode + prefill_count, total)).astype(jnp.int32)
+
+
+def _chunk_prefill_size_from_cfg(cfg) -> int | None:
+    """Extract ``chunk_prefill_size`` from a dict or dataclass-style config.
+
+    Args:
+        cfg: Operation config; may be ``None``, a ``dict``, or a dataclass.
+
+    Returns:
+        int | None: The configured chunk prefill size, or ``None`` when
+        unset or ``cfg`` is ``None``.
+    """
+    if cfg is None:
+        return None
+    if isinstance(cfg, dict):
+        return cfg.get("chunk_prefill_size")
+    return getattr(cfg, "chunk_prefill_size", None)
+
+
+def _cfg_value(cfg, name: str):
+    """Look up an attribute or key on a dual-shape (dict/dataclass) config.
+
+    Args:
+        cfg: Configuration object or dictionary; may be ``None``.
+        name: Attribute / key name to fetch.
+
+    Returns:
+        Any: The configured value, or ``None`` when missing.
+    """
+    if cfg is None:
+        return None
+    if isinstance(cfg, dict):
+        return cfg.get(name)
+    return getattr(cfg, name, None)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    """Return ``ceil(a / b)`` for positive integers.
+
+    Args:
+        a: Dividend.
+        b: Positive divisor.
+
+    Returns:
+        int: The ceiling of the integer division.
+    """
+    return (a + b - 1) // b
+
+
+def _align_to(value: int, boundary: int) -> int:
+    """Round ``value`` up to the next multiple of ``boundary``.
+
+    Args:
+        value: Non-negative integer to align.
+        boundary: Positive alignment boundary.
+
+    Returns:
+        int: The smallest multiple of ``boundary`` that is at least
+        ``value``.
+    """
+    return _ceil_div(value, boundary) * boundary
+
+
+def _next_power_of_2(value: int) -> int:
+    """Return the smallest power of 2 greater than or equal to ``value``.
+
+    Args:
+        value: Non-negative integer.
+
+    Returns:
+        int: ``1`` when ``value <= 1``; otherwise the next power of two
+        ``>= value``.
+    """
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def _tpu_version() -> int:
+    """Detect the major TPU generation of the local devices.
+
+    Inspects the first JAX device's ``device_kind`` string and maps it to
+    a small integer used by :func:`_default_tpu_rpa_v3_cfg` to pick block
+    sizes per TPU generation.
+
+    Returns:
+        int: ``7`` for TPU v7-class (Ironwood) devices, the trailing
+        version number (e.g. ``5`` for TPU v5) for ``TPU v*`` devices,
+        and ``-1`` when not running on TPU or the kind cannot be parsed.
+    """
+    try:
+        kind = jax.devices()[0].device_kind
+    except Exception:
+        return -1
+    if "TPU" not in kind:
+        return -1
+    if kind.endswith(" lite"):
+        kind = kind[: -len(" lite")]
+    if kind.endswith("p") or kind.endswith("e"):
+        kind = kind[:-1]
+    if kind == "TPU7x":
+        return 7
+    if not kind.startswith("TPU v"):
+        return -1
+    return int(kind[-1])
+
+
+def _default_tpu_rpa_v3_cfg(
+    cfg,
+    *,
+    query: Array,
+    key: Array,
+    kv_pages: Array,
+    context_lens: Array,
+    pages_tables: Array,
+):
+    """Choose vLLM-style TPU RPA block geometry when no user override exists.
+
+    Inspects the runtime tensor shapes plus the local TPU version to derive
+    sensible ``num_kv_pages_per_block`` and ``num_queries_per_block`` values
+    that mirror vLLM's TPU defaults. Returns the input config unchanged if
+    the user already supplied either knob, if the backend is not TPU, or
+    if the shape introspection fails.
+
+    Args:
+        cfg: Existing operation config (dict, dataclass, or ``None``).
+        query: Ragged query tensor used to derive ``max_num_tokens`` and
+            head counts.
+        key: Ragged key tensor used to read the KV-head count.
+        kv_pages: KV-page pool used to read ``page_size``.
+        context_lens: Per-request context lengths; ``shape[0]`` gives the
+            scheduled request count.
+        pages_tables: ``[num_seqs, max_pages]`` block table from which the
+            per-sequence page count is inferred.
+
+    Returns:
+        RaggedPageAttentionv3Config | Any: A new config carrying TPU-tuned
+        block sizes, or the original ``cfg`` if no defaults apply.
+    """
+    if jax.default_backend() != "tpu":
+        return cfg
+    if _cfg_value(cfg, "num_kv_pages_per_block") is not None or _cfg_value(cfg, "num_queries_per_block") is not None:
+        return cfg
+
+    try:
+        actual_num_q_heads = int(query.shape[1])
+        actual_num_kv_heads = int(key.shape[1])
+        page_size = int(kv_pages.shape[1])
+        max_num_tokens = int(query.shape[0])
+        max_num_seqs = int(context_lens.shape[0])
+        block_table_size = int(pages_tables.size)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return cfg
+    if actual_num_q_heads <= 0 or actual_num_kv_heads <= 0 or page_size <= 0 or max_num_tokens <= 0:
+        return cfg
+    if max_num_seqs <= 0 or block_table_size % max_num_seqs != 0:
+        return cfg
+
+    pages_per_seq = block_table_size // max_num_seqs
+    max_q = _next_power_of_2(max_num_tokens)
+    max_kv = pages_per_seq * page_size
+    q_heads_per_kv = _next_power_of_2(actual_num_q_heads // actual_num_kv_heads)
+
+    match _tpu_version():
+        case 5 | 6:
+            block_q = min(1024 // q_heads_per_kv, max_q // 2)
+            block_kv_tokens = min(1024, max_kv)
+        case 7:
+            block_q = min(2048 // q_heads_per_kv, max_q // 2)
+            block_kv_tokens = min(2048, max_kv // 2)
+        case _:
+            return cfg
+
+    return RaggedPageAttentionv3Config(
+        chunk_prefill_size=_chunk_prefill_size_from_cfg(cfg),
+        num_kv_pages_per_block=max(1, _align_to(max(1, int(block_kv_tokens)), page_size) // page_size),
+        num_queries_per_block=max(1, int(block_q)),
+        num_warps=_cfg_value(cfg, "num_warps") or 4,
+        num_stages=_cfg_value(cfg, "num_stages") or 1,
+        platform=_cfg_value(cfg, "platform") or "auto",
+        backend=_cfg_value(cfg, "backend") or "any",
+    )
+
+
+def _tpu_mixed_request_distribution(request_distribution: Array, cfg) -> Array:
+    """Match vLLM TPU's RPA request-distribution convention.
+
+    vLLM routes every non-decode request through the mixed RPA case unless a
+    chunk-prefill size is configured. The native ejkernel TPU path supports the
+    same case layout, and using the same distribution keeps the EasyDeL call
+    geometry aligned with vLLM's runner.
+
+    Args:
+        request_distribution: ``int32[3]`` distribution vector
+            ``[decode_end, prefill_end, total]``.
+        cfg: Operation config whose ``chunk_prefill_size`` controls whether
+            the mixed remapping should be applied.
+
+    Returns:
+        Array: The input distribution unchanged for non-TPU backends or
+        when ``chunk_prefill_size`` is set; otherwise a remapped vector
+        ``[decode_end, decode_end, total]`` that routes prefill traffic
+        through the mixed RPA case.
+    """
+    chunk_prefill_size = _chunk_prefill_size_from_cfg(cfg)
+    if jax.default_backend() != "tpu" or chunk_prefill_size is not None:
+        return request_distribution
+    return jnp.stack((request_distribution[0], request_distribution[0], request_distribution[2])).astype(
+        request_distribution.dtype
+    )
 
 
 def _dp_page_axis(cache_view: RaggedPagesCacheView):
@@ -196,6 +373,45 @@ def _kv_axis(cache_view: RaggedPagesCacheView, sharded_axis: str):
     """
     kv_head_shards = max(1, int(getattr(cache_view.metadata, "kv_head_shards", 1)))
     return sharded_axis if kv_head_shards > 1 else ct.EMPTY
+
+
+def _repeat_kv_heads_to_cache_width(
+    key: Float[Array, "total_tokens num_kv_heads head_dim"],
+    value: Float[Array, "total_tokens num_kv_heads head_dim"],
+    cache_view: RaggedPagesCacheView,
+):
+    """Repeat GQA/MQA KV heads to match a padded TP-sharded cache width.
+
+    When the cache view was allocated with a wider KV-head axis than the
+    model produces (e.g. for TP padding), this duplicates each head along
+    axis 1 until the source matches the cache width.
+
+    Args:
+        key: Ragged keys of shape ``(total_tokens, num_kv_heads, head_dim)``.
+        value: Ragged values of shape ``(total_tokens, num_kv_heads,
+            head_dim)``.
+        cache_view: Cache view whose ``metadata.num_kv_heads`` defines the
+            target width.
+
+    Returns:
+        tuple: ``(key, value)`` widened to match the cache. Returned
+        unchanged when the widths already agree.
+
+    Raises:
+        ValueError: When the cache width is narrower than the source or
+            not an integer multiple of it.
+    """
+    target_num_kv_heads = int(getattr(cache_view.metadata, "num_kv_heads", key.shape[1]))
+    source_num_kv_heads = int(key.shape[1])
+    if target_num_kv_heads == source_num_kv_heads:
+        return key, value
+    if target_num_kv_heads < source_num_kv_heads or target_num_kv_heads % source_num_kv_heads != 0:
+        raise ValueError(
+            "Ragged-page KV cache width is incompatible with the model KV heads: "
+            f"cache num_kv_heads={target_num_kv_heads}, tensor num_kv_heads={source_num_kv_heads}."
+        )
+    repeat_factor = target_num_kv_heads // source_num_kv_heads
+    return jnp.repeat(key, repeat_factor, axis=1), jnp.repeat(value, repeat_factor, axis=1)
 
 
 def _runtime_sharding_resolver(metadata, cache_view):
@@ -269,11 +485,17 @@ class _RaggedPageAttn(OperationImpl):
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
-        """
-        Returns the registered name for this attention implementation.
+        """Return the registered name for this attention implementation.
+
+        Subclasses must override.
 
         Returns:
-            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v3" or "ragged_page_attention_v2".
+            str | tuple[str]: ``"ragged_page_attention_v2"`` or
+            ``"ragged_page_attention_v3"``.
+
+        Raises:
+            NotImplementedError: Always, since the base class has no fixed
+                kernel; concrete subclasses provide the name.
         """
         raise NotImplementedError()
 
@@ -697,6 +919,7 @@ class _RaggedPageAttn(OperationImpl):
             with the mutated ``kv_pages``.
         """
         kv_pages = cache_view.kv_pages
+        key, value = _repeat_kv_heads_to_cache_width(key, value, cache_view)
         kv_cache_dtype = getattr(kv_pages, "dtype", None)
         if kv_cache_dtype is not None and (key.dtype != kv_cache_dtype or value.dtype != kv_cache_dtype):
             if jnp.dtype(kv_cache_dtype).itemsize < max(jnp.dtype(key.dtype).itemsize, jnp.dtype(value.dtype).itemsize):
@@ -739,7 +962,14 @@ class _RaggedPageAttn(OperationImpl):
 
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
         cfg = self.metadata.get_operation_config("ragged_page_attention_v3")
-        cfg = _clamp_tpu_ragged_page_v3_block_config(query, cfg)
+        cfg = _default_tpu_rpa_v3_cfg(
+            cfg,
+            query=query,
+            key=key,
+            kv_pages=kv_pages,
+            context_lens=cache_metadata.context_lens,
+            pages_tables=cache_metadata.pages_tables,
+        )
         common_call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
@@ -804,6 +1034,7 @@ class _RaggedPageAttn(OperationImpl):
 
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
                 local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                local_kernel_distribution = _tpu_mixed_request_distribution(local_distribution, cfg)
                 local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
@@ -819,7 +1050,7 @@ class _RaggedPageAttn(OperationImpl):
                     local_context_lens,
                     local_block_tables,
                     local_query_start_loc,
-                    local_distribution,
+                    local_kernel_distribution,
                     local_softmax_aux,
                     **common_call_kwargs,
                 )
@@ -859,6 +1090,7 @@ class _RaggedPageAttn(OperationImpl):
                 softmax_aux,
             )
         else:
+            kernel_distribution = _tpu_mixed_request_distribution(request_distribution, cfg)
             output, kv_pages = ragged_page_attention_v3(
                 query,
                 key,
@@ -867,7 +1099,7 @@ class _RaggedPageAttn(OperationImpl):
                 cache_metadata.context_lens,
                 cache_metadata.pages_tables.reshape(-1),
                 cache_metadata.query_start_loc,
-                request_distribution,
+                kernel_distribution,
                 softmax_aux,
                 in_specs=(qaxes, kvaxes, kvaxes, kv_pages_spec_replicated, Ps(), Ps(), Ps(), Ps(), sinks_axis),
                 out_specs=(qaxes, kv_pages_spec_replicated),
@@ -1108,11 +1340,10 @@ class RaggedPageAttnV2(_RaggedPageAttn):
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
-        """
-        Returns the registered name for this attention implementation.
+        """Return the registered name for this attention implementation.
 
         Returns:
-            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v2".
+            str: ``"ragged_page_attention_v2"``.
         """
         return "ragged_page_attention_v2"
 
@@ -1121,7 +1352,17 @@ class RaggedPageAttnV2(_RaggedPageAttn):
         cls,
         mode: ExecutionMode = ExecutionMode.MIXED,
     ) -> OperationRequirements:
-        """Returns requirements for RaggedPageAttnV2 (slot mapping based)."""
+        """Return requirements for RaggedPageAttnV2 (slot-mapping based).
+
+        Args:
+            mode: Execution mode (ignored; requirements are the same for
+                all modes).
+
+        Returns:
+            OperationRequirements: V2 requires sequence/context/position
+            metadata plus per-token slot mapping into the paged KV pool;
+            uses :class:`RaggedPagesCacheView`.
+        """
         return (
             RequirementsBuilder("ragged_page_attention_v2")
             .require_metadata(
@@ -1162,11 +1403,10 @@ class RaggedPageAttnV3(_RaggedPageAttn):
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
-        """
-        Returns the registered name for this attention implementation.
+        """Return the registered name for this attention implementation.
 
         Returns:
-            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v3".
+            str: ``"ragged_page_attention_v3"``.
         """
         return "ragged_page_attention_v3"
 
@@ -1175,7 +1415,17 @@ class RaggedPageAttnV3(_RaggedPageAttn):
         cls,
         mode: ExecutionMode = ExecutionMode.MIXED,
     ) -> OperationRequirements:
-        """Returns requirements for RaggedPageAttnV3 (request distribution based)."""
+        """Return requirements for RaggedPageAttnV3 (request-distribution based).
+
+        Args:
+            mode: Execution mode (ignored; requirements are the same for
+                all modes).
+
+        Returns:
+            OperationRequirements: V3 requires sequence/context/position
+            metadata plus the request-distribution triple driving the
+            decode/prefill/mixed dispatch; uses :class:`RaggedPagesCacheView`.
+        """
         return (
             RequirementsBuilder("ragged_page_attention_v3")
             .require_metadata(

@@ -12,16 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ZeroMQ-powered tokenizer and detokenizer clients.
+"""ZeroMQ REQ-socket clients for the tokenizer / detokenizer workers.
 
-This module provides client classes for communicating with tokenizer and
-detokenizer worker processes via ZeroMQ. The clients handle request/response
-serialization and provide a clean API for tokenization and detokenization operations.
+Provides the in-process companions to the worker loops defined in
+``easydel.workers.esurge.pipeline.worker_main``. Each client owns a
+single ``zmq.REQ`` socket guarded by a per-client lock so concurrent
+FastAPI request handlers can share one client instance without
+interleaving send / receive cycles.
+
+Module exports:
+    - :class:`DetokenizerResult`: streaming detokenization payload
+      returned by :meth:`DetokenizerWorkerClient.decode`.
+    - :class:`TokenizerWorkerClient`: thin wrapper around
+      ``tokenize`` / ``drain`` / ``shutdown`` commands on the
+      tokenizer worker.
+    - :class:`DetokenizerWorkerClient`: incremental detokenization
+      client that tracks per-request streamed length to send only the
+      new token delta on subsequent calls.
 
 Note:
-    This module is for internal use only and is not part of EasyDeL's public API.
-    It is only accessible to EasyDeL modules that require external worker processes
-    to handle specific tasks.
+    This module is for internal use only and is not part of EasyDeL's
+    public API.
 """
 
 from __future__ import annotations
@@ -80,20 +91,26 @@ class _BaseWorkerClient:
         self._lock = threading.Lock()
 
     def _request(self, payload: dict) -> dict:
-        """Send a request to the worker and return the response.
+        """Send one REQ/REP round-trip under the client lock.
 
         Args:
-            payload: The request payload to send.
+            payload: Command dictionary; must include a ``cmd`` key the
+                worker recognises.
 
         Returns:
-            The response from the worker.
+            dict: The full Pyobj-decoded worker reply. Subclasses are
+            responsible for inspecting ``status`` and raising on errors.
         """
         with self._lock:
             self._socket.send_pyobj(payload)
             return self._socket.recv_pyobj()
 
     def close(self):
-        """Close the ZeroMQ socket."""
+        """Close the local REQ socket without sending a shutdown command.
+
+        Used in the attached (non-owning) shutdown path where the
+        upstream worker is managed by an external lifecycle.
+        """
         self._socket.close(0)
 
 
@@ -121,17 +138,22 @@ class TokenizerWorkerClient(_BaseWorkerClient):
         super().__init__(endpoint)
 
     def tokenize(self, request_id: str, prompt: str) -> list[int]:
-        """Tokenize a text prompt.
+        """Encode a single text prompt into token ids on the worker.
 
         Args:
-            request_id: Unique identifier for this request.
-            prompt: The text to tokenize.
+            request_id: Unique identifier for this request; currently
+                forwarded but unused by the tokenizer worker (kept for
+                future telemetry / cancellation hooks).
+            prompt: Raw input string to encode.
 
         Returns:
-            List of token IDs.
+            list[int]: Flat list of token ids produced by the worker's
+            HuggingFace ``AutoTokenizer`` for ``prompt``.
 
         Raises:
-            RuntimeError: If the worker returns an error.
+            RuntimeError: When the worker returns a ``status != "ok"``
+                payload (typically caused by an unrecognised command on
+                a mismatched worker version).
         """
         resp = self._request({"cmd": "tokenize", "request_id": request_id, "prompt": prompt})
         if resp.get("status") != "ok":
@@ -139,11 +161,20 @@ class TokenizerWorkerClient(_BaseWorkerClient):
         return resp["tokens"]
 
     def drain(self) -> None:
-        """Ensure all tokenizer-side buffers are flushed."""
+        """Send ``drain`` to the tokenizer worker.
+
+        Tokenization is stateless, so this is effectively a no-op
+        acknowledgement included for symmetry with the detokenizer
+        client's pause / resume flow.
+        """
         self._request({"cmd": "drain"})
 
     def shutdown(self) -> None:
-        """Shutdown the tokenizer worker and close the connection."""
+        """Send ``shutdown`` to the worker then close the local socket.
+
+        Errors from the round-trip (e.g. when the worker has already
+        exited) are swallowed so the local socket is always released.
+        """
         try:
             self._request({"cmd": "shutdown"})
         except Exception:
@@ -189,24 +220,39 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
     ) -> DetokenizerResult:
-        """Decode tokens incrementally.
+        """Stream a detokenization step for a request to the worker.
+
+        Tracks the number of tokens previously sent for ``request_id``
+        in ``self._sent_lengths`` so only the *delta* slice plus a
+        ``token_offset`` is forwarded on subsequent calls. The first
+        call (and any ``finished=True`` call) also sends the full
+        ``tokens`` list so the worker can recover from an out-of-sync
+        offset. ``prompt_context`` is forwarded only once per request;
+        the worker caches it for later calls.
 
         Args:
-            request_id: Unique identifier for this request.
-            generated_tokens: The list of tokens generated so far.
-            finished: Whether generation is complete for this request.
-            skip_special_tokens: Whether to skip special tokens in the final decode.
-            spaces_between_special_tokens: Whether adjacent special tokens should
-                be separated by spaces during decode.
-            prompt_context: Last N prompt token IDs for first-token context.
-                SentencePiece tokenizers need preceding context to avoid
-                spurious leading spaces on the first generated token.
+            request_id: Stable identifier shared with the worker's
+                per-request decoder state.
+            generated_tokens: Full list of generated token ids so far.
+                The client computes the delta against the last call.
+            finished: Whether this is the final detokenization step
+                for the request; on ``True`` the worker re-decodes the
+                full token list once for consistency and drops its
+                state, and the client clears its sent-length record.
+            skip_special_tokens: Forwarded to the tokenizer.
+            spaces_between_special_tokens: Forwarded when supported by
+                the underlying tokenizer.
+            prompt_context: Optional last-N prompt token ids used as
+                context on the very first detokenization step;
+                SentencePiece-style tokenizers need this to avoid
+                spurious leading spaces.
 
         Returns:
-            DetokenizerResult containing the decoded text.
+            DetokenizerResult: Wire reply mapped onto the
+            :class:`DetokenizerResult` dataclass.
 
         Raises:
-            RuntimeError: If the worker returns an error.
+            RuntimeError: When the worker reports ``status != "ok"``.
         """
         prev_sent = int(self._sent_lengths.get(request_id, 0))
         total_tokens = len(generated_tokens)
@@ -239,20 +285,33 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         return DetokenizerResult(**result_payload)
 
     def reset(self, request_id: str) -> None:
-        """Reset the decoding state for a request.
+        """Drop per-request state on both client and worker.
+
+        Used when a request is cancelled or restarted so the worker
+        does not retain stale decoder state for the same id.
 
         Args:
-            request_id: The request ID to reset.
+            request_id: The request id whose state should be cleared.
         """
         self._sent_lengths.pop(request_id, None)
         self._request({"cmd": "reset", "request_id": request_id})
 
     def drain(self) -> None:
-        """Flush all detokenizer state (used during pause/resume)."""
+        """Flush every per-request decoder state on the worker.
+
+        Used during pause / resume cycles when the engine needs the
+        worker to forget all in-flight decoding before reconfiguring.
+        """
         self._request({"cmd": "drain"})
 
     def shutdown(self) -> None:
-        """Shutdown the detokenizer worker and close the connection."""
+        """Send ``shutdown`` to the worker then close the local socket.
+
+        Clears the local sent-length bookkeeping before contacting the
+        worker so a subsequent reuse of the same client (in tests) is
+        safe. Errors from the round-trip are swallowed so the local
+        socket is always released.
+        """
         self._sent_lengths.clear()
         try:
             self._request({"cmd": "shutdown"})

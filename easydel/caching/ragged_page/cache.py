@@ -274,6 +274,16 @@ def _select_compatible_v3_kv_cache_dtype(
         return storage_groups, (storage_groups // kv_head_shards) * packing
 
     def _can_shard(dtype: jnp.dtype) -> tuple[bool, int, int]:
+        """Test whether ``dtype`` admits a clean v3 KV-head shard split.
+
+        Args:
+            dtype: Candidate KV storage dtype.
+
+        Returns:
+            Tuple of ``(can_shard, storage_groups, local_combined_slots)``.
+            ``can_shard`` is ``True`` when each shard receives an even number
+            of combined K/V slots (so whole K/V pairs survive sharding).
+        """
         storage_groups, local_combined_slots = _layout_stats(dtype)
         return local_combined_slots > 0 and local_combined_slots % 2 == 0, storage_groups, local_combined_slots
 
@@ -368,6 +378,33 @@ def _resolve_ragged_cache_layout(
         return kvdtype, 1
 
     return kvdtype, kv_head_shards
+
+
+def _pad_v3_kv_heads_to_shards(num_kv_heads: int, kv_head_shards: int) -> int:
+    """Return the vLLM-style padded KV-head count for TP cache sharding.
+
+    TPU TP meshes can be wider than the model's GQA/MQA KV-head count. In that
+    case a v3 packed cache with the raw head count may be impossible to shard,
+    so older EasyDeL code replicated the whole cache across TP. vLLM instead
+    repeats KV heads up to the TP width before the paged-attention shard map.
+    This helper mirrors that behavior for the static cache shape.
+
+    Args:
+        num_kv_heads: Logical KV-head count for the layer.
+        kv_head_shards: Mesh shard count requested for the KV-head axis.
+
+    Returns:
+        The padded KV-head count: ``kv_head_shards`` when the original count
+        evenly divides it (so we can repeat heads up to the TP width), otherwise
+        the original ``num_kv_heads`` (no safe padding possible).
+    """
+    num_kv_heads = int(num_kv_heads)
+    kv_head_shards = max(1, int(kv_head_shards))
+    if kv_head_shards <= 1 or num_kv_heads >= kv_head_shards:
+        return num_kv_heads
+    if kv_head_shards % num_kv_heads != 0:
+        return num_kv_heads
+    return kv_head_shards
 
 
 def get_page_size_bytes(
@@ -494,6 +531,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     num_kv_heads: int = field(pytree_node=False)
     k_headdim: int = field(pytree_node=False)
     v_headdim: int = field(pytree_node=False)
+    logical_num_kv_heads: int = field(pytree_node=False, default=-1)
     hbm_utilization: float = field(pytree_node=False, default=0.9)
     data_parallel_size: int = field(pytree_node=False, default=1)
     kv_head_shards: int = field(pytree_node=False, default=1)
@@ -525,6 +563,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             mesh: JAX device mesh.
             runtime_sharding_resolver: Partition manager with axis configuration.
             hbm_utilization: Target memory utilization fraction.
+            kv_head_shards: Effective KV-head shard count to scale by. When
+                ``None``, the physical mesh axis size is used instead.
 
         Returns:
             int: Available bytes used for KV page-pool sizing, scaled by
@@ -615,6 +655,20 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         )
         physical_kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
         kvdtype = _canonicalize_dtype(kvdtype)
+        logical_num_kv_heads = int(num_kv_heads)
+        padded_num_kv_heads = (
+            _pad_v3_kv_heads_to_shards(logical_num_kv_heads, physical_kv_head_size)
+            if version == "v3"
+            else logical_num_kv_heads
+        )
+        if padded_num_kv_heads != logical_num_kv_heads:
+            logger.info(
+                "Padding ragged-page v3 KV heads from %s to %s to shard the cache across %s TP KV-head shards.",
+                logical_num_kv_heads,
+                padded_num_kv_heads,
+                physical_kv_head_size,
+            )
+            num_kv_heads = padded_num_kv_heads
         kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
             kvdtype,
             version=version,
@@ -649,6 +703,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
             num_kv_heads=num_kv_heads,
+            logical_num_kv_heads=logical_num_kv_heads,
             k_headdim=k_headdim,
             v_headdim=v_headdim,
             hbm_utilization=hbm_utilization,
@@ -823,20 +878,25 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
 @auto_pytree
 class RaggedPagesCacheView(BaseCacheView):
-    """
-    Represents the view of the Paged Attention KV cache for a single transformer layer.
+    """Per-layer view of the Paged Attention KV cache.
 
-    It holds references to the physical key and value pages allocated for this layer
-    and the associated metadata. It provides methods to write new key/value pairs
-    into the correct pages based on runtime metadata. It inherits from `BaseCacheView`.
+    Holds references to the physical key/value pages allocated for one
+    transformer layer and the associated metadata, and provides the write
+    path used during prefill/decode to land new KV pairs into the correct
+    pages based on runtime metadata. Inherits from :class:`BaseCacheView`.
 
     Attributes:
-        metadata (RaggedPagesCacheConfig): The static configuration metadata for the
-            entire paged cache.
-        layer_index (int): The index of the transformer layer this view corresponds to.
-        kv_pages (tp.Union[cx.Array, ImplicitArray]): The tensor holding all key value pages for this layer.
-            Shape: (num_pages, page_size, aligned_kv_groups, packing, aligned_head_dim).
-            Can be a JAX array or an ImplicitArray if quantization is used.
+        metadata (RaggedPagesCacheConfig): Static configuration metadata for
+            the entire paged cache (shared across all layer views).
+        layer_index (int): Index of the transformer layer this view
+            corresponds to.
+        kv_pages (cx.Array | ImplicitArray): Tensor holding all KV pages
+            for this layer. Shape for v3:
+            ``(num_pages, page_size, storage_groups, packing, head_dim)``;
+            for v2: ``(num_pages, page_size, num_kv_heads*2, head_dim)``.
+            May be an ``ImplicitArray`` when quantization is enabled.
+        runtime_sharding_resolver (RuntimeShardingResolver): Resolver used to
+            recover sharding axes during in-place page updates.
     """
 
     metadata: RaggedPagesCacheConfig
@@ -909,6 +969,10 @@ class RaggedPagesCacheView(BaseCacheView):
             kv_pages=kv_pages,
             runtime_sharding_resolver=runtime_sharding_resolver,
         )
+
+    def reset(self) -> "RaggedPagesCacheView":
+        """Return this cache view with its KV page storage zeroed."""
+        return self.replace(kv_pages=jnp.zeros_like(self.kv_pages))
 
     def concatenate_to_cache(
         self,
@@ -1088,15 +1152,16 @@ class RaggedPagesCacheView(BaseCacheView):
 
 @auto_pytree
 class RaggedPagesCache(BaseCache):
-    """
-    Represents the complete Paged Attention KV cache for all layers of a model.
+    """Multi-layer container for the Paged Attention KV cache.
 
-    It holds a list of `RaggedPagesCacheView` objects, one for each layer.
-    It inherits from `BaseCache`.
+    Holds one :class:`RaggedPagesCacheView` per transformer layer plus
+    convenience methods for serialization and inter-cache slot copies.
+    Inherits from :class:`BaseCache`.
 
     Attributes:
-        views (tp.List[RaggedPagesCacheView]): A list containing the cache view
-            for each layer in the model.
+        views (list[RaggedPagesCacheView | None]): Ordered per-layer cache
+            views. ``None`` entries represent layers whose page buffers have
+            not yet been allocated.
     """
 
     views: list[RaggedPagesCacheView | None]
@@ -1121,20 +1186,24 @@ class RaggedPagesCache(BaseCache):
         runtime_sharding_resolver: RuntimeShardingResolver,
         quantizer: EasyQuantizer | None = None,
     ) -> RaggedPagesCache:
-        """
-        Initializes the entire RaggedPagesCache for all layers.
+        """Initialize the entire ``RaggedPagesCache`` for all layers.
 
-        Creates a list of `RaggedPagesCacheView` instances, one for each layer
-        specified in the `config`, by calling `RaggedPagesCacheView.init` for each layer.
+        Creates a :class:`RaggedPagesCacheView` for each layer specified in
+        ``config`` by delegating to :meth:`RaggedPagesCacheView.init` under a
+        per-layer ``spx.assign_stage`` scope so that staged sharding hints can
+        differ per layer.
 
         Args:
-            mesh (Mesh): The JAX device mesh.
-            config (RaggedPagesCacheConfig): Static configuration for the cache.
-            runtime_sharding_resolver (RuntimeShardingResolver): Manages tensor sharding.
-            quantizer (tp.Optional["EasyQuantizer"]): Optional quantizer to apply.
+            mesh: JAX device mesh used for cache placement and sharding.
+            config: Static configuration for the cache.
+            runtime_sharding_resolver: Manager that resolves logical sharding
+                axes into ``PartitionSpec`` values.
+            quantizer: Optional quantizer to apply to the per-layer page
+                tensors. Defaults to ``None`` (no quantization).
 
         Returns:
-            RaggedPagesCache: An initialized cache object containing views for all layers.
+            RaggedPagesCache: Cache object with one initialized view per
+            transformer layer.
         """
         views = []
         for i in range(config.num_hidden_layers):
@@ -1346,6 +1415,7 @@ class RaggedPagesMetadata:
 
     request_distribution: Int[Array, "3"] | None = None
     num_kv_update_slices: Int[Array, "1"] | None = None
+    spec_recurrent_commit: Int[Array, "2 max_num_reqs"] | None = None
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 
@@ -1386,6 +1456,7 @@ class RaggedPagesMetadata:
             num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             request_distribution=jnp.zeros((3,), dtype=jnp.int32) if version == "v3" else None,
             num_kv_update_slices=jnp.zeros((1,), dtype=jnp.int32) if version == "v2" else None,
+            spec_recurrent_commit=None,
             page_size=page_size,
             version=version,
         )

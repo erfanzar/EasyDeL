@@ -303,28 +303,41 @@ class BaseInferenceApiServer(ABC):
         max_stored_conversations: int = 1_000,
         response_store_client: tp.Any | None = None,
     ) -> None:
-        """
-        Initialize the base inference API server.
+        """Initialize the base inference API server.
+
+        Configures the FastAPI application, thread pool, middleware, CORS, the
+        optional generation-slot limiter, response-store LRU caches, and the
+        OpenAPI security schemes used by the Swagger UI ``Authorize`` button.
 
         Args:
-            max_workers: Maximum number of worker threads
-            enable_cors: Enable CORS middleware
-            cors_origins: Allowed CORS origins
-            max_request_size: Maximum request size in bytes
-            request_timeout: Request timeout in seconds
-            enable_function_calling: Enable function calling support
-            default_function_format: Default format for function calls
-            server_name: Name of the server for FastAPI app
-            server_description: Description of the server
-            server_version: Version of the server
-            enable_auth_ui: Enable "Authorize" button in /docs for API key input
-            max_concurrent_generations: Maximum concurrent inference jobs allowed. ``None`` disables the limiter.
-            overload_message: Custom error message returned when all generation slots are busy.
-            enable_response_store: Enable in-memory storage for /v1/responses conversation state.
-            default_store_responses: Default value for the Responses API ``store`` flag when omitted.
-            max_stored_responses: Maximum stored response objects (LRU evicted).
-            max_stored_conversations: Maximum stored conversation histories (LRU evicted).
-            response_store_client: Optional external store client (for example a ZMQ worker client).
+            max_workers: Maximum number of worker threads for the executor.
+            enable_cors: When ``True``, install the CORS middleware.
+            cors_origins: Allowed CORS origins (defaults to ``["*"]``).
+            max_request_size: Maximum request body size in bytes.
+            request_timeout: Request timeout in seconds (informational).
+            enable_function_calling: Enable the ``/v1/tools`` endpoints.
+            default_function_format: Default :class:`FunctionCallFormat`
+                used when a request omits the format hint.
+            server_name: Name of the server displayed in the FastAPI title.
+            server_description: Description shown in the OpenAPI schema.
+            server_version: Reported server version.
+            enable_auth_ui: When ``True``, enable the "Authorize" button in
+                ``/docs`` for API-key input.
+            max_concurrent_generations: Maximum concurrent inference jobs
+                allowed; ``None`` disables the limiter.
+            overload_message: Error message returned when all generation
+                slots are busy.
+            enable_response_store: Enable in-memory storage for
+                ``/v1/responses`` conversation state.
+            default_store_responses: Default value for the Responses API
+                ``store`` flag when omitted on a request.
+            max_stored_responses: Maximum number of stored response objects
+                (LRU evicted).
+            max_stored_conversations: Maximum number of stored conversation
+                histories (LRU evicted).
+            response_store_client: Optional external store client (for
+                example a ZMQ worker client) used when in-process storage
+                is not desired.
         """
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="inference-worker")
         self.max_request_size = max_request_size

@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import typing as tp
 
-KernelTilePolicy: tp.TypeAlias = tp.Literal["auto", "b16", "b8", "b4"]
-KERNEL_TILE_POLICIES: frozenset[str] = frozenset(("auto", "b16", "b8", "b4"))
+KernelTilePolicy: tp.TypeAlias = tp.Literal["auto", "b16", "b8", "b4", "b2", "b1"]
+KERNEL_TILE_POLICIES: frozenset[str] = frozenset(("auto", "b16", "b8", "b4", "b2", "b1"))
 
 
 def normalize_kernel_tile_policy(policy: str | None) -> KernelTilePolicy:
@@ -38,9 +38,9 @@ def normalize_kernel_tile_policy(policy: str | None) -> KernelTilePolicy:
 
     Args:
         policy: A tile-policy identifier. ``None`` is treated as ``"auto"``.
-            Valid values (case-insensitive) are ``"auto"``, ``"b16"``, ``"b8"``
-            and ``"b4"``, corresponding to autoselect, block-size 16, 8 and 4
-            respectively.
+            Valid values (case-insensitive) are ``"auto"``, ``"b16"``,
+            ``"b8"``, ``"b4"``, ``"b2"`` and ``"b1"``, corresponding to
+            autoselect or a fixed token block size.
 
     Returns:
         KernelTilePolicy: The lower-cased policy string, narrowed to the
@@ -51,5 +51,5 @@ def normalize_kernel_tile_policy(policy: str | None) -> KernelTilePolicy:
     """
     normalized = "auto" if policy is None else str(policy).lower()
     if normalized not in KERNEL_TILE_POLICIES:
-        raise ValueError(f"kernel_tile_policy must be one of 'auto', 'b16', 'b8', or 'b4'; got {policy!r}.")
+        raise ValueError(f"kernel_tile_policy must be one of 'auto', 'b16', 'b8', 'b4', 'b2', or 'b1'; got {policy!r}.")
     return tp.cast(KernelTilePolicy, normalized)

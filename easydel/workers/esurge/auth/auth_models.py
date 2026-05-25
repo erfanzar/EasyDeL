@@ -12,7 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Enhanced authentication models and schemas for eSurge API server."""
+"""Authentication models and schemas for the eSurge API server.
+
+Defines the data classes and string enums that describe a managed API key's
+identity, lifecycle, configuration, and audit trail. Used as the in-memory
+representation by :class:`~easydel.workers.esurge.auth.auth_manager.EnhancedApiKeyManager`,
+serialized to disk by :class:`~easydel.workers.esurge.auth.auth_storage.AuthStorage`,
+and exchanged across the ZMQ boundary by
+:class:`~easydel.workers.esurge.auth.zmq_client.AuthWorkerClient`.
+
+Module exports:
+    - :class:`ApiKeyRole`: RBAC role enum (admin / user / readonly / service).
+    - :class:`ApiKeyStatus`: Lifecycle enum (active / suspended / expired / revoked).
+    - :class:`RateLimitConfig`: Sliding-window request / token rate limits.
+    - :class:`QuotaConfig`: Cumulative lifetime and monthly usage quotas.
+    - :class:`ApiKeyPermissions`: IP / endpoint / model allow-lists.
+    - :class:`ApiKeyMetadata`: Aggregate per-key record.
+    - :class:`AuditLogEntry`: Single audit log row.
+"""
 
 from __future__ import annotations
 

@@ -251,10 +251,14 @@ class FreeCachePageQueue:
             self.fake_free_list_tail.prev_free_page = self.fake_free_list_head
 
     def popleft(self) -> CachePage:
-        """Pop the first free page and reduce num_free_pages by 1.
+        """Pop the first free page and decrement ``num_free_pages``.
 
         Returns:
-            The first free page.
+            The first free page (highest eviction priority).
+
+        Raises:
+            ValueError: If the queue is empty.
+            RuntimeError: If the linked-list pointers are inconsistent.
         """
         if (
             self.fake_free_list_head.next_free_page is self.fake_free_list_tail
@@ -277,13 +281,17 @@ class FreeCachePageQueue:
         return first_page
 
     def popleft_n(self, n: int) -> list[CachePage]:
-        """Pop the first n free pages and reduce num_free_pages by n.
+        """Pop the first ``n`` free pages and decrement ``num_free_pages``.
 
         Args:
-            n: The number of pages to pop.
+            n: The number of pages to pop. Returning ``0`` is valid and
+                yields an empty list.
 
         Returns:
-            A list of n free pages.
+            A list of ``n`` free pages in queue order.
+
+        Raises:
+            AssertionError: If ``num_free_pages < n``.
         """
         if n == 0:
             return []
@@ -308,10 +316,14 @@ class FreeCachePageQueue:
         return ret
 
     def remove(self, page: CachePage) -> None:
-        """Remove a page in the free list and reduce num_free_pages by 1.
+        """Remove a specific page from the free list.
 
         Args:
-            page: The page to remove.
+            page: The page to remove; must currently be in the free list.
+
+        Raises:
+            RuntimeError: If the page is not properly linked into the
+                free list (missing prev/next pointers).
         """
         if page.prev_free_page is None or page.next_free_page is None:
             raise RuntimeError(f"remove() called on an invalid page: {page}")
@@ -324,11 +336,15 @@ class FreeCachePageQueue:
         self.num_free_pages -= 1
 
     def append(self, page: CachePage) -> None:
-        """Put a page back into the free list and increase
-        num_free_pages by 1.
+        """Append a page to the tail of the free list.
 
         Args:
-            page: The page to append.
+            page: The page to append. Must not be currently linked into the
+                free list.
+
+        Raises:
+            RuntimeError: If the sentinel tail pointer is missing (queue is
+                in an inconsistent state).
         """
         if self.fake_free_list_tail.prev_free_page is None:
             raise RuntimeError("prev_free_page of fake_free_list_tail should always exist")
@@ -343,10 +359,10 @@ class FreeCachePageQueue:
         self.num_free_pages += 1
 
     def append_n(self, pages: list[CachePage]) -> None:
-        """Put a list of pages back into the free list
+        """Append a list of pages to the tail of the free list.
 
         Args:
-            pages: The pages to append.
+            pages: Pages to append, in queue order. An empty list is a no-op.
         """
         if len(pages) == 0:
             return
@@ -364,10 +380,16 @@ class FreeCachePageQueue:
         self.fake_free_list_tail.prev_free_page = last_page
 
     def get_all_free_pages(self) -> list[CachePage]:
-        """Get all free pages in the free list. Mainly used for testing.
+        """Return every page currently in the free list, in queue order.
+
+        Mainly used for testing and DP-shard-aware scanning in
+        :meth:`PagePool.get_new_pages`.
 
         Returns:
-            A list of free pages.
+            List of free pages (head → tail).
+
+        Raises:
+            RuntimeError: If the sentinel head pointer is missing.
         """
         ret = []
         if self.fake_free_list_head.next_free_page is None:
@@ -419,21 +441,28 @@ def hash_page_tokens(
     curr_page_token_ids: Sequence[int],
     extra_keys: tuple[Any, ...] | None = None,
 ) -> PageHash:
-    """Computes a hash value corresponding to the contents of a page and
-    the contents of the preceding page(s). The hash value is used for
-    prefix caching. We use LRU cache for this function to avoid recomputing
-    hash values for the same page contents.
+    """Compute a hash for a single page's contents chained with its parent.
+
+    The hash value is used for prefix caching: each page hash depends on
+    the preceding page's hash, so two requests that share a token prefix
+    produce identical chains and can share KV-cache pages.
 
     Args:
-        parent_page_hash: The hash of the parent page. None
-            if this is the first page.
-        curr_page_token_ids: A list of token ids in the current
-            page. The current page is assumed to be full.
-        extra_keys: Extra keys for the page.
+        hash_function: The hash callable to apply to the
+            ``(parent_hash, tokens, extra_keys)`` tuple. Typically Python's
+            builtin :func:`hash`.
+        parent_page_hash: The hash of the parent page. ``None`` if this is
+            the first page in the sequence; the global ``none_hash`` is
+            substituted in that case.
+        curr_page_token_ids: Sequence of token ids in the current page. The
+            current page is assumed to be full.
+        extra_keys: Extra keys for the page (e.g. multimodal content
+            hashes). ``None`` means no extras.
 
     Returns:
-        The hash value of the page and the token ids in the page.
-        The entire tuple is used as the hash key of the page.
+        A :class:`PageHash` containing the computed integer hash, the token
+        tuple, and the extra keys. The entire tuple is used as the cache key
+        of the page.
     """
     if parent_page_hash is None:
         parent_page_hash = none_hash

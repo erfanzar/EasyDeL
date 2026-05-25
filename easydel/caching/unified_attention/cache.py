@@ -475,6 +475,13 @@ class UnifiedAttentionCacheView(BaseCacheView):
             runtime_sharding_resolver=runtime_sharding_resolver,
         )
 
+    def reset(self) -> "UnifiedAttentionCacheView":
+        """Return this cache view with key/value page storage zeroed."""
+        return self.replace(
+            key_cache=jnp.zeros_like(self.key_cache),
+            value_cache=jnp.zeros_like(self.value_cache),
+        )
+
     def concatenate_to_cache(
         self,
         key: Float[Array, "batch seq_len num_kv_heads head_dim"],

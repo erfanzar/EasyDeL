@@ -47,7 +47,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import NamedTuple, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from jax import Array
 from jax import numpy as jnp
@@ -265,6 +265,12 @@ class ModelRunnerOutput:
 
     token_logprobs: dict[str, float] | None = None
     """Token-level log probabilities by request ID."""
+
+    num_accepted_spec_tokens: dict[str, int] | None = None
+    """Number of speculative draft tokens accepted by request ID."""
+
+    hidden_states: dict[str, Any] | None = None
+    """Optional per-request hidden states exposed for runner-native drafters."""
 
 
 def swap_dict_values(obj: dict[_K, _V], key1: _K, key2: _K) -> None:

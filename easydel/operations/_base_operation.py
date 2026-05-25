@@ -12,9 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Defines the base class for operations within EasyDeL that may have
-backend-specific implementations (CPU, GPU, TPU).
+"""Backend-dispatching base class for EasyDeL kernel-style operations.
+
+This module defines :class:`BaseOperation`, the abstract root of every
+operation that may have multiple backend-specific implementations (TPU, GPU,
+CPU, and the experimental TT backend). The base class wires up:
+
+* A single backend-agnostic implementation (``forward_native``) that every
+  subclass must provide.
+* Per-backend override hooks (``forward_tpu``, ``forward_gpu``, ``forward_cpu``,
+  ``forward_rocm``, ``forward_cuda``, ``forward_tt``) that default to
+  ``forward_native`` so subclasses only override what they care about.
+* A ``__call__`` dispatcher that picks the right ``forward_*`` based on the
+  backend recorded in the instance's :class:`OperationMetadata`, with an
+  environment-variable escape hatch (``FORCE_NATIVE_RUNTIME``) for debugging.
+* A declarative :class:`OperationRequirements` machinery so callers can ask
+  what metadata fields and cache types an operation needs without
+  instantiating it.
+
+It also exposes :class:`OperationRegistry`, a class-decorator registry used
+by the higher-level attention dispatch in
+:mod:`easydel.operations._operation_impl` and the kernels under
+``easydel/operations/kernels/`` to look up implementations by name.
 """
 
 import functools
@@ -40,21 +59,33 @@ logger = get_logger("EasyDeL-BaseOperation")
 
 
 class BaseOperation(ABC):
-    """
-    Abstract Base Class for defining operations with potential backend-specific implementations.
+    """Abstract base for kernel-style operations with backend-specific overrides.
 
-    This class provides a structure for defining a core operation (`forward_native`)
-    and allowing optional, optimized implementations for different hardware backends
-    supported by JAX (TPU, GPU - CUDA/ROCm, CPU).
+    Provides a uniform structure for defining a core operation
+    (:meth:`forward_native`) plus optional, optimized implementations for
+    different JAX hardware backends (TPU, GPU - CUDA/ROCm, CPU, TT). The
+    :meth:`__call__` dispatcher reads ``self.metadata.backend`` and routes the
+    call to the matching ``forward_*`` method, falling back to
+    :meth:`forward_native` when ``FORCE_NATIVE_RUNTIME`` is set.
 
-    The `__call__` method acts as a dispatcher, detecting the current JAX default
-    backend and executing the corresponding `forward_...` method. If a specific
-    backend implementation (e.g., `forward_tpu`) is not overridden in a subclass,
-    it defaults to calling `forward_native`.
+    Subclass contract:
 
-    Subclasses MUST implement the `forward_native` method. They CAN optionally
-    override `forward_tpu`, `forward_gpu`, `forward_cpu`, `forward_rocm`, or
-    `forward_cuda` to provide backend-specific optimizations.
+    * MUST implement :meth:`get_impl_name`, :meth:`get_impl_metadata`, and
+      :meth:`forward_native`.
+    * MAY override :meth:`forward_tpu`, :meth:`forward_gpu`, :meth:`forward_cpu`,
+      :meth:`forward_rocm`, :meth:`forward_cuda`, and :meth:`forward_tt` to
+      provide hardware-specialized variants. Defaults forward to
+      :meth:`forward_native` (and ``forward_cuda``/``forward_rocm`` to
+      :meth:`forward_gpu`).
+    * MAY override :meth:`get_requirements` to declare metadata-field and
+      cache-type requirements consumed by the inference engine.
+
+    Attributes:
+        metadata (OperationMetadata | None): Runtime configuration carried
+            on the instance and consulted by :meth:`__call__` to pick the
+            correct backend dispatch arm. Set by subclasses during
+            initialization; must be non-``None`` before the operation is
+            called.
     """
 
     metadata: OperationMetadata | None = None
@@ -62,23 +93,23 @@ class BaseOperation(ABC):
     @classmethod
     @abstractmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
-        """
-        Returns the unique name(s) identifying this attention implementation.
+        """Return the unique name(s) identifying this implementation.
 
-        Used by the `OperationRegistry`. Can return a single string or a tuple/list
-        of strings if the implementation has multiple aliases.
+        Used by :class:`OperationRegistry` for registration and lookup. May
+        return either a single string or a tuple of strings when the
+        implementation should be discoverable under multiple aliases.
 
         Returns:
-            A string or tuple/list of strings representing the implementation name(s).
+            A single name or a tuple of aliases identifying this operation.
         """
 
     @abstractmethod
     def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the `OperationMetadata` associated with this implementation instance.
+        """Return the :class:`OperationMetadata` carried by this instance.
 
         Returns:
-            The `OperationMetadata` instance passed during initialization.
+            The metadata supplied during construction. Concrete subclasses
+            typically just return ``self.metadata``.
         """
 
     @classmethod
@@ -86,24 +117,28 @@ class BaseOperation(ABC):
         cls,
         mode: ExecutionMode = ExecutionMode.MIXED,
     ) -> OperationRequirements:
-        """
-        Returns the operation requirements for metadata and cache types.
+        """Declare the metadata fields and cache types this operation needs.
 
-        Operations override this method to declare:
-        - Required metadata fields (sequence lengths, page tables, etc.)
-        - Supported cache types (transformer, ragged pages, hybrid, etc.)
+        Subclasses override this to advertise:
 
-        The inference engine uses these requirements to:
-        - Build only necessary metadata (avoiding unnecessary computation)
-        - Validate cache compatibility at initialization
-        - Provide clear error messages when requirements aren't met
+        * Required metadata fields (sequence lengths, page tables, segment
+          ids, etc.).
+        * Supported cache types (transformer, ragged pages, hybrid, etc.).
+
+        The inference engine consults the returned requirements to build only
+        the necessary metadata, validate cache compatibility up-front, and
+        emit clear errors when an operation cannot be paired with the
+        engine's selected cache backend.
 
         Args:
-            mode: The execution mode (prefill, decode, or mixed). Some operations
-                  may have different requirements based on the mode.
+            mode: Execution mode (``PREFILL``, ``DECODE``, or ``MIXED``).
+                Some operations expose different requirements per mode
+                (e.g. decode-only paged variants).
 
         Returns:
-            OperationRequirements declaring metadata and cache needs.
+            OperationRequirements describing metadata and cache needs. The
+            default implementation returns "basic metadata + any cache",
+            which is suitable for unconstrained training-time operators.
 
         Example:
             >>> from easydel.operations.requirements import (
@@ -128,41 +163,43 @@ class BaseOperation(ABC):
         )
 
     def current_backend(self) -> tp.Literal["tpu", "gpu", "cpu"]:
-        """
-        Returns the current JAX default backend as a lowercase string literal.
+        """Return the current JAX default backend as a lowercase string.
 
         Returns:
-            "tpu", "gpu", or "cpu".
+            One of ``"tpu"``, ``"gpu"``, or ``"cpu"`` as reported by
+            :func:`jax.default_backend`. Note: this is *not* what
+            :meth:`__call__` dispatches on — dispatch uses
+            ``self.metadata.backend`` instead.
         """
         return jax.default_backend()  # type: ignore[return-value]
 
     @abstractmethod
     def forward_native(self, *args, **kwargs) -> tp.Any:
-        """
-        The core, backend-agnostic implementation of the operation.
+        """Backend-agnostic implementation of the operation.
 
-        This method MUST be implemented by any concrete subclass of `BaseOperation`.
-        It serves as the default implementation if no backend-specific override
-        is available or applicable.
+        Subclasses MUST implement this method. It is the default that every
+        other ``forward_*`` falls back to when no hardware-specialized path
+        is provided, and it is also the path forced by
+        ``FORCE_NATIVE_RUNTIME=1``.
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
-            The result of the operation. Type depends on the specific operation.
+            The result of the operation. Concrete type depends on the
+            subclass.
         """
 
     def forward_tpu(self, *args, **kwargs) -> tp.Any:
-        """
-        TPU-specific implementation of the operation.
+        """TPU-specific implementation of the operation.
 
-        Defaults to calling `forward_native`. Subclasses can override this for
-        TPU-specific optimizations.
+        Defaults to :meth:`forward_native`. Override in subclasses to call
+        into a TPU-optimized kernel (typically a Pallas/Mosaic kernel).
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
             The result of the operation, potentially optimized for TPU.
@@ -170,15 +207,14 @@ class BaseOperation(ABC):
         return self.forward_native(*args, **kwargs)
 
     def forward_tt(self, *args, **kwargs) -> tp.Any:
-        """
-        TT-specific implementation of the operation.
+        """Tenstorrent-specific implementation of the operation.
 
-        Defaults to calling `forward_native`. Subclasses can override this for
-        TT-specific optimizations.
+        Defaults to :meth:`forward_native`. Override in subclasses to call
+        into a Tenstorrent-optimized kernel.
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
             The result of the operation, potentially optimized for TT.
@@ -186,15 +222,14 @@ class BaseOperation(ABC):
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> tp.Any:
-        """
-        CPU-specific implementation of the operation.
+        """CPU-specific implementation of the operation.
 
-        Defaults to calling `forward_native`. Subclasses can override this for
-        CPU-specific optimizations (though often `forward_native` is sufficient).
+        Defaults to :meth:`forward_native`. Most operations have nothing
+        CPU-specific to add, so this is rarely overridden.
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
             The result of the operation, potentially optimized for CPU.
@@ -202,16 +237,15 @@ class BaseOperation(ABC):
         return self.forward_native(*args, **kwargs)
 
     def forward_gpu(self, *args, **kwargs) -> tp.Any:
-        """
-        Generic GPU-specific implementation of the operation.
+        """Generic GPU implementation of the operation.
 
-        Defaults to calling `forward_native`. This method serves as the base
-        for CUDA and ROCm backends unless they are specifically overridden.
-        Subclasses can override this for general GPU optimizations.
+        Defaults to :meth:`forward_native`. Serves as the common fallback
+        for both CUDA and ROCm — :meth:`forward_cuda` and
+        :meth:`forward_rocm` delegate here unless overridden.
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
             The result of the operation, potentially optimized for GPUs.
@@ -219,53 +253,58 @@ class BaseOperation(ABC):
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> tp.Any:
-        """
-        ROCm (AMD GPU)-specific implementation of the operation.
+        """ROCm (AMD GPU)-specific implementation of the operation.
 
-        Defaults to calling `forward_gpu`. Subclasses can override this for
-        optimizations specific to the ROCm platform, if necessary.
+        Defaults to :meth:`forward_gpu`. Override only when a ROCm-specific
+        code path is needed (rare in EasyDeL today).
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
-            The result of the operation, potentially optimized for ROCm GPUs.
+            The result of the operation, potentially optimized for ROCm.
         """
         return self.forward_gpu(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> tp.Any:
-        """
-        CUDA (NVIDIA GPU)-specific implementation of the operation.
+        """CUDA (NVIDIA GPU)-specific implementation of the operation.
 
-        Defaults to calling `forward_gpu`. Subclasses can override this for
-        optimizations specific to the CUDA platform, if necessary.
+        Defaults to :meth:`forward_gpu`. Override when a kernel is
+        specifically tuned for or depends on CUDA-only features
+        (e.g. Triton/CUDA-graphs paths).
 
         Args:
-            *args: Positional arguments for the operation.
-            **kwargs: Keyword arguments for the operation.
+            *args: Positional arguments forwarded by :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded by :meth:`__call__`.
 
         Returns:
-            The result of the operation, potentially optimized for CUDA GPUs.
+            The result of the operation, potentially optimized for CUDA.
         """
         return self.forward_gpu(*args, **kwargs)
 
     def __call__(self, *args, **kwargs) -> tp.Any:
-        """
-        Executes the appropriate forward method based on the detected JAX backend.
+        """Dispatch to the backend-appropriate ``forward_*`` method.
 
-        This method determines the current `jax.default_backend()` and dispatches
-        the call to the corresponding `forward_...` method (e.g., `forward_tpu`
-        if the backend is TPU). It logs which execution path is taken at the
-        DEBUG level. If the backend is not explicitly recognized, it falls back
-        to `forward_native`.
+        Reads ``self.metadata.backend`` and routes to :meth:`forward_tpu`,
+        :meth:`forward_gpu`, :meth:`forward_tt`, or :meth:`forward_native`
+        (used for CPU). The ``FORCE_NATIVE_RUNTIME`` environment flag (see
+        :func:`easydel.utils.helpers.check_bool_flag`) short-circuits
+        dispatch to :meth:`forward_native` for debugging.
 
         Args:
-            *args: Positional arguments to pass to the forward method.
-            **kwargs: Keyword arguments to pass to the forward method.
+            *args: Positional arguments forwarded to the resolved
+                ``forward_*`` method.
+            **kwargs: Keyword arguments forwarded to the resolved
+                ``forward_*`` method.
 
         Returns:
-            The result returned by the executed forward method.
+            The value returned by the selected ``forward_*`` method.
+
+        Raises:
+            RuntimeError: If ``self.metadata.backend`` is not one of the
+                recognised :class:`~easydel.infra.etils.EasyDeLBackends`
+                values.
         """
 
         if check_bool_flag("FORCE_NATIVE_RUNTIME", False):
@@ -307,39 +346,44 @@ _I = tp.TypeVar("ICa", bound=BaseOperation)
 
 
 class OperationRegistry:
-    """
-    Registry for discovering and managing different `OperationImpl` classes.
+    """Class-level registry of :class:`BaseOperation` implementations.
 
-    Allows registering implementations using a decorator and retrieving or
-    instantiating them by name.
+    Acts as a name-keyed plugin table populated by the
+    :meth:`OperationRegistry.register` decorator and read by the inference
+    engine and attention dispatch layers to materialize operations on demand.
+    Registration is performed at import time; the registry holds *classes*,
+    not instances, and :meth:`create` is the canonical instantiation path.
+
+    Attributes:
+        _registry (ClassVar[dict[str, type[BaseOperation]]]): Mapping from
+            registered implementation name to the operation class. Populated
+            by :meth:`register` and queried by :meth:`get`, :meth:`create`,
+            and :meth:`list_implementations`.
     """
 
     _registry: tp.ClassVar[dict[str, type[BaseOperation]]] = {}
 
     @classmethod
     def register(cls, impl_cls: type[_I]) -> type[_I]:
-        """
-        Class method decorator to register an `OperationImpl` subclass.
+        """Class decorator that registers an operation implementation.
 
-        The implementation is registered under the name(s) returned by its
-        `get_impl_name()` class method.
+        The implementation is registered under each name returned by
+        ``impl_cls.get_impl_name()``. If the same name is registered twice
+        the second registration wins and a warning is logged.
 
         Example:
-        ```python
-        @OperationRegistry.register
-        class FlashOperationImpl(OperationImpl):
-          @classmethod
-          def get_impl_name(cls) -> str:
-            return "flash"
-
-          # ... implementation ...
-        ```
+            >>> @OperationRegistry.register
+            ... class FlashOperationImpl(OperationImpl):
+            ...     @classmethod
+            ...     def get_impl_name(cls) -> str:
+            ...         return "flash"
+            ...     # ... implementation ...
 
         Args:
-            impl_cls: The `OperationImpl` subclass to register.
+            impl_cls: The :class:`BaseOperation` subclass to register.
 
         Returns:
-            The registered class itself.
+            The registered class, unchanged (so the decorator is transparent).
         """
 
         impl_names_raw: str | tuple[str, ...] = impl_cls.get_impl_name()
@@ -360,18 +404,19 @@ class OperationRegistry:
 
     @classmethod
     def get(cls, impl_name: str) -> type[BaseOperation] | None:
-        """
-        Retrieves an attention implementation class by its registered name.
+        """Look up an operation implementation class by registered name.
 
         Args:
-            impl_name: The name of the implementation to retrieve.
+            impl_name: Name the implementation was registered under (see
+                :meth:`register`).
 
         Returns:
-            The `OperationImpl` subclass registered under the given name,
-            or None if not found.
+            The :class:`BaseOperation` subclass registered for ``impl_name``.
 
         Raises:
-            ValueError: If no implementation is registered with that name.
+            ValueError: If no implementation is registered under
+                ``impl_name``. The error message includes the list of all
+                available implementations.
         """
         is_registered: bool = impl_name in cls._registry
         if not is_registered:
@@ -389,26 +434,30 @@ class OperationRegistry:
         metadata: OperationMetadata,
         requires_cache: bool | None = None,
     ) -> BaseOperation:
-        """
-        Creates an instance of an attention implementation by name.
+        """Look up and instantiate an operation implementation by name.
 
-        Retrieves the class associated with `impl_name` and initializes it
-        with the provided `metadata`.
+        Retrieves the class registered for ``impl_name`` via :meth:`get` and
+        constructs it with the supplied ``metadata``. When ``requires_cache``
+        is given, the metadata's ``requires_cache`` field is mutated to that
+        value before construction so the new instance reports the override
+        through :meth:`OperationImpl.get_instance_requirements`.
 
         Args:
-            impl_name: The name of the implementation to instantiate.
-            metadata: The `OperationMetadata` to pass to the implementation's constructor.
-            requires_cache: Optional override for cache requirements. If provided,
-                overrides the metadata's requires_cache setting for this instance.
-                - None: Use metadata's requires_cache (or class default if metadata is None)
-                - False: Disable cache (e.g., for vision encoders)
-                - True: Force cache requirement
+            impl_name: Registered name of the implementation to instantiate.
+            metadata: Runtime configuration handed to the constructor.
+            requires_cache: Optional instance-level override for the
+                operation's cache requirement.
+
+                * ``None`` — keep ``metadata.requires_cache`` as-is.
+                * ``False`` — disable the cache (e.g., for vision encoders).
+                * ``True`` — force the operation to require a cache.
 
         Returns:
-            An initialized instance of the requested `OperationImpl` subclass.
+            A freshly constructed :class:`BaseOperation` subclass instance.
 
         Raises:
-            ValueError: If no implementation is registered with `impl_name`.
+            ValueError: If no implementation is registered under
+                ``impl_name`` (propagated from :meth:`get`).
         """
         # Apply requires_cache override to metadata if provided
         if requires_cache is not None:
@@ -420,10 +469,11 @@ class OperationRegistry:
 
     @classmethod
     def list_implementations(cls) -> list[str]:
-        """
-        Returns a list of names of all registered attention implementations.
+        """Return the names of all registered operation implementations.
 
         Returns:
-            A list of strings, where each string is a registered implementation name.
+            A list of registered implementation names. Multiple entries may
+            point to the same class when that class declares aliases via
+            :meth:`BaseOperation.get_impl_name`.
         """
         return list(cls._registry.keys())

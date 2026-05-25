@@ -68,6 +68,7 @@ import threading
 import time
 import typing
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
@@ -79,6 +80,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
+from easydel.inference.speculative import DrafterProtocol
 from easydel.utils import Registry
 
 if typing.TYPE_CHECKING:
@@ -89,6 +91,7 @@ from .config import (
     eSurgeCacheRuntimeConfig,
     eSurgeContextConfig,
     eSurgeDistributedConfig,
+    eSurgeDrafterConfig,
     eSurgeParsingConfig,
     eSurgeRuntimeConfig,
     eSurgeVisionConfig,
@@ -483,10 +486,14 @@ class eSurge(
         parsing: eSurgeParsingConfig | typing.Mapping[str, Any] | None = None,
         vision: eSurgeVisionConfig | typing.Mapping[str, Any] | None = None,
         distributed: eSurgeDistributedConfig | typing.Mapping[str, Any] | None = None,
+        drafter: DrafterProtocol | bool | typing.Mapping[str, Any] | None = None,
+        drafter_config: eSurgeDrafterConfig | typing.Mapping[str, Any] | None = None,
+        assistant_model: str | EasyDeLBaseModule | None = None,
+        num_draft_tokens: int | None = None,
     ):
         """Initialize the eSurge engine.
 
-        The engine accepts seven sectioned configs (each a ``TypedDict``-backed
+        The engine accepts sectioned configs (each a ``TypedDict``-backed
         ``ConfigDict`` from :mod:`easydel.inference.esurge.config`). Each config
         argument may be passed as the typed object, a plain mapping with the
         same field names, or ``None`` (in which case all defaults are used).
@@ -512,7 +519,8 @@ class eSurge(
                   tile policy.
                 - ``max_model_len`` (int): Maximum sequence length (prompt + new).
                 - ``min_input_pad`` (int): Minimum padded input length per step.
-                - ``min_token_pad`` (int | None): Minimum padded total token count.
+                - ``min_token_pad`` (int | None): Minimum padded total token count;
+                  normal decode buckets are floored at 16 tokens.
                 - ``max_num_seqs`` (int): Maximum number of concurrent sequences.
                 - ``max_num_seq_buckets`` (list[int] | tuple[int, ...] | None):
                   Optional bucket sizes for batch padding.
@@ -639,6 +647,19 @@ class eSurge(
                   sampling digests across ranks.
 
                 Consumed via ``Unpack[eSurgeDistributedConfig]``.
+            drafter (DrafterProtocol | bool | Mapping[str, Any] | None):
+                Explicit drafter object, ``True`` for auto drafter construction,
+                or a config mapping treated as ``drafter_config`` for concise
+                calls.
+            drafter_config (eSurgeDrafterConfig | Mapping[str, Any] | None):
+                Declarative drafter settings. When enabled, eSurge calls
+                ``model.drafter(method=..., num_draft_tokens=..., ...)`` after
+                the target model is loaded.
+            assistant_model (str | EasyDeLBaseModule | None): Legacy assistant
+                drafter shortcut. Prefer ``drafter_config={"method":
+                "gemma4_assistant", "assistant_model": ...}``.
+            num_draft_tokens (int | None): Legacy override for drafter token
+                count. Prefer putting it in ``drafter_config``.
 
         Raises:
             ValueError: If processor/tokenizer cannot be inferred, if a
@@ -678,6 +699,12 @@ class eSurge(
         self.parsing_config = eSurgeParsingConfig.coerce_config(parsing)
         self.vision_config = eSurgeVisionConfig.coerce_config(vision)
         self.distributed_config = eSurgeDistributedConfig.coerce_config(distributed)
+        if isinstance(drafter, Mapping):
+            if drafter_config is not None:
+                raise ValueError("Pass either `drafter` as a config mapping or `drafter_config`, not both.")
+            drafter_config = drafter
+            drafter = None
+        self.drafter_config = eSurgeDrafterConfig.coerce_config(drafter_config)
 
         # Backward-compatible public aliases.  The sectioned configs above are
         # the source of truth, but server/eval adapters still read these names.
@@ -1021,6 +1048,68 @@ class eSurge(
             except KeyError:
                 logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
 
+        auto_drafter_requested = drafter is True
+        if drafter is True or drafter is False:
+            drafter = None
+
+        if self.drafter_config.enabled:
+            if drafter is not None:
+                raise ValueError("Pass either an explicit `drafter` object or `drafter_config`, not both.")
+            drafter_kwargs = dict(self.drafter_config.kwargs or {})
+            if self.drafter_config.target_embed_module is not None:
+                drafter_kwargs.setdefault("target_embed_module", self.drafter_config.target_embed_module)
+            if self.drafter_config.layer_mapping is not None:
+                drafter_kwargs.setdefault("layer_mapping", list(self.drafter_config.layer_mapping))
+            configured_assistant_model = self.drafter_config.assistant_model
+            if configured_assistant_model is not None:
+                assistant_model = configured_assistant_model
+            if num_draft_tokens is not None:
+                self.drafter_config.num_draft_tokens = int(num_draft_tokens)
+            if assistant_model is not None and isinstance(assistant_model, str):
+                assistant_loading = self.loading_kwargs.to_dict()
+                assistant_loading["pretrained_model_name_or_path"] = assistant_model
+                assistant_loading["dtype"] = dtype
+                assistant_loading["param_dtype"] = dtype
+                assistant_loading.pop("processor", None)
+                assistant_loading.pop("tokenizer", None)
+                assistant_loading.pop("config_kwargs", None)
+                assistant_model = AutoEasyDeLModelForCausalLM.from_pretrained(**assistant_loading)
+            drafter = model.drafter(
+                method=self.drafter_config.method or "auto",
+                num_draft_tokens=int(self.drafter_config.num_draft_tokens),
+                assistant_model=assistant_model,
+                **drafter_kwargs,
+            )
+
+        if drafter is None and assistant_model is not None:
+            if isinstance(assistant_model, str):
+                assistant_loading = self.loading_kwargs.to_dict()
+                assistant_loading["pretrained_model_name_or_path"] = assistant_model
+                assistant_loading["dtype"] = dtype
+                assistant_loading["param_dtype"] = dtype
+                assistant_loading.pop("processor", None)
+                assistant_loading.pop("tokenizer", None)
+                assistant_loading.pop("config_kwargs", None)
+                assistant_model = AutoEasyDeLModelForCausalLM.from_pretrained(**assistant_loading)
+            drafter = model.drafter(
+                method="gemma4_assistant",
+                assistant_model=assistant_model,
+                num_draft_tokens=1 if num_draft_tokens is None else int(num_draft_tokens),
+            )
+
+        if auto_drafter_requested and drafter is None:
+            drafter = model.drafter(
+                method="auto",
+                num_draft_tokens=1 if num_draft_tokens is None else int(num_draft_tokens),
+            )
+        if drafter is not None and num_draft_tokens is not None:
+            drafter.num_draft_tokens = int(num_draft_tokens)
+        self.drafter = drafter
+        runner_async_scheduling = bool(self.runtime_config.async_scheduling)
+        if drafter is not None and runner_async_scheduling:
+            logger.warning("Disabling async scheduling for runner-native speculative decoding.")
+            runner_async_scheduling = False
+
         max_num_batched_tokens = self.runtime_config.max_num_batched_tokens
         if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
             max_num_batched_tokens = min(max(2048, self.runtime_config.max_num_seqs), self.runtime_config.max_model_len)
@@ -1062,7 +1151,7 @@ class eSurge(
             min_input_pad=self.runtime_config.min_input_pad,
             max_num_seqs=self.runtime_config.max_num_seqs,
             max_num_seq_buckets=self.runtime_config.max_num_seq_buckets,
-            async_scheduling=bool(self.runtime_config.async_scheduling),
+            async_scheduling=runner_async_scheduling,
             min_token_pad=self.runtime_config.min_token_pad,
             use_aot_forward=self.runtime_config.use_aot_forward,
             verbose=self.runtime_config.runner_verbose,
@@ -1071,6 +1160,7 @@ class eSurge(
             mpmd_scheduler=self.runtime_config.mpmd_scheduler,
             pp_microbatch_count=self.runtime_config.pp_microbatch_count,
             pp_microbatch_size=self.runtime_config.pp_microbatch_size,
+            drafter=drafter,
         )
 
         if self.runtime_config.compile_runner:
@@ -1091,8 +1181,9 @@ class eSurge(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
-            async_scheduling=bool(self.runtime_config.async_scheduling),
+            async_scheduling=runner_async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
+            num_speculative_tokens=self.runner.num_speculative_tokens,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
 

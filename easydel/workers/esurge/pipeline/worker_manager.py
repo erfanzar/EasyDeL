@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lifecycle manager for tokenizer and detokenizer ZeroMQ workers.
+"""Lifecycle manager for tokenizer / detokenizer ZeroMQ workers.
 
-This module provides a WorkerManager class that handles the spawning, lifecycle
-management, and cleanup of tokenizer and detokenizer worker processes that communicate
-via ZeroMQ endpoints.
+Owns the spawn / wait-for-bind / shutdown dance for the two pipeline
+worker subprocesses defined in
+``easydel.workers.esurge.pipeline.worker_main``. Each manager is
+responsible for at most one tokenizer worker and at most one
+detokenizer worker; either or both can be replaced by externally
+managed endpoints passed into :meth:`WorkerManager.start`.
+
+Module exports:
+    - :class:`WorkerManager`: spawn / connect / drain / shutdown
+      wrapper that returns connected :class:`TokenizerWorkerClient` and
+      :class:`DetokenizerWorkerClient` instances.
+    - :data:`DEFAULT_WORKER_STARTUP_TIMEOUT`: default seconds the
+      manager waits for each worker to bind its ZMQ endpoint.
 
 Note:
-    This module is for internal use only and is not part of EasyDeL's public API.
-    It is only accessible to EasyDeL modules that require external worker processes
-    to handle specific tasks.
+    This module is for internal use only and is not part of EasyDeL's
+    public API.
 """
 
 from __future__ import annotations
@@ -47,11 +56,27 @@ _WORKER_STARTUP_TIMEOUT_ENV_VARS = ("EASURGE_WORKER_STARTUP_TIMEOUT", "ESURGE_WO
 
 
 class WorkerManager:
-    """Spawns and manages tokenizer/detokenizer worker processes and clients.
+    """Spawn and supervise the tokenizer / detokenizer ZMQ worker subprocesses.
 
-    When explicit endpoints are supplied we simply connect to them. Otherwise we
-    automatically launch the bundled ZeroMQ workers under isolated Python
-    interpreters (using ``uv run`` when available) and expose their endpoints.
+    Each worker runs ``worker_main.py`` under a CPU-only Python
+    interpreter. For each worker the manager operates in one of two
+    modes:
+
+    * **Owned**: ``start()`` is called without an endpoint; the
+      manager allocates a unique ``ipc://`` socket under
+      ``ipc_dir``, spawns the subprocess with the configured tokenizer
+      arguments, polls for the socket file to appear, and connects a
+      client. :meth:`shutdown` sends ``shutdown``, terminates the
+      subprocess and unlinks the socket file.
+    * **Attached**: ``start()`` is called with an explicit endpoint;
+      the manager only opens a client and never tries to spawn or
+      terminate the upstream worker.
+
+    Attributes:
+        tokenizer_endpoint (str | None): Endpoint of the tokenizer
+            worker once :meth:`start` succeeds; ``None`` otherwise.
+        detokenizer_endpoint (str | None): Endpoint of the detokenizer
+            worker once :meth:`start` succeeds; ``None`` otherwise.
     """
 
     def __init__(
@@ -197,7 +222,14 @@ class WorkerManager:
         self._detokenizer_endpoint = None
 
     def drain_workers(self) -> None:
-        """Flush in-flight tokenizer/detokenizer state."""
+        """Flush in-flight tokenizer / detokenizer state on both workers.
+
+        Sends ``drain`` to each managed client; for the detokenizer
+        this clears every per-request decoding state, and for the
+        tokenizer it merely acknowledges (the tokenizer is stateless).
+        Failures are logged at ``WARNING`` and otherwise swallowed so
+        the call cannot crash the API server.
+        """
         for name, client in (
             ("tokenizer", self._tokenizer_client),
             ("detokenizer", self._detokenizer_client),

@@ -70,13 +70,19 @@ logger = get_logger(__name__)
 class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
     """Configuration for TurboQuant-compressed ragged pages cache.
 
-    Extends RaggedPagesCacheConfig with TurboQuant-specific parameters.
-    The page layout stores 5 separate tensors per layer instead of one
-    interleaved KV tensor.
+    Extends :class:`RaggedPagesCacheConfig` with TurboQuant-specific
+    parameters. The page layout stores 5 separate tensors per layer
+    (key indices, key signs, key norms, value indices, value norms)
+    instead of one interleaved KV tensor.
 
-    The ``turboquant_config`` and ``turboquant_constants`` fields are
-    marked as non-pytree nodes since they contain configuration and
-    precomputed constants that don't participate in JAX transformations.
+    The ``turboquant_config`` field is marked as a non-pytree node since it
+    holds static configuration that doesn't participate in JAX
+    transformations.
+
+    Attributes:
+        turboquant_config (TurboQuantConfig): TurboQuant algorithm
+            configuration controlling quantization parameters such as the QJL
+            projection dimension and codebook size.
     """
 
     turboquant_config: TurboQuantConfig = field(pytree_node=False, default=None)
@@ -179,11 +185,32 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
     """Per-layer view into the TurboQuant-compressed page cache.
 
     Stores 5 separate page arrays for the compressed KV representation,
-    plus references to precomputed TurboQuant constants.
+    plus references to precomputed TurboQuant constants (rotation matrix,
+    QJL projection, codebooks). The actual cache update is deferred to the
+    ``ragged_page_attention_v3_turboquant`` kernel, which compresses and
+    writes pages internally.
 
-    The ``kv_pages`` field from the parent class is set to a dummy scalar
-    since TurboQuant uses separate arrays. Use the specific page arrays
-    (key_indices_pages, etc.) for actual data access.
+    The ``kv_pages`` field inherited from the parent class is set to a
+    dummy scalar since TurboQuant uses separate arrays. Use the specific
+    page arrays (``key_indices_pages`` etc.) for actual data access.
+
+    Attributes:
+        key_indices_pages (Array): 4-bit packed Lloyd-Max codebook indices
+            for keys. Shape
+            ``(num_pages, page_size, num_kv_heads, head_dim // 2)`` uint8.
+        key_signs_pages (Array): Bit-packed QJL residual signs for keys.
+            Shape ``(num_pages, page_size, num_kv_heads, qjl_dim // 8)``
+            uint8.
+        key_norms_pages (Array): Original + residual key norms.
+            Shape ``(num_pages, page_size, num_kv_heads, 2)`` bf16.
+        value_indices_pages (Array): 4-bit packed Lloyd-Max codebook
+            indices for values.
+            Shape ``(num_pages, page_size, num_kv_heads, head_dim // 2)``
+            uint8.
+        value_norms_pages (Array): Original value norms.
+            Shape ``(num_pages, page_size, num_kv_heads)`` bf16.
+        constants (TurboQuantConstants): Precomputed rotation matrix, QJL
+            projection, and codebooks. Marked non-pytree.
     """
 
     key_indices_pages: Array = None  # int32 (pages, page_size, nkv, packed_idx_dim_aligned)

@@ -183,24 +183,31 @@ class BatchMetadata:
     visual_pos_masks: jax.Array | None = None
     deepstack_visual_embeds: tuple[jax.Array, ...] | None = None
 
+    spec_recurrent_commit: jax.Array | None = None
+
     @property
     def model_input_ids(self) -> jax.Array:
-        """Input ids with any device-resident PP sampled-token handoff applied.
+        """Get input ids with any device-resident PP sampled-token handoff applied.
 
         Pipeline decode has a one-token loop-carried dependency: the token
         sampled by the final pipeline stage on step N is the next input consumed
-        by stage 0 on step N+1.  The host-prepared ``input_ids_buf`` may still
-        contain scheduler placeholders at those positions.  When the optional
+        by stage 0 on step N+1. The host-prepared ``input_ids_buf`` may still
+        contain scheduler placeholders at those positions. When the optional
         handoff buffers are present, this property resolves those placeholders
         inside the compiled model step by selecting replacement ids from the
         fixed-size handoff arrays.
 
-        The handoff arrays are padded to a stable shape, and
+        The handoff arrays are padded to a stable shape;
         ``input_token_handoff_count`` marks the live span length and
         ``input_token_handoff_offset`` selects that span inside the padded
-        arrays.  The offset is what lets PP microbatches reuse the full-window
+        arrays. The offset is what lets PP microbatches reuse the full-window
         sampled-token handoff directly instead of constructing a new device
         scatter buffer for each stage launch.
+
+        Returns:
+            jax.Array: Input token ids with shape matching ``input_ids_buf``,
+                with placeholder positions replaced by the corresponding ids
+                from the device-resident handoff arrays when present.
         """
         if (
             self.input_token_handoff_positions is None
@@ -318,17 +325,35 @@ class BatchMetadata:
 
     @property
     def frequency_penalties(self) -> jax.Array:
-        """Get frequency penalties for each request."""
+        """Get frequency penalties for each request.
+
+        Returns:
+            jax.Array: Frequency penalty values with shape [padded_num_reqs].
+                Values > 0 penalize tokens proportionally to how often they
+                already appear in the generated sequence.
+        """
         return self.packed_f32_padded[3]
 
     @property
     def presence_penalties(self) -> jax.Array:
-        """Get presence penalties for each request."""
+        """Get presence penalties for each request.
+
+        Returns:
+            jax.Array: Presence penalty values with shape [padded_num_reqs].
+                Values > 0 penalize tokens that have appeared at least once
+                in the generated sequence, regardless of frequency.
+        """
         return self.packed_f32_padded[4]
 
     @property
     def repetition_penalties(self) -> jax.Array:
-        """Get repetition penalties for each request."""
+        """Get repetition penalties for each request.
+
+        Returns:
+            jax.Array: Repetition penalty values with shape [padded_num_reqs].
+                Values > 1.0 reduce the probability of previously generated
+                tokens; 1.0 means no penalty.
+        """
         return self.packed_f32_padded[5]
 
     @property
@@ -529,6 +554,8 @@ class StepFunctionInputs:
             lines.append(f"  pixel_values_videos:  {self.batch_metadata.pixel_values_videos.shape}")
         if self.batch_metadata.video_grid_thw is not None:
             lines.append(f"  video_grid_thw:       {self.batch_metadata.video_grid_thw.shape}")
+        if self.batch_metadata.spec_recurrent_commit is not None:
+            lines.append(f"  spec_recurrent_commit:{self.batch_metadata.spec_recurrent_commit.shape}")
         print("\n".join(lines))
 
 

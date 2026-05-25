@@ -74,7 +74,7 @@ from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
-from .inference_conv1d import RaggedCausalConv1D, ragged_causal_conv1d
+from .inference_conv1d import RaggedCausalConv1D, ragged_causal_conv1d, ragged_causal_conv1d_head_sharded
 from .inference_gdn import RaggedGatedDeltaRule
 from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
 from .multi_latent_ragged_page_attention import MultiLatentRaggedPageAttn
@@ -113,4 +113,5 @@ __all__ = (
     "VanillaAttn",
     "fused_kda_gate",
     "ragged_causal_conv1d",
+    "ragged_causal_conv1d_head_sharded",
 )

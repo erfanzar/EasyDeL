@@ -12,7 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Enhanced API key manager with security, rate limiting, and audit logging."""
+"""Enhanced API key manager with security, rate limiting, and audit logging.
+
+This module is the in-process source of truth for eSurge API key state. It
+combines four responsibilities behind :class:`EnhancedApiKeyManager`:
+
+* **Key lifecycle** — minting (``sk-...`` tokens via ``secrets.token_urlsafe``),
+  registration, suspension, revocation, deletion, and rotation. Only SHA-256
+  hashes of secrets are retained on disk and in memory; raw keys leak the
+  process only when first returned to the caller.
+* **Authorisation** — :meth:`EnhancedApiKeyManager.authorize_request` runs the
+  pipeline of validity, IP allow/blocklist, endpoint / model permissions,
+  sliding-window rate limits, and cumulative quotas; rejections raise one of
+  :class:`PermissionDenied`, :class:`RateLimitExceeded`, :class:`QuotaExceeded`.
+* **Accounting** — :meth:`EnhancedApiKeyManager.record_usage` updates lifetime
+  and monthly request / token counters after a request is served and feeds
+  the token rate-limit windows used by the next admission decision.
+* **Audit logging** — every mutating action and every authorisation outcome
+  appends an :class:`AuditLogEntry` to a bounded in-memory ring and is
+  optionally persisted via :class:`AuthStorage` on auto-save ticks.
+
+The manager is safe to call concurrently: a :class:`threading.RLock` (chosen
+so the auto-save callback can re-enter the lock) guards every mutating path.
+"""
 
 from __future__ import annotations
 

@@ -28,6 +28,24 @@ Designed to be spawned by :class:`AuthWorkerManager` under a CPU-only
 JAX configuration (the worker does no model work) so the API server
 can keep authentication state, audit logs and rate-limit windows in a
 single process even when multiple FastAPI workers serve requests.
+
+Invocation:
+    The script is invoked via ``python -m
+    easydel.workers.esurge.auth.worker_main`` with the following CLI
+    options::
+
+        --endpoint <zmq-endpoint>         (required)
+        --require-api-key                 (flag)
+        --admin-key <secret>
+        --enable-audit-logging / --disable-audit-logging
+        --max-audit-entries <int>         (default 10000)
+        --storage-dir <path>
+        --enable-persistence / --disable-persistence
+        --auto-save-interval <seconds>    (default 60.0)
+
+    Before importing JAX-aware modules ``main()`` forces a CPU-only
+    placement and disables distributed init so the auth worker stays
+    out of the way of the model workers.
 """
 
 from __future__ import annotations
@@ -50,19 +68,35 @@ def _auth_worker(
     enable_persistence: bool,
     auto_save_interval: float,
 ) -> None:
-    """Run the auth worker process.
+    """Run the auth worker REQ/REP loop until a ``shutdown`` command arrives.
 
-    This function starts a ZeroMQ server that handles authentication requests.
+    Constructs a single :class:`EnhancedApiKeyManager`, binds a ZMQ
+    ``REP`` socket on ``endpoint``, then serves one Pyobj-encoded
+    command per iteration. Each incoming message must be a dict with a
+    ``cmd`` key whose value selects one of the supported manager
+    operations; the reply is always a dict with a ``status`` of
+    ``"ok"`` or ``"error"`` plus operation-specific payload fields.
+
+    Exceptions raised by the manager during ``authorize_request`` are
+    forwarded with their ``type(e).__name__`` in ``exception_type`` so
+    :class:`AuthWorkerClient` can re-raise the matching local class.
 
     Args:
-            endpoint: ZeroMQ endpoint to bind to.
-            require_api_key: If True, all requests must provide a valid API key.
-            admin_key: Optional admin key for initial setup.
-            enable_audit_logging: Enable audit logging.
-            max_audit_entries: Maximum audit log entries to keep.
-            storage_dir: Directory for persistent storage.
-            enable_persistence: Enable persistent storage.
-            auto_save_interval: Auto-save interval in seconds.
+        endpoint: ZeroMQ endpoint to bind to (e.g. ``ipc:///tmp/auth.sock``
+            or ``tcp://127.0.0.1:5555``).
+        require_api_key: When ``True``, the wrapped manager rejects
+            unauthenticated calls.
+        admin_key: Optional bootstrap admin key passed straight to the
+            manager constructor; refreshed on every restart.
+        enable_audit_logging: Whether the manager records mutation /
+            authorisation events.
+        max_audit_entries: Capacity of the in-memory audit-log ring.
+        storage_dir: Filesystem path for :class:`AuthStorage`. ``None``
+            falls back to ``~/.cache/esurge-auth``.
+        enable_persistence: Whether to attach the on-disk
+            :class:`AuthStorage` and hydrate from it.
+        auto_save_interval: Minimum seconds between auto-saves; also
+            controls how often the dirty flag triggers a flush.
     """
     # Initialize auth manager
     auth_manager = EnhancedApiKeyManager(
@@ -257,7 +291,15 @@ def _auth_worker(
 
 
 def main():
-    """Main entry point for auth worker process."""
+    """CLI entry point: parse arguments, force CPU-only JAX, run the loop.
+
+    Parses ``sys.argv`` for the worker configuration described in the
+    module docstring, sets ``JAX_PLATFORMS=cpu`` (plus
+    ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and
+    ``ENABLE_DISTRIBUTED_INIT=0``) so spawning this script never
+    competes with the model workers for accelerators, then hands off to
+    :func:`_auth_worker`.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--require-api-key", action="store_true")

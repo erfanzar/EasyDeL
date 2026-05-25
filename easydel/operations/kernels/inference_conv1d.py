@@ -30,10 +30,13 @@ Exports:
       can be resolved by name alongside other ragged inference kernels.
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
 
-from easydel.layers.norms import lowfloats
+from easydel.infra.sharding import mesh_axis_size
 
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
@@ -45,12 +48,145 @@ from ..requirements import (
 )
 
 
-@jax.jit(
-    donate_argnames=("conv_state",),
-    static_argnames=("d_conv", "apply_silu"),
-)
-@jax.named_scope("ragged_causal_conv1d_jax")
-def ragged_causal_conv1d(
+def _reorder_concatenated_tensor_for_sharding(
+    concatenated_tensor: jax.Array,
+    split_sizes: tuple[int, ...],
+    n_shards: int,
+    dim: int,
+) -> jax.Array:
+    """Arrange fused ``[A | B | C]`` features as ``[A0 | B0 | C0 | A1 | B1 | C1 | ...]``.
+
+    Reorders the channel axis of a tensor that concatenates several fused
+    feature groups so that, after the same axis is split into ``n_shards``
+    along the mesh, each shard holds an equal slice of *every* original
+    group. This matches the layout that vLLM TPU uses for sharded conv /
+    QKV projections.
+
+    Args:
+        concatenated_tensor: Input tensor with the fused axis to reorder.
+        split_sizes: Sizes of each contiguous group along ``dim`` before
+            reordering. ``sum(split_sizes)`` must equal
+            ``concatenated_tensor.shape[dim]``.
+        n_shards: Number of TP shards the axis will be split into.
+        dim: Axis to reorder. Negative values index from the end.
+
+    Returns:
+        jax.Array: A view with the same shape as ``concatenated_tensor``
+        whose axis ``dim`` is reordered so per-shard slices interleave the
+        original feature groups.
+    """
+    if dim < 0:
+        dim += concatenated_tensor.ndim
+    old_shape = concatenated_tensor.shape
+    new_shape = (*old_shape[:dim], int(n_shards), -1, *old_shape[dim + 1 :])
+    split_tensors = []
+    start_offset = 0
+    for split_size in split_sizes:
+        split_tensor = jax.lax.slice_in_dim(
+            concatenated_tensor,
+            start_offset,
+            start_offset + int(split_size),
+            axis=dim,
+        )
+        split_tensors.append(split_tensor.reshape(new_shape))
+        start_offset += int(split_size)
+    reordered_tensor = jnp.concatenate(split_tensors, axis=dim + 1)
+    return reordered_tensor.reshape(old_shape)
+
+
+def _fix_query_start_loc(query_start_loc: jnp.ndarray, num_valid_seqs: jnp.ndarray) -> jnp.ndarray:
+    """Clamp trailing padding entries of ``query_start_loc`` to a sentinel value.
+
+    The schedule sometimes carries inactive trailing slots whose
+    ``query_start_loc`` entries are not monotone. This helper rewrites all
+    entries past ``num_valid_seqs`` to ``query_start_loc[num_valid_seqs]``
+    so downstream length / boundary arithmetic produces zero-length
+    sequences for those slots.
+
+    Args:
+        query_start_loc: Cumulative per-request token offsets, shape
+            ``(num_slots + 1,)``.
+        num_valid_seqs: Scalar number of valid (non-padding) sequences.
+
+    Returns:
+        jnp.ndarray: A copy of ``query_start_loc`` with padding entries
+        clamped to the last valid offset.
+    """
+    last_valid_loc = query_start_loc[num_valid_seqs]
+    valid_loc_mask = jnp.arange(query_start_loc.shape[0]) <= num_valid_seqs
+    return jnp.where(valid_loc_mask, query_start_loc, last_valid_loc)
+
+
+def _depthwise_conv1d_flat(x: jnp.ndarray, kernel: jnp.ndarray) -> jnp.ndarray:
+    """Run a depthwise causal conv over the flat packed token stream.
+
+    Performs ``out[t, :] = sum_k padded_x[t + k, :] * kernel[:, k]`` with
+    a ``(d_conv - 1)``-wide left pad of zeros, in float32. The output
+    boundary tokens at the seam between requests are *not* yet correct —
+    they are rewritten by the boundary fix-up in
+    :func:`_ragged_causal_conv1d_impl`.
+
+    Args:
+        x: Packed input tokens, shape ``(num_tokens, conv_dim)``.
+        kernel: Depthwise kernel, shape ``(conv_dim, d_conv)``.
+
+    Returns:
+        jnp.ndarray: Conv output in float32, shape
+        ``(num_tokens, conv_dim)``.
+    """
+    num_tokens = x.shape[0]
+    d_conv = kernel.shape[-1]
+    padded_x = jnp.pad(x.astype(jnp.float32), ((d_conv - 1, 0), (0, 0)))
+    kernel = kernel.astype(jnp.float32)
+    out = jnp.zeros((num_tokens, x.shape[-1]), dtype=jnp.float32)
+    for k in range(d_conv):
+        out = out + padded_x[k : k + num_tokens, :] * kernel[None, :, k]
+    return out
+
+
+def _get_boundary_indices(
+    starts: jnp.ndarray,
+    lengths: jnp.ndarray,
+    d_conv: int,
+    num_valid_seqs: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Compute the gather/scatter indices used to fix per-request boundary tokens.
+
+    For each request, the first ``d_conv - 1`` output tokens depend on
+    historical state from the previous step rather than the zeros that the
+    flat conv produced. This helper materialises:
+
+    * ``gather_indices`` — token positions in ``x`` to read the head of
+      each request from (clamped to the request length so we never index
+      past its end).
+    * ``scatter_indices`` — destination output positions to rewrite with
+      the corrected boundary values, with ``-1`` for invalid (padding)
+      entries.
+
+    Args:
+        starts: Per-request start offsets, shape ``(num_slots,)``.
+        lengths: Per-request lengths, shape ``(num_slots,)``.
+        d_conv: Convolution window size.
+        num_valid_seqs: Scalar number of valid sequences.
+
+    Returns:
+        tuple: ``(gather_indices, scatter_indices)`` with shape
+        ``(num_slots, d_conv - 1)`` each, both ``int32``.
+    """
+    valid_mask = jnp.arange(starts.shape[0]) < num_valid_seqs
+    starts = jnp.where(valid_mask, starts, 1)[:, None]
+    lengths = lengths[:, None]
+    k_range = jnp.arange(d_conv - 1)[None, :]
+    gather_indices = starts + jnp.minimum(k_range, lengths - 1)
+    scatter_indices = jnp.where(
+        (k_range < lengths) & valid_mask[:, None],
+        starts + k_range,
+        -1,
+    )
+    return gather_indices, scatter_indices
+
+
+def _ragged_causal_conv1d_impl(
     x: jnp.ndarray,
     conv_state: jnp.ndarray,
     kernel: jnp.ndarray,
@@ -155,37 +291,37 @@ def ragged_causal_conv1d(
     """
     num_tokens, dim = x.shape
     max_reqs = state_indices.shape[0]
-    token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
 
     num_valid_seqs = distribution[2]
-    valid_loc_mask = jnp.arange(query_start_loc.shape[0]) <= num_valid_seqs
-    last_valid_loc = query_start_loc[num_valid_seqs]
-    effective_query_start_loc = jnp.where(valid_loc_mask, query_start_loc, last_valid_loc)
-
-    req_indices = jnp.sum(token_idx[:, None] >= effective_query_start_loc[None, :], axis=1) - 1
-    req_indices = jnp.clip(req_indices, 0, max_reqs - 1)
-    local_indices = token_idx - effective_query_start_loc[req_indices]
+    effective_query_start_loc = _fix_query_start_loc(query_start_loc, num_valid_seqs)
     lengths = effective_query_start_loc[1:] - effective_query_start_loc[:-1]
 
-    if conv_state.dtype in lowfloats or kernel.dtype in lowfloats:
-        compute_dtype = jnp.float32
-    else:
-        compute_dtype = jnp.promote_types(conv_state.dtype, kernel.dtype)
-
     gathered_state = conv_state[state_indices]
-    gathered_state_ct = gathered_state.astype(compute_dtype)
-    x_ct = x.astype(compute_dtype)
-    kernel_ct = kernel.astype(compute_dtype)
 
-    out = jnp.zeros((num_tokens, dim), dtype=compute_dtype)
-    for k in range(d_conv):
-        mask_from_x = local_indices >= k
-        idx_x = jnp.clip(token_idx - k, 0, num_tokens - 1)
-        idx_state_t = jnp.clip(d_conv + local_indices - k, 0, d_conv - 1)
-        x_tokens = x_ct[idx_x]
-        state_tokens = gathered_state_ct[req_indices, :, idx_state_t]
-        token_k = jnp.where(mask_from_x[:, None], x_tokens, state_tokens)
-        out = out + token_k * kernel_ct[None, :, d_conv - 1 - k]
+    out = _depthwise_conv1d_flat(x, kernel)
+
+    starts = effective_query_start_loc[:-1]
+    gather_indices, scatter_indices = _get_boundary_indices(starts, lengths, d_conv, num_valid_seqs)
+    x_first = x[gather_indices]
+    history = gathered_state[:, :, 1:].transpose(0, 2, 1)
+    combined_tokens = jnp.concatenate([history, x_first], axis=1)
+    boundary_out = jax.lax.conv_general_dilated(
+        combined_tokens.astype(jnp.float32),
+        kernel[:, None, :].astype(jnp.float32),
+        window_strides=(1,),
+        padding="VALID",
+        dimension_numbers=("NWC", "OIW", "NWC"),
+        feature_group_count=dim,
+        precision=jax.lax.Precision.HIGHEST,
+    ).reshape(-1, dim)
+    out = out.at[scatter_indices.flatten()].set(
+        boundary_out.astype(out.dtype),
+        mode="drop",
+        wrap_negative_indices=False,
+    )
+    total_valid_tokens = effective_query_start_loc[num_valid_seqs]
+    valid_token_mask = jnp.arange(num_tokens) < total_valid_tokens
+    out = jnp.where(valid_token_mask[:, None], out, 0.0)
 
     if apply_silu:
         out = jax.nn.silu(out)
@@ -220,6 +356,155 @@ def ragged_causal_conv1d(
     )
 
     return out.astype(x.dtype), updated_conv_state
+
+
+@jax.jit(
+    donate_argnames=("conv_state",),
+    static_argnames=("d_conv", "apply_silu"),
+)
+@jax.named_scope("ragged_causal_conv1d_jax")
+def ragged_causal_conv1d(
+    x: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    kernel: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    distribution: jnp.ndarray,
+    *,
+    d_conv: int,
+    apply_silu: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """JIT-compiled entry point for the ragged causal depthwise conv1d.
+
+    Thin wrapper that forwards to :func:`_ragged_causal_conv1d_impl` after
+    being jit-compiled with ``d_conv`` and ``apply_silu`` marked static and
+    ``conv_state`` donated.
+
+    Args:
+        x: Packed input stream, shape ``(num_tokens, conv_dim)``.
+        conv_state: Per-slot rolling state, shape
+            ``(num_slots, conv_dim, d_conv)``. Donated.
+        kernel: Depthwise kernel, shape ``(conv_dim, d_conv)``.
+        query_start_loc: Cumulative per-request token offsets, shape
+            ``(num_slots + 1,)``.
+        state_indices: Request-to-slot mapping, shape ``(num_slots,)``.
+        distribution: ``(decode_end, prefill_end, mixed_end)`` int32
+            triple of shape ``(3,)``.
+        d_conv: Convolution window size (static).
+        apply_silu: Whether to fuse SiLU into the output (static).
+
+    Returns:
+        tuple: ``(output, updated_conv_state)`` matching the return
+        contract of :func:`_ragged_causal_conv1d_impl`.
+    """
+    return _ragged_causal_conv1d_impl(
+        x=x,
+        conv_state=conv_state,
+        kernel=kernel,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        d_conv=d_conv,
+        apply_silu=apply_silu,
+    )
+
+
+def ragged_causal_conv1d_head_sharded(
+    x: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    kernel: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    distribution: jnp.ndarray,
+    *,
+    split_sizes: tuple[int, ...],
+    mesh: object | None,
+    head_axis: object | None,
+    d_conv: int,
+    apply_silu: bool = True,
+    pre_sharded: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Run ragged depthwise conv with the feature axis sharded across the TP mesh.
+
+    When the mesh exposes a non-trivial TP axis and every entry of
+    ``split_sizes`` is divisible by the TP size, the feature axis of ``x``
+    and ``kernel`` is reordered with
+    :func:`_reorder_concatenated_tensor_for_sharding` (unless ``pre_sharded``
+    is ``True``) and the kernel is launched under ``jax.shard_map`` so each
+    rank operates on its head shard. Otherwise the call falls back to the
+    single-device :func:`ragged_causal_conv1d`.
+
+    Args:
+        x: Packed input stream, shape ``(num_tokens, conv_dim)``.
+        conv_state: Per-slot rolling state, shape
+            ``(num_slots, conv_dim, d_conv)``.
+        kernel: Depthwise kernel, shape ``(conv_dim, d_conv)``.
+        query_start_loc: Cumulative per-request token offsets, shape
+            ``(num_slots + 1,)``.
+        state_indices: Request-to-slot mapping, shape ``(num_slots,)``.
+        distribution: ``(decode_end, prefill_end, mixed_end)`` triple of
+            shape ``(3,)``.
+        split_sizes: Sizes of the fused feature groups making up
+            ``conv_dim`` (e.g. one per Q/K/V projection).
+        mesh: Optional spectrax/jax mesh carrying ``head_axis``.
+        head_axis: Mesh axis name used for TP-sharding the feature axis.
+        d_conv: Convolution window size (static for the inner JIT).
+        apply_silu: Whether to fuse SiLU into the output.
+        pre_sharded: When ``True``, ``x`` and ``kernel`` are already in the
+            interleaved-per-shard layout; skip the reordering step.
+
+    Returns:
+        tuple: ``(output, updated_conv_state)`` matching the return
+        contract of :func:`ragged_causal_conv1d`.
+    """
+    tp_size = mesh_axis_size(mesh, head_axis)
+    can_head_shard = (
+        mesh is not None
+        and head_axis is not None
+        and int(tp_size) > 1
+        and all(int(size) % int(tp_size) == 0 for size in split_sizes)
+    )
+    if not can_head_shard:
+        return ragged_causal_conv1d(
+            x,
+            conv_state,
+            kernel,
+            query_start_loc,
+            state_indices,
+            distribution,
+            d_conv=d_conv,
+            apply_silu=apply_silu,
+        )
+
+    if not pre_sharded:
+        x = _reorder_concatenated_tensor_for_sharding(x, split_sizes, int(tp_size), -1)
+        kernel = _reorder_concatenated_tensor_for_sharding(kernel, split_sizes, int(tp_size), 0)
+
+    feature_spec = PartitionSpec(None, head_axis)
+    state_spec = PartitionSpec(None, head_axis, None)
+    kernel_spec = PartitionSpec(head_axis, None)
+    replicated = PartitionSpec()
+
+    @partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(feature_spec, state_spec, kernel_spec, replicated, replicated, replicated),
+        out_specs=(feature_spec, state_spec),
+        check_vma=False,
+    )
+    def _mapped(local_x, local_state, local_kernel, local_qsl, local_si, local_dist):
+        return _ragged_causal_conv1d_impl(
+            x=local_x,
+            conv_state=local_state,
+            kernel=local_kernel,
+            query_start_loc=local_qsl,
+            state_indices=local_si,
+            distribution=local_dist,
+            d_conv=d_conv,
+            apply_silu=apply_silu,
+        )
+
+    return _mapped(x, conv_state, kernel, query_start_loc, state_indices, distribution)
 
 
 @OperationRegistry.register

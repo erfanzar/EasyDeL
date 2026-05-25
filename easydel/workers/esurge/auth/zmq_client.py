@@ -107,16 +107,26 @@ class AuthWorkerClient:
         self._endpoint = endpoint
 
     def _request(self, payload: dict) -> dict:
-        """Send a request to the worker and return the response.
+        """Send one REQ/REP round-trip and translate worker errors.
+
+        Serialises ``payload`` with :meth:`zmq.Socket.send_pyobj`, blocks
+        for the reply, and inspects its ``status`` field. Errors carrying
+        the special ``exception_type`` markers are re-raised as the
+        matching client-side mirror class so callers see the same
+        exception hierarchy as if they were using
+        :class:`EnhancedApiKeyManager` directly.
 
         Args:
-                payload: The request payload to send.
+            payload: Command dictionary; must include a ``cmd`` key.
 
         Returns:
-                The response from the worker.
+            dict: The full worker response (always contains ``status``).
 
         Raises:
-                RuntimeError: If the worker returns an error.
+            PermissionDenied: Worker reported a permission failure.
+            RateLimitExceeded: Worker reported a rate-limit breach.
+            QuotaExceeded: Worker reported a quota breach.
+            RuntimeError: Any other ``status="error"`` reply.
         """
         with self._lock:
             self._socket.send_pyobj(payload)
@@ -148,22 +158,30 @@ class AuthWorkerClient:
         tags: list[str] | None = None,
         metadata: dict[str, tp.Any] | None = None,
     ) -> tuple[str, ApiKeyMetadata]:
-        """Generate a new API key.
+        """Ask the worker to mint a fresh ``sk-...`` API key.
+
+        Forwards to ``EnhancedApiKeyManager.generate_api_key`` on the
+        worker side; the returned raw key is the only point at which
+        the secret is observable.
 
         Args:
-                name: Human-readable name for the key.
-                role: Access control role.
-                description: Optional description.
-                created_by: User/service creating the key.
-                expires_in_days: Number of days until expiration.
-                rate_limits: Rate limiting configuration.
-                quota: Usage quota configuration.
-                permissions: Granular permissions.
-                tags: List of tags for organization.
-                metadata: Additional metadata.
+            name: Human-readable label.
+            role: Access control role. Defaults to :data:`ApiKeyRole.USER`.
+            description: Optional free-form description.
+            created_by: Creator identifier stored on the metadata.
+            expires_in_days: Optional TTL in days; ``None`` for no expiry.
+            rate_limits: Optional :class:`RateLimitConfig` overriding
+                the default open-ended limits.
+            quota: Optional :class:`QuotaConfig` overriding the default
+                open-ended quota.
+            permissions: Optional :class:`ApiKeyPermissions`.
+            tags: Optional organizational tags.
+            metadata: Optional arbitrary user-defined metadata payload.
 
         Returns:
-                Tuple of (raw_key, metadata).
+            tuple[str, ApiKeyMetadata]: ``(raw_key, metadata)``; the raw
+            key must be returned to the caller immediately and never
+            logged.
         """
         resp = self._request(
             {
@@ -183,13 +201,15 @@ class AuthWorkerClient:
         return resp["raw_key"], self._deserialize_metadata(resp["metadata"])
 
     def validate_key(self, raw_key: str | None) -> ApiKeyMetadata | None:
-        """Validate a raw API key and return its metadata.
+        """Resolve a raw key to live metadata or ``None`` for invalid keys.
 
         Args:
-                raw_key: The raw API key to validate.
+            raw_key: Bearer token presented by the client. ``None`` and
+                the empty string round-trip and reliably return ``None``.
 
         Returns:
-                ApiKeyMetadata if valid, None otherwise.
+            ApiKeyMetadata | None: Active metadata when the key is valid
+            and not revoked / suspended / expired; ``None`` otherwise.
         """
         resp = self._request({"cmd": "validate_key", "raw_key": raw_key})
         metadata_dict = resp.get("metadata")
@@ -203,22 +223,32 @@ class AuthWorkerClient:
         model: str | None = None,
         requested_tokens: int = 0,
     ) -> ApiKeyMetadata:
-        """Authorize a request and perform all security checks.
+        """Run the worker's full authorisation pipeline for a request.
+
+        Forwards to ``EnhancedApiKeyManager.authorize_request`` on the
+        worker; rejections from any stage (validity, IP, endpoint /
+        model permissions, rate limits, quotas, per-request token
+        ceiling) are re-raised locally as the matching mirror exception.
 
         Args:
-                raw_key: Raw API key from the request.
-                ip_address: Client IP address.
-                endpoint: API endpoint being accessed.
-                model: Model being requested.
-                requested_tokens: Number of tokens being requested.
+            raw_key: Bearer token from the client. ``None`` / empty
+                always fails with :class:`PermissionDenied`.
+            ip_address: Client IP for allow/blocklist enforcement.
+            endpoint: Path being accessed; checked against the key's
+                ``allowed_endpoints``.
+            model: Model name being requested; checked against the
+                key's ``allowed_models``.
+            requested_tokens: Projected token cost; checked against
+                both per-request ceiling and rate limit / quota windows.
 
         Returns:
-                ApiKeyMetadata if authorized.
+            ApiKeyMetadata: Live metadata for the authorising key with
+            ``last_used_at`` already refreshed by the worker.
 
         Raises:
-                PermissionDenied: If authorization fails.
-                RateLimitExceeded: If rate limit is exceeded.
-                QuotaExceeded: If quota is exceeded.
+            PermissionDenied: For invalid keys or permission failures.
+            RateLimitExceeded: When a sliding-window limit fires.
+            QuotaExceeded: When a cumulative quota is breached.
         """
         resp = self._request(
             {
@@ -238,12 +268,12 @@ class AuthWorkerClient:
         prompt_tokens: int,
         completion_tokens: int,
     ) -> None:
-        """Record token usage for a key.
+        """Tell the worker to bump per-key counters after a served request.
 
         Args:
-                raw_key: Raw API key.
-                prompt_tokens: Number of prompt tokens used.
-                completion_tokens: Number of completion tokens generated.
+            raw_key: Raw API key used for the served request.
+            prompt_tokens: Input tokens consumed.
+            completion_tokens: Output tokens generated.
         """
         self._request(
             {
@@ -255,65 +285,78 @@ class AuthWorkerClient:
         )
 
     def revoke_key(self, key_id: str, revoked_by: str | None = None) -> bool:
-        """Revoke an API key.
+        """Permanently disable a key via the worker.
+
+        Revocation is irreversible — :meth:`reactivate_key` only works
+        on suspended keys.
 
         Args:
-                key_id: ID of the key to revoke.
-                revoked_by: User/service revoking the key.
+            key_id: Internal key identifier (``"key_..."``).
+            revoked_by: Optional actor recorded in the worker's audit log.
 
         Returns:
-                True if revoked, False if not found.
+            bool: ``True`` when a key with that id existed and was
+            revoked; ``False`` otherwise.
         """
         resp = self._request({"cmd": "revoke_key", "key_id": key_id, "revoked_by": revoked_by})
         return resp["success"]
 
     def suspend_key(self, key_id: str, suspended_by: str | None = None) -> bool:
-        """Suspend an API key.
+        """Temporarily disable a key via the worker.
+
+        Reversible with :meth:`reactivate_key`.
 
         Args:
-                key_id: ID of the key to suspend.
-                suspended_by: User/service suspending the key.
+            key_id: Internal key identifier.
+            suspended_by: Optional actor recorded in the worker's audit log.
 
         Returns:
-                True if suspended, False if not found.
+            bool: ``True`` when the key existed and was suspended.
         """
         resp = self._request({"cmd": "suspend_key", "key_id": key_id, "suspended_by": suspended_by})
         return resp["success"]
 
     def reactivate_key(self, key_id: str, reactivated_by: str | None = None) -> bool:
-        """Reactivate a suspended API key.
+        """Move a suspended key back to active state via the worker.
+
+        Refuses to act on revoked or unknown keys.
 
         Args:
-                key_id: ID of the key to reactivate.
-                reactivated_by: User/service reactivating the key.
+            key_id: Internal key identifier.
+            reactivated_by: Optional actor recorded in the worker's audit log.
 
         Returns:
-                True if reactivated, False if not found or revoked.
+            bool: ``True`` when the key existed, was suspended (not
+            revoked) and is now active.
         """
         resp = self._request({"cmd": "reactivate_key", "key_id": key_id, "reactivated_by": reactivated_by})
         return resp["success"]
 
     def delete_key(self, key_id: str, deleted_by: str | None = None) -> bool:
-        """Permanently delete an API key.
+        """Hard-delete a key from the worker store.
+
+        Unlike :meth:`revoke_key`, deletion drops the metadata record
+        and clears the worker's rate-limit windows for the key.
 
         Args:
-                key_id: ID of the key to delete.
-                deleted_by: User/service deleting the key.
+            key_id: Internal key identifier.
+            deleted_by: Optional actor recorded in the worker's audit log.
 
         Returns:
-                True if deleted, False if not found.
+            bool: ``True`` when the key existed and was removed.
         """
         resp = self._request({"cmd": "delete_key", "key_id": key_id, "deleted_by": deleted_by})
         return resp["success"]
 
     def get_key_by_id(self, key_id: str) -> ApiKeyMetadata | None:
-        """Get key metadata by key ID.
+        """Fetch a key's metadata record from the worker.
 
         Args:
-                key_id: ID of the key.
+            key_id: Internal key identifier (``"key_..."``).
 
         Returns:
-                ApiKeyMetadata if found, None otherwise.
+            ApiKeyMetadata | None: Reconstructed metadata when the key
+            exists; ``None`` when no record is found.
         """
         resp = self._request({"cmd": "get_key_by_id", "key_id": key_id})
         metadata_dict = resp.get("metadata")
@@ -325,15 +368,19 @@ class AuthWorkerClient:
         status: ApiKeyStatus | None = None,
         tags: list[str] | None = None,
     ) -> list[ApiKeyMetadata]:
-        """List API keys with optional filtering.
+        """List managed keys, optionally filtered by role / status / tags.
+
+        Filters are AND-ed together on the worker side; tag filtering
+        requires every requested tag to be present on the candidate.
 
         Args:
-                role: Filter by role.
-                status: Filter by status.
-                tags: Filter by tags.
+            role: Restrict to keys with this :class:`ApiKeyRole`.
+            status: Restrict to keys with this :class:`ApiKeyStatus`.
+            tags: Restrict to keys whose ``tags`` are a superset of
+                this iterable.
 
         Returns:
-                List of matching ApiKeyMetadata objects.
+            list[ApiKeyMetadata]: Matching key records in worker order.
         """
         resp = self._request({"cmd": "list_keys", "role": role, "status": status, "tags": tags})
         return [self._deserialize_metadata(k) for k in resp["keys"]]
@@ -352,23 +399,29 @@ class AuthWorkerClient:
         metadata: dict[str, tp.Any] | None = None,
         updated_by: str | None = None,
     ) -> bool:
-        """Update API key configuration.
+        """Apply a partial update to a managed key via the worker.
+
+        ``None`` arguments are treated as "leave alone"; non-``None``
+        values overwrite the corresponding field on the worker.
+        ``metadata`` is merged into the existing dict rather than
+        replacing it.
 
         Args:
-                key_id: ID of the key to update.
-                name: New name.
-                description: New description.
-                role: New role.
-                expires_in_days: New expiration.
-                rate_limits: New rate limits.
-                quota: New quota.
-                permissions: New permissions.
-                tags: New tags.
-                metadata: New metadata.
-                updated_by: User/service updating the key.
+            key_id: Internal key identifier to update.
+            name: New display name.
+            description: New description.
+            role: New :class:`ApiKeyRole`.
+            expires_in_days: New TTL in days (converted to an absolute
+                timestamp on the worker side).
+            rate_limits: New :class:`RateLimitConfig` (full replacement).
+            quota: New :class:`QuotaConfig` (full replacement).
+            permissions: New :class:`ApiKeyPermissions` (full replacement).
+            tags: New tag list (full replacement).
+            metadata: User-metadata patch merged into the existing dict.
+            updated_by: Optional actor recorded in the worker audit log.
 
         Returns:
-                True if updated, False if not found.
+            bool: ``True`` when the key existed and was updated.
         """
         resp = self._request(
             {
@@ -389,14 +442,19 @@ class AuthWorkerClient:
         return resp["success"]
 
     def rotate_key(self, key_id: str, rotated_by: str | None = None) -> tuple[str, ApiKeyMetadata] | None:
-        """Rotate an API key.
+        """Issue a fresh secret for an existing key while preserving metadata.
+
+        Usage counters, permissions, audit history and key identifier
+        are all preserved on the worker side.
 
         Args:
-                key_id: ID of the key to rotate.
-                rotated_by: User/service rotating the key.
+            key_id: Internal key identifier to rotate.
+            rotated_by: Optional actor recorded in the audit log.
 
         Returns:
-                Tuple of (new_raw_key, metadata) if successful, None if not found.
+            tuple[str, ApiKeyMetadata] | None: ``(new_raw_key, metadata)``
+            on success; ``None`` when no key with that id is registered.
+            The new raw key must be returned to the caller immediately.
         """
         resp = self._request({"cmd": "rotate_key", "key_id": key_id, "rotated_by": rotated_by})
         if resp.get("status") == "ok" and "raw_key" in resp:
@@ -409,30 +467,42 @@ class AuthWorkerClient:
         key_id: str | None = None,
         action: str | None = None,
     ) -> list[dict]:
-        """Get audit log entries.
+        """Fetch newest-first audit-log entries from the worker.
 
         Args:
-                limit: Maximum number of entries to return.
-                key_id: Filter by key ID.
-                action: Filter by action type.
+            limit: Maximum number of entries to return after filtering.
+            key_id: When set, restrict to entries for this key id.
+            action: When set, restrict to entries with exactly this
+                ``action`` slug (e.g. ``"request_authorized"``).
 
         Returns:
-                List of audit log entry dicts.
+            list[dict]: Raw audit-log dicts ordered newest-first; the
+            client does not deserialise them into
+            :class:`AuditLogEntry` so consumers can inspect or stream
+            them directly.
         """
         resp = self._request({"cmd": "get_audit_logs", "limit": limit, "key_id": key_id, "action": action})
         return resp["logs"]
 
     def get_statistics(self) -> dict[str, tp.Any]:
-        """Get overall statistics about API keys and usage.
+        """Fetch aggregate auth statistics from the worker.
 
         Returns:
-                Dictionary with aggregate statistics.
+            dict[str, tp.Any]: The same blob produced by
+            :meth:`EnhancedApiKeyManager.get_statistics`, containing
+            lifecycle counts (active / suspended / revoked / expired),
+            cumulative request / token totals, per-role breakdown and
+            audit-log size.
         """
         resp = self._request({"cmd": "get_statistics"})
         return resp["statistics"]
 
     def shutdown(self) -> None:
-        """Shutdown the auth worker and close the connection."""
+        """Send ``shutdown`` to the worker then close the local socket.
+
+        Errors from the round-trip (e.g. the worker has already exited)
+        are swallowed so the local socket is always released.
+        """
         try:
             self._request({"cmd": "shutdown"})
         except Exception:
@@ -441,7 +511,12 @@ class AuthWorkerClient:
             self.close()
 
     def close(self):
-        """Close the ZeroMQ socket without sending a shutdown command."""
+        """Close the local REQ socket without notifying the worker.
+
+        Used by :meth:`AuthWorkerManager.shutdown` in the attached
+        (non-owning) mode where terminating the upstream worker is the
+        caller's responsibility.
+        """
         self._socket.close(0)
 
     @property

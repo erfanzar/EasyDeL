@@ -230,8 +230,20 @@ class PrometheusMetrics:
         """Observe deque entries added after the cursor, return new cursor id.
 
         Uses a single pass: if the cursor is found, only entries after it are
-        observed.  If the cursor was evicted (not found), all entries collected
+        observed. If the cursor was evicted (not found), all entries collected
         during the scan are observed.
+
+        Args:
+            deque: Bounded deque holding the metrics records to scan.
+            cursor_id: ``id()`` of the last observed entry, or ``0`` to
+                observe everything in the deque on the first call.
+            observe_fn: Callable invoked once per new entry (e.g. to
+                update a Prometheus histogram).
+
+        Returns:
+            The ``id()`` of the deque's last entry, suitable to be passed
+            back as ``cursor_id`` on the next call. Returns ``0`` when
+            the deque is empty.
         """
         if not deque:
             return 0

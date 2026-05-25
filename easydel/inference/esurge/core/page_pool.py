@@ -95,20 +95,24 @@ class PagePool:
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> list[CachePage] | None:
-        """Get the cached page by the page hash for each group in
-        `kv_cache_group_ids`, or None if cache miss for any group.
-        If there are duplicated pages, we return the first page in the cache.
+        """Look up cached pages by hash for every KV cache group.
+
+        Returns the cached page corresponding to ``page_hash`` for each
+        group in ``kv_cache_group_ids``, or ``None`` if any group misses.
+        If multiple cached pages share the same hash (typically duplicates
+        across requests), the first one in the cache is returned.
 
         Args:
             page_hash: The hash value of the page.
             kv_cache_group_ids: The ids of the KV cache groups.
             dp_shard_hint: Optional DP shard hint. When provided with
-                `data_parallel_size > 1`, only cached pages in the shard's
+                ``data_parallel_size > 1``, only cached pages in the shard's
                 page-ID range are considered cache hits.
             data_parallel_size: Total number of DP shards.
 
         Returns:
-            The cached pages if exists, or None.
+            The list of cached pages (one per group) if all groups hit,
+            ``None`` on any miss.
         """
         use_shard_hint = (
             dp_shard_hint is not None
@@ -153,24 +157,30 @@ class PagePool:
         page_size: int,
         kv_cache_group_id: int,
     ) -> None:
-        """Cache a list of full pages for prefix caching.
-        This function takes a list of pages that will have their page hash
-        metadata to be updated and cached. Given a request, it computes the
-        page hashes for the pages starting from `num_cached_pages` to
-        `num_full_pages`, updating the metadata for each page
-        and caching them in the `cached_page_hash_to_page`.
+        """Cache a contiguous range of newly-full pages for prefix sharing.
+
+        Updates page-hash metadata on pages between ``num_cached_pages`` and
+        ``num_full_pages``, computing any missing hashes from the request's
+        token IDs, and inserts them into ``cached_page_hash_to_page`` so
+        later requests can re-use the prefix.
 
         Args:
             request: The request to cache the pages.
-            pages: All pages in the request.
-            page_hashes: Page hashes of the pages in the request. Note that
-            this list may be shorter than the pages list. In this case the
-            missed page hash will be computed in this function.
-            num_cached_pages: The number of pages that are already cached.
-            num_full_pages: The number of pages that are full and should
-                be cached after this function.
+            pages: All pages currently held by the request.
+            page_hashes: Page hashes of the pages in the request. This list
+                may be shorter than ``pages``; missing hashes are computed
+                in-place and appended.
+            num_cached_pages: The number of pages already cached.
+            num_full_pages: The number of pages that are full and should be
+                cached after this call.
             page_size: Number of tokens in each page.
-            kv_cache_group_id: The id of the KV cache group.
+            kv_cache_group_id: The id of the KV cache group these pages
+                belong to.
+
+        Raises:
+            ValueError: If ``page_hashes`` is shorter than ``num_cached_pages``.
+            RuntimeError: If a page already has a hash assigned, or if a
+                page's token slice does not contain ``page_size`` tokens.
         """
         if num_cached_pages == num_full_pages:
             return
@@ -225,9 +235,10 @@ class PagePool:
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> list[CachePage]:
-        """Get new pages from the free page pool.
+        """Allocate fresh pages from the free pool, ignoring the page cache.
 
-        Note that we do not check page cache in this function.
+        Pages are bumped to ``ref_cnt = 1`` and (when caching is enabled)
+        any prior cache hash is evicted before they are returned.
 
         Args:
             num_pages: The number of pages to allocate.
@@ -238,7 +249,14 @@ class PagePool:
                 partitioning.
 
         Returns:
-            A list of new page.
+            A list of ``num_pages`` newly allocated pages.
+
+        Raises:
+            ValueError: If the requested number exceeds free pages, or if a
+                DP-shard-restricted allocation cannot find enough free pages
+                in the hinted shard's range.
+            RuntimeError: If shard partitioning becomes inconsistent or a
+                page is observed with non-zero ``ref_cnt`` at allocation.
         """
         if num_pages > self.get_num_free_pages():
             raise ValueError(f"Cannot get {num_pages} free pages from the pool")
@@ -313,12 +331,14 @@ class PagePool:
         return True
 
     def touch(self, pages: tuple[list[CachePage], ...]) -> None:
-        """Touch a page increases its reference count by 1, and may remove
-        the page from the free queue. This is used when a page is hit by
-        another request with the same prefix.
+        """Increment reference counts on pages re-hit by a new request.
+
+        For each non-null page with ``ref_cnt == 0``, the page is first
+        removed from the free queue (it was eligible for eviction); then
+        every page's reference count is bumped by 1.
 
         Args:
-            pages: A list of pages to touch.
+            pages: Per-group page lists to touch.
         """
         for pages_per_group in pages:
             for page in pages_per_group:
@@ -327,12 +347,14 @@ class PagePool:
                 page.incr_ref()
 
     def free_pages(self, ordered_pages: Iterable[CachePage]) -> None:
-        """Free a list of pages. The pages should be ordered by their
-        eviction priority, where the first page will be evicted first.
+        """Decrement refs and re-queue pages whose count drops to zero.
+
+        Pages must be ordered by eviction priority — the first page is
+        evicted first. Non-null pages with ``ref_cnt == 0`` after the
+        decrement are appended to the free queue.
 
         Args:
-            ordered_pages: A list of pages to free ordered by their eviction
-                priority.
+            ordered_pages: Pages to free, ordered by eviction priority.
         """
 
         pages_list = list(ordered_pages)
@@ -341,13 +363,16 @@ class PagePool:
         self.free_page_queue.append_n([page for page in pages_list if page.ref_cnt == 0 and not page.is_null])
 
     def reset_prefix_cache(self) -> bool:
-        """Reset prefix cache. This function may be used in RLHF
-        flows to invalid prefix caching after the weights are updated,
-        or used for resetting prefix caching status for benchmarking.
+        """Reset the prefix cache, clearing every cached page hash.
+
+        Used in RLHF flows to invalidate prefix caching after weights are
+        updated, or for resetting prefix caching state during benchmarking.
+        The reset fails (returning ``False``) if any pages besides the null
+        page are still in use.
 
         Returns:
-            bool: True if the prefix cache is successfully reset,
-            False otherwise.
+            True if the prefix cache is successfully reset, False if there
+            are still pages in use that prevent the reset.
         """
         num_used_pages = self.num_pages - self.get_num_free_pages()
         if num_used_pages != 1:

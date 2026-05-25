@@ -233,7 +233,10 @@ class CacheManager:
         data_parallel_size: int | None = None,
     ) -> tuple[CachePages, int]:
         """Get the computed (cached) pages for the request.
-        Note that the computed pages must be full.
+
+        Performs a prefix-cache lookup using the request's page hashes and
+        returns the longest matching prefix. Only complete pages are
+        considered for cache hits.
 
         Args:
             request: The request to get the computed pages.
@@ -243,7 +246,7 @@ class CacheManager:
 
         Returns:
             A tuple containing:
-                - A list of pages that are computed for the request.
+                - CachePages with the pages that are computed for the request.
                 - The number of computed tokens.
         """
 
@@ -276,8 +279,19 @@ class CacheManager:
     ) -> int | None:
         """Infer a consistent DP shard from already-attached pages.
 
-        Returns ``None`` when shard inference is not possible (e.g. single-DP,
-        uneven page partitioning, no pages, or mixed-shard pages).
+        Walks the per-group page lists and resolves each non-null page back
+        to a DP shard. If all observed pages map to the same shard, that
+        shard is returned; otherwise inference is treated as ambiguous.
+
+        Args:
+            pages: Per-group page lists currently attached to the request.
+            data_parallel_size: Total DP shard count; values ``<= 1`` short
+                circuit to ``None``.
+
+        Returns:
+            The single consistent shard index, or ``None`` when shard
+            inference is not possible (e.g. single-DP, uneven page
+            partitioning, no pages, or mixed-shard pages).
         """
         dp_size = int(data_parallel_size or 1)
         if dp_size <= 1:
@@ -421,11 +435,13 @@ class CacheManager:
 
     def free(self, request: EngineRequest) -> None:
         """Free the pages allocated for the request.
-        We free the pages in reverse order so that he tail pages are evicted
-        first when caching is enabled.
+
+        Pages are freed in reverse order so that tail pages are evicted
+        first when caching is enabled — this preserves LRU ordering for
+        head pages, which are most likely to be reused as prefix hits.
 
         Args:
-            request: The request to free the pages.
+            request: The request whose pages should be freed.
         """
         self.coordinator.free(request.request_id)
 
@@ -456,15 +472,14 @@ class CacheManager:
         request: EngineRequest,
         num_scheduled_requests: int,
     ) -> list[int]:
-        """Calculate the number of common prefix pages shared by all requests
-        in the RUNNING state for each kv cache group.
+        """Calculate the per-group common prefix page count for scheduled requests.
 
-        The function determines this by selecting any request and iterating
-        through its pages.  A page is considered a common prefix page if its
-        `ref_cnt` equals the total number of requests in the RUNNING state.
+        Determines the count by selecting the given request and iterating
+        through its pages. A page is considered a common prefix page if its
+        ``ref_cnt`` equals the total number of requests in the RUNNING state.
 
-        NOTE(woosuk): The number of requests in the RUNNING state is **greater
-        than or equal to** the number of requests scheduled in the current step.
+        NOTE: The number of requests in the RUNNING state is **greater than
+        or equal to** the number of requests scheduled in the current step.
         This is because the RUNNING state only indicates that:
         1. The request has not yet finished, and
         2. The request holds its pages unfreed.
@@ -482,22 +497,31 @@ class CacheManager:
         Args:
             request: Any request in the RUNNING state, used to identify the
                 common prefix pages.
-            num_running_requests: The total number of requests in the RUNNING
-                state. This can be different from the number of scheduled
-                requests in the current step.
+            num_scheduled_requests: The total number of requests scheduled in
+                the current step.
 
         Returns:
-            list[int]: The number of common prefix pages for each kv cache
-            group.
+            The number of common prefix pages for each kv cache group.
+
+        Raises:
+            AssertionError: If ``request.status`` is not RUNNING.
         """
         assert request.status == EngineRequestStatus.RUNNING
         return self.coordinator.get_num_common_prefix_pages(request.request_id, num_scheduled_requests)
 
     def free_page_hashes(self, request: EngineRequest) -> None:
-        """Discard the page hashes for the request.
+        """Discard the cached page hashes for the request.
 
-        NOTE: Unlike `free`, this method should be called only when the request
-        is finished, not when it is preempted.
+        Removes the request's entry from ``req_to_page_hashes`` so that the
+        next scheduling of the same request id recomputes hashes fresh.
+
+        Args:
+            request: The finished request whose page-hash cache entry should
+                be dropped.
+
+        Note:
+            Unlike :meth:`free`, this method should be called only when the
+            request is finished, not when it is preempted.
         """
         self.req_to_page_hashes.pop(request.request_id, None)
 

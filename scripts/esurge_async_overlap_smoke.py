@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""Smoke-test eSurge async scheduling with overlap execution on a real model."""
+"""Smoke-test eSurge async scheduling with overlap execution on a real model.
+
+Loads a small instruction model (default
+``HuggingFaceTB/SmolLM2-1.7B-Instruct``), spins up an :class:`eSurge` engine
+with ``async_scheduling=True`` and ``overlap_execution=True`` plus prefix
+caching, and runs a single chat completion against it. Useful as a quick
+end-to-end check that nothing in the runtime regressed for the most common
+async + overlap configuration.
+
+The script asserts that something actually came back from the engine and
+prints prompt, generated text, token ids, finish reason, and wall-clock time.
+
+Side effects:
+    - Downloads the model weights via Hugging Face on first run.
+    - Initializes and terminates an :class:`eSurge` engine.
+
+Usage:
+    python scripts/esurge_async_overlap_smoke.py \\
+        --model HuggingFaceTB/SmolLM2-1.7B-Instruct --prompt "hi" \\
+        --max-tokens 16
+"""
 
 from __future__ import annotations
 
@@ -12,6 +32,13 @@ from easydel.inference.sampling_params import SamplingParams
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace: Parsed flags (``model``, ``prompt``,
+            ``max_model_len``, ``max_num_seqs``, ``max_tokens``,
+            ``temperature``, ``top_p``, ``hbm_utilization``).
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
@@ -33,6 +60,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run the async-overlap smoke test end-to-end.
+
+    Builds the engine, calls :meth:`eSurge.chat` with the supplied prompt, and
+    prints the resulting text / token ids / finish reason / wall-clock time.
+    Guarantees ``engine.terminate()`` runs even when generation raises.
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: If the engine returns no text and no token ids.
+    """
     args = parse_args()
     engine = eSurge(
         model=args.model,

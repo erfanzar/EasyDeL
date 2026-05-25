@@ -150,6 +150,8 @@ class ModelStepExecutor:
         cache_capacity: int = 64,
         mpmd_scheduler: MpMdSchedulers | None = None,
         pipeline_plan: PipelineInferencePlan | None = None,
+        full_hidden_state_max_tokens: int = 0,
+        enable_spec_recurrent_commit: bool = False,
     ) -> None:
         """Initialize the ModelStepExecutor.
 
@@ -170,6 +172,10 @@ class ModelStepExecutor:
             mpmd_scheduler: Optional ``spectrax.runtime.schedules.Schedule``
                 forwarded to ``spx.jit(schedule=...)`` when the mesh is MPMD.
                 ``None`` ⇒ forward-only marker-cluster MPMD path. Ignored on SPMD.
+            full_hidden_state_max_tokens: Fused SPMD model-step buckets at or
+                below this token count return all token hidden rows rather than
+                only sampled rows. Speculative verification uses this for tiny
+                draft windows while larger prompt buckets keep compact outputs.
         """
         self.model = model
         self.mesh = mesh
@@ -180,8 +186,16 @@ class ModelStepExecutor:
         self._use_slot_mapping = self._metadata_version == "v2"
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
+        self.full_hidden_state_max_tokens = max(0, int(full_hidden_state_max_tokens))
         self.mpmd_scheduler = mpmd_scheduler
         self.pipeline_plan = pipeline_plan
+        self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
+        self._flat_state_args = not self._uses_mpmd_mesh()
+        self._graphstate_treedef = jax.tree_util.tree_structure(graphstate_template)
+        self._graphother_treedef = jax.tree_util.tree_structure(graphother_template)
+        self._runtime_graphstate_arg: tp.Any = graphstate_template
+        self._runtime_graphother_arg: tp.Any = graphother_template
+        self.set_runtime_graph_args(graphstate_template, graphother_template)
         self._pipeline_runtime = (
             PipelineStageRuntime(plan=pipeline_plan) if pipeline_plan is not None and pipeline_plan.is_enabled else None
         )
@@ -233,6 +247,60 @@ class ModelStepExecutor:
                 graphstate=graphstate_template,
                 graphother=graphother_template,
             )
+
+    def set_runtime_graph_args(self, graphstate: tp.Any, graphother: tp.Any) -> None:
+        """Cache the graph-state call arguments used on every decode step.
+
+        Pre-flattens the graph state to a tuple of leaves when the executor
+        runs on SPMD (so the hot-path call into the compiled jit does not pay
+        the per-step pytree traversal cost). On MPMD the original pytrees are
+        kept because SpectraX's stage-aware dispatch wants the nested
+        structure.
+
+        Args:
+            graphstate: Live mutable parameter pytree.
+            graphother: Live auxiliary buffer pytree.
+        """
+        if self._flat_state_args:
+            self._runtime_graphstate_arg = tuple(jax.tree_util.tree_leaves(graphstate))
+            self._runtime_graphother_arg = tuple(jax.tree_util.tree_leaves(graphother))
+        else:
+            self._runtime_graphstate_arg = graphstate
+            self._runtime_graphother_arg = graphother
+
+    def runtime_graph_args(self) -> tuple[tp.Any, tp.Any]:
+        """Return cached graph-state arguments for hot-path dispatch."""
+        return self._runtime_graphstate_arg, self._runtime_graphother_arg
+
+    def clear_runtime_graph_args(self) -> None:
+        """Drop cached graph-state call arguments."""
+        self._runtime_graphstate_arg = None
+        self._runtime_graphother_arg = None
+
+    def _graph_arg_sharding(self, state: tp.Any) -> tp.Any:
+        """Resolve the in-shardings tuple for a graph-state argument.
+
+        Honors :attr:`_flat_state_args`: on SPMD the model state is passed as
+        a flat tuple of leaves so the compiled jit's ``in_shardings`` must be
+        a matching flat tuple. On MPMD the original nested pytree shape is
+        kept so SpectraX's stage-aware placement can match the leaves.
+
+        Args:
+            state: Graph state or other pytree whose sharding structure is
+                being extracted.
+
+        Returns:
+            A flat tuple of leaf shardings (SPMD path), the nested sharding
+            tree (MPMD path), or ``None`` when leaf counts cannot be aligned.
+        """
+        sharding = spx.extract_sharding_structure(state, mesh=self.mesh)
+        if self._flat_state_args:
+            state_leaves = tuple(jax.tree_util.tree_leaves(state))
+            sharding_leaves = tuple(jax.tree_util.tree_leaves(sharding))
+            if len(sharding_leaves) != len(state_leaves):
+                return None
+            return sharding_leaves
+        return sharding
 
     @property
     def pipeline_runtime(self) -> PipelineStageRuntime | None:
@@ -331,6 +399,44 @@ class ModelStepExecutor:
         value = cache[key]
         cache.move_to_end(key)
         return value
+
+    def _metadata_sharding_template(self, *, include_vlm: bool = False) -> BatchMetadata:
+        """Build the BatchMetadata sharding tree for compiled model steps.
+
+        Materializes a :class:`BatchMetadata` whose array leaves are filled
+        with replicated shardings (``self._empty_sharding``) and whose optional
+        v2/spec/VLM fields are populated only when the executor needs them.
+        Used as the ``in_shardings`` template for the backbone / model-step
+        jits so every metadata leaf has a fixed placement.
+
+        Args:
+            include_vlm: Currently unused — VLM leaves are left ``None`` since
+                they are not part of the compiled signature for text-only
+                buckets.
+
+        Returns:
+            BatchMetadata pytree populated with sharding placeholders.
+        """
+        return BatchMetadata(
+            packed_qsl_seqlens=self._empty_sharding,
+            packed_i32_padded=self._empty_sharding,
+            packed_f32_padded=self._empty_sharding,
+            packed_misc_i32=self._empty_sharding,
+            pages_tables=self._empty_sharding,
+            input_ids_buf=self._empty_sharding,
+            position_ids_buf=self._empty_sharding,
+            input_token_handoff_positions=self._empty_sharding,
+            input_token_handoff_ids=self._empty_sharding,
+            input_token_handoff_count=self._empty_sharding,
+            input_token_handoff_offset=self._empty_sharding,
+            slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
+            num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
+            spec_recurrent_commit=self._empty_sharding if self.enable_spec_recurrent_commit else None,
+            pixel_values=None,
+            image_grid_thw=None,
+            pixel_values_videos=None,
+            video_grid_thw=None,
+        )
 
     def _uses_mpmd_mesh(self) -> bool:
         """Whether this executor's mesh requires the MPMD compile path.
@@ -1100,12 +1206,14 @@ class ModelStepExecutor:
         if key in self._cache:
             return None
 
+        graphstate_arg = tuple(jax.tree_util.tree_leaves(graphstate)) if self._flat_state_args else graphstate
+        graphother_arg = tuple(jax.tree_util.tree_leaves(graphother)) if self._flat_state_args else graphother
         if self.use_aot_forward:
             compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                 *(
                     graphdef,
-                    graphstate,
-                    graphother,
+                    graphstate_arg,
+                    graphother_arg,
                     inputs.kv_pages,
                     inputs.batch_metadata,
                     int(padded_num_reqs),
@@ -1131,7 +1239,7 @@ class ModelStepExecutor:
                 padded_num_reqs,
             )
 
-        out = wrapped_model_step(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+        out = wrapped_model_step(graphstate_arg, graphother_arg, inputs.kv_pages, inputs.batch_metadata)
         self._cache_store(self._cache, key, wrapped_model_step)
         return out
 
@@ -1420,6 +1528,16 @@ class ModelStepExecutor:
         backbone runs via SpectraX's stage-local carry executor; the LM head
         remains the small final-stage projection already used by
         :meth:`get_compiled`.
+
+        Args:
+            num_tokens: Token-axis bucket size shared by every microbatch.
+            padded_num_reqs: Request-axis bucket size shared by every microbatch.
+            input_batches: Iterable of ``(graphstate, graphother, kv_pages,
+                metadata)`` tuples, one per microbatch.
+
+        Returns:
+            List of :class:`ModelStepOutputs`, one per microbatch, in the
+            order ``input_batches`` was provided.
         """
         if len(input_batches) == 0:
             return []
@@ -1461,7 +1579,17 @@ class ModelStepExecutor:
         num_tokens: int,
         input_batches: tp.Sequence[tuple[tp.Any, tp.Any, tp.Any, BatchMetadata]],
     ) -> list[BackboneOutputs]:
-        """Run same-shaped backbone microbatches through SpectraX PP wavefront."""
+        """Run same-shaped backbone microbatches through SpectraX PP wavefront.
+
+        Args:
+            num_tokens: Token-axis bucket size shared by every microbatch.
+            input_batches: Iterable of ``(graphstate, graphother, kv_pages,
+                metadata)`` tuples, one per microbatch.
+
+        Returns:
+            List of :class:`BackboneOutputs` matching the order of
+            ``input_batches``.
+        """
         if len(input_batches) == 0:
             return []
         if not self._uses_mpmd_mesh() or self._pipeline_runtime is None or len(input_batches) == 1:
@@ -1582,6 +1710,8 @@ class ModelStepExecutor:
         if key in self._lm_head_cache:
             return
 
+        graphstate_arg = tuple(jax.tree_util.tree_leaves(graphstate)) if self._flat_state_args else graphstate
+        graphother_arg = tuple(jax.tree_util.tree_leaves(graphother)) if self._flat_state_args else graphother
         if hidden_dim is None:
             hidden_dim = int(self.model.config.get_text_config().hidden_size)
         if dtype is None:
@@ -1663,7 +1793,7 @@ class ModelStepExecutor:
 
         if self.use_aot_forward:
             compiled = self._lm_head_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                *(graphdef, graphstate, graphother, dummy_hs)
+                *(graphdef, graphstate_arg, graphother_arg, dummy_hs)
             ).compile()
             self._cache_store(self._lm_head_cache, key, compiled)
             return
@@ -1672,7 +1802,7 @@ class ModelStepExecutor:
             """SPMD JIT-mode LM-head wrapper that injects the live ``graphdef``."""
             return self._lm_head_fn(self.graphdef, graphstate_, graphother_, hs_)
 
-        _ = wrapped_lm_head(graphstate, graphother, dummy_hs)
+        _ = wrapped_lm_head(graphstate_arg, graphother_arg, dummy_hs)
         self._cache_store(self._lm_head_cache, key, wrapped_lm_head)
 
     def _build_backbone_fn(
@@ -1696,25 +1826,7 @@ class ModelStepExecutor:
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
 
-        metadata_sharding = BatchMetadata(
-            packed_qsl_seqlens=self._empty_sharding,
-            packed_i32_padded=self._empty_sharding,
-            packed_f32_padded=self._empty_sharding,
-            packed_misc_i32=self._empty_sharding,
-            pages_tables=self._empty_sharding,
-            input_ids_buf=self._empty_sharding,
-            position_ids_buf=self._empty_sharding,
-            input_token_handoff_positions=self._empty_sharding,
-            input_token_handoff_ids=self._empty_sharding,
-            input_token_handoff_count=self._empty_sharding,
-            input_token_handoff_offset=self._empty_sharding,
-            slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
-            num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
-            pixel_values=None,
-            image_grid_thw=None,
-            pixel_values_videos=None,
-            video_grid_thw=None,
-        )
+        metadata_sharding = self._metadata_sharding_template()
 
         kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
 
@@ -1795,6 +1907,7 @@ class ModelStepExecutor:
                             request_distribution=metadata.request_distribution,
                             slot_mapping=metadata.slot_mapping,
                             num_kv_update_slices=metadata.num_kv_update_slices,
+                            spec_recurrent_commit=metadata.spec_recurrent_commit,
                             version=self._metadata_version,
                         )
 
@@ -1856,7 +1969,22 @@ class ModelStepExecutor:
         return _backbone_step
 
     def _get_pipeline_model_step_fn(self, padded_num_reqs: int, *, graphdef: tp.Any) -> tp.Any:
-        """Return or build the fused PP model-step function for one request bucket."""
+        """Return or build the fused PP model-step function for one request bucket.
+
+        Lazily constructs the SpectraX-compiled fused PP model-step function
+        (backbone + sampled-row gather + LM head) and caches it keyed by the
+        request bucket and the active compile mode / graphdef identity.
+
+        Args:
+            padded_num_reqs: Request-axis bucket size for which to build the
+                fused step.
+            graphdef: Current graph definition. Used as part of the cache key
+                so weight hot-swaps that produce a fresh graphdef cause a
+                rebuild rather than a stale executable hit.
+
+        Returns:
+            The fused PP model-step callable from :meth:`_build_pipeline_model_step_fn`.
+        """
         key = (int(padded_num_reqs), f"{self._compile_mode()}:{id(graphdef)}")
         cached = self._pipeline_model_step_fn_cache.get(key)
         if cached is not None:
@@ -1893,25 +2021,7 @@ class ModelStepExecutor:
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
 
-        metadata_sharding = BatchMetadata(
-            packed_qsl_seqlens=self._empty_sharding,
-            packed_i32_padded=self._empty_sharding,
-            packed_f32_padded=self._empty_sharding,
-            packed_misc_i32=self._empty_sharding,
-            pages_tables=self._empty_sharding,
-            input_ids_buf=self._empty_sharding,
-            position_ids_buf=self._empty_sharding,
-            input_token_handoff_positions=self._empty_sharding,
-            input_token_handoff_ids=self._empty_sharding,
-            input_token_handoff_count=self._empty_sharding,
-            input_token_handoff_offset=self._empty_sharding,
-            slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
-            num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
-            pixel_values=None,
-            image_grid_thw=None,
-            pixel_values_videos=None,
-            video_grid_thw=None,
-        )
+        metadata_sharding = self._metadata_sharding_template()
 
         kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
         hidden_size = int(self.model.config.get_text_config().hidden_size)
@@ -1970,6 +2080,7 @@ class ModelStepExecutor:
                             request_distribution=metadata.request_distribution,
                             slot_mapping=metadata.slot_mapping,
                             num_kv_update_slices=metadata.num_kv_update_slices,
+                            spec_recurrent_commit=metadata.spec_recurrent_commit,
                             version=self._metadata_version,
                         )
 
@@ -2055,25 +2166,7 @@ class ModelStepExecutor:
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
 
-        metadata_sharding = BatchMetadata(
-            packed_qsl_seqlens=self._empty_sharding,
-            packed_i32_padded=self._empty_sharding,
-            packed_f32_padded=self._empty_sharding,
-            packed_misc_i32=self._empty_sharding,
-            pages_tables=self._empty_sharding,
-            input_ids_buf=self._empty_sharding,
-            position_ids_buf=self._empty_sharding,
-            input_token_handoff_positions=self._empty_sharding,
-            input_token_handoff_ids=self._empty_sharding,
-            input_token_handoff_count=self._empty_sharding,
-            input_token_handoff_offset=self._empty_sharding,
-            slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
-            num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
-            pixel_values=None,
-            image_grid_thw=None,
-            pixel_values_videos=None,
-            video_grid_thw=None,
-        )
+        metadata_sharding = self._metadata_sharding_template()
 
         kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
         model_step_out_shardings = ModelStepOutputs(
@@ -2082,17 +2175,22 @@ class ModelStepExecutor:
             logits=self._empty_sharding,
         )
 
-        @jax.jit(
-            static_argnums=(0, 5),
-            donate_argnums=(3,),
-            in_shardings=(
-                spx.extract_sharding_structure(graphstate_template, mesh=self.mesh),
-                spx.extract_sharding_structure(graphother_template, mesh=self.mesh),
+        jit_kwargs = {
+            "static_argnums": (0, 5),
+            "donate_argnums": (3,),
+            "in_shardings": (
+                self._graph_arg_sharding(graphstate_template),
+                self._graph_arg_sharding(graphother_template),
                 kv_pages_sharding,
                 metadata_sharding,
             ),
-            out_shardings=model_step_out_shardings,
-        )
+            "out_shardings": model_step_out_shardings,
+        }
+        flat_state_args = bool(self._flat_state_args)
+        graphstate_treedef = self._graphstate_treedef
+        graphother_treedef = self._graphother_treedef
+
+        @jax.jit(**jit_kwargs)
         def _model_step(
             graphdef,
             graphstate,
@@ -2112,6 +2210,9 @@ class ModelStepExecutor:
             """
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/spmd_model_step"):
+                    if flat_state_args:
+                        graphstate = jax.tree_util.tree_unflatten(graphstate_treedef, graphstate)
+                        graphother = jax.tree_util.tree_unflatten(graphother_treedef, graphother)
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
                     input_ids_view = metadata.model_input_ids
                     position_ids_view = metadata.position_ids_buf
@@ -2127,6 +2228,7 @@ class ModelStepExecutor:
                             request_distribution=metadata.request_distribution,
                             slot_mapping=metadata.slot_mapping,
                             num_kv_update_slices=metadata.num_kv_update_slices,
+                            spec_recurrent_commit=metadata.spec_recurrent_commit,
                             version=self._metadata_version,
                         )
 
@@ -2185,9 +2287,14 @@ class ModelStepExecutor:
                         gathered_hidden_states = hidden_states[metadata.logits_indices[:padded_num_reqs]]
                     with jax.named_scope("easydel/esurge/spmd_model_step/lm_head"):
                         logits = model.apply_lm_head(gathered_hidden_states)
+                    return_full_hidden = (
+                        self.full_hidden_state_max_tokens > 0
+                        and int(hidden_states.shape[0]) <= self.full_hidden_state_max_tokens
+                    )
+                    returned_hidden_states = hidden_states if return_full_hidden else gathered_hidden_states
                     return ModelStepOutputs(
                         kv_pages=output.past_key_values,
-                        hidden_states=gathered_hidden_states,
+                        hidden_states=returned_hidden_states,
                         logits=logits,
                     )
 
@@ -2221,11 +2328,15 @@ class ModelStepExecutor:
         hidden_in_sharding = None if self._uses_mpmd_mesh() else self._empty_sharding
         out_sharding = None if self._uses_mpmd_mesh() else self._empty_sharding
 
+        flat_state_args = bool(self._flat_state_args)
+        graphstate_treedef = self._graphstate_treedef
+        graphother_treedef = self._graphother_treedef
+
         @spx.jit(  # pyright: ignore[reportUntypedFunctionDecorator]
             static_argnums=(0,),
             in_shardings=(
-                spx.extract_sharding_structure(graphstate_template, mesh=self.mesh),
-                spx.extract_sharding_structure(graphother_template, mesh=self.mesh),
+                self._graph_arg_sharding(graphstate_template),
+                self._graph_arg_sharding(graphother_template),
                 hidden_in_sharding,
             ),
             out_shardings=out_sharding,
@@ -2248,6 +2359,9 @@ class ModelStepExecutor:
                 # spx.bind only runs at trace/compile time (inside @spx.jit),
                 # not at inference runtime; XLA sees through it.
                 with jax.named_scope("easydel/esurge/lm_head_step"):
+                    if flat_state_args:
+                        graphstate = jax.tree_util.tree_unflatten(graphstate_treedef, graphstate)
+                        graphother = jax.tree_util.tree_unflatten(graphother_treedef, graphother)
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
                     with jax.named_scope("easydel/esurge/lm_head_step/project"):
                         return model.apply_lm_head(gathered_hidden_states)

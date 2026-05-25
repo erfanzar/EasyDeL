@@ -1327,8 +1327,20 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
     ):
         """Decode token IDs into a string.
 
+        Probes the underlying tokenizer's ``decode`` signature once and
+        caches whether it accepts ``skip_special_tokens`` and
+        ``spaces_between_special_tokens`` so we never pass unsupported
+        kwargs (some HuggingFace fast/slow tokenizers differ here).
+
         Args:
-            tokens: A list or tensor of token IDs.
+            tokens: A list or array-like of integer token IDs to decode.
+            skip_special_tokens: When supported by the tokenizer, controls
+                whether special tokens are dropped from the decoded text.
+                Defaults to ``False`` so that markers such as
+                ``<|message|>`` survive for downstream parsers.
+            spaces_between_special_tokens: Optional override forwarded to
+                the tokenizer when supported; ``None`` leaves the
+                tokenizer's default behaviour intact.
 
         Returns:
             str: The decoded text string.

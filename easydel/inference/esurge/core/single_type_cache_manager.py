@@ -92,18 +92,22 @@ class SingleTypeCacheManager(ABC):
         self._null_page = page_pool.null_page
 
     def get_num_pages_to_allocate(self, request_id: str, num_tokens: int, new_computed_pages: list[CachePage]) -> int:
-        """
-        Get the number of pages needed to be allocated for the request.
+        """Compute the number of new pages the request needs in this group.
+
+        The result includes pages required to back ``num_tokens`` token slots
+        plus any cached pages that would have to be evicted from the free
+        queue to satisfy the allocation.
 
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
             new_computed_pages: The new computed pages just hitting the
-                prefix caching.
+                prefix caching for this cache group.
 
         Returns:
-            The number of pages.
+            The number of pages to allocate, including any to-be-evicted
+            computed pages.
         """
 
         num_required_pages = cdiv(num_tokens, self.page_size)
@@ -113,13 +117,17 @@ class SingleTypeCacheManager(ABC):
         return num_new_pages + num_evictable_computed_pages
 
     def save_new_computed_pages(self, request_id: str, new_computed_pages: list[CachePage]) -> None:
-        """
-        Add the new computed pages to the request.
+        """Attach new computed pages to the request for this cache group.
+
+        On the first call for a request, the computed pages become the
+        prefix of ``req_to_pages[request_id]`` and ``num_cached_page`` is
+        initialised. Subsequent calls are no-ops as long as no further
+        computed pages are supplied.
 
         Args:
             request_id: The request ID.
             new_computed_pages: The new computed pages just hitting the
-                prefix cache.
+                prefix cache for this cache group.
         """
         if request_id not in self.num_cached_page:
             req_pages = self.req_to_pages[request_id]
@@ -172,17 +180,21 @@ class SingleTypeCacheManager(ABC):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> list[CachePage]:
-        """
-        Allocate new pages for the request to give it at least `num_tokens`
-        token slots.
+        """Allocate new pages so the request reaches ``num_tokens`` slots.
+
+        If the request already has enough pages, returns an empty list.
 
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
                 tokens that are already allocated).
+            dp_shard_hint: Optional DP shard hint used to restrict new page
+                allocations to that shard's page-ID range.
+            data_parallel_size: Total number of DP shards for shard-hint
+                interpretation.
 
         Returns:
-            The new allocated pages.
+            The newly allocated pages (empty if no allocation was needed).
         """
         req_pages = self.req_to_pages[request_id]
         num_required_pages = cdiv(num_tokens, self.page_size)
@@ -199,11 +211,14 @@ class SingleTypeCacheManager(ABC):
             return new_pages
 
     def cache_pages(self, request: EngineRequest, page_hashes: list[PageHash], num_tokens: int) -> None:
-        """
-        Cache the pages for the request.
+        """Mark this group's pages as prefix-cacheable up to ``num_tokens``.
+
+        Delegates to :meth:`PagePool.cache_full_pages` for the range of
+        pages between ``num_cached_page[request_id]`` and the new full-page
+        count derived from ``num_tokens``.
 
         Args:
-            request: The request.
+            request: The request whose pages should be cached.
             page_hashes: The page hashes of the request.
             num_tokens: The total number of tokens that need to be cached
                 (including tokens that are already cached).
@@ -224,11 +239,14 @@ class SingleTypeCacheManager(ABC):
         self.num_cached_page[request.request_id] = num_full_pages
 
     def free(self, request_id: str) -> None:
-        """
-        Free the pages for the request.
+        """Free this group's pages for the request and forget cache counters.
+
+        Pages are released to the page pool in reverse order so that tail
+        pages are evicted first, preserving LRU order for head pages that
+        are most likely to be reused as prefix hits.
 
         Args:
-            request_id: The request ID.
+            request_id: The request ID whose pages should be freed.
         """
 
         req_pages = self.req_to_pages.pop(request_id, [])
@@ -240,15 +258,18 @@ class SingleTypeCacheManager(ABC):
 
     @abstractmethod
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
-        """
-        Get the number of common prefix pages for a request.
+        """Return the number of common prefix pages for a scheduled request.
 
         Args:
-            request_id: The request ID.
-            page_hashes: The page hashes of the request.
+            request_id: The request ID used as the reference for prefix counting.
+            num_scheduled_requests: The total number of requests scheduled in
+                the current step.
 
         Returns:
-            The number of common prefix pages.
+            The number of common prefix pages shared with the scheduled batch.
+
+        Raises:
+            NotImplementedError: Must be implemented by subclasses.
         """
 
         raise NotImplementedError
@@ -266,14 +287,16 @@ class SingleTypeCacheManager(ABC):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
-        """
-        Get the longest cache hit prefix of the pages that is not longer than
-        `max_length`. The prefix should be a common prefix hit for all the
-        kv cache groups in `kv_cache_group_ids`. If no cache hit is found,
-        return an empty list.
-        If eagle is enabled, drop the last matched page to force recompute the
-        last page to get the required hidden states for eagle drafting head.
-        Need to be customized for each attention type.
+        """Find the longest cache hit prefix of ``page_hashes``.
+
+        Returns the longest cache hit prefix of the pages that is not longer
+        than ``max_length``. The prefix should be a common prefix hit for
+        all the kv cache groups in ``kv_cache_group_ids``. If no cache hit
+        is found, an empty list is returned per group.
+
+        If eagle is enabled, drops the last matched page to force recompute
+        of that page so the required hidden states are available for the
+        eagle drafting head. Must be customized per attention type.
 
         Args:
             page_hashes: The page hashes of the request.
@@ -281,34 +304,39 @@ class SingleTypeCacheManager(ABC):
             kv_cache_group_ids: The ids of the kv cache groups.
             page_pool: The page pool.
             kv_cache_spec: The kv cache spec.
-            use_eagle: Whether to use eagle.
+            use_eagle: Whether to use eagle speculative decoding.
             dp_shard_hint: Optional DP shard hint used to constrain cache
                 hits to shard-local page IDs.
             data_parallel_size: Total number of DP shards.
 
         Returns:
-            A list of cached pages with skipped pages replaced by null page
-            for each kv cache group in `kv_cache_group_ids`.
-            Return a list of length `len(kv_cache_group_ids)`, where the i-th
-            element is a list of cached pages for the i-th kv cache group
-            in `kv_cache_group_ids`.
-            For example, sliding window manager should return a list like
-            ([NULL, NULL, CachePage(7), CachePage(8)]) for page size 4
-            and sliding window 8 and len(kv_cache_group_ids) = 1.
+            A tuple of length ``len(kv_cache_group_ids)``, where the i-th
+            element is the list of cached pages for the i-th kv cache group.
+            Skipped pages are replaced by ``null_page``. For example,
+            sliding window manager may return ``([NULL, NULL, CachePage(7),
+            CachePage(8)])`` for page size 4 and sliding window 8 when
+            ``len(kv_cache_group_ids) = 1``.
+
+        Raises:
+            NotImplementedError: Must be implemented by subclasses.
         """
 
         raise NotImplementedError
 
     @abstractmethod
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
-        """
-        Remove the pages that are no longer needed from `pages` and free the
-        pages. The removed pages should be replaced by null_page.
-        Need to be customized for each attention type.
+        """Remove pages no longer needed and free them; replace with null_page.
+
+        Must be customized per attention type. The default implementations
+        for sliding window and chunked local replace freed pages with
+        ``null_page``; full attention is a no-op.
 
         Args:
             request_id: The request ID.
             num_computed_tokens: The number of tokens that have been computed.
+
+        Raises:
+            NotImplementedError: Must be implemented by subclasses.
         """
         raise NotImplementedError
 
@@ -340,7 +368,29 @@ class FullAttentionManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
-        """Find the longest prefix cache hit by scanning pages sequentially from the start."""
+        """Find the longest prefix cache hit by scanning pages from index 0.
+
+        Walks forward through ``page_hashes`` and returns hits until the
+        first miss. When ``use_eagle`` is True the last matched page is
+        dropped so its hidden states can be recomputed for the eagle head.
+
+        Args:
+            page_hashes: The page hashes of the request.
+            max_length: The maximum length of the cache hit prefix in tokens.
+            kv_cache_group_ids: The ids of the kv cache groups.
+            page_pool: The page pool.
+            kv_cache_spec: The kv cache spec (must be Full or ChunkedLocal).
+            use_eagle: Whether to use eagle speculative decoding.
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
+
+        Returns:
+            Tuple of cached page lists, one per cache group.
+
+        Raises:
+            AssertionError: If the spec is not Full / ChunkedLocal attention.
+        """
         assert isinstance(kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec), (
             "FullAttentionManager can only be used for full attention and chunked local attention groups"
         )
@@ -445,7 +495,30 @@ class SlidingWindowManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
-        """Find the longest cache hit within the sliding window by scanning pages backward."""
+        """Find the longest sliding-window cache hit by scanning backward.
+
+        Walks backward over ``page_hashes`` looking for a run of cached
+        pages long enough to cover the sliding window. Out-of-window
+        positions are populated with ``null_page``.
+
+        Args:
+            page_hashes: The page hashes of the request.
+            max_length: The maximum length of the cache hit prefix in tokens.
+            kv_cache_group_ids: The ids of the kv cache groups.
+            page_pool: The page pool.
+            kv_cache_spec: The kv cache spec (must be SlidingWindowSpec).
+            use_eagle: Whether to use eagle speculative decoding.
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
+
+        Returns:
+            Tuple of cached page lists, one per cache group, with leading
+            out-of-window positions filled by ``null_page``.
+
+        Raises:
+            AssertionError: If the spec is not :class:`SlidingWindowSpec`.
+        """
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
@@ -568,25 +641,24 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
-        """
-        For chunked local attention, we need to find the longest cache hit
-        prefix of the pages that is not longer than `max_length`. The prefix
-        should be a common prefix hit for all the kv cache groups in
-        `kv_cache_group_ids`. If no cache hit is found, return an empty list.
-        note we mark as computed if the whole page is outside of the local
-        window, and set the page as null. Examples:
+        """Find the longest chunked-local cache hit, masking out-of-window pages.
 
-        1. Attention chunk size of 8, page size of 4, max length of 15
-        for next token at 15th (zero-indexed), 8th - 14th tokens are in
-        the window(needs lookup), 0th - 7th are not in the window,
-        so they are already marked as computed. We check the complete
-        page3 (8th - 11th tokens), Assume page 3 is hit, we will return
-        [null, null, page 3], otherwise, we return [null, null]
+        Pages whose entire span lies outside the current local window are
+        marked as computed and set to ``null_page``. Within-window pages
+        are looked up sequentially in the prefix cache.
 
-        2. Attention chunk size of 8, page size of 4, max length of 16
-        for next token at 16th (zero-indexed), 0th - 15th tokens are not
-        in the window, so they are already marked as computed.
-        we return 4 pages[null, null, null, null]
+        Examples:
+            1. ``attention_chunk_size=8``, ``page_size=4``, ``max_length=15``.
+               For the next token at index 15 (zero-indexed), tokens 8-14
+               are in the window (need lookup), tokens 0-7 are not in the
+               window so they are already marked as computed. We check the
+               complete page 3 (tokens 8-11). If page 3 is a hit we return
+               ``[null, null, page 3]``; otherwise ``[null, null]``.
+
+            2. ``attention_chunk_size=8``, ``page_size=4``, ``max_length=16``.
+               For the next token at index 16, tokens 0-15 are not in the
+               window so they are already marked as computed; we return
+               ``[null, null, null, null]``.
 
         Args:
             page_hashes: The page hashes of the request.
@@ -594,10 +666,18 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
             kv_cache_group_ids: The ids of the kv cache groups.
             page_pool: The page pool.
             kv_cache_spec: The kv cache spec.
-            use_eagle: Whether to use eagle.
+            use_eagle: Whether to use eagle (must be ``False`` here).
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
-            A list of cached pages
+            Tuple of cached page lists, one per cache group, with
+            out-of-window positions filled by ``null_page``.
+
+        Raises:
+            AssertionError: If the spec is not :class:`ChunkedLocalAttentionSpec`
+                or if ``use_eagle`` is True (unsupported combination).
         """
         assert isinstance(kv_cache_spec, ChunkedLocalAttentionSpec), (
             "ChunkedLocalAttentionManager can only be used for " + "chunked local attention groups"
@@ -698,7 +778,27 @@ class MambaManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
-        """Return empty pages (Mamba state is never prefix-cached)."""
+        """Return empty pages (Mamba state is never prefix-cached).
+
+        Mamba uses a fixed-size recurrent state, which cannot meaningfully
+        share a prefix across requests.
+
+        Args:
+            page_hashes: The page hashes of the request (ignored).
+            max_length: The maximum length of the cache hit prefix (ignored).
+            kv_cache_group_ids: The ids of the kv cache groups.
+            page_pool: The page pool (ignored).
+            kv_cache_spec: The kv cache spec (must be :class:`MambaSpec`).
+            use_eagle: Whether to use eagle speculative decoding (ignored).
+            dp_shard_hint: Optional DP shard hint (ignored).
+            data_parallel_size: Total number of DP shards (ignored).
+
+        Returns:
+            Tuple of empty page lists, one per cache group.
+
+        Raises:
+            AssertionError: If the spec is not :class:`MambaSpec`.
+        """
         assert isinstance(kv_cache_spec, MambaSpec), "MambaManager can only be used for mamba groups"
 
         computed_pages: tuple[list[CachePage], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))
@@ -744,10 +844,14 @@ class MambaManager(SingleTypeCacheManager):
 
         Args:
             request_id: The request ID.
-            num_tokens: The number of tokens (ignored for Mamba).
+            num_tokens: The number of tokens (effectively ignored — Mamba
+                state size is fixed).
+            dp_shard_hint: Optional DP shard hint forwarded to the page pool.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
-            List containing the single allocated page (if newly allocated).
+            List containing the single allocated page (empty if the request
+            already has its page).
 
         Raises:
             AssertionError: If more than one page would be allocated.

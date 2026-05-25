@@ -77,6 +77,8 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
 from spectrax import PartitionAxis, with_sharding_constraint
 
+from easydel.utils.helpers import check_bool_flag
+
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
@@ -96,6 +98,19 @@ LINEAR_ATTENTION = "linear_attention"
 KDA_LINEAR_ATTENTION = "kda_linear_attention"
 PARALLEL_HYBRID = "parallel_hybrid"
 LayerType = tp.Literal["full_attention", "linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"]
+
+
+def _linear_recurrent_state_dtype(cache_dtype: jnp.dtype) -> jnp.dtype:
+    """Return storage dtype for GDN/KDA recurrent state.
+
+    vLLM TPU stores convolution state in the cache dtype but keeps the
+    recurrent GDN matrix in fp32. EasyDeL's GDN kernels also run the recurrent
+    math in fp32; storing the row in fp32 avoids a full bf16->fp32 cast of the
+    state pool on every decode step.
+    """
+    if check_bool_flag("EASYDEL_HYBRID_RECURRENT_FLOAT32", True):
+        return jnp.float32
+    return cache_dtype
 
 
 @auto_pytree
@@ -119,8 +134,13 @@ class HybridCacheConfig(BaseCacheConfig):
         d_inner (int): Intermediate dimension for linear attention.
         d_conv (int): Convolution kernel size for linear attention.
         d_state (int): Recurrent state dimension for linear attention.
-        layer_types (tuple[str, ...]): Per-layer attention type specification.
-            Each element is either "full_attention" or "linear_attention".
+        num_attention_heads (int): Number of attention heads used to shape
+            the recurrent state for linear / KDA / parallel-hybrid layers.
+            Defaults to ``num_key_value_heads`` when not specified.
+        layer_types (tuple[str, ...]): Per-layer attention type. Each entry
+            is one of ``FULL_ATTENTION``, ``LINEAR_ATTENTION``,
+            ``KDA_LINEAR_ATTENTION``, ``PARALLEL_HYBRID``, or ``HYBRID``
+            (the latter is normalized to ``PARALLEL_HYBRID``).
     """
 
     # Required fields
@@ -271,27 +291,52 @@ class HybridCacheConfig(BaseCacheConfig):
 class HybridCacheView(BaseCacheView):
     """Single-layer cache view for hybrid attention models.
 
-    Manages cache state for one layer, supporting either:
-    - KV cache (for full_attention layers)
-    - Conv state + recurrent state (for linear_attention layers)
+    Manages cache state for one layer, supporting any of:
 
-    The view stores only the state type needed for its layer type,
-    with the other fields set to None.
+    * KV cache (for ``full_attention`` layers)
+    * Combined conv + recurrent state (for ``linear_attention`` /
+      GatedDeltaNet layers)
+    * Separate Q/K/V conv + recurrent state (for ``kda_linear_attention``
+      Kimi Linear layers)
+    * Both KV cache and recurrent state in parallel (for
+      ``parallel_hybrid`` layers, e.g. FalconH1)
+
+    The view stores only the state tensors needed for its layer type, with
+    the other fields left as ``None`` to keep the per-layer memory budget
+    tight. ``concatenate_to_cache`` dispatches on ``layer_type`` so callers
+    can use one cache view regardless of the underlying attention variant.
 
     Attributes:
         key (Array | None): Key cache for full attention.
-            Shape: [batch_size, sequence_length, num_kv_heads, head_dim]
+            Shape: ``[batch_size, sequence_length, num_kv_heads, head_dim]``.
+            ``None`` for non-attention layer types.
         value (Array | None): Value cache for full attention.
-            Shape: [batch_size, sequence_length, num_kv_heads, head_dim]
-        conv_state (Array | None): Convolution state for linear attention.
-            Shape: [batch_size, d_inner, d_conv]
-        recurrent_state (Array | None): Recurrent state for linear attention.
-            Shape: [batch_size, num_heads, head_dim, d_state]
+            Shape: ``[batch_size, sequence_length, num_kv_heads, head_dim]``.
+            ``None`` for non-attention layer types.
+        conv_state (Array | None): Combined convolution state for linear
+            attention (GatedDeltaNet) layers.
+            Shape: ``[batch_size, d_inner, d_conv]``.
+        recurrent_state (Array | None): Recurrent state for linear, KDA,
+            and parallel-hybrid layers.
+            Shape: ``[batch_size, num_heads, head_dim, d_state]``.
         positions (Array): Current position index per batch element.
-            Shape: [batch_size]
-        metadata (HybridCacheConfig): Static configuration metadata.
-        layer_index (int | None): Index of this layer in the model.
-        layer_type (str): Type of attention for this layer.
+            Shape: ``[batch_size]``.
+        metadata (HybridCacheConfig): Static configuration metadata
+            describing dimensions and per-layer attention types.
+        q_conv_state (Array | None): KDA Q convolution state.
+            Shape: ``[batch_size, key_dim, d_conv]``. Only allocated for
+            ``kda_linear_attention`` layers.
+        k_conv_state (Array | None): KDA K convolution state.
+            Shape: ``[batch_size, key_dim, d_conv]``. Only allocated for
+            ``kda_linear_attention`` layers.
+        v_conv_state (Array | None): KDA V convolution state.
+            Shape: ``[batch_size, value_dim, d_conv]``. Only allocated for
+            ``kda_linear_attention`` layers.
+        layer_index (int | None): Index of this layer in the model, or
+            ``None`` if the view is not bound to a specific layer.
+        layer_type (str): Attention variant for this layer; one of
+            ``FULL_ATTENTION``, ``LINEAR_ATTENTION``, ``KDA_LINEAR_ATTENTION``,
+            or ``PARALLEL_HYBRID``.
     """
 
     # KV cache (for full_attention)
@@ -389,6 +434,7 @@ class HybridCacheView(BaseCacheView):
             )
         elif layer_type == LINEAR_ATTENTION:
             # Allocate combined conv state + recurrent state for GatedDeltaNet
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
             conv_state = with_sharding_constraint(
                 arr=jnp.zeros(
                     shape=(
@@ -412,7 +458,7 @@ class HybridCacheView(BaseCacheView):
                         metadata.head_dim,
                         metadata.d_state,
                     ),
-                    dtype=dtype,
+                    dtype=recurrent_dtype,
                 ),
                 sharding=PartitionSpec(
                     metadata.partition_axis.batch_axis,
@@ -425,6 +471,7 @@ class HybridCacheView(BaseCacheView):
             # Allocate separate Q/K/V conv states + recurrent state for KDA (Kimi Linear)
             # For KDA, d_inner is split into key_dim (Q/K) and value_dim (V)
             # We use d_inner for key dimension and d_state for value dimension
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
             key_dim = metadata.num_attention_heads * metadata.head_dim
             value_dim = metadata.d_state  # In KDA, value has different dimension
 
@@ -462,7 +509,7 @@ class HybridCacheView(BaseCacheView):
                         metadata.head_dim,
                         metadata.d_state,
                     ),
-                    dtype=dtype,
+                    dtype=recurrent_dtype,
                 ),
                 sharding=PartitionSpec(
                     metadata.partition_axis.batch_axis,
@@ -475,6 +522,7 @@ class HybridCacheView(BaseCacheView):
         elif layer_type == PARALLEL_HYBRID:
             # Allocate BOTH KV cache AND recurrent state for parallel hybrid layers
             # (e.g., FalconH1 where attention and SSM run in parallel)
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
 
             # KV cache (same as FULL_ATTENTION)
             key = with_sharding_constraint(
@@ -526,7 +574,7 @@ class HybridCacheView(BaseCacheView):
                         metadata.head_dim,
                         metadata.d_state,
                     ),
-                    dtype=dtype,
+                    dtype=recurrent_dtype,
                 ),
                 sharding=PartitionSpec(
                     metadata.partition_axis.batch_axis,
@@ -1004,6 +1052,19 @@ class ParallelHybridCacheView(BaseCacheView):
         """
         if self.transformer is not None:
             self.transformer.kv_pages = value
+
+    def reset(self) -> "ParallelHybridCacheView":
+        """Reset both inner cache views and keep mirrored recurrent fields aligned."""
+        transformer = self.transformer.reset() if self.transformer is not None else None
+        recurrent = self.recurrent.reset() if self.recurrent is not None else None
+        return self.replace(
+            transformer=transformer,
+            recurrent=recurrent,
+            conv_state=getattr(recurrent, "conv_state", None),
+            recurrent_state=getattr(recurrent, "recurrent_state", None),
+            positions=getattr(recurrent, "positions", None),
+            seqlen_offset=getattr(recurrent, "seqlen_offset", None),
+        )
 
     @classmethod
     def init(cls, metadata: BaseCacheConfig, *args, **kwargs) -> "ParallelHybridCacheView":

@@ -293,6 +293,7 @@ class Scheduler(SchedulerInterface):
         enable_prefix_caching: bool = True,
         async_scheduling: bool = True,
         long_prefill_token_threshold: int | None = None,
+        num_speculative_tokens: int = 0,
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
 
@@ -352,6 +353,7 @@ class Scheduler(SchedulerInterface):
             max_num_seq_buckets=list(runner.max_num_seq_buckets) if runner.max_num_seq_buckets else None,
             async_scheduling=async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
+            num_speculative_tokens=int(num_speculative_tokens),
         )
 
         if async_scheduling:
@@ -946,6 +948,8 @@ class Scheduler(SchedulerInterface):
                 output includes new tokens, finish reason, and metadata.
         """
         sampled_token_ids = model_runner_output.sampled_token_ids
+        spec_token_ids = model_runner_output.spec_token_ids
+        num_accepted_spec_tokens = model_runner_output.num_accepted_spec_tokens or {}
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -984,6 +988,14 @@ class Scheduler(SchedulerInterface):
                 )
                 continue
             generated_token_ids = sampled_token_ids[out_index] if sampled_token_ids else []
+            if spec_token_ids is not None:
+                request.spec_token_ids = list(spec_token_ids[out_index]) if out_index < len(spec_token_ids) else []
+            accepted_spec_tokens = num_accepted_spec_tokens.get(req_id)
+            if accepted_spec_tokens is not None:
+                scheduled_specs = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+                rejected_specs = max(0, len(scheduled_specs) - int(accepted_spec_tokens))
+                if rejected_specs:
+                    request.num_computed_tokens = max(0, request.num_computed_tokens - rejected_specs)
             stopped = False
             new_token_ids = generated_token_ids
             status_before_stop = request.status
@@ -991,6 +1003,7 @@ class Scheduler(SchedulerInterface):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
             if stopped:
+                request.spec_token_ids = []
                 self._free_request(request)
                 if status_before_stop == EngineRequestStatus.RUNNING:
                     stopped_running_reqs.add(request)

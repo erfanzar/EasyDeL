@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lifecycle manager for auth ZeroMQ worker.
+"""Lifecycle manager for the auth ZeroMQ worker subprocess.
 
-This module provides an AuthWorkerManager class that handles the spawning, lifecycle
-management, and cleanup of the auth worker process that communicates via ZeroMQ.
+Wraps the spawn / wait-for-bind / shutdown dance for
+``easydel.workers.esurge.auth.worker_main`` so the API server can keep its
+auth state in an isolated CPU-only Python process. The manager either
+spawns the worker itself (auto-generating a unique ``ipc://`` endpoint
+under the system tmp directory) or attaches to an externally-managed
+endpoint passed in by the caller.
+
+Module exports:
+    - :class:`AuthWorkerManager`: spawn / connect / shutdown wrapper that
+      returns a connected :class:`AuthWorkerClient` once the worker is
+      ready to serve requests.
 
 Note:
-    This module is for internal use only and is not part of EasyDeL's public API.
+    This module is for internal use only and is not part of EasyDeL's
+    public API.
 """
 
 from __future__ import annotations
@@ -39,11 +49,29 @@ logger = get_logger(__name__)
 
 
 class AuthWorkerManager:
-    """Spawns and manages auth worker process and client.
+    """Spawn and supervise the auth ZMQ worker subprocess.
 
-    When an explicit endpoint is supplied we simply connect to it. Otherwise we
-    automatically launch the bundled ZeroMQ worker under an isolated Python
-    interpreter and expose its endpoint.
+    Owns the lifecycle of the ``worker_main`` Python subprocess that
+    hosts :class:`EnhancedApiKeyManager` behind a ZMQ ``REP`` socket.
+    Two operating modes:
+
+    * **Owned**: ``start()`` is called without ``auth_endpoint``; the
+      manager generates a unique ``ipc://`` socket under
+      ``ipc_dir``, launches ``worker_main`` with the constructor
+      arguments forwarded as CLI flags, polls until the IPC file
+      appears, and connects an :class:`AuthWorkerClient` to it.
+      :meth:`shutdown` sends the ``shutdown`` command, terminates the
+      subprocess, and unlinks the IPC file.
+    * **Attached**: ``start(auth_endpoint=...)`` is called; the
+      manager only opens a client to the existing endpoint and never
+      tries to terminate the upstream process.
+
+    Attributes:
+        auth_endpoint (str | None): Bound endpoint of the running
+            worker, set by :meth:`start` and cleared by
+            :meth:`shutdown`.
+        auth_client (AuthWorkerClient | None): Connected client; same
+            lifecycle as ``auth_endpoint``.
     """
 
     def __init__(
@@ -59,18 +87,28 @@ class AuthWorkerManager:
         startup_timeout: float = 30.0,
         ipc_dir: str | None = None,
     ) -> None:
-        """Initialize the auth worker manager.
+        """Capture configuration; nothing is spawned until :meth:`start` runs.
 
         Args:
-            require_api_key: If True, all requests must provide a valid API key.
-            admin_key: Optional admin key for initial setup.
-            enable_audit_logging: Enable audit logging.
-            max_audit_entries: Maximum audit log entries to keep.
-            storage_dir: Directory for persistent storage.
-            enable_persistence: Enable persistent storage.
-            auto_save_interval: Auto-save interval in seconds.
-            startup_timeout: Timeout for worker startup.
-            ipc_dir: Directory for IPC socket files.
+            require_api_key: When ``True`` the spawned worker rejects
+                unauthenticated callers; forwarded as ``--require-api-key``.
+            admin_key: Optional bootstrap admin secret; forwarded as
+                ``--admin-key``.
+            enable_audit_logging: Forwarded as ``--enable-audit-logging``
+                / ``--disable-audit-logging``.
+            max_audit_entries: Forwarded as ``--max-audit-entries``;
+                caps the in-memory audit ring in the worker.
+            storage_dir: Forwarded as ``--storage-dir``; ``None`` lets
+                the worker default to ``~/.cache/esurge-auth``.
+            enable_persistence: Forwarded as ``--enable-persistence``
+                / ``--disable-persistence``.
+            auto_save_interval: Forwarded as ``--auto-save-interval``
+                in seconds.
+            startup_timeout: Maximum seconds :meth:`_wait_for_endpoint`
+                will poll for the IPC socket file to appear before
+                raising :class:`TimeoutError`.
+            ipc_dir: Directory where the ``ipc://`` socket file is
+                placed; defaults to the system tmp directory.
         """
         self._require_api_key = require_api_key
         self._admin_key = admin_key
@@ -108,16 +146,27 @@ class AuthWorkerManager:
         return self._auth_client
 
     def start(self, *, auth_endpoint: str | None = None) -> AuthWorkerClient:
-        """Start auth worker process.
+        """Spawn (or attach to) the worker and return a connected client.
+
+        When ``auth_endpoint`` is ``None`` the manager allocates a fresh
+        ``ipc://`` endpoint under ``ipc_dir``, launches the worker
+        subprocess, and blocks until the IPC socket file appears (up to
+        ``startup_timeout`` seconds). When an endpoint is supplied, no
+        process is spawned and ownership stays with the caller.
 
         Args:
-            auth_endpoint: Optional auth worker endpoint. If None, spawns a worker.
+            auth_endpoint: Pre-existing worker endpoint to attach to.
+                ``None`` triggers the owned-subprocess path.
 
         Returns:
-            AuthWorkerClient instance.
+            AuthWorkerClient: A client connected to the running worker;
+            also exposed via :attr:`auth_client`.
 
         Raises:
-            RuntimeError: If worker has already started or fails to start.
+            RuntimeError: If the manager already has an active client,
+                or if the spawned worker exits before binding.
+            TimeoutError: If the worker fails to bind within
+                ``startup_timeout`` seconds.
         """
         if self._auth_client:
             raise RuntimeError("Auth worker has already started.")
@@ -140,7 +189,14 @@ class AuthWorkerManager:
         return self._auth_client
 
     def shutdown(self) -> None:
-        """Shutdown the auth worker and clean up resources."""
+        """Shut down the worker (if owned) and release all resources.
+
+        Sends ``shutdown`` to the worker when the manager owns the
+        subprocess, otherwise only closes the local client. Always
+        terminates the tracked subprocess and unlinks the IPC socket
+        file when ownership was retained. Idempotent: subsequent calls
+        are no-ops.
+        """
         if self._auth_client is None:
             return
 
@@ -162,13 +218,22 @@ class AuthWorkerManager:
     # Internal helpers -----------------------------------------------------
 
     def _spawn_auth_worker(self, endpoint: str) -> subprocess.Popen:
-        """Spawn auth worker process.
+        """Launch ``worker_main.py`` under a CPU-only Python interpreter.
+
+        Builds the CLI argument list from the manager's configuration
+        and seeds the child environment with ``JAX_PLATFORMS=cpu``,
+        ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and
+        ``ENABLE_DISTRIBUTED_INIT=0`` so the auth worker never tries to
+        grab accelerators.
 
         Args:
-            endpoint: ZeroMQ endpoint for the auth worker.
+            endpoint: ZMQ endpoint to bind on the child side. Always
+                an ``ipc://`` URL when called from :meth:`start`.
 
         Returns:
-            subprocess.Popen instance.
+            subprocess.Popen: Handle to the spawned worker; the manager
+            keeps a reference so :meth:`_terminate_process` can clean
+            it up on shutdown.
         """
         worker_main_path = Path(__file__).with_name("worker_main.py")
         cmd = [
@@ -208,15 +273,21 @@ class AuthWorkerManager:
         return subprocess.Popen(cmd, env=env)
 
     def _wait_for_endpoint(self, endpoint: str, process: subprocess.Popen | None) -> None:
-        """Wait for the worker to bind to the endpoint.
+        """Block until the worker binds to ``endpoint`` or fails fast.
+
+        For ``ipc://`` endpoints, readiness is detected by the socket
+        file appearing on disk; for other transports the method only
+        verifies the subprocess is alive until the timeout elapses.
 
         Args:
-            endpoint: ZeroMQ endpoint to wait for.
-            process: Worker process to monitor.
+            endpoint: Endpoint string the worker is expected to bind.
+            process: The subprocess being supervised. ``None`` skips
+                liveness checks (used when attaching).
 
         Raises:
-            RuntimeError: If worker process exits unexpectedly.
-            TimeoutError: If worker doesn't bind within timeout.
+            RuntimeError: When ``process`` exits before binding.
+            TimeoutError: When ``startup_timeout`` seconds pass without
+                the IPC socket file appearing.
         """
         deadline = time.time() + self._startup_timeout
         path = None
@@ -235,20 +306,31 @@ class AuthWorkerManager:
         raise TimeoutError(f"Timed out waiting for auth worker to bind to {endpoint}")
 
     def _make_ipc_endpoint(self, prefix: str) -> str:
-        """Create a unique IPC endpoint.
+        """Allocate a fresh ``ipc://`` endpoint under :attr:`_ipc_dir`.
+
+        Uses ``uuid.uuid4().hex`` to guarantee uniqueness so re-running
+        the manager (or running multiple instances) never collides on
+        socket paths. Creates ``_ipc_dir`` if it does not exist.
 
         Args:
-            prefix: Prefix for the socket filename.
+            prefix: Short slug embedded in the filename for
+                disambiguation (e.g. ``"auth"``).
 
         Returns:
-            IPC endpoint URL.
+            str: A ZMQ endpoint of the form
+            ``ipc:///<ipc_dir>/easydel_<prefix>_<hex>.sock``.
         """
         os.makedirs(self._ipc_dir, exist_ok=True)
         file_path = os.path.join(self._ipc_dir, f"easydel_{prefix}_{uuid.uuid4().hex}.sock")
         return f"ipc://{file_path}"
 
     def _terminate_process(self) -> None:
-        """Terminate the auth worker process."""
+        """Best-effort termination of the auth worker subprocess.
+
+        Sends ``SIGTERM``, waits up to 5 seconds for a clean exit, then
+        escalates to ``SIGKILL`` if the process is still running.
+        No-op when the process has already exited or was never spawned.
+        """
         if not self._auth_process:
             return
         if self._auth_process.poll() is None:
@@ -262,10 +344,13 @@ class AuthWorkerManager:
         self._auth_process = None
 
     def _cleanup_ipc_file(self, endpoint: str | None) -> None:
-        """Clean up IPC socket file.
+        """Unlink the IPC socket file backing ``endpoint``, if any.
+
+        Skipped for non-IPC endpoints or when the file is already gone.
 
         Args:
-            endpoint: Endpoint URL to clean up.
+            endpoint: Endpoint URL whose socket file should be removed.
+                ``None`` is silently ignored.
         """
         if not endpoint or not endpoint.startswith("ipc://"):
             return

@@ -410,6 +410,8 @@ class ExecutionManager:
         pipeline_plan: PipelineInferencePlan | None = None,
         pp_microbatch_count: int | str | None = "auto",
         pp_microbatch_size: int | str | None = "auto",
+        full_hidden_state_max_tokens: int = 0,
+        speculative_recurrent_state_tokens: int = 0,
     ):
         """Initialize the executor manager.
 
@@ -432,6 +434,13 @@ class ExecutionManager:
                 keeps the built-in split, ``None`` or ``0`` disables
                 microbatch wavefront execution, and a positive integer pins
                 rows per microbatch.
+            full_hidden_state_max_tokens: Model-step buckets at or below this
+                token count carry every hidden row. Used by runner-native
+                speculative verification; standard decoding keeps compact
+                sampled-row outputs.
+            speculative_recurrent_state_tokens: Number of per-request recurrent
+                candidate rows to allocate for speculative decode. Zero keeps
+                the standard cache shape.
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -444,10 +453,13 @@ class ExecutionManager:
         self.mesh = model.mesh
 
         self.use_aot_forward = use_aot_forward
+        self.full_hidden_state_max_tokens = max(0, int(full_hidden_state_max_tokens))
         self.mpmd_scheduler = mpmd_scheduler
         self.pipeline_plan = pipeline_plan
         self.pp_microbatch_count = pp_microbatch_count
         self.pp_microbatch_size = pp_microbatch_size
+        self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
+        self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -506,6 +518,7 @@ class ExecutionManager:
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             min_input_pad=self.min_input_pad,
+            enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
         )
         self._model_executor = ModelStepExecutor(
             model=self.model,
@@ -520,6 +533,8 @@ class ExecutionManager:
             use_aot_forward=self.use_aot_forward,
             mpmd_scheduler=self.mpmd_scheduler,
             pipeline_plan=self.pipeline_plan,
+            full_hidden_state_max_tokens=self.full_hidden_state_max_tokens,
+            enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_executor = SamplerExecutor(
@@ -670,8 +685,11 @@ class ExecutionManager:
 
         def _allocate() -> tp.Any:
             """Single attempt at building the operations cache via the model API."""
+            cache_batch_size = int(self.max_num_reqs)
+            if self.speculative_recurrent_state_tokens > 0:
+                cache_batch_size += cache_batch_size * int(self.speculative_recurrent_state_tokens)
             return self.model.init_operations_cache(
-                batch_size=int(self.max_num_reqs),
+                batch_size=cache_batch_size,
                 max_length=int(self.max_model_len),
                 page_size=int(getattr(self.metadata, "page_size", 128)),
                 hbm_utilization=float(getattr(self.metadata, "hbm_utilization", 0.9)),
@@ -1186,6 +1204,8 @@ class ExecutionManager:
                 graphstate=self.graphstate,
                 graphother=self.graphother,
             )
+        if self.graphstate is not None and self.graphother is not None:
+            self._model_executor.set_runtime_graph_args(self.graphstate, self.graphother)
 
         # Clear cached baselines so future diagnostics re-hash with new weights.
         self._debug_baselines.clear()
@@ -1211,6 +1231,7 @@ class ExecutionManager:
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
         page_table_version: int | None = None,
+        spec_recurrent_commit_cpu: numpy.ndarray | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: numpy.ndarray | None = None,
         prefill_embeds_cpu: numpy.ndarray | None = None,
@@ -1249,12 +1270,44 @@ class ExecutionManager:
                 generated enough tokens without an extra per-step device_put.
             active_mask_full: Boolean mask for active requests [max_num_reqs].
                 Inactive requests are skipped during processing.
+            window_row_indices_cpu: Per-row global request indices for the
+                current window. Used to map compact sampler rows back to the
+                full-table layout.
             input_ids_buf: Contiguous token ID buffer [max_num_tokens]. Flattened
                 across requests for efficient batch processing.
             position_ids_buf: Contiguous position ID buffer [max_num_tokens].
                 Parallel to input_ids_buf with position indices.
             padded_num_reqs: Bucketed request count for compilation lookup. Must
                 be a power of 2 (or min_input_pad) matching a compiled variant.
+            token_ids_cpu: Host-side ``[max_num_reqs, max_model_len]`` token id
+                buffer used to fill the packed input slice.
+            num_computed_tokens_cpu: Tokens already prefilled per request.
+            temperature_cpu: Per-request sampling temperatures.
+            top_p_cpu: Per-request top-p sampling values.
+            top_k_cpu: Per-request top-k sampling values.
+            min_p_cpu: Per-request min-p sampling thresholds.
+            frequency_penalties_cpu: Per-request frequency penalty values.
+            presence_penalties_cpu: Per-request presence penalty values.
+            repetition_penalties_cpu: Per-request repetition penalty values.
+            page_table_cpu: Host-side KV-cache page-table block ids.
+            page_table_version: Optional monotonic version for page-table cache
+                reuse; bump on allocator/swap/condense changes.
+            spec_recurrent_commit_cpu: Optional speculative recurrent commit
+                metadata (active mask + real prefix length per request).
+            mrope_position_ids_cpu: Optional ``[3, num_tokens]`` mRoPE positions.
+            prefill_embeds_cpu: Optional prefill embedding overrides for VLMs.
+            prefill_embeds_mask_cpu: Optional mask selecting prefill rows.
+            visual_pos_masks_cpu: Optional visual position masks for DeepStack.
+            deepstack_visual_embeds_cpu: Optional DeepStack visual embeddings.
+            pixel_values: Optional raw image pixel values for VLMs.
+            image_grid_thw: Optional image grid shape ``(T, H, W)``.
+            pixel_values_videos: Optional raw video pixel values for VLMs.
+            video_grid_thw: Optional video grid shape ``(T, H, W)``.
+            device_token_handoff: Optional device-resident sampled-token handoff
+                from the previous PP step (avoids host token materialization).
+            wait_for_outputs: If ``True``, block on the device-side output
+                arrays before returning so the timing metrics reflect full
+                completion; otherwise the returned arrays may still be running.
 
         Returns:
             Tuple of 7 elements:
@@ -1358,6 +1411,7 @@ class ExecutionManager:
             repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             padded_num_reqs_in=padded_num_reqs,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
             prefill_embeds_cpu=prefill_embeds_cpu,
@@ -1553,12 +1607,14 @@ class ExecutionManager:
         start_exec = time.time()
         if self._verbose and num_tokens > 0:
             logger.info("[esurge-prof-exec] launching model tok=%d", int(num_tokens))
+        model_enqueue_start = time.time()
         model_outputs = self.execute_model(
             num_tokens=num_tokens,
             padded_num_reqs=model_logits_padded_num_reqs,
             inputs=inputs,
             use_pipeline_runtime=use_pipeline_runtime_for_window,
         )
+        model_enqueue_took = time.time() - model_enqueue_start
         if self._verbose and num_tokens > 0:
             logger.info("[esurge-prof-exec] model launched tok=%d", int(num_tokens))
 
@@ -1587,9 +1643,15 @@ class ExecutionManager:
             sampler_hash_baseline = self._debug_baselines[f"{num_tokens}_{sampler_padded_num_reqs}_hash_in_sampler"]
             _tree_hash_diff(sampler_hash_baseline, sampler_hash)
 
+        need_penalties = bool(
+            numpy.any(frequency_penalties_cpu != 0.0)
+            or numpy.any(presence_penalties_cpu != 0.0)
+            or numpy.any(repetition_penalties_cpu != 1.0)
+        )
         # Enqueue sampling immediately (it will run after the forward pass),
         # then synchronize on logits to measure forward time without an extra
         # host-side dispatch gap between the two computations.
+        sampler_enqueue_start = time.time()
         sampler_out = self.sample_tokens(
             num_tokens=num_tokens,
             padded_num_reqs=padded_num_reqs,
@@ -1613,21 +1675,21 @@ class ExecutionManager:
             compact_frequency_penalties_cpu=self._sampler_frequency_penalties_cpu,
             compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
             compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
-            need_penalties=bool(
-                numpy.any(frequency_penalties_cpu != 0.0)
-                or numpy.any(presence_penalties_cpu != 0.0)
-                or numpy.any(repetition_penalties_cpu != 1.0)
-            ),
+            need_penalties=need_penalties,
         )
+        sampler_enqueue_took = time.time() - sampler_enqueue_start
         if self._verbose and num_tokens > 0:
             logger.info("[esurge-prof-exec] sampler launched tok=%d", int(num_tokens))
         rng_key_out, out_tokens_full, valid_mask_full, token_counts_out = sampler_out
         self.rng_key = rng_key_out
         self._sampler_token_counts = token_counts_out
+        logits_wait_took = 0.0
         if wait_for_outputs:
             if self._verbose and num_tokens > 0:
                 logger.info("[esurge-prof-exec] waiting model logits tok=%d", int(num_tokens))
+            logits_wait_start = time.time()
             jax.block_until_ready(model_outputs.logits)
+            logits_wait_took = time.time() - logits_wait_start
             exec_took = time.time() - start_exec
 
             start_sample = time.time()
@@ -1645,7 +1707,13 @@ class ExecutionManager:
         buckets_processed = batch_metadata.input_ids_buf.shape[-1]
         metrics = {
             "exec_time": exec_took,
+            "model_enqueue_time": model_enqueue_took,
+            "sampler_enqueue_time": sampler_enqueue_took,
+            "logits_wait_time": logits_wait_took,
+            "exec_enqueue_time": model_enqueue_took + sampler_enqueue_took,
+            "exec_wait_time": logits_wait_took,
             "sample_time": sample_took,
+            "sampler_wait_time": sample_took,
             "prep_time": prep_took,
             "prep_batch_metadata_time": prep_batch_metadata_took,
             "prep_handoff_time": prep_handoff_took,
@@ -1741,6 +1809,7 @@ class ExecutionManager:
             prefill_embeds_mask=batch_metadata.prefill_embeds_mask,
             visual_pos_masks=batch_metadata.visual_pos_masks,
             deepstack_visual_embeds=batch_metadata.deepstack_visual_embeds,
+            spec_recurrent_commit=batch_metadata.spec_recurrent_commit,
         )
 
     def _get_pipeline_handoff_scalars(self, *, offset: int, count: int) -> tuple[jax.Array, jax.Array]:
@@ -2490,8 +2559,9 @@ class ExecutionManager:
         )
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
+        graphstate_arg, graphother_arg = self._model_executor.runtime_graph_args()
         with forward_autotune_only():
-            outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
+            outputs = model_fn(graphstate_arg, graphother_arg, inputs.kv_pages, inputs.batch_metadata)
         self.kv_pages = outputs.kv_pages
         return outputs
 
@@ -2534,6 +2604,14 @@ class ExecutionManager:
 
         changed = False
         new_views = list(cache.views)
+        slot_indices_to_clear = list(slot_indices)
+        candidate_count = max(0, int(getattr(self, "speculative_recurrent_state_tokens", 0) or 0))
+        if candidate_count > 0:
+            base_slots = int(self.max_num_reqs)
+            for slot in slot_indices:
+                if 0 <= int(slot) < base_slots:
+                    start = base_slots + int(slot) * candidate_count
+                    slot_indices_to_clear.extend(range(start, start + candidate_count))
         for idx, view in enumerate(new_views):
             rec = None
             if isinstance(view, RecurrentCacheView):
@@ -2545,7 +2623,6 @@ class ExecutionManager:
 
             new_conv = rec.conv_state
             new_rec = rec.recurrent_state
-            slot_arr = jnp.array(slot_indices, dtype=jnp.int32)
             # Build mask once — conv_state and recurrent_state share the batch dim.
             if new_conv is not None:
                 n_slots = typing.cast(jax.Array, new_conv).shape[0]
@@ -2553,6 +2630,10 @@ class ExecutionManager:
                 n_slots = typing.cast(jax.Array, new_rec).shape[0]
             else:
                 continue
+            filtered_slots = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < int(n_slots)})
+            if not filtered_slots:
+                continue
+            slot_arr = jnp.array(filtered_slots, dtype=jnp.int32)
             keep_mask = jnp.ones(n_slots, dtype=jnp.bool_).at[slot_arr].set(False)
             if new_conv is not None:
                 new_conv = jnp.where(keep_mask.reshape(-1, *([1] * (new_conv.ndim - 1))), new_conv, 0)
@@ -2898,7 +2979,12 @@ class ExecutionManager:
             self._reset_kv_pages_after_compile_warmup()
         else:
             reqs_to_compile = all_reqs_padds
-            model_compile_pairs = self._get_feasible_compile_pairs(model_tokens, reqs_padds)
+            if prune_infeasible_pairs:
+                model_compile_pairs = self._get_feasible_compile_pairs(model_tokens, reqs_padds)
+            else:
+                model_compile_pairs = [
+                    (int(num_tokens), int(reqs_padd)) for num_tokens in model_tokens for reqs_padd in reqs_padds
+                ]
             model_step_progress = ProgressLogger("eSurge-model-step", logger)
             for idx, (num_tokens, reqs_padd) in enumerate(model_compile_pairs):
                 model_step_progress.update(
@@ -3249,6 +3335,7 @@ class ExecutionManager:
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
+        spec_recurrent_commit_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: numpy.ndarray | None = None,
@@ -3285,6 +3372,8 @@ class ExecutionManager:
             repetition_penalties_cpu: Repetition penalty per request (CPU array).
             page_table_cpu: Page table (CPU array).
             padded_num_reqs_in: Requested padding for request count.
+            spec_recurrent_commit_cpu: Optional speculative recurrent commit
+                metadata for the recurrent-drafter speculative decoding path.
             page_table_version: Optional version for page table caching.
             mrope_position_ids_cpu: Optional mRoPE positions for VLMs.
             prefill_embeds_cpu: Optional prefill embeddings for VLMs.
@@ -3318,6 +3407,7 @@ class ExecutionManager:
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs_in,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
             prefill_embeds_cpu=prefill_embeds_cpu,
             prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
@@ -3347,6 +3437,7 @@ class ExecutionManager:
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
         padded_num_reqs_in: int,
+        spec_recurrent_commit_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
     ) -> None:
         """Start async device transfer for double-buffered batch preparation.
@@ -3371,6 +3462,8 @@ class ExecutionManager:
             repetition_penalties_cpu: Repetition penalty per request.
             page_table_cpu: Page table for all requests.
             padded_num_reqs_in: Requested padding for request count.
+            spec_recurrent_commit_cpu: Optional speculative recurrent commit
+                metadata snapshot for the next batch.
             page_table_version: Optional version for page table caching.
 
         Note:
@@ -3393,6 +3486,7 @@ class ExecutionManager:
             repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             padded_num_reqs_in=padded_num_reqs_in,
         )
 

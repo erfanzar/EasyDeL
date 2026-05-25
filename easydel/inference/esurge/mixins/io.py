@@ -693,7 +693,7 @@ class EngineIOMixin:
             >>> for chunk in engine.chat(messages, stream=True):
             ...     print(chunk.delta_text, end="", flush=True)
 
-        Note:ƒ
+        Note:
             For multimodal support, you must configure the engine with a processor
             in the model loading config:
             eSurge(model="model-id", processor=AutoProcessor.from_pretrained(...))

@@ -76,6 +76,7 @@ from .config import (
     eSurgeCacheRuntimeConfig,
     eSurgeContextConfig,
     eSurgeDistributedConfig,
+    eSurgeDrafterConfig,
     eSurgeParsingConfig,
     eSurgeRuntimeConfig,
     eSurgeVisionConfig,
@@ -146,6 +147,13 @@ from .scheduler import (
     SchedulerOutput,
 )
 from .server import eSurgeApiServer
+from .speculative_decoding import (
+    SpecDecodeStats,
+    SpeculativeAssistantDriver,
+    SpeculativeMTPDriver,
+    build_target_kv_pairs,
+    default_assistant_layer_mapping,
+)
 
 __all__ = (
     "AttentionSpec",
@@ -189,17 +197,23 @@ __all__ = (
     "SingleTypeCacheManager",
     "SlidingWindowManager",
     "SlidingWindowSpec",
+    "SpecDecodeStats",
+    "SpeculativeAssistantDriver",
+    "SpeculativeMTPDriver",
     "StepDispatch",
     "SystemMetrics",
     "UnitaryCacheCoordinator",
     "VisionEncoderCache",
+    "build_target_kv_pairs",
     "compute_sampled_digest",
     "create_kv_cache_specs_from_config",
+    "default_assistant_layer_mapping",
     "eSurge",
     "eSurgeApiServer",
     "eSurgeCacheRuntimeConfig",
     "eSurgeContextConfig",
     "eSurgeDistributedConfig",
+    "eSurgeDrafterConfig",
     "eSurgeMonitoringServer",
     "eSurgeParsingConfig",
     "eSurgeRunner",

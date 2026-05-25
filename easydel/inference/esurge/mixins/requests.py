@@ -133,15 +133,45 @@ class EngineRequestsMixin:
             prompt: Text prompt to generate from. May be truncated based on
                 context management settings.
             sampling_params: Generation parameters including max_tokens/max_new_tokens.
+            prompt_token_ids: Pre-tokenized prompt token ids; when ``None``
+                the engine tokenizes ``prompt`` on the fly.
+            tool_parser_request: Optional :class:`ChatCompletionRequest`
+                handed to the request's tool parser so it can disambiguate
+                forced-function calls.
+            defer_scheduler_enqueue: When ``True``, return the constructed
+                :class:`EngineRequest` objects to the caller instead of
+                enqueueing them on the scheduler. Used by :meth:`generate`
+                to batch-add all sample children under a single
+                ``_scheduler_lock`` window.
+            pixel_values: Optional vision tensor (image pixels) attached
+                to the request for vision-language models.
+            image_grid_thw: Vision grid dimensions (temporal, height, width)
+                aligned with ``pixel_values``.
+            pixel_values_videos: Optional vision tensor for video inputs.
+            video_grid_thw: Grid dimensions aligned with ``pixel_values_videos``.
+            mm_features: Optional list of :class:`MultiModalFeature` items
+                used by the prefix cache to share multimodal KV blocks
+                across ``n>1`` samples.
+
+        Returns:
+            List of :class:`EngineRequest` to enqueue when
+            ``defer_scheduler_enqueue=True``; otherwise ``None`` (the
+            requests are enqueued internally before returning).
+
+        Raises:
+            ValueError: If the prompt exceeds the context budget under
+                ``strict_context=True``, or if the requested
+                ``max_new_tokens`` cannot be satisfied even after
+                truncation.
 
         Context Management:
-            The method implements a sophisticated context management strategy:
-            1. Calculates available token budget (max_model_len - reserve_tokens)
-            2. If prompt exceeds budget:
-               - Truncates based on truncate_mode (left/right/middle)
-               - Or raises error if strict_context=True
-            3. Adjusts max_new_tokens to fit within remaining context
-            4. Prioritizes based on prefer_preserve_prompt setting
+            The method implements a context management strategy:
+                1. Calculates available token budget (max_model_len - reserve_tokens)
+                2. If prompt exceeds budget:
+                    - Truncates based on truncate_mode (left/right/middle)
+                    - Or raises error if strict_context=True
+                3. Adjusts max_new_tokens to fit within remaining context
+                4. Prioritizes based on prefer_preserve_prompt setting
 
         Truncation Strategies:
             - "left": Removes tokens from beginning (keeps recent context)

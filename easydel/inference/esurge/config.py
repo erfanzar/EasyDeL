@@ -32,6 +32,7 @@ Example:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack
@@ -47,6 +48,7 @@ else:
     MpMdSchedulers: type[object] = object
 
 LONG_PREFILL_TRS: int = 2048
+ESURGE_MIN_TOKEN_PAD: int = 16
 PPMicrobatchPolicy: TypeAlias = int | Literal["auto"] | None
 
 
@@ -56,6 +58,23 @@ def _normalize_pp_microbatch_policy(value: Any, *, field_name: str) -> PPMicroba
     ``"auto"`` preserves the built-in policy, ``None`` or ``0`` disables the
     wavefront path, and a positive integer pins either count or rows per
     microbatch depending on the field being normalized.
+
+    Args:
+        value: Raw user-supplied value. Accepts ``None``, ``"auto"`` /
+            ``"none"`` / ``"off"`` / ``"disable"`` (case insensitive), a
+            numeric string, or any non-negative integer.
+        field_name: Name of the config field being normalized, used in
+            error messages.
+
+    Returns:
+        ``"auto"`` to defer to the built-in policy, ``None`` to disable
+        wavefront microbatching, or a positive integer to pin the
+        microbatch knob.
+
+    Raises:
+        ValueError: If ``value`` is a string that cannot be coerced to
+            one of the recognized literals or a non-negative integer, or
+            if a negative integer is supplied.
     """
     if value is None:
         return None
@@ -98,6 +117,8 @@ def _validate_esurge_runtime_config(self):
         raise ValueError(f"min_input_pad must be positive, got {self.min_input_pad}")
     if self.min_token_pad is not None and self.min_token_pad <= 0:
         raise ValueError(f"min_token_pad must be positive when specified, got {self.min_token_pad}")
+    if self.min_token_pad is not None and self.max_model_len >= ESURGE_MIN_TOKEN_PAD:
+        self.min_token_pad = max(int(self.min_token_pad), ESURGE_MIN_TOKEN_PAD)
     if self.max_num_seqs <= 0:
         raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
     if self.max_num_batched_tokens is not NOT_GIVEN and self.max_num_batched_tokens is not None:
@@ -178,7 +199,9 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
         min_token_pad: Optional floor on the *token-count* bucket ladder.
             ``None`` defers to ``min_input_pad``. Set this explicitly when the
             request-count floor and token-count floor should differ. Must be
-            positive when set.
+            positive when set. Decode token buckets are clamped to at least
+            16 tokens for normal model lengths, matching the TPU serving path
+            used by vLLM-style decode benchmarks.
         max_num_seqs: Hard ceiling on concurrent in-flight sequences. The
             actual runtime concurrency may be smaller when KV pages are
             scarce.
@@ -772,6 +795,111 @@ class eSurgeDistributedConfig(TypedDict, total=False):
         ...
 
 
+def _validate_esurge_drafter_config(self):
+    """Validate and normalize an :class:`eSurgeDrafterConfig`."""
+    method = self.method
+    enabled = bool(self.enabled)
+    if method is not None:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(method).strip().lower()).strip("_")
+        if normalized in {"", "none", "off", "false", "disable", "disabled"}:
+            method = None
+            enabled = False
+        else:
+            method = normalized
+            enabled = True
+
+    if enabled and method is None:
+        method = "auto"
+
+    num_draft_tokens = int(self.num_draft_tokens)
+    if num_draft_tokens <= 0:
+        raise ValueError(f"num_draft_tokens must be positive, got {num_draft_tokens}")
+
+    if self.layer_mapping is not None:
+        self.layer_mapping = [int(layer_idx) for layer_idx in self.layer_mapping]
+
+    if self.kwargs is None:
+        self.kwargs = {}
+    elif not isinstance(self.kwargs, Mapping):
+        raise TypeError(f"kwargs must be a mapping or None, got {type(self.kwargs).__name__}")
+    else:
+        self.kwargs = dict(self.kwargs)
+
+    self.enabled = enabled
+    self.method = method
+    self.num_draft_tokens = num_draft_tokens
+
+
+@typed_config(
+    defaults={
+        "enabled": False,
+        "method": None,
+        "num_draft_tokens": 1,
+        "assistant_model": None,
+        "target_embed_module": None,
+        "layer_mapping": None,
+        "kwargs": None,
+    },
+    post_init=_validate_esurge_drafter_config,
+)
+class eSurgeDrafterConfig(TypedDict, total=False):
+    """Speculative drafter construction config for eSurge.
+
+    This is the declarative form of ``model.drafter(...)``. Passing it to
+    :class:`eSurge` lets the engine build the drafter from the loaded model
+    instead of requiring callers to instantiate a drafter class by hand.
+
+    Examples:
+        >>> eSurgeDrafterConfig.from_dict(method="mtp", num_draft_tokens=4)
+        >>> eSurgeDrafterConfig.from_dict(
+        ...     method="gemma4_assistant",
+        ...     assistant_model=assistant,
+        ...     num_draft_tokens=4,
+        ... )
+
+    Attributes:
+        enabled: Enable drafter construction. A non-empty ``method`` also
+            enables the config. ``False`` / ``method=None`` disables drafting.
+        method: Drafter family passed to ``model.drafter``. Supported runtime
+            values depend on the model, currently ``"auto"``, ``"mtp"``, and
+            ``"gemma4_assistant"``.
+        num_draft_tokens: Draft tokens proposed per verify window.
+        assistant_model: Optional standalone assistant model or model id/path
+            for assistant-style drafting.
+        target_embed_module: Optional target embedding module forwarded to
+            assistant drafters.
+        layer_mapping: Optional assistant-layer to target-layer mapping.
+        kwargs: Extra keyword arguments forwarded to ``model.drafter``.
+    """
+
+    enabled: NotRequired[bool]
+    method: NotRequired[str | None]
+    num_draft_tokens: NotRequired[int]
+    assistant_model: NotRequired[Any | None]
+    target_embed_module: NotRequired[Any | None]
+    layer_mapping: NotRequired[list[int] | tuple[int, ...] | None]
+    kwargs: NotRequired[dict[str, Any] | None]
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Unpack["eSurgeDrafterConfig"],
+    ) -> "eSurgeDrafterConfig":
+        """Build an :class:`eSurgeDrafterConfig` from a mapping/kwargs.
+
+        Args:
+            data: Optional source mapping; keys override defaults, and
+                ``kwargs`` override ``data``.
+            **kwargs: Any field of :class:`eSurgeDrafterConfig` consumed
+                via ``Unpack[eSurgeDrafterConfig]``.
+
+        Returns:
+            A validated ``eSurgeDrafterConfig`` instance.
+        """
+        ...
+
+
 class SchedulerConfig(SimpleNamespace):
     """Backward-compatible scheduler section for direct Scheduler tests.
 
@@ -796,6 +924,29 @@ class SchedulerConfig(SimpleNamespace):
         policy: Literal["priority", "fcfs"] = "fcfs",
         num_speculative_tokens: int = 0,
     ) -> None:
+        """Build a scheduler-config namespace consumed by the Scheduler.
+
+        Args:
+            max_num_seqs: Hard ceiling on concurrent in-flight sequences.
+            max_num_batched_tokens: Per-step token budget; ``None`` falls
+                back to ``max_model_len``.
+            max_model_len: Hard upper bound on per-request total sequence
+                length.
+            max_num_seq_buckets: Explicit request-count bucket ladder, or
+                ``None`` for the framework default.
+            async_scheduling: Run the scheduler on a background thread
+                so it can produce the next batch while the device finishes
+                the previous one.
+            long_prefill_token_threshold: Token count above which a single
+                prompt is split into multiple chunked-prefill steps.
+            chunked_prefill_enabled: Master switch for chunked prefill.
+            token_safety_margin: Optional safety margin (tokens) reserved
+                in the per-step budget.
+            policy: Admission policy: ``"fcfs"`` (default) or
+                ``"priority"``.
+            num_speculative_tokens: Number of speculative draft tokens
+                proposed per verify window. ``0`` disables speculation.
+        """
         super().__init__(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
@@ -820,6 +971,14 @@ class CacheConfig(SimpleNamespace):
         page_size: int,
         enable_prefix_caching: bool = True,
     ) -> None:
+        """Build a cache-config namespace consumed by the Scheduler.
+
+        Args:
+            num_pages: Total number of KV-cache pages in the pool.
+            page_size: Tokens stored per KV-cache page.
+            enable_prefix_caching: When ``True``, identical prompt
+                prefixes hit already-resident pages and skip re-prefill.
+        """
         super().__init__(
             num_pages=num_pages,
             page_size=page_size,
@@ -836,6 +995,14 @@ class Config(SimpleNamespace):
         scheduler_config: SchedulerConfig | None = None,
         cache_config: CacheConfig | None = None,
     ) -> None:
+        """Build an aggregate config namespace for direct Scheduler tests.
+
+        Args:
+            scheduler_config: The scheduler section. ``None`` builds a
+                default :class:`SchedulerConfig`.
+            cache_config: The cache section, or ``None`` when the
+                scheduler is being exercised without a real cache.
+        """
         super().__init__(
             scheduler_config=scheduler_config or SchedulerConfig(),
             cache_config=cache_config,
