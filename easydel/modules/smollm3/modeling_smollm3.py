@@ -21,8 +21,6 @@ SmolLM3 is a transformer decoder model with:
 - Grouped Query Attention (GQA)
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -45,7 +43,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -114,7 +119,6 @@ class SmolLM3Attention(UnifiedAttention):
             causal=True,  # Causal language modeling
             sliding_window=config.sliding_window if self.is_sliding else None,
             use_qk_norm=False,  # SmolLM3 doesn't use Q/K normalization
-            use_fused_qkv=False,  # Separate Q/K/V projections
             use_gqa=True,  # SmolLM3 uses Grouped Query Attention
         )
 
@@ -403,17 +407,20 @@ class SmolLM3MLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            in_features=self.hidden_size,
+            out_features=(self.intermediate_size, self.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.mlp_bias,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
+            layout=dense_gate_up_layout(self.intermediate_size),
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.down_proj = RowParallelLinear(
+            in_features=self.intermediate_size,
+            out_features=self.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.mlp_bias,
@@ -422,17 +429,12 @@ class SmolLM3MLP(spx.Module):
             rngs=rngs,
         )
 
-        self.gate_proj = column_parallel_linear(
-            in_features=self.hidden_size,
-            out_features=self.intermediate_size,
-        )
-        self.up_proj = column_parallel_linear(
-            in_features=self.hidden_size,
-            out_features=self.intermediate_size,
-        )
-        self.down_proj = row_parallel_linear(
-            in_features=self.intermediate_size,
-            out_features=self.hidden_size,
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param(
+            "gate_up_proj",
+            config=self.config,
+            include_bias=self.config.mlp_bias,
         )
 
     def forward(
@@ -456,8 +458,9 @@ class SmolLM3MLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         # SwiGLU activation: silu(gate) * up
-        gate = checkpoint_name(self.gate_proj(hidden_states), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(gate, "mlp_gate")
         hidden_states = jax.nn.silu(gate) * up
         hidden_states = checkpoint_name(self.down_proj(hidden_states), "mlp_down")
         hidden_states = apply_logical_sharding(

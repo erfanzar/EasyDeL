@@ -33,73 +33,51 @@ from easydel.infra.factory import register_config
 
 @register_config("gidd")
 class GiddConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for the GIDD masked-diffusion decoder.
 
-    Args:
-        vocab_size (`int`, *optional*, defaults to 131072):
-            Vocabulary size of the `Gidd` model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed to the forward method.
-        hidden_size (`int`, *optional*, defaults to 4096):
-            Dimensionality of the encoder layers and the pooler layer.
-        intermediate_size (`int`, *optional*, defaults to 11008):
-            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the Transformer encoder.
-        num_attention_heads (`int`, *optional*, defaults to 32):
-            Number of attention heads for each attention layer in the Transformer encoder.
-        number_rep_kv (`int`, *optional*, defaults to 1):
-            Number of repetitions for the key and value vectors.
-        num_key_value_heads (`int`, *optional*):
-            Number of key and value heads for each attention layer in the Transformer encoder. Will default to
-            `number_rep_kv * num_attention_heads` if not set.
-        max_position_embeddings (`int`, *optional*, defaults to 2048):
-            The maximum sequence length that this model might ever be used with. Typically set this to something large
-            just in case (e.g., 2048 or 4096).
-            head_dim (`int`, *optional*):
-                    head_dim for attention qkv.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-6):
-            The epsilon used by the rms normalization layers.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models). Only
-            relevant if `config.is_decoder=True`.
-        bos_token_id (`int`, *optional*, defaults to 0):
-            The id of the *beginning-of-sequence* token.
-        eos_token_id (`int`, *optional*, defaults to 1):
-            The id of the *end-of-sequence* token.
-        resid_pdrop (`float`, *optional*, defaults to 0.0):
-            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
-        embd_pdrop (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the embeddings.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-        rope_theta (`float`, *optional*, defaults to 10000.0):
-            The theta value to use for rotary position embeddings.
-        attention_bias (`bool`, *optional*, defaults to `False`):
-            Whether to use attention bias.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie the weights of the input embeddings and the output embeddings.
-        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
-            The gradient checkpointing configuration.
-        fcm_min_ratio (`float`, *optional*, defaults to -1):
-            The minimum ratio for Flash Attention.
-        fcm_max_ratio (`float`, *optional*, defaults to -1):
-            The maximum ratio for Flash Attention.
-        rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
-            The configuration for rope scaling.
-        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
-            The chunk size to use when scanning the MLP.
-        bits (`int`, *optional*):
-            The number of bits to quantize the model to.
-        pretraining_tp (`int`, *optional*, defaults to 1):
-            The tensor parallelism degree used during pretraining.
-        mlp_bias (`bool`, *optional*, defaults to `False`):
-            Whether to use bias in the MLP.
-        scan_layers (`bool`, *optional*, defaults to `False`):
-            Whether to use the scan implementation for the layers.
+    Inherits from :class:`EasyDeLBaseConfig`. GIDD shares the standard
+    decoder transformer skeleton (RMSNorm, gated/squared-ReLU MLP, RoPE,
+    GQA-capable attention) but is trained as a non-autoregressive masked
+    diffusion model. The configuration therefore exposes a handful of
+    GIDD-specific knobs on top of the usual transformer fields:
+
+    - ``resid_scale`` rescales the residual stream contribution at every
+      sub-block, which the GIDD recipe relies on to keep activation
+      variance under control as the diffusion chain refines noisy tokens.
+    - ``use_qk_norm`` / ``qk_norm_eps`` toggle the Primer-style RMSNorm on
+      the Q/K projections inside attention.
+    - ``init_scale``, ``emb_init_scale``, and ``head_init_scale`` control
+      the per-stage weight initialisation scales (block, embedding, and
+      output head) used by the original GIDD implementation.
+
+    Attributes:
+        vocab_size (int): Token vocabulary size.
+        hidden_size (int): Hidden/residual stream dimension.
+        intermediate_size (int): MLP inner width.
+        num_hidden_layers (int): Number of transformer blocks.
+        num_attention_heads (int): Attention heads per layer.
+        head_dim (int): Per-head dimension; derived from ``hidden_size /
+            num_attention_heads`` when not set explicitly.
+        max_position_embeddings (int): Maximum supported sequence length.
+        resid_scale (float): Residual contribution rescale (default ``4.0``).
+        rms_norm_eps (float): RMSNorm epsilon.
+        use_qk_norm (bool): Whether attention applies RMSNorm to Q/K.
+        qk_norm_eps (float): Epsilon for the QK norm.
+        init_scale (float): Weight init scale for transformer blocks.
+        emb_init_scale (float): Embedding init scale.
+        head_init_scale (float): Output head init scale.
+        rope_theta (float): RoPE base frequency.
+        rope_scaling (dict | None): Optional RoPE scaling configuration.
+        attention_bias (bool): Whether attention projections use bias.
+        mlp_bias (bool): Whether MLP projections use bias.
+        tie_word_embeddings (bool): Tie input embeddings with the LM head.
+        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient
+            checkpointing policy.
+        scan_mlp_chunk_size (int): Chunk size used by the scan-MLP path.
+        scan_layers (bool): Use ``lax.scan`` over decoder layers.
+        bits (int | None): Optional quantization bit-width.
+        layer_types (list[str]): Per-layer attention type list; defaults to
+            ``["full_attention"] * num_hidden_layers``.
     """
 
     model_type: str = "gidd"
@@ -225,33 +203,26 @@ class GiddConfig(EasyDeLBaseConfig):
         scan_layers: bool = True,
         **kwargs,
     ):
-        """The attach_custom_arguments function adds the following arguments to the Transformer class:
+        """Mutate the config in place with a small set of training-time toggles.
+
+        Convenience hook that overwrites a handful of behavioural flags after
+        the config has been constructed; useful when restoring a checkpoint
+        and adjusting its quantization / checkpointing / RoPE settings without
+        rebuilding the whole config.
 
         Args:
-            self: Refer to the current object
-            resid_pdrop: float: Set the dropout rate for residual
-                connections
-            embd_pdrop: float: Set the probability of dropping an
-                embedding
-            attention_dropout: float: Set the probability of dropping
-                out the attention layer
-            tie_word_embeddings: bool: Tie the word embeddings to the
-                decoder
-            gradient_checkpointing: str: Control the amount of memory
-                used by jax
-            fcm_min_ratio: float: Control the minimum ratio of the
-                number of chunks to be used in flash-based computation
-            fcm_max_ratio: float: Set the maximum ratio of the number of
-                input tokens to output tokens
-            number_rep_kv: int: Determine how many times the key and
-                value vectors are repeated
-            bits: tp.Optional[int]: Determine the number of bits used in
-                the quantization
-            rope_theta: float : rope_theta for compute rope
-            attention_bias: bool : whenever to use attention bias or no
-            mlp_bias: bool : whenever to use bias in mlp
-            scan_layers: bool: Determine whether to use scan layers or
-                not
+            tie_word_embeddings (bool, optional): Tie input embeddings with the
+                LM head. Defaults to ``False``.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                Checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            rope_theta (float, optional): RoPE base frequency. Defaults to ``10000.0``.
+            attention_bias (bool, optional): Use bias on attention projections.
+                Defaults to ``False``.
+            mlp_bias (bool, optional): Use bias on MLP projections. Defaults to ``False``.
+            scan_layers (bool, optional): Use ``lax.scan`` over decoder layers.
+                Defaults to ``True``.
+            **kwargs: Accepted and ignored for forward compatibility.
         """
         self.scan_layers = scan_layers
         self.rope_theta = rope_theta

@@ -281,7 +281,10 @@ class MptConfig(EasyDeLBaseConfig):
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
                 Defaults to EasyDeLGradientCheckPointers.NONE.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            **kwargs: Additional keyword arguments.
+            layer_types (list[str] | None, optional): Per-layer attention type
+                (e.g. ``"full_attention"``); defaults to all-``"full_attention"``
+                when ``None``. Defaults to None.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
         """
         if attn_config is None:
             self.attn_config = MptAttentionConfig(**kwargs)

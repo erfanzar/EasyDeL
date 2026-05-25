@@ -168,7 +168,21 @@ class Glm4vMoeTextAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: Glm4vMoeTextConfig, dtype: jnp.dtype):
-        """Create GLM4V-MoE rotary embeddings (NeoX-style rotation)."""
+        """Create NeoX-style rotary position embeddings for GLM-4V-MoE.
+
+        Builds a RoPE table sized to ``self.head_dim`` using the
+        configured ``rope_theta`` (default 10000) and the NeoX rotation
+        convention (paired-half rotation rather than GPT-J's interleaved
+        even/odd rotation).
+
+        Args:
+            config: Text-decoder configuration providing ``rope_theta``.
+            dtype: Data type for the precomputed RoPE table.
+
+        Returns:
+            Rotary position embedding module callable from the unified
+            attention module's forward path.
+        """
         return config.get_basic_rope(
             dtype=dtype,
             head_size=self.head_dim,

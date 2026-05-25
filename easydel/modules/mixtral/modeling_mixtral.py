@@ -30,8 +30,6 @@ Exports:
     - ``MixtralForSequenceClassification``: classification head wrapper.
 """
 
-import typing
-
 import jax
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -69,6 +67,7 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RMSNorm,
     RowParallelMoELinear,
+    moe_fused_gate_up_reform_param,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -94,7 +93,9 @@ class MixtralAttention(UnifiedAttention):
     - **High RoPE base** (``rope_theta = 1e6``) for long-context
       extrapolation up to ~130k tokens.
 
-    Inherited capabilities:
+    Everything else — Q/K/V/O linear projections, RoPE application, KV
+    caching, paged-attention support — is inherited verbatim from
+    :class:`UnifiedAttention` and configured via ``attention_type="standard"``.
     """
 
     def __init__(
@@ -165,25 +166,6 @@ class MixtralMoEMlp(spx.Module):
         act_fn (Callable): Per-expert activation (typically SiLU).
     """
 
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {"name": "w1.weight", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
-                {"name": "w3.weight", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
-
     def __init__(
         self,
         config: MixtralConfig,
@@ -208,10 +190,10 @@ class MixtralMoEMlp(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.w1 = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.hidden_size,
-            out_features=config.intermediate_size,
+            out_features=2 * config.intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -224,18 +206,6 @@ class MixtralMoEMlp(spx.Module):
             num_experts=config.num_local_experts,
             in_features=config.intermediate_size,
             out_features=config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.w3 = ColumnParallelMoELinear(
-            num_experts=config.num_local_experts,
-            in_features=config.hidden_size,
-            out_features=config.intermediate_size,
             rngs=rngs,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(),
@@ -263,8 +233,9 @@ class MixtralMoEMlp(spx.Module):
         Returns:
             Array: Transformed hidden states after expert MLP processing.
         """
-        hidden_states = checkpoint_name(self.act_fn(self.w1(x, group_sizes, sorted_experts)), "mlp_gate")
-        hidden_states = checkpoint_name(hidden_states * self.w3(x, group_sizes, sorted_experts), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(x, group_sizes, sorted_experts), "mlp_gate_up")
+        gate, up = jnp.split(gate_up, 2, axis=-1)
+        hidden_states = checkpoint_name(self.act_fn(gate) * up, "mlp_up")
         outputs = checkpoint_name(self.w2(hidden_states, group_sizes, sorted_experts), "mlp_down")
         return checkpoint_name(outputs, "mlp_output")
 
@@ -372,8 +343,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_state,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.w1.weight.value,
-            wu_kernel=self.experts.w3.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.w2.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -402,35 +372,6 @@ class MixtralDecoderLayer(spx.Module):
             and pre-FFN RMSNorms.
     """
 
-    # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion
-    # so conversion does not depend on test-only key remaps.
-    reform_param: typing.ClassVar = {
-        "mlp.gate.weight$": {
-            "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-        "mlp.experts.gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "block_sparse_moe.experts.w1.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "block_sparse_moe.experts.w3.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "mlp.experts.down_proj$": {
-            "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
-
     def __init__(
         self,
         config: MixtralConfig,
@@ -457,7 +398,6 @@ class MixtralDecoderLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-
         self.self_attn = MixtralAttention(
             config=config,
             dtype=dtype,
@@ -490,6 +430,24 @@ class MixtralDecoderLayer(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+
+    @property
+    def reform_param(self):
+        return {
+            "mlp.gate.weight$": {
+                "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
+                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+            },
+            "mlp.experts.down_proj$": {
+                "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
+                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+            },
+            **moe_fused_gate_up_reform_param(
+                config=self.config,
+                target_prefix="block_sparse_moe.experts.gate_up_proj",
+                source_prefix="mlp.experts.gate_up_proj",
+            ),
+        }
 
     def forward(
         self,
@@ -972,7 +930,7 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):  # ty
             top_k=self.config.num_experts_per_tok,
             attention_mask=attention_mask,
         )
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        return aux_loss * self.config.router_aux_loss_coef
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MixtralConfig, model_type="mixtral")

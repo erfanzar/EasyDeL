@@ -540,6 +540,10 @@ class Llama4Config(EasyDeLBaseConfig):
             self.vision_config = Llama4VisionConfig(**self._fix_parent_kws(vision_config, kwargs))
         elif isinstance(vision_config, Llama4VisionConfig):
             self.vision_config = vision_config
+        else:
+            raise TypeError(
+                f"vision_config must be a dict, Llama4VisionConfig, or None; got {type(vision_config).__name__}."
+            )
 
         self.boi_token_index = boi_token_index
         self.eoi_token_index = eoi_token_index
@@ -552,6 +556,8 @@ class Llama4Config(EasyDeLBaseConfig):
             self.text_config = Llama4TextConfig(**self._fix_parent_kws(text_config, kwargs))
         elif isinstance(text_config, Llama4TextConfig):
             self.text_config = text_config
+        else:
+            raise TypeError(f"text_config must be a dict, Llama4TextConfig, or None; got {type(text_config).__name__}.")
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 

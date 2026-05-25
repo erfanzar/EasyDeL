@@ -255,6 +255,8 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         linear_value_head_dim: int = 128,
         linear_num_key_heads: int = 16,
         linear_num_value_heads: int = 32,
+        linear_attention_separate_proj: bool = False,
+        linear_attention_merged_split_proj: bool = False,
         decoder_sparse_step: int = 1,
         moe_intermediate_size: int = 512,
         shared_expert_intermediate_size: int = 512,
@@ -302,6 +304,12 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         self.linear_value_head_dim = linear_value_head_dim
         self.linear_num_key_heads = linear_num_key_heads
         self.linear_num_value_heads = linear_num_value_heads
+        if linear_attention_separate_proj and linear_attention_merged_split_proj:
+            raise ValueError(
+                "linear_attention_separate_proj and linear_attention_merged_split_proj are mutually exclusive"
+            )
+        self.linear_attention_separate_proj = linear_attention_separate_proj
+        self.linear_attention_merged_split_proj = linear_attention_merged_split_proj
 
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size

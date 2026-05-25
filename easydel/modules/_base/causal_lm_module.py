@@ -223,7 +223,13 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
             Creating an MoE model with auxiliary loss::
 
-                model = BaseCausalLMModule()
+                model = BaseCausalLMModule(
+                    config=moe_config,
+                    base_model_class=MyMoEModel,
+                    dtype=jnp.bfloat16,
+                    rngs=spx.Rngs(0),
+                    router_aux_loss_coef=0.001,
+                )
         """
         # Initialize base with features
         super().__init__(

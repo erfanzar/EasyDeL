@@ -71,6 +71,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    moe_fused_gate_up_reform_param,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
@@ -459,23 +460,6 @@ class MiniMaxExperts(spx.Module):
         act_fn: Activation function for the gating mechanism.
     """
 
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {"name": "w1.weight", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
-                {"name": "w3.weight", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [{"name": "w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
-
     def __init__(
         self,
         config: MiniMaxConfig,
@@ -501,10 +485,10 @@ class MiniMaxExperts(spx.Module):
         self.precision = precision
 
         init = jax.nn.initializers.normal(config.initializer_range)
-        self.w1 = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.hidden_size,
-            out_features=config.intermediate_size,
+            out_features=2 * config.intermediate_size,
             rngs=rngs,
             use_bias=False,
             kernel_init=init,
@@ -517,18 +501,6 @@ class MiniMaxExperts(spx.Module):
             num_experts=config.num_local_experts,
             in_features=config.intermediate_size,
             out_features=config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=init,
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.w3 = ColumnParallelMoELinear(
-            num_experts=config.num_local_experts,
-            in_features=config.hidden_size,
-            out_features=config.intermediate_size,
             rngs=rngs,
             use_bias=False,
             kernel_init=init,
@@ -558,12 +530,9 @@ class MiniMaxExperts(spx.Module):
         Returns:
             Array: Output tensor of shape (tokens, hidden_dim).
         """
-        return self.w2(
-            self.act_fn(self.w1(hidden_states, group_sizes, sorted_experts))
-            * self.w3(hidden_states, group_sizes, sorted_experts),
-            group_sizes,
-            sorted_experts,
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = jnp.split(gate_up, 2, axis=-1)
+        return self.w2(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class MiniMaxSparseMoeBlock(BaseMoeModule):
@@ -684,8 +653,7 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.w1.weight.value,
-            wu_kernel=self.experts.w3.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.w2.weight.value,
             act_fn=self.experts.act_fn,
             layer_idx=layer_idx,
@@ -725,35 +693,6 @@ class MiniMaxDecoderLayer(spx.Module):
         mlp_alpha_factor, mlp_beta_factor (float): Residual / sub-layer
             scales for the MoE block.
     """
-
-    # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion
-    # so conversion does not depend on test-only key remaps.
-    reform_param: typing.ClassVar = {
-        "mlp.gate.weight$": {
-            "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-        "mlp.experts.gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "block_sparse_moe.experts.w1.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "block_sparse_moe.experts.w3.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "mlp.experts.down_proj$": {
-            "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -826,6 +765,24 @@ class MiniMaxDecoderLayer(spx.Module):
         )
         self.mlp_alpha_factor = config.mlp_alpha_factor
         self.mlp_beta_factor = config.mlp_beta_factor
+
+    @property
+    def reform_param(self):
+        return {
+            "mlp.gate.weight$": {
+                "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
+                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+            },
+            "mlp.experts.down_proj$": {
+                "splits": [{"name": "block_sparse_moe.experts.w2.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
+                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+            },
+            **moe_fused_gate_up_reform_param(
+                config=self.config,
+                target_prefix="block_sparse_moe.experts.gate_up_proj",
+                source_prefix="mlp.experts.gate_up_proj",
+            ),
+        }
 
     def forward(
         self,
@@ -1324,8 +1281,20 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # ty
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            aux_loss_fn=None,
+            aux_loss_fn=self._compute_aux_loss,
         )
+
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary load balancing loss from router logits."""
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_local_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
+        )
+        return aux_loss * self.config.router_aux_loss_coef
 
     def get_inference_cache_type(self) -> str:
         """Get the cache type used for inference.

@@ -41,9 +41,9 @@ Public model classes (registered with the factory):
 - :class:`FalconForCausalLM` — causal LM head.
 """
 
-import functools
 import math
 import typing
+from functools import partial
 
 import jax
 import spectrax as spx
@@ -67,7 +67,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
@@ -76,20 +76,26 @@ from .falcon_configuration import FalconConfig
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
-    """The built_bloom_alibi function is used to create a bloom alibi for the attention mask.
-    The bloom alibi is used in the Bloom Attention layer to ensure that each token has a unique
-    attention vector, even if it's masked out. This ensures that all tokens have an equal chance of being selected as
-    the most important token in the sequence, which helps with training stability and performance.
+    """Construct BLOOM-style ALiBi attention biases.
+
+    Builds the additive linear-attention bias used by Falcon's ALiBi-enabled
+    variants. Per-head slopes follow the BLOOM recipe (geometric series with
+    base ``2 ** -(2 ** -(log2(cp2) - 3))`` where ``cp2`` is the largest power
+    of two ``<= num_attention_heads``; remaining heads use a doubled-base
+    extension). Each slope is multiplied by a relative-position index derived
+    from the cumulative sum of ``attention_mask`` so that padding tokens get
+    a zero offset.
 
     Args:
-        attention_mask: Mask out the padding tokens in the input
-            sequence
-        num_attention_heads: Determine the number of attention heads in
-            the model
+        attention_mask: Boolean / int mask of shape ``(batch_size,
+            sequence_length)`` marking real tokens (``1``) vs. padding (``0``).
+        num_attention_heads: Number of attention heads. Slopes are tiled to
+            this many heads, with the BLOOM extension applied when this is
+            not a power of two.
 
     Returns:
-        A tensor of shape (batch_size, num_attention_heads, 1,
-        sequence_length)
+        Float array of shape ``(batch_size, num_attention_heads, 1,
+        sequence_length)`` ready to be broadcast-added to the QK logits.
     """
     batch_size, sequence_length = attention_mask.shape
     cp2 = 2 ** math.floor(math.log2(num_attention_heads))
@@ -111,22 +117,19 @@ def dropout_add(
     x: Array,
     residual: Array,
 ) -> Array:
-    """The dropout_add function is a helper function that adds the residual to the output of
-    the dropout layer. This is necessary because we want to use deterministic=True when
-    we are evaluating our model, but we still need to add in the residual. The reason for this
-    is that during training, we have two paths through our network: one with dropout and one without.
-    The path without dropout (residual) allows us to backpropagate gradients through both paths at once.
+    """Apply dropout to ``x`` and add it to the residual stream.
+
+    Convenience helper used by :class:`FalconBlock` for the post-attention
+    and post-MLP residual additions. Behaves like ``residual + dropout(x)``.
 
     Args:
-        nn_drop: nn.Dropout: Specify the dropout layer
-        x: Array: Pass in the input to the dropout layer
-        residual: Array: Add the residual to the output of
-            dropout_add
-        deterministic: bool: Determine whether the dropout layer is
-            active or not
+        nn_drop: Spectrax ``nn.Dropout`` module to apply to ``x``.
+        x: Sub-layer output to be dropped and added.
+        residual: Residual tensor that ``dropout(x)`` is added back into.
 
     Returns:
-        A tensor that is the sum of the residual and a dropout layer
+        Array of the same shape as ``x``/``residual`` equal to
+        ``residual + dropout(x)``.
     """
     out = nn_drop(inputs=x)
     out = residual + out
@@ -190,7 +193,6 @@ class FalconAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="alibi" if config.alibi else "standard",
             causal=True,
-            use_fused_qkv=True,
             use_gqa=use_gqa,
         )
 
@@ -214,15 +216,20 @@ class FalconAttention(UnifiedAttention):
         Returns:
             ColumnParallelLinear: Fused QKV projection layer.
         """
+        qkv_layout = dense_qkv_layout(
+            self.num_heads * self.head_dim,
+            self.num_key_value_heads * self.head_dim,
+        )
         return ColumnParallelLinear(
             config.hidden_size,
-            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
+            qkv_layout.segment_sizes,
             rngs=rngs,
             use_bias=config.bias,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
+            layout=qkv_layout,
         )
 
     def _create_o_proj(
@@ -294,7 +301,7 @@ class FalconMlp(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        linear = functools.partial(
+        linear = partial(
             ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -755,28 +762,35 @@ class FalconModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Falcon is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder sub-module (``self`` for a decoder-only stack).
+
+        Returns:
+            FalconModel: This module, since Falcon has no separate decoder.
         """
         return self
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: The bare backbone carries no LM head; see
+                :class:`FalconForCausalLM`.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``word_embeddings`` lookup table.
         """
         return self.word_embeddings
 

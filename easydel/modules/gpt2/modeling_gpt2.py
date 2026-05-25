@@ -248,7 +248,6 @@ class GPT2Attention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=causal,
-            use_fused_qkv=not is_cross_attention,
         )
         self.precision = precision
         self.dtype = dtype
@@ -329,14 +328,16 @@ class GPT2Attention(UnifiedAttention):
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
-        """
-        Merges the attention heads into a single hidden state tensor.
+        """Merge the per-head representations back into a single embedding axis.
+
+        Inverse of :meth:`_split_heads`: collapses the trailing
+        ``(num_heads, head_dim)`` pair into a flat ``embed_dim`` axis.
 
         Args:
-            hidden_states (Array): The hidden states with separate head dimensions.
+            hidden_states: Tensor of shape ``[batch, seq, num_heads, head_dim]``.
 
         Returns:
-            Array: The hidden states with merged head dimensions.
+            Tensor of shape ``[batch, seq, embed_dim]``.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
@@ -352,24 +353,41 @@ class GPT2Attention(UnifiedAttention):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
     ) -> AttentionLayerOutput:
-        """Forward pass of the GPT2Attention module.
+        """Run GPT-2 self- or cross-attention and produce a residual-ready output.
+
+        Splits the fused ``c_attn`` projection into Q/K/V (or, for cross
+        attention, runs ``q_attn`` on the decoder hidden states and
+        ``c_attn`` on the encoder hidden states), reshapes the per-head
+        view, optionally concatenates against the KV cache, dispatches to
+        the underlying attention performer, and applies the row-sharded
+        ``c_proj`` output projection with residual dropout.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            key_value_states (Array, optional): Key/value states for cross-attention.
-                Defaults to None (self-attention).
-            attention_mask (Array): Mask to apply on the attention scores.
-            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
-                Defaults to None.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
-                Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
-                Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            hidden_states: Decoder hidden states of shape
+                ``[batch, seq_len, hidden_dim]``.
+            mask_info: Pre-computed attention mask information (segments
+                or boolean mask). ``None`` to skip masking.
+            position_ids: Position indices of shape ``[batch, seq_len]``;
+                unused by GPT-2 attention itself (positions are absorbed
+                in the embedding step) but kept for interface uniformity.
+            mode: Runtime mode (train / decode / infer) used by the
+                attention performer for path selection.
+            cache_view: Optional KV-cache view to append the new K/V into.
+            cache_metadata: Optional paged/ragged metadata accompanying
+                ``cache_view``.
+            output_attentions: When True, the returned
+                :class:`AttentionLayerOutput` carries the per-head
+                attention weight tensor.
+            frequencies: Unused for GPT-2 (no RoPE); accepted for
+                signature uniformity with other attention blocks.
+            key_value_states: Optional encoder states of shape
+                ``[batch, src_len, hidden_dim]`` enabling cross-attention.
+                When ``None`` the layer runs self-attention.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the attention output and optionally
-                the attention weights.
+            :class:`AttentionLayerOutput` carrying the post-projection
+            attention output, the optional attention weights, and the
+            updated cache view.
         """
         is_cross_attention = key_value_states is not None
 
@@ -502,13 +520,15 @@ class GPT2MLP(spx.Module):
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the GPT2MLP module.
+        """Apply the GPT-2 MLP (``c_fc → act → c_proj → dropout``).
 
         Args:
-            hidden_states (Array): Input hidden states.
+            hidden_states: Input tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
 
         Returns:
-            Array: Output hidden states after processing through the MLP.
+            Tensor of shape ``[batch, seq_len, hidden_dim]`` representing
+            the residual-ready MLP output.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -633,25 +653,39 @@ class GPT2Block(spx.Module):
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass of the GPT2Block module.
+        """Run a single GPT-2 pre-norm transformer block.
+
+        Pre-norm flow: ``x + attn(ln_1(x))`` followed (when configured)
+        by ``x + crossattn(ln_cross_attn(x), enc)`` and finally
+        ``x + mlp(ln_2(x))``. Optionally chunked via
+        :func:`block_wise_ffn` when ``config.use_scan_mlp`` is set.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array, optional): Mask to apply on the self-attention scores. Defaults to None.
-            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
-            encoder_hidden_states (Array, optional): Hidden states from the encoder for cross-attention.
-                Defaults to None.
-            encoder_attention_mask (Array, optional): Mask for the encoder hidden states in cross-attention.
-                Defaults to None.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
-                Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
-                Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            hidden_states: Input tensor of shape
+                ``[batch, seq_len, hidden_dim]``.
+            mask_info: Self-attention mask information.
+            position_ids: Position indices of shape ``[batch, seq_len]``.
+            mode: Runtime mode forwarded to the attention sub-layers.
+            cache_view: Optional KV-cache view used by self-attention.
+            cache_metadata: Optional metadata accompanying ``cache_view``.
+            output_attentions: When True, attention weights are returned
+                on the :class:`DecoderLayerOutput`.
+            frequencies: Unused (kept for interface uniformity).
+            encoder_hidden_states: Optional encoder output of shape
+                ``[batch, src_len, hidden_dim]`` enabling cross-attention;
+                requires ``config.add_cross_attention=True``.
+            encoder_mask_info: Optional mask info paired with
+                ``encoder_hidden_states``.
 
         Returns:
-            tp.Tuple[Array, ...]: A tuple containing the output hidden states and
-                optionally attention weights (self and cross).
+            :class:`DecoderLayerOutput` containing the residual stream
+            after this block, self-attention weights (optional),
+            cross-attention weights (optional), and the updated cache
+            view.
+
+        Raises:
+            ValueError: If ``encoder_hidden_states`` is provided but the
+                block was constructed without ``add_cross_attention``.
         """
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)

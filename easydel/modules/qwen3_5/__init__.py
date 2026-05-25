@@ -18,6 +18,9 @@ from .modeling_qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
+    Qwen3_5MTPHead,
+    Qwen3_5MTPLayer,
+    Qwen3_5MTPOutput,
     Qwen3_5TextModel,
 )
 from .qwen3_5_configuration import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
@@ -26,6 +29,9 @@ __all__ = (
     "Qwen3_5Config",
     "Qwen3_5ForCausalLM",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MTPHead",
+    "Qwen3_5MTPLayer",
+    "Qwen3_5MTPOutput",
     "Qwen3_5Model",
     "Qwen3_5TextConfig",
     "Qwen3_5TextModel",

@@ -88,9 +88,29 @@ class Qwen3OmniMoeAudioEncoderConfig(EasyDeLBaseConfig):
         downsample_hidden_size: int = 480,
         **kwargs,
     ):
-        """Initialize audio encoder configuration.
+        """Initialize the audio encoder configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            num_mel_bins: Number of mel frequency bins.
+            encoder_layers: Number of transformer layers.
+            encoder_attention_heads: Number of attention heads.
+            encoder_ffn_dim: FFN intermediate dimension.
+            d_model: Audio encoder hidden dimension.
+            dropout: Dropout probability on residuals.
+            attention_dropout: Dropout probability on attention weights.
+            activation_function: Activation function name (e.g. ``"gelu"``).
+            activation_dropout: Dropout on activations.
+            scale_embedding: Whether to scale embeddings by ``sqrt(d_model)``.
+            initializer_range: Standard deviation for weight initialization.
+            max_source_positions: Maximum number of source mel frames.
+            n_window: Window size for windowed attention during training.
+            output_dim: Output projection dimension (matches text decoder).
+            n_window_infer: Window size for inference.
+            conv_chunksize: Convolution chunk size used for streaming.
+            downsample_hidden_size: Hidden size of the convolutional
+                downsampler.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
         self.num_mel_bins = num_mel_bins
@@ -162,9 +182,25 @@ class Qwen3OmniMoeVisionEncoderConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
-        """Initialize vision encoder configuration.
+        """Initialize the vision encoder configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            depth: Number of vision transformer layers.
+            hidden_size: Vision tower hidden dimension.
+            hidden_act: Activation used inside the vision MLP.
+            intermediate_size: FFN intermediate dimension.
+            num_heads: Number of attention heads.
+            in_channels: Number of input channels.
+            patch_size: Spatial patch size in pixels.
+            spatial_merge_size: Spatial merge factor for the patch merger.
+            temporal_patch_size: Temporal patch size for video inputs.
+            out_hidden_size: Output projection dimension (matches text decoder).
+            num_position_embeddings: Maximum 2-D position embedding count.
+            deepstack_visual_indexes: Layer indices that emit DeepStack
+                features (defaults to ``[8, 16, 24]`` when ``None``).
+            initializer_range: Standard deviation for weight initialization.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         if deepstack_visual_indexes is None:
             deepstack_visual_indexes = [8, 16, 24]
@@ -262,9 +298,44 @@ class Qwen3OmniMoeTextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize text decoder configuration with MoE parameters.
+        """Initialize the Thinker text decoder configuration with MoE parameters.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            vocab_size: Vocabulary size.
+            hidden_size: Decoder hidden dimension.
+            intermediate_size: Dense MLP intermediate dimension.
+            num_hidden_layers: Number of decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of KV heads (GQA).
+            head_dim: Per-head dimension. Auto-computed if ``None``.
+            hidden_act: Activation function for the MLP.
+            max_position_embeddings: Maximum sequence length.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: RMS normalization epsilon.
+            use_cache: Whether to return KV cache during generation.
+            tie_word_embeddings: Whether to tie input and output embeddings.
+            rope_theta: Base period for RoPE.
+            rope_scaling: Optional RoPE scaling configuration.
+            attention_bias: Whether QKV/output projections use bias.
+            attention_dropout: Dropout probability on attention weights.
+            use_sliding_window: Enable sliding-window attention.
+            sliding_window: Sliding-window size (forced to ``None`` when
+                ``use_sliding_window=False``).
+            max_window_layers: Layers at or above this index use sliding-window
+                attention when enabled.
+            decoder_sparse_step: Apply MoE every this many decoder layers.
+            moe_intermediate_size: Per-expert intermediate dimension.
+            num_experts_per_tok: Active experts per token (top-k).
+            num_experts: Total number of routed experts.
+            norm_topk_prob: Whether to normalize top-k routing probabilities.
+            output_router_logits: Whether to return router logits for the
+                auxiliary load-balancing loss.
+            router_aux_loss_coef: Coefficient for the router auxiliary loss.
+            mlp_only_layers: Indices of layers that use the dense MLP
+                instead of MoE.
+            layer_types: Per-layer attention type; auto-derived if ``None``.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -384,9 +455,30 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
-        """Initialize Thinker configuration with audio, vision, and text sub-configs.
+        """Initialize the Thinker composite configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            audio_config: Audio encoder configuration (dict,
+                :class:`Qwen3OmniMoeAudioEncoderConfig`, or ``None`` for
+                defaults).
+            vision_config: Vision encoder configuration (dict,
+                :class:`Qwen3OmniMoeVisionEncoderConfig`, or ``None`` for
+                defaults).
+            text_config: Text decoder configuration (dict,
+                :class:`Qwen3OmniMoeTextConfig`, or ``None`` for defaults).
+            audio_token_id: Token id used as a placeholder for audio frames.
+            image_token_id: Token id used as a placeholder for image patches.
+            video_token_id: Token id used as a placeholder for video patches.
+            vision_start_token_id: Token id marking the start of a vision
+                sequence.
+            vision_end_token_id: Token id marking the end of a vision sequence.
+            position_id_per_seconds: Audio position ids emitted per second.
+            audio_start_token_id: Token id marking the start of an audio
+                sequence.
+            user_token_id: User-role token id (used by chat templates).
+            initializer_range: Standard deviation for weight initialization.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig` and the embedded sub-configs.
         """
         super().__init__(**kwargs)
         self.user_token_id = user_token_id
@@ -422,6 +514,10 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
         self.audio_token_id = audio_token_id
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
+
+    def get_text_config(self, decoder: bool = True) -> Qwen3OmniMoeTextConfig:
+        """Return the embedded text-decoder configuration."""
+        return getattr(self, "text_config", None) or Qwen3OmniMoeTextConfig()
 
 
 @register_config("qwen3_omni_moe_talker_code_predictor")
@@ -481,9 +577,31 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(EasyDeLBaseConfig):
         num_code_groups: int = 32,
         **kwargs,
     ):
-        """Initialize Talker code predictor configuration.
+        """Initialize the Talker code predictor configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            vocab_size: Per-quantizer codebook vocabulary size.
+            hidden_size: Decoder hidden dimension.
+            intermediate_size: FFN intermediate dimension.
+            num_hidden_layers: Number of decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of KV heads (GQA).
+            head_dim: Per-head dimension.
+            hidden_act: Activation function for the MLP.
+            max_position_embeddings: Maximum sequence length.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: RMS normalization epsilon.
+            use_cache: Whether to return KV cache during generation.
+            tie_word_embeddings: Whether to tie input and output embeddings.
+            rope_theta: Base period for RoPE.
+            rope_scaling: Optional RoPE scaling configuration.
+            attention_bias: Whether QKV/output projections use bias.
+            attention_dropout: Dropout probability on attention weights.
+            sliding_window: Sliding-window size for local attention.
+            layer_types: Per-layer attention type; auto-derived if ``None``.
+            num_code_groups: Number of residual codebook groups.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -585,9 +703,40 @@ class Qwen3OmniMoeTalkerTextConfig(EasyDeLBaseConfig):
         shared_expert_intermediate_size: int = 2048,
         **kwargs,
     ):
-        """Initialize Talker text decoder configuration with MoE parameters.
+        """Initialize the Talker text decoder configuration with MoE + shared expert.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            vocab_size: Vocabulary size.
+            hidden_size: Decoder hidden dimension.
+            intermediate_size: Dense MLP intermediate dimension.
+            num_hidden_layers: Number of decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of KV heads (GQA).
+            head_dim: Per-head dimension. Auto-computed if ``None``.
+            hidden_act: Activation function for the MLP.
+            max_position_embeddings: Maximum sequence length.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: RMS normalization epsilon.
+            use_cache: Whether to return KV cache during generation.
+            tie_word_embeddings: Whether to tie input and output embeddings.
+            rope_theta: Base period for RoPE.
+            rope_scaling: Optional RoPE scaling configuration.
+            attention_bias: Whether QKV/output projections use bias.
+            attention_dropout: Dropout probability on attention weights.
+            sliding_window: Sliding-window size for local attention.
+            decoder_sparse_step: Apply MoE every this many decoder layers.
+            moe_intermediate_size: Per-expert intermediate dimension.
+            num_experts_per_tok: Active experts per token (top-k).
+            num_experts: Total number of routed experts.
+            norm_topk_prob: Whether to normalize top-k routing probabilities.
+            output_router_logits: Whether to return router logits.
+            router_aux_loss_coef: Coefficient for the router auxiliary loss.
+            mlp_only_layers: Indices of layers that use the dense MLP
+                instead of MoE.
+            shared_expert_intermediate_size: Intermediate size of the
+                gated shared expert that runs alongside the routed experts.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -681,9 +830,35 @@ class Qwen3OmniMoeTalkerConfig(EasyDeLBaseConfig):
         spatial_merge_size: int = 2,
         **kwargs,
     ):
-        """Initialize Talker configuration with text model and code predictor sub-configs.
+        """Initialize the Talker composite configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            code_predictor_config: Code predictor configuration (dict,
+                :class:`Qwen3OmniMoeTalkerCodePredictorConfig`, or ``None``).
+            text_config: Talker text model configuration (dict,
+                :class:`Qwen3OmniMoeTalkerTextConfig`, or ``None``).
+            num_code_groups: Number of residual codebook groups.
+            thinker_hidden_size: Hidden size emitted by the Thinker
+                (used by the resize MLP that bridges Thinker and Talker).
+            codec_eos_token_id: Codec end-of-sequence token id.
+            accept_hidden_layer: Thinker layer index whose hidden state
+                seeds the Talker.
+            codec_nothink_id: Codec token id for the no-think marker.
+            codec_think_bos_id: Codec token id for the think-start marker.
+            codec_think_eos_id: Codec token id for the think-end marker.
+            codec_pad_id: Codec padding token id.
+            codec_bos_id: Codec beginning-of-sequence token id.
+            audio_token_id: Audio placeholder token id (text side).
+            image_token_id: Image placeholder token id (text side).
+            video_token_id: Video placeholder token id (text side).
+            vision_start_token_id: Vision-start marker token id.
+            position_id_per_seconds: Audio position ids per second.
+            audio_start_token_id: Audio-start marker token id.
+            speaker_id: Optional mapping of speaker label to id.
+            spatial_merge_size: Spatial merge factor (carried over from
+                the vision tower for token-count accounting).
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig` and the embedded sub-configs.
         """
         super().__init__(**kwargs)
 
@@ -780,9 +955,33 @@ class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
         decoder_dim: int = 1536,
         **kwargs,
     ):
-        """Initialize Code2Wav vocoder configuration.
+        """Initialize the Code2Wav vocoder configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            codebook_size: Per-quantizer codebook size.
+            hidden_size: Transformer hidden dimension.
+            intermediate_size: FFN intermediate dimension.
+            num_hidden_layers: Number of transformer layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of KV heads.
+            head_dim: Per-head dimension. Auto-computed if ``None``.
+            hidden_act: Activation function for the MLP.
+            max_position_embeddings: Maximum sequence length.
+            rms_norm_eps: RMS normalization epsilon.
+            rope_theta: Base period for RoPE.
+            attention_bias: Whether QKV/output projections use bias.
+            attention_dropout: Dropout probability on attention weights.
+            sliding_window: Sliding-window size for bounded local attention
+                (``None`` disables the local mask).
+            layer_scale_initial_scale: Initial value for the per-channel
+                LayerScale ``gamma``.
+            num_quantizers: Number of residual quantizers in the codec.
+            upsample_rates: ConvNeXt upsampling factors.
+            upsampling_ratios: Additional upsampling ratios applied after the
+                primary ConvNeXt stack.
+            decoder_dim: Final decoder output dimension before the upsampler.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
         self.codebook_size = codebook_size
@@ -870,9 +1069,28 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
         assistant_token_id: int = 77091,
         **kwargs,
     ):
-        """Initialize top-level Qwen3OmniMoe config with thinker, talker, and vocoder sub-configs.
+        """Initialize the top-level Qwen3OmniMoe configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            thinker_config: Thinker (understanding) configuration as a dict,
+                :class:`Qwen3OmniMoeThinkerConfig`, or ``None`` for defaults.
+            talker_config: Talker (speech-generation) configuration as a dict,
+                :class:`Qwen3OmniMoeTalkerConfig`, or ``None`` for defaults.
+            code2wav_config: Code2Wav vocoder configuration as a dict,
+                :class:`Qwen3OmniMoeCode2WavConfig`, or ``None`` for defaults.
+            enable_audio_output: When ``True``, the Talker and Code2Wav
+                components are constructed so the model can emit audio;
+                set to ``False`` for text-only inference to save memory.
+            im_start_token_id: Token id for the ``<|im_start|>`` marker.
+            im_end_token_id: Token id for the ``<|im_end|>`` marker.
+            tts_pad_token_id: TTS padding token id.
+            tts_bos_token_id: TTS beginning-of-sequence token id.
+            tts_eos_token_id: TTS end-of-sequence token id.
+            system_token_id: System-role token id.
+            user_token_id: User-role token id.
+            assistant_token_id: Assistant-role token id.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig` and the embedded sub-configs.
         """
         super().__init__(**kwargs)
 
@@ -924,7 +1142,10 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
             Qwen3OmniMoeTextConfig: The text-decoder portion of the
             Thinker config.
         """
-        return self.thinker_config.get_text_config(decoder)  # pyright: ignore[reportReturnType]
+        thinker_config = getattr(self, "thinker_config", None)
+        if thinker_config is None:
+            return Qwen3OmniMoeTextConfig()
+        return thinker_config.get_text_config(decoder)  # pyright: ignore[reportReturnType]
 
 
 __all__ = [

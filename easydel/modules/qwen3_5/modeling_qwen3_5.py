@@ -38,24 +38,39 @@ mRoPE indices and bridge between 1-D text-only position IDs and the
 """
 
 import itertools
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-from spectrax import common_types
+from ejkernel.types import MaskInfo
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
+    RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCache,
+    TransformerCacheView,
     TransformerMetadata,
 )
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import MoeCausalLMOutput
+from easydel.infra.utils import auto_remat
+from easydel.layers import ColumnParallelLinear
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
-from easydel.modules.qwen3_next.modeling_qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
+from easydel.modules.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextForCausalLM,
+    Qwen3NextFullAttention,
+    Qwen3NextMLP,
+    Qwen3NextModel,
+    Qwen3NextRMSNorm,
+)
 from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VisionTransformerPretrainedModel,
     Qwen3VLModel,
@@ -178,6 +193,331 @@ def _maybe_flatten_position_ids_for_text(config: Qwen3_5TextConfig, position_ids
     return position_ids
 
 
+#
+#
+#
+#
+
+
+@dataclass(frozen=True)
+class Qwen3_5MTPOutput:
+    """Output of the Qwen3.5 MTP head.
+
+    Attributes:
+        last_hidden_state: ``(batch, seq_len, hidden_size)`` MTP hidden
+            states ready for projection through the shared LM head.
+        past_key_values: Updated MTP-local KV cache (one ``cache_view``
+            per MTP layer). ``None`` during training.
+    """
+
+    last_hidden_state: Float[Array, "batch seq_len hidden"]
+    past_key_values: tuple[TransformerCacheView | RaggedPagesCacheView | None, ...] | None = None
+
+
+class Qwen3_5MTPLayer(spx.Module):
+    """Single MTP transformer block.
+
+    Combines a Qwen3-Next full-attention layer (with attention output
+    gating + per-head qk-norm) and a dense SwiGLU MLP, identical in
+    shape to one Qwen3.5 full-attention decoder layer. Allocated
+    outside the main model so MTP carries its own KV cache namespace.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Build the MTP block.
+
+        Args:
+            config: Qwen3.5 text config.
+            layer_idx: Position within the MTP stack (0-indexed); also
+                used as the cache index into MTP-local KV caches.
+            dtype: Computation dtype.
+            param_dtype: Parameter storage dtype.
+            precision: JAX matmul precision.
+            rngs: PRNG container.
+        """
+        self.config = config
+        self.layer_idx = layer_idx
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        self.self_attn = Qwen3NextFullAttention(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+        self.mlp = Qwen3NextMLP(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.input_layernorm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> tuple[Float[Array, "batch seq_len hidden"], TransformerCacheView | RaggedPagesCacheView | None]:
+        """Run one MTP block.
+
+        Args:
+            hidden_states: Fused (concat+fc) input hidden states.
+            mask_info: Causal mask info (typically reused from the main
+                model's forward pass).
+            position_ids: Position indices, ``(batch, seq_len)``.
+            mode: Runtime mode (train, decode, prefill).
+            cache_view: MTP-local cache view at this layer's index.
+            cache_metadata: Cache metadata.
+            frequencies: Precomputed RoPE frequencies (reused from main
+                model).
+
+        Returns:
+            Tuple of ``(updated_hidden_states, updated_cache_view)``.
+        """
+        residual = hidden_states
+        h = self.input_layernorm(hidden_states)
+        attn_out = self.self_attn(
+            h,
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            False,
+            frequencies,
+        )
+        hidden_states = checkpoint_name(residual + attn_out.attention_output, "mtp_attn_residual")
+
+        residual = hidden_states
+        h = self.post_attention_layernorm(hidden_states)
+        h = self.mlp(h)
+        hidden_states = checkpoint_name(residual + h, "mtp_mlp_residual")
+        return hidden_states, attn_out.cache_view
+
+
+class Qwen3_5MTPHead(spx.Module):
+    """Qwen3.5 Multi-Token Prediction (MTP) head.
+
+    Implements the DeepSeek-V3-style MTP: fuse previous-position hidden
+    state with next-token embedding via concat → pre-fc RMSNorms → fc,
+    process through ``N`` MTP decoder layers, final norm. The shared LM
+    head is applied by the caller.
+
+    For ``N > 1`` (not used by Qwen3.5 today; reserved for future
+    multi-depth variants) the layers are stacked sequentially; each
+    additional layer further conditions on the same fused hidden state
+    rather than re-fusing.
+
+    Training-time use::
+
+        last_hidden = main_model(input_ids).last_hidden_state
+        next_embeds = embed_tokens(jnp.roll(input_ids, shift=-1, axis=-1))
+        mtp_hidden = mtp_head(last_hidden, next_embeds, ...).last_hidden_state
+        mtp_logits = lm_head(mtp_hidden)
+    """
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Build the MTP head.
+
+        Args:
+            config: Qwen3.5 text config. Reads ``mtp_num_hidden_layers``,
+                ``hidden_size``, ``rms_norm_eps``, and ``initializer_range``.
+            dtype: Computation dtype.
+            param_dtype: Parameter storage dtype.
+            precision: JAX matmul precision.
+            rngs: PRNG container.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        num_mtp_layers = int(getattr(config, "mtp_num_hidden_layers", 0))
+        if num_mtp_layers < 1:
+            raise ValueError(
+                f"Qwen3_5MTPHead requires mtp_num_hidden_layers >= 1, got {num_mtp_layers}. "
+                "Set config.mtp_num_hidden_layers > 0 to enable the head."
+            )
+        self.num_mtp_layers = num_mtp_layers
+
+        self.fc = ColumnParallelLinear(
+            2 * config.hidden_size,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            rngs=rngs,
+        )
+        self.pre_fc_norm_hidden = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.pre_fc_norm_embedding = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        remat_layer = auto_remat(
+            Qwen3_5MTPLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList(
+            [
+                remat_layer(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(num_mtp_layers)
+            ]
+        )
+        self.norm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        prev_hidden_states: Float[Array, "batch seq_len hidden"],
+        next_token_embeds: Float[Array, "batch seq_len hidden"],
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        attention_mask: Float[Array, "batch seq_len"] | None = None,
+    ) -> Qwen3_5MTPOutput:
+        """Forward through the MTP head.
+
+        Args:
+            prev_hidden_states: ``(B, S, H)`` last_hidden_state from the
+                main model (already post-final-norm).
+            next_token_embeds: ``(B, S, H)`` token embeddings for the
+                ground-truth next position. Caller is responsible for
+                the shift (``embed_tokens(jnp.roll(input_ids, -1))``).
+                For boundary positions where there is no next token,
+                pass any embedding; the MTP loss should mask those
+                positions out.
+            mask_info: Causal mask info, reused from main forward.
+            position_ids: Position indices; reused from main forward.
+            mode: Runtime mode.
+            past_key_values: MTP-local KV cache. Must be allocated by
+                the caller with ``num_mtp_layers`` entries; do NOT pass
+                the main model's cache (different layer count).
+            cache_metadata: Cache metadata.
+            frequencies: RoPE frequencies (reuse main model's).
+            attention_mask: Optional padding mask used to build
+                ``mask_info`` / ``position_ids`` when those are not
+                supplied by the caller.
+
+        Returns:
+            Qwen3_5MTPOutput with ``last_hidden_state`` shaped
+            ``(B, S, H)`` and the updated MTP cache.
+        """
+        normed_h = self.pre_fc_norm_hidden(prev_hidden_states)
+        normed_e = self.pre_fc_norm_embedding(next_token_embeds)
+        fused = jnp.concatenate([normed_h, normed_e], axis=-1)
+        h = self.fc(fused)
+        h = apply_logical_sharding(
+            h,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        batch_size, seq_len = h.shape[:2]
+        if mask_info is None:
+            mask_info = MaskInfo.dynamic_init(
+                mask_info=None,
+                input_ids=None,
+                inputs_embeds=h,
+                attention_mask=attention_mask,
+            )
+        if position_ids is None:
+            position_ids = (
+                mask_info.q_position_ids
+                if hasattr(mask_info, "q_position_ids")
+                else (jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(batch_size, axis=0))
+            )
+
+        views = past_key_values.views if past_key_values is not None else None
+        new_views: list[TransformerCacheView | RaggedPagesCacheView | None] = []
+        for i, layer in enumerate(self.layers):
+            cv_in = views[i] if views is not None and i < len(views) else None
+            h, cv_out = layer(
+                h,
+                mask_info,
+                position_ids,
+                mode,
+                cv_in,
+                cache_metadata,
+                frequencies,
+            )
+            new_views.append(cv_out)
+
+        h = self.norm(h)
+        h = checkpoint_name(h, "mtp_output")
+        return Qwen3_5MTPOutput(last_hidden_state=h, past_key_values=tuple(new_views) or None)
+
+
+
+
 @register_module(TaskType.BASE_MODULE, config=Qwen3_5TextConfig, model_type="qwen3_5_text")
 class Qwen3_5TextModel(Qwen3NextModel):
     """Qwen3.5 text-only base model (no LM head).
@@ -193,7 +533,8 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     """Qwen3.5 text causal language model.
 
     Wraps :class:`Qwen3_5TextModel` with a linear LM head for next-token
-    prediction.
+    prediction, plus an optional DeepSeek-V3-style Multi-Token
+    Prediction (MTP) head when ``config.mtp_num_hidden_layers > 0``.
 
     Args:
         config: Qwen3.5 text configuration.
@@ -215,7 +556,12 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Qwen3.5 text causal LM with MoE support.
+        """Initialize Qwen3.5 text causal LM (optionally with MTP head).
+
+        When ``config.mtp_num_hidden_layers > 0``, an
+        :class:`~easydel.modules.qwen3_5.mtp.Qwen3_5MTPHead` is
+        instantiated as ``self.mtp`` so HF ``mtp.*`` checkpoint tensors
+        auto-bind by name during ``from_pretrained``.
 
         Args:
             config: Qwen3.5 text configuration.
@@ -236,6 +582,267 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
             lm_head_bias=False,
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
+        if int(getattr(config, "mtp_num_hidden_layers", 0)) > 0:
+            self.mtp = Qwen3_5MTPHead(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mtp = None
+
+    def has_mtp(self) -> bool:
+        """Report whether this model carries an MTP head.
+
+        Returns:
+            ``True`` iff ``config.mtp_num_hidden_layers > 0`` and the
+            head was instantiated.
+        """
+        return self.mtp is not None
+
+    def compute_mtp_outputs(
+        self,
+        outputs: MoeCausalLMOutput,
+        input_ids: jax.Array,
+        attention_mask: jax.Array | None = None,
+        mask_info=None,
+        position_ids: jax.Array | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        mtp_past_key_values=None,
+        cache_metadata=None,
+    ) -> Qwen3_5MTPOutput | None:
+        """Run the MTP head and produce per-depth-1 hidden states + logits.
+
+        Given the main model's ``outputs.last_hidden_state``, fuses each
+        position's hidden state with the embedding of the NEXT
+        ground-truth token (``input_ids`` rolled left by 1) through the
+        MTP head, then projects through the shared LM head to obtain
+        ``mtp_logits`` predicting position ``t + 2``.
+
+        Args:
+            outputs: Result of the main causal-LM forward pass.
+                ``outputs.last_hidden_state`` is required.
+            input_ids: ``(batch, seq_len)`` token IDs of the main forward
+                pass. Used to look up next-token embeddings via the
+                shared ``embed_tokens`` table.
+            attention_mask: Optional padding mask.
+            mask_info: Causal mask info from the main forward (reused
+                so the MTP attention sees the same mask).
+            position_ids: Position indices, reused from main forward.
+            mode: Runtime mode. ``None`` falls back to train.
+            mtp_past_key_values: MTP-local KV cache. Pass ``None`` for
+                training; allocate with ``num_mtp_layers`` entries for
+                generation.
+            cache_metadata: Cache metadata.
+
+        Returns:
+            :class:`Qwen3_5MTPOutput` with ``last_hidden_state`` shaped
+            ``(B, S, H)`` and the updated MTP cache, or ``None`` when
+            the model has no MTP head.
+
+            The caller projects ``output.last_hidden_state`` through
+            ``self.compute_lm_logits(self.prepare_lm_head_inputs(...))``
+            to obtain MTP logits.
+        """
+        if self.mtp is None:
+            return None
+
+        next_input_ids = jnp.concatenate(
+            [input_ids[:, 1:], jnp.zeros((input_ids.shape[0], 1), dtype=input_ids.dtype)],
+            axis=-1,
+        )
+        next_token_embeds = self.model.get_embedding()(next_input_ids.astype("i4"))
+
+        frequencies = getattr(self.model, "frequencies", None)
+        return self.mtp(
+            prev_hidden_states=outputs.last_hidden_state,
+            next_token_embeds=next_token_embeds,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=mtp_past_key_values,
+            cache_metadata=cache_metadata,
+            frequencies=frequencies,
+            attention_mask=attention_mask,
+        )
+
+    def compute_mtp_logits(self, mtp_output: Qwen3_5MTPOutput) -> jax.Array:
+        """Project MTP hidden states through the shared LM head.
+
+        Args:
+            mtp_output: Output of :meth:`compute_mtp_outputs`.
+
+        Returns:
+            ``(batch, seq_len, vocab_size)`` MTP logits over the
+            "skip-one" prediction targets (``input_ids[t + 2]``).
+        """
+        h = self.prepare_lm_head_inputs(mtp_output.last_hidden_state)
+        return self.compute_lm_logits(h)
+
+    def compute_mtp_loss(
+        self,
+        mtp_logits: jax.Array,
+        labels: jax.Array,
+        attention_mask: jax.Array | None = None,
+        ignore_index: int = -100,
+    ) -> jax.Array:
+        """Compute the DeepSeek-V3-style MTP cross-entropy loss.
+
+        With one MTP depth (the Qwen3.5 default), the head predicts
+        token at position ``t + 2`` from a fusion of the hidden state
+        at ``t`` and the embedding at ``t + 1``. The CE loss therefore
+        compares ``mtp_logits[..., t, :]`` against
+        ``labels[..., t + 2]``.
+
+        Args:
+            mtp_logits: ``(batch, seq_len, vocab_size)`` from
+                :meth:`compute_mtp_logits`.
+            labels: ``(batch, seq_len)`` ground-truth token IDs
+                (typically the same as ``input_ids``).
+            attention_mask: Optional ``(batch, seq_len)`` mask;
+                positions where ``attention_mask == 0`` AT THE TARGET
+                INDEX (``t + 2``) are excluded.
+            ignore_index: Label sentinel for "skip this position";
+                applied to the trailing 2 positions where there is no
+                ``t + 2`` target.
+
+        Returns:
+            Scalar mean CE loss over non-ignored positions, BEFORE
+            multiplication by ``config.mtp_loss_coef``. Callers should
+            scale by ``self.config.mtp_loss_coef`` (or
+            ``self.config.text_config.mtp_loss_coef`` for the
+            multimodal wrapper) and add to the main CE loss.
+        """
+        batch_size = labels.shape[0]
+        labels.shape[1]
+        pad = jnp.full((batch_size, 2), ignore_index, dtype=labels.dtype)
+        shifted_labels = jnp.concatenate([labels[:, 2:], pad], axis=-1)
+
+        if attention_mask is not None:
+            mask_shifted = jnp.concatenate(
+                [attention_mask[:, 2:], jnp.zeros((batch_size, 2), dtype=attention_mask.dtype)],
+                axis=-1,
+            )
+            shifted_labels = jnp.where(mask_shifted.astype(jnp.bool_), shifted_labels, ignore_index)
+
+        logits = mtp_logits.astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        nll = -jnp.take_along_axis(log_probs, jnp.maximum(shifted_labels, 0)[..., None], axis=-1).squeeze(-1)
+        valid = (shifted_labels != ignore_index).astype(jnp.float32)
+        loss_sum = jnp.sum(nll * valid)
+        loss_count = jnp.maximum(jnp.sum(valid), 1.0)
+        return loss_sum / loss_count
+
+    def _maybe_add_mtp_aux_loss(
+        self,
+        outputs: MoeCausalLMOutput,
+        input_ids: jax.Array | None,
+        attention_mask: jax.Array | None,
+        mode: common_types.RUNTIME_MODE_TYPES | None,  # type: ignore
+    ) -> MoeCausalLMOutput:
+        """Fold the MTP CE loss into ``outputs.aux_loss`` during training.
+
+        EasyDeL's trainer (:meth:`EasyDeLBaseModule.compute_loss`) adds
+        ``outputs.aux_loss`` to the main causal-LM loss automatically —
+        the same channel MoE router losses use. Routing the MTP loss
+        through ``aux_loss`` is therefore what makes the MTP head
+        actually receive gradients during ``fit`` / fine-tuning; no
+        trainer changes are needed.
+
+        The MTP loss is computed only when:
+
+        - an MTP head exists (``config.mtp_num_hidden_layers > 0``),
+        - ``config.mtp_loss_coef > 0`` (set it to ``0`` to freeze /
+          ignore the MTP head while fine-tuning the base model),
+        - ``input_ids`` are available (the MTP targets are
+          ``input_ids`` shifted by 2 — self-supervised, so no extra
+          ``labels`` are needed),
+        - the run is training/eval, not autoregressive decode/prefill
+          (skipping MTP during generation avoids wasted compute).
+
+        Args:
+            outputs: The main causal-LM forward output.
+            input_ids: Token IDs of the current batch.
+            attention_mask: Optional padding mask.
+            mode: Runtime mode; decode/prefill/insert skip the MTP loss.
+
+        Returns:
+            ``outputs`` with ``aux_loss`` updated to include
+            ``mtp_loss_coef * mtp_ce_loss`` (added to any existing
+            MoE router aux loss), or unchanged when MTP is inactive.
+        """
+        if self.mtp is None or input_ids is None:
+            return outputs
+        coef = float(getattr(self.config, "mtp_loss_coef", 0.0))
+        if coef <= 0.0:
+            return outputs
+        if mode in (common_types.MODE_DECODE, common_types.MODE_PREFILL, common_types.MODE_INSERT):
+            return outputs
+        if getattr(outputs, "last_hidden_state", None) is None:
+            return outputs
+
+        mtp_output = self.compute_mtp_outputs(
+            outputs,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            mode=mode,
+        )
+        if mtp_output is None:
+            return outputs
+        mtp_logits = self.compute_mtp_logits(mtp_output)
+        mtp_loss = self.compute_mtp_loss(mtp_logits, input_ids, attention_mask) * coef
+        existing = getattr(outputs, "aux_loss", None)
+        new_aux = mtp_loss if existing is None else existing + mtp_loss
+        return outputs.replace(aux_loss=new_aux)
+
+    def forward(
+        self,
+        input_ids: jax.Array | None = None,
+        inputs_embeds: jax.Array | None = None,
+        attention_mask: jax.Array | None = None,
+        mask_info=None,
+        position_ids: jax.Array | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> MoeCausalLMOutput:
+        """Causal-LM forward with the MTP auxiliary loss folded in.
+
+        Runs the standard Qwen3-Next causal-LM forward, then — during
+        training/eval and when an MTP head is present — adds the MTP
+        cross-entropy loss to ``outputs.aux_loss`` via
+        :meth:`_maybe_add_mtp_aux_loss`, so the trainer trains the
+        MTP head automatically. See that method for the gating rules.
+        """
+        outputs = super().forward(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+        )
+        mtp_mode = mode
+        if mtp_mode is None and (past_key_values is not None or cache_metadata is not None):
+            seq_len = None
+            if input_ids is not None:
+                seq_len = input_ids.shape[1]
+            elif inputs_embeds is not None:
+                seq_len = inputs_embeds.shape[1]
+            mtp_mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
+        return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mtp_mode)
 
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3_5Config, model_type="qwen3_5")
@@ -551,6 +1158,172 @@ class Qwen3_5ForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5Model, Qwe
             lm_head_bias=False,
         )
         self.vocab_size = config.text_config.vocab_size
+        if int(getattr(config.text_config, "mtp_num_hidden_layers", 0)) > 0:
+            self.mtp = Qwen3_5MTPHead(
+                config=config.text_config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mtp = None
+
+    def has_mtp(self) -> bool:
+        """Whether this multimodal wrapper carries an MTP head."""
+        return self.mtp is not None
+
+    def compute_mtp_outputs(
+        self,
+        outputs,
+        input_ids: jax.Array,
+        attention_mask: jax.Array | None = None,
+        mask_info=None,
+        position_ids: jax.Array | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        mtp_past_key_values=None,
+        cache_metadata=None,
+    ) -> Qwen3_5MTPOutput | None:
+        """Run the MTP head over the multimodal model's hidden states.
+
+        See :meth:`Qwen3_5ForCausalLM.compute_mtp_outputs` for the
+        per-position semantics. For multimodal inputs the MTP head sees
+        the merged text+visual hidden states the language trunk
+        produced; only the text positions contribute meaningfully to
+        the MTP CE loss, so the caller should mask non-text positions
+        in the label.
+
+        Args:
+            outputs: Result of the multimodal forward pass; must expose
+                ``last_hidden_state``.
+            input_ids: Token IDs (with placeholder tokens at visual
+                positions).
+            attention_mask: Optional padding mask.
+            mask_info: Causal mask info, reused from main forward.
+            position_ids: Position indices, reused from main forward.
+            mode: Runtime mode.
+            mtp_past_key_values: MTP-local KV cache (do NOT share with
+                the main model's cache).
+            cache_metadata: Cache metadata.
+
+        Returns:
+            :class:`Qwen3_5MTPOutput` or ``None`` if no MTP head.
+        """
+        if self.mtp is None:
+            return None
+
+        next_input_ids = jnp.concatenate(
+            [input_ids[:, 1:], jnp.zeros((input_ids.shape[0], 1), dtype=input_ids.dtype)],
+            axis=-1,
+        )
+        next_token_embeds = self.model.get_input_embeddings()(next_input_ids.astype("i4"))
+
+        language_model = self.model.language_model
+        frequencies = getattr(language_model, "frequencies", None)
+        return self.mtp(
+            prev_hidden_states=outputs.last_hidden_state,
+            next_token_embeds=next_token_embeds,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=mtp_past_key_values,
+            cache_metadata=cache_metadata,
+            frequencies=frequencies,
+            attention_mask=attention_mask,
+        )
+
+    def compute_mtp_logits(self, mtp_output: Qwen3_5MTPOutput) -> jax.Array:
+        """Project MTP hidden states through the shared LM head."""
+        h = self.prepare_lm_head_inputs(mtp_output.last_hidden_state)
+        return self.compute_lm_logits(h)
+
+    def compute_mtp_loss(
+        self,
+        mtp_logits: jax.Array,
+        labels: jax.Array,
+        attention_mask: jax.Array | None = None,
+        ignore_index: int = -100,
+    ) -> jax.Array:
+        """Compute MTP cross-entropy loss for the multimodal model.
+
+        See :meth:`Qwen3_5ForCausalLM.compute_mtp_loss` for semantics.
+        For multimodal inputs the caller should additionally mask out
+        non-text positions (image/video placeholders) by setting their
+        labels to ``ignore_index`` before invoking this method.
+        """
+        batch_size = labels.shape[0]
+        pad = jnp.full((batch_size, 2), ignore_index, dtype=labels.dtype)
+        shifted_labels = jnp.concatenate([labels[:, 2:], pad], axis=-1)
+        if attention_mask is not None:
+            mask_shifted = jnp.concatenate(
+                [attention_mask[:, 2:], jnp.zeros((batch_size, 2), dtype=attention_mask.dtype)],
+                axis=-1,
+            )
+            shifted_labels = jnp.where(mask_shifted.astype(jnp.bool_), shifted_labels, ignore_index)
+        logits = mtp_logits.astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        nll = -jnp.take_along_axis(log_probs, jnp.maximum(shifted_labels, 0)[..., None], axis=-1).squeeze(-1)
+        valid = (shifted_labels != ignore_index).astype(jnp.float32)
+        loss_sum = jnp.sum(nll * valid)
+        loss_count = jnp.maximum(jnp.sum(valid), 1.0)
+        return loss_sum / loss_count
+
+    def _maybe_add_mtp_aux_loss(self, outputs, input_ids, attention_mask, mode):
+        """Fold the MTP CE loss into ``outputs.aux_loss`` during training.
+
+        Multimodal counterpart of
+        :meth:`Qwen3_5ForCausalLM._maybe_add_mtp_aux_loss`. ``VLMCausalLMOutput``
+        carries an ``aux_loss`` field that the trainer's ``compute_loss``
+        adds to the main loss, so routing the MTP loss here makes the
+        MTP head train during vision-language fine-tuning. Gating rules
+        are identical (MTP head present, ``mtp_loss_coef > 0``,
+        ``input_ids`` available, training/eval mode).
+        """
+        if self.mtp is None or input_ids is None:
+            return outputs
+        coef = float(getattr(self.config.text_config, "mtp_loss_coef", 0.0))
+        if coef <= 0.0:
+            return outputs
+        if mode in (common_types.MODE_DECODE, common_types.MODE_PREFILL, common_types.MODE_INSERT):
+            return outputs
+        if getattr(outputs, "last_hidden_state", None) is None:
+            return outputs
+        mtp_output = self.compute_mtp_outputs(outputs, input_ids=input_ids, attention_mask=attention_mask, mode=mode)
+        if mtp_output is None:
+            return outputs
+        mtp_logits = self.compute_mtp_logits(mtp_output)
+        mtp_loss = self.compute_mtp_loss(mtp_logits, input_ids, attention_mask) * coef
+        existing = getattr(outputs, "aux_loss", None)
+        new_aux = mtp_loss if existing is None else existing + mtp_loss
+        return outputs.replace(aux_loss=new_aux)
+
+    def forward(self, *args, **kwargs):
+        """Vision-language forward with the MTP auxiliary loss folded in.
+
+        Delegates to :meth:`BaseVisionLanguageModule.forward`, then —
+        during training/eval with an MTP head present — adds the MTP
+        cross-entropy loss to ``outputs.aux_loss`` so the trainer
+        trains the MTP head. See :meth:`_maybe_add_mtp_aux_loss`.
+        """
+        outputs = super().forward(*args, **kwargs)
+        if self.mtp is None:
+            return outputs
+        input_ids = kwargs.get("input_ids")
+        attention_mask = kwargs.get("attention_mask")
+        mode = kwargs.get("mode")
+        past_key_values = kwargs.get("past_key_values")
+        cache_metadata = kwargs.get("cache_metadata")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if mode is None and (past_key_values is not None or cache_metadata is not None):
+            inputs_embeds = kwargs.get("inputs_embeds")
+            seq_len = None
+            if input_ids is not None:
+                seq_len = input_ids.shape[1]
+            elif inputs_embeds is not None:
+                seq_len = inputs_embeds.shape[1]
+            mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
+        return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mode)
 
     def get_input_embeddings(self):
         """Return the shared text token embedding layer.
@@ -717,6 +1490,9 @@ __all__ = [
     "Qwen3_5Config",
     "Qwen3_5ForCausalLM",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MTPHead",
+    "Qwen3_5MTPLayer",
+    "Qwen3_5MTPOutput",
     "Qwen3_5Model",
     "Qwen3_5TextConfig",
     "Qwen3_5TextModel",

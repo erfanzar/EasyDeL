@@ -190,9 +190,67 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         use_bidirectional_attention: bool = False,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the attributes of an object, which are sometimes called fields or properties.
-        The __init__ function can accept arguments, but self must be the first one.
+        """Initialize a :class:`Gemma3TextConfig`.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``262208``.
+            hidden_size (int, optional): Decoder hidden dimension. Defaults to ``2304``.
+            intermediate_size (int | None, optional): MLP intermediate width.
+                Defaults to ``9216``.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to ``26``.
+            num_attention_heads (int, optional): Query heads per layer. Defaults to ``8``.
+            num_key_value_heads (int, optional): KV heads (GQA). Defaults to ``4``.
+            head_dim (int, optional): Per-head attention dimension. Defaults to ``256``.
+            hidden_activation (str, optional): MLP activation. Defaults to
+                ``"gelu_pytorch_tanh"``.
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``131072``.
+            initializer_range (float, optional): Truncated-normal init stddev.
+                Defaults to ``0.02``.
+            rms_norm_eps (float, optional): RMSNorm epsilon. Defaults to ``1e-6``.
+            use_cache (bool, optional): Return KV caches. Defaults to ``True``.
+            pad_token_id (int, optional): Padding id. Defaults to ``0``.
+            eos_token_id (int, optional): End-of-sequence id. Defaults to ``1``.
+            bos_token_id (int, optional): Beginning-of-sequence id. Defaults to ``2``.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to ``True``.
+            rope_theta (float, optional): RoPE base frequency for full-attention
+                layers. Defaults to ``1000000.0``.
+            attention_bias (bool, optional): Use bias on attention projections.
+                Defaults to ``False``.
+            attention_dropout (float, optional): Attention dropout. Defaults to ``0.0``.
+            query_pre_attn_scalar (int, optional): Replaces the default
+                ``1/sqrt(head_dim)`` query scaling. Defaults to ``256``.
+            sliding_window (int, optional): Sliding-window length for the
+                ``"sliding_attention"`` layer slots. Defaults to ``4096``.
+            final_logit_softcapping (float | None, optional): Tanh-softcap value
+                applied to LM head logits. Defaults to ``None``.
+            attn_logit_softcapping (float | None, optional): Tanh-softcap value
+                applied inside the attention kernel. Defaults to ``None``.
+            cache_implementation (str, optional): Cache backend to use with
+                ``generate`` (``"hybrid"`` mixes per-layer sliding/full caches).
+                Defaults to ``"hybrid"``.
+            rope_scaling (dict | None, optional): RoPE scaling spec for the
+                global (full-attention) RoPE. See class docstring for the
+                accepted ``rope_type`` values.
+            rope_local_base_freq (float, optional): RoPE base frequency for the
+                local (sliding-attention) layers. Defaults to ``10000.0``.
+            sliding_window_pattern (int, optional): One full-attention layer is
+                inserted every ``sliding_window_pattern``-th position; the rest
+                are sliding. Defaults to ``6``.
+            layer_types (list[str] | None, optional): Explicit per-layer
+                attention types (``"sliding_attention"`` / ``"full_attention"``);
+                overrides the pattern when provided.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                Checkpointing policy. Defaults to
+                ``EasyDeLGradientCheckPointers.NONE``.
+            bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
+            scan_layers (bool, optional): Use ``lax.scan`` for shared decoder
+                weights. Defaults to ``False``.
+            use_bidirectional_attention (bool, optional): Use bidirectional
+                (non-causal) attention. When set, the effective sliding window
+                is shrunk to ``sliding_window // 2 + 1``. Defaults to ``False``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
         """
 
         self.gradient_checkpointing = gradient_checkpointing

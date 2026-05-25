@@ -28,7 +28,7 @@ Exposes :class:`StableLmModel` (transformer trunk) and the task wrappers
 :class:`StableLmForCausalLM` and :class:`StableLmForSequenceClassification`.
 """
 
-from functools import cached_property, partial
+from functools import cached_property
 from typing import ClassVar
 
 import jax
@@ -53,7 +53,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+    split_interleaved_segments_last_axis,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
@@ -93,39 +100,42 @@ class StableLmMLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
+            rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-        )
-
-        self.gate_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
             rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Builds the per-projection rename/split table that lets HF-style
+        checkpoints with separate ``gate_proj`` and ``up_proj`` weights load
+        into this module's fused :class:`ColumnParallelLinear`.
+
+        Returns:
+            dict: Reform-param mapping produced by
+            :meth:`ColumnParallelLinear.build_reform_param`.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -144,8 +154,9 @@ class StableLmMLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -362,12 +373,17 @@ class StableLmAttention(UnifiedAttention):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # Project to Q/K/V
-        query_states, key_states, value_states = (
-            checkpoint_name(self.query_projection(hidden_states), "attn_query"),
-            checkpoint_name(self.key_projection(hidden_states), "attn_key"),
-            checkpoint_name(self.value_projection(hidden_states), "attn_value"),
+        q_size = self.config.num_attention_heads * self.head_dim
+        kv_size = self.config.num_key_value_heads * self.head_dim
+        qkv_states = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        qkv_parts = split_interleaved_segments_last_axis(
+            qkv_states,
+            (q_size, kv_size, kv_size),
+            config=self.config,
         )
+        if qkv_parts is None:
+            qkv_parts = jnp.split(qkv_states, (q_size, q_size + kv_size), axis=-1)
+        query_states, key_states, value_states = qkv_parts
 
         query_states = query_states.reshape(
             batch_size,

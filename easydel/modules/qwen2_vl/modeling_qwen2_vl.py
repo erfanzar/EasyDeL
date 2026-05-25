@@ -33,7 +33,6 @@ Components:
 import math
 import typing as tp
 from collections.abc import Mapping
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -65,7 +64,14 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
@@ -747,7 +753,6 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=False,
-            use_fused_qkv=True,
             use_gqa=False,
         )
 
@@ -983,8 +988,9 @@ class Qwen2VLMLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -992,31 +998,22 @@ class Qwen2VLMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
@@ -1032,8 +1029,9 @@ class Qwen2VLMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -2187,7 +2185,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             lm_head_bias=False,
         )
-        self.vocab_size = config.vocab_size
+        self.vocab_size = config.text_config.vocab_size
 
     @property
     def visual(self):

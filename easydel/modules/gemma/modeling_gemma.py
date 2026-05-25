@@ -32,7 +32,6 @@ Exports:
     - :class:`GemmaForSequenceClassification`: Pooled classifier head over the last token.
 """
 
-import functools
 import warnings
 
 import jax
@@ -63,7 +62,13 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -267,8 +272,9 @@ class GemmaMLP(spx.Module):
             hidden_activation = self.config.hidden_activation
         self.act = ACT2FN[hidden_activation]
 
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            inner_dim,
+            embed_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -276,31 +282,28 @@ class GemmaMLP(spx.Module):
             kernel_init=kernel_init,
             rngs=rngs,
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            embed_dim,
+            (inner_dim, inner_dim),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
+            layout=dense_gate_up_layout(inner_dim),
         )
 
-        self.gate_proj = column_parallel_linear(
-            embed_dim,
-            inner_dim,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            inner_dim,
-            embed_dim,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            embed_dim,
-            inner_dim,
-            rngs=rngs,
-        )
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Returns:
+            dict: HuggingFace -> EasyDeL remapping rules so that the unfused
+            ``gate_proj`` / ``up_proj`` weights from upstream checkpoints are
+            restaged into the fused ``gate_up_proj`` linear.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -321,8 +324,9 @@ class GemmaMLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
 
         hidden_states = apply_logical_sharding(
@@ -721,28 +725,35 @@ class GemmaModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder sub-module (``self`` for a decoder-only stack).
+
+        Returns:
+            GemmaModel: This module.
         """
         return self
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: The bare backbone carries no LM head; see
+                :class:`GemmaForCausalLM`.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table.
         """
         return self.embed_tokens
 
@@ -873,27 +884,36 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder backbone.
+
+        Returns:
+            GemmaModel: The underlying backbone returned by
+            :meth:`GemmaModel.get_decoder`.
         """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
+        """Return the language modeling head.
+
+        Returns:
+            ParallelLinear: The unembedding projection (tied to ``embed_tokens``
+            when ``config.tie_word_embeddings`` is set).
         """
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the backbone.
         """
         return self.model.get_embedding()
 
@@ -1031,31 +1051,44 @@ class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder backbone.
+
+        Returns:
+            GemmaModel: The underlying decoder backbone.
         """
         return self.model
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: This wrapper carries a classification head
+                rather than an LM head; use :class:`GemmaForCausalLM` for LM
+                generation.
         """
         raise NotImplementedError("This model has a sequence classification head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the backbone.
         """
         return self.model.get_embedding()
 
     def get_task_head(self):
-        """Returns the sequence classification head."""
+        """Return the linear classification (score) head.
+
+        Returns:
+            ParallelLinear: The ``(hidden_size, num_labels)`` projection used
+            for pooled classification logits.
+        """
         return self.score

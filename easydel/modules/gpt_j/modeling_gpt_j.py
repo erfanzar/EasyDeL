@@ -82,9 +82,7 @@ class GPTJAttention(UnifiedAttention):
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         layer_idx (int): Index of this layer in the model (0-indexed).
         rngs (spx.Rngs): Random number generators.
-        q_proj (ColumnParallelLinear): Query projection layer.
-        k_proj (ColumnParallelLinear): Key projection layer.
-        v_proj (ColumnParallelLinear): Value projection layer.
+        qkv_proj (ColumnParallelLinear): Fused query/key/value projection layer.
         out_proj (ColumnParallelLinear): Output projection layer.
         resid_dropout (nn.Dropout): Residual dropout layer.
     """
@@ -315,42 +313,6 @@ class GPTJAttention(UnifiedAttention):
             Tensor reshaped to (batch, seq_len, num_heads, head_dim).
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
-
-    def _get_query_proj(self, hidden_states: Array) -> Array:
-        """Apply query projection with checkpoint naming and head splitting.
-
-        Args:
-            hidden_states: Input hidden states with shape (batch, seq_len, hidden_size).
-
-        Returns:
-            Query states with shape (batch, seq_len, num_heads, head_dim).
-        """
-        query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
-        return self._split_heads(query_states)
-
-    def _get_key_proj(self, hidden_states: Array) -> Array:
-        """Apply key projection with checkpoint naming and head splitting.
-
-        Args:
-            hidden_states: Input hidden states with shape (batch, seq_len, hidden_size).
-
-        Returns:
-            Key states with shape (batch, seq_len, num_kv_heads, head_dim).
-        """
-        key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
-        return self._split_heads(key_states)
-
-    def _get_value_proj(self, hidden_states: Array) -> Array:
-        """Apply value projection with checkpoint naming and head splitting.
-
-        Args:
-            hidden_states: Input hidden states with shape (batch, seq_len, hidden_size).
-
-        Returns:
-            Value states with shape (batch, seq_len, num_kv_heads, head_dim).
-        """
-        value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
-        return self._split_heads(value_states)
 
     def _get_output_proj(self, attn_output: Array) -> Array:
         """Apply output projection with checkpoint naming and residual dropout.

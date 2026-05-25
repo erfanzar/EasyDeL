@@ -39,7 +39,24 @@ from easydel.infra.factory import register_config
 
 
 def _patch_hf_glm4v_moe_router_logits_output() -> None:
-    """HF compatibility: expose missing router_logits on GLM4V-MoE model output."""
+    """Backfill missing GLM-4V-MoE attributes on older Hugging Face releases.
+
+    Mutates the upstream :mod:`transformers.models.glm4v_moe` module so
+    EasyDeL's converter and trainer code can rely on a stable surface:
+
+    * Adds a ``router_logits`` attribute (``None`` by default) to
+      ``Glm4vMoeModelOutputWithPast`` so downstream router-loss code can
+      always read it.
+    * Adds settable ``num_experts`` / ``num_experts_per_tok`` properties
+      to ``Glm4vMoeForConditionalGeneration`` when missing, defaulting to
+      the values stored on the text sub-config.
+    * Wraps ``load_balancing_loss_func`` so it always returns a torch
+      tensor (the upstream helper sometimes returns the integer ``0``
+      which breaks downstream tensor ops).
+
+    This is invoked once at import time and is a no-op when the upstream
+    module is unavailable or already up-to-date.
+    """
     try:
         from transformers.models.glm4v_moe import modeling_glm4v_moe as hf_glm4v_moe
     except Exception:

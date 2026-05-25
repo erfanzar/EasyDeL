@@ -56,7 +56,12 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_qkv_layout,
+)
 from easydel.layers import RMSNorm as Grok1RMSNorm
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.modules._base import BaseCausalLMModule
@@ -111,35 +116,19 @@ class Grok1Attention(AttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = ColumnParallelLinear(
+        q_dim = config.num_attention_heads * self.head_dim
+        kv_dim = config.num_key_value_heads * self.head_dim
+        qkv_layout = dense_qkv_layout(q_dim, kv_dim)
+        self.qkv_proj = ColumnParallelLinear(
             config.hidden_size,
-            config.num_attention_heads * self.head_dim,
+            qkv_layout.segment_sizes,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-        )
-        self.k_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-        )
-        self.v_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            layout=qkv_layout,
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
@@ -160,6 +149,10 @@ class Grok1Attention(AttentionModule):
             dropout_prob=config.attention_dropout,
         )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     def _merge_heads(self, hidden_states):
         """
@@ -204,11 +197,8 @@ class Grok1Attention(AttentionModule):
             AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        query_states, key_states, value_states = self.qkv_proj.split(qkv, config=self.config)
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -1081,7 +1071,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
             top_k=self.config.num_experts_per_tok,
             attention_mask=attention_mask,
         )
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        return aux_loss * self.config.router_aux_loss_coef
 
     def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply language model head with Grok-1's output multiplier scaling.

@@ -66,6 +66,8 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    moe_gate_up_fusion_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -344,8 +346,9 @@ class Xerxes2MLP(spx.Module):
         self.rngs = rngs
 
         self.act = jax.nn.silu
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            2 * config.intermediate_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -353,8 +356,9 @@ class Xerxes2MLP(spx.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -362,8 +366,6 @@ class Xerxes2MLP(spx.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
         )
-        self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size, rngs=rngs)
-        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -429,10 +431,10 @@ class Xerxes2MoeMLPStack(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -453,19 +455,11 @@ class Xerxes2MoeMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return moe_gate_up_fusion_reform_param(config=self.config)
 
     def forward(
         self,
@@ -485,15 +479,9 @@ class Xerxes2MoeMLPStack(spx.Module):
         Returns:
             Transformed hidden states after expert processing.
         """
-        return checkpoint_name(
-            self.down_proj(
-                self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-                * self.up_proj(hidden_states, group_sizes, sorted_experts),
-                group_sizes,
-                sorted_experts,
-            ),
-            "moe_output",
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return checkpoint_name(self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts), "moe_output")
 
 
 class Xerxes2MoeSparseBlock(BaseMoeModule):
@@ -589,8 +577,7 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -1181,7 +1168,7 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # ty
             attention_mask=attention_mask,
         )
 
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        return aux_loss * self.config.router_aux_loss_coef
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA-based key-value caching.

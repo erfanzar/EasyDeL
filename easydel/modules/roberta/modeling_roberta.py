@@ -112,7 +112,7 @@ def dot_product_attention_weights(
     return attn_weights
 
 
-class RobertaEmbeddings(spx.Module):
+class RobertaEmbeddings(EasyDeLLayerStackMixin, spx.Module):
     """Embedding layer for RoBERTa model.
 
     This layer constructs the combined embeddings from word, position, and

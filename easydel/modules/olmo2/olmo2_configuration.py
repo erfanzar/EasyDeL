@@ -32,16 +32,19 @@ from easydel.infra.factory import register_config
 
 @register_config("olmo2")
 class Olmo2Config(EasyDeLBaseConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`Olmo2Model`]. It is used to instantiate an OLMo2
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the [allenai/Olmo2-7B-1124-hf](https://huggingface.co/allenai/Olmo2-7B-1124-hf).
+    r"""Configuration for AI2's OLMo-2 (Open Language Model v2) decoder family.
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    OLMo-2's headline architectural change vs. OLMo-1 is **Q/K
+    normalization** — an RMSNorm applied to the query and key projections
+    inside attention to keep their magnitudes bounded and improve training
+    stability at large scale. The rest of the architecture is LLaMA-style:
+    SwiGLU MLP, RoPE positional encoding (configurable
+    ``rope_theta`` / ``rope_scaling``), RMSNorm at ``rms_norm_eps``, and
+    grouped-query attention via ``num_key_value_heads``. Defaults reproduce
+    the OLMo2-7B-1124 release. Inherits from :class:`EasyDeLBaseConfig`,
+    so all standard EasyDeL sharding/quantization knobs are also accepted.
 
-
-    Args:
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 50304):
             Vocabulary size of the Olmo2 model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`Olmo2Model`]
@@ -98,18 +101,11 @@ class Olmo2Config(EasyDeLBaseConfig):
         rms_norm_eps (`float`, *optional*, defaults to 1e-05):
             The epsilon used by the rms normalization layers.
 
-
-    >>> from transformers import Olmo2Model, Olmo2Config
-
-    >>> # Initializing a Olmo2 7B style configuration
-    >>> configuration = Olmo2Config()
-
-    >>> # Initializing a model from the Olmo2 7B style configuration
-    >>> model = Olmo2Model(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-
+    Example:
+        >>> from easydel import Olmo2Config, Olmo2Model
+        >>> configuration = Olmo2Config()
+        >>> model = Olmo2Model(configuration)
+        >>> configuration = model.config
     """
 
     model_type = "olmo2"

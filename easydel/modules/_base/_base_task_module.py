@@ -316,10 +316,19 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         """Return the decoder/text stack length used for task-head placement.
 
         Task heads such as ``lm_head`` consume the final hidden states produced
-        by the decoder/text stack. In PP mode their parameters should therefore
-        be created under the final layer's stage assignment. Model families use
-        different attribute names for that stack, so this probes the common
-        containers without adding model-specific branches to every wrapper.
+        by the decoder/text stack. In pipeline-parallel (PP) mode their
+        parameters should therefore be created under the final layer's stage
+        assignment. Different model families expose that stack under different
+        attribute names, so this helper probes the common containers
+        (``language_model``/``text_model``/``decoder``/``model``/
+        ``transformer``/``gpt``) and the common layer-list names
+        (``layers``/``h``/``blocks``/``block``/``layer``) without forcing
+        every wrapper to add a model-specific branch.
+
+        Returns:
+            int: The number of decoder layers found, or ``0`` when no
+            recognised stack is present (in which case callers should fall
+            back to creating the task head outside any stage context).
         """
         candidates = [self.base_model]
         for owner in list(candidates):
@@ -342,7 +351,26 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         return 0
 
     def _create_task_head_on_last_stage(self, factory: Callable[[], Any]) -> Any:
-        """Create a task head on the decoder's final PP stage when possible."""
+        """Create a task head on the decoder's final pipeline-parallel stage.
+
+        When pipeline parallelism is active, task heads (``lm_head``,
+        ``classifier``, etc.) should live on the same PP stage as the final
+        decoder layer so that the head's parameters and the hidden states it
+        consumes are already co-located. This helper probes the decoder stack
+        for its layer count, opens an :meth:`assign_layer_stage` context for
+        the last stage, and invokes ``factory`` inside it. When no decoder
+        stack is found (rare or non-PP setups), ``factory`` is invoked
+        directly without a stage context.
+
+        Args:
+            factory: Zero-arg callable that constructs and returns the task
+                head module. Typically a closure over the head class and its
+                hyperparameters.
+
+        Returns:
+            The task head module returned by ``factory``, built under the
+            final stage's mesh context when applicable.
+        """
         stage_total = self._base_model_layer_count_for_head()
         if stage_total:
             with self.assign_layer_stage(stage_total - 1, total_layers=stage_total):
@@ -463,7 +491,25 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         return max(1, min(chunk_size, int(seq_len)))
 
     def _constrain_lm_logits(self, logits: Array) -> Array:
-        """Constrain full-rank LM logits through the configured logical-axis rules."""
+        """Apply logical-axis sharding constraints to full-rank LM logits.
+
+        Routes the logits tensor through ``apply_logical_sharding`` with
+        ``(BATCH, LENGTH, VOCAB)`` axes so that the produced logits respect
+        the configured partition rules (e.g., vocab-parallel sharding) before
+        being returned to the caller. Non-3-D inputs are passed through
+        unchanged because the chunked LM-head path may produce auxiliary
+        shapes (e.g., per-chunk accumulators) where the standard axis mapping
+        does not apply.
+
+        Args:
+            logits: Logits tensor. Expected shape is
+                ``(batch_size, sequence_length, vocab_size)``; any other rank
+                is returned unchanged.
+
+        Returns:
+            Array: The same logits with logical-axis sharding applied when
+            ``logits.ndim == 3``, otherwise the input unchanged.
+        """
         if logits.ndim != 3:
             return logits
         return cast(

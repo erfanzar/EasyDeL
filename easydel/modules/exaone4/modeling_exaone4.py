@@ -34,8 +34,6 @@ Public model classes (registered with the factory):
 - :class:`Exaone4ForSequenceClassification` — pooled classifier head.
 """
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -62,7 +60,14 @@ from easydel.infra.utils import (
     auto_remat,
     block_wise_ffn,
 )
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -103,41 +108,41 @@ class Exaone4MLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,  # Exaone4 uses no bias
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,  # Exaone4 uses no bias
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
-        self.gate_proj = column_parallel_linear(
+        self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
-            config.intermediate_size,
+            (config.intermediate_size, config.intermediate_size),
             rngs=rngs,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,  # Exaone4 uses no bias
+            kernel_init=kernel_init,
+            precision=precision,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
-        self.up_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
+        self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             rngs=rngs,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,  # Exaone4 uses no bias
+            kernel_init=kernel_init,
+            precision=precision,
         )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Returns:
+            dict: HuggingFace -> EasyDeL parameter remapping rules so that the
+            unfused ``gate_proj`` / ``up_proj`` weights from upstream
+            checkpoints are loaded into the fused ``gate_up_proj`` linear.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -157,8 +162,9 @@ class Exaone4MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,

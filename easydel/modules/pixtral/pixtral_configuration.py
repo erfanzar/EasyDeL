@@ -94,9 +94,27 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         initializer_range: int = 0.02,
         **kwargs,
     ):
-        """Initialize PixtralVisionConfig with vision encoder hyperparameters.
+        """Initialize Pixtral vision encoder configuration.
 
-        See class docstring for detailed parameter descriptions.
+        See class docstring for parameter semantics. Also computes the
+        derived ``head_dim = hidden_size // num_attention_heads`` used by
+        the 2-D RoPE implementation.
+
+        Args:
+            hidden_size: Hidden representation dimension.
+            intermediate_size: MLP intermediate dimension.
+            num_hidden_layers: Number of transformer encoder layers.
+            num_attention_heads: Number of self-attention heads.
+            num_channels: Number of input image channels (3 for RGB).
+            image_size: Maximum image side length (in pixels).
+            patch_size: Side length of each square image patch (in pixels).
+            hidden_act: Activation name used in the MLP block.
+            attention_dropout: Dropout probability on attention weights.
+            rope_theta: Base period for 2-D rotary position embeddings.
+            initializer_range: Standard deviation of the truncated-normal
+                weight initializer.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
 

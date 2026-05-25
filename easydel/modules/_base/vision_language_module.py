@@ -306,6 +306,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             lm_head_kernel_init=lm_head_kernel_init,
             create_lm_head=create_lm_head,
         )
+        self._clear_dynamic_language_stage_hints()
 
         # Get token IDs from config if not provided
         image_token_index = image_token_index or getattr(config, "image_token_id", None)
@@ -343,6 +344,28 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
 
         # Store router aux loss coefficient for MoE models
         self._router_aux_loss_coef = router_aux_loss_coef
+
+    def _clear_dynamic_language_stage_hints(self) -> None:
+        """Let MPMD infer language-model ownership in multimodal schedules.
+
+        In VLMs, the language decoder can be the first active scheduled region
+        for text-only inputs, or it can run after the vision path for multimodal
+        inputs. Static construction-time stage hints from the standalone text
+        model are therefore not a reliable owner for the composite VLM graph.
+        """
+        if not self._pipeline_stage_regions_enabled():
+            return
+        try:
+            language_model = self.get_language_model()
+        except AttributeError:
+            return
+        for _path, var in spx.live_variables(language_model):
+            metadata = getattr(var, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata.pop("pipeline_stage", None)
+        for module in (self, self.base_model, language_model):
+            if hasattr(module, "_spx_export_cache"):
+                object.__setattr__(module, "_spx_export_cache", None)
 
     @abstractmethod
     def get_image_features(

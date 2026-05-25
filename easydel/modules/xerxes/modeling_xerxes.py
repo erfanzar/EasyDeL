@@ -46,7 +46,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
 
@@ -135,8 +142,20 @@ class XerxesMLP(spx.Module):
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
         self.act = jax.nn.silu if config.swish_run else functools.partial(jax.nn.gelu, approximate=True)
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            self.config.hidden_size,
+            (self.config.intermediate_size, self.config.intermediate_size),
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+            layout=dense_gate_up_layout(self.config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            self.config.intermediate_size,
+            self.config.hidden_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -144,30 +163,20 @@ class XerxesMLP(spx.Module):
             kernel_init=kernel_init,
             rngs=rngs,
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel_init,
-            rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(
-            self.config.hidden_size,
-            self.config.intermediate_size,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            self.config.hidden_size,
-            self.config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            self.config.intermediate_size,
-            self.config.hidden_size,
-            rngs=rngs,
-        )
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Builds the per-projection rename/split table that lets HF-style
+        checkpoints with separate ``gate_proj`` and ``up_proj`` weights load
+        into this module's fused :class:`ColumnParallelLinear`.
+
+        Returns:
+            dict: Reform-param mapping produced by
+            :meth:`ColumnParallelLinear.build_reform_param`.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -185,8 +194,9 @@ class XerxesMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,

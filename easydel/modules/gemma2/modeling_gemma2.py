@@ -36,8 +36,6 @@ Exports:
     - :class:`Gemma2ForSequenceClassification`: Pooled classifier over the last token.
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -66,7 +64,13 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -315,8 +319,9 @@ class Gemma2MLP(spx.Module):
 
         self.act = ACT2FN[self.config.hidden_activation]
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            inner_dim,
+            embed_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -324,30 +329,28 @@ class Gemma2MLP(spx.Module):
             kernel_init=kernel_init,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            embed_dim,
+            (inner_dim, inner_dim),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
+            layout=dense_gate_up_layout(inner_dim),
         )
-        self.gate_proj = column_parallel_linear(
-            embed_dim,
-            inner_dim,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            inner_dim,
-            embed_dim,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            embed_dim,
-            inner_dim,
-            rngs=rngs,
-        )
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Returns:
+            dict: HuggingFace -> EasyDeL remapping rules so that the unfused
+            ``gate_proj`` / ``up_proj`` weights from upstream checkpoints are
+            restaged into the fused ``gate_up_proj`` linear.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -367,8 +370,9 @@ class Gemma2MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -776,28 +780,35 @@ class Gemma2Model(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma2 is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder sub-module (``self`` for a decoder-only stack).
+
+        Returns:
+            Gemma2Model: This module.
         """
         return self
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: The bare backbone carries no LM head; see
+                :class:`Gemma2ForCausalLM`.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table.
         """
         return self.embed_tokens
 
@@ -941,9 +952,10 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma2 is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
@@ -968,7 +980,22 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         return lm_logits
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Gemma-2 soft-capping."""
+        """Build a trace-safe LM-head projection with Gemma-2 soft-capping.
+
+        Wraps the base trace-safe projection (used by the remat bypass on the
+        LM head for very large vocabs) and post-composes the
+        ``cap * tanh(logits / cap)`` softcap when
+        ``config.final_logit_softcapping`` is set. If softcapping is disabled
+        the underlying base function is returned unchanged.
+
+        Args:
+            vocab_shard_stage: Optional pipeline-stage hint propagated to the
+                base projection helper.
+
+        Returns:
+            Callable[[Array], Array]: A function mapping hidden states of
+            shape ``[B, T, H]`` to logits of shape ``[B, T, V]``.
+        """
         base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         cap_value = self.config.final_logit_softcapping
         if cap_value is None:
@@ -988,20 +1015,28 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         return _project
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder backbone.
+
+        Returns:
+            Gemma2Model: The underlying decoder backbone (forwards to
+            :meth:`Gemma2Model.get_decoder`).
         """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
+        """Return the language modeling head.
+
+        Returns:
+            ParallelLinear: The unembedding projection (tied to ``embed_tokens``
+            when ``config.tie_word_embeddings`` is set).
         """
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the backbone.
         """
         return self.model.get_embedding()
 
@@ -1136,31 +1171,44 @@ class Gemma2ForSequenceClassification(BaseSequenceClassificationModule[Gemma2Mod
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma2 is decoder-only and exposes no encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder backbone.
+
+        Returns:
+            Gemma2Model: The underlying decoder backbone.
         """
         return self.model
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: This wrapper carries a classification head
+                rather than an LM head; use :class:`Gemma2ForCausalLM` for LM
+                generation.
         """
         raise NotImplementedError("This model has a sequence classification head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the backbone.
         """
         return self.model.get_embedding()
 
     def get_task_head(self):
-        """Returns the sequence classification head."""
+        """Return the linear classification (score) head.
+
+        Returns:
+            ParallelLinear: The ``(hidden_size, num_labels)`` projection used
+            for pooled classification logits.
+        """
         return self.score

@@ -67,7 +67,15 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+    split_interleaved_pair_last_axis,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
@@ -267,26 +275,19 @@ class Glm4vVisionMLP(spx.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.act = ACT2FN[config.hidden_act]
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
-            config.intermediate_size,
+            (config.intermediate_size, config.intermediate_size),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -298,6 +299,18 @@ class Glm4vVisionMLP(spx.Module):
             rngs=rngs,
         )
 
+    @property
+    def reform_param(self):
+        """Return checkpoint reform rules for the fused gate-up projection.
+
+        Returns:
+            dict: Reform rules emitted by the fused-projection layout for
+                the ``gate_up_proj`` parameter, used by HF-checkpoint
+                loaders to split the fused kernel into separate ``gate``
+                and ``up`` tensors.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
     def forward(self, x: Array) -> Array:
         """Apply gated feedforward transformation.
 
@@ -307,7 +320,9 @@ class Glm4vVisionMLP(spx.Module):
         Returns:
             Array: Transformed tensor of shape (seq_len, hidden_dim).
         """
-        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+        gate_up = self.gate_up_proj(x)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act(gate) * up)
 
 
 class Glm4vVisionAttention(UnifiedAttention):
@@ -317,10 +332,9 @@ class Glm4vVisionAttention(UnifiedAttention):
     ``causal=False``: every patch attends to every other patch in its
     image (or to every patch across frames in a video, after temporal
     flattening). Three Q/K/V projections are fused into one
-    ``ColumnParallelLinear`` of width ``3 * hidden_size`` (``use_fused_qkv=True``),
-    and grouped-query attention is disabled (``use_gqa=False``) — the
-    encoder is small enough that the GQA cost / quality trade-off is not
-    worthwhile.
+    ``ColumnParallelLinear`` of width ``3 * hidden_size``. Grouped-query
+    attention is disabled (``use_gqa=False``) — the encoder is small enough
+    that the GQA cost / quality trade-off is not worthwhile.
 
     Position information enters via 2-D rotary embeddings (one frequency
     set for the spatial-y axis, another for the spatial-x axis) computed
@@ -361,7 +375,6 @@ class Glm4vVisionAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=False,
-            use_fused_qkv=True,
             use_gqa=False,
         )
 
@@ -619,23 +632,15 @@ class Glm4vVisionPatchMerger(spx.Module):
         self.norm = LayerNorm(dim, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.act1 = jax.nn.gelu
         self.act = ACT2FN[hidden_act]
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = ColumnParallelLinear(
             dim,
-            context_dim,
+            (context_dim, context_dim),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.up_proj = ColumnParallelLinear(
-            dim,
-            context_dim,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            layout=dense_gate_up_layout(context_dim),
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -646,15 +651,20 @@ class Glm4vVisionPatchMerger(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.reform_param = {
+
+    @property
+    def reform_param(self):
+        return {
             "post_projection_norm": {
                 "splits": [
                     {
                         "name": "norm",
                         "spliter": lambda x: x,
                     }
-                ]
-            }
+                ],
+                "inverse_spliter": lambda x: x,
+            },
+            **self.gate_up_proj.build_reform_param("gate_up_proj"),
         }
 
     def forward(self, hidden_state: Array) -> Array:
@@ -673,7 +683,9 @@ class Glm4vVisionPatchMerger(spx.Module):
             partition_manager=self.partition_manager,
         )
         hidden_state = self.act1(self.norm(hidden_state))
-        hidden_state = self.down_proj(self.act(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        gate_up = self.gate_up_proj(hidden_state)
+        gate, up = split_interleaved_pair_last_axis(gate_up)
+        hidden_state = self.down_proj(self.act(gate) * up)
         hidden_state = apply_logical_sharding(
             hidden_state,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -750,16 +762,6 @@ class Glm4vVisionModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
         self.num_grid_per_side = int(math.sqrt(num_positions))
-        self.reform_param = {
-            "embeddings.position_embedding": {
-                "splits": [
-                    {
-                        "name": "pos_embed",
-                        "spliter": lambda x: x,
-                    }
-                ]
-            }
-        }
 
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = (head_dim // 2) // 2
@@ -797,6 +799,20 @@ class Glm4vVisionModel(EasyDeLBaseModule):
             partition_manager=config.runtime_sharding_resolver,
             rngs=rngs,
         )
+
+    @property
+    def reform_param(self):
+        return {
+            "embeddings.position_embedding": {
+                "splits": [
+                    {
+                        "name": "pos_embed",
+                        "spliter": lambda x: x,
+                    }
+                ],
+                "inverse_spliter": lambda x: x,
+            }
+        }
 
     def get_dtype(self) -> jnp.dtype:
         """Get the data type of the model's position embeddings.
@@ -1931,7 +1947,7 @@ class Glm4vModel(EasyDeLBaseModule):
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
-                placeholder_token_id=self.config.image_token_id,
+                placeholder_token_id=self.config.video_token_id,
             )
 
         return inputs_embeds

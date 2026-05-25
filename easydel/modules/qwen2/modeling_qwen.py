@@ -29,8 +29,6 @@ Exposes :class:`Qwen2Model` (transformer trunk) and the task wrappers
 the embedding-only :class:`Qwen2ForEmbedding`.
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -57,7 +55,14 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    build_fused_gate_up_projection,
+    dense_qkv_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseEmbeddingModule, BaseSequenceClassificationModule
@@ -95,8 +100,9 @@ class Qwen2MLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -104,32 +110,34 @@ class Qwen2MLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.gate_up_proj = build_fused_gate_up_projection(
+            config=config,
+            intermediate_size=config.intermediate_size,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint-reform rules for the fused gate-up projection.
+
+        Forwards to :meth:`ColumnParallelLinear.build_reform_param` so that
+        upstream checkpoints carrying separate ``gate_proj`` / ``up_proj``
+        tensors can be loaded into Qwen2's fused ``gate_up_proj`` layout
+        without manual remapping.
+
+        Returns:
+            dict: Mapping from upstream parameter prefixes to the fused
+            ``gate_up_proj`` parameter slot for this MLP, consumable by
+            EasyDeL's HF-to-EasyDeL conversion pipeline.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -147,8 +155,9 @@ class Qwen2MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = self.dropout(hidden_states)
         hidden_states = apply_logical_sharding(
@@ -205,8 +214,48 @@ class Qwen2Attention(UnifiedAttention):
             ),
         )
 
+    def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Build the fused QKV projection with Qwen2's configured Q/K/V bias.
+
+        Constructs a single :class:`ColumnParallelLinear` that produces the
+        concatenated Q, K and V outputs in one matmul, sized via
+        :func:`dense_qkv_layout` so the GQA segment widths
+        (``num_attention_heads * head_dim`` for Q,
+        ``num_key_value_heads * head_dim`` each for K and V) line up with
+        the downstream split. The bias toggle follows
+        ``config.attention_bias`` (default ``True`` for Qwen2).
+
+        Args:
+            config: Qwen2 configuration providing head counts, hidden size,
+                initializer range, and the attention-bias flag.
+            dtype: Compute dtype for the projection.
+            param_dtype: Storage dtype for the kernel and optional bias.
+            precision: JAX precision passed through to the matmul.
+            rngs: Random number generators used for parameter init.
+
+        Returns:
+            ColumnParallelLinear: Fused QKV projection with the
+            ``dense_qkv_layout`` attached so the result can be split into
+            Q/K/V via the layout's segment sizes.
+        """
+        qkv_layout = dense_qkv_layout(
+            config.num_attention_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
+        )
+        return ColumnParallelLinear(
+            config.hidden_size,
+            qkv_layout.segment_sizes,
+            rngs=rngs,
+            use_bias=bool(getattr(config, "attention_bias", True)),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            layout=qkv_layout,
+        )
+
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the query projection with the Qwen2 always-on bias.
+        """Build the query projection with Qwen2's configured bias.
 
         Qwen2 attaches a learned bias to every QKV projection (in
         contrast to Llama, which omits it). This override wires that
@@ -222,7 +271,7 @@ class Qwen2Attention(UnifiedAttention):
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
-            use_bias=True,
+            use_bias=bool(getattr(config, "attention_bias", True)),
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -230,7 +279,7 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the key projection with the Qwen2 always-on bias.
+        """Build the key projection with Qwen2's configured bias.
 
         Output dim follows GQA: ``num_key_value_heads * head_dim``.
 
@@ -241,7 +290,7 @@ class Qwen2Attention(UnifiedAttention):
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
-            use_bias=True,
+            use_bias=bool(getattr(config, "attention_bias", True)),
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -249,7 +298,7 @@ class Qwen2Attention(UnifiedAttention):
         )
 
     def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Build the value projection with the Qwen2 always-on bias.
+        """Build the value projection with Qwen2's configured bias.
 
         Returns:
             ColumnParallelLinear: V projection mapping
@@ -259,7 +308,7 @@ class Qwen2Attention(UnifiedAttention):
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
-            use_bias=True,
+            use_bias=bool(getattr(config, "attention_bias", True)),
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),

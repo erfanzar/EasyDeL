@@ -30,8 +30,6 @@ Exposes :class:`SeedOssModel` (transformer trunk) and the task wrapper
 
 from __future__ import annotations
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -59,7 +57,14 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -109,8 +114,20 @@ class SeedOssMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        column_parallel = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.mlp_bias,
@@ -118,21 +135,16 @@ class SeedOssMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_parallel(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.up_proj = column_parallel(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.down_proj = row_parallel(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param(
+            "gate_up_proj",
+            config=self.config,
+            include_bias=self.config.mlp_bias,
+        )
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -150,8 +162,9 @@ class SeedOssMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.gate_proj(hidden_states), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(gate, "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(self.act_fn(gate) * up), "mlp_down")
         hidden_states = self.dropout(hidden_states)
         hidden_states = apply_logical_sharding(
@@ -211,6 +224,7 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=self.sliding_window,
         )
 
     def _create_o_proj(
@@ -386,6 +400,7 @@ class SeedOssDecoderLayer(spx.Module):
         )
 
 
+@register_module(TaskType.BASE_MODULE, config=SeedOssConfig, model_type="seed_oss")
 class SeedOssModel(EasyDeLBaseModule):
     """Base Seed OSS transformer model without task-specific heads.
 

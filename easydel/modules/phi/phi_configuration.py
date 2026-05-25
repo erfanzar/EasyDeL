@@ -26,9 +26,30 @@ from easydel.infra.factory import register_config
 
 @register_config("phi")
 class PhiConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for Microsoft's Phi-1/Phi-2 small-language-model family.
+
+    Phi predates Phi-3 and keeps a couple of pre-modern design choices
+    that this config makes explicit:
+
+    * **Partial rotary embeddings** via ``partial_rotary_factor`` (default
+      ``0.5``) — only the first fraction of each head dimension is
+      rotated by RoPE; the remainder uses plain (non-rotated) dot-product
+      attention. This reduces the RoPE compute slightly while preserving
+      positional sensitivity.
+    * **LayerNorm with bias** (rather than RMSNorm) on the full hidden
+      size, plus **biased linear layers** throughout attention and MLP
+      (``attention_bias=True`` is set at runtime by the modeling code).
+    * **Optional QK LayerNorm** (``qk_layernorm``) for training stability
+      in larger Phi variants.
+    * **Two-layer dense FFN** (``fc1 -> activation -> fc2``) with
+      configurable ``hidden_act`` (default ``"gelu_new"``), and a
+      *parallel* attention/MLP residual: both sublayers consume the same
+      pre-norm input and their outputs are summed into the residual
+      stream together.
+
+    Inherits from :class:`EasyDeLBaseConfig`; see that class for the full
+    list of cross-cutting EasyDeL knobs (sharding, gradient
+    checkpointing, scan-MLP, etc.).
 
     Args:
         vocab_size (`int`, *optional*, defaults to 51200):

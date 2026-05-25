@@ -40,7 +40,7 @@ logger = get_logger(__name__)
 
 @register_config("siglip_text_model")
 class SiglipTextConfig(EasyDeLBaseConfig):
-    r"""
+    r"""Configuration for the SigLIP text encoder transformer.
 
     Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read the
     documentation from [`EasyDeLBaseConfig`] for more information.
@@ -141,7 +141,8 @@ class SiglipTextConfig(EasyDeLBaseConfig):
 
 @register_config("siglip_vision_model")
 class SiglipVisionConfig(EasyDeLBaseConfig):
-    r"""
+    r"""Configuration for the SigLIP vision encoder (Vision Transformer).
+
     Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read the
     documentation from [`EasyDeLBaseConfig`] for more information.
 
@@ -209,7 +210,8 @@ class SiglipVisionConfig(EasyDeLBaseConfig):
 
 @register_config("siglip")
 class SiglipConfig(EasyDeLBaseConfig):
-    r"""
+    r"""Composite configuration combining SigLIP text and vision encoders.
+
     [`SiglipConfig`] is the configuration class to store the configuration of a [`SiglipModel`]. It is used to
     instantiate a Siglip model according to the specified arguments, defining the text model and vision model configs.
     Instantiating a configuration with the defaults will yield a similar configuration to that of the Siglip

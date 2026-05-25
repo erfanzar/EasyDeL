@@ -28,8 +28,6 @@ Exports:
     - ``Olmo3ForSequenceClassification``: classification head wrapper.
 """
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -57,7 +55,14 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -103,8 +108,9 @@ class Olmo3MLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -112,31 +118,30 @@ class Olmo3MLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Reform-param rules for the fused gate/up projection.
+
+        Returns:
+            dict: Checkpoint reform rules that split the fused
+            ``gate_up_proj`` kernel back into the conventional
+            ``gate_proj`` / ``up_proj`` tensor names expected by
+            upstream OLMo-3 checkpoints.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -167,8 +172,9 @@ class Olmo3MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,

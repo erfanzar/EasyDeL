@@ -61,7 +61,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -80,6 +80,7 @@ class InternLM2Attention(UnifiedAttention):
         "output_projection": "wo",
         "query_key_value_projection": "wqkv",
     }
+    fused_qkv_layout: ClassVar = "gqa_grouped"
 
     def __init__(
         self,
@@ -110,7 +111,6 @@ class InternLM2Attention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            use_fused_qkv=True,
             use_gqa=True,
         )
 
@@ -129,15 +129,20 @@ class InternLM2Attention(UnifiedAttention):
             ColumnParallelLinear: Combined Q/K/V projection with output size
             ``(num_attention_heads + 2 * num_key_value_heads) * head_dim``.
         """
+        qkv_layout = dense_qkv_layout(
+            config.num_attention_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
+        )
         return ColumnParallelLinear(
             config.hidden_size,
-            (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim,
+            qkv_layout.segment_sizes,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.bias,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
+            layout=qkv_layout,
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):

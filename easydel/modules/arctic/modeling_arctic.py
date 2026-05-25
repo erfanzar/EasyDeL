@@ -36,7 +36,6 @@ Exports:
   registration.
 """
 
-import typing
 from functools import partial
 
 import jax
@@ -76,6 +75,7 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RMSNorm,
     RowParallelMoELinear,
+    moe_gate_up_fusion_reform_param,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -269,22 +269,6 @@ class ArcticMLPMoE(spx.Module):
     ``w1`` / ``w3`` / ``w2`` on load and reassembled on save.
     """
 
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {"name": "w1.weight", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "w3.weight", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "w2.weight", "spliter": lambda x: x},
-            ],
-            "inverse_spliter": lambda x: x,
-        },
-    }
-
     def __init__(
         self,
         config: ArcticConfig,
@@ -315,22 +299,10 @@ class ArcticMLPMoE(spx.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size if not self.is_residual_mlp else self.hidden_dim
 
-        self.w1 = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=self.hidden_dim,
-            out_features=self.ffn_dim,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            rngs=rngs,
-        )
-        self.w3 = ColumnParallelMoELinear(
-            num_experts=config.num_local_experts,
-            in_features=self.hidden_dim,
-            out_features=self.ffn_dim,
+            out_features=2 * self.ffn_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -352,6 +324,15 @@ class ArcticMLPMoE(spx.Module):
             rngs=rngs,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return moe_gate_up_fusion_reform_param(
+            config=self.config,
+            target_prefix="gate_up_proj",
+            gate_prefix="w1",
+            up_prefix="w3",
+        )
 
     def forward(
         self,
@@ -375,13 +356,10 @@ class ArcticMLPMoE(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = jnp.split(gate_up, 2, axis=-1)
         return apply_logical_sharding(
-            self.w2(
-                self.act_fn(self.w1(hidden_states, group_sizes, sorted_experts))
-                * self.w3(hidden_states, group_sizes, sorted_experts),
-                group_sizes,
-                sorted_experts,
-            ),
+            self.w2(self.act_fn(gate) * up, group_sizes, sorted_experts),
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
@@ -582,8 +560,7 @@ class ArcticMoeBlock(BaseMoeModule):
                 hidden_state=hidden_states,
                 gate_layer=self.gate,
                 expert_layer=self.experts,
-                wi_kernel=self.experts.w1.weight.value,
-                wu_kernel=self.experts.w3.weight.value,
+                gate_up_kernel=self.experts.gate_up_proj.weight.value,
                 wd_kernel=self.experts.w2.weight.value,
                 act_fn=self.experts.act_fn,
             )

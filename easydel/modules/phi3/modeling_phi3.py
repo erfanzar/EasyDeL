@@ -95,32 +95,24 @@ class Phi3MLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.gate_up_proj = column_parallel_linear(
+        self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
             2 * config.intermediate_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
             rngs=rngs,
         )
-        self.down_proj = row_parallel_linear(
+        self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
             rngs=rngs,
         )
         self.activation_fn = ACT2FN[self.config.hidden_act]

@@ -27,9 +27,6 @@ Components:
   wraps it with an LM head and the load-balancing auxiliary loss.
 """
 
-import typing
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -67,6 +64,10 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
@@ -81,31 +82,6 @@ class Qwen3MoeMLPStack(spx.Module):
     Implements the expert MLP stack with SwiGLU activation function using
     column and row parallel MoE linear layers for efficient expert computation.
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -132,10 +108,10 @@ class Qwen3MoeMLPStack(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -156,19 +132,14 @@ class Qwen3MoeMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -186,12 +157,9 @@ class Qwen3MoeMLPStack(spx.Module):
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim] after MoE MLP processing.
         """
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-            * self.up_proj(hidden_states, group_sizes, sorted_experts),
-            group_sizes,
-            sorted_experts,
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen3MoeMLP(spx.Module):
@@ -229,8 +197,20 @@ class Qwen3MoeMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (intermediate_size, intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -238,19 +218,20 @@ class Qwen3MoeMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
-        self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size, rngs=rngs)
-        self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Return checkpoint-reform rules for the fused ``gate_up_proj`` kernel.
+
+        Delegates to :meth:`ColumnParallelLinear.build_reform_param` so HF
+        checkpoints carrying separate ``gate_proj`` / ``up_proj`` tensors can be
+        re-formed into the EasyDeL fused layout used by this dense MLP path.
+
+        Returns:
+            dict: Reform-rule mapping consumable by the checkpoint loader.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
@@ -266,8 +247,9 @@ class Qwen3MoeMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -353,8 +335,7 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -931,7 +912,7 @@ class Qwen3MoeForCausalLM(BaseCausalLMModule[Qwen3MoeModel, Qwen3MoeConfig]):  #
             top_k=self.config.num_experts_per_tok,
             attention_mask=attention_mask,
         )
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        return aux_loss * self.config.router_aux_loss_coef
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen3MoeConfig, model_type="qwen3_moe")

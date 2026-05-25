@@ -40,7 +40,7 @@ Exports:
 """
 
 import typing as tp
-from functools import cached_property, partial
+from functools import cached_property
 
 import jax
 import jax.numpy as jnp
@@ -73,7 +73,13 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms._norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
@@ -86,16 +92,25 @@ logger = get_logger(__name__)
 
 @auto_pytree
 class Gemma3ModelOutputWithPast(ModelOutput):
-    r"""
-    past_key_values (`tuple(tuple(Array))`):
-        Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
-        `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
+    """Outputs for the Gemma 3 multimodal backbone forward pass.
 
-        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-        `past_key_values` input) to speed up sequential decoding.
-    image_hidden_states (`Array`, *optional*):
-        A `Array` of size `(batch_size, num_images, sequence_length, hidden_size)`.
-        image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
+    Returned by :class:`Gemma3Model.forward` to bundle the final text hidden
+    state, the projected image features, the (possibly updated) KV cache, and
+    optional per-layer hidden states / attention weights.
+
+    Attributes:
+        last_hidden_state: Final hidden states of shape ``(batch, seq_len,
+            hidden_size)`` after the text decoder's final RMSNorm.
+        image_hidden_states: Projected vision features of shape
+            ``(batch, mm_tokens_per_image, hidden_size)`` after
+            :class:`Gemma3MultiModalProjector`, or ``None`` when no
+            ``pixel_values`` were provided.
+        past_key_values: Updated cache returned by the language model; carries
+            both sliding and full KV views per layer.
+        hidden_states: Optional tuple of per-layer hidden states, populated
+            when ``output_hidden_states=True``.
+        attentions: Optional tuple of per-layer attention weights, populated
+            when ``output_attentions=True``.
     """
 
     last_hidden_state: Array | None = None
@@ -107,36 +122,31 @@ class Gemma3ModelOutputWithPast(ModelOutput):
 
 @auto_pytree
 class Gemma3CausalLMOutputWithPast(ModelOutput):
-    """
-    Base class for Gemma3 causal language model (or autoregressive) outputs.
+    """Outputs for the Gemma 3 multimodal causal LM forward pass.
 
-    Args:
-        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss (for next-token prediction).
-        logits (`Array` of shape `(batch_size, sequence_length, config.get_text_config().vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(Array))`):
-            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
-            `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
+    Returned by the vision-language wrappers (e.g.
+    :class:`Gemma3ForConditionalGeneration`) when they need to surface both
+    the LM logits and the projected vision features alongside the standard
+    causal-LM outputs.
 
-            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-            `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or
-            when `config.output_hidden_states=True`):
-            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed
-            or when `config.output_attentions=True`):
-            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-        image_hidden_states (`Array`, *optional*):
-            A `Array` of size `(batch_size, sequence_length, hidden_size)`.
-            image_hidden_states of the model produced by the vision encoder after projecting last hidden state.
+    Attributes:
+        loss: Optional next-token-prediction loss of shape ``(1,)`` populated
+            when ``labels`` are supplied.
+        logits: Vocabulary logits of shape ``(batch, seq_len,
+            text_config.vocab_size)``, possibly tanh-softcapped by
+            ``final_logit_softcapping``.
+        last_hidden_state: Final pre-LM-head hidden states of shape
+            ``(batch, seq_len, hidden_size)``.
+        past_key_values: Updated hybrid KV cache returned by the language
+            model.
+        hidden_states: Optional tuple of per-layer hidden states when
+            ``output_hidden_states=True``.
+        attentions: Optional tuple of per-layer attention weights when
+            ``output_attentions=True``.
+        image_hidden_states: Projected vision features of shape
+            ``(batch, mm_tokens_per_image, hidden_size)`` produced by
+            :class:`Gemma3MultiModalProjector`, or ``None`` when no
+            ``pixel_values`` were provided.
     """
 
     loss: Array | None = None
@@ -287,15 +297,55 @@ class Gemma3Attention(UnifiedAttention):
         self.causal = causal
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
-        """Override to use Gemma3RMSNorm instead of standard RMSNorm."""
+        """Build the per-head query normalization layer.
+
+        Uses :class:`Gemma3RMSNorm` sized to ``head_dim`` so the normalization
+        runs over the per-head channel axis (instead of the full hidden dim
+        used elsewhere in the decoder).
+
+        Args:
+            config: Gemma3 text config (read for ``rms_norm_eps``).
+            dtype: Compute dtype (unused; kept for API parity).
+            param_dtype: Parameter dtype for the learnable scale.
+            rngs: Random number generator state (unused; the bound scale is
+                initialised deterministically to ones).
+
+        Returns:
+            Gemma3RMSNorm: Per-head query normalization.
+        """
         return Gemma3RMSNorm(config, param_dtype=param_dtype, dim=self.head_dim)
 
     def _create_k_norm(self, config, dtype, param_dtype, rngs):
-        """Override to use Gemma3RMSNorm instead of standard RMSNorm."""
+        """Build the per-head key normalization layer.
+
+        Mirror of :meth:`_create_q_norm` for the key tensor; same per-head
+        :class:`Gemma3RMSNorm` over ``head_dim``.
+
+        Args:
+            config: Gemma3 text config.
+            dtype: Compute dtype (unused).
+            param_dtype: Parameter dtype for the learnable scale.
+            rngs: Random number generator state (unused).
+
+        Returns:
+            Gemma3RMSNorm: Per-head key normalization.
+        """
         return Gemma3RMSNorm(config, param_dtype=param_dtype, dim=self.head_dim)
 
     def _create_attention_performer(self, config, rngs):
-        """Override to use custom softmax scale with query_pre_attn_scalar."""
+        """Build the flexible attention performer with Gemma3's custom temperature.
+
+        Replaces the default ``1/sqrt(head_dim)`` softmax scale with
+        ``1/sqrt(config.query_pre_attn_scalar)``, matching Gemma2/3's
+        decoupled-temperature recipe, and wires through ``attention_dropout``.
+
+        Args:
+            config: Source ``Gemma3TextConfig``.
+            rngs: Random number generator state for the attention dropout.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention backend.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -363,12 +413,24 @@ class Gemma3MLP(spx.Module):
 
         embed_dim = self.config.hidden_size
         inner_dim = self.config.intermediate_size if self.config.intermediate_size is not None else 4 * embed_dim
-        kernel_init = jax.jax.nn.initializers.normal(config.initializer_range)
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
         self.act = ACT2FN[self.config.hidden_activation]
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            embed_dim,
+            (inner_dim, inner_dim),
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+            layout=dense_gate_up_layout(inner_dim),
+        )
+        self.down_proj = RowParallelLinear(
+            inner_dim,
+            embed_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -376,18 +438,17 @@ class Gemma3MLP(spx.Module):
             kernel_init=kernel_init,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel_init,
-            rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(embed_dim, inner_dim)
-        self.down_proj = row_parallel_linear(inner_dim, embed_dim)
-        self.up_proj = column_parallel_linear(embed_dim, inner_dim)
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Returns:
+            dict: HuggingFace -> EasyDeL remapping rules so that the unfused
+            ``gate_proj`` / ``up_proj`` weights from upstream checkpoints are
+            restaged into the fused ``gate_up_proj`` linear.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -407,8 +468,9 @@ class Gemma3MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -625,7 +687,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             self.embed_tokens = Embed(
                 self.config.vocab_size,
                 self.hidden_size,
-                embedding_init=jax.jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
                 dtype=dtype,
                 param_dtype=param_dtype,
                 rngs=rngs,
@@ -854,28 +916,35 @@ class Gemma3TextModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma3's text model is decoder-only.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder sub-module (``self`` for a decoder-only stack).
+
+        Returns:
+            Gemma3TextModel: This module.
         """
         return self
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: The bare backbone carries no LM head; see
+                :class:`Gemma3ForCausalLM`.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table.
         """
         return self.embed_tokens
 
@@ -1011,9 +1080,10 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma3's text model is decoder-only.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
@@ -1038,7 +1108,22 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
         return lm_logits
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Gemma-3 soft-capping."""
+        """Build a trace-safe LM-head projection with Gemma-3 soft-capping.
+
+        Wraps the base trace-safe projection used by the remat bypass on the
+        LM head for very large vocabs and post-composes the
+        ``cap * tanh(logits / cap)`` softcap when
+        ``config.final_logit_softcapping`` is set. Without softcapping the
+        base function is returned unchanged.
+
+        Args:
+            vocab_shard_stage: Optional pipeline-stage hint propagated to the
+                base projection helper.
+
+        Returns:
+            Callable[[Array], Array]: Function mapping hidden states of shape
+            ``[B, T, H]`` to logits of shape ``[B, T, V]``.
+        """
         base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
         cap_value = self.config.final_logit_softcapping
         if cap_value is None:
@@ -1058,21 +1143,28 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
         return _project
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder backbone.
+
+        Returns:
+            Gemma3TextModel: The underlying decoder backbone (forwards to
+            :meth:`Gemma3TextModel.get_decoder`).
         """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the language modeling head.
+
+        Returns:
+            ParallelLinear: The unembedding projection (tied to ``embed_tokens``
+            when ``config.tie_word_embeddings`` is set).
         """
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the text backbone.
         """
         return self.model.get_embedding()
 
@@ -1208,32 +1300,45 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
+        """Return the encoder sub-module.
+
+        Raises:
+            NotImplementedError: Gemma3's text model is decoder-only.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder backbone.
+
+        Returns:
+            Gemma3TextModel: The underlying decoder backbone.
         """
         return self.model
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
+        """Return the LM head.
+
+        Returns:
+            ParallelLinear: The unembedding projection inherited from the
+            classification base module.
         """
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the text backbone.
         """
         return self.model.get_embedding()
 
     def get_task_head(self):
-        """Returns the sequence classification head."""
+        """Return the linear classification (score) head.
+
+        Returns:
+            ParallelLinear: The ``(hidden_size, num_labels)`` projection used
+            for pooled classification logits.
+        """
         return self.score
 
 
@@ -1688,29 +1793,37 @@ class Gemma3Model(EasyDeLBaseModule):
         return model_kwargs
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Gemma3 is a multi-modal model with a vision tower, but for typical LLM usage,
-        it's considered a decoder-only architecture.
+        """Return the vision tower (used as the "encoder" for the VLM).
+
+        Returns:
+            spx.Module: The SigLIP-style vision tower mounted at
+            ``self.vision_tower``.
         """
         return self.vision_tower
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the text decoder backbone.
+
+        Returns:
+            Gemma3TextModel: The decoder returned by the language model's
+            :meth:`Gemma3TextModel.get_decoder`.
         """
         return self.language_model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+        """Return the LM head.
+
+        Raises:
+            NotImplementedError: The bare multimodal backbone carries no LM
+                head; see :class:`Gemma3ForConditionalGeneration`.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Return the text token embedding layer.
+
+        Returns:
+            Embed: The ``embed_tokens`` lookup table of the language model.
         """
         return self.language_model.get_embedding()
 
@@ -1916,7 +2029,22 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         return lm_logits
 
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
-        """Trace-safe projection with Gemma-3 VLM soft-capping (bypasses nn.remat)."""
+        """Build a trace-safe VLM LM-head projection with Gemma-3 soft-capping.
+
+        Bypasses ``nn.remat`` on the LM head by routing through
+        ``self.lm_head.native_forward`` (safe under tracing), applies the
+        shared ``apply_logit_cap`` post-processing, then layers the
+        ``text_config.final_logit_softcapping`` tanh-softcap on top when
+        configured.
+
+        Args:
+            vocab_shard_stage: Unused; accepted for API parity with the base
+                helper.
+
+        Returns:
+            Callable[[Array], Array]: A function mapping hidden states of
+            shape ``[B, T, H]`` to logits of shape ``[B, T, V]``.
+        """
         _native = self.lm_head.native_forward
         cap_value = self.config.get_text_config().final_logit_softcapping
         _cap = self.apply_logit_cap
@@ -1960,13 +2088,27 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def get_vision_tower(self) -> spx.Module:
-        """Returns the vision tower component."""
+        """Return the SigLIP vision tower component.
+
+        Returns:
+            spx.Module: The ``vision_tower`` sub-module of the base model.
+        """
         return self.base_model.vision_tower
 
     def get_projector(self) -> spx.Module:
-        """Returns the multimodal projector component."""
+        """Return the multimodal vision-to-text projector.
+
+        Returns:
+            spx.Module: The :class:`Gemma3MultiModalProjector` instance held
+            by the base model.
+        """
         return self.base_model.multi_modal_projector
 
     def get_language_model(self) -> spx.Module:
-        """Returns the language model component."""
+        """Return the text decoder language model component.
+
+        Returns:
+            spx.Module: The :class:`Gemma3TextModel` instance held by the
+            base model.
+        """
         return self.base_model.language_model

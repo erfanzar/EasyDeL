@@ -45,7 +45,6 @@ Public model classes (registered with the factory):
 """
 
 import functools
-import typing
 from typing import ClassVar
 
 import jax
@@ -87,6 +86,9 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    moe_gate_up_fusion_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.rotary import yarn_get_mscale
@@ -106,22 +108,6 @@ class DeepseekV2MLPMoE(spx.Module):
     ``group_sizes`` and the sorted-expert indices arrive with the call.
     Intermediate width is ``config.moe_intermediate_size``.
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {"name": "gate_proj.weight", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "up_proj.weight", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x},
-            ],
-            "inverse_spliter": lambda x: x,
-        },
-    }
 
     def __init__(
         self,
@@ -151,22 +137,10 @@ class DeepseekV2MLPMoE(spx.Module):
 
         imz = intermediate_size or config.intermediate_size
         hs = hidden_size or config.hidden_size
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=hs,
-            out_features=imz,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            rngs=rngs,
-        )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.n_routed_experts,
-            in_features=hs,
-            out_features=imz,
+            out_features=2 * imz,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -188,6 +162,32 @@ class DeepseekV2MLPMoE(spx.Module):
             rngs=rngs,
         )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the per-expert fused gate/up projection.
+
+        Composes :func:`moe_gate_up_fusion_reform_param` (which handles the
+        fused gate/up MoE kernel) with an identity rule for the down
+        projection so HF-style per-expert weight names map cleanly onto the
+        :class:`ColumnParallelMoELinear` / :class:`RowParallelMoELinear`
+        layout used here.
+
+        Returns:
+            dict: Reform-param mapping consumed by the checkpoint loader.
+        """
+        reform_param = moe_gate_up_fusion_reform_param(config=self.config)
+        reform_param.update(
+            {
+                "down_proj$": {
+                    "splits": [
+                        {"name": "down_proj.weight", "spliter": lambda x: x},
+                    ],
+                    "inverse_spliter": lambda x: x,
+                },
+            }
+        )
+        return reform_param
 
     def forward(
         self,
@@ -211,18 +211,10 @@ class DeepseekV2MLPMoE(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states, group_sizes, sorted_experts), name="mlp_gate_up")
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         return apply_logical_sharding(
-            checkpoint_name(
-                self.down_proj(
-                    self.act_fn(
-                        checkpoint_name(self.gate_proj(hidden_states, group_sizes, sorted_experts), name="mlp_gate")
-                    )
-                    * checkpoint_name(self.up_proj(hidden_states, group_sizes, sorted_experts), name="mlp_up"),
-                    group_sizes,
-                    sorted_experts,
-                ),
-                name="mlp_down",
-            ),
+            checkpoint_name(self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts), name="mlp_down"),
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
@@ -264,20 +256,44 @@ class DeepseekV2MLP(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        linear = functools.partial(
-            ColumnParallelLinear,
+        imz = intermediate_size or config.intermediate_size
+        hs = hidden_size or config.hidden_size
+        self.gate_up_proj = ColumnParallelLinear(
+            hs,
+            (imz, imz),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(),
+            rngs=rngs,
+            layout=dense_gate_up_layout(imz),
         )
-        imz = intermediate_size or config.intermediate_size
-        hs = hidden_size or config.hidden_size
-        self.gate_proj = linear(hs, imz, rngs=rngs)
-        self.up_proj = linear(hs, imz, rngs=rngs)
-        self.down_proj = linear(imz, hs, rngs=rngs)
+        self.down_proj = RowParallelLinear(
+            imz,
+            hs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=jax.nn.initializers.normal(),
+            rngs=rngs,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate/up projection.
+
+        Builds the per-projection rename/split table that lets HF-style
+        checkpoints with separate ``gate_proj`` and ``up_proj`` weights load
+        into this module's fused :class:`ColumnParallelLinear`.
+
+        Returns:
+            dict: Reform-param mapping produced by
+            :meth:`ColumnParallelLinear.build_reform_param`.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -296,8 +312,9 @@ class DeepseekV2MLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        gate = self.act_fn(checkpoint_name(self.gate_proj(hidden_states), name="mlp_gate"))
-        up = checkpoint_name(self.up_proj(hidden_states), name="mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = self.act_fn(checkpoint_name(gate_raw, name="mlp_gate"))
         hidden_states = checkpoint_name(self.down_proj(gate * up), name="mlp_down")
 
         hidden_states = apply_logical_sharding(
@@ -592,8 +609,7 @@ class DeepseekV2MoE(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -1427,7 +1443,7 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             top_k=self.config.num_experts_per_tok,
             attention_mask=attention_mask,
         )
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        return aux_loss * self.config.router_aux_loss_coef
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA attention.

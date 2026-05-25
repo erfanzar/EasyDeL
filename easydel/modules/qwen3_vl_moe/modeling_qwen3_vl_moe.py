@@ -27,7 +27,7 @@ contributes a load-balancing auxiliary loss when training.
 
 import math
 import typing
-from functools import cached_property, partial
+from functools import cached_property
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +70,10 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -186,7 +190,7 @@ def get_rope_index(
         attention_mask = attention_mask[:, : input_ids.shape[-1]]
 
     batch_size, seq_length = input_ids.shape[:2]
-    position_ids = np.ones((3, batch_size, seq_length), dtype=np.int32)
+    position_ids = np.zeros((3, batch_size, seq_length), dtype=np.int32)
     mrope_position_deltas: list[int] = []
     image_index, video_index = 0, 0
 
@@ -696,7 +700,6 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=False,
-            use_fused_qkv=True,
             use_gqa=False,
         )
 
@@ -1256,8 +1259,20 @@ class Qwen3VLMoeTextMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        column_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -1265,20 +1280,20 @@ class Qwen3VLMoeTextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.up_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate-up projection.
+
+        Returns:
+            dict: Mapping from external ``gate_up_proj`` checkpoint
+            entries to the layout used internally by the fused
+            :attr:`gate_up_proj` ColumnParallelLinear, allowing
+            HuggingFace-style separate gate / up weights to be merged
+            into the fused layout used here (and back again).
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
@@ -1294,8 +1309,9 @@ class Qwen3VLMoeTextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1311,31 +1327,6 @@ class Qwen3VLMoeMLPStack(spx.Module):
     Implements the expert MLP stack for Mixture of Experts, where each expert
     is a SwiGLU MLP that processes tokens routed to it.
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -1360,10 +1351,10 @@ class Qwen3VLMoeMLPStack(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -1384,19 +1375,14 @@ class Qwen3VLMoeMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -1428,12 +1414,9 @@ class Qwen3VLMoeMLPStack(spx.Module):
             ``(num_dispatched_tokens, hidden_size)`` ready to be
             scattered back to their source token positions.
         """
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-            * self.up_proj(hidden_states, group_sizes, sorted_experts),
-            group_sizes,
-            sorted_experts,
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
@@ -1519,8 +1502,7 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )

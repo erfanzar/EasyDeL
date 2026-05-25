@@ -30,9 +30,34 @@ from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 @register_config("qwen2")
 class Qwen2Config(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read
-    the documentation from [`PretrainedConfig`] for more information.
+    """Configuration for Alibaba's Qwen2 dense decoder language-model family.
+
+    Qwen2 is a LLaMA-style architecture with a couple of family-specific
+    choices that this config exposes:
+
+    * **Grouped-query attention** with ``num_key_value_heads`` decoupled
+      from ``num_attention_heads`` and **biased QKV linear layers**
+      (``attention_bias=True``) — Qwen2 keeps the bias on Q/K/V but
+      leaves the output projection bias-free.
+    * **SwiGLU MLP** (``hidden_act="silu"``) with fused
+      ``gate_up_proj`` / split ``down_proj`` linears.
+    * **RMSNorm** with epsilon ``rms_norm_eps`` and pre-norm residual.
+    * **Layer-mixed attention masks** controlled by ``use_sliding_window``
+      / ``sliding_window`` / ``max_window_layers``: layers
+      ``[max_window_layers, num_hidden_layers)`` use
+      ``"sliding_attention"`` and the earlier layers use
+      ``"full_attention"`` (when sliding is enabled). The per-layer
+      schedule is materialised into ``layer_types`` and surfaced via
+      :meth:`get_mask_details`.
+    * **Full rotary embeddings** with ``rope_theta`` and optional
+      ``rope_scaling``; the legacy ``"type"`` key is mirrored into
+      ``"rope_type"`` for compatibility with newer rotary code paths.
+    * **Extended multilingual vocab** (default 151936) and large default
+      context (32768) to match released Qwen2 checkpoints.
+
+    Inherits from :class:`EasyDeLBaseConfig`; see that class for the full
+    list of cross-cutting EasyDeL knobs (sharding, gradient
+    checkpointing, scan-MLP / scan-layers, quantization bits, etc.).
 
     Args:
         vocab_size (`int`, *optional*, defaults to 151936):
@@ -117,6 +142,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         use_sliding_window: bool = False,
         sliding_window: int | None = 4096,
         max_window_layers: int = 28,
+        attention_bias: bool = True,
         attention_dropout: float = 0.0,
         resid_pdrop: float = 0.0,
         embd_pdrop: float = 0.0,
@@ -191,6 +217,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         self.embd_pdrop = embd_pdrop
         self.number_rep_kv = number_rep_kv
         self.resid_pdrop = resid_pdrop
+        self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing

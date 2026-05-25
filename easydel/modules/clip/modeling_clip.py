@@ -67,7 +67,11 @@ from easydel.infra.modeling_outputs import (
     ImageClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers import ColumnParallelLinear, Embed
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    dense_qkv_layout,
+)
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseImageClassificationModule
@@ -338,9 +342,8 @@ class CLIPAttention(AttentionModule):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(0.01),
         )
-        self.k_proj = linear_class(self.embed_dim, self.embed_dim)
-        self.v_proj = linear_class(self.embed_dim, self.embed_dim)
-        self.q_proj = linear_class(self.embed_dim, self.embed_dim)
+        qkv_layout = dense_qkv_layout(self.embed_dim, self.embed_dim)
+        self.qkv_proj = linear_class(self.embed_dim, qkv_layout.segment_sizes, layout=qkv_layout)
         self.out_proj = linear_class(self.embed_dim, self.embed_dim)
 
         self.causal = isinstance(config, CLIPTextConfig)
@@ -351,6 +354,10 @@ class CLIPAttention(AttentionModule):
             dropout_prob=config.attention_dropout,
             requires_cache=False,  # Vision/text encoder doesn't need KV cache
         )
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     def _split_heads(self, hidden_states):
         """Split hidden states into multiple attention heads.
@@ -390,9 +397,8 @@ class CLIPAttention(AttentionModule):
         Returns:
             AttentionLayerOutput containing attention output and optional attention weights.
         """
-        query = checkpoint_name(self.q_proj(hidden_states), name="attn_query")
-        key = checkpoint_name(self.k_proj(hidden_states), name="attn_key")
-        value = checkpoint_name(self.v_proj(hidden_states), name="attn_value")
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), name="attn_qkv")
+        query, key, value = self.qkv_proj.split(qkv, config=self.config)
 
         query = self._split_heads(query)
         key = self._split_heads(key)

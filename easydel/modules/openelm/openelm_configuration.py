@@ -206,10 +206,12 @@ class OpenELMConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It allows the class to initialize the attributes of a class.
-        The self parameter is a reference to the current instance of the class,
-        and is used to access variables that belong to the class.
+        """Initialize an OpenELMConfig with model hyperparameters.
+
+        Stores raw user-supplied values on ``self`` and defers the
+        expansion of ``qkv_multipliers`` / ``ffn_multipliers`` into
+        per-layer integer schedules to :meth:`__post_init__`, which is
+        invoked unconditionally at the end of ``__init__``.
 
         Args:
             vocab_size (`int`, *optional*, defaults to 32000): Vocabulary size.
@@ -265,7 +267,6 @@ class OpenELMConfig(EasyDeLBaseConfig):
         )
         self.initializer_range = initializer_range
         self.bits = bits
-        self.initializer_range = initializer_range
         self.use_cache = use_cache
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -356,7 +357,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         else:
             raise NotImplementedError(
                 f"FFN multipliers should be a single number or a list containing exactly two numbers. "
-                f"Got: {qkv_multipliers}."
+                f"Got: {self.ffn_multipliers}."
             )
 
         # check num_query_heads divisible by num_kv_heads for every layer

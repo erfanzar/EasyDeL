@@ -30,24 +30,31 @@ import numpy as np
 try:
     from mistral_common.tokens.tokenizers.mistral import ChatCompletionRequest, MistralTokenizer, SpecialTokenPolicy  # type:ignore #noqa
 except ImportError:
-    ChatCompletionRequest, MistralTokenizer, SpecialTokenPolicy = (
-        type(None),
-        type(None),
-        type(None),
-    )
+    ChatCompletionRequest = MistralTokenizer = SpecialTokenPolicy = None
 
 
 class Mistral3Tokenizer:
-    """
-    A wrapper class to make the `mistral-common` tokenizer behave like a
-    Hugging Face `transformers` tokenizer. This is useful for maintaining a
-    consistent API in projects that might use various tokenizers.
+    """HuggingFace-style wrapper around ``mistral_common.MistralTokenizer``.
+
+    Exposes the standard ``transformers`` tokenizer surface
+    (``encode``/``decode``/``__call__``/``apply_chat_template``/batch
+    helpers) on top of Mistral AI's official ``mistral-common`` tokenizer so
+    that downstream EasyDeL code can treat Mistral-3 / Pixtral tokenization
+    interchangeably with HuggingFace tokenizers. Supports ``"left"`` /
+    ``"right"`` padding sides via :attr:`padding_side` and ``return_tensors="np"``
+    for numpy output.
 
     Attributes:
-        mistral_tokenizer: The original MistralTokenizer instance.
-        pad_token_id: The ID of the padding token.
-        eos_token_id: The ID of the end-of-sequence token.
-        bos_token_id: The ID of the beginning-of-sequence token.
+        mistral_tokenizer (MistralTokenizer): The wrapped ``mistral-common``
+            tokenizer (with chat / instruct templating capabilities).
+        tokenizer: The inner SentencePiece-style tokenizer reached via
+            ``mistral_tokenizer.instruct_tokenizer.tokenizer``.
+        pad_token_id (int | None): Padding token id (``None`` if the
+            underlying tokenizer has no pad token).
+        eos_token_id (int): End-of-sequence token id.
+        bos_token_id (int): Beginning-of-sequence token id.
+        padding_side (str): Either ``"left"`` (default) or ``"right"``,
+            controlling where pad tokens are inserted.
     """
 
     def __init__(self, mistral_tokenizer: MistralTokenizer):  # type: ignore[no-untyped-def]
@@ -71,32 +78,32 @@ class Mistral3Tokenizer:
         self.padding_side = "left"
 
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
-        """
-        Encodes a single string into a list of token IDs.
+        """Encode a single string into a list of token ids.
 
-        This method maps the `add_special_tokens` flag to the `bos` and `eos`
-        arguments of the underlying Mistral tokenizer.
+        Maps the ``add_special_tokens`` flag to both the ``bos`` and ``eos``
+        arguments of the underlying Mistral tokenizer (HuggingFace's
+        single-flag semantics are not exposed by ``mistral-common``).
 
         Args:
             text: The input text to encode.
-            add_special_tokens: Whether to add special tokens (BOS/EOS).
+            add_special_tokens: Whether to prepend BOS and append EOS.
 
         Returns:
-            A list of token IDs.
+            list[int]: The encoded token ids.
         """
         return self.tokenizer.encode(text, bos=add_special_tokens, eos=add_special_tokens)
 
     def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
-        """
-        Decodes a list of token IDs back into a string.
+        """Decode a list of token ids back into a string.
 
         Args:
-            token_ids: The list of token IDs to decode.
-            skip_special_tokens: Whether to remove special tokens from the
-                                 decoded string.
+            token_ids: Token ids to decode.
+            skip_special_tokens: When ``True``, applies the IGNORE policy so
+                special tokens are stripped from the output; when ``False``,
+                the KEEP policy preserves them verbatim.
 
         Returns:
-            The decoded text string.
+            str: The decoded text.
         """
         policy = SpecialTokenPolicy.IGNORE if skip_special_tokens else SpecialTokenPolicy.KEEP
         return self.mistral_tokenizer.decode(token_ids, policy)
@@ -112,20 +119,27 @@ class Mistral3Tokenizer:
         return_tensors: str | None = None,
         **kwargs,
     ) -> str | list[int] | dict[str, Any]:
-        """
-        Applies a chat template to a conversation history.
+        """Apply Mistral's chat template to a conversation history.
 
         Args:
-            conversation: A list of message dictionaries, each with 'role' and 'content'.
-            tokenize: If False, returns the formatted string. If True, tokenizes it.
-            add_special_tokens: Whether to add special tokens.
-            padding: Whether to pad the sequences.
-            truncation: Whether to truncate the sequences.
-            max_length: The maximum length for truncation or padding.
-            return_tensors: The tensor format for the output (e.g., 'np').
+            conversation: List of role/content message dicts describing the
+                conversation (Mistral chat schema).
+            tokenize: When ``False``, returns the formatted string;
+                when ``True``, tokenizes the formatted text via
+                :meth:`__call__`.
+            add_special_tokens: Whether to add BOS/EOS during tokenization
+                (only used when ``tokenize=True``).
+            padding: Padding behaviour forwarded to :meth:`__call__`.
+            truncation: Truncation behaviour forwarded to :meth:`__call__`.
+            max_length: Maximum length forwarded to :meth:`__call__`.
+            return_tensors: Tensor format for the tokenized output
+                (e.g. ``"np"``); ignored when ``tokenize=False``.
+            **kwargs: Extra keyword arguments forwarded to :meth:`__call__`.
 
         Returns:
-            The processed output, which can be a string, list of IDs, or a dict.
+            str | list[int] | dict[str, Any]: The templated string when
+            ``tokenize=False``; otherwise the tokenizer output dictionary
+            from :meth:`__call__`.
         """
         tokenized = self.mistral_tokenizer.encode_chat_completion(ChatCompletionRequest(messages=conversation))
         formatted_text = tokenized.text
@@ -153,26 +167,36 @@ class Mistral3Tokenizer:
         add_special_tokens: bool = True,
         **kwargs,
     ) -> dict[str, Any]:
-        """
-        Tokenizes a single text or a batch of texts, with advanced options for
-        padding and truncation, mimicking Hugging Face tokenizers.
+        """Tokenize a single text or a batch of texts.
+
+        Mimics the HuggingFace tokenizer call surface with padding and
+        truncation control.
 
         Args:
-            text: A single string or a list of strings to tokenize.
-            padding: Controls padding.
-                - `False` or `'do_not_pad'`: No padding.
-                - `True` or `'longest'`: Pad to the longest sequence in the batch.
-                - `'max_length'`: Pad to `max_length`.
-            truncation: Controls truncation.
-                - `False` or `'do_not_truncate'`: No truncation.
-                - `True` or `'longest_first'`: Truncate to `max_length`.
-            max_length: The maximum sequence length. Required for truncation
-                        and `padding='max_length'`.
-            return_tensors: If 'np', returns numpy arrays. Otherwise, returns lists.
-            add_special_tokens: Whether to add special tokens like BOS and EOS.
+            text: A single string, or a list of strings for batch tokenization.
+            padding: Padding strategy. ``False`` / ``"do_not_pad"`` disables
+                padding; ``True`` / ``"longest"`` pads to the longest sequence
+                in the batch; ``"max_length"`` pads to ``max_length``.
+            truncation: Truncation strategy. ``False`` / ``"do_not_truncate"``
+                disables truncation; ``True`` / ``"longest_first"`` truncates
+                to ``max_length``.
+            max_length: Maximum sequence length. Required when ``truncation``
+                is enabled or ``padding="max_length"``.
+            return_tensors: When ``"np"``, returns numpy arrays; otherwise
+                returns plain Python lists.
+            add_special_tokens: Whether to prepend BOS / append EOS.
+            **kwargs: Reserved for HF compatibility (currently unused).
 
         Returns:
-            A dictionary containing 'input_ids' and 'attention_mask'.
+            dict[str, Any]: A dictionary with ``"input_ids"`` and
+            ``"attention_mask"``. For a single string input with
+            ``return_tensors=None`` the leading batch dimension is squeezed
+            out; otherwise outputs are batched.
+
+        Raises:
+            ValueError: If padding is enabled without a ``pad_token_id``, if
+                ``padding="max_length"`` is requested without ``max_length``,
+                or if :attr:`padding_side` is not ``"left"`` or ``"right"``.
         """
         is_single_input = isinstance(text, str)
         batch_texts = [text] if is_single_input else text
@@ -237,23 +261,43 @@ class Mistral3Tokenizer:
         return result
 
     def batch_encode_plus(self, *args, **kwargs) -> dict[str, Any]:
-        """Alias for `__call__` for Hugging Face compatibility."""
+        """HF-compatible alias for :meth:`__call__`.
+
+        Args:
+            *args: Positional arguments forwarded to :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded to :meth:`__call__`.
+
+        Returns:
+            dict[str, Any]: Same dictionary as :meth:`__call__`.
+        """
         return self.__call__(*args, **kwargs)
 
     def encode_plus(self, *args, **kwargs) -> dict[str, Any]:
-        """Alias for `__call__` for Hugging Face compatibility."""
+        """HF-compatible alias for :meth:`__call__`.
+
+        Args:
+            *args: Positional arguments forwarded to :meth:`__call__`.
+            **kwargs: Keyword arguments forwarded to :meth:`__call__`.
+
+        Returns:
+            dict[str, Any]: Same dictionary as :meth:`__call__`.
+        """
         return self.__call__(*args, **kwargs)
 
     @classmethod
     def from_hf_hub(cls, model_name: str = "mistralai/Mistral-Nemo-Instruct-2407"):
-        """
-        Creates an instance from a model name on the Hugging Face Hub.
+        """Construct a tokenizer from a HuggingFace Hub repo id.
 
         Args:
-            model_name: The name of the Mistral model on the Hub.
+            model_name: Repository id of a Mistral model on the Hub
+                (defaults to Mistral-Nemo-Instruct-2407).
 
         Returns:
-            An instance of Mistral3Tokenizer.
+            Mistral3Tokenizer: A configured wrapper around the downloaded
+            ``mistral-common`` tokenizer.
+
+        Raises:
+            ImportError: If ``mistral-common`` is not installed.
         """
         if MistralTokenizer is None:
             raise ImportError("mistral-common is not installed. Please install it with `pip install mistral-common`.")

@@ -416,13 +416,6 @@ class WhisperEncoderLayer(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
-        )
         self.self_attn_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,
@@ -436,8 +429,24 @@ class WhisperEncoderLayer(spx.Module):
             rate=self.config.activation_dropout,
             rngs=rngs,
         )
-        self.fc1 = linear(self.embed_dim, self.config.encoder_ffn_dim, rngs=rngs)
-        self.fc2 = linear(self.config.encoder_ffn_dim, self.embed_dim, rngs=rngs)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            self.config.encoder_ffn_dim,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dtype=self.dtype,
+            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            rngs=rngs,
+        )
+        self.fc2 = ColumnParallelLinear(
+            self.config.encoder_ffn_dim,
+            self.embed_dim,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dtype=self.dtype,
+            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            rngs=rngs,
+        )
         self.final_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,

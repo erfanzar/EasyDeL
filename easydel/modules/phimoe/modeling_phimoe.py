@@ -28,8 +28,6 @@ Key components:
   wraps it with an LM head and computes the auxiliary load-balancing loss.
 """
 
-import functools
-
 import jax.lax
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -54,6 +52,7 @@ from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, Deco
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.layouts import hf_per_expert_swiglu_reform_param
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
 
@@ -91,30 +90,39 @@ class PhiMoEBlockSparseTop2MLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
         ffn_dim = config.intermediate_size
         hidden_dim = config.hidden_size
 
-        self.w1 = column_parallel_linear(hidden_dim, ffn_dim, rngs=rngs)
-        self.w2 = row_parallel_linear(ffn_dim, hidden_dim, rngs=rngs)
-        self.w3 = column_parallel_linear(hidden_dim, ffn_dim, rngs=rngs)
+        self.w1 = ColumnParallelLinear(
+            hidden_dim,
+            ffn_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.w2 = RowParallelLinear(
+            ffn_dim,
+            hidden_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.w3 = ColumnParallelLinear(
+            hidden_dim,
+            ffn_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def forward(self, hidden_states: Array) -> Array:
@@ -224,7 +232,7 @@ class PhiMoeSparseMoeBlock(spx.Module):
         self.top_k = config.num_experts_per_tok
         self.router_jitter_noise = config.router_jitter_noise
         self.input_jitter_noise = config.input_jitter_noise
-        self.gate = ColumnParallelLinear(
+        self.router = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.num_local_experts,
             use_bias=False,
@@ -247,6 +255,10 @@ class PhiMoeSparseMoeBlock(spx.Module):
                 for _ in range(self.config.num_local_experts)
             ]
         )
+
+    @property
+    def reform_param(self):
+        return hf_per_expert_swiglu_reform_param(num_experts=self.config.num_local_experts)
 
     def forward(
         self,
@@ -272,7 +284,7 @@ class PhiMoeSparseMoeBlock(spx.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
 
-        router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
+        router_logits = self.router(hidden_states).astype(  # no reshaping is needed
             jnp.promote_types(self.dtype, jnp.float32)
         )
 
@@ -386,41 +398,6 @@ class PhiMoeDecoderLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        gate_up_splits = []
-        down_splits = []
-        for expert_idx in range(config.num_local_experts):
-            gate_up_splits.append(
-                {
-                    "name": f"block_sparse_moe.experts.{expert_idx}.w1.weight",
-                    "spliter": lambda x, idx=expert_idx: x[idx, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                }
-            )
-            gate_up_splits.append(
-                {
-                    "name": f"block_sparse_moe.experts.{expert_idx}.w3.weight",
-                    "spliter": lambda x, idx=expert_idx: x[idx, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                }
-            )
-            down_splits.append(
-                {
-                    "name": f"block_sparse_moe.experts.{expert_idx}.w2.weight",
-                    "spliter": lambda x, idx=expert_idx: x[idx].swapaxes(-1, -2),
-                }
-            )
-
-        # Accept HF PhiMoE MoE naming (`mlp.*`) directly during state-dict conversion.
-        # HF stores expert projections as consolidated tensors over experts:
-        # - mlp.experts.gate_up_proj: [num_experts, 2 * intermediate, hidden]
-        # - mlp.experts.down_proj:    [num_experts, hidden, intermediate]
-        # while EasyDeL stores per-expert w1/w2/w3 modules.
-        self.reform_param = {
-            "mlp.router.weight$": {
-                "splits": [{"name": "block_sparse_moe.gate.weight", "spliter": lambda x: x.swapaxes(-1, -2)}]
-            },
-            "mlp.experts.gate_up_proj$": {"splits": gate_up_splits},
-            "mlp.experts.down_proj$": {"splits": down_splits},
-        }
-
         self.self_attn = PhiMoEAttention(
             config=config,
             dtype=dtype,
@@ -429,7 +406,7 @@ class PhiMoeDecoderLayer(spx.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.block_sparse_moe = PhiMoeSparseMoeBlock(
+        self.mlp = PhiMoeSparseMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -514,7 +491,7 @@ class PhiMoeDecoderLayer(spx.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits = self.mlp(hidden_states)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = checkpoint_name(hidden_states, "layer_output")
 

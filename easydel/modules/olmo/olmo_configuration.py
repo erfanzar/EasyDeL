@@ -28,11 +28,18 @@ from easydel.infra.factory import register_config
 
 @register_config("olmo")
 class OlmoConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for AI2's OLMo (Open Language Model) v1 decoder family.
 
-    Args:
+    OLMo is a LLaMA-style decoder transformer with **non-parametric LayerNorm**
+    (no learnable weight or bias) before attention and MLP, **SwiGLU** activation,
+    **RoPE** positional encoding, and optional **QKV clipping** (``clip_qkv``)
+    to bound activation magnitudes during training. Heads use no bias by default
+    (``attention_bias=False``). Configuration objects inherit from
+    :class:`EasyDeLBaseConfig` and accept all standard EasyDeL sharding /
+    quantization knobs in addition to the OLMo-specific hyperparameters listed
+    below.
+
+    Attributes:
         vocab_size (`int`, *optional*, defaults to 50304):
             Vocabulary size of the Olmo model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.

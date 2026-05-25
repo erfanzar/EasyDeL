@@ -33,16 +33,92 @@ from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 @register_config("seed_oss")
 class SeedOssConfig(EasyDeLBaseConfig):
-    """
-    Configuration class for the Seed OSS decoder-only transformer.
+    """Configuration class for the Seed-OSS decoder-only transformer.
 
     The architecture follows a GPT-style stack with:
+
     - Pre-attention RMSNorm and post-attention RMSNorm
     - Rotary position embeddings with optional scaling
-    - Gated SiLU feed-forward network
+    - Gated SiLU (SwiGLU) feed-forward network
     - Optional sliding-window attention per-layer
 
-    Default hyper-parameters are aligned with the public Seed OSS checkpoints.
+    Default hyper-parameters are aligned with the public Seed-OSS checkpoints.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 200704):
+            Vocabulary size of the Seed-OSS tokenizer.
+        hidden_size (`int`, *optional*, defaults to 7168):
+            Dimensionality of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 20480):
+            Dimensionality of the MLP intermediate layer.
+        num_hidden_layers (`int`, *optional*, defaults to 36):
+            Number of transformer decoder layers.
+        num_attention_heads (`int`, *optional*, defaults to 56):
+            Number of query attention heads.
+        num_key_value_heads (`int`, *optional*):
+            Number of key/value heads (GQA). Defaults to
+            ``num_attention_heads`` (MHA) when not provided.
+        head_dim (`int`, *optional*):
+            Dimensionality of each attention head. Defaults to
+            ``hidden_size // num_attention_heads`` when not provided.
+        hidden_act (`str`, *optional*, defaults to ``"silu"``):
+            Activation function used in the gated MLP.
+        max_position_embeddings (`int`, *optional*, defaults to 131072):
+            Maximum sequence length the model supports.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation for weight initialization.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-5):
+            Epsilon for RMSNorm layers.
+        rope_theta (`float`, *optional*, defaults to 1_000_000.0):
+            Base frequency for rotary position embeddings.
+        rope_scaling (`Mapping`, *optional*):
+            RoPE scaling configuration (e.g. ``{"type": "yarn", "factor": 4.0}``).
+        tie_word_embeddings (`bool`, *optional*, defaults to ``False``):
+            Whether to tie input and output embedding weights.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout probability on attention weights.
+        resid_pdrop (`float`, *optional*, defaults to 0.0):
+            Dropout probability on residual connections.
+        embd_pdrop (`float`, *optional*, defaults to 0.0):
+            Dropout probability on the input embeddings.
+        use_cache (`bool`, *optional*, defaults to ``True``):
+            Whether to cache key/value tensors for incremental decoding.
+        use_sliding_window (`bool`, *optional*, defaults to ``False``):
+            Whether to enable sliding-window attention on the first
+            ``max_window_layers`` layers.
+        sliding_window (`int`, *optional*):
+            Sliding-window size (only used when ``use_sliding_window=True``).
+        max_window_layers (`int`, *optional*):
+            Number of leading layers that use sliding-window attention.
+            Defaults to ``num_hidden_layers`` when not provided.
+        layer_types (`list[str]`, *optional*):
+            Per-layer attention type (``"full_attention"`` or
+            ``"sliding_attention"``). Auto-derived from the sliding-window
+            settings when not provided.
+        gradient_checkpointing (`EasyDeLGradientCheckPointers`, *optional*):
+            Gradient-checkpointing policy. Defaults to
+            :attr:`EasyDeLGradientCheckPointers.NONE`.
+        gradient_checkpointing_targets (`tuple[str, ...]`, *optional*):
+            Optional named tensors to save through checkpointing.
+        scan_layers (`bool`, *optional*, defaults to ``True``):
+            Whether to scan the decoder stack with ``lax.scan``.
+        use_scan_mlp (`bool`, *optional*, defaults to ``False``):
+            Whether to chunk the MLP forward pass to reduce peak memory.
+        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+            Chunk size used when ``use_scan_mlp`` is enabled.
+        bits (`int`, *optional*):
+            Optional quantization bit-width (forwarded to
+            :class:`EasyDeLBaseConfig`).
+        attention_bias (`bool`, *optional*, defaults to ``True``):
+            Whether the Q/K/V projections carry a bias term.
+        attention_out_bias (`bool`, *optional*, defaults to ``False``):
+            Whether the output projection carries a bias term.
+        residual_dropout (`float`, *optional*, defaults to 0.1):
+            Dropout probability applied at residual connections.
+        mlp_bias (`bool`, *optional*, defaults to ``False``):
+            Whether the MLP projections carry bias terms.
+        **kwargs: Additional keyword arguments forwarded to
+            :class:`EasyDeLBaseConfig`.
     """
 
     model_type = "seed_oss"
@@ -146,8 +222,6 @@ class SeedOssConfig(EasyDeLBaseConfig):
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
-        # Seed OSS uses attention bias on Q/K/V projections but not on O projection.
-        self.attention_bias = True
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

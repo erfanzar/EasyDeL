@@ -28,6 +28,7 @@ The module exposes :class:`PhiModel` (encoder of hidden states) and the
 task-specific wrapper :class:`PhiForCausalLM` (causal language modeling).
 """
 
+import copy
 import functools
 from typing import ClassVar
 
@@ -161,6 +162,7 @@ class PhiAttention(UnifiedAttention):
         "key_projection": "k_proj",
         "value_projection": "v_proj",
         "output_projection": "dense",
+        "query_key_value_projection": "qkv_proj",
     }
 
     def __init__(
@@ -184,9 +186,10 @@ class PhiAttention(UnifiedAttention):
             rngs (spx.Rngs): Random number generator state.
         """
         self.qk_layernorm = config.qk_layernorm
-        config.attention_bias = True
+        attention_config = copy.copy(config)
+        attention_config.attention_bias = True
         super().__init__(
-            config,
+            attention_config,
             dtype,
             param_dtype,
             precision,
@@ -347,7 +350,7 @@ class PhiDecoderLayer(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
+        self.resid_dropout = nn.Dropout(self.config.resid_pdrop, rngs=rngs)
 
     def forward(
         self,

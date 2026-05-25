@@ -53,8 +53,9 @@ Public surface:
       computes the routed-MoE auxiliary load-balancing loss.
 """
 
+import os
 import typing
-from functools import partial
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -92,18 +93,36 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.sharding import RuntimeShardingResolver, coerce_runtime_sharding_resolver, resolve_stage_mesh
+from easydel.infra.sharding import (
+    RuntimeShardingResolver,
+    coerce_runtime_sharding_resolver,
+    mesh_axis_size,
+    resolve_stage_mesh,
+)
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
     Embed,
+    FusedColumnLayout,
+    FusedSegment,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
+    build_fused_gate_up_projection,
+    interleaved_fusion_reform_param,
+    keep_interleaved_segments_last_axis,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
+    split_interleaved_segments_last_axis,
+    tensor_parallel_size,
+    torch_deinterleave_segments_for_tp,
+    torch_interleave_segments_for_tp,
+    with_tp_last_axis_sharding,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.linear_attention import (
@@ -117,10 +136,9 @@ from easydel.operations.kernels import (
     GatedDeltaRuleOp,
     GatedDeltaRuleOutput,
     RaggedGatedDeltaRule,
-    ragged_causal_conv1d,
+    ragged_causal_conv1d_head_sharded,
 )
 from easydel.utils import is_inference_mode
-from easydel.utils.helpers import check_bool_flag
 
 from .qwen3_next_configuration import Qwen3NextConfig
 
@@ -154,6 +172,272 @@ def l2norm_decode(
     """
     inv_norm = jax.lax.rsqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
     return x * inv_norm
+
+
+def _apply_tp_last_axis_sharding(x: Array, config: Qwen3NextConfig) -> Array:
+    """Keep projection products local on the TP axis while residuals stay replicated.
+
+    Thin wrapper around :func:`with_tp_last_axis_sharding` that consumes
+    the Qwen3-Next config object directly. Used immediately after the
+    Q/K/V matmul (and after the attention output merge) to pin the
+    trailing channel axis to the tensor-parallel mesh axis so the next
+    row-parallel projection can avoid an all-gather.
+    """
+    return with_tp_last_axis_sharding(x, config)
+
+
+def _qwen3_next_tp_size(config: Qwen3NextConfig) -> int:
+    """Return the tensor-parallel mesh size from the Qwen3-Next config."""
+    return tensor_parallel_size(config)
+
+
+def _qwen3_next_full_attention_layout(*, q_size: int, kv_size: int) -> FusedColumnLayout:
+    """Build the fused ``[Q | K | V]`` column-parallel layout for full attention.
+
+    Args:
+        q_size: Number of output channels in the Q (or Q+gate) segment.
+        kv_size: Number of output channels in each of the K and V segments.
+
+    Returns:
+        :class:`FusedColumnLayout` describing the three labelled segments
+        used by checkpoint reform and split helpers in
+        :class:`Qwen3NextFullAttention`.
+    """
+    return FusedColumnLayout(
+        segments=(
+            FusedSegment("q", q_size, "q_proj"),
+            FusedSegment("k", kv_size, "k_proj"),
+            FusedSegment("v", kv_size, "v_proj"),
+        ),
+        log_label="full-attention Q/K/V groups",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Qwen3NextLinearAttentionLayout:
+    """Packed Qwen3-Next linear-attention checkpoint layout.
+
+    Qwen3-Next's linear attention is not stock dense QKV: HF stores
+    ``in_proj_qkv`` plus a separate ``in_proj_z``, while the packed runtime
+    projection is ``[q | k | v | z]``. Beta/alpha are similarly packed as
+    ``[b | a]``. This layout owns that checkpoint reform contract so the
+    model body no longer carries ad-hoc fuser functions.
+    """
+
+    key_dim: int
+    value_dim: int
+    config: Qwen3NextConfig
+
+    @property
+    def qkvz_segment_sizes(self) -> tuple[int, int, int, int]:
+        """Per-segment widths of the packed ``[q | k | v | z]`` projection.
+
+        Returns:
+            Tuple ``(key_dim, key_dim, value_dim, value_dim)`` matching the
+            four channel groups in the packed runtime projection.
+        """
+        return (self.key_dim, self.key_dim, self.value_dim, self.value_dim)
+
+    def split_projected_qkvz(self, projected_qkvz: Array) -> tuple[Array, Array]:
+        """Split the packed runtime ``[q | k | v | z]`` projection.
+
+        Uses the TP-aware interleaved-segment helpers when the layout was
+        interleaved by the parallel projection (so each TP rank holds a
+        contiguous slice of every segment); falls back to a vanilla
+        :func:`jnp.split` when the helpers report a non-interleaved
+        layout.
+
+        Args:
+            projected_qkvz: Packed projection output, shape ``(..., key_dim
+                * 2 + value_dim * 2)``.
+
+        Returns:
+            Tuple ``(conv_input, z)`` where ``conv_input`` carries the
+            ``[q | k | v]`` slice fed to the depthwise conv and ``z`` is
+            the gate stream used by the gated RMSNorm.
+        """
+        conv_input = keep_interleaved_segments_last_axis(
+            projected_qkvz,
+            self.qkvz_segment_sizes,
+            (0, 1, 2),
+            config=self.config,
+        )
+        z_parts = split_interleaved_segments_last_axis(
+            projected_qkvz,
+            self.qkvz_segment_sizes,
+            config=self.config,
+        )
+        if conv_input is None or z_parts is None:
+            return tuple(jnp.split(projected_qkvz, [self.key_dim * 2 + self.value_dim], axis=-1))
+        return conv_input, z_parts[3]
+
+    def split_projected_ba(self, projected_ba: Array, num_v_heads: int) -> tuple[Array, Array]:
+        """Split the packed ``[beta | alpha]`` projection into its halves.
+
+        Args:
+            projected_ba: Packed beta/alpha projection output, shape
+                ``(..., 2 * num_v_heads)``.
+            num_v_heads: Number of value heads — half of the packed
+                channel dimension.
+
+        Returns:
+            Tuple ``(beta, alpha)`` of per-value-head gating streams.
+        """
+        ba_parts = split_interleaved_segments_last_axis(
+            projected_ba,
+            (num_v_heads, num_v_heads),
+            config=self.config,
+        )
+        if ba_parts is None:
+            return tuple(jnp.split(projected_ba, [num_v_heads], axis=-1))
+        return ba_parts
+
+    def reform_param(self) -> dict[str, typing.Any]:
+        """Build the HuggingFace -> EasyDeL checkpoint reform rules.
+
+        Produces a mapping that fuses the HF tensors ``in_proj_qkv`` and
+        ``in_proj_z`` into the runtime ``in_proj_qkvz`` projection (and
+        analogously ``in_proj_b`` / ``in_proj_a`` into ``in_proj_ba``)
+        while respecting the TP interleave imposed by the column-parallel
+        projection layout. The inverse direction (EasyDeL -> HF) is
+        provided via ``inverse_fuser`` callbacks so the same registry is
+        usable for round-trip conversion.
+
+        Returns:
+            Dictionary keyed by EasyDeL parameter-name regexes whose
+            values describe the fuser / inverse_fuser callables consumed
+            by :class:`StateDictConverter`.
+        """
+
+        def _qkvz(torch, qkv, z):
+            """Fuse HF ``in_proj_qkv`` + ``in_proj_z`` into TP-interleaved QKVZ.
+
+            Splits the HF ``in_proj_qkv`` tensor along axis 0 into its
+            Q/K/V slices and re-interleaves them with the ``in_proj_z``
+            tensor along the channel axis so each TP rank ends up with a
+            contiguous slice of every segment.
+            """
+            q, k, v = torch.split(qkv, (self.key_dim, self.key_dim, self.value_dim), dim=0)
+            return torch_interleave_segments_for_tp(
+                torch,
+                (q, k, v, z),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+
+        def _qkvz_inverse(torch, qkvz):
+            """Inverse of :func:`_qkvz` — split TP-interleaved QKVZ back to HF.
+
+            Deinterleaves the runtime ``in_proj_qkvz`` tensor into the
+            individual Q/K/V/Z segments and re-concatenates Q/K/V to
+            reproduce HF's ``in_proj_qkv`` plus the original
+            ``in_proj_z``.
+            """
+            z_dim = int(qkvz.shape[0]) - self.key_dim - self.key_dim - self.value_dim
+            q, k, v, z = torch_deinterleave_segments_for_tp(
+                torch,
+                qkvz,
+                (self.key_dim, self.key_dim, self.value_dim, z_dim),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+            return torch.cat((q, k, v), dim=0).contiguous(), z
+
+        reform_param = {
+            "in_proj_qkvz.weight$": {
+                "sources": ("in_proj_qkv.weight", "in_proj_z.weight"),
+                "fuser": _qkvz,
+                "inverse_fuser": _qkvz_inverse,
+                "log_label": "linear-attention qkv/z weight groups",
+            },
+        }
+        reform_param.update(
+            interleaved_fusion_reform_param(
+                "in_proj_ba.weight",
+                ("in_proj_b.weight", "in_proj_a.weight"),
+                config=self.config,
+                log_label="linear-attention beta/alpha weight groups",
+            )
+        )
+        return reform_param
+
+
+def _build_qwen3_next_linear_attention_fusion_reform_param(
+    *,
+    key_dim: int,
+    value_dim: int,
+    config: Qwen3NextConfig,
+) -> dict[str, typing.Any]:
+    """Build the linear-attention QKVZ/BA fusion reform-param dict.
+
+    Thin shim that instantiates :class:`Qwen3NextLinearAttentionLayout`
+    with the layer's per-segment widths and forwards to its
+    :meth:`reform_param` so callers do not have to manage the layout
+    object lifetime.
+
+    Args:
+        key_dim: Total key dimension (``num_k_heads * head_k_dim``).
+        value_dim: Total value dimension (``num_v_heads * head_v_dim``).
+        config: Owning :class:`Qwen3NextConfig` carrying TP and partition
+            info needed by the layout helpers.
+
+    Returns:
+        Reform-param mapping suitable for merging into a layer's
+        ``reform_param`` registry.
+    """
+    return Qwen3NextLinearAttentionLayout(
+        key_dim=key_dim,
+        value_dim=value_dim,
+        config=config,
+    ).reform_param()
+
+
+def _build_qwen3_next_linear_attention_reform_param(
+    *,
+    key_dim: int,
+    value_dim: int,
+    config: Qwen3NextConfig,
+    include_qkvz_fusion: bool,
+) -> dict[str, typing.Any]:
+    """Build the full linear-attention checkpoint reform-param dict.
+
+    Combines the conv1d weight permutation rule (HF stores conv weights
+    as ``[conv_dim, 1, kernel_size]``; EasyDeL wants
+    ``[kernel_size, 1, conv_dim]``) with, optionally, the QKVZ/BA
+    fusion rules from
+    :func:`_build_qwen3_next_linear_attention_fusion_reform_param` when
+    the layer uses the merged-split projection variant.
+
+    Args:
+        key_dim: Total key dimension (``num_k_heads * head_k_dim``).
+        value_dim: Total value dimension (``num_v_heads * head_v_dim``).
+        config: Owning :class:`Qwen3NextConfig`.
+        include_qkvz_fusion: When ``True``, also include the QKVZ/BA
+            packing rules; used only by the merged-split projection
+            variant.
+
+    Returns:
+        Reform-param mapping consumed by :class:`StateDictConverter`.
+    """
+
+    def _conv1d_weight(tensor):
+        """Permute the HF conv1d weight ``[conv_dim, 1, k]`` into EasyDeL's ``[k, 1, conv_dim]``."""
+        tensor = tensor.permute(2, 1, 0)
+        return tensor.contiguous()
+
+    reform_param = {
+        "conv1d.weight$": {
+            "splits": [{"name": "conv1d.weight", "spliter": _conv1d_weight}],
+            "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
+        },
+    }
+    if include_qkvz_fusion:
+        reform_param.update(
+            _build_qwen3_next_linear_attention_fusion_reform_param(
+                key_dim=key_dim,
+                value_dim=value_dim,
+                config=config,
+            )
+        )
+    return reform_param
 
 
 def _preserve_array_sharding(
@@ -226,6 +510,36 @@ def apply_grouped_single_step_gdr(
 
     On TPU, dispatches to a fused Pallas kernel that performs the entire
     grouped state update in VMEM without materializing the 5D intermediate.
+
+    Args:
+        query: Per-step query, shape ``(batch, 1, num_k_heads, head_dim)``.
+        key: Per-step key, same shape as ``query``.
+        value: Per-step value with one entry per value head,
+            shape ``(batch, 1, num_v_heads, value_dim)``.
+        beta: Per-step beta (write-strength), shape
+            ``(batch, 1, num_v_heads)``.
+        decay: Per-step decay factor, shape ``(batch, 1, num_v_heads)``
+            or ``None`` for pure delta updates with no exponential decay.
+        recurrent_state: Carried per-value-head state, shape
+            ``(batch, num_v_heads, head_dim, value_dim)``.
+        gdr_op: Optional :class:`GatedDeltaRuleOp` providing the fused
+            Pallas decode kernel. When ``None``, falls back to the pure
+            JAX reference path (slower but device-agnostic).
+        use_qk_l2norm: When ``True`` (the default) the Q/K are
+            L2-normalised channel-wise via :func:`l2norm_decode` before
+            being handed to the kernel — matches the runtime numerics
+            elsewhere in the model.
+
+    Returns:
+        Tuple ``(output, new_recurrent_state)`` where ``output`` has
+        shape ``(batch, 1, num_v_heads, value_dim)`` in the original
+        ``query`` dtype and ``new_recurrent_state`` has the same shape
+        as the input ``recurrent_state``.
+
+    Raises:
+        ValueError: If ``num_v_heads`` is not divisible by ``num_k_heads``.
+        RuntimeError: When the underlying kernel returns ``None`` for the
+            attention output.
     """
     batch_size, _, num_k_heads, _head_dim = query.shape
     num_v_heads = value.shape[2]
@@ -439,6 +753,10 @@ def _apply_qwen3_next_packed_updates_unified(
     conv_input: Float[Array, "batch seq_len conv_dim"],
     beta: Float[Array, "batch seq_len num_v_heads"],
     decay: Float[Array, "batch seq_len num_v_heads"],
+    beta_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
+    alpha_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
+    A_log: Float[Array, "num_v_heads"] | None = None,
+    dt_bias: Float[Array, "num_v_heads"] | None = None,
     kernel: Float[Array, "conv_dim d_conv"],
     query_start_loc: Int[Array, "num_slots_plus_1"],
     num_requests: Int[Array, ""],
@@ -450,6 +768,8 @@ def _apply_qwen3_next_packed_updates_unified(
     expand_ratio: int,
     conv_output_dtype: jnp.dtype,
     gdr_op: GatedDeltaRuleOp,
+    context_lens: Int[Array, "num_slots"] | None = None,
+    spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -525,6 +845,41 @@ def _apply_qwen3_next_packed_updates_unified(
     if num_slots == 0:
         return conv_states, recurrent_states, token_outputs
 
+    candidate_conv_states, candidate_recurrent_states = conv_states, recurrent_states
+    extra_slots = conv_states.shape[0] - num_slots
+    candidate_count = extra_slots // num_slots if num_slots > 0 and extra_slots > 0 else 0
+    has_spec_candidates = candidate_count > 0
+    if has_spec_candidates and spec_recurrent_commit is not None:
+        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
+        raw_prefix = commit[1, :num_slots]
+        commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
+        candidate_rows = num_slots + slot_ids * int(candidate_count) + raw_prefix - 1
+        safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
+        row_valid = commit_active & (candidate_rows < conv_states.shape[0])
+        conv_states = conv_states.at[:num_slots].set(
+            jnp.where(row_valid[:, None, None], conv_states[safe_rows], conv_states[:num_slots]).astype(
+                conv_states.dtype
+            )
+        )
+        recurrent_states = recurrent_states.at[:num_slots].set(
+            jnp.where(
+                row_valid[:, None, None, None],
+                recurrent_states[safe_rows],
+                recurrent_states[:num_slots],
+            ).astype(recurrent_states.dtype)
+        )
+        candidate_conv_states, candidate_recurrent_states = conv_states, recurrent_states
+    if context_lens is None:
+        context_lens_i = scheduled_tokens
+    else:
+        context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:num_slots]
+    context_before = context_lens_i - scheduled_tokens
+    spec_slot_mask = jnp.zeros_like(active_slots)
+    if has_spec_candidates:
+        spec_slot_mask = (
+            active_slots & (scheduled_tokens > 1) & (scheduled_tokens <= int(candidate_count)) & (context_before > 0)
+        )
+
     prefix_conv_states = conv_states[:num_slots]
     prefix_recurrent_states = recurrent_states[:num_slots]
     safe_single_indices = jnp.clip(starts, 0, seq_len - 1)
@@ -585,7 +940,11 @@ def _apply_qwen3_next_packed_updates_unified(
 
         if single_output is None:
             raise RuntimeError("Grouped delta rule did not return attention outputs.")
-        conv_states_i = jnp.where(single_slot_mask[:, None, None], shifted_conv_states, conv_states_i)
+        conv_states_i = jnp.where(
+            single_slot_mask[:, None, None],
+            shifted_conv_states.astype(conv_states_i.dtype),
+            conv_states_i,
+        )
         recurrent_states_i = jnp.where(
             single_slot_mask[:, None, None, None],
             single_recurrent.astype(recurrent_states_i.dtype),
@@ -603,13 +962,122 @@ def _apply_qwen3_next_packed_updates_unified(
         (token_outputs, prefix_conv_states, prefix_recurrent_states),
     )
 
+    def _apply_spec_decode_windows(operand):
+        """Step the spec-decode draft window for every candidate prefix.
+
+        Conditional branch invoked when ``spec_slot_mask`` is non-empty.
+        Iterates over the ``candidate_count`` draft positions, advancing
+        a rolling ``(conv, recurrent)`` state per slot using
+        :meth:`GatedDeltaRuleOp.fused_conv_decode` plus a manual
+        single-step gated-delta-rule, and writes each intermediate state
+        into the corresponding candidate row of the per-request commit
+        buffer so that later acceptance/rejection can rewind to any
+        prefix length.
+        """
+        token_outputs_i, conv_states_i, recurrent_states_i, candidate_conv_i, candidate_recurrent_i = operand
+        rolling_conv = conv_states_i
+        rolling_recurrent = recurrent_states_i
+
+        for prefix_idx in range(candidate_count):
+            prefix_pos = jnp.asarray(prefix_idx, dtype=jnp.int32)
+            token_positions = starts + prefix_pos
+            safe_positions = jnp.clip(token_positions, 0, seq_len - 1)
+            prefix_valid = spec_slot_mask & (prefix_pos < scheduled_tokens)
+
+            new_tokens = conv_input[0, safe_positions, :]
+            shifted_conv_states, conv_output = GatedDeltaRuleOp.fused_conv_decode(
+                conv_state=rolling_conv,
+                new_tokens=new_tokens,
+                kernel=kernel,
+                output_dtype=conv_output_dtype,
+            )
+            query = conv_output[:, :key_dim].reshape(num_slots, 1, num_k_heads, head_k_dim)
+            key = conv_output[:, key_dim : key_dim * 2].reshape(num_slots, 1, num_k_heads, head_k_dim)
+            value = conv_output[:, key_dim * 2 :].reshape(num_slots, 1, num_v_heads, head_v_dim)
+            beta_step = beta[0, safe_positions].reshape(num_slots, 1, num_v_heads)
+            decay_step = decay[0, safe_positions].reshape(num_slots, 1, num_v_heads)
+
+            query_mask = prefix_valid[:, None, None, None]
+            token_mask = prefix_valid[:, None, None]
+            query = jnp.where(query_mask, query, 0)
+            key = jnp.where(query_mask, key, 0)
+            value = jnp.where(query_mask, value, 0)
+            beta_step = jnp.where(token_mask, beta_step, 0)
+            decay_step = jnp.where(token_mask, decay_step, 0)
+
+            if expand_ratio > 1:
+                query = jnp.repeat(query, expand_ratio, axis=2)
+                key = jnp.repeat(key, expand_ratio, axis=2)
+            query = l2norm_decode(query, axis=-1, eps=1e-6)
+            key = l2norm_decode(key, axis=-1, eps=1e-6)
+            scale = jax.lax.rsqrt(jnp.asarray(head_k_dim, dtype=jnp.float32))
+            query_f = query[:, 0].astype(jnp.float32) * scale
+            key_f = key[:, 0].astype(jnp.float32)
+            value_f = value[:, 0].astype(jnp.float32)
+            beta_f = beta_step[:, 0].astype(jnp.float32)
+            exp_g = jnp.exp(decay_step[:, 0].astype(jnp.float32))
+            state_f = rolling_recurrent.astype(jnp.float32)
+            k_state = jnp.einsum("bhd,bhdm->bhm", key_f, state_f)
+            q_state = jnp.einsum("bhd,bhdm->bhm", query_f, state_f)
+            v_new = beta_f[..., None] * (value_f - exp_g[..., None] * k_state)
+            q_k = jnp.sum(query_f * key_f, axis=-1, keepdims=True)
+            step_output = (exp_g[..., None] * q_state + q_k * v_new)[:, None, :, :]
+            step_recurrent = state_f * exp_g[..., None, None] + key_f[..., :, None] * v_new[..., None, :]
+
+            rolling_conv = jnp.where(
+                prefix_valid[:, None, None],
+                shifted_conv_states.astype(rolling_conv.dtype),
+                rolling_conv,
+            )
+            rolling_recurrent = jnp.where(
+                prefix_valid[:, None, None, None],
+                step_recurrent.astype(rolling_recurrent.dtype),
+                rolling_recurrent,
+            )
+            token_outputs_i = token_outputs_i.at[safe_positions].add(
+                jnp.where(token_mask, step_output[:, 0].astype(token_outputs_i.dtype), 0)
+            )
+
+            candidate_rows = num_slots + slot_ids * int(candidate_count) + int(prefix_idx)
+            safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
+            row_valid = prefix_valid & (candidate_rows < conv_states.shape[0])
+            candidate_conv_values = jnp.where(
+                row_valid[:, None, None],
+                rolling_conv.astype(candidate_conv_i.dtype),
+                candidate_conv_i[safe_rows],
+            )
+            candidate_recurrent_values = jnp.where(
+                row_valid[:, None, None, None],
+                rolling_recurrent.astype(candidate_recurrent_i.dtype),
+                candidate_recurrent_i[safe_rows],
+            )
+            candidate_conv_i = candidate_conv_i.at[safe_rows].set(candidate_conv_values.astype(candidate_conv_i.dtype))
+            candidate_recurrent_i = candidate_recurrent_i.at[safe_rows].set(
+                candidate_recurrent_values.astype(candidate_recurrent_i.dtype)
+            )
+
+        conv_states_i = jnp.where(spec_slot_mask[:, None, None], rolling_conv, conv_states_i)
+        recurrent_states_i = jnp.where(spec_slot_mask[:, None, None, None], rolling_recurrent, recurrent_states_i)
+        return token_outputs_i, conv_states_i, recurrent_states_i, candidate_conv_i, candidate_recurrent_i
+
+    token_outputs, base_conv_states, base_recurrent_states, candidate_conv_states, candidate_recurrent_states = (
+        jax.lax.cond(
+            jnp.any(spec_slot_mask),
+            _apply_spec_decode_windows,
+            lambda operand: operand,
+            (token_outputs, base_conv_states, base_recurrent_states, candidate_conv_states, candidate_recurrent_states),
+        )
+    )
+
+    prefill_slot_mask = multi_slot_mask & ~spec_slot_mask
     packed_slots = jnp.where(
-        multi_slot_mask,
+        prefill_slot_mask,
         size=num_prefill_chunks * prefill_chunk_size,
         fill_value=0,
     )[0].reshape(num_prefill_chunks, prefill_chunk_size)
     packed_valid = (
-        jnp.arange(num_prefill_chunks * prefill_chunk_size, dtype=jnp.int32) < jnp.sum(multi_slot_mask.astype(jnp.int32))
+        jnp.arange(num_prefill_chunks * prefill_chunk_size, dtype=jnp.int32)
+        < jnp.sum(prefill_slot_mask.astype(jnp.int32))
     ).reshape(num_prefill_chunks, prefill_chunk_size)
     prefill_offsets = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
 
@@ -634,44 +1102,26 @@ def _apply_qwen3_next_packed_updates_unified(
             Bool[Array, "chunk"],
         ],
     ]:
-        """Process one prefill chunk in the multi-token scan.
+        """``jax.lax.scan`` body that prefills one prefill-chunk per step.
 
-        Body of the prefill ``jax.lax.scan`` over fixed-size chunks. For
-        each chunk the function gathers the active slots, runs the
-        depthwise convolution and the gated-delta-rule recurrence over
-        the chunk's tokens, and emits the per-slot conv-state and
-        recurrent-state updates. Empty chunks are short-circuited via
-        :func:`_skip_chunk` to avoid wasted work.
+        Gathers the active slots for this chunk, prepends each slot's
+        conv-state prefix to its packed token stream, runs the full
+        causal depthwise conv + chunked gated-delta-rule update, and
+        accumulates per-token outputs while emitting the updated
+        ``(conv, recurrent)`` slices for downstream scatter. Dispatches
+        between ``_apply_chunk`` and ``_skip_chunk`` based on the
+        chunk's validity mask to keep dead chunks free of work.
         """
         chunk_slots, chunk_valid = scan_inputs
 
         def _apply_chunk(operand):
-            """Active branch: run conv + GDN over one packed prefill chunk.
+            """Run the conv + GDR prefill update for a non-empty chunk.
 
-            Selected by :func:`jax.lax.cond` when at least one slot in
-            this fixed-size chunk has scheduled tokens. The body:
-
-            1. **Gather**: index ``starts`` and ``scheduled_tokens`` by
-               ``chunk_slots`` to recover per-slot offsets / lengths,
-               then build a per-token validity mask.
-            2. **Compute**: prepend the slot's existing conv-state
-               prefix to the gathered tokens, run the full causal
-               depthwise convolution over the combined sequence, slice
-               off the prefix portion, and reshape into
-               ``query``/``key``/``value`` per-head tensors. Apply
-               masking to invalid positions, optionally repeat Q/K
-               across grouped value heads, and dispatch the
-               gated-delta-rule recurrence.
-            3. **Scatter**: produce the final per-slot conv-state
-               updates via :func:`_finalize_qwen3_next_conv_state_from_combined`
-               and return them alongside the GDN-updated recurrent
-               state and the chunk's output tokens. Token outputs are
-               written back into ``token_outputs_j`` at the original
-               token positions via ``.at[].add``.
-
-            The function returns the same carry shape as
-            :func:`_skip_chunk` so :func:`jax.lax.cond` can select
-            between the two without reshaping.
+            Active branch of the chunk-validity ``lax.cond`` inside
+            ``_prefill_chunk_step``. Constructs per-slot token windows,
+            applies the depthwise conv with state-prefix concatenation,
+            runs the chunked gated-delta-rule, and accumulates the
+            resulting per-token outputs into ``token_outputs_j``.
             """
             token_outputs_j, chunk_slots_j, chunk_valid_j = operand
             chunk_starts = starts[chunk_slots_j]
@@ -757,18 +1207,11 @@ def _apply_qwen3_next_packed_updates_unified(
             )
 
         def _skip_chunk(operand):
-            """Inactive branch: skip this chunk and emit empty state updates.
+            """No-op branch of the chunk-validity ``lax.cond``.
 
-            Selected by :func:`jax.lax.cond` when none of the
-            ``chunk_slots`` in this packed chunk have scheduled tokens
-            (i.e. ``chunk_valid`` is all-False). The branch returns
-            zero-filled conv- and recurrent-state update tiles of the
-            shape :func:`_apply_chunk` would have produced so the
-            outer :func:`_scatter_qwen3_next_selected_updates` call
-            sees a uniform tensor signature; because the corresponding
-            ``flat_valid`` entries are False, those zero rows are
-            ignored during the final scatter. The token outputs
-            accumulator is returned untouched.
+            Emits zeroed conv and recurrent updates and passes
+            ``token_outputs_j`` through unchanged so the scan's pytree
+            shape stays consistent with the active branch.
             """
             token_outputs_j, chunk_slots_j, chunk_valid_j = operand
             return token_outputs_j, (
@@ -786,13 +1229,13 @@ def _apply_qwen3_next_packed_updates_unified(
         )
 
     def _run_prefill_scan(operand):
-        """Driver branch: run the chunk-wise prefill scan and scatter resulting state updates.
+        """Drive the prefill scan and scatter results back to the slot pool.
 
-        Used when at least one packed-batch slot is in prefill mode (more
-        than one new token per slot). Iterates :func:`_prefill_chunk_step`
-        over fixed-size chunks via ``jax.lax.scan`` and writes the
-        accumulated per-slot updates back into the bulk conv-state and
-        recurrent-state buffers.
+        Active branch of the prefill-slot ``lax.cond``: kicks off
+        ``jax.lax.scan(_prefill_chunk_step, ...)`` over the packed
+        prefill chunks, then writes the per-chunk conv/recurrent
+        updates back into the slot-indexed buffers via
+        :func:`_scatter_qwen3_next_selected_updates`.
         """
         token_outputs_i, conv_states_i, recurrent_states_i = operand
         token_outputs_i, scan_outputs = jax.lax.scan(
@@ -819,7 +1262,7 @@ def _apply_qwen3_next_packed_updates_unified(
         return token_outputs_i, conv_states_i, recurrent_states_i
 
     token_outputs, final_prefix_conv_states, final_prefix_recurrent_states = jax.lax.cond(
-        jnp.any(multi_slot_mask),
+        jnp.any(prefill_slot_mask),
         _run_prefill_scan,
         lambda operand: operand,
         (token_outputs, base_conv_states, base_recurrent_states),
@@ -827,8 +1270,162 @@ def _apply_qwen3_next_packed_updates_unified(
 
     out_conv_states = conv_states.at[:num_slots].set(final_prefix_conv_states)
     out_recurrent_states = recurrent_states.at[:num_slots].set(final_prefix_recurrent_states)
+    if conv_states.shape[0] > num_slots:
+        out_conv_states = out_conv_states.at[num_slots:].set(candidate_conv_states[num_slots:])
+        out_recurrent_states = out_recurrent_states.at[num_slots:].set(candidate_recurrent_states[num_slots:])
 
     return out_conv_states, out_recurrent_states, token_outputs
+
+
+def _write_qwen3_next_spec_candidate_states(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    kernel: Float[Array, "conv_dim d_conv"],
+    query_start_loc: Int[Array, "num_slots_plus_1"],
+    context_lens: Int[Array, "num_slots"] | None,
+    num_requests: Int[Array, ""],
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    conv_output_dtype: jnp.dtype,
+    alpha_raw: Float[Array, "batch seq_len num_v_heads"],
+    beta_raw: Float[Array, "batch seq_len num_v_heads"],
+    A_log: Float[Array, "num_v_heads"],
+    dt_bias: Float[Array, "num_v_heads"],
+) -> tuple[
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_v_heads head_dim value_dim"],
+]:
+    """Write vLLM-style speculative GDN candidate states into extra cache rows.
+
+    eSurge stores live recurrent state in rows ``[0, max_num_reqs)``. When the
+    runner allocates speculative candidate rows, they are laid out as
+    ``base + request_row * num_candidates + prefix_index``. Prefix index 0 is
+    the state after the real decode token, index 1 after the first accepted
+    draft, and so on. The full-accept case can use the normal live row because
+    the main ragged update already advanced through the complete verify window.
+    """
+    base_slots = query_start_loc.shape[0] - 1
+    if base_slots <= 0:
+        return conv_states, recurrent_states
+
+    extra_slots = conv_states.shape[0] - base_slots
+    if extra_slots <= 0:
+        return conv_states, recurrent_states
+
+    candidate_count = extra_slots // base_slots
+    if candidate_count <= 0:
+        return conv_states, recurrent_states
+
+    seq_len = conv_input.shape[1]
+    key_dim = int(num_k_heads) * int(head_k_dim)
+    slot_ids = jnp.arange(base_slots, dtype=jnp.int32)
+    starts = query_start_loc[:base_slots]
+    scheduled_tokens = query_start_loc[1 : base_slots + 1] - starts
+    if context_lens is None:
+        context_lens_i = scheduled_tokens
+    else:
+        context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:base_slots]
+    context_before = context_lens_i - scheduled_tokens
+    active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
+    spec_slot_mask = (
+        active_slots & (scheduled_tokens > 1) & (scheduled_tokens <= (candidate_count + 1)) & (context_before > 0)
+    )
+
+    def _run_candidate_scan(_):
+        """Compute and stash per-prefix speculative candidate states.
+
+        Conditional body executed when ``spec_slot_mask`` has any
+        active entries. For each draft prefix position it advances a
+        rolling ``(conv, recurrent)`` copy of the live state and writes
+        the resulting tuple into the slot's candidate row using the
+        ``base + slot * candidate_count + prefix`` layout so the
+        scheduler can rewind to any accepted prefix length.
+        """
+        candidate_conv_states = conv_states
+        candidate_recurrent_states = recurrent_states
+        rolling_conv = conv_states[:base_slots]
+        rolling_recurrent = recurrent_states[:base_slots]
+        repeat_factor = max(1, int(num_v_heads) // max(1, int(num_k_heads)))
+
+        for prefix_idx in range(candidate_count):
+            token_positions = starts + jnp.asarray(prefix_idx, dtype=jnp.int32)
+            safe_positions = jnp.clip(token_positions, 0, seq_len - 1)
+            prefix_valid = spec_slot_mask & (jnp.asarray(prefix_idx, dtype=jnp.int32) < scheduled_tokens)
+
+            new_tokens = conv_input[0, safe_positions, :]
+            shifted_conv, conv_output = GatedDeltaRuleOp.fused_conv_decode(
+                conv_state=rolling_conv,
+                new_tokens=new_tokens,
+                kernel=kernel,
+                output_dtype=conv_output_dtype,
+            )
+
+            query = conv_output[:, :key_dim].reshape(base_slots, num_k_heads, head_k_dim)
+            key = conv_output[:, key_dim : key_dim * 2].reshape(base_slots, num_k_heads, head_k_dim)
+            value = conv_output[:, key_dim * 2 :].reshape(base_slots, num_v_heads, head_v_dim)
+            if repeat_factor > 1:
+                query = jnp.repeat(query, repeat_factor, axis=1)
+                key = jnp.repeat(key, repeat_factor, axis=1)
+
+            query = l2norm_decode(query, axis=-1, eps=1e-6)
+            key = l2norm_decode(key, axis=-1, eps=1e-6)
+            scale = jax.lax.rsqrt(jnp.asarray(head_k_dim, dtype=jnp.float32))
+            query = (query.astype(jnp.float32) * scale).astype(query.dtype)
+
+            beta = jax.nn.sigmoid(beta_raw[0, safe_positions].astype(jnp.float32))
+            g = -jnp.exp(A_log.astype(jnp.float32))[None, :] * jax.nn.softplus(
+                alpha_raw[0, safe_positions].astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
+            )
+            exp_g = jnp.exp(g)
+
+            state_f = rolling_recurrent.astype(jnp.float32)
+            key_f = key.astype(jnp.float32)
+            value_f = value.astype(jnp.float32)
+            exp_g_f = exp_g.astype(jnp.float32)
+            k_state = jnp.einsum("bhd,bhdm->bhm", key_f, state_f)
+            v_new = beta[..., None] * (value_f - exp_g_f[..., None] * k_state)
+            next_recurrent = state_f * exp_g_f[..., None, None] + key_f[..., :, None] * v_new[..., None, :]
+
+            rolling_conv = jnp.where(
+                prefix_valid[:, None, None],
+                shifted_conv.astype(rolling_conv.dtype),
+                rolling_conv,
+            ).astype(rolling_conv.dtype)
+            rolling_recurrent = jnp.where(
+                prefix_valid[:, None, None, None],
+                next_recurrent.astype(rolling_recurrent.dtype),
+                rolling_recurrent,
+            )
+
+            candidate_rows = base_slots + slot_ids * candidate_count + int(prefix_idx)
+            in_bounds = candidate_rows < conv_states.shape[0]
+            safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
+            write_mask = prefix_valid & in_bounds
+            candidate_conv_values = jnp.where(
+                write_mask[:, None, None],
+                rolling_conv.astype(candidate_conv_states.dtype),
+                candidate_conv_states[safe_rows],
+            ).astype(candidate_conv_states.dtype)
+            candidate_recurrent_values = jnp.where(
+                write_mask[:, None, None, None],
+                rolling_recurrent.astype(candidate_recurrent_states.dtype),
+                candidate_recurrent_states[safe_rows],
+            ).astype(candidate_recurrent_states.dtype)
+            candidate_conv_states = candidate_conv_states.at[safe_rows].set(candidate_conv_values)
+            candidate_recurrent_states = candidate_recurrent_states.at[safe_rows].set(candidate_recurrent_values)
+
+        return candidate_conv_states, candidate_recurrent_states
+
+    return jax.lax.cond(
+        jnp.any(spec_slot_mask),
+        _run_candidate_scan,
+        lambda _: (conv_states, recurrent_states),
+        operand=None,
+    )
 
 
 def _apply_qwen3_next_packed_updates_ragged(
@@ -849,6 +1446,8 @@ def _apply_qwen3_next_packed_updates_ragged(
     beta_raw: Float[Array, "batch seq_len num_v_heads"],
     A_log: Float[Array, "num_v_heads"],
     dt_bias: Float[Array, "num_v_heads"],
+    context_lens: Int[Array, "num_slots"] | None = None,
+    spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -931,6 +1530,7 @@ def _apply_qwen3_next_packed_updates_ragged(
     """
     seq_len = conv_input.shape[1]
     d_conv = kernel.shape[1]
+    token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
     num_slots = min(conv_states.shape[0], query_start_loc.shape[0] - 1)
     slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
     scheduled_tokens = query_start_loc[1 : num_slots + 1] - query_start_loc[:num_slots]
@@ -938,46 +1538,134 @@ def _apply_qwen3_next_packed_updates_ragged(
     single_slot_mask = active_slots & (scheduled_tokens == 1)
 
     if num_slots == 0:
-        token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
         return conv_states, recurrent_states, token_outputs
+
+    extra_slots = conv_states.shape[0] - num_slots
+    candidate_count = extra_slots // num_slots if num_slots > 0 and extra_slots > 0 else 0
+    if candidate_count > 0 and spec_recurrent_commit is not None:
+        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
+        raw_prefix = commit[1, :num_slots]
+        commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
+        candidate_rows = num_slots + slot_ids * int(candidate_count) + raw_prefix - 1
+        safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
+        row_valid = commit_active & (candidate_rows < conv_states.shape[0])
+        conv_states = conv_states.at[:num_slots].set(
+            jnp.where(row_valid[:, None, None], conv_states[safe_rows], conv_states[:num_slots]).astype(
+                conv_states.dtype
+            )
+        )
+        recurrent_states = recurrent_states.at[:num_slots].set(
+            jnp.where(
+                row_valid[:, None, None, None],
+                recurrent_states[safe_rows],
+                recurrent_states[:num_slots],
+            ).astype(recurrent_states.dtype)
+        )
 
     state_indices = jnp.arange(num_slots, dtype=jnp.int32)
     decode_count = jnp.sum(single_slot_mask)
     num_active = jnp.sum(active_slots)
     distribution = jnp.stack([decode_count, num_active, num_active])
     qsl = query_start_loc[: num_slots + 1]
-
-    conv_outputs_flat, updated_conv_states = ragged_causal_conv1d(
-        conv_input[0],
-        conv_states,
-        kernel,
-        qsl,
-        state_indices,
-        distribution,
-        d_conv=d_conv,
-        apply_silu=True,
+    if context_lens is None:
+        has_initial_state = jnp.ones((num_slots,), dtype=jnp.bool_)
+    else:
+        context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:num_slots]
+        has_initial_state = ((context_lens_i - scheduled_tokens) > 0) & active_slots
+    gdr_metadata = ragged_gdr_op.get_impl_metadata()
+    gdr_mode = ragged_gdr_op.get_mode(query=jnp.expand_dims(conv_input[0], 0), BTHD=False)
+    shardings_bthd = gdr_metadata.get_shardings(gdr_mode, layout="bthd")
+    head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+    mesh = gdr_metadata.mesh
+    tp_size = int(mesh_axis_size(mesh, head_axis))
+    split_sizes = (
+        int(num_k_heads * head_k_dim),
+        int(num_k_heads * head_k_dim),
+        int(num_v_heads * head_v_dim),
     )
-    conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
+    use_head_sharded_conv = (
+        mesh is not None and head_axis is not None and tp_size > 1 and all(size % tp_size == 0 for size in split_sizes)
+    )
+    use_recurrent_scan_prefill = jax.default_backend() == "tpu" and seq_len >= 128
 
-    new_recurrent_state, token_outputs = ragged_gdr_op(
-        mixed_qkv=conv_outputs_flat,
-        b=beta_raw[0, :seq_len],
-        a=alpha_raw[0, :seq_len],
-        recurrent_state=recurrent_states,
+    candidate_conv_states, candidate_recurrent_states = _write_qwen3_next_spec_candidate_states(
+        conv_states=conv_states,
+        recurrent_states=recurrent_states,
+        conv_input=conv_input,
+        kernel=kernel,
+        query_start_loc=query_start_loc,
+        context_lens=context_lens,
+        num_requests=num_requests,
+        num_k_heads=num_k_heads,
+        head_k_dim=head_k_dim,
+        num_v_heads=num_v_heads,
+        head_v_dim=head_v_dim,
+        conv_output_dtype=conv_output_dtype,
+        alpha_raw=alpha_raw,
+        beta_raw=beta_raw,
         A_log=A_log,
         dt_bias=dt_bias,
-        query_start_loc=qsl,
-        state_indices=state_indices,
-        distribution=distribution,
-        n_kq=num_k_heads,
-        n_v=num_v_heads,
-        d_k=head_k_dim,
-        d_v=head_v_dim,
-        chunk_size=64,
-        use_qk_norm_in_gdn=True,
     )
-    token_outputs = token_outputs.reshape(seq_len, num_v_heads, head_v_dim)
-    return updated_conv_states, new_recurrent_state, token_outputs.astype(jnp.float32)
+
+    def _run_normal_ragged_path(_):
+        """Run the standard ragged conv + ragged GDR fast path.
+
+        Composes :func:`ragged_causal_conv1d_head_sharded` with the
+        chunked / decode-only branches of :class:`RaggedGatedDeltaRule`,
+        sharing one ``(query_start_loc, state_indices, distribution)``
+        triple so the entire layer collapses to two kernel launches.
+        Speculative-candidate rows produced earlier are merged back
+        after both kernel calls.
+        """
+        conv_outputs_flat, updated_conv_states = ragged_causal_conv1d_head_sharded(
+            conv_input[0],
+            conv_states,
+            kernel,
+            qsl,
+            state_indices,
+            distribution,
+            split_sizes=split_sizes,
+            mesh=mesh,
+            head_axis=head_axis,
+            d_conv=d_conv,
+            apply_silu=not use_recurrent_scan_prefill,
+            pre_sharded=use_head_sharded_conv,
+        )
+        conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
+
+        new_recurrent_state, token_outputs_i = ragged_gdr_op(
+            mixed_qkv=conv_outputs_flat,
+            b=beta_raw[0, :seq_len],
+            a=alpha_raw[0, :seq_len],
+            recurrent_state=recurrent_states,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            query_start_loc=qsl,
+            state_indices=state_indices,
+            distribution=distribution,
+            has_initial_state=has_initial_state,
+            n_kq=num_k_heads,
+            n_v=num_v_heads,
+            d_k=head_k_dim,
+            d_v=head_v_dim,
+            chunk_size=32,
+            use_qk_norm_in_gdn=True,
+            pre_sharded_mixed_qkv=use_head_sharded_conv,
+            flat_tp_shard=use_head_sharded_conv,
+            apply_silu_in_gdr=use_recurrent_scan_prefill,
+            use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+        )
+        token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
+        if conv_states.shape[0] > num_slots:
+            updated_conv_states = updated_conv_states.at[num_slots:].set(
+                candidate_conv_states[num_slots:].astype(updated_conv_states.dtype)
+            )
+            new_recurrent_state = new_recurrent_state.at[num_slots:].set(
+                candidate_recurrent_states[num_slots:].astype(new_recurrent_state.dtype)
+            )
+        return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
+
+    return _run_normal_ragged_path(None)
 
 
 def _apply_qwen3_next_packed_updates(
@@ -1003,6 +1691,8 @@ def _apply_qwen3_next_packed_updates(
     beta_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
     A_log: Float[Array, "num_v_heads"] | None = None,
     dt_bias: Float[Array, "num_v_heads"] | None = None,
+    context_lens: Int[Array, "num_slots"] | None = None,
+    spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -1011,9 +1701,9 @@ def _apply_qwen3_next_packed_updates(
     """Dispatch function that selects the packed update implementation.
 
     This is the public entry point called by ``Qwen3NextLinearAttention`` during
-    packed-batch (continuous batching) inference. It delegates to either the
-    unified implementation or the ragged GDR fast path depending on the
-    ``EASYDEL_RAGGED_GDR`` flag and runtime mode.
+    packed-batch (continuous batching) inference. In inference mode it uses the
+    vLLM-style ragged conv + ragged GDR path by default; the older unified path
+    remains the non-inference fallback.
 
     Args:
         conv_states: Per-slot conv state, shape ``[num_slots, conv_dim, d_conv]``.
@@ -1040,7 +1730,12 @@ def _apply_qwen3_next_packed_updates(
         token_outputs of shape ``[seq_len, num_v_heads, head_v_dim]``).
     """
 
-    use_ragged = is_inference_mode() and check_bool_flag("EASYDEL_RAGGED_GDR", True)
+    use_ragged = is_inference_mode() and os.environ.get("EASYDEL_RAGGED_GDR", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
     if not use_ragged:
         return _apply_qwen3_next_packed_updates_unified(
             conv_states=conv_states,
@@ -1048,6 +1743,10 @@ def _apply_qwen3_next_packed_updates(
             conv_input=conv_input,
             beta=beta,
             decay=decay,
+            beta_raw=beta_raw,
+            alpha_raw=alpha_raw,
+            A_log=A_log,
+            dt_bias=dt_bias,
             kernel=kernel,
             query_start_loc=query_start_loc,
             num_requests=num_requests,
@@ -1059,6 +1758,8 @@ def _apply_qwen3_next_packed_updates(
             expand_ratio=expand_ratio,
             conv_output_dtype=conv_output_dtype,
             gdr_op=gdr_op,
+            context_lens=context_lens,
+            spec_recurrent_commit=spec_recurrent_commit,
         )
 
     return _apply_qwen3_next_packed_updates_ragged(
@@ -1078,6 +1779,8 @@ def _apply_qwen3_next_packed_updates(
         beta_raw=beta_raw,
         A_log=A_log,
         dt_bias=dt_bias,
+        context_lens=context_lens,
+        spec_recurrent_commit=spec_recurrent_commit,
     )
 
 
@@ -1131,14 +1834,18 @@ class Qwen3NextRMSNorm(spx.Module):
         return x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
 
     def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
-        """
-        Apply RMSNorm with (1 + weight) formula.
+        """Apply RMSNorm with (1 + weight) scaling.
+
+        Computes the normalisation in fp32 for numerical stability, then
+        scales by ``(1 + weight)`` so the learnable weight can be
+        initialised to zero and still recover an identity transform.
 
         Args:
-            hidden_states: Input tensor to normalize.
+            hidden_states: Input tensor with the channel dim last.
 
         Returns:
-            Normalized tensor.
+            Normalised and rescaled tensor cast back to the original
+            input dtype.
         """
         org_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
@@ -1187,8 +1894,9 @@ class Qwen3NextMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -1196,19 +1904,29 @@ class Qwen3NextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.gate_up_proj = build_fused_gate_up_projection(
+            config=config,
+            intermediate_size=intermediate_size,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
-        self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
-        self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size, rngs=rngs)
-        self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Return the checkpoint reform rule for the fused gate/up projection.
+
+        The HF Qwen3-Next checkpoint stores ``gate_proj`` and
+        ``up_proj`` as two separate tensors; EasyDeL fuses them into a
+        single ``gate_up_proj`` column-parallel projection. This
+        property exposes the corresponding fuser registered on the
+        fused projection layout.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
@@ -1224,8 +1942,9 @@ class Qwen3NextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1248,29 +1967,6 @@ class Qwen3NextMLPStack(spx.Module):
         up_proj: Column-parallel up projection for all experts.
         act_fn: Activation function (SiLU).
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [{"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -1296,10 +1992,10 @@ class Qwen3NextMLPStack(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -1320,19 +2016,18 @@ class Qwen3NextMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(
+                config=self.config,
+                target_prefix="gate_up_proj",
+                source_prefix="gate_up_proj",
+            ),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -1350,12 +2045,9 @@ class Qwen3NextMLPStack(spx.Module):
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-            * self.up_proj(hidden_states, group_sizes, sorted_experts),
-            group_sizes,
-            sorted_experts,
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = jnp.split(gate_up, 2, axis=-1)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen3NextSparseMoeBlock(BaseMoeModule):
@@ -1457,8 +2149,7 @@ class Qwen3NextSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -1530,6 +2221,21 @@ class Qwen3NextFullAttention(UnifiedAttention):
             use_qk_norm=True,
         )
         self.layer_idx = layer_idx
+        self.attn_output_gate = bool(getattr(config, "attn_output_gate", True))
+        num_kv_heads = int(getattr(config, "num_key_value_heads", self.num_key_value_heads))
+        self.logical_num_key_value_heads = num_kv_heads
+
+    def _q_proj_multiplier(self) -> int:
+        """Return ``2`` when the query projection also produces an output gate.
+
+        Qwen3-Next's full-attention layers use a doubled-width query
+        projection so the second half of the matmul can serve as a
+        per-head sigmoid gate applied to the attention output. When the
+        ``attn_output_gate`` config field is disabled, the projection
+        falls back to a vanilla ``num_heads * head_dim`` output and this
+        helper returns ``1``.
+        """
+        return 2 if bool(getattr(self, "attn_output_gate", True)) else 1
 
     def _create_q_proj(
         self,
@@ -1543,10 +2249,94 @@ class Qwen3NextFullAttention(UnifiedAttention):
 
         HuggingFace Qwen3Next uses q_proj that outputs doubled dimension,
         which is then split into query states and gate values.
+
+        Args:
+            config: Owning :class:`Qwen3NextConfig`.
+            dtype: Compute dtype for the projection.
+            param_dtype: Parameter dtype for the kernel.
+            precision: JAX precision flag forwarded to the matmul.
+            rngs: Random number generator state for initialisation.
+
+        Returns:
+            :class:`ColumnParallelLinear` with output width
+            ``num_heads * head_dim * 2``.
         """
         return ColumnParallelLinear(
             config.hidden_size,
             self.num_heads * self.head_dim * 2,  # 2x for query + gate
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+        )
+
+    def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create vLLM-style packed ``[Q(+gate) | K | V]`` projection.
+
+        Builds a single column-parallel projection whose output is
+        partitioned into Q (optionally doubled for the gate), K, and V
+        segments by a :class:`FusedColumnLayout`. This lets the runtime
+        issue one matmul per layer instead of three and lets the
+        downstream split helpers reuse the layout for both runtime
+        ``split`` and checkpoint reform.
+
+        Args:
+            config: Owning :class:`Qwen3NextConfig`.
+            dtype: Compute dtype for the projection.
+            param_dtype: Parameter dtype for the kernel.
+            precision: JAX precision flag forwarded to the matmul.
+            rngs: Random number generator state for initialisation.
+
+        Returns:
+            :class:`ColumnParallelLinear` carrying the QKV layout.
+        """
+        q_out = self.num_heads * self.head_dim * (2 if getattr(config, "attn_output_gate", True) else 1)
+        kv_out = self.num_key_value_heads * self.head_dim
+        layout = _qwen3_next_full_attention_layout(q_size=q_out, kv_size=kv_out)
+        return ColumnParallelLinear(
+            config.hidden_size,
+            layout.out_features,
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+            layout=layout,
+        )
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create the per-KV-head key projection.
+
+        Returns:
+            :class:`ColumnParallelLinear` with output width
+            ``num_key_value_heads * head_dim``; used only on the
+            non-fused projection code path.
+        """
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+        )
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create the per-KV-head value projection.
+
+        Returns:
+            :class:`ColumnParallelLinear` with output width
+            ``num_key_value_heads * head_dim``; used only on the
+            non-fused projection code path.
+        """
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
@@ -1642,31 +2432,20 @@ class Qwen3NextFullAttention(UnifiedAttention):
         batch_size = hidden_states.shape[0]
         sequence_length = hidden_states.shape[1]
 
-        q_proj_output = checkpoint_name(self.q_proj(hidden_states), "attn_query")
-        q_proj_output = apply_logical_sharding(
-            q_proj_output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        q_multiplier = self._q_proj_multiplier()
+        qkv_output = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        qkv_output = _apply_tp_last_axis_sharding(qkv_output, self.config)
+        q_proj_output, key_states, value_states = self.qkv_proj.split(qkv_output, config=self.config)
 
-        q_proj_output = q_proj_output.reshape(batch_size, sequence_length, -1, self.head_dim * 2)
-        query_states, gate = jnp.split(q_proj_output, 2, axis=-1)
-
-        key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
-        value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
-        key_states = apply_logical_sharding(
-            key_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        value_states = apply_logical_sharding(
-            value_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-
+        q_proj_output = q_proj_output.reshape(batch_size, sequence_length, -1, self.head_dim * q_multiplier)
         key_states = key_states.reshape(batch_size, sequence_length, -1, self.head_dim)
         value_states = value_states.reshape(batch_size, sequence_length, -1, self.head_dim)
+
+        if self.attn_output_gate:
+            query_states, gate = jnp.split(q_proj_output, 2, axis=-1)
+        else:
+            query_states = q_proj_output
+            gate = None
 
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
 
@@ -1724,15 +2503,19 @@ class Qwen3NextFullAttention(UnifiedAttention):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        if attn_output.dtype in lowfloats or gate.dtype in lowfloats:
-            attn_output_dtype = attn_output.dtype
-            attn_output = attn_output.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
-            attn_output = attn_output.astype(attn_output_dtype)
-        else:
-            attn_output = attn_output * jax.nn.sigmoid(gate)
+        if gate is not None:
+            if attn_output.dtype in lowfloats or gate.dtype in lowfloats:
+                attn_output_dtype = attn_output.dtype
+                attn_output = attn_output.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
+                attn_output = attn_output.astype(attn_output_dtype)
+            else:
+                attn_output = attn_output * jax.nn.sigmoid(gate)
 
         attn_output = self._merge_heads(attn_output)
-        attn_output = self.shard_attention_prod(attn_output)
+        if _qwen3_next_tp_size(self.config) > 1:
+            attn_output = _apply_tp_last_axis_sharding(attn_output, self.config)
+        else:
+            attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.o_proj(attn_output)
         attn_output = self.shard_attention_prod(attn_output)
 
@@ -1755,6 +2538,7 @@ class Qwen3NextLinearAttention(spx.Module):
     HuggingFace-compatible parameter naming:
     - Packed mode (Qwen3-Next): in_proj_qkvz and in_proj_ba
     - Split mode (Qwen3.5): in_proj_qkv, in_proj_z, in_proj_b, and in_proj_a
+    - Merged-split mode: load split HF tensors into packed TP-interleaved projections
     - A_log: Log of decay matrix A
     - dt_bias: Time discretization bias
     - conv1d: Causal convolution
@@ -1765,13 +2549,6 @@ class Qwen3NextLinearAttention(spx.Module):
         config: Model configuration.
         layer_idx: Index of this layer.
     """
-
-    reform_param: typing.ClassVar = {
-        "conv1d.weight$": {
-            "splits": [{"name": "conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
-            "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
-        },
-    }
 
     def __init__(
         self,
@@ -1807,9 +2584,39 @@ class Qwen3NextLinearAttention(spx.Module):
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.linear_attention_layout = Qwen3NextLinearAttentionLayout(
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            config=config,
+        )
 
-        self.uses_split_proj = bool(getattr(config, "linear_attention_separate_proj", False))
-        if self.uses_split_proj:
+        self.uses_split_proj = bool(config.linear_attention_separate_proj)
+        self.uses_merged_split_proj = bool(config.linear_attention_merged_split_proj)
+        if self.uses_split_proj and self.uses_merged_split_proj:
+            raise ValueError("linear_attention_separate_proj and linear_attention_merged_split_proj are exclusive")
+        if self.uses_merged_split_proj:
+            self.in_proj_qkvz = ColumnParallelLinear(
+                config.hidden_size,
+                self.key_dim * 2 + self.value_dim * 2,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+
+            self.in_proj_ba = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads * 2,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+        elif self.uses_split_proj:
             self.in_proj_qkv = ColumnParallelLinear(
                 config.hidden_size,
                 self.key_dim * 2 + self.value_dim,
@@ -1851,10 +2658,9 @@ class Qwen3NextLinearAttention(spx.Module):
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
             )
         else:
-            qkvz_dim = self.key_dim * 2 + self.value_dim * 2
             self.in_proj_qkvz = ColumnParallelLinear(
                 config.hidden_size,
-                qkvz_dim,
+                self.key_dim * 2 + self.value_dim * 2,
                 use_bias=False,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1863,10 +2669,9 @@ class Qwen3NextLinearAttention(spx.Module):
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
             )
 
-            ba_dim = self.num_v_heads * 2
             self.in_proj_ba = ColumnParallelLinear(
                 config.hidden_size,
-                ba_dim,
+                self.num_v_heads * 2,
                 use_bias=False,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1927,6 +2732,15 @@ class Qwen3NextLinearAttention(spx.Module):
         self.gdr_op = GatedDeltaRuleOp(metadata)
         self.ragged_gdr_op = RaggedGatedDeltaRule(metadata)
 
+    @property
+    def reform_param(self):
+        return _build_qwen3_next_linear_attention_reform_param(
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            config=self.config,
+            include_qkvz_fusion=self.uses_merged_split_proj,
+        )
+
     def _stage_replicated_depthwise_conv(
         self,
         conv_input: Float[Array, "batch seq conv_dim"],
@@ -1941,6 +2755,15 @@ class Qwen3NextLinearAttention(spx.Module):
         current physical PP stage, run the depthwise conv there, and let the
         following query/key/value sharding constraints restore the normal TP
         layout before the GDR kernel.
+
+        Args:
+            conv_input: Convolution input, shape
+                ``(batch, seq, conv_dim)``; expected to be the
+                concatenation of the Q/K/V projection streams.
+
+        Returns:
+            Convolution output with the same shape as ``conv_input``,
+            constrained to the same replicated 3-D ``PartitionSpec``.
         """
         stage_mesh = resolve_stage_mesh(self.config.mesh)
         replicated_3d = PartitionSpec(None, None, None)
@@ -1967,19 +2790,27 @@ class Qwen3NextLinearAttention(spx.Module):
         mixed_qkvz: Float[Array, "batch seq proj_dim"],
         mixed_ba: Float[Array, "batch seq ba_dim"],
     ):
-        """Reorder QKV from grouped layout to separate tensors.
+        """Unpack HF's grouped packed QKVZ/beta-alpha runtime layout.
 
-        HuggingFace organizes the projection output in a grouped layout:
-        [q_h0, k_h0, v_h0, z_h0, q_h1, k_h1, v_h1, z_h1, ...]
-
-        This method unpacks that layout into separate Q, K, V, Z tensors.
+        Qwen3-Next stores ``q``, ``k``, ``v``, ``z`` per *query head*
+        (interleaved within the channel axis) and ``b``/``a`` per *value
+        head* (also interleaved). This helper splits the packed
+        projections into the four QKVZ streams plus the two BA streams
+        with the correct per-head reshapes so the downstream
+        gated-delta-rule code sees one tensor per logical role.
 
         Args:
-            mixed_qkvz: Projected QKVZ tensor in grouped layout.
-            mixed_ba: Projected beta/alpha tensor.
+            mixed_qkvz: Output of the packed ``in_proj_qkvz`` projection,
+                shape ``(batch, seq, num_k_heads * (2 * head_k_dim +
+                2 * expand_ratio * head_v_dim))``.
+            mixed_ba: Output of the packed ``in_proj_ba`` projection,
+                shape ``(batch, seq, num_k_heads * 2 * expand_ratio)``.
 
         Returns:
-            Tuple of (query, key, value, z, beta, alpha) tensors.
+            Six-tuple ``(query, key, value, z, beta, alpha)`` with shapes
+            ``(batch, seq, num_k_heads, head_k_dim)`` for query/key,
+            ``(batch, seq, num_v_heads, head_v_dim)`` for value/z, and
+            ``(batch, seq, num_v_heads)`` for beta/alpha.
         """
         batch, seq, _ = mixed_qkvz.shape
 
@@ -2044,7 +2875,13 @@ class Qwen3NextLinearAttention(spx.Module):
         is_inference = seq_len == 1 and cache_view is not None
         expand_ratio = self.num_v_heads // self.num_k_heads
 
-        if self.uses_split_proj:
+        if self.uses_merged_split_proj:
+            projected_qkvz = self.in_proj_qkvz(hidden_states)
+            conv_input, z_flat = self.linear_attention_layout.split_projected_qkvz(projected_qkvz)
+            z = z_flat.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+            mixed_ba = self.in_proj_ba(hidden_states)
+            beta, alpha = self.linear_attention_layout.split_projected_ba(mixed_ba, self.num_v_heads)
+        elif self.uses_split_proj:
             projected_qkv = self.in_proj_qkv(hidden_states)
             z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
             beta = self.in_proj_b(hidden_states)
@@ -2071,6 +2908,10 @@ class Qwen3NextLinearAttention(spx.Module):
 
         packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
         packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
+        packed_context_lens = getattr(cache_metadata, "context_lens", None) if cache_metadata is not None else None
+        packed_spec_recurrent_commit = (
+            getattr(cache_metadata, "spec_recurrent_commit", None) if cache_metadata is not None else None
+        )
         use_packed_state_updates = (
             cache_view is not None
             and cache_view.conv_state is not None
@@ -2117,6 +2958,8 @@ class Qwen3NextLinearAttention(spx.Module):
                 beta_raw=beta_raw,
                 A_log=self.A_log.value,
                 dt_bias=self.dt_bias.value,
+                context_lens=packed_context_lens,
+                spec_recurrent_commit=packed_spec_recurrent_commit,
             )
 
             output = token_outputs[None, ...]
@@ -2130,6 +2973,7 @@ class Qwen3NextLinearAttention(spx.Module):
                 raise RuntimeError("Packed state update did not produce output/cache state.")
             output = self.norm(output, z)
             output = output.reshape(batch_size, seq_len, -1)
+            output = _apply_tp_last_axis_sharding(output, self.config)
             output = self.out_proj(output)
             output = apply_logical_sharding(
                 output,
@@ -2231,11 +3075,7 @@ class Qwen3NextLinearAttention(spx.Module):
         )
         output = self.norm(output, z)
         output = output.reshape(batch_size, seq_len, -1)
-        output = apply_logical_sharding(
-            output,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
+        output = _apply_tp_last_axis_sharding(output, self.config)
         output = self.out_proj(output)
         output = apply_logical_sharding(
             output,
@@ -2842,7 +3682,7 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
             top_k=self.config.num_experts_per_tok,
             attention_mask=attention_mask,
         )
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        return aux_loss * self.config.router_aux_loss_coef
 
 
 __all__ = [

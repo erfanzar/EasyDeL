@@ -33,7 +33,6 @@ Exports:
     - :class:`Glm4MoeForSequenceClassification`: Pooled classifier head.
 """
 
-import typing
 from functools import partial
 
 import jax
@@ -71,6 +70,10 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -113,8 +116,20 @@ class Glm4MoeMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (self.intermediate_size, self.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(self.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -122,19 +137,17 @@ class Glm4MoeMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(config.hidden_size, self.intermediate_size)
-        self.up_proj = column_parallel_linear(config.hidden_size, self.intermediate_size)
-        self.down_proj = row_parallel_linear(self.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused ``gate_up_proj`` projection.
+
+        Returns:
+            dict: Mapping consumed by the checkpoint loader to split the fused
+                gate/up kernel back into per-projection slices on load.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply gated feedforward transformation.
@@ -151,8 +164,9 @@ class Glm4MoeMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate_output = self.act_fn(checkpoint_name(self.gate_proj(hidden_states), name="mlp_gate"))
-        up_output = checkpoint_name(self.up_proj(hidden_states), name="mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
+        gate_raw, up_output = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate_output = self.act_fn(checkpoint_name(gate_raw, name="mlp_gate"))
         hidden_states = checkpoint_name(self.down_proj(gate_output * up_output), name="mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -169,31 +183,6 @@ class Glm4MoeMLPStack(spx.Module):
     batched computation with ColumnParallelMoELinear and RowParallelMoELinear
     layers. Supports expert tensor mode for optimized expert computation.
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -219,10 +208,10 @@ class Glm4MoeMLPStack(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -243,19 +232,14 @@ class Glm4MoeMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.n_routed_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -273,8 +257,9 @@ class Glm4MoeMLPStack(spx.Module):
         Returns:
             Expert output tensor after gated feedforward transformation.
         """
-        hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes, sorted_experts), name="moe_gate"))
-        hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes, sorted_experts), name="moe_up")
+        gate_up = checkpoint_name(self.gate_up_proj(x, group_sizes, sorted_experts), name="moe_gate_up")
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        hidden_states = self.act_fn(checkpoint_name(gate, name="moe_gate")) * up
         outputs = checkpoint_name(self.down_proj(hidden_states, group_sizes, sorted_experts), name="moe_expert_output")
         return outputs
 
@@ -589,8 +574,7 @@ class Glm4MoeMoE(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )

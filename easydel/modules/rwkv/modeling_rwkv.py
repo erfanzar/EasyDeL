@@ -101,8 +101,23 @@ class RwkvCausalLMOutput(ModelOutput):
 def init_state(hidden_size: int, batch_size: int | None = None):
     """Create zeroed RWKV recurrent state tensors for a given hidden size.
 
-    RWKV is recurrent over the sequence dimension but can be vectorized over the batch
-    dimension. When `batch_size` is provided, the state tensors include the batch axis.
+    RWKV is recurrent over the sequence dimension but can be vectorized over
+    the batch dimension. The returned tuple holds both the time-mix state
+    (four arrays: previous hidden, numerator, denominator, log-normaliser)
+    and the channel-mix state (single previous-hidden array). The
+    log-normaliser is initialised to ``-1e38`` so the log-sum-exp update is
+    numerically equivalent to starting from an empty running average.
+
+    Args:
+        hidden_size: Per-channel dimensionality of the RWKV state.
+        batch_size: Optional batch axis. When ``None`` the returned arrays
+            are 1-D ``(hidden_size,)``; when set, they are 2-D
+            ``(batch_size, hidden_size)``.
+
+    Returns:
+        Tuple ``(time_mix_state, channel_mix_state)`` where
+        ``time_mix_state`` is itself a 4-tuple of arrays and
+        ``channel_mix_state`` is a single array.
     """
     if batch_size is None:
         zeros = jnp.zeros((hidden_size,))
@@ -123,28 +138,35 @@ def rwkv_linear_attention(
     state=None,
     return_state=False,
 ):
-    """Compute RWKV linear attention update with optional recurrent state.
+    """Reference RWKV linear-attention update with optional recurrent state.
 
-    Implements the RWKV attention mechanism that achieves linear complexity
-    through a recurrent formulation. Unlike traditional attention, this
-    computes a weighted combination of values using exponential decay
-    over time steps.
+    Implements the RWKV attention mechanism that achieves linear
+    complexity through a recurrent formulation: a weighted combination
+    of values using exponential decay over time steps, with a
+    log-sum-exp normaliser for stability.
+
+    This is the pedagogical Python-loop reference implementation. The
+    runtime-fused path used by :class:`RwkvSelfAttention` is
+    ``jax.lax.scan``-based and lives inside the layer's ``forward``;
+    this helper is retained for clarity / debugging.
 
     Args:
-        time_decay: Time decay parameter controlling how quickly past
-            information fades, shape (hidden_size,).
-        time_first: Initial time weighting parameter for the first token,
-            shape (hidden_size,).
-        key: Key tensor of shape (batch, seq_len, hidden_size).
-        value: Value tensor of shape (batch, seq_len, hidden_size).
-        state: Optional tuple of (numerator_state, denominator_state, max_state)
-            from previous time steps for continuing recurrence.
+        time_decay: Time-decay parameter controlling how quickly past
+            information fades, shape ``(hidden_size,)``.
+        time_first: Initial time-weighting parameter for the first token,
+            shape ``(hidden_size,)``.
+        key: Key tensor of shape ``(batch, seq_len, hidden_size)``.
+        value: Value tensor of shape ``(batch, seq_len, hidden_size)``.
+        state: Optional tuple ``(numerator_state, denominator_state,
+            max_state)`` carried from previous time steps to continue
+            the recurrence.
         return_state: Whether to return the updated recurrent state.
 
     Returns:
-        tuple: (output, state) where output has shape (batch, seq_len, hidden_size)
-            and state is a list of [num_state, den_state, max_state] if
-            return_state is True or state was provided, else None.
+        Tuple ``(output, state)`` where ``output`` has shape
+        ``(batch, seq_len, hidden_size)`` and ``state`` is a list
+        ``[num_state, den_state, max_state]`` if ``return_state`` is true
+        or a non-``None`` ``state`` was supplied, else ``None``.
     """
     current_sequence_length = key.shape[1]
     output = jnp.zeros_like(key)

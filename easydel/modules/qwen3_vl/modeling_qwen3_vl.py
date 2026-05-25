@@ -29,7 +29,7 @@ forwards through the LM head.
 """
 
 import math
-from functools import cached_property, partial
+from functools import cached_property
 
 import jax
 import jax.numpy as jnp
@@ -61,7 +61,14 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
@@ -687,7 +694,6 @@ class Qwen3VLVisionAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=False,
-            use_fused_qkv=True,
             use_gqa=False,
         )
 
@@ -1248,8 +1254,20 @@ class Qwen3VLTextMLP(spx.Module):
         self.precision = precision
         self.layer_idx = layer_idx
 
-        column_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -1257,20 +1275,20 @@ class Qwen3VLTextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.up_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused gate-up projection.
+
+        Returns:
+            dict: Mapping from external ``gate_up_proj`` checkpoint
+            entries to the layout used internally by the fused
+            :attr:`gate_up_proj` ColumnParallelLinear, enabling
+            round-trip conversion of HuggingFace-style separate gate /
+            up weights into the fused layout used here.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
@@ -1286,8 +1304,9 @@ class Qwen3VLTextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,

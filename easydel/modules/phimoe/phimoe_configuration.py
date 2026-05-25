@@ -258,18 +258,17 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         )
 
     def _rope_scaling_validation(self):
-        """
-        Validate the `rope_scaling` configuration.
-        """
-        """Validates the `rope_scaling` configuration dictionary.
+        """Validate the ``rope_scaling`` configuration dictionary.
 
-    Ensures that `rope_scaling` is a dictionary with the correct keys and value types
-    for the 'longrope' scaling type.
+        Ensures that ``rope_scaling`` is a dictionary with the correct keys and
+        value types for the ``"longrope"`` scaling type. ``None`` and a sentinel
+        ``"default"`` payload are accepted and treated as "no scaling".
 
-    Raises:
-        ValueError: If `rope_scaling` is not a dictionary, is missing keys,
-            or has invalid values/types for the 'longrope' configuration.
-    """
+        Raises:
+            ValueError: If ``rope_scaling`` is not a dictionary, is missing
+                required keys, has an unsupported type, or carries invalid
+                values for the ``"longrope"`` configuration.
+        """
         if self.rope_scaling is None:
             return
 

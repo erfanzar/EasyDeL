@@ -24,7 +24,6 @@ Components:
 """
 
 import typing
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -66,6 +65,11 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -990,6 +994,7 @@ class Qwen3OmniMoeVisionAttention(spx.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
@@ -1408,8 +1413,20 @@ class Qwen3OmniMoeTextMLP(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        column_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -1417,20 +1434,11 @@ class Qwen3OmniMoeTextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.up_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
@@ -1446,8 +1454,9 @@ class Qwen3OmniMoeTextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -1458,31 +1467,6 @@ class Qwen3OmniMoeMLPStack(spx.Module):
     Implements the expert MLP stack with SwiGLU activation function using
     column and row parallel MoE linear layers for efficient expert computation.
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -1503,10 +1487,10 @@ class Qwen3OmniMoeMLPStack(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -1527,19 +1511,14 @@ class Qwen3OmniMoeMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -1557,12 +1536,9 @@ class Qwen3OmniMoeMLPStack(spx.Module):
         Returns:
             Transformed hidden states after MoE MLP processing.
         """
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-            * self.up_proj(hidden_states, group_sizes, sorted_experts),
-            group_sizes,
-            sorted_experts,
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
@@ -1634,8 +1610,7 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -1921,8 +1896,20 @@ class Qwen3OmniMoeTalkerTextMLP(spx.Module):
         """
         self.config = config
         imz = intermediate_size or config.intermediate_size
-        column_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (imz, imz),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(imz),
+        )
+        self.down_proj = RowParallelLinear(
+            imz,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -1930,20 +1917,11 @@ class Qwen3OmniMoeTalkerTextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_linear(config.hidden_size, imz, rngs=rngs)
-        self.up_proj = column_linear(config.hidden_size, imz, rngs=rngs)
-        self.down_proj = row_linear(imz, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
@@ -1959,8 +1937,9 @@ class Qwen3OmniMoeTalkerTextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -1971,31 +1950,6 @@ class Qwen3OmniMoeTalkerMLPStack(spx.Module):
     Implements the expert MLP stack with SwiGLU activation function for
     the Talker's MoE layers.
     """
-
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
 
     def __init__(
         self,
@@ -2016,10 +1970,10 @@ class Qwen3OmniMoeTalkerMLPStack(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
+            out_features=2 * config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=False,
@@ -2040,19 +1994,14 @@ class Qwen3OmniMoeTalkerMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_experts,
-            in_features=config.hidden_size,
-            out_features=config.moe_intermediate_size,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -2070,12 +2019,9 @@ class Qwen3OmniMoeTalkerMLPStack(spx.Module):
         Returns:
             Transformed hidden states after MoE MLP processing.
         """
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-            * self.up_proj(hidden_states, group_sizes, sorted_experts),
-            group_sizes,
-            sorted_experts,
-        )
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
@@ -2174,8 +2120,7 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
         )
@@ -2400,8 +2345,20 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(spx.Module):
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
-        column_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -2409,20 +2366,11 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.up_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
@@ -2438,8 +2386,9 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         return checkpoint_name(hidden_states, "mlp_output")
 
@@ -3499,27 +3448,30 @@ class Qwen3OmniMoeCode2WavMLP(spx.Module):
             rngs: Random number generator state.
         """
         self.config = config
-        column_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             precision=precision,
             rngs=rngs,
         )
-        row_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.gate_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.up_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply gated MLP: down_proj(act(gate_proj(x)) * up_proj(x)).
@@ -3530,8 +3482,9 @@ class Qwen3OmniMoeCode2WavMLP(spx.Module):
         Returns:
             Transformed hidden states with same hidden dimension.
         """
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
+        gate_up = self.gate_up_proj(hidden_states)
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = self.act_fn(gate_raw)
         return self.down_proj(gate * up)
 
 
@@ -3578,32 +3531,18 @@ class Qwen3OmniMoeCode2WavAttention(spx.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.sliding_window = config.sliding_window
 
-        self.q_proj = ColumnParallelLinear(
+        q_size = config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+        qkv_layout = dense_qkv_layout(q_size, kv_size)
+        self.qkv_proj = ColumnParallelLinear(
             config.hidden_size,
-            config.num_attention_heads * config.head_dim,
+            qkv_layout.segment_sizes,
             use_bias=config.attention_bias,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.k_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.v_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            layout=qkv_layout,
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * config.head_dim,
@@ -3641,9 +3580,8 @@ class Qwen3OmniMoeCode2WavAttention(spx.Module):
         """
         batch_size, seq_len, _ = hidden_states.shape
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = self.qkv_proj.split(qkv, config=self.config)
 
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
@@ -3774,6 +3712,10 @@ class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     def forward(
         self,

@@ -159,6 +159,21 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         mlp_only_layers (`list[int]`, *optional*):
             Layer indices that use dense MLPs instead of MoE. Defaults to all layers
             (Qwen3.5 text is dense).
+        mtp_num_hidden_layers (`int`, *optional*, defaults to 0):
+            Number of MTP decoder blocks. Qwen3.5 checkpoints ship 1 block
+            per depth (DeepSeek-V3-style head). ``0`` disables the MTP head.
+        mtp_use_dedicated_embeddings (`bool`, *optional*, defaults to ``False``):
+            Whether the MTP head owns its own token embedding table. When
+            ``False`` (the Qwen3.5 default), the MTP head reads embeddings
+            from the main model's ``embed_tokens`` and projects through the
+            shared LM head.
+        mtp_loss_coef (`float`, *optional*, defaults to 0.3):
+            Coefficient for the MTP auxiliary cross-entropy loss when
+            summed with the main causal-LM loss during training.
+        attn_output_gate (`bool`, *optional*, defaults to ``True``):
+            Whether full-attention layers use a per-head sigmoid output
+            gate (``q_proj`` outputs ``2 * num_heads * head_dim``; the
+            second half drives the gate). Mirrors HF ``text_config.attn_output_gate``.
     """
 
     model_type = "qwen3_5_text"
@@ -202,6 +217,11 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
         linear_attention_separate_proj: bool | None = None,
+        linear_attention_merged_split_proj: bool = False,
+        mtp_num_hidden_layers: int = 0,
+        mtp_use_dedicated_embeddings: bool = False,
+        mtp_loss_coef: float = 0.3,
+        attn_output_gate: bool = True,
         **kwargs,
     ):
         """Initialize Qwen3.5 text config with hybrid attention and MoE parameters.
@@ -217,6 +237,8 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         # Qwen3.5 text uses dense MLPs by default.
         if mlp_only_layers is None or len(mlp_only_layers) == 0:
             mlp_only_layers = list(range(num_hidden_layers))
+        if linear_attention_separate_proj is None:
+            linear_attention_separate_proj = _has_hf_qwen3_5_text_impl() and not linear_attention_merged_split_proj
 
         super().__init__(
             vocab_size=vocab_size,
@@ -253,17 +275,18 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             output_router_logits=output_router_logits,
             router_aux_loss_coef=router_aux_loss_coef,
             mlp_only_layers=mlp_only_layers,
+            linear_attention_separate_proj=bool(linear_attention_separate_proj),
+            linear_attention_merged_split_proj=linear_attention_merged_split_proj,
             **kwargs,
         )
-        # Prefer split projections when native HF Qwen3.5 exists. In older HF
-        # installs that only expose Qwen3Next fallback classes, keep packed
-        # projections to match checkpoint parameter names.
-        if linear_attention_separate_proj is None:
-            self.linear_attention_separate_proj = _has_hf_qwen3_5_text_impl()
-        else:
-            self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
         # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
+
+        #
+        self.mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        self.mtp_use_dedicated_embeddings = bool(mtp_use_dedicated_embeddings)
+        self.mtp_loss_coef = float(mtp_loss_coef)
+        self.attn_output_gate = bool(attn_output_gate)
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Indicate that no Qwen3.5 text decoder layer is sparse.

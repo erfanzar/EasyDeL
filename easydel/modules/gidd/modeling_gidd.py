@@ -27,7 +27,6 @@ optimizations including gradient checkpointing, mixed precision, and model paral
 
 import typing as tp
 import warnings
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -51,7 +50,12 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_qkv_layout,
+)
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 
 from .gidd_configuration import GiddConfig
@@ -103,8 +107,9 @@ class GiddMLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size,
             scale="fan_in",
             dtype=dtype,
             param_dtype=param_dtype,
@@ -113,8 +118,9 @@ class GiddMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             scale="fan_in",
             dtype=dtype,
             param_dtype=param_dtype,
@@ -123,9 +129,6 @@ class GiddMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-
-        self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
-        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
 
     def forward(self, h: jnp.ndarray) -> jnp.ndarray:
         """Apply squared ReLU feedforward transformation.
@@ -233,41 +236,31 @@ class GiddAttention(AttentionModule):
             # Fixed scale based on head dimension
             self.qk_scale = 1.0
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        qkv_dim = config.num_attention_heads * self.head_dim
+        qkv_layout = dense_qkv_layout(qkv_dim, qkv_dim)
+        self.qkv_proj = ColumnParallelLinear(
+            config.hidden_size,
+            qkv_layout.segment_sizes,
             scale="fan_in",
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
             kernel_init=jax.nn.initializers.normal(config.init_scale),
             precision=precision,
+            rngs=rngs,
+            layout=qkv_layout,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
             scale="fan_in",
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
             kernel_init=jax.nn.initializers.normal(config.init_scale),
             precision=precision,
-        )
-
-        self.q_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
             rngs=rngs,
         )
-        self.k_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.v_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         self.rotary = self.config.get_basic_rope(
             self.dtype,
@@ -281,6 +274,10 @@ class GiddAttention(AttentionModule):
             softmax_scale=1.0 if self.use_qk_norm else 1.0 / self.head_dim**0.5,
             dropout_prob=0.0,
         )
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     @jax.named_scope("gidd-SpecTrax-attention-concatenate")
     def concatenate(
@@ -399,11 +396,8 @@ class GiddAttention(AttentionModule):
         batch_size, sequence_length = hidden_states.shape[:2]
 
         # Project inputs to Q, K, V
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), name="attn_qkv")
+        query_states, key_states, value_states = self.qkv_proj.split(qkv, config=self.config)
 
         if self.use_qk_norm:
             query_states = self._norm(query_states)
@@ -470,7 +464,7 @@ class GiddAttention(AttentionModule):
 
         # Project attention outputs back to hidden dimension
         attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
+            self.o_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))),
             name="attn_output",
         )
         attn_output = self.shard_attention_prod(attn_output)

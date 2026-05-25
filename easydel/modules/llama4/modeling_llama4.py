@@ -81,6 +81,11 @@ from easydel.layers import (
     MoeRoutingStrategy,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers import RMSNorm as Llama4TextRMSNorm
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
@@ -225,23 +230,6 @@ class Llama4TextExperts(spx.Module):
             corresponding fields on ``Llama4Config``.
     """
 
-    reform_param: tp.ClassVar = {
-        # HuggingFace has fused gate_up_proj, we split into separate gate_proj and up_proj
-        "gate_up_proj$": {
-            "splits": [
-                {"name": "gate_proj.weight", "spliter": lambda x: x[:, :, : x.shape[-1] // 2]},
-                {"name": "up_proj.weight", "spliter": lambda x: x[:, :, x.shape[-1] // 2 :]},
-            ],
-            "inverse_spliter": lambda g, u: jnp.concatenate([g, u], axis=-1),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x},
-            ],
-            "inverse_spliter": lambda x: x,
-        },
-    }
-
     def __init__(
         self,
         config: Llama4Config,
@@ -270,22 +258,10 @@ class Llama4TextExperts(spx.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
 
-        self.gate_proj = ColumnParallelMoELinear(
+        self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.hidden_size,
-            out_features=config.intermediate_size,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            use_bias=False,
-            partition_manager=config.runtime_sharding_resolver,
-            use_expert_tensor_mode=config.use_expert_tensor_mode,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.up_proj = ColumnParallelMoELinear(
-            num_experts=config.num_local_experts,
-            in_features=config.hidden_size,
-            out_features=config.intermediate_size,
+            out_features=2 * config.intermediate_size,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             use_bias=False,
@@ -308,6 +284,13 @@ class Llama4TextExperts(spx.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config, transpose_weight=False),
+            **moe_down_projection_reform_param(transpose_weight=False),
+        }
+
     def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
@@ -324,8 +307,8 @@ class Llama4TextExperts(spx.Module):
         Returns:
             Transformed hidden states after expert processing [batch, seq_len, hidden_dim].
         """
-        gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
-        up = self.up_proj(hidden_states, group_sizes, sorted_experts)
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
@@ -419,8 +402,20 @@ class Llama4TextMLP(spx.Module):
         self.precision = precision
         if intermediate_size is None:
             intermediate_size = config.intermediate_size
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (intermediate_size, intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -428,19 +423,18 @@ class Llama4TextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size)
-        self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size)
-        self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size)
         self.activation_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Build checkpoint reform rules for the fused gate/up projection.
+
+        Returns:
+            dict: Reform rules emitted by ``ColumnParallelLinear.build_reform_param``
+            for the ``gate_up_proj`` fused layout, suitable for round-tripping
+            HuggingFace checkpoints.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
@@ -456,8 +450,9 @@ class Llama4TextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.activation_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.activation_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -649,8 +644,7 @@ class Llama4TextMoe(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.router,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
@@ -1648,8 +1642,22 @@ class Llama4VisionAttention(AttentionModule):
         self.num_key_value_groups = 1
         self.attention_dropout = config.attention_dropout
 
-        linear_class = partial(
-            ColumnParallelLinear,
+        qkv_dim = self.num_heads * self.head_dim
+        qkv_layout = dense_qkv_layout(qkv_dim, qkv_dim)
+        self.qkv_proj = ColumnParallelLinear(
+            self.embed_dim,
+            qkv_layout.segment_sizes,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=True,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=qkv_layout,
+        )
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.head_dim,
+            self.embed_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=True,
@@ -1657,10 +1665,6 @@ class Llama4VisionAttention(AttentionModule):
             precision=precision,
             rngs=rngs,
         )
-        self.q_proj = linear_class(self.embed_dim, self.num_heads * self.head_dim)
-        self.k_proj = linear_class(self.embed_dim, self.num_heads * self.head_dim)
-        self.v_proj = linear_class(self.embed_dim, self.num_heads * self.head_dim)
-        self.o_proj = linear_class(self.num_heads * self.head_dim, self.embed_dim)
 
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
@@ -1669,6 +1673,10 @@ class Llama4VisionAttention(AttentionModule):
             dropout_prob=0.0,
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     def forward(
         self,
@@ -1688,11 +1696,8 @@ class Llama4VisionAttention(AttentionModule):
         """
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
-        )
+        qkv = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj.split(qkv, config=self.config)
         query_states = query_states.reshape(*hidden_shape)
         key_states = key_states.reshape(*hidden_shape)
         value_states = value_states.reshape(*hidden_shape)
@@ -1770,6 +1775,8 @@ class Llama4VisionMLP2(spx.Module):
         self.precision = precision
         self.rngs = rngs
         self.activation_fn = ACT2FN["gelu"]
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
         linear_class = partial(
             ColumnParallelLinear,
             use_bias=False,
@@ -1779,8 +1786,6 @@ class Llama4VisionMLP2(spx.Module):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(0.01),
         )
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
         self.fc1 = linear_class(self.intermediate_size, config.projector_input_dim)
         self.fc2 = linear_class(config.projector_output_dim, config.projector_output_dim)
 
@@ -1846,7 +1851,6 @@ class Llama4VisionMLP(spx.Module):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(0.01),
         )
-
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
         self.activation_fn = ACT2FN["gelu"]

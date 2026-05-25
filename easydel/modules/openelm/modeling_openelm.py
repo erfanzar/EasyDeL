@@ -184,7 +184,6 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
                 layer_idx=layer_idx,
                 attention_type="standard",
                 causal=True,
-                use_fused_qkv=True,
                 use_gqa=True,
             )
         finally:

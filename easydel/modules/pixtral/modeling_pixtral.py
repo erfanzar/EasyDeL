@@ -40,7 +40,14 @@ from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers import ColumnParallelLinear, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 
 from .pixtral_configuration import PixtralVisionConfig
@@ -222,8 +229,9 @@ class PixtralMLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -231,31 +239,22 @@ class PixtralMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-        )
-        self.gate_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = row_parallel_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
-        self.up_proj = column_parallel_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -273,8 +272,9 @@ class PixtralMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -324,26 +324,29 @@ class PixtralAttention(AttentionModule):
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_attention_heads
 
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        qkv_dim = config.num_attention_heads * self.head_dim
+        qkv_layout = dense_qkv_layout(qkv_dim, qkv_dim)
+        self.qkv_proj = ColumnParallelLinear(
+            config.hidden_size,
+            qkv_layout.segment_sizes,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
+            rngs=rngs,
+            layout=qkv_layout,
         )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
+        self.o_proj = RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
+            rngs=rngs,
         )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
@@ -352,6 +355,10 @@ class PixtralAttention(AttentionModule):
             dropout_prob=config.attention_dropout,
             requires_cache=False,  # Vision encoder doesn't need KV cache
         )
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     def forward(
         self,
@@ -374,11 +381,8 @@ class PixtralAttention(AttentionModule):
             AttentionLayerOutput: Contains attention_output, optional attention_weight, and cache_view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        query_states, key_states, value_states = self.qkv_proj.split(qkv, config=self.config)
 
         query_states = query_states.reshape(
             batch_size,

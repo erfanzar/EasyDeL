@@ -33,8 +33,6 @@ Exports:
     - :class:`GptOssForSequenceClassification`: Pooled classifier head.
 """
 
-import typing
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -143,35 +141,6 @@ class GptOssExperts(spx.Module):
             GLU math is hand-rolled in :meth:`forward`).
     """
 
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {"name": "gate_proj.weight", "spliter": lambda x: x[..., 0::2]},
-                {"name": "up_proj.weight", "spliter": lambda x: x[..., 1::2]},
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
-        },
-        "gate_up_proj_bias$": {
-            "splits": [
-                {"name": "gate_proj.bias", "spliter": lambda x: x[..., 0::2]},
-                {"name": "up_proj.bias", "spliter": lambda x: x[..., 1::2]},
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x},
-            ],
-            "inverse_spliter": lambda x: x,
-        },
-        "down_proj_bias$": {
-            "splits": [
-                {"name": "down_proj.bias", "spliter": lambda x: x},
-            ],
-            "inverse_spliter": lambda x: x,
-        },
-    }
-
     def __init__(
         self,
         config: GptOssConfig,
@@ -239,6 +208,37 @@ class GptOssExperts(spx.Module):
         )
         self.alpha = 1.702
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            "gate_up_proj$": {
+                "splits": [
+                    {"name": "gate_proj.weight", "spliter": lambda x: x[..., 0::2]},
+                    {"name": "up_proj.weight", "spliter": lambda x: x[..., 1::2]},
+                ],
+                "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+            },
+            "gate_up_proj_bias$": {
+                "splits": [
+                    {"name": "gate_proj.bias", "spliter": lambda x: x[..., 0::2]},
+                    {"name": "up_proj.bias", "spliter": lambda x: x[..., 1::2]},
+                ],
+                "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+            },
+            "down_proj$": {
+                "splits": [
+                    {"name": "down_proj.weight", "spliter": lambda x: x},
+                ],
+                "inverse_spliter": lambda x: x,
+            },
+            "down_proj_bias$": {
+                "splits": [
+                    {"name": "down_proj.bias", "spliter": lambda x: x},
+                ],
+                "inverse_spliter": lambda x: x,
+            },
+        }
 
     def forward(
         self,
@@ -1075,7 +1075,23 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):  # type:
         """
 
         def _aux_loss_fn(outputs, attention_mask):
-            """Custom auxiliary loss for GPT-OSS."""
+            """Compute the load-balancing auxiliary loss for GPT-OSS MoE layers.
+
+            Delegates to :func:`auxiliary_load_balancing_loss_func` using
+            the model's ``num_local_experts`` and ``num_experts_per_tok``
+            so the loss penalises imbalanced routing across the 128
+            experts in each MoE layer.
+
+            Args:
+                outputs: MoE forward outputs carrying ``router_logits``
+                    (a tuple of per-layer logits, one entry per MoE layer).
+                attention_mask: Padding mask used to exclude pad tokens
+                    from the load-balance calculation.
+
+            Returns:
+                The auxiliary load-balancing loss, or ``None`` when no
+                router logits are available.
+            """
             if outputs.router_logits is None or len(outputs.router_logits) == 0:
                 return None
             return auxiliary_load_balancing_loss_func(

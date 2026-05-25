@@ -28,9 +28,31 @@ from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 @register_config("phi3")
 class Phi3Config(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for Microsoft's Phi-3 decoder language-model family.
+
+    Phi-3 modernises the Phi-1/Phi-2 architecture and aligns with the
+    LLaMA-style template while keeping a couple of model-family
+    specialities:
+
+    * **Fused projections.** Attention uses a single ``qkv_proj`` of
+      width ``(num_attention_heads + 2*num_key_value_heads) * head_dim``
+      and the MLP uses a single ``gate_up_proj`` of width
+      ``2 * intermediate_size``; both are split internally during the
+      forward pass.
+    * **RMSNorm** throughout (replacing Phi's LayerNorm) with epsilon
+      ``rms_norm_eps``, and **bias-free linear layers** in attention/MLP.
+    * **Full rotary embeddings** with ``rope_theta`` and optional
+      ``rope_scaling`` — the legacy ``"su"`` / ``"yarn"`` scaling types
+      are silently rewritten to ``"longrope"`` by
+      :meth:`_rope_scaling_validation` for backward compatibility.
+    * **Optional sliding-window attention** controlled by
+      ``sliding_window``; when set, every layer's mask is built as a
+      ``"sliding_attention"`` window via :meth:`get_mask_details`.
+    * **Grouped-query attention** with ``num_key_value_heads``
+      independently of ``num_attention_heads``.
+
+    Inherits from :class:`EasyDeLBaseConfig`; see that class for the full
+    list of cross-cutting EasyDeL knobs.
 
     Args:
         vocab_size (`int`, *optional*, defaults to 32064):

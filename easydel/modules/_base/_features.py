@@ -201,32 +201,34 @@ class TieEmbeddingsFeature:
         self.tie = tie
 
     def setup(self, embedding_module: spx.Module, lm_head_module: spx.Module) -> None:
-        """Set up weight tying between embedding and LM head.
+        """Marker hook invoked when weight tying is enabled.
 
-        This method configures the relationship between the input embedding
-        layer and the output projection (LM head). In spectrax, this typically
-        means the LM head's forward method will accept the embedding weights
-        as a parameter rather than using its own kernel.
+        In spectrax, weight tying is realised at the call site rather than by
+        binding ``lm_head.weight`` to ``embedding.weight``. Concretely, the
+        task module's ``apply_lm_head`` forwards ``embedding.weight.value.T``
+        through the LM head's optional ``w`` parameter when tying is on (see
+        :meth:`BaseCausalLMModule.apply_lm_head`). As a result, this hook does
+        not need to mutate the modules — it exists purely as an extension
+        point: when ``self.tie`` is ``False`` the method short-circuits;
+        when ``True`` it currently performs no setup but reserves the
+        signature so subclasses can attach actual rebinding logic.
 
         Args:
-            embedding_module: The input embedding layer, typically an nn.Embed
-                with an `embedding` attribute containing the embedding matrix.
-            lm_head_module: The LM head linear layer. When tying is enabled,
-                this module should accept an optional weight parameter in
-                its forward method.
+            embedding_module: The input embedding layer, typically an
+                ``nn.Embed`` carrying the ``(vocab_size, hidden_size)``
+                embedding matrix in its ``weight`` parameter.
+            lm_head_module: The LM head linear layer that will be paired
+                with ``embedding_module`` during the forward pass via its
+                optional ``w`` kwarg.
 
         Note:
-            In spectrax, actual weight tying is handled differently than in
-            PyTorch. Instead of sharing parameters, the embedding weights are
-            passed to the LM head during forward pass:
+            Reference forward-pass pattern used by the surrounding task
+            modules to realise weight tying without parameter aliasing::
 
-            ```python
-            # In forward pass
-            if tie_embeddings:
-                logits = lm_head(hidden, w=embedding.weight.T)
-            else:
-                logits = lm_head(hidden)
-            ```
+                if tie_embeddings:
+                    logits = lm_head(hidden, w=embedding.weight.value.T)
+                else:
+                    logits = lm_head(hidden)
         """
         if not self.tie:
             return

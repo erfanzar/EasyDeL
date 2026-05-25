@@ -32,8 +32,6 @@ Exports:
     - :class:`GlmForSequenceClassification`: Pooled classifier head.
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -102,8 +100,9 @@ class GlmMLP(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            2 * config.intermediate_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -111,8 +110,9 @@ class GlmMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -120,8 +120,6 @@ class GlmMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size)
-        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def forward(

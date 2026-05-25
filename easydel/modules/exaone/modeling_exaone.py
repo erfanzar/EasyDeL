@@ -109,18 +109,18 @@ class ExaoneGatedMLP(spx.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(),
         )
-
-        row_linear = functools.partial(
-            RowParallelLinear,
+        self.c_fc_0 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
+        self.c_fc_1 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
+        self.c_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(),
+            rngs=rngs,
         )
-        self.c_fc_0 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.c_fc_1 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.c_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.activation_function]
 
     def forward(

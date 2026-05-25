@@ -400,12 +400,6 @@ class FalconMambaMixer(spx.Module):
             param_dtype=param_dtype,
             precision=precision,
         )
-        row_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-        )
         self.in_proj = column_linear(
             hidden_size,
             intermediate_size * 2,
@@ -427,9 +421,12 @@ class FalconMambaMixer(spx.Module):
             rngs=rngs,
         )
         # Contracting projection is typically sharded ROW-wise.
-        self.out_proj = row_linear(
+        self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
             use_bias=config.use_bias,
             rngs=rngs,
         )

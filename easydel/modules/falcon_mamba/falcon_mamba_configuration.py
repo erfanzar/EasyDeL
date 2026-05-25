@@ -153,11 +153,8 @@ class FalconMambaConfig(EasyDeLBaseConfig):
         self.mixer_rms_eps = mixer_rms_eps
         self.gradient_checkpointing = gradient_checkpointing
 
-        self.intermediate_size = (
-            int(expand * self.hidden_size)
-            if kwargs.get("intermediate_size") is None
-            else kwargs.get("intermediate_size")
-        )
+        intermediate_size = kwargs.pop("intermediate_size", None)
+        self.intermediate_size = int(expand * self.hidden_size) if intermediate_size is None else intermediate_size
         super().__init__(**kwargs)
 
     @property

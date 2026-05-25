@@ -47,7 +47,6 @@ Public model classes (registered with the factory):
 
 from __future__ import annotations
 
-import functools
 import typing as tp
 
 import jax
@@ -67,7 +66,14 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import MaskInfo, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
@@ -887,25 +893,35 @@ class FalconH1MLP(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        column = functools.partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            use_bias=config.mlp_bias,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
-        row = functools.partial(
-            RowParallelLinear,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            use_bias=config.mlp_bias,
+            rngs=rngs,
         )
-
-        self.gate_proj = column(config.hidden_size, config.intermediate_size, use_bias=config.mlp_bias, rngs=rngs)
-        self.up_proj = column(config.hidden_size, config.intermediate_size, use_bias=config.mlp_bias, rngs=rngs)
-        self.down_proj = row(config.intermediate_size, config.hidden_size, use_bias=config.mlp_bias, rngs=rngs)
-
         self.act_fn = ACT2FN[config.hidden_act]
         self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.build_reform_param(
+            "gate_up_proj",
+            config=self.config,
+            include_bias=self.config.mlp_bias,
+        )
 
     def forward(self, x: Array) -> Array:
         """Apply SwiGLU feedforward transformation with muP scaling.
@@ -923,7 +939,9 @@ class FalconH1MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        y = self.up_proj(x) * self.act_fn(self.gate_proj(x) * self.gate_multiplier)
+        gate_up = self.gate_up_proj(x)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        y = up * self.act_fn(gate * self.gate_multiplier)
         y = self.down_proj(y) * self.down_multiplier
         y = apply_logical_sharding(
             y,

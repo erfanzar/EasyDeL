@@ -30,43 +30,43 @@ from easydel.infra.factory import register_config
 
 @register_config("rwkv")
 class RwkvConfig(EasyDeLBaseConfig):
-    """
-    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
-    the documentation from [`EasyDeLBaseConfig`] for more information.
+    """Configuration for the RWKV recurrent-attention language model.
 
-    Args:
-        vocab_size (`int`, *optional*, defaults to 50277):
-            Vocabulary size of the RWKV model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`~easydel.modules.RwkvModel`].
-        context_length (`int`, *optional*, defaults to 1024):
-            The maximum sequence length that this model might ever be used with.
-        hidden_size (`int`, *optional*, defaults to 4096):
-            Dimensionality of the encoder layers and the pooler layer.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the Transformer encoder.
-        attention_hidden_size (`int`, *optional*):
-            Dimensionality of the query/key/value of the MultiHead Attention layer of the RWKV* model. If None, it is
-            set to `hidden_size`.
-        intermediate_size (`int`, *optional*):
-            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder. If None,
-            it is set to `4 * hidden_size`.
-        layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
-            The epsilon used by the layer normalization layers.
-        rescale_every (`int`, *optional*, defaults to 6):
-            Interval of layers at which to rescale the attention scores.
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models).
-        bos_token_id (`int`, *optional*, defaults to 0):
-            The id for the beginning of stream token.
-        eos_token_id (`int`, *optional*, defaults to 0):
-            The id for the end of stream token.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie the weights of the input embeddings and the output embeddings.
-        bits (`int`, *optional*):
-            The number of bits to quantize the model to. If None, the model is not quantized.
-        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
-            What to save during gradient checkpointing. Choose one of `"nothing_saveable"`, `"first_half_saveable"`,
-            `"full_saveable"`.
+    Inherits from :class:`EasyDeLBaseConfig` and adds the RWKV-specific
+    hyperparameters: number of hidden layers, attention/intermediate
+    sizes, per-layer rescaling cadence, and recurrent-cache toggles.
+    The defaults mirror the public ``RWKV-4-Pile-7B`` checkpoint.
+
+    Attributes:
+        vocab_size (int): Vocabulary size. Defines the number of distinct
+            tokens representable by ``input_ids``. Defaults to 50277.
+        context_length (int): Maximum sequence length supported by the
+            model (aliased as ``max_position_embeddings``). Defaults to 1024.
+        hidden_size (int): Dimensionality of the encoder layers and the
+            pooler layer. Defaults to 4096.
+        num_hidden_layers (int): Number of hidden RWKV blocks. Defaults to 32.
+        attention_hidden_size (int | None): Dimensionality of the QKV-like
+            projections of the RWKV time-mix block. Falls back to
+            ``hidden_size`` when ``None``.
+        intermediate_size (int | None): Dimensionality of the channel-mix
+            ("feed-forward") layer. Falls back to ``4 * hidden_size`` when
+            ``None``.
+        layer_norm_epsilon (float): Epsilon for the LayerNorm modules.
+            Defaults to 1e-5.
+        rescale_every (int): Cadence (in layers) at which the attention
+            output is rescaled by 1/2 during inference to stabilise the
+            recurrence; 0 disables the rescale. Defaults to 6.
+        bos_token_id (int): Beginning-of-stream token id. Defaults to 0.
+        eos_token_id (int): End-of-stream token id. Defaults to 0.
+        tie_word_embeddings (bool): Whether to tie the input embedding
+            and the LM head weights. Defaults to False.
+        use_cache (bool): Whether the model should return the recurrent
+            state for stepwise generation. Defaults to True.
+        bits (int | None): Optional quantisation bit-width. ``None`` keeps
+            the model in full precision.
+        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient
+            checkpointing policy. Defaults to
+            ``EasyDeLGradientCheckPointers.NONE``.
     """
 
     model_type: str = "rwkv"

@@ -62,7 +62,7 @@ References:
 """
 
 import typing
-from functools import cached_property, partial
+from functools import cached_property
 
 import jax
 import jax.numpy as jnp
@@ -99,11 +99,17 @@ from easydel.layers import (
     ColumnParallelLinear,
     ColumnParallelMoELinear,
     Embed,
+    FusedColumnLayout,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     ParallelLinear,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms._norms import lowfloats
@@ -153,6 +159,24 @@ def _gemma4_vision_pixel_values_to_nhwc(pixel_values: Array) -> Array:
     if pixel_values.shape[1] in (1, 3, 4):
         return jnp.transpose(pixel_values, (0, 2, 3, 1))
     return pixel_values
+
+
+def _gemma4_needs_fp32_attention_cache(dtype: jnp.dtype) -> bool:
+    """Return True when ``dtype`` requires fp32 attention bookkeeping for Gemma4.
+
+    Used to decide whether attention K/V and post-RoPE buffers should be
+    materialised in float32 for numerical stability. The Gemma4 attention
+    path runs into precision artefacts under bfloat16 and the EasyDeL
+    low-float dtypes, so those families opt in to fp32.
+
+    Args:
+        dtype (jnp.dtype): Compute or storage dtype to inspect.
+
+    Returns:
+        bool: ``True`` if ``dtype`` is bfloat16 or part of the
+        :data:`lowfloats` family.
+    """
+    return jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) or dtype in lowfloats
 
 
 class Gemma4RMSNorm(spx.Module):
@@ -265,8 +289,8 @@ class Gemma4RMSNorm(spx.Module):
         else:
             out = variance
         target_dtype = hidden_states.dtype
-        if target_dtype in lowfloats:
-            target_dtype = jnp.bfloat16
+        if _gemma4_needs_fp32_attention_cache(target_dtype):
+            target_dtype = jnp.float32
         return out.astype(target_dtype)
 
 
@@ -511,13 +535,14 @@ class Gemma4VisionClippableLinear(spx.Module):
         self,
         config: Gemma4VisionConfig,
         in_features: int,
-        out_features: int,
+        out_features: int | tuple[int, ...],
         *,
         parallel_mode: str,
         use_bias: bool,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
+        layout: FusedColumnLayout | None = None,
         rngs: spx.Rngs,
     ):
         """Initialize the clippable linear wrapper.
@@ -549,6 +574,7 @@ class Gemma4VisionClippableLinear(spx.Module):
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
+            layout=layout,
         )
 
     def forward(self, hidden_states: Array) -> Array:
@@ -717,38 +743,26 @@ class Gemma4VisionAttention(spx.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
 
-        self.q_proj = Gemma4VisionClippableLinear(
-            config,
-            config.hidden_size,
-            self.num_attention_heads * self.head_dim,
-            parallel_mode="column",
-            use_bias=bool(config.attention_bias),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+        q_size = self.num_attention_heads * self.head_dim
+        kv_size = self.num_key_value_heads * self.head_dim
+        qkv_layout = dense_qkv_layout(
+            q_size,
+            kv_size,
+            query_prefix="q_proj.linear",
+            key_prefix="k_proj.linear",
+            value_prefix="v_proj.linear",
         )
-        self.k_proj = Gemma4VisionClippableLinear(
+        self.qkv_proj = Gemma4VisionClippableLinear(
             config,
             config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
+            qkv_layout.segment_sizes,
             parallel_mode="column",
             use_bias=bool(config.attention_bias),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.v_proj = Gemma4VisionClippableLinear(
-            config,
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            parallel_mode="column",
-            use_bias=bool(config.attention_bias),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            layout=qkv_layout,
         )
         self.o_proj = Gemma4VisionClippableLinear(
             config,
@@ -778,6 +792,10 @@ class Gemma4VisionAttention(spx.Module):
             dropout_prob=config.attention_dropout,
             requires_cache=False,
         )
+
+    @property
+    def reform_param(self):
+        return self.qkv_proj.linear.build_reform_param("qkv_proj.linear", config=self.config)
 
     def forward(
         self,
@@ -813,13 +831,13 @@ class Gemma4VisionAttention(spx.Module):
         )
         batch_size, sequence_length, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states).reshape(
-            batch_size, sequence_length, self.num_attention_heads, self.head_dim
-        )
-        key_states = self.k_proj(hidden_states).reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
-        )
-        value_states = self.v_proj(hidden_states).reshape(
+        self.num_attention_heads * self.head_dim
+        self.num_key_value_heads * self.head_dim
+        qkv_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj.linear.split(qkv_states, config=self.config)
+        query_states = query_states.reshape(batch_size, sequence_length, self.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(
             batch_size,
             sequence_length,
             self.num_key_value_heads,
@@ -891,27 +909,21 @@ class Gemma4VisionMLP(spx.Module):
         """
         self.config = config
         self.act = ACT2FN[config.hidden_activation]
-        self.gate_proj = Gemma4VisionClippableLinear(
+        self.gate_up_proj = Gemma4VisionClippableLinear(
             config,
             config.hidden_size,
-            config.intermediate_size,
+            (config.intermediate_size, config.intermediate_size),
             parallel_mode="column",
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.up_proj = Gemma4VisionClippableLinear(
-            config,
-            config.hidden_size,
-            config.intermediate_size,
-            parallel_mode="column",
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            layout=dense_gate_up_layout(
+                config.intermediate_size,
+                gate_prefix="gate_proj.linear",
+                up_prefix="up_proj.linear",
+            ),
         )
         self.down_proj = Gemma4VisionClippableLinear(
             config,
@@ -924,6 +936,10 @@ class Gemma4VisionMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
+
+    @property
+    def reform_param(self):
+        return self.gate_up_proj.linear.build_reform_param("gate_up_proj.linear", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply the gated MLP transformation.
@@ -940,8 +956,9 @@ class Gemma4VisionMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "vision_mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "vision_mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "vision_mlp_gate_up")
+        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        gate = checkpoint_name(self.act(gate_raw), "vision_mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "vision_mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1589,13 +1606,38 @@ class Gemma4Attention(UnifiedAttention):
 
     @staticmethod
     def _hf_sliding_window(sliding_window: int | None) -> tuple[int, int] | None:
-        """Convert HF Gemma4 sliding-window size to EasyDeL's inclusive tuple form."""
+        """Convert HF Gemma4 sliding-window size to EasyDeL's inclusive tuple form.
+
+        Hugging Face's Gemma4 expresses the window as the total number of
+        tokens (current + previous). EasyDeL's mask builders expect a
+        ``(left, right)`` inclusive offset tuple, so a HF window of ``N``
+        becomes ``(N - 1, 0)``.
+
+        Args:
+            sliding_window (int | None): HF-style window size.
+
+        Returns:
+            tuple[int, int] | None: ``(left, right)`` tuple for EasyDeL, or
+            ``None`` when ``sliding_window`` is ``None``.
+        """
         if sliding_window is None:
             return None
         return (max(int(sliding_window) - 1, 0), 0)
 
     def _kernel_sliding_window(self) -> int | tuple[int, int] | None:
-        """Choose the sliding-window representation expected by the active attention kernel."""
+        """Choose the sliding-window representation expected by the active attention kernel.
+
+        Some ejkernel backends (ragged/page/decode/unified) accept a single
+        integer window count while the generic masked kernels expect the
+        inclusive ``(left, right)`` tuple produced by
+        :meth:`_hf_sliding_window`. This helper inspects the active
+        attention performer and returns whichever form the kernel needs.
+
+        Returns:
+            int | tuple[int, int] | None: Integer window size for ragged/page
+            backends, ``(left, right)`` tuple for the generic path, or
+            ``None`` when this layer is not sliding.
+        """
         if self.sliding_window is None:
             return None
 
@@ -1656,32 +1698,67 @@ class Gemma4Attention(UnifiedAttention):
         self.num_key_value_groups = config.num_attention_heads // resolved_num_kv_heads
 
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
-        column = partial(
-            ColumnParallelLinear,
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel_init,
-            rngs=rngs,
-        )
-        row = partial(
-            RowParallelLinear,
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel_init,
-            rngs=rngs,
-        )
-
-        self.q_proj = column(config.hidden_size, config.num_attention_heads * resolved_head_dim)
-        self.k_proj = column(config.hidden_size, resolved_num_kv_heads * resolved_head_dim)
-        if not self.use_alternative_attention:
-            self.v_proj = column(config.hidden_size, resolved_num_kv_heads * resolved_head_dim)
+        q_size = config.num_attention_heads * resolved_head_dim
+        kv_size = resolved_num_kv_heads * resolved_head_dim
+        self.use_tp_interleaved_qkv = False
+        if not self.use_alternative_attention and not self.is_kv_shared_layer:
+            qkv_layout = dense_qkv_layout(q_size, kv_size)
+            self.qkv_proj = ColumnParallelLinear(
+                config.hidden_size,
+                qkv_layout.segment_sizes,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=kernel_init,
+                rngs=rngs,
+                layout=qkv_layout,
+            )
+            self.use_tp_interleaved_qkv = True
         else:
-            self.v_proj = self.k_proj
-        self.o_proj = row(config.num_attention_heads * resolved_head_dim, config.hidden_size)
+            self.q_proj = ColumnParallelLinear(
+                config.hidden_size,
+                q_size,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=kernel_init,
+                rngs=rngs,
+            )
+            self.k_proj = ColumnParallelLinear(
+                config.hidden_size,
+                kv_size,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=kernel_init,
+                rngs=rngs,
+            )
+            if not self.use_alternative_attention:
+                self.v_proj = ColumnParallelLinear(
+                    config.hidden_size,
+                    kv_size,
+                    use_bias=config.attention_bias,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    kernel_init=kernel_init,
+                    rngs=rngs,
+                )
+            else:
+                self.v_proj = self.k_proj
+        self.o_proj = RowParallelLinear(
+            q_size,
+            config.hidden_size,
+            use_bias=config.attention_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
 
         self.rotary = self._create_rotary(config, dtype)
         self.attention_performer = self._create_attention_performer(config, rngs)
@@ -1689,6 +1766,12 @@ class Gemma4Attention(UnifiedAttention):
         if self.use_qk_norm:
             self.q_norm = self._create_q_norm(config, dtype, param_dtype, rngs)
             self.k_norm = self._create_k_norm(config, dtype, param_dtype, rngs)
+
+    @property
+    def reform_param(self):
+        if not hasattr(self, "qkv_proj"):
+            return {}
+        return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
         """Create query normalization using Gemma4's (1+kernel)*norm convention."""
@@ -1741,6 +1824,10 @@ class Gemma4Attention(UnifiedAttention):
         else:
             key_states = self.k_norm(key_states)
             value_states = self.v_norm(value_states)
+        if _gemma4_needs_fp32_attention_cache(self.dtype):
+            query_states = query_states.astype(jnp.float32)
+            key_states = key_states.astype(jnp.float32)
+            value_states = value_states.astype(jnp.float32)
         return query_states, key_states, value_states
 
     def _preprocess_qkv(self, query_states, key_states, value_states):
@@ -1762,6 +1849,32 @@ class Gemma4Attention(UnifiedAttention):
         if self.use_alternative_attention:
             value_states = key_states
         return query_states, key_states, value_states
+
+    def _project_qkv_states(self, hidden_states):
+        """Project Q/K/V, using fused QKV for layers where it avoids extra work.
+
+        When the layer was built with a fused ``query_key_value_projection``
+        (no k_eq_v aliasing and not a KV-shared layer), a single matmul
+        emits Q/K/V together and is split by the projection's fused layout.
+        Otherwise three independent matmuls run, after which
+        :meth:`_preprocess_qkv` may alias V to K for the k_eq_v case.
+
+        Args:
+            hidden_states: Input tensor ``[batch, seq_len, hidden_dim]``.
+
+        Returns:
+            tuple: ``(query_states, key_states, value_states)`` raw projection
+            outputs before the multi-head reshape, with V aliased to K when
+            ``use_alternative_attention`` is enabled.
+        """
+        if hasattr(self, self._projection_attr("query_key_value_projection")):
+            qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
+            return self.query_key_value_projection.split(qkv, config=self.config)
+
+        query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
+        key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
+        value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
+        return self._preprocess_qkv(query_states, key_states, value_states)
 
     def _forward_with_kv_capture(
         self,
@@ -1796,15 +1909,7 @@ class Gemma4Attention(UnifiedAttention):
         batch_size = hidden_states.shape[0]
         sequence_length = hidden_states.shape[1]
 
-        query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
-        key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
-        value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
-
-        query_states, key_states, value_states = self._preprocess_qkv(
-            query_states,
-            key_states,
-            value_states,
-        )
+        query_states, key_states, value_states = self._project_qkv_states(hidden_states)
 
         query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
         key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
@@ -2105,8 +2210,20 @@ class Gemma4MLP(spx.Module):
 
         self.act = ACT2FN[config.hidden_activation]
 
-        column = partial(
-            ColumnParallelLinear,
+        self.gate_up_proj = ColumnParallelLinear(
+            embed_dim,
+            (inner_dim, inner_dim),
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+            layout=dense_gate_up_layout(inner_dim),
+        )
+        self.down_proj = RowParallelLinear(
+            inner_dim,
+            embed_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -2114,18 +2231,17 @@ class Gemma4MLP(spx.Module):
             kernel_init=kernel_init,
             rngs=rngs,
         )
-        row = partial(
-            RowParallelLinear,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel_init,
-            rngs=rngs,
-        )
-        self.gate_proj = column(embed_dim, inner_dim)
-        self.up_proj = column(embed_dim, inner_dim)
-        self.down_proj = row(inner_dim, embed_dim)
+
+    @property
+    def reform_param(self):
+        """Checkpoint-reform rules for the fused gate-up projection.
+
+        Returns:
+            dict: Split/merge transformations produced by the fused
+            ``gate_up_proj`` layout, used by the checkpoint loader to map
+            between the HF fused tensor and EasyDeL's split representation.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply the gated MLP transformation.
@@ -2146,8 +2262,8 @@ class Gemma4MLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate = self.gate_proj(hidden_states)
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         if self.config.activations_in_float32:
             gate = gate.astype(jnp.float32)
             up = up.astype(jnp.float32)
@@ -2184,31 +2300,6 @@ class Gemma4TextMLPStack(spx.Module):
         rngs: Random number generator state.
     """
 
-    reform_param: typing.ClassVar = {
-        "gate_up_proj$": {
-            "splits": [
-                {
-                    "name": "gate_proj.weight",
-                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
-                },
-                {
-                    "name": "up_proj.weight",
-                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
-                },
-            ],
-            "inverse_spliter": lambda torch, gate, up: torch.cat(
-                (gate.transpose(-1, -2), up.transpose(-1, -2)),
-                dim=1,
-            ),
-        },
-        "down_proj$": {
-            "splits": [
-                {"name": "down_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-            ],
-            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-        },
-    }
-
     def __init__(
         self,
         config: Gemma4TextConfig,
@@ -2239,8 +2330,9 @@ class Gemma4TextMLPStack(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        moe_linear_col = partial(
-            ColumnParallelMoELinear,
+        self.gate_up_proj = ColumnParallelMoELinear(
+            in_features=config.hidden_size,
+            out_features=2 * config.moe_intermediate_size,
             num_experts=config.num_experts,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
@@ -2250,8 +2342,9 @@ class Gemma4TextMLPStack(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        moe_linear_row = partial(
-            RowParallelMoELinear,
+        self.down_proj = RowParallelMoELinear(
+            in_features=config.moe_intermediate_size,
+            out_features=config.hidden_size,
             num_experts=config.num_experts,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(),
@@ -2262,10 +2355,14 @@ class Gemma4TextMLPStack(spx.Module):
             param_dtype=param_dtype,
         )
 
-        self.gate_proj = moe_linear_col(in_features=config.hidden_size, out_features=config.moe_intermediate_size)
-        self.up_proj = moe_linear_col(in_features=config.hidden_size, out_features=config.moe_intermediate_size)
-        self.down_proj = moe_linear_row(in_features=config.moe_intermediate_size, out_features=config.hidden_size)
         self.act_fn = ACT2FN[config.hidden_activation]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
 
     def forward(
         self,
@@ -2288,8 +2385,8 @@ class Gemma4TextMLPStack(spx.Module):
         Returns:
             Expert-processed hidden states ``(total_tokens, hidden_size)``.
         """
-        gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
-        up = self.up_proj(hidden_states, group_sizes, sorted_experts)
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         if self.config.activations_in_float32:
             gate = gate.astype(jnp.float32)
             up = up.astype(jnp.float32)
@@ -2446,7 +2543,25 @@ class Gemma4TextRouter(BaseMoeModule):
         _pre_bias_logits: Array | None,
         num_experts_per_tok: int,
     ) -> tuple[Array, Array]:
-        """Select top-k experts from router probabilities and apply expert scaling."""
+        """Select top-k experts from router probabilities and apply expert scaling.
+
+        Detects whether ``router_scores`` already looks normalised (non-negative
+        and rows summing to one); softmaxes them otherwise. Picks the top
+        ``num_experts_per_tok`` experts per token, renormalises their weights
+        when more than one expert is active, and finally multiplies each
+        chosen weight by its corresponding learned ``per_expert_scale``.
+
+        Args:
+            router_scores (Array): Router probability/logit tensor of shape
+                ``(num_tokens, num_experts)``.
+            _pre_bias_logits (Array | None): Unused pre-bias logits accepted
+                for hook signature compatibility.
+            num_experts_per_tok (int): Number of experts to select per token.
+
+        Returns:
+            tuple[Array, Array]: ``(top_k_weights, top_k_indices)``, both of
+            shape ``(num_tokens, num_experts_per_tok)``.
+        """
         router_scores_f32 = router_scores.astype(jnp.float32)
         row_sums = router_scores_f32.sum(axis=-1)
         appears_normalized = jnp.logical_and(
@@ -2501,8 +2616,7 @@ class Gemma4TextRouter(BaseMoeModule):
             gate_hidden_state=router_hidden_states,
             gate_layer=self.proj,
             expert_layer=expert_layer,
-            wi_kernel=expert_layer.gate_proj.weight.value,
-            wu_kernel=expert_layer.up_proj.weight.value,
+            gate_up_kernel=expert_layer.gate_up_proj.weight.value,
             wd_kernel=expert_layer.down_proj.weight.value,
             hooks=runtime_hooks,
             act_fn=expert_layer.act_fn,
@@ -2791,6 +2905,10 @@ class Gemma4TextModel(EasyDeLBaseModule):
             precision (jax.lax.PrecisionLike, optional): Matmul precision.
             rngs (spx.Rngs): Random number generator state.
         """
+        if _gemma4_needs_fp32_attention_cache(dtype) and _gemma4_needs_fp32_attention_cache(
+            getattr(config, "kvdtype", jnp.bfloat16)
+        ):
+            config.kvdtype = jnp.float32
         super().__init__(
             config=config,
             dtype=dtype,
@@ -3672,7 +3790,25 @@ class Gemma4Model(EasyDeLBaseModule):
         return inputs_embeds
 
     def _compute_per_layer_inputs(self, input_ids: Array | None) -> Array | None:
-        """Build per-layer inputs while masking multimodal placeholder tokens."""
+        """Build per-layer inputs while masking multimodal placeholder tokens.
+
+        Per-layer input embeddings cannot be recovered from a token id once
+        that id has been replaced by image/video soft tokens, so this helper
+        substitutes ``pad_token_id`` at every multimodal placeholder position
+        before performing the lookup. The resulting per-layer embeddings then
+        line up with the merged ``inputs_embeds`` produced by
+        :meth:`compute_embedding`.
+
+        Args:
+            input_ids (Array | None): Token IDs ``[batch, seq_len]`` before
+                multimodal merging, or ``None``.
+
+        Returns:
+            Array | None: Per-layer embeddings of shape
+            ``(batch, seq_len, num_hidden_layers, hidden_size_per_layer_input)``
+            when per-layer inputs are enabled; ``None`` if disabled or
+            ``input_ids`` is ``None``.
+        """
         if not self.language_model.hidden_size_per_layer_input or input_ids is None:
             return None
 

@@ -104,17 +104,11 @@ class Olmo3Config(EasyDeLBaseConfig):
                     Attention pattern for each layer. Defaults to sliding window attention
                     for 3 out of 4 layers, and full attention for every 4th layer.
 
-    >>> from transformers import Olmo3Model, Olmo3Config
-
-    >>> # Initializing a Olmo3 7B style configuration
-    >>> configuration = Olmo3Config()
-
-    >>> # Initializing a model from the Olmo3 7B style configuration
-    >>> model = Olmo3Model(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```
+    Example:
+        >>> from easydel import Olmo3Config, Olmo3Model
+        >>> configuration = Olmo3Config()
+        >>> model = Olmo3Model(configuration)
+        >>> configuration = model.config
     """
 
     model_type = "olmo3"

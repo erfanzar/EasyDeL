@@ -130,7 +130,6 @@ class GPTNeoXAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            use_fused_qkv=True,
         )
 
     def _create_rotary(self, config: GPTNeoXConfig, dtype: jnp.dtype):

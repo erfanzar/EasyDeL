@@ -31,7 +31,8 @@ from easydel.infra.factory import register_config
 
 @register_config("whisper")
 class WhisperConfig(EasyDeLBaseConfig):
-    """
+    """Configuration for the Whisper encoder-decoder speech-to-text model.
+
     Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
     the documentation from [`EasyDeLBaseConfig`] for more information.
 

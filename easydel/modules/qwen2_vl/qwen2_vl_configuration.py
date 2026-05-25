@@ -79,9 +79,23 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
-        """Initialize Qwen2VL vision encoder configuration.
+        """Initialize the Qwen2-VL vision encoder configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            depth: Number of transformer layers in the vision tower.
+            embed_dim: Patch-embedding dimension produced by the vision encoder.
+            hidden_size: Intermediate / projected hidden size of the vision tower.
+            hidden_act: Activation function used inside the vision MLP.
+            mlp_ratio: Ratio between hidden size and MLP intermediate dimension.
+            num_heads: Number of attention heads.
+            in_channels: Number of input image channels (typically 3 for RGB).
+            patch_size: Square spatial patch size in pixels.
+            spatial_merge_size: Spatial merge factor used by the patch merger.
+            temporal_patch_size: Temporal patch size for video inputs.
+            initializer_range: Standard deviation for the truncated-normal
+                weight initializer.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
 
@@ -181,9 +195,36 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize Qwen2VL text decoder configuration.
+        """Initialize the Qwen2-VL text decoder configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            vocab_size: Text-side vocabulary size.
+            hidden_size: Decoder hidden dimension.
+            intermediate_size: MLP intermediate dimension.
+            num_hidden_layers: Number of decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of grouped-query KV heads;
+                defaults to ``num_attention_heads`` (i.e. MHA) when ``None``.
+            hidden_act: Activation used inside the MLP block.
+            max_position_embeddings: Maximum sequence length supported.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: RMS normalization epsilon.
+            use_cache: Whether to return KV caches during generation.
+            tie_word_embeddings: Whether to tie embedding and LM-head weights.
+            rope_theta: Base frequency for rotary position embeddings.
+            use_sliding_window: Enable sliding-window attention.
+            sliding_window: Sliding-window length (set to ``None`` internally
+                when ``use_sliding_window=False``).
+            max_window_layers: Layers at or above this index use sliding-window
+                attention when ``use_sliding_window=True``.
+            attention_dropout: Dropout probability on attention weights.
+            rope_scaling: RoPE scaling configuration dictionary; ``mrope`` is
+                auto-detected via the presence of ``mrope_section``.
+            rope_parameters: Alias for ``rope_scaling`` (HF compatibility).
+            layer_types: Per-layer attention type. Auto-derived from
+                sliding-window settings when ``None``.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig`.
         """
         super().__init__(**kwargs)
 
@@ -268,9 +309,24 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
         vision_end_token_id: int = 151653,
         **kwargs,
     ):
-        """Initialize Qwen2VL composite configuration with text and vision sub-configs.
+        """Initialize the composite Qwen2-VL configuration.
 
-        See class docstring for detailed parameter descriptions.
+        Args:
+            text_config: Text decoder configuration as a dict,
+                :class:`Qwen2VLTextConfig`, or ``None`` to build from
+                ``**kwargs``.
+            vision_config: Vision encoder configuration as a dict,
+                :class:`Qwen2VLVisionConfig`, or ``None`` for defaults.
+            image_token_id: Token id used as a placeholder for image patches
+                inside ``input_ids``.
+            video_token_id: Token id used as a placeholder for video patches
+                inside ``input_ids``.
+            vision_start_token_id: Token id marking the start of a vision
+                sequence.
+            vision_end_token_id: Token id marking the end of a vision sequence.
+            **kwargs: Additional arguments forwarded to
+                :class:`EasyDeLBaseConfig` and used as fallback when
+                ``text_config`` is ``None``.
         """
         super().__init__(**kwargs)
 
