@@ -11,7 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+"""Convert a single Hugging Face PyTorch checkpoint to an EasyDeL checkpoint.
+
+Wraps EasyDeL's two conversion strategies under one CLI:
+
+* ``sequential`` (default, recommended): streams safetensors shards one at a
+  time from the HF Hub (or a local copy), rewriting each tensor straight into
+  a TensorStore checkpoint without ever materializing the full parameter tree
+  in host RAM. This is what you want for 70B+ models.
+* ``from_pretrained``: loads the model via ``Auto*.from_pretrained`` (full
+  model in memory) and then calls ``model.save_pretrained``. Simpler, but
+  caps out at whatever fits on the host.
+
+Side effects:
+    - Reads from the HF Hub or a local model path.
+    - Writes a converted checkpoint, tokenizer/processor/image-processor/
+      feature-extractor assets (when present) into the ``--out`` directory.
+    - Optionally pushes the resulting folder to the HF Hub under ``--repo-id``
+      when ``--push-to-hub`` is set (the default).
+    - May set ``HF_HUB_ENABLE_HF_TRANSFER=1`` if ``--enable-hf-transfer``.
+
 How to use
 
 Convert a Hugging Face checkpoint to an EasyDeL checkpoint (recommended: sequential, no push yet):
@@ -60,6 +79,14 @@ except ModuleNotFoundError:  # pragma: no cover
     import logging
 
     def get_logger(name: str):
+        """Fallback ``get_logger`` used when ``eformer.loggings`` is unavailable.
+
+        Args:
+            name: Logger name passed through to :func:`logging.getLogger`.
+
+        Returns:
+            logging.Logger: Standard-library logger instance.
+        """
         return logging.getLogger(name)
 
 
@@ -92,6 +119,19 @@ IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
 
 
 def _infer_task_from_hf_config(config) -> TaskType:
+    """Guess an EasyDeL task tag from a Hugging Face config.
+
+    Inspects ``config.architectures`` and ``config.model_type`` to decide
+    which ``AutoEasyDeLModel*`` class is appropriate. The default is
+    ``"causal_lm"`` when nothing else matches.
+
+    Args:
+        config: A Hugging Face ``PretrainedConfig`` instance.
+
+    Returns:
+        TaskType: One of the literal task strings (e.g. ``"causal_lm"``,
+            ``"image_text_to_text"``, ``"speech_seq2seq"``).
+    """
     architectures = [str(a) for a in (getattr(config, "architectures", None) or [])]
     joined = " ".join(architectures).lower()
     model_type = str(getattr(config, "model_type", "") or "").lower()
@@ -116,6 +156,20 @@ def _infer_task_from_hf_config(config) -> TaskType:
 
 
 def _parse_dtype(value: str):
+    """Parse a dtype shorthand string into a ``jnp.dtype``.
+
+    Accepts ``bf16`` / ``bfloat16``, ``fp16`` / ``float16`` / ``f16``, and
+    ``fp32`` / ``float32`` / ``f32`` (case-insensitive).
+
+    Args:
+        value: User-supplied dtype string.
+
+    Returns:
+        jnp.dtype: Matching JAX dtype.
+
+    Raises:
+        ValueError: If ``value`` is not a recognized dtype string.
+    """
     v = value.strip().lower()
     mapping = {
         "bf16": jnp.bfloat16,
@@ -133,6 +187,19 @@ def _parse_dtype(value: str):
 
 
 def _parse_int_list(value: str, *, expected_len: int | None = None) -> tuple[int, ...]:
+    """Parse a comma-separated string of integers.
+
+    Args:
+        value: Comma-separated integers, e.g. ``"1,-1,1,1,1"``.
+        expected_len: Optional exact length to enforce.
+
+    Returns:
+        tuple[int, ...]: Parsed integers.
+
+    Raises:
+        ValueError: If any part is not an integer or the count does not match
+            ``expected_len``.
+    """
     parts = [p.strip() for p in value.split(",") if p.strip() != ""]
     try:
         ints = tuple(int(p) for p in parts)
@@ -144,6 +211,18 @@ def _parse_int_list(value: str, *, expected_len: int | None = None) -> tuple[int
 
 
 def _parse_str_list(value: str, *, expected_len: int | None = None) -> tuple[str, ...]:
+    """Parse a comma-separated string of names.
+
+    Args:
+        value: Comma-separated string, e.g. ``"dp,fsdp,ep,tp,sp"``.
+        expected_len: Optional exact length to enforce.
+
+    Returns:
+        tuple[str, ...]: Parsed entries with whitespace stripped.
+
+    Raises:
+        ValueError: If the count does not match ``expected_len``.
+    """
     parts = tuple(p.strip() for p in value.split(",") if p.strip() != "")
     if expected_len is not None and len(parts) != expected_len:
         raise ValueError(f"Expected {expected_len} items, got {len(parts)}: {value!r}")
@@ -169,6 +248,36 @@ TorchStreamingCache = Literal["hf_cache", "temp"]
 
 @dataclass
 class ConvertArgs:
+    """CLI arguments for :func:`main` (parsed by ``DataClassArgumentParser``).
+
+    Attributes:
+        source: HF repo id or local path of the model to convert.
+        out: Output directory (local path; gcsfuse mount works).
+        repo_id: Optional HF repo id to push the converted checkpoint to.
+        push_to_hub: When ``--repo-id`` is set, push the converted folder to
+            the HF Hub.
+        task: Model task; ``"auto"`` infers from the HF config.
+        convert_mode: ``"sequential"`` streams shards; ``"from_pretrained"``
+            loads then saves.
+        torch_streaming_cache: Where to keep streamed shards (``"hf_cache"`` or
+            ``"temp"``).
+        torch_streaming_tmp_dir: Optional parent directory for ``"temp"``
+            shard downloads.
+        tensorstore_chunk_bytes: Maximum TensorStore chunk size.
+        dtype: Compute dtype string (``bf16`` / ``fp16`` / ``fp32``).
+        param_dtype: Parameter storage dtype string.
+        sharding_axis_dims: Comma-separated 5D mesh dims (``dp,fsdp,ep,tp,sp``).
+        sharding_axis_names: Comma-separated 5D mesh axis names.
+        auto_shard_model: Enable EasyDeL automatic sharding.
+        cache_dir: HF cache directory override.
+        revision: HF revision/branch/tag/commit.
+        token: HF token (or ``HF_TOKEN`` env / ``huggingface-cli login``).
+        local_files_only: Skip HF Hub access entirely.
+        force_download: Force re-download from HF Hub.
+        trust_remote_code: Pass ``trust_remote_code=True`` to HF loaders.
+        enable_hf_transfer: Enable ``hf_transfer`` accelerated downloads.
+    """
+
     source: str = field(metadata={"help": "HF repo id (e.g. meta-llama/Llama-3.1-8B) or local path"})
     out: str = field(metadata={"help": "Output directory (local path; GCSFuse mount works)"})
 
@@ -246,6 +355,22 @@ class ConvertArgs:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point for the single-checkpoint converter.
+
+    Parses :class:`ConvertArgs`, downloads tokenizer/processor/image-processor/
+    feature-extractor assets (best-effort, ignored when absent), then either
+    runs the sequential streaming conversion or the full
+    ``from_pretrained``+``save_pretrained`` path. Optionally pushes the
+    resulting folder to the HF Hub.
+
+    Args:
+        argv: Optional list of command-line tokens. When ``None`` the parser
+            reads from ``sys.argv``.
+
+    Returns:
+        None. Side effects: writes a converted EasyDeL checkpoint and
+        accompanying artifacts to ``args.out`` and may push them to the Hub.
+    """
     parser = DataClassArgumentParser(
         ConvertArgs,
         description="Download/convert a HuggingFace PyTorch checkpoint to EasyDeL and optionally push to HF Hub.",
@@ -336,6 +461,12 @@ def main(argv: list[str] | None = None) -> None:
         from easydel.infra.base_module import EasyDeLBaseModule
 
         class Base(EasyDeLBaseModule):
+            """Lightweight :class:`EasyDeLBaseModule` shell pinned to the inferred task.
+
+            Exists only so we can call ``huggingface_to_easydel_sequential``
+            without instantiating the actual model class.
+            """
+
             _model_task = model_cls.model_task
 
         Base.huggingface_to_easydel_sequential(

@@ -11,7 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+"""Download large (non-PyTorch) artifacts from Hugging Face repos to a local tree.
+
+Walks each requested model repo's file metadata, filters by size and glob
+patterns, and downloads the surviving files into ``<--out-root>/<owner>/<name>/``
+using ``huggingface_hub.hf_hub_download``. PyTorch weight extensions are
+excluded by default; pass ``--include-pytorch`` to allow them.
+
+The script is *size-based*, so it isn't well suited for directory-style
+weight formats like Zarr (many small chunk files). For Zarr / whole-repo
+downloads use :file:`scripts/download_hf_repo_chunked_to_gcs.py` instead.
+
+Side effects:
+    - Issues HTTP requests against the HF Hub.
+    - Writes downloaded files under ``--out-root`` (commonly a gcsfuse mount).
+    - May enable ``hf_transfer`` accelerated downloads via the
+      ``HF_HUB_ENABLE_HF_TRANSFER`` env var.
+
 How to use
 
 Download large non-PyTorch artifacts from one or more Hugging Face repos into a local directory
@@ -74,12 +90,42 @@ PYTORCH_WEIGHT_GLOBS = (
 
 @dataclass(frozen=True)
 class RepoFile:
+    """One file entry from a Hugging Face repo's metadata listing.
+
+    Attributes:
+        name: Path of the file within the repo (``rfilename``).
+        size: File size in bytes when reported by the Hub, else ``None``.
+    """
+
     name: str
     size: int | None
 
 
 @dataclass
 class LargeWeightsArgs:
+    """CLI arguments for :func:`main`.
+
+    Attributes:
+        out_root: Output root directory.
+        repo_id: Explicit repo ids to download (repeatable).
+        repos_file: Optional file with one repo id per line.
+        collection: HF collection URL or ``"owner/slug"`` strings whose member
+            model repos are added to the download set (repeatable).
+        revision: Repo revision to download from.
+        token: HF access token (env-fallback supported).
+        cache_dir: HF cache directory override.
+        min_size_mb: Files smaller than this are skipped (unless explicitly
+            included via ``--include``).
+        include: Globs to include (overrides size-only filtering when present).
+        exclude: Globs to exclude.
+        include_pytorch: Allow ``*.bin`` / ``*.safetensors`` / ``*.pt`` files
+            in the download set.
+        match_repo: Substrings every repo id must contain.
+        dry_run: Print what would be downloaded but do nothing.
+        continue_on_error: Continue on per-repo failures.
+        enable_hf_transfer: Toggle the ``hf_transfer`` accelerated downloader.
+    """
+
     out_root: str = field(metadata={"help": "Output root directory (e.g. /mnt/gcs/weights)."})
 
     repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "Model repo id (repeatable)."})
@@ -135,6 +181,14 @@ class LargeWeightsArgs:
 
 
 def _read_models_file(path: str | os.PathLike) -> list[str]:
+    """Read one-repo-id-per-line file, stripping comments and blank lines.
+
+    Args:
+        path: UTF-8 text file path.
+
+    Returns:
+        list[str]: Repo ids in file order.
+    """
     text = Path(path).read_text(encoding="utf-8")
     repo_ids: list[str] = []
     for raw_line in text.splitlines():
@@ -146,6 +200,21 @@ def _read_models_file(path: str | os.PathLike) -> list[str]:
 
 
 def _parse_collection(value: str) -> tuple[str, str]:
+    """Parse an HF collection identifier into ``(owner, slug)``.
+
+    Accepts either a full URL of the form
+    ``https://huggingface.co/collections/<owner>/<slug>`` or the bare
+    ``owner/slug`` shorthand.
+
+    Args:
+        value: Collection URL or ``"owner/slug"`` string.
+
+    Returns:
+        tuple[str, str]: ``(owner, slug)`` pair.
+
+    Raises:
+        ValueError: If the value is empty or cannot be parsed.
+    """
     value = value.strip()
     if not value:
         raise ValueError("Empty collection value")
@@ -164,6 +233,17 @@ def _parse_collection(value: str) -> tuple[str, str]:
 
 
 def _fetch_collection_repo_ids(owner: str, slug: str, *, timeout_s: int = 30) -> list[str]:
+    """Fetch the model-typed member repos of an HF collection.
+
+    Args:
+        owner: Collection owner / org.
+        slug: Collection slug.
+        timeout_s: HTTP request timeout in seconds.
+
+    Returns:
+        list[str]: Repo ids of every collection item whose ``repoType`` is
+            ``"model"``.
+    """
     url = f"https://huggingface.co/api/collections/{owner}/{slug}"
     data = requests.get(url, timeout=timeout_s).json()
     repo_ids: list[str] = []
@@ -177,6 +257,15 @@ def _fetch_collection_repo_ids(owner: str, slug: str, *, timeout_s: int = 30) ->
 
 
 def _matches_any_glob(name: str, globs: tuple[str, ...]) -> bool:
+    """Return ``True`` if ``name`` matches any glob in ``globs``.
+
+    Args:
+        name: File name or path to test.
+        globs: Tuple of ``fnmatch``-style patterns.
+
+    Returns:
+        bool: Whether at least one glob matched.
+    """
     return any(fnmatch.fnmatch(name, pattern) for pattern in globs)
 
 
@@ -188,6 +277,22 @@ def _should_keep_file(
     include_globs: tuple[str, ...],
     exclude_globs: tuple[str, ...],
 ) -> bool:
+    """Decide whether a repo file should be downloaded.
+
+    Applies the include globs, then the exclude globs, then the size floor.
+    Files whose size is unknown are only kept when they explicitly matched an
+    include glob.
+
+    Args:
+        filename: File path within the repo.
+        size: File size in bytes, or ``None`` if unknown.
+        min_size_bytes: Minimum file size to keep.
+        include_globs: Whitelist globs (empty tuple disables whitelist).
+        exclude_globs: Blacklist globs.
+
+    Returns:
+        bool: ``True`` if the file should be downloaded.
+    """
     if include_globs and not _matches_any_glob(filename, include_globs):
         return False
     if exclude_globs and _matches_any_glob(filename, exclude_globs):
@@ -199,6 +304,16 @@ def _should_keep_file(
 
 
 def _repo_out_dir(out_root: Path, repo_id: str) -> Path:
+    """Compute the per-repo download directory under ``out_root``.
+
+    Args:
+        out_root: Output root directory.
+        repo_id: Repo id; ``"owner/name"`` splits into ``out_root/owner/name``,
+            otherwise the bare id is used as a single sub-folder.
+
+    Returns:
+        Path: Target download directory for the repo.
+    """
     if "/" in repo_id:
         owner, name = repo_id.split("/", 1)
         return out_root / owner / name
@@ -206,6 +321,22 @@ def _repo_out_dir(out_root: Path, repo_id: str) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for the large-weights downloader.
+
+    Resolves the repo set from ``--repo-id`` / ``--repos-file`` /
+    ``--collection``, filters to those matching every ``--match-repo``
+    substring, then for each repo selects files passing the size / glob
+    filters and downloads them via ``hf_hub_download``.
+
+    Args:
+        argv: Optional list of CLI tokens. ``None`` reads from ``sys.argv``.
+
+    Returns:
+        int: ``0`` if every repo succeeded or was skipped, otherwise ``2``.
+
+    Raises:
+        SystemExit: If no repos were selected.
+    """
     parser = DataClassArgumentParser(
         LargeWeightsArgs,
         description="Download large (non-PyTorch) weight files from Hugging Face into a GCS (or local) directory.",

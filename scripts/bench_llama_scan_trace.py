@@ -13,7 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark Llama layer execution with SpectraX scan trace on vs off."""
+"""Benchmark Llama layer execution with SpectraX scan trace on vs off.
+
+Builds a small Llama-shaped causal LM twice — once with ``scan_layers=True``
+(scan-driven traversal) and once with ``scan_layers=False`` (fully unrolled
+layer stack) — then JIT-compiles the backbone forward and times steady-state
+iterations. The script also monkey-patches SpectraX's ``ModuleList.scan`` /
+``StackedModuleList.scan`` to capture the ``trace`` flag actually used at
+runtime, so the report shows whether scan-based or unrolled tracing dominated.
+
+Useful for diagnosing the compile-time / iteration-time tradeoff between
+scan-on-layers (compact HLO, slightly higher dispatch overhead) and full
+unrolling (large HLO, sometimes faster steady-state).
+
+Usage:
+    python scripts/bench_llama_scan_trace.py --batch-size 1 --seq-len 128 \\
+        --layers 4 --hidden-size 256 --intermediate-size 512
+"""
 
 from __future__ import annotations
 
@@ -31,6 +47,19 @@ import easydel as ed
 
 @dataclass(frozen=True)
 class Result:
+    """Latency / scan-trace summary for one configuration of the benchmark.
+
+    Attributes:
+        name: Human-readable label (``trace_off`` / ``trace_on``).
+        scan_layers: The ``scan_layers`` flag the config was built with.
+        trace_values: ``trace`` argument seen on each ``ModuleList.scan`` call
+            in invocation order during the forward.
+        compile_ms: Wall-clock time for the first traced + compiled forward.
+        iter_ms: Mean steady-state iteration latency in milliseconds.
+        tokens_per_second: Throughput derived from ``batch * seq_len / iter``.
+        output_shape: Shape of the resulting ``last_hidden_state``.
+    """
+
     name: str
     scan_layers: bool
     trace_values: tuple[bool, ...]
@@ -41,6 +70,17 @@ class Result:
 
 
 def _dtype(name: str) -> jnp.dtype:
+    """Map a dtype string flag to the corresponding ``jnp.dtype``.
+
+    Args:
+        name: One of ``"float32"``, ``"bfloat16"``, ``"float16"``.
+
+    Returns:
+        jnp.dtype: The matching JAX dtype.
+
+    Raises:
+        ValueError: If ``name`` is not a recognized dtype string.
+    """
     if name == "float32":
         return jnp.float32
     if name == "bfloat16":
@@ -51,10 +91,28 @@ def _dtype(name: str) -> jnp.dtype:
 
 
 def _block_until_ready(tree: Any) -> Any:
+    """Block until every device-array leaf in ``tree`` finishes executing.
+
+    Args:
+        tree: Arbitrary pytree whose leaves may include JAX arrays.
+
+    Returns:
+        Any: The same pytree, with each blocking-capable leaf replaced by its
+            ``block_until_ready`` return value.
+    """
     return jax.tree.map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, tree)
 
 
 def _build_model(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaForCausalLM:
+    """Build a small :class:`easydel.LlamaForCausalLM` with the given scan flag.
+
+    Args:
+        args: Parsed CLI namespace.
+        scan_layers: Whether to scan over decoder layers (vs full unroll).
+
+    Returns:
+        ed.LlamaForCausalLM: Freshly initialized causal LM.
+    """
     dtype = _dtype(args.dtype)
     cfg = ed.LlamaConfig(
         vocab_size=args.vocab_size,
@@ -72,11 +130,25 @@ def _build_model(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaForC
 
 
 def _trace_values(model: ed.LlamaForCausalLM, input_ids: jax.Array) -> tuple[bool, ...]:
+    """Capture the ``trace`` flag at every SpectraX scan call during one forward.
+
+    Monkey-patches ``ModuleList.scan`` / ``StackedModuleList.scan`` for the
+    duration of a single forward, restoring the originals on exit.
+
+    Args:
+        model: Model to invoke with ``input_ids``.
+        input_ids: Input tokens for the forward.
+
+    Returns:
+        tuple[bool, ...]: ``trace`` flag at each scan call site, in invocation
+            order.
+    """
     calls: list[bool] = []
     original_module_scan = ModuleList.scan
     original_stacked_scan = StackedModuleList.scan
 
     def wrapped_scan(self, fn, init_carry, *, trace=False, unroll=None):
+        """Record ``trace`` and delegate to the original ``ModuleList.scan``."""
         calls.append(bool(trace))
         original = original_stacked_scan if isinstance(self, StackedModuleList) else original_module_scan
         return original(self, fn, init_carry, trace=trace, unroll=unroll)
@@ -93,12 +165,26 @@ def _trace_values(model: ed.LlamaForCausalLM, input_ids: jax.Array) -> tuple[boo
 
 
 def _bench_case(args: argparse.Namespace, *, name: str, scan_layers: bool) -> Result:
+    """Build, warm up, and time one scan configuration.
+
+    Builds two models with the same config: the first is used purely to capture
+    scan trace flags, the second is the model actually JIT-compiled and timed.
+
+    Args:
+        args: Parsed CLI namespace.
+        name: Label written into the resulting :class:`Result`.
+        scan_layers: ``scan_layers`` flag for this configuration.
+
+    Returns:
+        Result: Latency / throughput summary for this configuration.
+    """
     input_ids = jnp.ones((args.batch_size, args.seq_len), dtype=jnp.int32)
     trace_values = _trace_values(_build_model(args, scan_layers=scan_layers), input_ids)
     model = _build_model(args, scan_layers=scan_layers)
 
     @jax.jit
     def run(m, ids):
+        """JIT-compiled backbone forward used inside the timing loop."""
         return m.model(input_ids=ids).last_hidden_state
 
     start = time.perf_counter()
@@ -128,6 +214,20 @@ def _bench_case(args: argparse.Namespace, *, name: str, scan_layers: bool) -> Re
 
 
 def main() -> None:
+    """CLI entry point for the scan-trace benchmark.
+
+    Args:
+        --batch-size: Per-step batch size.
+        --seq-len: Sequence length for the synthetic forward.
+        --layers / --hidden-size / --intermediate-size / --heads / --kv-heads /
+            --vocab-size / --max-position-embeddings: Llama architecture knobs.
+        --dtype: Storage / compute dtype.
+        --warmup / --iters: Iteration counts for warmup / timed runs.
+        --seed: Initialization seed.
+
+    Returns:
+        None.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)

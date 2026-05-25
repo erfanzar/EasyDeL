@@ -15,9 +15,27 @@
 
 """Benchmark a real 8B-shaped sharded Llama model on TPU/GPU.
 
-The default architecture is Llama-3-8B shaped and the default mesh uses all
-visible devices for tensor parallelism: ``(pp, dp, fsdp, ep, tp, sp) =
-(1, 1, 1, 1, -1, 1)``.
+Builds a freshly initialized :class:`easydel.LlamaForCausalLM` (or the bare
+:class:`easydel.LlamaModel` when ``--base-only`` is passed) with Llama-3-8B
+defaults, applies the requested 6D mesh ``(pp, dp, fsdp, ep, tp, sp)``, and
+measures parameter sharding, single-step compile time, and steady-state
+forward iteration latency / tokens-per-second. The default mesh uses all
+visible devices for tensor parallelism: ``(1, 1, 1, 1, -1, 1)``.
+
+Two scan modes can be benchmarked:
+
+* ``trace_off`` — ``scan_layers=True``, layer stack traversed via SpectraX
+  ``ModuleList.scan`` without per-step tracing.
+* ``trace_on`` — ``scan_layers=False``, every layer is traced unrolled, which
+  helps surface XLA fusion behaviour but produces a much larger HLO.
+
+The script also patches ``ModuleList.scan`` / ``StackedModuleList.scan`` to
+record the ``trace`` flag each call site uses, so the report reflects what
+SpectraX actually did during the timed forward.
+
+Usage:
+    python scripts/bench_llama_8b_sharded.py --case both --batch-size 1 \\
+        --seq-len 128 --dtype bfloat16
 """
 
 from __future__ import annotations
@@ -40,6 +58,22 @@ AXIS_NAMES = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
 @dataclass(frozen=True)
 class Result:
+    """Single benchmark result captured by :func:`_bench_case`.
+
+    Attributes:
+        name: Human-readable label for the case (``trace_off`` / ``trace_on``).
+        build_ms: Wall-clock time to construct the model in milliseconds.
+        compile_ms: Time spent on the first JIT trace + compile in milliseconds.
+        iter_ms: Mean steady-state forward iteration latency in milliseconds.
+        tokens_per_second: Throughput derived from ``batch_size * seq_len / iter_ms``.
+        output_shape: Shape of the final hidden-state output tensor.
+        trace_values: ``trace`` flags observed inside SpectraX scan calls
+            during the warmup forward.
+        param_count: Total scalar parameter count of the model.
+        unique_shardings: Set of distinct partition-spec strings seen across
+            parameters.
+    """
+
     name: str
     build_ms: float
     compile_ms: float
@@ -52,6 +86,17 @@ class Result:
 
 
 def _dtype(name: str) -> jnp.dtype:
+    """Map a dtype string flag to the corresponding ``jnp.dtype``.
+
+    Args:
+        name: One of ``"float32"``, ``"bfloat16"``, ``"float16"``.
+
+    Returns:
+        jnp.dtype: The matching JAX dtype.
+
+    Raises:
+        ValueError: If ``name`` is not a recognized dtype string.
+    """
     if name == "float32":
         return jnp.float32
     if name == "bfloat16":
@@ -62,6 +107,18 @@ def _dtype(name: str) -> jnp.dtype:
 
 
 def _parse_axis_dims(value: str) -> tuple[int, ...]:
+    """Parse the ``--axis-dims`` CLI string into a 6-tuple matching :data:`AXIS_NAMES`.
+
+    Args:
+        value: Comma-separated integers, e.g. ``"1,1,1,1,-1,1"``. Entries equal
+            to ``-1`` request automatic sizing for that axis.
+
+    Returns:
+        tuple[int, ...]: Parsed dims, with length equal to ``len(AXIS_NAMES)``.
+
+    Raises:
+        ValueError: If the number of entries does not match ``AXIS_NAMES``.
+    """
     dims = tuple(int(part.strip()) for part in value.split(","))
     if len(dims) != len(AXIS_NAMES):
         raise ValueError(f"--axis-dims must have {len(AXIS_NAMES)} entries for {AXIS_NAMES}, got {dims}")
@@ -69,10 +126,29 @@ def _parse_axis_dims(value: str) -> tuple[int, ...]:
 
 
 def _block_until_ready(tree: Any) -> Any:
+    """Block until every device-array leaf in ``tree`` finishes executing.
+
+    Args:
+        tree: Arbitrary pytree whose leaves may include JAX arrays.
+
+    Returns:
+        Any: The same pytree, with each blocking-capable leaf replaced by its
+            ``block_until_ready`` return value.
+    """
     return jax.tree.map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, tree)
 
 
 def _build_config(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaConfig:
+    """Construct a :class:`easydel.LlamaConfig` from parsed CLI arguments.
+
+    Args:
+        args: Parsed CLI namespace produced by :func:`main`.
+        scan_layers: If ``True`` configure the model to use SpectraX scan over
+            the decoder layer stack; if ``False`` the stack is unrolled.
+
+    Returns:
+        easydel.LlamaConfig: A fully populated Llama configuration.
+    """
     dtype = _dtype(args.dtype)
     return ed.LlamaConfig(
         vocab_size=args.vocab_size,
@@ -94,6 +170,16 @@ def _build_config(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaCon
 
 
 def _build_model(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaForCausalLM | ed.LlamaModel:
+    """Instantiate either :class:`LlamaForCausalLM` or bare :class:`LlamaModel`.
+
+    Args:
+        args: Parsed CLI namespace.
+        scan_layers: Forwarded into :func:`_build_config`.
+
+    Returns:
+        ed.LlamaForCausalLM | ed.LlamaModel: Newly initialized model. Returns
+            the bare backbone when ``args.base_only`` is set.
+    """
     cfg = _build_config(args, scan_layers=scan_layers)
     dtype = _dtype(args.dtype)
     if args.base_only:
@@ -102,6 +188,18 @@ def _build_model(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaForC
 
 
 def _forward(model: ed.LlamaForCausalLM | ed.LlamaModel, input_ids: jax.Array) -> jax.Array:
+    """Run a single forward pass and return the final hidden state.
+
+    For full ``ForCausalLM`` models, the LM head is bypassed via
+    ``apply_lm_head=False`` so the benchmark measures the backbone cost only.
+
+    Args:
+        model: Either a full causal-LM or the bare backbone.
+        input_ids: Token ID tensor of shape ``[batch, seq_len]``.
+
+    Returns:
+        jax.Array: ``last_hidden_state`` of shape ``[batch, seq_len, hidden]``.
+    """
     if hasattr(model, "model"):
         out = model(input_ids=input_ids, apply_lm_head=False)
         return out.last_hidden_state
@@ -109,11 +207,26 @@ def _forward(model: ed.LlamaForCausalLM | ed.LlamaModel, input_ids: jax.Array) -
 
 
 def _trace_values(model: ed.LlamaForCausalLM | ed.LlamaModel, input_ids: jax.Array) -> tuple[bool, ...]:
+    """Capture the ``trace`` flag at every SpectraX scan call during one forward.
+
+    Monkey-patches ``ModuleList.scan`` and ``StackedModuleList.scan`` for the
+    duration of a single forward, restoring the originals on exit. Used to
+    confirm what scan mode the model is actually exercising in a given case.
+
+    Args:
+        model: Model to run the introspecting forward through.
+        input_ids: Input token IDs for the forward pass.
+
+    Returns:
+        tuple[bool, ...]: ``trace`` flag value recorded at each scan call site
+            in invocation order.
+    """
     calls: list[bool] = []
     original_module_scan = ModuleList.scan
     original_stacked_scan = StackedModuleList.scan
 
     def wrapped_scan(self, fn, init_carry, *, trace=False, unroll=None):
+        """Record ``trace`` and delegate to the original ``ModuleList.scan``."""
         calls.append(bool(trace))
         original = original_stacked_scan if isinstance(self, StackedModuleList) else original_module_scan
         return original(self, fn, init_carry, trace=trace, unroll=unroll)
@@ -130,6 +243,16 @@ def _trace_values(model: ed.LlamaForCausalLM | ed.LlamaModel, input_ids: jax.Arr
 
 
 def _parameter_summary(model: ed.LlamaForCausalLM | ed.LlamaModel) -> tuple[int, tuple[str, ...]]:
+    """Compute total parameter count and the set of unique parameter shardings.
+
+    Args:
+        model: Model to inspect via ``spx.iter_variables``.
+
+    Returns:
+        tuple[int, tuple[str, ...]]: ``(param_count, unique_shardings)`` where
+            ``unique_shardings`` is a sorted tuple of partition-spec strings
+            (or ``"unsharded"`` for replicated params).
+    """
     param_count = 0
     shardings: set[str] = set()
     for _path, var in spx.iter_variables(model):
@@ -150,6 +273,22 @@ def _parameter_summary(model: ed.LlamaForCausalLM | ed.LlamaModel) -> tuple[int,
 
 
 def _bench_case(args: argparse.Namespace, *, name: str, scan_layers: bool) -> Result:
+    """Build, warm up, and time a single scan configuration.
+
+    Builds a fresh model, captures scan ``trace`` flags, JIT-compiles the
+    forward, runs ``args.warmup`` warmup iterations, then times ``args.iters``
+    timed iterations to derive steady-state latency / throughput. The model is
+    deleted and JAX compile caches are cleared afterwards so subsequent cases
+    start from a clean slate.
+
+    Args:
+        args: Parsed CLI namespace.
+        name: Result label written into the returned :class:`Result`.
+        scan_layers: Whether to enable SpectraX layer scan in this case.
+
+    Returns:
+        Result: Latency / throughput / sharding summary for this configuration.
+    """
     input_ids = jnp.ones((args.batch_size, args.seq_len), dtype=jnp.int32)
 
     build_start = time.perf_counter()
@@ -161,6 +300,7 @@ def _bench_case(args: argparse.Namespace, *, name: str, scan_layers: bool) -> Re
 
     @jax.jit
     def run(m, ids):
+        """JIT-compiled forward used inside the timing loop."""
         return _forward(m, ids)
 
     start = time.perf_counter()
@@ -198,6 +338,14 @@ def _bench_case(args: argparse.Namespace, *, name: str, scan_layers: bool) -> Re
 
 
 def _print_result(result: Result) -> None:
+    """Pretty-print a :class:`Result` to stdout in two-line summary form.
+
+    Args:
+        result: Benchmark output produced by :func:`_bench_case`.
+
+    Returns:
+        None.
+    """
     print(
         f"{result.name}: trace_values={result.trace_values} "
         f"params={result.param_count:,} unique_shardings={result.unique_shardings}"
@@ -210,6 +358,32 @@ def _print_result(result: Result) -> None:
 
 
 def main() -> None:
+    """CLI entry point for the sharded 8B Llama benchmark.
+
+    Parses arguments, optionally monkey-patches SpectraX scan's effective
+    unroll policy, and runs the selected benchmark cases.
+
+    Args:
+        --case: Which configuration to run (``trace_off``, ``trace_on``, or
+            ``both``).
+        --base-only: When set, benchmark :class:`LlamaModel` instead of
+            :class:`LlamaForCausalLM`.
+        --batch-size: Per-step batch size.
+        --seq-len: Sequence length for the synthetic input.
+        --layers / --hidden-size / --intermediate-size / --heads / --kv-heads /
+            --vocab-size / --max-position-embeddings / --rope-theta /
+            --rms-norm-eps: Llama architecture knobs.
+        --dtype: Storage and compute dtype (``bfloat16`` by default).
+        --precision: Optional ``jax.lax.Precision`` override.
+        --axis-dims: 6-axis mesh dims string consumed by :func:`_parse_axis_dims`.
+        --use-sharding-constraint: Toggle SpectraX sharding constraints.
+        --warmup / --iters: Iteration counts for warmup / timed runs.
+        --seed: Initialization seed.
+        --scan-unroll-default: Override SpectraX's default scan unroll factor.
+
+    Returns:
+        None.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=("trace_off", "trace_on", "both"), default="trace_off")
     parser.add_argument(
@@ -245,6 +419,7 @@ def main() -> None:
         import spectrax.core.containers as containers
 
         def effective_unroll(unroll, length):
+            """Replace SpectraX's default unroll policy with the CLI override."""
             if length <= 0:
                 return 1
             if unroll is None:

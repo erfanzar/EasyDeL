@@ -825,7 +825,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "setuptools", marker = "extra == 'profile'", specifier = ">=70,<81" },
-    { name = "spectrax-lib", specifier = "==0.1.3" },
+    { name = "spectrax-lib", specifier = "==0.1.4" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = "~=2.19.0" },
     { name = "tensorflow-datasets", marker = "extra == 'tensorflow'", specifier = "~=4.9.9" },
@@ -4220,7 +4220,7 @@ wheels = [
 
 [[package]]
 name = "spectrax-lib"
-version = "0.1.3"
+version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fsspec", extra = ["http"] },
@@ -4232,9 +4232,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "treescope" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/15/f6/616dcfe263147c75d70bd4198a708232518498431c3ce0fb1d313d9d9c2c/spectrax_lib-0.1.3.tar.gz", hash = "sha256:0be19fd610bcec1c0a5617ec2d57ce5de1f39e3d49358f9214da041a4d0a28eb", size = 551638, upload-time = "2026-05-14T16:08:07.358Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8b/f5/03c91fe5c0115ee8a888f8ddb608172165e48cb614dd9133f12566460031/spectrax_lib-0.1.4.tar.gz", hash = "sha256:0f25ab9013168b11e5e8c0586bc974767e4b98b7ddfd0c939077161f8121866c", size = 580819, upload-time = "2026-05-22T18:45:59.25Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/d3/e6ed69d31188fa05fac99e1360e283c7eeefcc5ac9a053c98d15478d01fe/spectrax_lib-0.1.3-py3-none-any.whl", hash = "sha256:5c8c8d8dc34574b424a544d3f8c5b4ba4b4c9035043cb8dcc18e1d4840b62e22", size = 639973, upload-time = "2026-05-14T16:08:08.653Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/7e/b4c24c7da641291c5e37c9c287300bca37c2b80f81d666e31a023c96c406/spectrax_lib-0.1.4-py3-none-any.whl", hash = "sha256:77bcd42d48eaaba0c6144827b22657ef2879e86fda5a4bd56edec33630e2e9d4", size = 676177, upload-time = "2026-05-22T18:46:00.701Z" },
 ]
 
 [[package]]

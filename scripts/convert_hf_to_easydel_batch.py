@@ -11,7 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+"""Batch wrapper around ``scripts/convert_hf_to_easydel.py``.
+
+Reads a list of HF model sources (from ``--source`` flags and/or a
+``--models-file``), de-duplicates them, then spawns one ``convert_hf_to_easydel``
+subprocess per model with the per-model ``--source``, ``--out``, and
+``--repo-id`` filled in. Any unrecognized arguments are forwarded verbatim to
+the per-model command, so the same conversion flags accepted by the single
+converter (``--convert-mode``, ``--torch-streaming-cache``, ``--token``, ...)
+apply to every model in the batch.
+
+Side effects:
+    - Spawns child ``python convert_hf_to_easydel.py`` processes.
+    - Creates ``<--out-root>/<model-name>`` directories.
+    - The child processes may download from HF and push to HF (see the
+      single-converter docstring).
+
 How to use
 
 Batch wrapper around `scripts/convert_hf_to_easydel.py`.
@@ -51,16 +66,45 @@ from eformer.aparser import DataClassArgumentParser
 
 @dataclass(frozen=True)
 class ModelJob:
+    """One model conversion job to dispatch as a subprocess.
+
+    Attributes:
+        source: HF source repo id or local path.
+        repo_id: Output HF repo id (e.g. ``"EasyDeL/Llama-3.1-8B"``).
+        out_dir: Local output directory under ``--out-root``.
+    """
+
     source: str
     repo_id: str
     out_dir: Path
 
 
 def _strip_comment(line: str) -> str:
+    """Drop trailing ``#`` comments and surrounding whitespace from a line.
+
+    Args:
+        line: Raw text line, possibly containing a comment.
+
+    Returns:
+        str: Line with the first ``#`` and everything after it removed,
+            trimmed of leading/trailing whitespace.
+    """
     return line.split("#", 1)[0].strip()
 
 
 def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root: Path) -> list[ModelJob]:
+    """Read a model-list file and turn each non-empty line into a :class:`ModelJob`.
+
+    Args:
+        path: Path to a UTF-8 text file with one model per line. See the
+            module docstring for the accepted line formats.
+        default_owner: HF owner/org to prefix when a line has no explicit
+            ``owner/name``.
+        out_root: Root directory under which each job's output folder lives.
+
+    Returns:
+        list[ModelJob]: One job per non-empty, non-comment line.
+    """
     jobs: list[ModelJob] = []
     text = Path(path).read_text(encoding="utf-8")
 
@@ -77,11 +121,25 @@ def _parse_models_file(path: str | os.PathLike, *, default_owner: str, out_root:
 
 
 def _parse_model_line(line: str, *, default_owner: str) -> tuple[str, str]:
-    # Supported formats:
-    # - source
-    # - source -> owner/name
-    # - source,owner/name
-    # - source owner/name
+    """Parse a single model-list line into ``(source, repo_id)``.
+
+    Supported formats:
+
+    * ``source`` — repo id defaults to ``"<default_owner>/<basename>"``.
+    * ``source -> owner/name``
+    * ``source,owner/name``
+    * ``source owner/name``
+
+    Args:
+        line: A pre-stripped line from the models file.
+        default_owner: HF owner used when no explicit repo id is provided.
+
+    Returns:
+        tuple[str, str]: ``(source, repo_id)``.
+
+    Raises:
+        ValueError: If the line cannot be parsed into a source / repo pair.
+    """
     if "->" in line:
         left, right = (part.strip() for part in line.split("->", 1))
         source = left
@@ -111,6 +169,17 @@ def _parse_model_line(line: str, *, default_owner: str) -> tuple[str, str]:
 
 
 def _mask_secrets(argv: list[str]) -> list[str]:
+    """Return a copy of ``argv`` with values after token-like flags hidden.
+
+    Useful for safely printing the per-model command before exec'ing it.
+
+    Args:
+        argv: Argument list to sanitize.
+
+    Returns:
+        list[str]: New list where values following ``--token``, ``--hf-token``,
+            or ``--huggingface-token`` are replaced with ``"****"``.
+    """
     masked = argv[:]
     for i, arg in enumerate(masked):
         if arg in {"--token", "--hf-token", "--huggingface-token"} and i + 1 < len(masked):
@@ -119,15 +188,46 @@ def _mask_secrets(argv: list[str]) -> list[str]:
 
 
 def _format_cmd(argv: list[str]) -> str:
+    """Format an ``argv`` list as a copy-pasteable shell command string.
+
+    Args:
+        argv: Argument list, typically already masked by :func:`_mask_secrets`.
+
+    Returns:
+        str: Space-joined shell-quoted command.
+    """
     return " ".join(shlex.quote(x) for x in argv)
 
 
 def _default_convert_script() -> Path:
+    """Resolve the default path to the per-model converter script.
+
+    Returns:
+        Path: ``<scripts/>/convert_hf_to_easydel.py`` next to this file.
+    """
     return Path(__file__).resolve().parent / "convert_hf_to_easydel.py"
 
 
 @dataclass
 class BatchArgs:
+    """CLI arguments for :func:`main`.
+
+    Attributes:
+        out_root: Output root directory; each model writes to
+            ``<out_root>/<repo-name>``.
+        source: List of HF source ids (repeatable ``--source`` flag).
+        models_file: Optional path to a file with one model per line.
+        repo_owner: Default output HF owner when a line in ``models_file`` does
+            not specify one.
+        python: Override the Python interpreter used for child processes.
+        convert_script: Override the converter script path.
+        dry_run: Print commands without executing.
+        continue_on_error: Continue processing remaining models when one
+            subprocess fails.
+        skip_existing: Skip models whose output dir already exists and is
+            non-empty.
+    """
+
     out_root: str = field(metadata={"help": "Output root directory; each model writes to <out-root>/<repo-name>."})
     source: str = field(
         default_factory=list,
@@ -167,6 +267,27 @@ class BatchArgs:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for the batch converter wrapper.
+
+    Builds the deduplicated list of :class:`ModelJob` entries from
+    ``--source`` flags and ``--models-file``, then either prints (when
+    ``--dry-run``) or runs the per-model ``convert_hf_to_easydel.py``
+    subprocess for each one. Forwarded ``pass_through`` arguments are
+    appended verbatim to every child command.
+
+    Args:
+        argv: Optional list of command-line tokens. When ``None`` the parser
+            reads from ``sys.argv``.
+
+    Returns:
+        int: ``0`` if every conversion succeeded (or all jobs were skipped),
+            the failing subprocess's return code when one fails and
+            ``--continue-on-error`` is not set, or ``2`` if some failed but
+            execution continued.
+
+    Raises:
+        SystemExit: If no models were selected.
+    """
     parser = DataClassArgumentParser(
         BatchArgs,
         description="Batch wrapper around scripts/convert_hf_to_easydel.py",

@@ -11,14 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-How to use
+"""Format EasyDeL Python code with ruff and (re)generate the Sphinx API docs.
 
-Format code and generate API documentation for EasyDeL (also used by pre-commit):
+Drives three steps the project runs from pre-commit and CI:
 
-  python scripts/format_and_generate_docs.py
+1. ``format_code`` — runs ``ruff check --fix`` (when ``--fix``) and
+   ``ruff format`` over every ``*.py`` under ``--directory``.
+2. ``generate_api_docs`` — walks the package, emits one ``.rst`` page per
+   module mirroring the package layout under ``docs/api_docs/``, and writes
+   per-package and root index pages with sorted toctree entries.
+3. ``run_tests`` — runs ``pytest`` over ``test/`` when ``--test`` is set.
 
-Run with `--help` to see all options.
+By default (no flags), every step except tests is executed.
+
+Side effects:
+    - Mutates files in place under ``--directory`` via ruff fixes.
+    - Removes and recreates ``docs/api_docs/`` (when ``--clean``).
+
+Usage:
+    python scripts/format_and_generate_docs.py            # format + docs
+    python scripts/format_and_generate_docs.py --all      # format + docs + tests
+    python scripts/format_and_generate_docs.py --no-fix --docs
 """
 
 import shutil
@@ -36,17 +49,44 @@ DOCS_API_DIR = PROJECT_ROOT / "docs" / "api_docs"
 
 
 def _strip_prefix(module_path: str) -> str:
+    """Strip the top-level ``"<PROJECT_NAME>."`` prefix from a dotted module path.
+
+    Args:
+        module_path: Dotted Python module path.
+
+    Returns:
+        str: ``module_path`` with the leading ``"easydel."`` removed, unchanged
+            when the prefix is absent.
+    """
     prefix = f"{PROJECT_NAME}."
     return module_path[len(prefix) :] if module_path.startswith(prefix) else module_path
 
 
 def _docname_from_module(module_path: str) -> str:
+    """Convert a dotted module path to a slash-separated doc name.
+
+    Args:
+        module_path: Dotted Python module path (e.g. ``"easydel.kernels.foo"``).
+
+    Returns:
+        str: Slash-separated doc name relative to the API root (``"kernels/foo"``).
+    """
     return _strip_prefix(module_path).replace(".", "/")
 
 
 def create_rst_file(name: str, module_path: str, output_dir: Path) -> None:
-    """
-    Create a module page at a nested path (mirrors package structure).
+    """Write one Sphinx ``automodule`` page for a Python module.
+
+    The output path mirrors the package layout so the per-package
+    ``index.rst`` toctrees can reference it without further translation.
+
+    Args:
+        name: Page title (typically the full dotted module path).
+        module_path: Dotted module path to expand via ``automodule``.
+        output_dir: Root directory holding the generated ``.rst`` tree.
+
+    Returns:
+        None.
     """
     docname = _docname_from_module(module_path)
     rst_path = output_dir / f"{docname}.rst"
@@ -63,10 +103,21 @@ def create_rst_file(name: str, module_path: str, output_dir: Path) -> None:
 
 
 def _write_package_index(pkg_docname: str, children: list[str], packages: set[str]) -> None:
-    """
-    Write index.rst for a package.
-    pkg_docname: '' for top-level, otherwise 'kernels' or 'kernels/triton_flash_attention', etc.
-    children: list of docnames for immediate children (packages or modules)
+    """Write the ``index.rst`` toctree page for one package (or the API root).
+
+    Packages are listed before modules; within each group entries are sorted
+    alphabetically. Package entries become ``<child>/index`` toctree lines,
+    module entries are referenced directly by their doc name.
+
+    Args:
+        pkg_docname: Slash-separated package doc name, or ``""`` for the
+            top-level API root.
+        children: Doc names of immediate children (packages and modules).
+        packages: Set of all package doc names; used to detect which children
+            should resolve to ``<child>/index`` toctree entries.
+
+    Returns:
+        None.
     """
     if pkg_docname:
         index_path = DOCS_API_DIR / pkg_docname / "index.rst"
@@ -99,8 +150,18 @@ def _write_package_index(pkg_docname: str, children: list[str], packages: set[st
 
 
 def generate_api_docs(clean: bool = True) -> bool:
-    """
-    Generate API documentation with a hierarchical layout.
+    """Discover every module under the package and emit a hierarchical Sphinx tree.
+
+    Walks ``easydel/``, registers each non-``__init__`` module, builds the
+    package -> child relationship map, and writes one ``automodule`` page per
+    module plus one index per package and a top-level index.
+
+    Args:
+        clean: When ``True`` (default), recursively remove ``docs/api_docs/``
+            before regenerating so stale pages are not left behind.
+
+    Returns:
+        bool: ``True`` on success; ``False`` when no modules were discovered.
     """
     print("Generating API documentation...")
 
@@ -157,15 +218,25 @@ def generate_api_docs(clean: bool = True) -> bool:
 
 
 def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess | subprocess.CalledProcessError:
-    """
-    Run a shell command and return the result.
+    """Run a subprocess command, capturing stdout/stderr.
+
+    When the command fails and ``check`` is ``True`` the exception is logged
+    and re-raised; when ``check`` is ``False`` the
+    :class:`subprocess.CalledProcessError` is returned instead so the caller
+    can inspect it.
 
     Args:
-        cmd: Command and arguments as list.
-        check: Whether to raise exception on non-zero exit code.
+        cmd: Command and arguments as a list of strings.
+        check: When ``True``, propagate non-zero exit codes as exceptions.
 
     Returns:
-        CompletedProcess object with command results.
+        subprocess.CompletedProcess | subprocess.CalledProcessError: The
+            completed-process object on success, or the caught error when
+            ``check`` is ``False`` and the command failed.
+
+    Raises:
+        subprocess.CalledProcessError: If ``check`` is ``True`` and the command
+            exits non-zero.
     """
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=check)
@@ -179,15 +250,18 @@ def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProce
 
 
 def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
-    """
-    Format Python code using ruff.
+    """Format every Python file under ``directory`` with ruff.
+
+    When ``fix`` is ``True`` runs ``ruff check --fix --unsafe-fixes`` first,
+    then unconditionally runs ``ruff format``. Both commands are pinned to
+    the repo-root ``pyproject.toml`` configuration.
 
     Args:
-        directory: Directory to format.
-        fix: Whether to apply fixes automatically.
+        directory: Directory to format (defaults to the package name).
+        fix: Whether to apply ``ruff check --fix`` before formatting.
 
     Returns:
-        True if successful, False otherwise.
+        bool: ``True`` if both ruff invocations exited zero.
     """
     print(f"Formatting code in {directory}/...")
 
@@ -227,6 +301,21 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
 
 
 def discover_modules(project_name: str) -> list[str]:
+    """Walk a package directory and return every importable dotted module path.
+
+    ``__init__.py`` files are skipped because Sphinx ``automodule`` already
+    handles package-level docstrings via the per-package ``index.rst``.
+
+    Args:
+        project_name: Top-level package directory name under ``PROJECT_ROOT``.
+
+    Returns:
+        list[str]: Sorted, deduplicated dotted module paths
+            (e.g. ``"easydel.kernels.flash_attention"``).
+
+    Raises:
+        FileNotFoundError: If ``PROJECT_ROOT/project_name`` does not exist.
+    """
     base_dir = (PROJECT_ROOT / project_name).resolve()
     if not base_dir.is_dir():
         raise FileNotFoundError(f"Package directory not found: {base_dir}")
@@ -242,14 +331,13 @@ def discover_modules(project_name: str) -> list[str]:
 
 
 def run_tests(test_dir: str = "test") -> bool:
-    """
-    Run project tests using pytest.
+    """Run the project's pytest suite under ``test_dir``.
 
     Args:
-        test_dir: Directory containing tests.
+        test_dir: Directory containing tests (default ``"test"``).
 
     Returns:
-        True if tests pass, False otherwise.
+        bool: ``True`` if pytest exited zero, otherwise ``False``.
     """
     print(f"Running tests in {test_dir}/...")
 
@@ -265,6 +353,18 @@ def run_tests(test_dir: str = "test") -> bool:
 
 @dataclass
 class ScriptArgs:
+    """CLI arguments for :func:`main`.
+
+    Attributes:
+        format: Run ruff formatting.
+        docs: Regenerate Sphinx API docs.
+        test: Run the pytest suite.
+        all: Shortcut for selecting every task.
+        fix: Apply ruff's auto-fixes when formatting.
+        clean: Remove ``docs/api_docs/`` before regenerating.
+        directory: Directory to format with ruff.
+    """
+
     format: bool = field(default=False, metadata={"help": "Format code with ruff"})
     docs: bool = field(default=False, metadata={"help": "Generate API documentation"})
     test: bool = field(default=False, metadata={"help": "Run tests"})
@@ -282,6 +382,21 @@ class ScriptArgs:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point for the format/docs/test driver.
+
+    When none of ``--format`` / ``--docs`` / ``--test`` is passed, runs
+    formatting and documentation generation (i.e. the pre-commit shape).
+    Raises ``SystemExit`` with code ``1`` when any selected step fails.
+
+    Args:
+        argv: Optional list of CLI tokens. ``None`` reads from ``sys.argv``.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: Always; the code reflects step success.
+    """
     parser = DataClassArgumentParser(
         ScriptArgs,
         description=f"Format code and generate documentation for {PROJECT_NAME}",
