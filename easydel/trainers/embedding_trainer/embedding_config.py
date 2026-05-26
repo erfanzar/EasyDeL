@@ -168,4 +168,23 @@ class EmbeddingConfig(TrainingArguments):
         metadata={"help": "Number of processes for dataset preprocessing."},
     )
 
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
+        if self.pooling_strategy is not None and self.pooling_strategy not in {
+            "last",
+            "first",
+            "mean",
+            "weighted_mean",
+            "max",
+        }:
+            raise ValueError("`pooling_strategy` must be one of 'last', 'first', 'mean', 'weighted_mean', or 'max'.")
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__(
+                max_sequence_length=max_sequence_length,
+                quantization_block=quantization_block,
+            )
+
     __hash__ = hash_fn

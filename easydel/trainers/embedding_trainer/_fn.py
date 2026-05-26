@@ -193,6 +193,11 @@ def matryoshka_loss(
     return avg_loss, all_metrics
 
 
+def _missing_triplet_negative_metrics() -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Return neutral triplet metrics when no negative examples are present."""
+    return jnp.float32(0.0), {"fraction_active_triplets": jnp.float32(0.0)}
+
+
 def _embed_batch(
     module,
     input_ids: jax.Array,
@@ -339,7 +344,9 @@ def embedding_training_step(
                 loss_kwargs["margin"] = margin
 
             with jax.named_scope(scope_root + "/loss_fn/compute_contrastive_loss"):
-                if matryoshka_dims is not None:
+                if loss_type == "triplet" and n_embeds is None:
+                    loss, extra_metrics = _missing_triplet_negative_metrics()
+                elif matryoshka_dims is not None:
                     loss, extra_metrics = matryoshka_loss(
                         base_loss_fn,
                         q_embeds,
@@ -351,11 +358,7 @@ def embedding_training_step(
                 elif n_embeds is not None:
                     loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, n_embeds, **loss_kwargs)
                 else:
-                    if loss_type == "triplet":
-                        loss = jnp.float32(0.0)
-                        extra_metrics = {"fraction_active_triplets": jnp.float32(0.0)}
-                    else:
-                        loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
+                    loss, extra_metrics = base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
 
             metrics = LossMetrics(
                 loss=loss,
@@ -450,6 +453,8 @@ def _embedding_loss_values(
     elif loss_type == "triplet":
         loss_kwargs["margin"] = margin
 
+    if loss_type == "triplet" and n_embeds is None:
+        return _missing_triplet_negative_metrics()
     if matryoshka_dims is not None:
         return matryoshka_loss(
             base_loss_fn,
@@ -461,8 +466,6 @@ def _embedding_loss_values(
         )
     if n_embeds is not None:
         return base_loss_fn(q_embeds, p_embeds, n_embeds, **loss_kwargs)
-    if loss_type == "triplet":
-        return jnp.float32(0.0), {"fraction_active_triplets": jnp.float32(0.0)}
     return base_loss_fn(q_embeds, p_embeds, **loss_kwargs)
 
 

@@ -131,6 +131,7 @@ class EmbeddingTrainer(Trainer):
             raise TypeError(f"arguments must be EmbeddingConfig, got {type(arguments)}")
 
         self._embedding_config = arguments
+        self._apply_pooling_strategy(model, arguments.pooling_strategy)
 
         pad_token_id = getattr(processing_class, "pad_token_id", None) if processing_class else None
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
@@ -153,6 +154,31 @@ class EmbeddingTrainer(Trainer):
                 processing_class=processing_class,
                 data_collator=data_collator,
             )
+
+    @staticmethod
+    def _apply_pooling_strategy(model: EasyDeLBaseModule | EasyDeLState | None, pooling_strategy: str | None) -> None:
+        """Apply a requested embedding pooling strategy to a mutable module."""
+        if pooling_strategy is None:
+            return
+        if model is None:
+            raise ValueError("`pooling_strategy` was set, but no embedding model was provided.")
+        if isinstance(model, EasyDeLState):
+            raise ValueError(
+                "`pooling_strategy` overrides must be applied before converting the embedding model to EasyDeLState."
+            )
+
+        pooling_feature = getattr(model, "_pooling_feature", None)
+        if pooling_feature is None:
+            raise ValueError(
+                "`pooling_strategy` was set, but the provided embedding model does not expose a pooling feature."
+            )
+        pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = -1
+        model._pooling_feature = pooling_feature.__class__(
+            strategy=pooling_strategy,
+            pad_token_id=pad_token_id,
+        )
 
     def _get_preprocess_transform(self) -> EmbeddingPreprocessTransform | None:
         """Build the lazy tokenisation transform for raw-text embedding datasets.
