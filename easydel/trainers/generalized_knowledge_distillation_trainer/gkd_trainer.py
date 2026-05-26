@@ -52,6 +52,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.traversals import deepcopy_model
 
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..supervised_fine_tuning_trainer import SFTTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
@@ -146,12 +147,20 @@ class GKDTrainer(SFTTrainer):
         self._warned_missing_prompt = False
         self.gkd_generate_function = None
 
+        teacher_model = self._resolve_teacher_model(
+            teacher_model=teacher_model,
+        )
+
         if teacher_model is None:
             teacher_state = deepcopy_model(student_state)
         elif isinstance(teacher_model, EasyDeLState):
             teacher_state = teacher_model
         else:
             teacher_state = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+
+        if arguments.disable_dropout:
+            student_state = disable_state_dropout(student_state)
+            teacher_state = disable_state_dropout(teacher_state)
 
         self.teacher_state = teacher_state
 
@@ -167,10 +176,6 @@ class GKDTrainer(SFTTrainer):
 
         if teacher_model is None:
             self.teacher_state = deepcopy_model(self.model_state)
-
-        if arguments.disable_dropout:
-            self.model_state.model.eval()
-            self.teacher_state.model.eval()
 
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
@@ -192,6 +197,16 @@ class GKDTrainer(SFTTrainer):
         except Exception as exc:  # pragma: no cover - generation is optional
             self.gkd_generate_function = None
             logger.warning("Failed to initialize GKD generation function, on-policy sampling disabled: %s", exc)
+
+    @staticmethod
+    def _resolve_teacher_model(
+        *,
+        teacher_model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState | None:
+        """Resolve an initialized GKD teacher."""
+        if isinstance(teacher_model, str):
+            reject_string_model_id(teacher_model, role="teacher model")
+        return teacher_model
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled GKD training/evaluation step functions.

@@ -107,7 +107,7 @@ def generalized_jsd_loss(
     From Agarwal et al. 2024. Given the temperature-softened
     distributions ``p_s = softmax(student / T)`` and
     ``p_t = softmax(teacher / T)`` and a midpoint
-    ``m = beta * p_s + (1 - beta) * p_t``, the loss is the convex
+    ``m = (1 - beta) * p_s + beta * p_t``, the loss is the convex
     combination
     ``beta * KL(p_t || m) + (1 - beta) * KL(p_s || m)``.
     The ``beta`` knob therefore interpolates the GKD objective between
@@ -148,8 +148,8 @@ def generalized_jsd_loss(
         mixture_log_probs = jax.scipy.special.logsumexp(
             jnp.stack(
                 [
-                    teacher_log_probs + log_one_minus,
-                    student_log_probs + log_beta,
+                    student_log_probs + log_one_minus,
+                    teacher_log_probs + log_beta,
                 ]
             ),
             axis=0,

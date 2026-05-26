@@ -58,6 +58,8 @@ def main():
             "dataset_text_field": None,
             "lmbda": 0.0,  # disable on-policy sampling for the smoke test
             "max_new_tokens": 16,
+            "num_generations": 1,
+            "num_return_sequences": 1,
         },
     )
 
