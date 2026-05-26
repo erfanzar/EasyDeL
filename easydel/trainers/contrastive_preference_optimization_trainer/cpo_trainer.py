@@ -34,6 +34,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import CPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
@@ -118,14 +119,13 @@ class CPOTrainer(Trainer):
             raise TypeError(f"`arguments` must be a `CPOConfig`, received {type(arguments)}.")
         if processing_class is None:
             raise ValueError("`processing_class` must be provided to tokenize a CPO dataset.")
-        if model is None:
-            raise ValueError("A policy model must be supplied to the CPO trainer.")
 
         self.arguments = arguments
         self.processing_class = processing_class
         self.truncation_mode = arguments.truncation_mode
         self._stored_metrics = {}
 
+        model = self._resolve_policy_model(model)
         if isinstance(model, EasyDeLState):
             model_state = model
         else:
@@ -174,7 +174,7 @@ class CPOTrainer(Trainer):
             self.input_data_collator_grain = data_collator
 
         if arguments.disable_dropout:
-            model_state.model.eval()
+            model_state = disable_state_dropout(model_state)
 
         self.model_state = model_state
 
@@ -186,6 +186,17 @@ class CPOTrainer(Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+
+    @staticmethod
+    def _resolve_policy_model(
+        model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Resolve a CPO policy model, rejecting accidental string identifiers."""
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        if model is None:
+            raise ValueError("A policy model must be supplied to the CPO trainer.")
+        return model
 
     def _get_preprocess_transform(self) -> CPOPreprocessTransform | None:
         """Build the lazy preprocessing transform for ``ShardedDataSource``.

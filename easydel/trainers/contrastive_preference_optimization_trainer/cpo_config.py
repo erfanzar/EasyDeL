@@ -84,6 +84,8 @@ class CPOConfig(TrainingArguments):
         alpha: AlphaPO reward shaping parameter. ``0.0`` uses log-prob
             rewards; non-zero applies ``(1 - p**(-alpha)) / alpha``
             to the token probabilities.
+        generate_during_eval: TRL compatibility flag for generating
+            evaluation samples through EasyDeL/eSurge preview generation.
         label_pad_token_id: Token id used to mask prompt tokens in the
             supervised NLL term (default ``-100``).
         padding_value: Explicit padding token id for completions.
@@ -133,6 +135,10 @@ class CPOConfig(TrainingArguments):
     disable_dropout: bool = field(
         default=True,
         metadata={"help": "Disable dropout layers during training for more stable updates."},
+    )
+    generate_during_eval: bool = field(
+        default=False,
+        metadata={"help": ("Generate and log completions during evaluation through EasyDeL/eSurge preview generation.")},
     )
     cpo_alpha: float = field(
         default=1.0,
@@ -225,6 +231,9 @@ class CPOConfig(TrainingArguments):
                 size; forwarded to the base class.
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
+        if self.generate_during_eval:
+            self.generation_interval = self.generation_interval or self.evaluation_steps or 1
+            self.use_esurge_generation = True
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
