@@ -35,6 +35,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from ..group_relative_policy_optimization import GRPOTrainer
+from ..group_relative_policy_optimization.grpo_trainer import _clip_rewards_if_configured
 from ..prompt_utils import apply_chat_template
 from ..training_utils import (
     extract_generation_model_kwargs,
@@ -591,6 +592,7 @@ class GFPOTrainer(GRPOTrainer):
 
             # Compute rewards before filtering (for metrics)
             rewards = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
+            rewards = _clip_rewards_if_configured(rewards, self.arguments)
             log_completion_length = jnp.sum(completion_mask, -1)
 
             num_remains = self.arguments.num_remains_in_group
@@ -622,12 +624,24 @@ class GFPOTrainer(GRPOTrainer):
             else:
                 filter_time = 0.0
 
+            difficulty_weights = None
+            difficulty_key = getattr(self.arguments, "difficulty_key", None)
+            if getattr(self.arguments, "difficulty_loss_weight", False) and difficulty_key is not None:
+                difficulty_values = batch.get(difficulty_key)
+                if difficulty_values is None:
+                    difficulty_values = reward_batch.get(difficulty_key)
+                if difficulty_values is not None:
+                    difficulty_weights = jnp.asarray(difficulty_values, dtype=jnp.float32).reshape(-1)
+                    difficulty_weights = difficulty_weights.repeat(generation_factor, axis=0)
+
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
             completion_ids = self._all_gather(completion_ids)
             completion_mask = self._all_gather(completion_mask)
             ref_per_token_logps = self._all_gather(ref_per_token_logps)
             rewards_per_func = self._all_gather(rewards_per_func)
+            if difficulty_weights is not None:
+                difficulty_weights = self._all_gather(difficulty_weights)
             scoring_prompt_model_kwargs = jax.tree_util.tree_map(
                 lambda x: self._all_gather(x) if isinstance(x, jax.Array) else x,
                 scoring_prompt_model_kwargs,
@@ -638,6 +652,7 @@ class GFPOTrainer(GRPOTrainer):
                 generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
                 generation_factor = max(generation_factor, 1)
                 rewards = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
+                rewards = _clip_rewards_if_configured(rewards, self.arguments)
                 mean_grouped_rewards = jnp.nanmean(rewards.reshape(-1, generation_factor), axis=-1)
                 advantages = rewards - mean_grouped_rewards.repeat(generation_factor, axis=0)
 
@@ -673,6 +688,8 @@ class GFPOTrainer(GRPOTrainer):
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
+        if difficulty_weights is not None:
+            metrics_dict["difficulty_weight_mean"] = float(jnp.mean(difficulty_weights))
         self._log_training_generations_to_wandb(
             state=state,
             prompts=completion_prompts,
@@ -684,16 +701,16 @@ class GFPOTrainer(GRPOTrainer):
             source="policy",
         )
 
-        return (
-            {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "ref_per_token_logps": ref_per_token_logps,
-                "advantages": advantages,
-                "num_items_in_batch": jnp.sum(completion_mask),
-                **scoring_prompt_model_kwargs,
-            },
-            metrics_dict,
-        )
+        model_batch = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "ref_per_token_logps": ref_per_token_logps,
+            "advantages": advantages,
+            "num_items_in_batch": jnp.sum(completion_mask),
+            **scoring_prompt_model_kwargs,
+        }
+        if difficulty_weights is not None:
+            model_batch["difficulty_weights"] = difficulty_weights
+        return (model_batch, metrics_dict)

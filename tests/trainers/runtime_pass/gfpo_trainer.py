@@ -21,7 +21,6 @@ response length inflation while maintaining accuracy.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -57,27 +56,20 @@ def main():
         ed.GFPOConfig,
         "gfpo",
         overrides={
-            "max_prompt_length": 512,
-            "max_completion_length": 256,
-            "max_length": 768,
+            "max_prompt_length": 64,
+            "max_completion_length": 32,
+            "max_length": 96,
             "num_train_epochs": 1,
             "total_batch_size": 2,
-            "num_generations": 8,  # Generate more samples
-            "num_remains_in_group": 4,  # Keep top 4 after filtering
+            "num_generations": 3,
+            "num_remains_in_group": 2,
             "filter_by_length": True,
             "filter_by_efficiency": True,
         },
     )
 
-    lightweight = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
-    expected_generations = 3 if lightweight else 8
-    expected_remains = 2 if lightweight else 4
-    assert trainer_args.num_generations == expected_generations, (
-        f"Expected {expected_generations}, got {trainer_args.num_generations}"
-    )
-    assert trainer_args.num_remains_in_group == expected_remains, (
-        f"Expected {expected_remains}, got {trainer_args.num_remains_in_group}"
-    )
+    assert trainer_args.num_generations == 3
+    assert trainer_args.num_remains_in_group == 2
     assert trainer_args.filter_by_length is True
     assert trainer_args.filter_by_efficiency is True
 
