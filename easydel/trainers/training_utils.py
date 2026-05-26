@@ -1205,6 +1205,7 @@ def prepare_scheduled_reference_outputs(
     reference_state_field: str,
     forward_field: str,
     output_to_batch: collections.abc.Mapping[str, str],
+    forward_kwargs: collections.abc.Mapping[str, tp.Any] | None = None,
     partition_spec_field: str = "partition_spec",
     skip_field: str | None = None,
     missing_error: str | None = None,
@@ -1245,7 +1246,10 @@ def prepare_scheduled_reference_outputs(
             microbatches=getattr(call.schedule, "microbatches", 1),
             batch_argnums=1,
         )
-        ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch))
+        if forward_kwargs:
+            ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch, **dict(forward_kwargs)))
+        else:
+            ref_out = stop_gradient_tree(ref_forward(ref_model, constrained_batch))
     for output_key, batch_key in output_to_batch.items():
         batch[batch_key] = ref_out[output_key]
     return batch

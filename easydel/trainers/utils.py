@@ -823,6 +823,13 @@ class RewardDataCollatorWithPaddingTFDS:
     padding: bool | str = "max_length"
     max_length: int | None = None
     truncation_mode: str = "keep_end"
+    pad_to_multiple_of: int | None = None
+
+    def _resolve_target_length(self, target_len: int | None) -> int | None:
+        """Round a reward-collator target length to the configured multiple."""
+        if target_len is not None and self.pad_to_multiple_of is not None and target_len % self.pad_to_multiple_of != 0:
+            target_len = ((target_len // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
+        return target_len
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
         """Collate a batch of chosen/rejected pairs for reward modeling.
@@ -876,6 +883,7 @@ class RewardDataCollatorWithPaddingTFDS:
             target_len = None
         else:
             target_len = None
+        target_len = self._resolve_target_length(target_len)
 
         def _pad_right(arr: jnp.ndarray, pad_value: int) -> jnp.ndarray:
             """Pad or truncate an array to ``target_len`` on the right side.
@@ -907,6 +915,7 @@ class RewardDataCollatorWithPaddingTFDS:
 
         if target_len is None:
             target_len = max(x.shape[-1] for x in chosen_ids + rejected_ids)
+            target_len = self._resolve_target_length(target_len)
             chosen_ids = [_pad_right(x, pad_token_id) for x in chosen_ids]
             chosen_mask = [_pad_right(x, 0) for x in chosen_mask]
             rejected_ids = [_pad_right(x, pad_token_id) for x in rejected_ids]
@@ -947,6 +956,14 @@ class RewardDataCollatorWithPaddingGrain:
     padding: bool | str = "max_length"
     max_length: int | None = None
     truncation_mode: str = "keep_end"
+    pad_to_multiple_of: int | None = None
+
+    def _resolve_target_length(self) -> int | None:
+        """Return the Grain reward-collator target length after rounding."""
+        target_len = self.max_length if self.padding else None
+        if target_len is not None and self.pad_to_multiple_of is not None and target_len % self.pad_to_multiple_of != 0:
+            target_len = ((target_len // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
+        return target_len
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
         """Collate chosen/rejected pairs for Grain-based reward modeling.
@@ -983,6 +1000,7 @@ class RewardDataCollatorWithPaddingGrain:
             pad_token_id = getattr(getattr(self.tokenizer, "tokenizer", None), "pad_token_id", None)
         if pad_token_id is None:
             pad_token_id = 0
+        target_len = self._resolve_target_length()
 
         def _pad_right(arr: np.ndarray, pad_value: int) -> np.ndarray:
             """Pad or truncate a NumPy array to ``max_length`` on the right side.
@@ -995,15 +1013,15 @@ class RewardDataCollatorWithPaddingGrain:
                 Array with its last dimension matching ``max_length``, or
                 unchanged if padding is disabled.
             """
-            if self.max_length is None or not self.padding:
+            if target_len is None:
                 return arr
-            if arr.shape[-1] > self.max_length:
+            if arr.shape[-1] > target_len:
                 if self.truncation_mode == "keep_end":
-                    arr = arr[..., -self.max_length :]
+                    arr = arr[..., -target_len:]
                 else:
-                    arr = arr[..., : self.max_length]
-            if arr.shape[-1] < self.max_length:
-                pad_amount = self.max_length - arr.shape[-1]
+                    arr = arr[..., :target_len]
+            if arr.shape[-1] < target_len:
+                pad_amount = target_len - arr.shape[-1]
                 arr = np.pad(arr, [(0, 0)] * (arr.ndim - 1) + [(0, pad_amount)], constant_values=pad_value)
             return arr
 
@@ -1049,6 +1067,14 @@ class DataCollatorForPreferenceTFDS:
     pad_token_id: int = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
+    pad_to_multiple_of: int | None = None
+
+    def _resolve_pad_length(self, tensors: list[jnp.ndarray], max_length: int | None) -> int:
+        """Return the collator pad length, optionally rounded to a multiple."""
+        target_length = max_length if max_length is not None else max(int(tensor.shape[-1]) for tensor in tensors)
+        if self.pad_to_multiple_of is not None and target_length % self.pad_to_multiple_of != 0:
+            target_length = ((target_length // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
+        return target_length
 
     def _get_prompt_arrays(self, feature: dict[str, tp.Any]) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Extract prompt input IDs and attention mask as JAX arrays.
@@ -1141,6 +1167,11 @@ class DataCollatorForPreferenceTFDS:
         rejected_arrays = [self._extract_completion_arrays(feature, "rejected") for feature in features]
         rejected_input_ids = [input_ids for input_ids, _ in rejected_arrays]
         rejected_attention_mask = [attention_mask for _, attention_mask in rejected_arrays]
+        prompt_pad_length = self._resolve_pad_length(prompt_input_ids, self.max_prompt_length)
+        completion_pad_length = self._resolve_pad_length(
+            [*chosen_input_ids, *rejected_input_ids],
+            self.max_completion_length,
+        )
 
         pixel_values = None
         pixel_attention_mask = None
@@ -1167,25 +1198,25 @@ class DataCollatorForPreferenceTFDS:
         output = {
             "prompt_input_ids": pad(
                 prompt_input_ids,
-                self.max_prompt_length,
+                prompt_pad_length,
                 padding_value=self.pad_token_id,
                 padding_side="left",
             ),
             "prompt_attention_mask": pad(
                 prompt_attention_mask,
-                self.max_prompt_length,
+                prompt_pad_length,
                 padding_value=0,
                 padding_side="left",
             ),
-            "chosen_input_ids": pad(chosen_input_ids, self.max_completion_length, padding_value=self.pad_token_id),
-            "chosen_attention_mask": pad(chosen_attention_mask, self.max_completion_length, padding_value=0),
-            "rejected_input_ids": pad(rejected_input_ids, self.max_completion_length, padding_value=self.pad_token_id),
-            "rejected_attention_mask": pad(rejected_attention_mask, self.max_completion_length, padding_value=0),
+            "chosen_input_ids": pad(chosen_input_ids, completion_pad_length, padding_value=self.pad_token_id),
+            "chosen_attention_mask": pad(chosen_attention_mask, completion_pad_length, padding_value=0),
+            "rejected_input_ids": pad(rejected_input_ids, completion_pad_length, padding_value=self.pad_token_id),
+            "rejected_attention_mask": pad(rejected_attention_mask, completion_pad_length, padding_value=0),
         }
         if pixel_values is not None:
-            output["pixel_values"] = pad(pixel_values, self.max_prompt_length, padding_value=0.0)
+            output["pixel_values"] = pad(pixel_values, prompt_pad_length, padding_value=0.0)
         if pixel_attention_mask is not None:
-            output["pixel_attention_mask"] = pad(pixel_attention_mask, self.max_prompt_length, padding_value=0)
+            output["pixel_attention_mask"] = pad(pixel_attention_mask, prompt_pad_length, padding_value=0)
         if "image_sizes" in features[0]:
             output["image_sizes"] = jnp.array([feature["image_sizes"] for feature in features])
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
@@ -1219,6 +1250,14 @@ class DataCollatorForPreferenceGrain:
     pad_token_id: int = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
+    pad_to_multiple_of: int | None = None
+
+    def _resolve_pad_length(self, tensors: list[np.ndarray], max_length: int | None) -> int:
+        """Return the collator pad length, optionally rounded to a multiple."""
+        target_length = max_length if max_length is not None else max(int(tensor.shape[-1]) for tensor in tensors)
+        if self.pad_to_multiple_of is not None and target_length % self.pad_to_multiple_of != 0:
+            target_length = ((target_length // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
+        return target_length
 
     def _get_prompt_arrays(self, features: dict[str, tp.Any]) -> tuple[np.ndarray, np.ndarray]:
         """Extract prompt input IDs and attention mask as NumPy arrays.
@@ -1294,6 +1333,11 @@ class DataCollatorForPreferenceGrain:
         prompt_input_ids, prompt_attention_mask = self._get_prompt_arrays(features)
         chosen_input_ids, chosen_attention_mask = self._extract_completion_arrays(features, "chosen")
         rejected_input_ids, rejected_attention_mask = self._extract_completion_arrays(features, "rejected")
+        prompt_pad_length = self._resolve_pad_length([prompt_input_ids], self.max_prompt_length)
+        completion_pad_length = self._resolve_pad_length(
+            [chosen_input_ids, rejected_input_ids],
+            self.max_completion_length,
+        )
         pixel_values = None
         pixel_attention_mask = None
         if "pixel_values" in features.keys():
@@ -1319,43 +1363,43 @@ class DataCollatorForPreferenceGrain:
         output = {
             "prompt_input_ids": pad_single(
                 prompt_input_ids,
-                self.max_prompt_length,
+                prompt_pad_length,
                 padding_value=self.pad_token_id,
                 padding_side="left",
             ),
             "prompt_attention_mask": pad_single(
                 prompt_attention_mask,
-                self.max_prompt_length,
+                prompt_pad_length,
                 padding_value=0,
                 padding_side="left",
             ),
             "chosen_input_ids": pad_single(
                 chosen_input_ids,
-                self.max_completion_length,
+                completion_pad_length,
                 padding_value=self.pad_token_id,
             ),
             "chosen_attention_mask": pad_single(
                 chosen_attention_mask,
-                self.max_completion_length,
+                completion_pad_length,
                 padding_value=0,
             ),
             "rejected_input_ids": pad_single(
                 rejected_input_ids,
-                self.max_completion_length,
+                completion_pad_length,
                 padding_value=self.pad_token_id,
             ),
             "rejected_attention_mask": pad_single(
                 rejected_attention_mask,
-                self.max_completion_length,
+                completion_pad_length,
                 padding_value=0,
             ),
         }
 
         # Add optional outputs
         if pixel_values is not None:
-            output["pixel_values"] = pad_single(pixel_values, self.max_prompt_length, padding_value=0.0)
+            output["pixel_values"] = pad_single(pixel_values, prompt_pad_length, padding_value=0.0)
         if pixel_attention_mask is not None:
-            output["pixel_attention_mask"] = pad_single(pixel_attention_mask, self.max_prompt_length, padding_value=0)
+            output["pixel_attention_mask"] = pad_single(pixel_attention_mask, prompt_pad_length, padding_value=0)
         if "image_sizes" in features.keys():
             output["image_sizes"] = np.array(features["image_sizes"])
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
@@ -1565,6 +1609,14 @@ class GRPODataCollatorTFDS:
 
     max_prompt_length: int
     pad_token_id: int = 0
+    pad_to_multiple_of: int | None = None
+
+    def _resolve_prompt_pad_length(self) -> int:
+        """Return the GRPO prompt pad length after applying the optional multiple."""
+        target_length = self.max_prompt_length
+        if self.pad_to_multiple_of is not None and target_length % self.pad_to_multiple_of != 0:
+            target_length = ((target_length // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
+        return target_length
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
         """Collate a batch of GRPO prompt examples for TFDS-based training.
@@ -1582,10 +1634,11 @@ class GRPODataCollatorTFDS:
         """
         input_ids = [np.asarray(f["input_ids"], dtype=np.int32) for f in features]
         attention_mask = [np.asarray(f["attention_mask"], dtype=np.int32) for f in features]
+        prompt_pad_length = self._resolve_prompt_pad_length()
 
         batch = {
-            "input_ids": pad(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
-            "attention_mask": pad(attention_mask, self.max_prompt_length, 0, "left"),
+            "input_ids": pad(input_ids, prompt_pad_length, self.pad_token_id, "left"),
+            "attention_mask": pad(attention_mask, prompt_pad_length, 0, "left"),
         }
         for key in _collect_present_feature_keys(features):
             if key in {"input_ids", "attention_mask"}:
@@ -1625,7 +1678,7 @@ class GRPODataCollatorTFDS:
                     key,
                     array,
                     prompt.shape[-1],
-                    self.max_prompt_length,
+                    prompt_pad_length,
                     pad_token_id=self.pad_token_id,
                 )
                 for array, prompt in zip(arrays, input_ids, strict=False)
@@ -1773,6 +1826,14 @@ class GRPODataCollatorGrain:
 
     max_prompt_length: int
     pad_token_id: int = 0
+    pad_to_multiple_of: int | None = None
+
+    def _resolve_prompt_pad_length(self) -> int:
+        """Return the GRPO prompt pad length after applying the optional multiple."""
+        target_length = self.max_prompt_length
+        if self.pad_to_multiple_of is not None and target_length % self.pad_to_multiple_of != 0:
+            target_length = ((target_length // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
+        return target_length
 
     def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
         """Collate a single GRPO prompt example for Grain-based training.
@@ -1790,10 +1851,11 @@ class GRPODataCollatorGrain:
         """
         input_ids = np.asarray(feature["input_ids"], dtype=np.int32)
         attention_mask = np.asarray(feature["attention_mask"], dtype=np.int32)
+        prompt_pad_length = self._resolve_prompt_pad_length()
 
         batch = {
-            "input_ids": pad_single(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
-            "attention_mask": pad_single(attention_mask, self.max_prompt_length, 0, "left"),
+            "input_ids": pad_single(input_ids, prompt_pad_length, self.pad_token_id, "left"),
+            "attention_mask": pad_single(attention_mask, prompt_pad_length, 0, "left"),
         }
         for key, value in feature.items():
             if key not in {"input_ids", "attention_mask"} and value is not None:
@@ -1812,7 +1874,7 @@ class GRPODataCollatorGrain:
                         key,
                         array,
                         input_ids.shape[-1],
-                        self.max_prompt_length,
+                        prompt_pad_length,
                         pad_token_id=self.pad_token_id,
                     )
         return batch

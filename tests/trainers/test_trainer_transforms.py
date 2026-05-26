@@ -29,6 +29,12 @@ try:
         RewardPreprocessTransform,
         SFTPreprocessTransform,
     )
+    from easydel.trainers.utils import (
+        GRPODataCollatorGrain,
+        GRPODataCollatorTFDS,
+        RewardDataCollatorWithPaddingGrain,
+        RewardDataCollatorWithPaddingTFDS,
+    )
 except ImportError as exc:
     pytest.skip(f"Trainer transforms unavailable: {exc}", allow_module_level=True)
 
@@ -293,6 +299,18 @@ class PromptMaskTokenizer(MockTokenizer):
         raise AssertionError(f"Unexpected templated text: {text!r}")
 
 
+class RecordingTokenizer(MockTokenizer):
+    """Tokenizer that records keyword arguments from tokenization calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def __call__(self, text, **kwargs):
+        self.calls.append((text, kwargs))
+        return super().__call__(text, **kwargs)
+
+
 class TestSFTPreprocessTransform:
     """Tests for SFTPreprocessTransform."""
 
@@ -524,6 +542,57 @@ class TestSFTPreprocessTransform:
         assert "attention_mask" in result
         assert result["input_ids"] == [99, 11, 12, 13, 14, tokenizer.eos_token_id] + [0] * 10
         assert result["completion_mask"] == [0, 0, 0, 0, 1, 1] + [0] * 10
+
+    def test_prompt_completion_padding_free_keeps_variable_length_rows(self):
+        tokenizer = PromptMaskTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=16,
+            mask_prompt=True,
+            padding=False,
+        )
+
+        result = transform(
+            {
+                "prompt": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Say hi."},
+                ],
+                "completion": [
+                    {"role": "assistant", "content": "Hello!"},
+                ],
+            }
+        )
+
+        assert result["input_ids"] == [99, 11, 12, 13, 14, tokenizer.eos_token_id]
+        assert result["attention_mask"] == [1, 1, 1, 1, 1, 1]
+        assert result["completion_mask"] == [0, 0, 0, 0, 1, 1]
+
+    def test_prompt_completion_can_pad_to_multiple_without_max_length_padding(self):
+        tokenizer = PromptMaskTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=16,
+            mask_prompt=True,
+            padding=False,
+            pad_to_multiple_of=8,
+        )
+
+        result = transform(
+            {
+                "prompt": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Say hi."},
+                ],
+                "completion": [
+                    {"role": "assistant", "content": "Hello!"},
+                ],
+            }
+        )
+
+        assert result["input_ids"] == [99, 11, 12, 13, 14, tokenizer.eos_token_id, 0, 0]
+        assert result["attention_mask"] == [1, 1, 1, 1, 1, 1, 0, 0]
+        assert result["completion_mask"] == [0, 0, 0, 0, 1, 1, 0, 0]
 
     def test_prompt_completion_conversational_suffix_uses_example_tools(self):
         tokenizer = ToolAwareTokenizer()
@@ -1003,6 +1072,29 @@ class TestBCOPreprocessTransform:
         assert "completion_input_ids" in result
         assert "label" in result
 
+    def test_bco_preserves_reference_logps(self):
+        tokenizer = MockTokenizer()
+        transform = BCOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=256,
+            max_completion_length=128,
+        )
+
+        result = next(
+            iter(
+                transform(
+                    {
+                        "prompt": "Question?",
+                        "completion": "Answer",
+                        "label": True,
+                        "reference_logps": -1.25,
+                    }
+                )
+            )
+        )
+
+        assert result["reference_logps"] == -1.25
+
     def test_conversational_completion_suffix(self):
         tokenizer = StrictChatTokenizer()
         transform = BCOPreprocessTransform(
@@ -1165,6 +1257,25 @@ class TestGRPOPreprocessTransform:
         assert tokenizer.calls[-1]["messages"] == [{"role": "user", "content": "Tell me a joke"}]
         assert tokenizer.calls[-1]["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
 
+    def test_conversational_prompt_forwards_chat_template_kwargs(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = GRPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=1024,
+            chat_template_kwargs={"chat_template": "custom-template"},
+        )
+
+        result = transform(
+            {
+                "prompt": [
+                    {"role": "user", "content": "Tell me a joke"},
+                ],
+            }
+        )
+
+        assert "input_ids" in result
+        assert tokenizer.calls[-1]["chat_template"] == "custom-template"
+
     def test_mixed_preference_format_keeps_explicit_prompt(self):
         """Explicit prompt should not be replaced by empty extracted prefix."""
         tokenizer = MockTokenizer()
@@ -1211,6 +1322,38 @@ class TestGRPOPreprocessTransform:
         result = transform(example)
         assert "attention_mask" in result
         assert sum(result["attention_mask"]) > 0
+
+    def test_pad_to_multiple_of_pads_prompt_after_truncation(self):
+        tokenizer = MockTokenizer()
+        transform = GRPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=5,
+            pad_to_multiple_of=4,
+        )
+
+        result = transform({"prompt": "abcdefg"})
+
+        assert len(result["input_ids"]) == 8
+        assert result["attention_mask"] == [0, 0, 0, 1, 1, 1, 1, 1]
+
+    def test_collators_keep_pad_to_multiple_of_prompt_length(self):
+        feature = {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "position_ids": [0, 1, 2],
+        }
+        tfds = GRPODataCollatorTFDS(max_prompt_length=5, pad_token_id=0, pad_to_multiple_of=4)
+        grain = GRPODataCollatorGrain(max_prompt_length=5, pad_token_id=0, pad_to_multiple_of=4)
+
+        tfds_batch = tfds([feature])
+        grain_batch = grain(feature)
+
+        assert tfds_batch["input_ids"].shape == (1, 8)
+        assert tfds_batch["attention_mask"].tolist() == [[0, 0, 0, 0, 0, 1, 1, 1]]
+        assert tfds_batch["position_ids"].tolist() == [[0, 0, 0, 0, 0, 0, 1, 2]]
+        assert grain_batch["input_ids"].shape == (8,)
+        assert grain_batch["attention_mask"].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+        assert grain_batch["position_ids"].tolist() == [0, 0, 0, 0, 0, 0, 1, 2]
 
 
 class TestPPOPreprocessTransform:
@@ -1330,6 +1473,46 @@ class TestRewardPreprocessTransform:
         assert result["attention_mask_chosen"] == expected_chosen["attention_mask"]
         assert result["input_ids_rejected"] == expected_rejected["input_ids"]
         assert result["attention_mask_rejected"] == expected_rejected["attention_mask"]
+
+    def test_reward_transform_forwards_pad_to_multiple_of_to_tokenizer(self):
+        tokenizer = RecordingTokenizer()
+        transform = RewardPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=7,
+            pad_to_multiple_of=4,
+        )
+
+        transform({"chosen": "good", "rejected": "bad"})
+
+        assert [call[1]["pad_to_multiple_of"] for call in tokenizer.calls] == [4, 4]
+
+    def test_reward_collators_pad_to_multiple_of_after_max_length(self):
+        tokenizer = MockTokenizer(pad_token_id=0)
+        feature = {
+            "input_ids_chosen": [1, 2, 3],
+            "attention_mask_chosen": [1, 1, 1],
+            "input_ids_rejected": [4, 5],
+            "attention_mask_rejected": [1, 1],
+        }
+        tfds = RewardDataCollatorWithPaddingTFDS(
+            tokenizer=tokenizer,
+            max_length=5,
+            pad_to_multiple_of=4,
+        )
+        grain = RewardDataCollatorWithPaddingGrain(
+            tokenizer=tokenizer,
+            max_length=5,
+            pad_to_multiple_of=4,
+        )
+
+        tfds_batch = tfds([feature])
+        grain_batch = grain(feature)
+
+        assert tfds_batch["input_ids_chosen"].shape == (1, 8)
+        assert tfds_batch["input_ids_chosen"].tolist() == [[1, 2, 3, 0, 0, 0, 0, 0]]
+        assert tfds_batch["attention_mask_rejected"].tolist() == [[1, 1, 0, 0, 0, 0, 0, 0]]
+        assert grain_batch["input_ids_chosen"].shape == (8,)
+        assert grain_batch["input_ids_chosen"].tolist() == [1, 2, 3, 0, 0, 0, 0, 0]
 
     def test_repr(self):
         """Test string representation."""

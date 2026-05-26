@@ -31,6 +31,7 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import with_sharding_constraint
 
@@ -50,6 +51,23 @@ from ..training_utils import (
 )
 
 
+def _dft_causal_lm_metrics(logits: jax.Array, labels: jax.Array, ignore_index: int = -100) -> LossMetrics:
+    """Compute the DFT SFT loss from logits and causal-LM labels."""
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    loss_mask = shift_labels != ignore_index
+    safe_labels = jnp.where(loss_mask, shift_labels, 0)
+    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+    token_logps = jnp.take_along_axis(log_probs, safe_labels[..., None], axis=-1).squeeze(-1)
+    per_token_loss = -jax.lax.stop_gradient(jnp.exp(token_logps)) * token_logps
+    weights = loss_mask.astype(logits.dtype)
+    weight_sum = jnp.sum(weights)
+    loss = jnp.sum(per_token_loss * weights) / jnp.maximum(weight_sum, 1.0)
+    predictions = jnp.argmax(shift_logits, axis=-1)
+    accuracy = jnp.sum((predictions == safe_labels).astype(logits.dtype) * weights) / jnp.maximum(weight_sum, 1.0)
+    return LossMetrics(loss=loss, weight_sum=weight_sum, accuracy=accuracy)
+
+
 def base_step(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
@@ -59,6 +77,7 @@ def base_step(
     gradient_accumulation_steps: int = 1,
     is_training: bool = True,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
+    loss_type: str = "nll",
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Run the shared base trainer loss path for train or eval.
 
@@ -137,11 +156,20 @@ def base_step(
                 call_batch = module.prepare_inputs_for_call(**minibatch)
                 labels = call_batch.pop("labels", None)
             with jax.named_scope(scope_root + "/loss_fn/forward_and_loss"):
-                outputs, metrics = module.compute_loss(
-                    labels=labels,
-                    loss_config=loss_config,
-                    **call_batch,
-                )
+                if loss_type == "dft":
+                    outputs = module(**call_batch)
+                    metrics = _dft_causal_lm_metrics(
+                        outputs.logits,
+                        labels,
+                        ignore_index=-100 if loss_config is None else loss_config.ignore_index,
+                    )
+                    outputs = outputs.replace(loss=metrics.loss)
+                else:
+                    outputs, metrics = module.compute_loss(
+                        labels=labels,
+                        loss_config=loss_config,
+                        **call_batch,
+                    )
             return outputs.loss, metrics
 
     if not is_training:
@@ -179,6 +207,7 @@ def training_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
+    loss_type: str = "nll",
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Perform one base trainer update step.
 
@@ -209,6 +238,7 @@ def training_step(
             gradient_accumulation_steps=gradient_accumulation_steps,
             is_training=True,
             straight_through_emulator=straight_through_emulator,
+            loss_type=loss_type,
         ),
     )
 
@@ -218,6 +248,7 @@ def evaluation_step(
     batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
+    loss_type: str = "nll",
 ) -> LossMetrics:
     """Perform one base trainer evaluation step.
 
@@ -242,6 +273,7 @@ def evaluation_step(
             partition_spec=partition_spec,
             gradient_accumulation_steps=1,
             is_training=False,
+            loss_type=loss_type,
         ),
     )
 
@@ -259,7 +291,7 @@ def _base_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     """
     return scheduled_loss_cache_key(
         call,
-        value_fields=("partition_spec",),
+        value_fields=("partition_spec", "loss_type"),
         object_fields=("loss_config", "straight_through_emulator"),
     )
 
@@ -277,6 +309,7 @@ def _make_base_scheduled_loss(call):
     """
     loss_config = call.get("loss_config")
     partition_spec = call.get("partition_spec")
+    loss_type = call.get("loss_type", "nll")
 
     def scheduled_loss(tree, batch):
         """Compute the base-trainer scalar loss for the scheduled adapter.
@@ -297,11 +330,20 @@ def _make_base_scheduled_loss(call):
                 call_batch = module.prepare_inputs_for_call(**batch)
                 labels = call_batch.pop("labels", None)
             with jax.named_scope("easydel/trainer/base/scheduled_loss/forward_and_loss"):
-                outputs, _metrics = module.compute_loss(
-                    labels=labels,
-                    loss_config=loss_config,
-                    **call_batch,
-                )
+                if loss_type == "dft":
+                    outputs = module(**call_batch)
+                    metrics = _dft_causal_lm_metrics(
+                        outputs.logits,
+                        labels,
+                        ignore_index=-100 if loss_config is None else loss_config.ignore_index,
+                    )
+                    outputs = outputs.replace(loss=metrics.loss)
+                else:
+                    outputs, _metrics = module.compute_loss(
+                        labels=labels,
+                        loss_config=loss_config,
+                        **call_batch,
+                    )
             return outputs.loss
 
     return scheduled_loss

@@ -23,6 +23,7 @@ from typing import Any
 
 import jax
 import numpy as np
+import spectrax as spx
 from datasets import Dataset, IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
@@ -30,7 +31,12 @@ from transformers import AutoTokenizer
 
 import easydel as ed
 
-_DEFAULT_MODEL_REPO = "Qwen/Qwen3-4B" if jax.default_backend() == "tpu" else "Qwen/Qwen2.5-0.5B-Instruct"
+_LIGHTWEIGHT = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+_DEFAULT_MODEL_REPO = (
+    "Qwen/Qwen3-0.6B"
+    if _LIGHTWEIGHT
+    else ("Qwen/Qwen3-4B" if jax.default_backend() == "tpu" else "Qwen/Qwen2.5-0.5B-Instruct")
+)
 MODEL_REPO: str = os.environ.get("EASYDEL_RUNTIME_MODEL_REPO", _DEFAULT_MODEL_REPO)
 
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
@@ -79,7 +85,6 @@ def get_tokenizer(model_repo: str = MODEL_REPO):
 
 
 def _load_model_kwargs() -> dict[str, Any]:
-    lightweight = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
     return dict(
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
@@ -89,9 +94,10 @@ def _load_model_kwargs() -> dict[str, Any]:
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=MAX_TOTAL_LENGTH,
             mask_max_position_embeddings=MAX_TOTAL_LENGTH,
-            attn_mechanism=ed.AttentionMechanisms.VANILLA if lightweight else ed.AttentionMechanisms.AUTO,
+            attn_mechanism=ed.AttentionMechanisms.VANILLA if _LIGHTWEIGHT else ed.AttentionMechanisms.AUTO,
             attn_dtype=jnp.bfloat16,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+            scan_layers=False,
             use_expert_tensor_mode=False,
             moe_force_xla_gmm=True,
         ),
@@ -123,6 +129,33 @@ def load_sequence_classifier_model(
     )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model  # pyright: ignore[reportReturnType]
+
+
+def load_token_classifier_model(tokenizer=None):
+    tokenizer = tokenizer or get_tokenizer()
+    vocab_size = max(int(getattr(tokenizer, "vocab_size", 32000) or 32000), len(tokenizer), 1024)
+    config = ed.RobertaConfig(
+        vocab_size=vocab_size,
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=256,
+        max_position_embeddings=MAX_TOTAL_LENGTH + 2,
+        pad_token_id=0,
+        bos_token_id=getattr(tokenizer, "bos_token_id", None) or 0,
+        eos_token_id=getattr(tokenizer, "eos_token_id", None) or tokenizer.pad_token_id,
+        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+        num_labels=2,
+        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
+    )
+    model = ed.RobertaForTokenClassification.sequential_init(
+        config=config,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=lax.Precision.DEFAULT,
+        rngs=spx.Rngs(0),
+    )
+    return model.shard_model()
 
 
 def load_preference_dataset(split: str = PREFERENCE_SPLIT):
@@ -201,8 +234,6 @@ def make_config(
         "generation_log_to_wandb": True,
     }
 
-    if overrides:
-        base_args.update(overrides)
     runtime_steps = os.environ.get("EASYDEL_RUNTIME_MAX_TRAINING_STEPS")
     if runtime_steps:
         base_args["max_training_steps"] = int(runtime_steps)
@@ -229,9 +260,44 @@ def make_config(
                 "generation_log_to_wandb": False,
             }
         )
+    if overrides:
+        base_args.update(overrides)
 
     field_names = set(getattr(config_cls, "__dataclass_fields__", {}).keys())
     filtered = {key: value for key, value in base_args.items() if key in field_names}
+    if issubclass(config_cls, ed.DistillationConfig):
+        needs_generation_lengths = issubclass(
+            config_cls,
+            (ed.OnPolicyDistillationConfig, ed.SparseDistillationConfig),
+        )
+        distillation_defaults = {
+            "max_prompt_length": None,
+            "max_completion_length": None,
+            "num_generations": 1,
+            "num_return_sequences": 1,
+            "generation_batch_size": None,
+            "top_p": 1.0,
+            "top_k": 0,
+            "wandb_entity": None,
+            "wandb_project": None,
+            "wandb_run_group": None,
+            "log_completions": False,
+        }
+        for key, value in distillation_defaults.items():
+            if key in field_names:
+                if key in {
+                    "max_prompt_length",
+                    "max_completion_length",
+                    "wandb_entity",
+                    "wandb_project",
+                    "wandb_run_group",
+                    "log_completions",
+                }:
+                    if needs_generation_lengths and key in {"max_prompt_length", "max_completion_length"}:
+                        continue
+                    filtered[key] = value
+                else:
+                    filtered.setdefault(key, value)
     return config_cls(**filtered)
 
 
@@ -267,6 +333,67 @@ def build_reward_dataset(split: str = PREFERENCE_SPLIT):
     runtime scripts instead of requiring a separate ``prompt`` column.
     """
     return load_preference_dataset(split)
+
+
+def build_tpo_dataset(split: str = PREFERENCE_SPLIT):
+    dataset = load_preference_dataset(split)
+
+    def convert(sample):
+        prompt, chosen_completion = split_preference_messages(sample["chosen"])
+        _, rejected_completion = split_preference_messages(sample["rejected"])
+        return {
+            "prompt": prompt,
+            "chosen": chosen_completion,
+            "rejected": rejected_completion,
+            "reference": chosen_completion,
+        }
+
+    return dataset.map(convert, remove_columns=dataset.column_names)
+
+
+def build_prompt_dataset(split: str = PREFERENCE_SPLIT):
+    dataset = load_preference_dataset(split)
+
+    def convert(sample):
+        prompt, _completion = split_preference_messages(sample["chosen"])
+        if isinstance(prompt, list):
+            prompt = "\n".join(str(message.get("content", "")) for message in prompt)
+        return {"prompt": prompt}
+
+    return dataset.map(convert, remove_columns=dataset.column_names)
+
+
+def split_preference_messages(messages) -> tuple[list[dict[str, str]] | str, str]:
+    if not isinstance(messages, list) or not messages:
+        return "", str(messages)
+    prompt_messages = []
+    completion_parts = []
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content", ""))
+        if role == "assistant":
+            completion_parts.append(content)
+        else:
+            prompt_messages.append({"role": role or "user", "content": content})
+    completion = "\n".join(part for part in completion_parts if part).strip() or "."
+    return prompt_messages or [{"role": "user", "content": ""}], completion
+
+
+def build_prm_dataset(split: str = PREFERENCE_SPLIT):
+    dataset = load_preference_dataset(split)
+
+    def convert(sample):
+        prompt, completion = split_preference_messages(sample["chosen"])
+        if isinstance(prompt, list):
+            prompt = "\n".join(str(message.get("content", "")) for message in prompt)
+        midpoint = max(1, len(completion) // 2)
+        return {
+            "prompt": prompt,
+            "completions": [completion[:midpoint], completion[midpoint:] or "."],
+            "labels": [0, 1],
+        }
+
+    return dataset.map(convert, remove_columns=dataset.column_names)
 
 
 def dummy_reward_fn(*, prompts: Iterable[Any] | None = None, completions: Iterable[Any] | None = None, **_: Any):

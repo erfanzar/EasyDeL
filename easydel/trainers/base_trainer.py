@@ -2460,7 +2460,7 @@ class BaseTrainer(BaseTrainerProtocol):
         if state is None:
             raise RuntimeError("Model state is not initialized; cannot create generation function.")
         if not hasattr(state.model, "generate"):
-            raise NotImplementedError("Attached model does not provide a `generate` method.")
+            raise TypeError("Attached model does not provide a `generate` method.")
 
         effective_generate_kwargs = dict(generate_kwargs)
         config_copy = self._prepare_generation_config(generation_config)
@@ -4640,7 +4640,7 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
         """
-        raise NotImplementedError
+        raise RuntimeError(f"{type(self).__name__}.configure_functions() must be implemented by the trainer subclass.")
 
     def _create_dataloader_from_source(
         self,
@@ -5183,7 +5183,14 @@ class BaseTrainer(BaseTrainerProtocol):
             if "://" in dest_str or dest_str.startswith("/") or dest_str.startswith("~"):
                 full_path = dest_str
             else:
-                full_path = str(self.arguments._get_save_directory() / dest)
+                save_directory = self.arguments._get_save_directory()
+                save_directory_str = str(save_directory).rstrip("/") if save_directory is not None else ""
+                if save_directory_str and (
+                    dest_str == save_directory_str or dest_str.startswith(f"{save_directory_str}/")
+                ):
+                    full_path = dest_str
+                else:
+                    full_path = str(save_directory / dest) if save_directory is not None else dest_str
             saved_directory[0] = self._save_state(
                 state=s,
                 save_directory=full_path,
@@ -6091,7 +6098,7 @@ class BaseTrainer(BaseTrainerProtocol):
         elif rpr == "json":
             return JSONProgressBar(desc=desc)
         else:
-            raise NotImplementedError(f"Progress Bar type {rpr}'s not supported.")
+            raise ValueError(f"Progress Bar type {rpr!r} is not supported.")
 
     def log_weight_distribution(self, state: EasyDeLState, step: int):
         """Log weight distribution statistics.
