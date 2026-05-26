@@ -344,7 +344,8 @@ def compute_bco_loss(
     Returns:
         A 7-tuple ``(loss, chosen_rewards, rejected_rewards,
         chosen_losses, rejected_losses, chosen_mask_f, rejected_mask_f)``
-        where ``loss`` is the scalar (weighted) mean BCO loss, the
+        where ``loss`` is the scalar BCO loss, with undesirable-row
+        losses reweighted before averaging over examples, the
         ``*_rewards`` arrays carry the unmasked per-example implicit
         rewards (for logging/delta updates), and the ``*_losses`` /
         ``*_mask_f`` arrays carry the per-example masked losses and
@@ -366,8 +367,8 @@ def compute_bco_loss(
 
     if udm_weights is not None:
         rejected_weights = udm_weights.astype(policy_logps.dtype) * rejected_mask_f
-        total_weight = jnp.maximum(chosen_count + rejected_weights.sum(), 1.0)
-        loss = (chosen_losses.sum() + (rejected_losses * rejected_weights).sum()) / total_weight
+        total_count = jnp.maximum(chosen_count + rejected_count, 1.0)
+        loss = (chosen_losses.sum() + (rejected_losses * rejected_weights).sum()) / total_count
     else:
         total_weight = jnp.maximum(chosen_count + rejected_count, 1.0)
         loss = (chosen_losses.sum() + rejected_losses.sum()) / total_weight

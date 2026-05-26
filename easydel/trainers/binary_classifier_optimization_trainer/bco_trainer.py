@@ -29,6 +29,7 @@ import jax
 import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
+from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -37,6 +38,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils.registery import Registry
 from easydel.utils.traversals import deepcopy_model
 
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import BCOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -149,6 +151,9 @@ class BCOTrainer(Trainer):
         seed = getattr(arguments, "seed", None)
         self._rng = np.random.default_rng(seed)
 
+        model = self._resolve_policy_model(model)
+        reference_model = self._resolve_reference_model(reference_model)
+
         if isinstance(model, EasyDeLState):
             model_state = model
         else:
@@ -160,6 +165,9 @@ class BCOTrainer(Trainer):
             reference_state = reference_model
         else:
             reference_state = reference_model.to_state(trainable_selector=arguments.trainable_selector)
+
+        if arguments.disable_dropout:
+            model_state, reference_state = self._disable_state_dropout(model_state, reference_state)
 
         if arguments.is_encoder_decoder is not None:
             self.is_encoder_decoder = arguments.is_encoder_decoder
@@ -234,6 +242,29 @@ class BCOTrainer(Trainer):
         if self.embedding_func is not None and self.embedding_tokenizer is not None:
             self._train_density_ratio_classifier()
 
+    @staticmethod
+    def _resolve_policy_model(
+        model: EasyDeLBaseModule | EasyDeLState,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Reject accidental string policy identifiers."""
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        return model
+
+    @staticmethod
+    def _resolve_reference_model(
+        reference_model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState | None:
+        """Reject accidental string references."""
+        if isinstance(reference_model, str):
+            reject_string_model_id(reference_model, role="reference model")
+        return reference_model
+
+    @staticmethod
+    def _disable_state_dropout(*states: EasyDeLState | None) -> tuple[EasyDeLState | None, ...]:
+        """Put BCO policy/reference state modules into eval mode when requested."""
+        return tuple(disable_state_dropout(state) for state in states)
+
     def _get_preprocess_transform(self) -> BCOPreprocessTransform | None:
         """Build the lazy BCO preprocessing transform for ``ShardedDataSource``.
 
@@ -279,6 +310,27 @@ class BCOTrainer(Trainer):
             return "prompt_input_ids" in sample
         except (StopIteration, IndexError):
             return False
+
+    @staticmethod
+    def _source_has_reference_logps(source: "ShardedDataSource | None") -> bool:
+        """Return whether a BCO source already carries reference logps."""
+        if source is None:
+            return False
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+        except (StopIteration, IndexError):
+            return False
+        return "reference_logps" in sample
+
+    def _build_source_from_dataset(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+    ) -> "ShardedDataSource | None":
+        """Wrap a dataset in a sharded source, applying BCO tokenization if needed."""
+        source = self._to_sharded_source(dataset)
+        if source is None or self._source_has_reference_logps(source) or self._source_is_pretokenized(source):
+            return source
+        return source.transform(self._get_preprocess_transform())
 
     def _vectorize_prompt(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
         """Embed prompt tokens via the UDM embedding function.
@@ -614,8 +666,110 @@ class BCOTrainer(Trainer):
             reference_model = self.model_state.model
         else:
             reference_model = self.reference_state.model
-        outputs = self.concatenated_forward(reference_model, batch)
+        forward_fn = getattr(self, "concatenated_forward", None)
+        if forward_fn is None:
+            outputs = concatenated_forward(
+                reference_model,
+                batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=getattr(self.model_state.model, "output_router_logits", False),
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            )
+        else:
+            outputs = forward_fn(reference_model, batch)
         return outputs["completion_logps"]
+
+    def configure_dataloaders(self):
+        """Build dataloaders, optionally materializing BCO reference logps."""
+        if self.dataset_train is not None:
+            if self._source_has_reference_logps(self._train_source):
+                self._precomputed_train_ref_log_probs = True
+            if self.arguments.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
+                self._precomputed_train_ref_log_probs = self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_train",
+                    source_attr="_train_source",
+                    batch_size=self.training_batch_size,
+                    is_train=True,
+                    desc="Train dataset reference log probs",
+                )
+
+        if self.dataset_eval is not None:
+            if self._source_has_reference_logps(self._eval_source):
+                self._precomputed_eval_ref_log_probs = True
+            if self.arguments.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
+                self._precomputed_eval_ref_log_probs = self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_eval",
+                    source_attr="_eval_source",
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    desc="Eval dataset reference log probs",
+                )
+
+        return super().configure_dataloaders()
+
+    def _precompute_reference_log_probs_for_split(
+        self,
+        *,
+        dataset_attr: str,
+        source_attr: str,
+        batch_size: int,
+        is_train: bool,
+        desc: str,
+    ) -> bool:
+        """Precompute BCO reference logps for materializable one-row-per-example splits."""
+        dataset = getattr(self, dataset_attr)
+        source = getattr(self, source_attr)
+        if dataset is None or source is None:
+            return False
+        if not hasattr(dataset, "add_column"):
+            logger.warning(
+                "`precompute_ref_log_probs=True` requires a dataset that supports `add_column`; "
+                "falling back to on-the-fly BCO reference scoring for `%s`.",
+                dataset_attr,
+            )
+            return False
+
+        reference_logps: list[np.ndarray] = []
+        data_collator = self.data_collator or (lambda batch: batch)
+        batch_iterator = self._create_dataloader_from_source(
+            source=source,
+            batch_size=batch_size,
+            is_train=is_train,
+            shuffle=False,
+            num_epochs=1,
+            drop_remainder=False,
+        )
+        for raw_batch in tqdm(iterable=batch_iterator, desc=desc):
+            padded_batch = self._purify_batch(data_collator(raw_batch))
+            reference_logps.append(np.asarray(self.compute_reference_log_probs(padded_batch)))
+
+        if not reference_logps:
+            return False
+
+        reference_values = np.concatenate(reference_logps, axis=0)
+        dataset_len = len(dataset) if hasattr(dataset, "__len__") else None
+        if dataset_len is not None and int(dataset_len) != int(reference_values.shape[0]):
+            logger.warning(
+                "`precompute_ref_log_probs=True` cannot materialize BCO reference logps for `%s` because "
+                "the preprocessing transform changes the row count (%s dataset rows -> %s scored rows). "
+                "Falling back to on-the-fly reference scoring.",
+                dataset_attr,
+                dataset_len,
+                reference_values.shape[0],
+            )
+            return False
+
+        updated_dataset = dataset.add_column(
+            name="reference_logps",
+            column=reference_values,
+        )
+        setattr(self, dataset_attr, updated_dataset)
+        setattr(self, source_attr, self._build_source_from_dataset(updated_dataset))
+        return True
 
     def _preprocess_batch_input(
         self,

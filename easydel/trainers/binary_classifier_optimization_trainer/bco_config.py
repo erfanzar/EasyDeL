@@ -84,10 +84,6 @@ class BCOConfig(TrainingArguments):
         precompute_ref_log_probs: When ``True``, compute reference
             logps once at dataset-prep time and stash them in the
             dataset to skip the reference forward during training.
-        model_init_kwargs: Extra kwargs forwarded to the policy model
-            loader.
-        ref_model_init_kwargs: Extra kwargs forwarded to the reference
-            model loader.
         dataset_num_proc: Worker count used when ``Dataset.map``-ing
             over the dataset during preprocessing.
         prompt_sample_size: Number of prompts sampled to train the
@@ -149,7 +145,12 @@ class BCOConfig(TrainingArguments):
     )
     generate_during_eval: bool = field(
         default=False,
-        metadata={"help": "Generate and log completions during evaluation if True."},
+        metadata={
+            "help": (
+                "TRL compatibility alias for EasyDeL preview generation. When True, preview generation runs on "
+                "evaluation steps using the configured EasyDeL/eSurge generation settings."
+            )
+        },
     )
     is_encoder_decoder: bool | None = field(
         default=None,
@@ -159,16 +160,6 @@ class BCOConfig(TrainingArguments):
         default=False,
         metadata={
             "help": "Whether to precompute reference log probabilities and store them inside the dataset to save compute."
-        },
-    )
-    model_init_kwargs: dict[str, tp.Any] | None = field(
-        default=None,
-        metadata={"help": "Keyword arguments passed to `AutoModelForCausalLM.from_pretrained` when loading the policy."},
-    )
-    ref_model_init_kwargs: dict[str, tp.Any] | None = field(
-        default=None,
-        metadata={
-            "help": "Keyword arguments passed to `AutoModelForCausalLM.from_pretrained` when loading the reference model."
         },
     )
     dataset_num_proc: int | None = field(
@@ -212,6 +203,9 @@ class BCOConfig(TrainingArguments):
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
         self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
+        if self.generate_during_eval:
+            self.generation_interval = self.generation_interval or self.evaluation_steps or 1
+            self.use_esurge_generation = True
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
