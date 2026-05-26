@@ -74,7 +74,17 @@ if TYPE_CHECKING:
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
     "agentic_moshpit": "agentic-moshpit",
+    "async-grpo": "async_grpo",
+    "dppo-trainer": "dppo",
+    "gspo-token": "gspo_token",
+    "grpo-replay-buffer": "grpo_with_replay_buffer",
+    "grpo-with-replay-buffer": "grpo_with_replay_buffer",
+    "grpo_replay_buffer": "grpo_with_replay_buffer",
+    "grpo_replay_buffer_trainer": "grpo_with_replay_buffer",
+    "nemo-gym": "nemo_gym",
+    "online-dpo": "online_dpo",
     "rlvr_trainer": "rlvr",
+    "self_distillation": "sdft",
 }
 
 
@@ -243,6 +253,8 @@ class BaseTrainerCfg(TypedDict, total=False):
         dataloader_num_workers: Number of worker processes for data loading.
         dataloader_pin_memory: Whether to pin memory in data loaders for faster
             GPU transfer.
+        dataloader_prefetch: Whether to overlap host-side batch fetching with
+            the compiled training step.
         remove_unused_columns: Whether to remove columns not used by the model
             from the dataset.
         ids_to_pop_from_dataset: List of column names to explicitly remove from dataset.
@@ -410,7 +422,21 @@ class BaseTrainerCfg(TypedDict, total=False):
             "sparse_distillation",
             "agentic-moshpit",
             "agentic_moshpit",
+            "async_grpo",
+            "dppo",
+            "gold",
+            "grpo_with_replay_buffer",
+            "gspo_token",
+            "minillm",
+            "nemo_gym",
+            "online_dpo",
+            "papo",
+            "prm",
             "rlvr",
+            "rloo",
+            "sdft",
+            "ssd",
+            "tpo",
             "embedding",
         ]
     ]
@@ -436,6 +462,7 @@ class BaseTrainerCfg(TypedDict, total=False):
 
     dataloader_num_workers: NotRequired[int | None]
     dataloader_pin_memory: NotRequired[bool | None]
+    dataloader_prefetch: NotRequired[bool]
     remove_unused_columns: NotRequired[bool]
     ids_to_pop_from_dataset: NotRequired[list[str] | None]
     shuffle_train_dataset: NotRequired[bool]
@@ -2229,6 +2256,113 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "remove_unused_columns": False,
     },
 }
+
+TRAINER_SPECIFIC_DEFAULTS.update(
+    {
+        "async_grpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "AsyncGRPO",
+            "max_inflight_tasks": 32,
+            "max_staleness": 1,
+            "queue_maxsize": 0,
+            "weight_sync_steps": 1,
+            "request_timeout": 120.0,
+        },
+        "dppo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "DPPO",
+            "loss_type": "dppo",
+            "divergence_type": "binary_tv",
+            "divergence_topk": 20,
+            "clip_ratio_c": 20.0,
+        },
+        "gold": {
+            **TRAINER_SPECIFIC_DEFAULTS["distillation"],
+            "trainer_prefix": "GOLD",
+        },
+        "grpo_with_replay_buffer": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "GRPOWithReplayBuffer",
+            "replay_buffer_size": 64,
+        },
+        "gspo_token": {
+            **TRAINER_SPECIFIC_DEFAULTS["gspo"],
+            "trainer_prefix": "GSPOToken",
+            "importance_sampling_level": "sequence_token",
+        },
+        "minillm": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "MiniLLM",
+            "rkl_advantage": True,
+            "single_step_decomposition": False,
+            "kd_temperature": 1.0,
+            "gamma": 0.0,
+            "length_normalization": True,
+        },
+        "nemo_gym": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "NeMoGym",
+            "request_timeout": 10800.0,
+            "metadata_key": "metadata",
+            "agent_ref_key": "agent_ref",
+            "environment_reward_weight": 1.0,
+        },
+        "online_dpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["dpo"],
+            "trainer_prefix": "OnlineDPO",
+            "max_new_tokens": 64,
+            "temperature": 0.9,
+            "top_p": 1.0,
+            "top_k": 0,
+            "repetition_penalty": 1.0,
+        },
+        "papo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "PAPO",
+            "perception_loss_weight": 0.1,
+            "mask_ratio": 0.3,
+            "mask_type": "random",
+            "der_loss_weight1": 0.03,
+            "der_loss_weight2": 0.03,
+        },
+        "prm": {
+            **TRAINER_SPECIFIC_DEFAULTS["reward"],
+            "trainer_prefix": "PRM",
+            "step_separator": "\n",
+            "train_on_last_step_only": False,
+        },
+        "rloo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "RLOO",
+            "num_return_sequences": 2,
+            "num_generations": 2,
+            "advantage_estimator": "leave_one_out",
+            "scale_rewards": "none",
+        },
+        "sdft": {
+            **TRAINER_SPECIFIC_DEFAULTS["sdpo"],
+            "trainer_prefix": "SDFT",
+            "generate_from_teacher": False,
+            "teacher_prompt_template": None,
+            "num_loss_tokens_to_skip": 0,
+        },
+        "ssd": {
+            **TRAINER_SPECIFIC_DEFAULTS["sdpo"],
+            "trainer_prefix": "SSD",
+            "num_generations": 1,
+            "num_return_sequences": 1,
+            "filter_empty": True,
+        },
+        "tpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["dpo"],
+            "trainer_prefix": "TPO",
+            "reference_free": True,
+            "precompute_ref_log_probs": False,
+            "tpo_alpha": 1.0,
+            "tpo_l_gamma": 0.5,
+        },
+    }
+)
 # TRAINER_SPECIFIC_DEFAULTS: Trainer-specific default configuration overrides.
 #
 # This dictionary maps trainer type identifiers to their specific default
@@ -2245,7 +2379,32 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
 # For these trainers, if max_completion_length is not explicitly set but
 # max_length and max_prompt_length are provided, max_completion_length is
 # computed as: max_length - max_prompt_length.
-_TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo", "ppo", "sdpo"})
+_TRAINERS_WITH_COMPLETION_LENGTH = frozenset(
+    {
+        "async_grpo",
+        "bco",
+        "cpo",
+        "dpo",
+        "dppo",
+        "gfpo",
+        "grpo",
+        "grpo_with_replay_buffer",
+        "gspo",
+        "gspo_token",
+        "kto",
+        "minillm",
+        "nemo_gym",
+        "online_dpo",
+        "orpo",
+        "papo",
+        "ppo",
+        "rloo",
+        "sdft",
+        "sdpo",
+        "ssd",
+        "tpo",
+    }
+)
 
 
 def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> None:

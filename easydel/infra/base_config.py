@@ -222,19 +222,7 @@ def download_url(url: str, cache_dir: str | None = None) -> str:
 
 
 def _compute_mpmd_axis(jax_mesh: jax.sharding.Mesh) -> str | None:
-    """Return ``"pp"`` iff the mesh has a real pipeline axis (named AND dim > 1).
-
-    The decision is made off the *resolved* mesh shape (``mesh.shape["pp"]``),
-    not pre-creation axis dims -- the latter still contain spectrax's ``-1``
-    auto-fill placeholder so we can't tell from them whether ``pp`` will end
-    up as 1 or the full chip count.
-
-    Naming ``"pp"`` with ``dim=1`` would otherwise route every ``spx.jit``
-    through the heavy single-stage MPMD pipeline runtime, which does not honor
-    caller-allocated array layouts and forces XLA to insert layout-reformat
-    copies at the JIT boundary (e.g. ~4 x 4 GB cache copies for paged-attention
-    KV pages on a 27B run with tp=4, pp=1).
-    """
+    """Return ``"pp"`` only when the resolved mesh has multiple pipeline stages."""
     if "pp" not in getattr(jax_mesh, "axis_names", ()):
         return None
     try:

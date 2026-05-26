@@ -155,8 +155,6 @@ class DrafterProtocol(typing.Protocol):
         ...
 
 
-
-
 def accept_or_reject(
     draft_log_probs: Float[Array, "batch"],
     target_log_probs: Float[Array, "batch"],
@@ -212,8 +210,6 @@ def resample_rejected(
     residual = jnp.maximum(p_target - p_draft, 0.0)
     residual = residual / jnp.maximum(jnp.sum(residual, axis=-1, keepdims=True), 1e-9)
     return jax.random.categorical(rng_key, jnp.log(residual + 1e-9))
-
-
 
 
 class Qwen3_5MTPDrafter:
@@ -532,8 +528,6 @@ class Qwen3_5MTPDrafter:
             full_log_probs=log_probs,
             hidden_states=hidden_states,
         )
-
-
 
 
 class Gemma4AssistantDrafter:

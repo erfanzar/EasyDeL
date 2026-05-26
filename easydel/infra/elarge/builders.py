@@ -395,6 +395,8 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
     quant = cfg.get("quantization", {})
 
     config_kwargs = materialize_base_config(cfg, prefer="base")
+    if "scan_layers" not in (cfg.get("base_config", {}).get("values", {}) or {}):
+        config_kwargs["scan_layers"] = False
 
     config_kwargs.pop("partition_axis", None)
     config_kwargs.pop("backend", None)

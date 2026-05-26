@@ -1793,11 +1793,11 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
-        token_type_ids,
-        position_ids,
-        head_mask,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        token_type_ids: Int[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        head_mask: Bool[Array, "num_heads"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1945,11 +1945,11 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
-        token_type_ids,
-        position_ids,
-        head_mask,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        token_type_ids: Int[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        head_mask: Bool[Array, "num_heads"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):

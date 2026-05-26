@@ -516,8 +516,6 @@ class Qwen3_5MTPHead(spx.Module):
         return Qwen3_5MTPOutput(last_hidden_state=h, past_key_values=tuple(new_views) or None)
 
 
-
-
 @register_module(TaskType.BASE_MODULE, config=Qwen3_5TextConfig, model_type="qwen3_5_text")
 class Qwen3_5TextModel(Qwen3NextModel):
     """Qwen3.5 text-only base model (no LM head).

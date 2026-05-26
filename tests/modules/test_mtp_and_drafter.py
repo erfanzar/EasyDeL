@@ -95,8 +95,6 @@ def assert_shape(arr, expected: tuple[int, ...], name: str = "tensor"):
         raise AssertionError(f"{name} shape mismatch: got {got}, expected {expected}")
 
 
-
-
 def make_qwen35_text_config(*, mtp_layers: int = 1, hidden: int = 64, vocab: int = 128):
     return Qwen3_5TextConfig(
         vocab_size=vocab,
@@ -141,8 +139,6 @@ def make_gemma4_assistant_config(
         use_ordered_embeddings=True,
         tie_word_embeddings=True,
     )
-
-
 
 
 @test("Qwen3_5MTPHead.forward shape + dtype")
@@ -469,8 +465,6 @@ def test_qwen35_drafter_without_mtp_raises():
     raise AssertionError("Expected ValueError when wrapping model without MTP head")
 
 
-
-
 def _qwen35_2b_snap():
     p = "/dev/shm/easydel_ckpts/hf/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc"
     return p if os.path.isdir(p) else None
@@ -674,8 +668,6 @@ def test_gemma4_real_assistant_load_and_forward():
     gc.collect()
 
 
-
-
 @test("PERF: Qwen3.5 MTP head JIT-compile + per-call latency (S=128, S=512, S=2048)")
 def perf_qwen35_mtp_latency():
     """Profile MTP head at varying sequence lengths to characterize
@@ -806,8 +798,6 @@ def perf_gemma4_centroid_vs_full():
         assert centroid_ms < full_ms * 5.0, (
             f"centroid head wallclock {centroid_ms}ms is much slower than full {full_ms}ms on CPU"
         )
-
-
 
 
 @test("REAL: Qwen3.5 MTP forward output is non-degenerate (varies per position + per batch)")

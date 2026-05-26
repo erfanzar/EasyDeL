@@ -195,6 +195,10 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
         ),
         device,
     )
+    manager._sampler_packed_i32_cpu_by_reqs = {}
+    manager._sampler_packed_f32_cpu_by_reqs = {}
+    manager._sampler_packed_misc_i32_cpu = np.zeros((2,), dtype=np.int32)
+    manager._sampler_prefix_cpu_by_reqs = {}
     manager._sampler_penalty_state_ready = True
     manager._ensure_sampler_penalty_state = lambda: calls.setdefault("rebuilt", True)
 
@@ -205,7 +209,7 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
         sampler_padded_num_reqs=2,
         sampler_num_reqs=2,
         sampler_total_tokens=2,
-        req_num_tokens_full=jnp.array([3, 4, 0, 0], dtype=jnp.int32),
+        req_num_tokens_full_cpu=np.array([3, 4, 0, 0], dtype=np.int32),
         logits=jnp.zeros((2, 8), dtype=jnp.float32),
         rng_key=jax.random.PRNGKey(0),
         gather_positions_cpu=np.array([0, 1, 0, 0], dtype=np.int32),
@@ -230,7 +234,7 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
 
     args = calls["args"]
     np.testing.assert_array_equal(
-        np.asarray(args[16])[:2],
+        np.asarray(args[5])[:2],
         np.array(
             [
                 [0, 1, 1, 0, 0, 0, 0, 0],
@@ -239,8 +243,8 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
             dtype=np.uint32,
         ),
     )
-    np.testing.assert_array_equal(np.asarray(args[7])[:2], np.array([0, 1], dtype=np.int32))
-    np.testing.assert_array_equal(np.asarray(args[17])[:2], np.array([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(args[1])[0, :2], np.array([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(args[1])[6, :2], np.array([3, 4], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(result[1]), np.array([5, 7], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(result[2]), np.array([True, True]))
 

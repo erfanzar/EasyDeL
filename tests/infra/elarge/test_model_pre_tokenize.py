@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -8,6 +22,7 @@ import pytest
 from easydel.data.execution import pipeline as pipeline_mod
 from easydel.infra.elarge.builders import _create_source_from_inform
 from easydel.infra.elarge.model import eLargeModel
+from easydel.infra.elarge.types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
 
 
 class SimpleTokenizer:
@@ -112,7 +127,7 @@ def test_pre_tokenize_sft_streams_mixture_to_jsonl(tmp_path):
     stats = elm.pre_tokenize(tmp_path / "sft-out", trainer_type="sft", compression=None, show_progress=False)
 
     assert stats.num_examples == 2
-    assert str(tmp_path / "sft-out" / "sft-SimpleTokenizer-MXL8-PLNA-CLNA-train") in stats.output_paths[0]
+    assert str(tmp_path / "sft-out" / "sft-SimpleTokenizer-MXL_8-PL_NA-CL_NA-train") in stats.output_paths[0]
     row = _read_first_jsonl(stats)
     assert set(row) == {"input_ids", "attention_mask"}
     assert len(row["input_ids"]) <= 8
@@ -144,7 +159,7 @@ def test_pre_tokenize_dpo_uses_preference_transform(tmp_path):
     stats = elm.pre_tokenize(tmp_path / "dpo-out", trainer_type="dpo", compression=None, show_progress=False)
 
     assert stats.num_examples == 1
-    assert str(tmp_path / "dpo-out" / "dpo-SimpleTokenizer-MXL32-PL6-CL4-pref") in stats.output_paths[0]
+    assert str(tmp_path / "dpo-out" / "dpo-SimpleTokenizer-MXL_32-PL_6-CL_4-pref") in stats.output_paths[0]
     row = _read_first_jsonl(stats)
     assert {"prompt_input_ids", "chosen_input_ids", "rejected_input_ids"} <= set(row)
     assert len(row["prompt_input_ids"]) <= 6
@@ -175,7 +190,7 @@ def test_pre_tokenize_infers_trainer_type_and_output_path(tmp_path):
 
     assert stats.num_examples == 1
     assert stats.output_paths
-    expected_folder = tmp_path / "trainer-out" / "pretokenized" / "distillation-SimpleTokenizer-MXL16-PLNA-CLNA-train"
+    expected_folder = tmp_path / "trainer-out" / "pretokenized" / "distillation-SimpleTokenizer-MXL_16-PL_NA-CL_NA-train"
     assert str(expected_folder) in stats.output_paths[0]
     row = _read_first_jsonl(stats)
     assert set(row) == {"input_ids", "attention_mask"}
@@ -204,7 +219,7 @@ def test_pre_tokenize_prefers_mixture_save_output_path(tmp_path):
     stats = elm.pre_tokenize(compression=None, show_progress=False)
 
     assert stats.output_paths
-    expected_folder = mixture_output / "sft-SimpleTokenizer-MXL16-PLNA-CLNA-train"
+    expected_folder = mixture_output / "sft-SimpleTokenizer-MXL_16-PL_NA-CL_NA-train"
     assert str(expected_folder) in stats.output_paths[0]
 
 
@@ -227,7 +242,7 @@ def test_pre_tokenize_accepts_base_path_as_first_positional_arg(tmp_path):
     stats = elm.pre_tokenize(str(base_output), compression=None, show_progress=False)
 
     assert stats.output_paths
-    expected_folder = base_output / "sft-SimpleTokenizer-MXL16-PLNA-CLNA-train"
+    expected_folder = base_output / "sft-SimpleTokenizer-MXL_16-PL_NA-CL_NA-train"
     assert str(expected_folder) in stats.output_paths[0]
 
 
@@ -390,7 +405,7 @@ def test_pre_tokenize_generated_path_uses_one_dataset_name(tmp_path):
         dataset_name="reasoning/and calling",
     )
 
-    assert folder == "dpo-SimpleTokenizer-MXL48-PL12-CL8-reasoning_and_calling"
+    assert folder == "dpo-SimpleTokenizer-MXL_48-PL_12-CL_8-reasoning_and_calling"
 
 
 def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path):
@@ -423,8 +438,8 @@ def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path)
 
     assert stats.num_examples == 2
     output_paths = "\n".join(stats.output_paths)
-    expected_a = base_output / "sft-SimpleTokenizer-MXL16-PLNA-CLNA-agentic-behave-1"
-    expected_b = base_output / "sft-SimpleTokenizer-MXL16-PLNA-CLNA-reasoning_and_calling"
+    expected_a = base_output / "sft-SimpleTokenizer-MXL_16-PL_NA-CL_NA-agentic-behave-1"
+    expected_b = base_output / "sft-SimpleTokenizer-MXL_16-PL_NA-CL_NA-reasoning_and_calling"
     assert str(expected_a) in output_paths
     assert str(expected_b) in output_paths
     assert "agentic-behave-1_reasoning_and_calling" not in output_paths
@@ -436,17 +451,31 @@ def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path)
         ("sft", "SFTPreprocessTransform"),
         ("gkd", "SFTPreprocessTransform"),
         ("distillation", "SFTPreprocessTransform"),
+        ("gold", "SFTPreprocessTransform"),
         ("dpo", "DPOPreprocessTransform"),
+        ("online_dpo", "DPOPreprocessTransform"),
         ("orpo", "ORPOPreprocessTransform"),
         ("cpo", "DPOPreprocessTransform"),
         ("kto", "KTOPreprocessTransform"),
         ("bco", "BCOPreprocessTransform"),
         ("reward", "RewardPreprocessTransform"),
+        ("prm", "PRMPreprocessTransform"),
         ("embedding", "EmbeddingPreprocessTransform"),
+        ("async_grpo", "GRPOPreprocessTransform"),
+        ("dppo", "GRPOPreprocessTransform"),
         ("grpo", "GRPOPreprocessTransform"),
+        ("grpo_with_replay_buffer", "GRPOPreprocessTransform"),
         ("gfpo", "GRPOPreprocessTransform"),
         ("gspo", "GRPOPreprocessTransform"),
+        ("gspo_token", "GRPOPreprocessTransform"),
+        ("minillm", "GRPOPreprocessTransform"),
+        ("nemo_gym", "GRPOPreprocessTransform"),
+        ("papo", "GRPOPreprocessTransform"),
+        ("rloo", "GRPOPreprocessTransform"),
+        ("sdft", "GRPOPreprocessTransform"),
         ("sdpo", "GRPOPreprocessTransform"),
+        ("ssd", "GRPOPreprocessTransform"),
+        ("tpo", "TPOPreprocessTransform"),
         ("ppo", "PPOPreprocessTransform"),
         ("xpo", "GRPOPreprocessTransform"),
         ("nash_md", "GRPOPreprocessTransform"),
@@ -458,13 +487,42 @@ def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path)
     ],
 )
 def test_pre_tokenize_resolves_trainer_transforms(trainer_type, expected_cls):
+    trainer_config = {"max_length": 4096}
+    if trainer_type not in {"distillation", "gold", "on_policy_distillation", "sparse_distillation"}:
+        trainer_config["max_prompt_length"] = 16
     elm = _elm_with_tokenizer(
         {
             "model": {"name_or_path": "dummy-model"},
-            "trainer": {"max_length": 4096, "max_prompt_length": 16},
+            "trainer": trainer_config,
         }
     )
 
     transform = elm._build_pre_tokenize_transform(trainer_type)
 
     assert transform.__class__.__name__ == expected_cls
+
+
+@pytest.mark.parametrize(
+    ("trainer_type", "expected_class", "expected_args"),
+    [
+        ("async-grpo", "AsyncGRPOTrainer", "AsyncGRPOConfig"),
+        ("dppo", "DPPOTrainer", "DPPOConfig"),
+        ("gold", "GOLDTrainer", "GOLDConfig"),
+        ("grpo-replay-buffer", "GRPOWithReplayBufferTrainer", "GRPOWithReplayBufferConfig"),
+        ("gspo-token", "GSPOTokenTrainer", "GSPOTokenConfig"),
+        ("minillm", "MiniLLMTrainer", "MiniLLMConfig"),
+        ("nemo-gym", "NeMoGymTrainer", "NeMoGymConfig"),
+        ("online-dpo", "OnlineDPOTrainer", "OnlineDPOConfig"),
+        ("papo", "PAPOTrainer", "PAPOConfig"),
+        ("prm", "PRMTrainer", "PRMConfig"),
+        ("rloo", "RLOOTrainer", "RLOOConfig"),
+        ("self_distillation", "SDFTTrainer", "SDFTConfig"),
+        ("ssd", "SSDTrainer", "SSDConfig"),
+        ("tpo", "TPOTrainer", "TPOConfig"),
+    ],
+)
+def test_elarge_resolves_new_trainer_families(trainer_type, expected_class, expected_args):
+    trainer_config = normalize_trainer_config({"trainer_type": trainer_type})
+
+    assert get_trainer_class(trainer_config["trainer_type"]).__name__ == expected_class
+    assert get_training_arguments_class(trainer_config["trainer_type"]).__name__ == expected_args

@@ -172,8 +172,6 @@ class SpecDecodeStats:
         return self.num_drafts_accepted / self.num_draft_steps
 
 
-
-
 class _SpecDecodeDriverBase:
     """Common machinery for spec-decode drivers (cache-free)."""
 
@@ -604,8 +602,6 @@ class _SpecDecodeDriverBase:
         return out_tokens, stats
 
 
-
-
 class SpeculativeMTPDriver(_SpecDecodeDriverBase):
     """Speculative decoding driven by an INLINE MTP head.
 
@@ -643,8 +639,6 @@ class SpeculativeMTPDriver(_SpecDecodeDriverBase):
             greedy=greedy,
             rng_seed=rng_seed,
         )
-
-
 
 
 def default_assistant_layer_mapping(

@@ -2503,6 +2503,25 @@ def materialize_meta_leaves(tree: tp.Any, *, seed: int = 0) -> tp.Any:
     """Replace ShapeDtypeStruct placeholder leaves with concrete values."""
     import spectrax as spx
 
+    def _materialize_rng_leaf(shape: tuple[int, ...], dtype: jnp.dtype) -> tuple[jax.Array, jax.Array]:
+        nonlocal rng
+        if not shape:
+            return jnp.array(0, dtype=dtype), rng
+        key_words = int(shape[-1])
+        if key_words < 2:
+            return jnp.zeros(shape, dtype=dtype), rng
+        prefix = shape[:-1]
+        count = int(np.prod(prefix, dtype=np.int64)) if prefix else 1
+        keys = jax.random.split(rng, count + 1)
+        rng = keys[0]
+        raw_keys = jax.random.key_data(keys[1:]).reshape(count, -1)
+        if key_words <= raw_keys.shape[-1]:
+            packed = raw_keys[:, :key_words]
+        else:
+            padding = jnp.zeros((count, key_words - raw_keys.shape[-1]), dtype=raw_keys.dtype)
+            packed = jnp.concatenate([raw_keys, padding], axis=-1)
+        return packed.reshape(shape).astype(dtype), rng
+
     if isinstance(tree, spx.State):
         changed = False
         rng = jax.random.PRNGKey(seed)
@@ -2511,8 +2530,7 @@ def materialize_meta_leaves(tree: tp.Any, *, seed: int = 0) -> tp.Any:
         for collection, path, value in tree.items():
             if isinstance(value, jax.ShapeDtypeStruct):
                 if collection == "rng":
-                    value = rng
-                    rng, _ = jax.random.split(rng)
+                    value, rng = _materialize_rng_leaf(tuple(value.shape), value.dtype)
                 else:
                     value = jnp.zeros(value.shape, dtype=value.dtype)
                 changed = True

@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -184,7 +198,6 @@ def inner_kernel(
     """
     step = pl.program_id(0)
 
-
     prefill_valid = schedule_table[step, 0][...]
     prefill_req_id = schedule_table[step, 2][...]
 
@@ -204,6 +217,7 @@ def inner_kernel(
         return x / norm
 
     if not prefill_only:
+
         @pl.when(decode_valid > 0)
         def decode_wrapper():
 
@@ -314,10 +328,6 @@ def inner_kernel(
 
                     out = jnp.concatenate(out_list, axis=0)  # (n_v, d_v)
                     new_state = jnp.stack(new_state_list, axis=0)  # (n_v, d_k, d_v)
-
-
-
-
 
                     decode_state_scratch[pl.ds(0, 1)] = new_state[None, ...].astype(current_state.dtype)
 

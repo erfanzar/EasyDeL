@@ -77,6 +77,7 @@ class PackedSequence:
     input_ids: np.ndarray
     attention_mask: np.ndarray | None = None
     segment_ids: np.ndarray | None = None
+    extra_fields: dict[str, np.ndarray] | None = None
     source_ids: list[str] | None = None
     num_segments: int = 0
 
@@ -98,6 +99,8 @@ class PackedSequence:
             result["attention_mask"] = self.attention_mask
         if self.segment_ids is not None:
             result["segment_ids"] = self.segment_ids
+        if self.extra_fields is not None:
+            result.update(self.extra_fields)
         return result
 
 
@@ -123,6 +126,8 @@ class GreedyPacker:
         eos_token_id: int,
         pad_token_id: int = 0,
         include_segment_ids: bool = True,
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
     ):
         """Capture packing settings and initialise empty rolling buffers.
 
@@ -136,19 +141,35 @@ class GreedyPacker:
             include_segment_ids: When ``True``, track segment ids
                 alongside ``input_ids`` so attention can be masked
                 across segment boundaries.
+            extra_field_pad_values: Optional token-aligned fields to pack
+                alongside ``input_ids`` and their pad values.
+            extra_field_separator_values: Values appended to aligned fields
+                for the synthetic EOS separator between examples.
         """
         self.seq_length = seq_length
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.include_segment_ids = include_segment_ids
+        self.extra_field_pad_values = extra_field_pad_values or {}
+        self.extra_field_separator_values = {
+            key: self.extra_field_pad_values[key] for key in self.extra_field_pad_values
+        }
+        if extra_field_separator_values:
+            self.extra_field_separator_values.update(extra_field_separator_values)
 
         # Current buffer
         self._buffer: list[int] = []
         self._segment_ids: list[int] = []
+        self._extra_buffers: dict[str, list[int]] = {key: [] for key in self.extra_field_pad_values}
         self._current_segment = 0
         self._source_ids: list[str] = []
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> PackedSequence | None:
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        extra_fields: dict[str, list[int]] | None = None,
+    ) -> PackedSequence | None:
         """Append a tokenized example, emitting a packed window if one is ready.
 
         After adding, an EOS separator and segment-id bump are
@@ -162,6 +183,8 @@ class GreedyPacker:
                 :attr:`PackedSequence.source_ids`. Pass the dataset
                 name from :class:`MixedShardedSource`'s
                 ``"__source__"`` field for per-source visibility.
+            extra_fields: Optional token-aligned values matching
+                ``tokens`` for configured extra fields.
 
         Returns:
             PackedSequence | None: A packed window when this call
@@ -171,11 +194,15 @@ class GreedyPacker:
         """
         result = None
 
+        aligned_extra_fields = self._normalize_extra_fields(tokens, extra_fields)
+
         # Add tokens to buffer
-        for tok in tokens:
+        for index, tok in enumerate(tokens):
             self._buffer.append(tok)
             if self.include_segment_ids:
                 self._segment_ids.append(self._current_segment)
+            for field_name, values in aligned_extra_fields.items():
+                self._extra_buffers[field_name].append(values[index])
 
             # Check if we have a full sequence
             if len(self._buffer) >= self.seq_length:
@@ -186,6 +213,8 @@ class GreedyPacker:
             self._buffer.append(self.eos_token_id)
             if self.include_segment_ids:
                 self._segment_ids.append(self._current_segment)
+            for field_name, separator_value in self.extra_field_separator_values.items():
+                self._extra_buffers[field_name].append(separator_value)
             self._current_segment += 1
             if source_id:
                 self._source_ids.append(source_id)
@@ -210,10 +239,15 @@ class GreedyPacker:
         segment_ids = None
         if self.include_segment_ids:
             segment_ids = np.array(self._segment_ids[: self.seq_length], dtype=np.int32)
+        extra_fields = {
+            field_name: np.array(values[: self.seq_length], dtype=np.int32)
+            for field_name, values in self._extra_buffers.items()
+        } or None
 
         result = PackedSequence(
             input_ids=input_ids,
             segment_ids=segment_ids,
+            extra_fields=extra_fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=self._current_segment,
         )
@@ -222,6 +256,8 @@ class GreedyPacker:
         self._buffer = self._buffer[self.seq_length :]
         if self.include_segment_ids:
             self._segment_ids = self._segment_ids[self.seq_length :]
+        for field_name in self._extra_buffers:
+            self._extra_buffers[field_name] = self._extra_buffers[field_name][self.seq_length :]
         self._source_ids = []
         self._current_segment = 0
 
@@ -255,21 +291,43 @@ class GreedyPacker:
         if self.include_segment_ids:
             padded_segments = self._segment_ids + [self._current_segment] * pad_len
             segment_ids = np.array(padded_segments, dtype=np.int32)
+        extra_fields = {
+            field_name: np.array(
+                values + [self.extra_field_pad_values[field_name]] * pad_len,
+                dtype=np.int32,
+            )
+            for field_name, values in self._extra_buffers.items()
+        } or None
 
         result = PackedSequence(
             input_ids=input_ids,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
+            extra_fields=extra_fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
             num_segments=self._current_segment + 1,
         )
 
         self._buffer = []
         self._segment_ids = []
+        self._extra_buffers = {key: [] for key in self.extra_field_pad_values}
         self._source_ids = []
         self._current_segment = 0
 
         return result
+
+    def _normalize_extra_fields(
+        self,
+        tokens: list[int],
+        extra_fields: dict[str, list[int]] | None,
+    ) -> dict[str, list[int]]:
+        normalized: dict[str, list[int]] = {}
+        for field_name, pad_value in self.extra_field_pad_values.items():
+            values = list((extra_fields or {}).get(field_name, []))
+            if len(values) < len(tokens):
+                values = values + [pad_value] * (len(tokens) - len(values))
+            normalized[field_name] = values[: len(tokens)]
+        return normalized
 
 
 class PoolPacker:
@@ -290,6 +348,8 @@ class PoolPacker:
         pad_token_id: int = 0,
         num_packers: int = 4,
         include_segment_ids: bool = True,
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
     ):
         """Allocate ``num_packers`` underlying :class:`GreedyPacker` instances.
 
@@ -304,14 +364,31 @@ class PoolPacker:
                 packing.
             include_segment_ids: Whether the inner packers track
                 segment ids.
+            extra_field_pad_values: Optional token-aligned fields to pack
+                alongside ``input_ids`` and their pad values.
+            extra_field_separator_values: Values appended to aligned fields
+                for the synthetic EOS separator between examples.
         """
         self.seq_length = seq_length
         self.num_packers = num_packers
         self._packers = [
-            GreedyPacker(seq_length, eos_token_id, pad_token_id, include_segment_ids) for _ in range(num_packers)
+            GreedyPacker(
+                seq_length,
+                eos_token_id,
+                pad_token_id,
+                include_segment_ids,
+                extra_field_pad_values,
+                extra_field_separator_values,
+            )
+            for _ in range(num_packers)
         ]
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        extra_fields: dict[str, list[int]] | None = None,
+    ) -> list[PackedSequence]:
         """Route the tokens to the best-fit inner packer and surface any completed windows.
 
         Best fit is computed as the smallest non-negative
@@ -324,6 +401,8 @@ class PoolPacker:
             tokens: Token id list for one upstream example.
             source_id: Optional source label propagated through to
                 the inner packer.
+            extra_fields: Optional token-aligned values matching
+                ``tokens`` for configured extra fields.
 
         Returns:
             list[PackedSequence]: Completed packed windows produced
@@ -345,7 +424,7 @@ class PoolPacker:
                 best_idx = i
 
         # Add to best packer
-        result = self._packers[best_idx].add(tokens, source_id)
+        result = self._packers[best_idx].add(tokens, source_id, extra_fields)
         if result is not None:
             results.append(result)
 
@@ -391,6 +470,8 @@ class FirstFitPacker:
         pad_token_id: int = 0,
         include_segment_ids: bool = True,
         buffer_size: int = 1000,
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
     ):
         """Capture packing settings and initialise the pending buffer.
 
@@ -405,16 +486,31 @@ class FirstFitPacker:
             buffer_size: Number of upstream examples accumulated
                 before a packing pass runs. Larger buffers give
                 better density but more latency and memory use.
+            extra_field_pad_values: Optional token-aligned fields to pack
+                alongside ``input_ids`` and their pad values.
+            extra_field_separator_values: Values appended to aligned fields
+                for the synthetic EOS separator between examples.
         """
         self.seq_length = seq_length
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.include_segment_ids = include_segment_ids
         self.buffer_size = buffer_size
+        self.extra_field_pad_values = extra_field_pad_values or {}
+        self.extra_field_separator_values = {
+            key: self.extra_field_pad_values[key] for key in self.extra_field_pad_values
+        }
+        if extra_field_separator_values:
+            self.extra_field_separator_values.update(extra_field_separator_values)
 
-        self._pending: list[tuple[list[int], str | None]] = []
+        self._pending: list[tuple[list[int], str | None, dict[str, list[int]]]] = []
 
-    def add(self, tokens: list[int], source_id: str | None = None) -> list[PackedSequence]:
+    def add(
+        self,
+        tokens: list[int],
+        source_id: str | None = None,
+        extra_fields: dict[str, list[int]] | None = None,
+    ) -> list[PackedSequence]:
         """Buffer one example, triggering a packing pass when the buffer fills.
 
         Args:
@@ -423,13 +519,15 @@ class FirstFitPacker:
                 example; aggregated into
                 :attr:`PackedSequence.source_ids` when the bin is
                 emitted.
+            extra_fields: Optional token-aligned values matching
+                ``tokens`` for configured extra fields.
 
         Returns:
             list[PackedSequence]: Newly packed bins when this call
             tipped the buffer over ``buffer_size`` and triggered
             :meth:`_pack_buffer`; an empty list otherwise.
         """
-        self._pending.append((tokens, source_id))
+        self._pending.append((tokens, source_id, self._normalize_extra_fields(tokens, extra_fields)))
 
         if len(self._pending) >= self.buffer_size:
             return self._pack_buffer()
@@ -449,21 +547,24 @@ class FirstFitPacker:
         # Sort by length (decreasing)
         sorted_pending = sorted(self._pending, key=lambda x: len(x[0]), reverse=True)
 
-        # Bins: list of (tokens, segment_ids, source_ids)
-        bins: list[tuple[list[int], list[int], list[str]]] = []
+        # Bins: list of (tokens, segment_ids, source_ids, extra_fields)
+        bins: list[tuple[list[int], list[int], list[str], dict[str, list[int]]]] = []
 
-        for tokens, source_id in sorted_pending:
+        for tokens, source_id, extra_fields in sorted_pending:
             token_len = len(tokens) + 1  # +1 for EOS
             placed = False
 
             # Find first bin that fits
-            for _i, (bin_tokens, bin_segments, bin_sources) in enumerate(bins):
+            for _i, (bin_tokens, bin_segments, bin_sources, bin_extra_fields) in enumerate(bins):
                 if len(bin_tokens) + token_len <= self.seq_length:
                     # Add to this bin
                     segment_id = max(bin_segments) + 1 if bin_segments else 0
                     bin_tokens.extend(tokens)
                     bin_tokens.append(self.eos_token_id)
                     bin_segments.extend([segment_id] * (len(tokens) + 1))
+                    for field_name, values in extra_fields.items():
+                        bin_extra_fields[field_name].extend(values)
+                        bin_extra_fields[field_name].append(self.extra_field_separator_values[field_name])
                     if source_id:
                         bin_sources.append(source_id)
                     placed = True
@@ -474,11 +575,15 @@ class FirstFitPacker:
                 new_tokens = [*tokens, self.eos_token_id]
                 new_segments = [0] * len(new_tokens)
                 new_sources = [source_id] if source_id else []
-                bins.append((new_tokens, new_segments, new_sources))
+                new_extra_fields = {
+                    field_name: [*values, self.extra_field_separator_values[field_name]]
+                    for field_name, values in extra_fields.items()
+                }
+                bins.append((new_tokens, new_segments, new_sources, new_extra_fields))
 
         # Convert bins to PackedSequences
         results = []
-        for bin_tokens, bin_segments, bin_sources in bins:
+        for bin_tokens, bin_segments, bin_sources, bin_extra_fields in bins:
             # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
@@ -491,12 +596,20 @@ class FirstFitPacker:
                 max_seg = max(bin_segments) if bin_segments else 0
                 padded_segments = bin_segments + [max_seg + 1] * pad_len
                 segment_ids = np.array(padded_segments, dtype=np.int32)
+            extra_fields = {
+                field_name: np.array(
+                    values + [self.extra_field_pad_values[field_name]] * pad_len,
+                    dtype=np.int32,
+                )
+                for field_name, values in bin_extra_fields.items()
+            } or None
 
             results.append(
                 PackedSequence(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     segment_ids=segment_ids,
+                    extra_fields=extra_fields,
                     source_ids=bin_sources if bin_sources else None,
                     num_segments=max(bin_segments) + 1 if bin_segments else 0,
                 )
@@ -513,6 +626,19 @@ class FirstFitPacker:
             buffer; may be empty when the buffer was already drained.
         """
         return self._pack_buffer()
+
+    def _normalize_extra_fields(
+        self,
+        tokens: list[int],
+        extra_fields: dict[str, list[int]] | None,
+    ) -> dict[str, list[int]]:
+        normalized: dict[str, list[int]] = {}
+        for field_name, pad_value in self.extra_field_pad_values.items():
+            values = list((extra_fields or {}).get(field_name, []))
+            if len(values) < len(tokens):
+                values = values + [pad_value] * (len(tokens) - len(values))
+            normalized[field_name] = values[: len(tokens)]
+        return normalized
 
 
 class PackedShardedSource(ShardedDataSource[dict]):
@@ -542,6 +668,8 @@ class PackedShardedSource(ShardedDataSource[dict]):
         num_packers: int = 4,
         include_segment_ids: bool = True,
         input_field: str = "input_ids",
+        extra_field_pad_values: dict[str, int] | None = None,
+        extra_field_separator_values: dict[str, int] | None = None,
         shuffle: bool = True,
         shuffle_buffer_factor: int = 10,
         seed: int | None = None,
@@ -565,6 +693,10 @@ class PackedShardedSource(ShardedDataSource[dict]):
             include_segment_ids: Whether the packer tracks segment
                 ids.
             input_field: Row key from which token ids are read.
+            extra_field_pad_values: Optional token-aligned row fields to
+                preserve through packing, mapped to their pad value.
+            extra_field_separator_values: Values inserted for each
+                extra field at the synthetic EOS separator.
             shuffle: Run reservoir-sampling shuffle on packed rows
                 before yielding.
             shuffle_buffer_factor: Multiplier on a reference batch
@@ -580,6 +712,12 @@ class PackedShardedSource(ShardedDataSource[dict]):
         self._num_packers = num_packers
         self._include_segment_ids = include_segment_ids
         self._input_field = input_field
+        self._extra_field_pad_values = extra_field_pad_values or {}
+        self._extra_field_separator_values = {
+            key: self._extra_field_pad_values[key] for key in self._extra_field_pad_values
+        }
+        if extra_field_separator_values:
+            self._extra_field_separator_values.update(extra_field_separator_values)
         self._shuffle = shuffle
         self._shuffle_buffer_factor = shuffle_buffer_factor
         self._seed = seed
@@ -615,6 +753,8 @@ class PackedShardedSource(ShardedDataSource[dict]):
                 self._pad_token_id,
                 self._num_packers,
                 self._include_segment_ids,
+                self._extra_field_pad_values,
+                self._extra_field_separator_values,
             )
         elif self._strategy == "first_fit":
             return FirstFitPacker(
@@ -622,6 +762,8 @@ class PackedShardedSource(ShardedDataSource[dict]):
                 self._eos_token_id,
                 self._pad_token_id,
                 self._include_segment_ids,
+                extra_field_pad_values=self._extra_field_pad_values,
+                extra_field_separator_values=self._extra_field_separator_values,
             )
         else:  # greedy
             return GreedyPacker(
@@ -629,6 +771,8 @@ class PackedShardedSource(ShardedDataSource[dict]):
                 self._eos_token_id,
                 self._pad_token_id,
                 self._include_segment_ids,
+                self._extra_field_pad_values,
+                self._extra_field_separator_values,
             )
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
@@ -697,19 +841,20 @@ class PackedShardedSource(ShardedDataSource[dict]):
         for source_shard in self._source.shard_names:
             for example in self._source.open_shard(source_shard):
                 tokens = example.get(self._input_field, [])
-                if not tokens:
+                if len(tokens) == 0:
                     continue
 
                 source_id = example.get("__source__")
+                extra_fields = self._extract_extra_fields(example, len(tokens))
 
                 if isinstance(packer, (PoolPacker, FirstFitPacker)):
-                    results = packer.add(list(tokens), source_id)
+                    results = packer.add(list(tokens), source_id, extra_fields)
                     for packed in results:
                         out = emit(packed)
                         if out is not None:
                             yield out
                 else:
-                    result = packer.add(list(tokens), source_id)
+                    result = packer.add(list(tokens), source_id, extra_fields)
                     if result is not None:
                         out = emit(result)
                         if out is not None:
@@ -764,6 +909,19 @@ class PackedShardedSource(ShardedDataSource[dict]):
         return (
             f"PackedShardedSource(seq_length={self._seq_length}, strategy={self._strategy!r}, source={self._source!r})"
         )
+
+    def _extract_extra_fields(self, example: dict, token_count: int) -> dict[str, list[int]]:
+        extra_fields: dict[str, list[int]] = {}
+        for field_name, pad_value in self._extra_field_pad_values.items():
+            values = example.get(field_name)
+            if values is None:
+                values_list: list[int] = [pad_value] * token_count
+            else:
+                values_list = list(values)
+                if len(values_list) < token_count:
+                    values_list = values_list + [pad_value] * (token_count - len(values_list))
+            extra_fields[field_name] = values_list[:token_count]
+        return extra_fields
 
 
 class PackStage(BaseStage):

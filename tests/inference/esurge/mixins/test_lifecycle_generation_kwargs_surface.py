@@ -84,8 +84,9 @@ def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
     model = DummyModel()
     engine = DummyEngine()
 
+    tokenizer = SimpleNamespace(name_or_path="tok")
     kwargs = dict(
-        tokenizer="tok",
+        tokenizer=tokenizer,
         max_model_len=512,
         min_input_pad=16,
         max_num_seqs=8,
@@ -95,6 +96,8 @@ def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
         page_size=32,
         enable_prefix_caching=True,
         data_parallelism_axis="dp",
+        async_scheduling=True,
+        overlap_execution=True,
         runner_verbose=False,
         decode_truncated_prompt=True,
         destroy_pages_on_pause=True,
@@ -102,7 +105,7 @@ def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
     )
 
     model_hash = model._esurge_cache_scope()
-    extra_dict_str = pprint.pformat(kwargs)
+    extra_dict_str = pprint.pformat(model._normalize_esurge_cache_value(kwargs), sort_dicts=True)
     bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
     extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
     generation_module._ESURGE_MAP_CACHE[f"{model_hash}-{extra_dict_hash}"] = engine
@@ -448,6 +451,10 @@ def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
             self.async_dispatches += 1
             return "future"
 
+        def can_dispatch_next_before_async_drain(self, scheduler_output):
+            del scheduler_output
+            return True
+
         def wait_for_execution(self, future):
             del future
             raise RuntimeError("drain failed")
@@ -523,7 +530,7 @@ def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
     assert isinstance(engine._scheduler_exception, RuntimeError)
     assert "drain failed" in str(engine._scheduler_exception)
     assert engine.scheduler.schedule_calls == 2
-    assert engine.runner.async_dispatches == 1
+    assert engine.runner.async_dispatches == 2
 
 
 def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
@@ -761,6 +768,9 @@ def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compa
     runner = DummyRunner()
 
     class MockState:
+        def overlay(self, other):
+            return self.merge(other, copy=False)
+
         def merge(self, other, *, copy=False):
             del copy
             return f"{self._val}+{other}"
@@ -886,6 +896,8 @@ def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monke
         page_size=32,
         enable_prefix_caching=True,
         data_parallelism_axis="dp",
+        async_scheduling=True,
+        overlap_execution=True,
         runner_verbose=False,
         decode_truncated_prompt=True,
         destroy_pages_on_pause=True,
@@ -904,12 +916,14 @@ def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monke
         page_size=kwargs["page_size"],
         enable_prefix_caching=kwargs["enable_prefix_caching"],
         data_parallelism_axis=kwargs["data_parallelism_axis"],
+        async_scheduling=kwargs["async_scheduling"],
+        overlap_execution=kwargs["overlap_execution"],
         runner_verbose=kwargs["runner_verbose"],
         decode_truncated_prompt=kwargs["decode_truncated_prompt"],
         destroy_pages_on_pause=kwargs["destroy_pages_on_pause"],
         silent_mode=kwargs["silent_mode"],
     )
-    extra_dict_str = pprint.pformat(extra_dict)
+    extra_dict_str = pprint.pformat(model._normalize_esurge_cache_value(extra_dict), sort_dicts=True)
     bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
     extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
     generation_module._ESURGE_MAP_CACHE[f"{model_hash}-{extra_dict_hash}"] = expected_engine
@@ -1077,7 +1091,7 @@ def test_get_esurge_reuses_cached_engine_for_equivalent_tokenizer_instances(monk
     created_engines: list[DummyEngine] = []
 
     def _fake_esurge_ctor(*_args, **kwargs):
-        engine = DummyEngine(kwargs["tokenizer"])
+        engine = DummyEngine(kwargs["processor"])
         created_engines.append(engine)
         return engine
 
@@ -1163,7 +1177,7 @@ def test_get_esurge_reuses_cached_engine_when_tokenizer_padding_side_changes(mon
     created_engines: list[DummyEngine] = []
 
     def _fake_esurge_ctor(*_args, **kwargs):
-        engine = DummyEngine(kwargs["tokenizer"])
+        engine = DummyEngine(kwargs["processor"])
         created_engines.append(engine)
         return engine
 

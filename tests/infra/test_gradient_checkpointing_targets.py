@@ -215,7 +215,7 @@ def test_llama_mlp_exposes_checkpoint_names_used_by_targets():
 
     jaxpr = jax.make_jaxpr(mlp.forward)(jnp.ones((1, 2, config.hidden_size), dtype=jnp.float32))
 
-    assert {"mlp_gate", "mlp_up", "mlp_down", "mlp_output"}.issubset(_jaxpr_checkpoint_names(jaxpr.jaxpr))
+    assert {"mlp_gate", "mlp_gate_up", "mlp_down", "mlp_output"}.issubset(_jaxpr_checkpoint_names(jaxpr.jaxpr))
 
 
 def test_target_policy_selects_the_named_residual(capsys):

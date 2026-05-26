@@ -127,8 +127,6 @@ class Gemma4AssistantOutput:
     top_token_ids: Int[Array, "batch seq_len candidates"] | None = None
 
 
-
-
 class Gemma4AssistantCentroidHead(spx.Module):
     """Two-stage centroid-clustered output head.
 
@@ -274,8 +272,6 @@ class Gemma4AssistantCentroidHead(spx.Module):
                 candidate_ids,
             ].set(top_logits)
         return top_logits, candidate_ids, dense_logits
-
-
 
 
 class Gemma4AssistantMLP(spx.Module):
@@ -659,8 +655,6 @@ class Gemma4AssistantDecoderLayer(spx.Module):
         h = self.post_feedforward_layernorm(h)
         hidden_states = (residual + h) * self.layer_scalar.value
         return hidden_states
-
-
 
 
 @register_module(TaskType.BASE_MODULE, config=Gemma4AssistantConfig, model_type="gemma4_assistant")

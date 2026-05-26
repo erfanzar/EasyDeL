@@ -158,6 +158,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
             AgenticMoshPit trainer. Each call must return a new environment
             instance so per-rollout seeding/state remains independent across
             workers.
+        environment_factory: Alias used by NeMo Gym / async GRPO-style trainers
+            for the same fresh-environment factory.
         tools: List of tool implementations exposed to the agent under the
             AgenticMoshPit trainer; typically aligned with ``tool_names`` on
             the trainer config so that the registered names resolve to these
@@ -177,6 +179,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     external_reward_weights: NotRequired[list[float] | None]
     feedback_func: NotRequired[typing.Callable | None]
     env_factory: NotRequired[typing.Callable | None]
+    environment_factory: NotRequired[typing.Callable | None]
+    bema_callback: NotRequired[Any | None]
     tools: NotRequired[list | None]
 
 
@@ -1502,6 +1506,7 @@ class eLargeModel:
             ValueError: If *trainer_type* is not one of the supported families.
         """
         import easydel.trainers  # noqa: F401
+        from easydel.trainers.prm_trainer import PRMPreprocessTransform
         from easydel.trainers.prompt_transforms import (
             BCOPreprocessTransform,
             CPOPreprocessTransform,
@@ -1514,13 +1519,14 @@ class eLargeModel:
             RewardPreprocessTransform,
             SFTPreprocessTransform,
         )
+        from easydel.trainers.tpo_trainer import TPOPreprocessTransform
 
         trainer_cfg, arguments = self._build_training_arguments_for_type(trainer_type)
         trainer_type = trainer_cfg.get("trainer_type", trainer_type)
         tokenizer = self.build_tokenizer()
         mixture_cfg = self._config.get("mixture", {})
 
-        if trainer_type in {"sft", "gkd", "distillation"}:
+        if trainer_type in {"sft", "gkd", "distillation", "gold"}:
             text_field = getattr(arguments, "dataset_text_field", None) or mixture_cfg.get("text_target_field", "text")
             mask_prompt = bool(getattr(arguments, "assistant_only_loss", False))
             completion_only_loss = getattr(arguments, "completion_only_loss", None)
@@ -1534,8 +1540,17 @@ class eLargeModel:
                 formatting_func=formatting_func,
             )
 
-        if trainer_type == "dpo":
+        if trainer_type in {"dpo", "online_dpo"}:
             return DPOPreprocessTransform(
+                tokenizer=tokenizer,
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                tools=getattr(arguments, "tools", None),
+                label_pad_token_id=arguments.label_pad_token_id,
+            )
+
+        if trainer_type == "tpo":
+            return TPOPreprocessTransform(
                 tokenizer=tokenizer,
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,
@@ -1585,6 +1600,16 @@ class eLargeModel:
                 max_length=arguments.max_length,
             )
 
+        if trainer_type == "prm":
+            return PRMPreprocessTransform(
+                tokenizer=tokenizer,
+                max_length=arguments.max_length,
+                max_completion_length=arguments.max_completion_length,
+                step_separator=arguments.step_separator,
+                train_on_last_step_only=arguments.train_on_last_step_only,
+                pad_to_multiple_of=arguments.pad_to_multiple_of,
+            )
+
         if trainer_type == "embedding":
             return EmbeddingPreprocessTransform(
                 tokenizer=tokenizer,
@@ -1596,16 +1621,26 @@ class eLargeModel:
 
         prompt_only_trainers = {
             "agentic-moshpit",
+            "async_grpo",
+            "dppo",
             "gfpo",
             "grpo",
+            "grpo_with_replay_buffer",
             "gspo",
+            "gspo_token",
+            "minillm",
             "nash-md",
+            "nemo_gym",
             "on_policy_distillation",
+            "papo",
             "ppo",
             "rlvr",
+            "rloo",
+            "sdft",
             "sdpo",
             "seq_kd",
             "sparse_distillation",
+            "ssd",
             "xpo",
         }
         if trainer_type in prompt_only_trainers:
@@ -2299,6 +2334,47 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type == "online_dpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    "online_dpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "tpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
         elif trainer_type == "cpo":
             if reference_model is None:
                 reference_model = self.build_reference_model()
@@ -2337,7 +2413,17 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
-        elif trainer_type in {"grpo", "gfpo", "gspo"}:
+        elif trainer_type in {
+            "grpo",
+            "gfpo",
+            "gspo",
+            "async_grpo",
+            "dppo",
+            "grpo_with_replay_buffer",
+            "gspo_token",
+            "papo",
+            "rloo",
+        }:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
@@ -2355,6 +2441,20 @@ class eLargeModel:
             trainer_kwargs["processing_class"] = self._tokenizer
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+            trainer_kwargs["tools"] = kwargs.get("tools", None)
+            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
+
+        elif trainer_type == "nemo_gym":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+            trainer_kwargs["tools"] = kwargs.get("tools", None)
+            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
 
         elif trainer_type == "sdpo":
             if reward_funcs is None and reward_model is None:
@@ -2368,6 +2468,42 @@ class eLargeModel:
             trainer_kwargs["model"] = model
             trainer_kwargs["reward_funcs"] = resolved_reward
             trainer_kwargs["feedback_func"] = kwargs.get("feedback_func", None)
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "sdft":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["feedback_func"] = kwargs.get("feedback_func", None)
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "ssd":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "minillm":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["reward_funcs"] = reward_funcs
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["processing_class"] = self._tokenizer
@@ -2449,7 +2585,7 @@ class eLargeModel:
             trainer_kwargs["formatting_func"] = kwargs.get("formatting_func", None)
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
-        elif trainer_type == "distillation":
+        elif trainer_type in {"distillation", "gold"}:
             if teacher_model is None:
                 teacher_model = self.build_teacher_model()
 
@@ -2459,6 +2595,14 @@ class eLargeModel:
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["student_model"] = model
             trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "prm":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
             trainer_kwargs["processing_class"] = self._tokenizer
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
@@ -2553,6 +2697,9 @@ class eLargeModel:
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
 
+        if kwargs.get("bema_callback", None) is not None and trainer_class.__name__ == "BEMADPOTrainer":
+            trainer_kwargs["bema_callback"] = kwargs["bema_callback"]
+
         trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if v is not None}
 
         for key, value in kwargs.items():
@@ -2564,6 +2711,8 @@ class eLargeModel:
                     "data_tokenize_fn",
                     "feedback_func",
                     "env_factory",
+                    "environment_factory",
+                    "bema_callback",
                     "tools",
                 ]:
                     trainer_kwargs[key] = value

@@ -64,8 +64,6 @@ def make_tiny_model(mtp_layers: int = 1):
     return Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
 
 
-
-
 class _FakeOutput:
     def __init__(self, logits, last_hidden_state):
         self.logits = logits
@@ -111,8 +109,6 @@ class FakeMatchingDrafter:
         tok = ((seed + 1) % self.vocab).astype(jnp.int32)
         lp = jax.nn.log_softmax(jax.nn.one_hot(tok, self.vocab, dtype=jnp.float32) * 30.0, axis=-1)
         return DraftStep(token_ids=tok, log_probs=jnp.zeros_like(tok, dtype=jnp.float32), full_log_probs=lp)
-
-
 
 
 def test_driver_runs_dynamically():

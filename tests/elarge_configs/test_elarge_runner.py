@@ -30,11 +30,45 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 CONFIGS_DIR = Path(__file__).parent
 ELARGE_MODULE = "easydel.scripts.elarge"
+TRAINING_TEST_STEPS = int(os.environ.get("EASYDEL_ELARGE_TEST_STEPS", "3"))
+
+
+def _materialize_training_test_config(config_path: Path) -> Path:
+    """Create a short-running copy of an eLarge YAML config for runtime tests."""
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required for eLarge config tests.") from exc
+
+    with config_path.open(encoding="utf-8") as handle:
+        doc: dict[str, Any] = yaml.safe_load(handle) or {}
+
+    config = doc.get("config")
+    if config is None:
+        config = doc
+    if not isinstance(config, dict):
+        raise TypeError(f"Expected mapping config in {config_path}, got {type(config).__name__}")
+
+    trainer = config.setdefault("trainer", {})
+    if not isinstance(trainer, dict):
+        raise TypeError(f"Expected trainer mapping in {config_path}, got {type(trainer).__name__}")
+
+    trainer["max_training_steps"] = TRAINING_TEST_STEPS
+    trainer["save_steps"] = None
+    trainer["do_last_save"] = False
+
+    tmp_dir = (Path.cwd() / "tmp-files" / "elarge-tests" / "runtime-configs").resolve()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    runtime_path = tmp_dir / config_path.name
+    with runtime_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(doc, handle, sort_keys=False)
+    return runtime_path
 
 
 def run_elarge_config(config_name: str, dry_run: bool = False) -> subprocess.CompletedProcess:
@@ -51,7 +85,8 @@ def run_elarge_config(config_name: str, dry_run: bool = False) -> subprocess.Com
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
-    cmd = [sys.executable, "-m", ELARGE_MODULE, str(config_path)]
+    runtime_config_path = config_path if dry_run else _materialize_training_test_config(config_path)
+    cmd = [sys.executable, "-m", ELARGE_MODULE, str(runtime_config_path)]
     if dry_run:
         cmd.append("--dry-run")
 
