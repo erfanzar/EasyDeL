@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import typing as tp
 
+import numpy as np
 from eformer.loggings import get_logger
+from tqdm.auto import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -34,6 +36,7 @@ from easydel.utils import Registry
 from easydel.utils.traversals import deepcopy_model
 
 from ..binary_classifier_optimization_trainer._fn import concatenated_forward
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import KTOPreprocessTransform
 from ..prompt_utils import (
     maybe_apply_chat_template,
@@ -44,7 +47,7 @@ from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
 from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
-from ._fn import evaluation_step, training_step
+from ._fn import _build_kl_batch, evaluation_step, training_step
 from .kto_config import KTOConfig
 
 if tp.TYPE_CHECKING:
@@ -132,6 +135,9 @@ class KTOTrainer(Trainer):
         if getattr(processing_class, "pad_token_id", None) is None and hasattr(processing_class, "eos_token"):
             processing_class.pad_token = processing_class.eos_token
 
+        model = self._resolve_policy_model(model)
+        reference_model = self._resolve_reference_model(reference_model)
+
         if isinstance(model, EasyDeLState):
             model_state = model
         else:
@@ -145,6 +151,10 @@ class KTOTrainer(Trainer):
             reference_state = reference_model.to_state(trainable_selector=arguments.trainable_selector)
         else:
             reference_state = deepcopy_model(model_state)
+
+        if arguments.disable_dropout:
+            model_state = disable_state_dropout(model_state)
+            reference_state = disable_state_dropout(reference_state)
 
         self.arguments = arguments
         if self.arguments.is_encoder_decoder is not None:
@@ -209,9 +219,23 @@ class KTOTrainer(Trainer):
             processing_class=processing_class,
         )
 
-        if arguments.disable_dropout:
-            self.model_state.model.eval()
-            self.reference_state.model.eval()
+    @staticmethod
+    def _resolve_policy_model(
+        model: EasyDeLBaseModule | EasyDeLState,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Reject accidental string policy identifiers."""
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        return model
+
+    @staticmethod
+    def _resolve_reference_model(
+        reference_model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState | None:
+        """Reject accidental string references."""
+        if isinstance(reference_model, str):
+            reject_string_model_id(reference_model, role="reference model")
+        return reference_model
 
     @staticmethod
     def _preprocess_kto_dataset(dataset, processing_class, arguments):
@@ -287,6 +311,17 @@ class KTOTrainer(Trainer):
             tools=getattr(self.arguments, "tools", None),
         )
 
+    @staticmethod
+    def _source_is_pretokenized(source: "ShardedDataSource | None") -> bool:
+        """Return whether a source already contains tokenized KTO prompt fields."""
+        if source is None:
+            return False
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+            return "prompt_input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
+
     def _is_pretokenized(self) -> bool:
         """Detect whether the training :class:`ShardedDataSource` is pre-tokenized.
 
@@ -300,13 +335,30 @@ class KTOTrainer(Trainer):
             ``prompt_input_ids``; ``False`` when no train source is
             attached, the shard is empty, or the key is missing.
         """
-        if self._train_source is None:
+        return self._source_is_pretokenized(self._train_source)
+
+    @staticmethod
+    def _source_has_reference_logps(source: "ShardedDataSource | None", *, require_kl: bool = False) -> bool:
+        """Return whether a source carries precomputed KTO reference log-probs."""
+        if source is None:
             return False
         try:
-            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
-            return "prompt_input_ids" in sample
+            sample = next(iter(source.open_shard(source.shard_names[0])))
         except (StopIteration, IndexError):
             return False
+        if "reference_logps" not in sample:
+            return False
+        return not require_kl or "reference_KL_logps" in sample
+
+    def _build_source_from_dataset(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+    ) -> "ShardedDataSource | None":
+        """Convert a dataset to a sharded source and attach preprocessing if needed."""
+        source = self._to_sharded_source(dataset)
+        if source is None or self._source_is_pretokenized(source):
+            return source
+        return source.transform(self._get_preprocess_transform())
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled KTO training/evaluation step functions.
@@ -424,6 +476,134 @@ class KTOTrainer(Trainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    def configure_dataloaders(self):
+        """Precompute optional KTO reference log-probs before base dataloaders."""
+        if self.dataset_train is not None and not self._source_has_reference_logps(
+            self._train_source, require_kl=self.calculate_kl
+        ):
+            if self.arguments.precompute_ref_log_probs:
+                self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_train",
+                    source_attr="_train_source",
+                    batch_size=self.arguments.precompute_ref_batch_size or self.training_batch_size,
+                    is_train=True,
+                    desc="Train dataset reference log probs",
+                )
+        if self.dataset_eval is not None and not self._source_has_reference_logps(
+            self._eval_source, require_kl=self.calculate_kl
+        ):
+            if self.arguments.precompute_ref_log_probs:
+                self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_eval",
+                    source_attr="_eval_source",
+                    batch_size=self.arguments.precompute_ref_batch_size or self.evaluation_batch_size,
+                    is_train=False,
+                    desc="Eval dataset reference log probs",
+                )
+        return super().configure_dataloaders()
+
+    def _precompute_reference_log_probs_for_split(
+        self,
+        *,
+        dataset_attr: str,
+        source_attr: str,
+        batch_size: int,
+        is_train: bool,
+        desc: str,
+    ) -> bool:
+        """Materialize reference log-prob columns for one KTO dataset split.
+
+        The method only mutates dataset/source attributes when the dataset
+        supports ``add_column`` and at least one batch is produced. Otherwise it
+        returns ``False`` and leaves runtime scoring to the normal KTO path.
+        """
+        dataset = getattr(self, dataset_attr)
+        source = getattr(self, source_attr)
+        if dataset is None or source is None:
+            return False
+        if not hasattr(dataset, "add_column"):
+            logger.warning(
+                "`precompute_ref_log_probs=True` requires a dataset that supports `add_column`; "
+                "falling back to on-the-fly KTO reference scoring for `%s`.",
+                dataset_attr,
+            )
+            return False
+
+        reference_logps: list[np.ndarray] = []
+        reference_kl_logps: list[np.ndarray] = []
+        data_collator = self.data_collator or (lambda batch: batch)
+        batch_iterator = self._create_dataloader_from_source(
+            source=source,
+            batch_size=batch_size,
+            is_train=is_train,
+            shuffle=False,
+            num_epochs=1,
+            drop_remainder=False,
+        )
+        for raw_batch in tqdm(iterable=batch_iterator, desc=desc):
+            padded_batch = self._purify_batch(data_collator(raw_batch))
+            if self.calculate_kl:
+                completion_logps, kl_logps = self.compute_reference_log_probs(padded_batch, include_kl=True)
+                reference_logps.append(np.asarray(completion_logps))
+                reference_kl_logps.append(np.asarray(kl_logps))
+            else:
+                reference_logps.append(np.asarray(self.compute_reference_log_probs(padded_batch)))
+
+        if not reference_logps:
+            return False
+
+        updated_dataset = dataset.add_column(
+            name="reference_logps",
+            column=np.concatenate(reference_logps, axis=0),
+        )
+        if self.calculate_kl:
+            updated_dataset = updated_dataset.add_column(
+                name="reference_KL_logps",
+                column=np.concatenate(reference_kl_logps, axis=0),
+            )
+        setattr(self, dataset_attr, updated_dataset)
+        setattr(self, source_attr, self._build_source_from_dataset(updated_dataset))
+        return True
+
+    def compute_reference_log_probs(self, padded_batch: dict, *, include_kl: bool = False) -> tp.Any:
+        """Compute KTO reference completion log-probs for a padded batch."""
+        reference_model = self.model_state.model if self.reference_state is None else self.reference_state.model
+        reference_model.eval()
+        forward_fn = getattr(self, "concatenated_forward", None)
+        if forward_fn is None:
+            completion_logps = concatenated_forward(
+                reference_model,
+                padded_batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=self.aux_loss_enabled,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            )["completion_logps"]
+            if not include_kl:
+                return completion_logps
+            kl_batch = _build_kl_batch(padded_batch)
+            kl_logps = concatenated_forward(
+                reference_model,
+                kl_batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=self.aux_loss_enabled,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            )["completion_logps"]
+            return completion_logps, kl_logps
+
+        completion_logps = forward_fn(reference_model, padded_batch)["completion_logps"]
+        if not include_kl:
+            return completion_logps
+        kl_logps = forward_fn(reference_model, _build_kl_batch(padded_batch))["completion_logps"]
+        return completion_logps, kl_logps
 
     def create_grain_collect_function(
         self,

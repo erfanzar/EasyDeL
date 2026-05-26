@@ -261,7 +261,7 @@ def training_step(
         state: Policy ``EasyDeLState`` being differentiated.
         batch: KTO minibatch with ``prompt_*`` / ``completion_*``,
             boolean ``label``, and (optionally) precomputed
-            ``reference_logps`` and ``reference_kl_logps``.
+            ``reference_logps`` and ``reference_KL_logps``.
         reference_state: Frozen reference state used when reference
             logps are not already cached on the batch.
         learning_rate_fn: Schedule mapping step to learning rate.
@@ -304,9 +304,13 @@ def training_step(
             batch["reference_logps"] = jax.lax.stop_gradient(ref_out["completion_logps"])
 
         if calculate_kl:
-            kl_batch = _build_kl_batch(batch)
-            ref_kl_out = forward_fn(reference_state.model, kl_batch)
-            batch["_reference_kl_logps"] = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
+            if "_reference_kl_logps" not in batch:
+                reference_kl_logps = batch.get("reference_KL_logps")
+                if reference_kl_logps is None:
+                    kl_batch = _build_kl_batch(batch)
+                    ref_kl_out = forward_fn(reference_state.model, kl_batch)
+                    reference_kl_logps = ref_kl_out["completion_logps"]
+                batch["_reference_kl_logps"] = jax.lax.stop_gradient(reference_kl_logps)
 
     def _loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         """Compute the KTO loss for one minibatch.
@@ -426,6 +430,9 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
     if not bool(call.get("calculate_kl", False)):
         return batch
 
+    if "_reference_kl_logps" not in batch and "reference_KL_logps" in batch:
+        batch["_reference_kl_logps"] = batch["reference_KL_logps"]
+
     if "_reference_kl_logps" in batch and "_policy_kl_logps" in batch:
         return batch
 
@@ -438,24 +445,26 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
     partition_spec = call.get("partition_spec")
 
     _kl_microbatches = getattr(call.schedule, "microbatches", 1)
-    ref_model = reference_state.model
-    ref_model.eval()
-    with sync_module_physical_stage_config(ref_model):
-        ref_kl_batch = constrain_scheduled_batch(ref_model, kl_batch, partition_spec)
-        ref_forward = cached_scheduled_auxiliary(
-            forward_fn, ref_model.mesh, microbatches=_kl_microbatches, batch_argnums=1
-        )
-        ref_out = stop_gradient_tree(ref_forward(ref_model, ref_kl_batch))
-    batch["_reference_kl_logps"] = ref_out["completion_logps"]
+    if "_reference_kl_logps" not in batch:
+        ref_model = reference_state.model
+        ref_model.eval()
+        with sync_module_physical_stage_config(ref_model):
+            ref_kl_batch = constrain_scheduled_batch(ref_model, kl_batch, partition_spec)
+            ref_forward = cached_scheduled_auxiliary(
+                forward_fn, ref_model.mesh, microbatches=_kl_microbatches, batch_argnums=1
+            )
+            ref_out = stop_gradient_tree(ref_forward(ref_model, ref_kl_batch))
+        batch["_reference_kl_logps"] = ref_out["completion_logps"]
 
-    policy_model = call.state.model
-    with sync_module_physical_stage_config(policy_model):
-        policy_kl_batch = constrain_scheduled_batch(policy_model, kl_batch, partition_spec)
-        policy_forward = cached_scheduled_auxiliary(
-            forward_fn, policy_model.mesh, microbatches=_kl_microbatches, batch_argnums=1
-        )
-        policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
-    batch["_policy_kl_logps"] = policy_out["completion_logps"]
+    if "_policy_kl_logps" not in batch:
+        policy_model = call.state.model
+        with sync_module_physical_stage_config(policy_model):
+            policy_kl_batch = constrain_scheduled_batch(policy_model, kl_batch, partition_spec)
+            policy_forward = cached_scheduled_auxiliary(
+                forward_fn, policy_model.mesh, microbatches=_kl_microbatches, batch_argnums=1
+            )
+            policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
+        batch["_policy_kl_logps"] = policy_out["completion_logps"]
     return batch
 
 
@@ -630,7 +639,10 @@ def evaluation_step(
         with jax.named_scope(eval_scope + "/kl_forward"):
             kl_batch = _build_kl_batch(batch)
             policy_kl_logps = forward_fn(state.model, kl_batch)["completion_logps"]
-            reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
+            if "reference_KL_logps" in batch:
+                reference_kl_logps = batch["reference_KL_logps"]
+            else:
+                reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
     else:
         policy_kl_logps = reference_kl_logps = None
 

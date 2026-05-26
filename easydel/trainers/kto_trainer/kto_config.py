@@ -90,6 +90,9 @@ class KTOConfig(TrainingArguments):
         precompute_ref_log_probs: When ``True``, the trainer caches
             reference logps during dataset preparation so the
             reference forward is skipped at training time.
+        precompute_ref_batch_size: Batch size used for KTO reference
+            log-prob precomputation. ``None`` uses the train/eval
+            dataloader batch sizes.
     """
 
     trainer_prefix: str | None = field(
@@ -161,6 +164,15 @@ class KTOConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to precompute reference log probabilities into the dataset."},
     )
+    precompute_ref_batch_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Batch size used when precomputing reference log probabilities. "
+                "If None, the trainer dataloader batch sizes are used."
+            )
+        },
+    )
 
     def __post_init__(
         self,
@@ -183,6 +195,8 @@ class KTOConfig(TrainingArguments):
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = max(self.max_length - self.max_prompt_length, 1)
         self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
+        if self.precompute_ref_batch_size is not None and self.precompute_ref_batch_size <= 0:
+            raise ValueError("`precompute_ref_batch_size` must be a positive integer when set.")
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
                 max_sequence_length=None,
