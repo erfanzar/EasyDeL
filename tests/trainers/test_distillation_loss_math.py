@@ -240,6 +240,69 @@ def test_supervised_ce_unchanged():
     assert jnp.allclose(metrics_b["ce_loss"], expected_ce, atol=1e-6)
 
 
+def test_distillation_beta_uses_generalized_jsd():
+    student_logits = jnp.array([[[1.0, 0.0, -0.5], [0.2, 0.5, -0.3]]], dtype=jnp.float32)
+    teacher_logits = jnp.array([[[0.1, 0.6, -0.2], [0.4, -0.1, 0.3]]], dtype=jnp.float32)
+    mask = jnp.array([[1, 0]], dtype=jnp.int32)
+    beta = 0.25
+
+    _, metrics = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        loss_mask=mask,
+        temperature=1.5,
+        alpha=1.0,
+        beta=beta,
+    )
+
+    student_log_probs = jax.nn.log_softmax(student_logits / 1.5, axis=-1)
+    teacher_log_probs = jax.nn.log_softmax(teacher_logits / 1.5, axis=-1)
+    mixture_log_probs = jax.scipy.special.logsumexp(
+        jnp.stack(
+            [
+                student_log_probs + jnp.log1p(-beta),
+                teacher_log_probs + jnp.log(beta),
+            ]
+        ),
+        axis=0,
+    )
+    student_probs = jnp.exp(student_log_probs)
+    teacher_probs = jnp.exp(teacher_log_probs)
+    kl_teacher = jnp.sum(teacher_probs * (teacher_log_probs - mixture_log_probs), axis=-1)
+    kl_student = jnp.sum(student_probs * (student_log_probs - mixture_log_probs), axis=-1)
+    per_token = beta * kl_teacher + (1 - beta) * kl_student
+    expected = jnp.sum(per_token * mask) / jnp.sum(mask) * (1.5**2)
+
+    assert jnp.allclose(metrics["kl_loss"], expected, atol=1e-6)
+
+
+def test_distillation_topk_tail_matches_bucketed_loss():
+    student_logits = jnp.array([[[0.1, 0.7, -0.2, 0.5]]], dtype=jnp.float32)
+    teacher_logits = jnp.array([[[1.2, 0.4, -0.1, 0.2]]], dtype=jnp.float32)
+
+    _, metrics = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        temperature=1.0,
+        alpha=1.0,
+        loss_top_k=2,
+        loss_add_tail=True,
+    )
+
+    teacher_log_probs = jax.nn.log_softmax(teacher_logits, axis=-1)
+    student_log_probs = jax.nn.log_softmax(student_logits, axis=-1)
+    top_teacher_log_probs, top_indices = jax.lax.top_k(teacher_log_probs, 2)
+    top_student_log_probs = jnp.take_along_axis(student_log_probs, top_indices, axis=-1)
+    top_teacher_probs = jnp.exp(top_teacher_log_probs)
+    top_student_probs = jnp.exp(top_student_log_probs)
+    teacher_tail = 1.0 - jnp.sum(top_teacher_probs, axis=-1)
+    student_tail = 1.0 - jnp.sum(top_student_probs, axis=-1)
+    xent = -(jnp.sum(top_teacher_probs * top_student_log_probs, axis=-1) + teacher_tail * jnp.log(student_tail))
+    entropy = -(jnp.sum(top_teacher_probs * top_teacher_log_probs, axis=-1) + teacher_tail * jnp.log(teacher_tail))
+
+    assert jnp.allclose(metrics["kl_loss"], jnp.mean(xent - entropy), atol=1e-6)
+
+
 def test_teacher_branch_is_stop_gradient():
     student_logits = jnp.array(
         [

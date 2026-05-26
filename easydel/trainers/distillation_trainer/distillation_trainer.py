@@ -47,6 +47,7 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -159,12 +160,20 @@ class DistillationTrainer(Trainer):
             raise TypeError("passed argument must be a `DistillationConfig`.")
 
         self.arguments = arguments
+        student_model = self._resolve_student_model(student_model)
+        teacher_model = self._resolve_teacher_model(
+            teacher_model=teacher_model,
+            teacher_model_revision=arguments.teacher_model_revision,
+        )
 
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
         if not isinstance(teacher_model, EasyDeLState):
             teacher_model.eval()
             teacher_model = teacher_model.to_state()
+        if arguments.disable_dropout:
+            student_model = disable_state_dropout(student_model)
+            teacher_model = disable_state_dropout(teacher_model)
 
         self.teacher_state = teacher_model
 
@@ -176,6 +185,32 @@ class DistillationTrainer(Trainer):
             data_collator=data_collator,
             processing_class=processing_class,
         )
+
+    @staticmethod
+    def _resolve_student_model(
+        student_model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Reject accidental string student ids."""
+        if student_model is None:
+            raise ValueError("`student_model` must be provided for EasyDeL distillation.")
+        if isinstance(student_model, str):
+            reject_string_model_id(student_model, role="student model")
+        return student_model
+
+    @staticmethod
+    def _resolve_teacher_model(
+        *,
+        teacher_model: EasyDeLBaseModule | EasyDeLState | None,
+        teacher_model_revision: str | None,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Resolve an initialized teacher model/state."""
+        if teacher_model_revision is not None:
+            raise ValueError("`teacher_model_revision` is only metadata for externally loaded teachers.")
+        if isinstance(teacher_model, str):
+            reject_string_model_id(teacher_model, role="teacher model")
+        if teacher_model is None:
+            raise ValueError("`teacher_model` must be provided for distillation.")
+        return teacher_model
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled distillation training/evaluation step functions.
@@ -246,9 +281,12 @@ class DistillationTrainer(Trainer):
             straight_through_emulator,
             self.arguments.logits_chunk_size,
             bool(self.arguments.checkpoint_kl_loss),
+            self.arguments.beta,
+            int(self.arguments.loss_top_k),
+            bool(self.arguments.loss_add_tail),
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21)
         self._runtime_trace("train.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
@@ -287,6 +325,9 @@ class DistillationTrainer(Trainer):
             None,
             self.arguments.logits_chunk_size,
             bool(self.arguments.checkpoint_kl_loss),
+            self.arguments.beta,
+            int(self.arguments.loss_top_k),
+            bool(self.arguments.loss_add_tail),
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")

@@ -55,6 +55,8 @@ def main():
             "temperature": 2.0,
             "hidden_state_loss_weight": 0.05,
             "hidden_state_layers": (-1,),
+            "num_generations": 1,
+            "num_return_sequences": 1,
         },
     )
 

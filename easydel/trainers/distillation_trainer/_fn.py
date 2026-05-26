@@ -211,6 +211,94 @@ def _per_token_xent(
     return per_token_distill_xent, per_token_teacher_entropy
 
 
+def _kl_div_from_log_probs(log_target: Array, log_input: Array) -> Array:
+    """Return per-token ``KL(target || input)`` from log-probabilities."""
+    target_probs = jnp.exp(log_target)
+    return jnp.sum(target_probs * (log_target - log_input), axis=-1)
+
+
+def _per_token_generalized_jsd(
+    teacher_logits: Array,
+    student_logits: Array,
+    temperature: float,
+    beta: float,
+    dtype: jnp.dtype,
+) -> Array:
+    """Compute per-token generalized Jensen-Shannon distillation loss.
+
+    Uses the same convention as EasyDeL GKD:
+    ``m = (1 - beta) * p_s + beta * p_t`` and
+    ``beta * KL(p_t || m) + (1 - beta) * KL(p_s || m)``.
+    """
+    student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
+    teacher_log_probs = jax.lax.stop_gradient(
+        jax.nn.log_softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
+    )
+    if beta <= 0.0:
+        return _kl_div_from_log_probs(student_log_probs, teacher_log_probs).astype(dtype)
+    if beta >= 1.0:
+        return _kl_div_from_log_probs(teacher_log_probs, student_log_probs).astype(dtype)
+    beta_val = jnp.asarray(beta, dtype=jnp.float32)
+    mixture_log_probs = jax.scipy.special.logsumexp(
+        jnp.stack(
+            [
+                student_log_probs + jnp.log1p(-beta_val),
+                teacher_log_probs + jnp.log(beta_val),
+            ]
+        ),
+        axis=0,
+    )
+    kl_teacher = _kl_div_from_log_probs(teacher_log_probs, mixture_log_probs)
+    kl_student = _kl_div_from_log_probs(student_log_probs, mixture_log_probs)
+    per_token = beta_val * kl_teacher + (jnp.asarray(1.0, dtype=jnp.float32) - beta_val) * kl_student
+    return per_token.astype(dtype)
+
+
+def _per_token_topk_xent(
+    teacher_logits: Array,
+    student_logits: Array,
+    temperature: float,
+    top_k: int,
+    add_tail: bool,
+    dtype: jnp.dtype,
+) -> tuple[Array, Array]:
+    """Compute teacher-top-k distillation cross-entropy and entropy.
+
+    When ``add_tail`` is enabled, all non-top-k mass is represented by one
+    extra bucket. Otherwise both teacher and student distributions are
+    re-normalized over the selected support, matching TRL's top-k KD surface.
+    """
+    vocab_size = int(teacher_logits.shape[-1])
+    k = min(max(int(top_k), 1), vocab_size)
+    teacher_log_probs = jax.lax.stop_gradient(
+        jax.nn.log_softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
+    )
+    student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
+    top_teacher_log_probs, top_indices = jax.lax.top_k(teacher_log_probs, k)
+    top_student_log_probs = jnp.take_along_axis(student_log_probs, top_indices, axis=-1)
+
+    if add_tail and k < vocab_size:
+        top_teacher_probs = jnp.exp(top_teacher_log_probs)
+        top_student_probs = jnp.exp(top_student_log_probs)
+        eps = jnp.asarray(1e-7, dtype=jnp.float32)
+        teacher_tail_prob = jnp.clip(1.0 - jnp.sum(top_teacher_probs, axis=-1), eps, 1.0)
+        student_tail_prob = jnp.clip(1.0 - jnp.sum(top_student_probs, axis=-1), eps, 1.0)
+        teacher_tail_log_prob = jnp.log(teacher_tail_prob)
+        student_tail_log_prob = jnp.log(student_tail_prob)
+        xent = -(jnp.sum(top_teacher_probs * top_student_log_probs, axis=-1) + teacher_tail_prob * student_tail_log_prob)
+        entropy = -(
+            jnp.sum(top_teacher_probs * top_teacher_log_probs, axis=-1) + teacher_tail_prob * teacher_tail_log_prob
+        )
+        return xent.astype(dtype), entropy.astype(dtype)
+
+    teacher_support_log_probs = jax.nn.log_softmax(top_teacher_log_probs, axis=-1)
+    student_support_log_probs = jax.nn.log_softmax(top_student_log_probs, axis=-1)
+    teacher_support_probs = jnp.exp(teacher_support_log_probs)
+    xent = -jnp.sum(teacher_support_probs * student_support_log_probs, axis=-1)
+    entropy = -jnp.sum(teacher_support_probs * teacher_support_log_probs, axis=-1)
+    return xent.astype(dtype), entropy.astype(dtype)
+
+
 def _compute_kl_and_ce(
     student_logits: Array,
     teacher_logits: Array,
@@ -386,6 +474,9 @@ def distillation_loss(
     use_hard_labels: bool = False,
     temperature: float = 4.0,
     alpha: float = 0.9,
+    beta: float | None = None,
+    loss_top_k: int = 0,
+    loss_add_tail: bool = False,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute knowledge distillation loss between student and teacher models.
 
@@ -429,12 +520,35 @@ def distillation_loss(
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
 
-    per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
-        teacher_logits,
-        student_logits,
-        temperature,
-        dtype,
-    )
+    use_per_token_divergence = beta is not None or loss_top_k > 0
+    if loss_top_k > 0:
+        per_token_distill_xent, per_token_teacher_entropy = _per_token_topk_xent(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            temperature=temperature,
+            top_k=loss_top_k,
+            add_tail=loss_add_tail,
+            dtype=dtype,
+        )
+        per_token_divergence = per_token_distill_xent - per_token_teacher_entropy
+    elif beta is not None:
+        per_token_divergence = _per_token_generalized_jsd(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            temperature=temperature,
+            beta=beta,
+            dtype=dtype,
+        )
+        per_token_distill_xent = per_token_divergence
+        per_token_teacher_entropy = jnp.zeros_like(per_token_divergence)
+    else:
+        per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
+            teacher_logits,
+            student_logits,
+            temperature,
+            dtype,
+        )
+        per_token_divergence = per_token_distill_xent - per_token_teacher_entropy
 
     if loss_mask is not None:
         mask = loss_mask.astype(dtype)
@@ -451,12 +565,17 @@ def distillation_loss(
         normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
         distill_xent_loss = jnp.sum(per_token_distill_xent * mask) / normalizer
         teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask) / normalizer
+        divergence_loss = jnp.sum(per_token_divergence * mask) / normalizer
     else:
         distill_xent_loss = jnp.mean(per_token_distill_xent)
         teacher_entropy_loss = jnp.mean(per_token_teacher_entropy)
+        divergence_loss = jnp.mean(per_token_divergence)
     distill_xent_loss = distill_xent_loss * temp_sq
     teacher_entropy_loss = teacher_entropy_loss * temp_sq
-    kl_loss = distill_xent_loss - teacher_entropy_loss
+    if use_per_token_divergence:
+        kl_loss = divergence_loss * temp_sq
+    else:
+        kl_loss = distill_xent_loss - teacher_entropy_loss
     total_loss = alpha_s * kl_loss
     ce_loss = jnp.array(0.0, dtype=dtype)
     if use_hard_labels and labels is not None:
@@ -867,6 +986,9 @@ def distillation_step(
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
     logits_chunk_size: int | None = None,
     checkpoint_kl_loss: bool = True,
+    beta: float | None = None,
+    loss_top_k: int = 0,
+    loss_add_tail: bool = False,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single knowledge-distillation training or evaluation step.
 
@@ -926,14 +1048,15 @@ def distillation_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(batch, partition_spec)
 
     if hidden_state_loss != "mse":
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
 
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
-    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
+    use_advanced_vocab_loss = beta is not None or loss_top_k > 0 or loss_add_tail
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
 
     def teacher_forward(input_batch: collections.abc.Mapping[str, jax.Array]) -> dict[str, tp.Any]:
         """Run the teacher in stop-gradient mode for one minibatch.
@@ -953,10 +1076,40 @@ def distillation_step(
             TypeError: If the teacher does not return logits in the
                 non-chunked code path.
         """
+        result: dict[str, tp.Any] = {}
+        if use_chunked:
+            teacher_hidden_for_kl = input_batch.get("_teacher_hidden_for_kl", input_batch.get("teacher_hidden_for_kl"))
+            if teacher_hidden_for_kl is not None:
+                result["hidden_for_kl"] = jax.lax.stop_gradient(teacher_hidden_for_kl)
+        else:
+            teacher_logits = input_batch.get("_teacher_logits", input_batch.get("teacher_logits"))
+            if teacher_logits is not None:
+                result["logits"] = jax.lax.stop_gradient(teacher_logits)
+
+        if result:
+            teacher_hiddens = input_batch.get("_teacher_hidden_states", input_batch.get("teacher_hidden_states"))
+            if request_hidden_states and teacher_hiddens is not None:
+                result["hidden_states"] = _stop_gradient_tree(tuple(teacher_hiddens))
+            teacher_attns = input_batch.get("_teacher_attentions", input_batch.get("teacher_attentions"))
+            if request_attentions and teacher_attns is not None:
+                result["attentions"] = _stop_gradient_tree(tuple(teacher_attns))
+            return result
+
         teacher_call_kwargs = dict(input_batch)
         teacher_call_kwargs.pop("labels", None)
         teacher_call_kwargs.pop("completion_mask", None)
         teacher_call_kwargs.pop("assistant_masks", None)
+        for key in (
+            "teacher_logits",
+            "teacher_hidden_for_kl",
+            "teacher_hidden_states",
+            "teacher_attentions",
+            "_teacher_logits",
+            "_teacher_hidden_for_kl",
+            "_teacher_hidden_states",
+            "_teacher_attentions",
+        ):
+            teacher_call_kwargs.pop(key, None)
         if use_chunked:
             teacher_call_kwargs["apply_lm_head"] = False
         if request_hidden_states:
@@ -977,6 +1130,7 @@ def distillation_step(
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         def _teacher_fwd(kw, t_graphstate):
+            """Run the frozen teacher forward pass and stop-gradient outputs."""
             teacher_module = teacher_state.merge(t_graphstate)
             teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
             result: dict[str, tp.Any] = {}
@@ -1070,6 +1224,9 @@ def distillation_step(
                 use_hard_labels=(labels is not None),
                 temperature=temperature,
                 alpha=alpha,
+                beta=beta,
+                loss_top_k=loss_top_k,
+                loss_add_tail=loss_add_tail,
             )
         metrics_map: dict[str, jax.Array] = dict(loss_components)
 
@@ -1201,6 +1358,9 @@ def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "attention_normalize",
             "logits_chunk_size",
             "checkpoint_kl_loss",
+            "beta",
+            "loss_top_k",
+            "loss_add_tail",
         ),
         object_fields=("straight_through_emulator", "teacher_state"),
     )
@@ -1230,8 +1390,12 @@ def _make_distillation_scheduled_loss(call):
     attention_layers = call.get("attention_layers")
     attention_normalize = call.get("attention_normalize", False)
     logits_chunk_size = call.get("logits_chunk_size")
-    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
     checkpoint_kl_loss = bool(call.get("checkpoint_kl_loss", True))
+    beta = call.get("beta")
+    loss_top_k = int(call.get("loss_top_k", 0) or 0)
+    loss_add_tail = bool(call.get("loss_add_tail", False))
+    use_advanced_vocab_loss = beta is not None or loss_top_k > 0 or loss_add_tail
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
     teacher_state = call.get("teacher_state")
@@ -1320,6 +1484,9 @@ def _make_distillation_scheduled_loss(call):
                     use_hard_labels=(labels is not None),
                     temperature=temperature,
                     alpha=alpha,
+                    beta=beta,
+                    loss_top_k=loss_top_k,
+                    loss_add_tail=loss_add_tail,
                 )
 
         if request_hidden_states:

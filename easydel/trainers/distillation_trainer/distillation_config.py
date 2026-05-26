@@ -127,6 +127,64 @@ class DistillationConfig(TrainingArguments):
             "1.0 = pure distillation, 0.0 = pure supervised learning."
         },
     )
+    teacher_model_revision: str | None = field(
+        default=None,
+        metadata={"help": "Reserved teacher revision metadata for externally loaded teacher modules."},
+    )
+    lmbda: float = field(
+        default=0.0,
+        metadata={"help": "TRL on-policy sampling probability. EasyDeL offline distillation requires 0.0."},
+    )
+    beta: float | None = field(
+        default=None,
+        metadata={"help": "Optional generalized Jensen-Shannon interpolation coefficient in [0, 1]."},
+    )
+    reverse_kl_top_1_mode: tp.Literal["sampled", "argmax"] = field(
+        default="sampled",
+        metadata={"help": "TRL reverse-KL support selector. Only the default is accepted in EasyDeL offline mode."},
+    )
+    loss_top_k: int = field(
+        default=0,
+        metadata={"help": "If positive, distill only the teacher top-k vocabulary support."},
+    )
+    loss_add_tail: bool = field(
+        default=False,
+        metadata={"help": "When using `loss_top_k`, add one bucket for all non-top-k teacher/student probability mass."},
+    )
+    max_prompt_length: int | None = field(
+        default=None,
+        metadata={"help": "TRL on-policy prompt length budget. EasyDeL offline distillation uses `max_length`."},
+    )
+    max_completion_length: int | None = field(
+        default=None,
+        metadata={"help": "TRL on-policy completion length budget. Not used by EasyDeL offline distillation."},
+    )
+    disable_dropout: bool = field(
+        default=False,
+        metadata={"help": "Put both student and teacher states in eval mode before training."},
+    )
+    num_generations: int = field(
+        default=1,
+        metadata={"help": "TRL on-policy generations per prompt. EasyDeL offline distillation requires 1."},
+    )
+    generation_batch_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL on-policy generation batch size. Not used by EasyDeL offline distillation."},
+    )
+    top_p: float = field(
+        default=1.0,
+        metadata={"help": "TRL on-policy top-p sampling. Not used by EasyDeL offline distillation."},
+    )
+    top_k: int = field(
+        default=0,
+        metadata={"help": "TRL on-policy top-k sampling. Not used by EasyDeL offline distillation."},
+    )
+    wandb_entity: str | None = field(default=None, metadata={"help": "TRL W&B entity."})
+    wandb_project: str | None = field(default=None, metadata={"help": "TRL W&B project."})
+    wandb_run_group: str | None = field(default=None, metadata={"help": "TRL W&B run group."})
+    log_completions: bool = field(default=False, metadata={"help": "TRL generated-completion logging toggle."})
+    log_completions_steps: int = field(default=100, metadata={"help": "TRL generated-completion logging interval."})
+    num_completions_to_print: int | None = field(default=None, metadata={"help": "Number of completions to print."})
     dataset_text_field: str | None = field(
         default="text",
         metadata={"help": "Name of the text field used when tokenizing raw text datasets."},
@@ -241,6 +299,30 @@ class DistillationConfig(TrainingArguments):
         if self.completion_only_loss is not None:
             self.assistant_only_loss = bool(self.completion_only_loss)
         self.completion_only_loss = bool(self.assistant_only_loss)
+        if self.teacher_model_revision is not None:
+            raise ValueError("`teacher_model_revision` is not used by EasyDeL trainers; pass an initialized teacher.")
+        if self.lmbda != 0.0:
+            raise ValueError("EasyDeL `DistillationTrainer` is offline-only; set `lmbda=0.0`.")
+        if self.beta is not None and not 0.0 <= float(self.beta) <= 1.0:
+            raise ValueError("`beta` must be within [0, 1] when set.")
+        if self.reverse_kl_top_1_mode != "sampled":
+            raise ValueError("`reverse_kl_top_1_mode` is only meaningful for TRL GJSD distillation.")
+        self.loss_top_k = int(self.loss_top_k)
+        if self.loss_top_k < 0:
+            raise ValueError("`loss_top_k` must be non-negative.")
+        if self.loss_add_tail and self.loss_top_k <= 0:
+            raise ValueError("`loss_add_tail=True` requires `loss_top_k > 0`.")
+        if self.max_prompt_length is not None:
+            raise ValueError("`max_prompt_length` is not used by EasyDeL offline distillation; use `max_length`.")
+        if self.max_completion_length is not None:
+            raise ValueError("`max_completion_length` is not used by EasyDeL offline distillation.")
+        if self.num_generations != 1:
+            raise ValueError("EasyDeL offline distillation requires `num_generations=1`.")
+        if self.generation_batch_size is not None:
+            raise ValueError("`generation_batch_size` is not used by EasyDeL offline distillation.")
+        if self.top_p != 1.0 or self.top_k != 0:
+            raise ValueError("On-policy sampling knobs are not used by EasyDeL offline distillation.")
+        self._validate_logging_fields()
         if self.hidden_state_layers is not None:
             self.hidden_state_layers = tuple(int(i) for i in self.hidden_state_layers)
         if self.attention_layers is not None:
@@ -269,3 +351,10 @@ class DistillationConfig(TrainingArguments):
             )
 
     __hash__ = hash_fn
+
+    def _validate_logging_fields(self) -> None:
+        """Reject TRL logging-only fields that EasyDeL distillation does not use."""
+        if self.log_completions_steps <= 0:
+            raise ValueError("`log_completions_steps` must be positive.")
+        if self.num_completions_to_print is not None and self.num_completions_to_print <= 0:
+            raise ValueError("`num_completions_to_print` must be positive when set.")
