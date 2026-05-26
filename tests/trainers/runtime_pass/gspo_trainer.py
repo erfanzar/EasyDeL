@@ -56,9 +56,9 @@ def main():
         ed.GSPOConfig,
         "gspo",
         overrides={
-            "max_prompt_length": 512,
-            "max_completion_length": 256,
-            "max_length": 768,
+            "max_prompt_length": 64,
+            "max_completion_length": 32,
+            "max_length": 96,
             "num_train_epochs": 1,
             "total_batch_size": 2,
         },
