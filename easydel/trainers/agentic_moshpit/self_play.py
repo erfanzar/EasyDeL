@@ -24,7 +24,7 @@ Three question-generation backends are supported:
   model) with a questioner system prompt. The model is called via
   ``generate_fn`` which is injected by the trainer at rollout time.
 - **OpenAI-compatible API**: Calls any OpenAI-compatible endpoint
-  (OpenAI, Anthropic via proxy, vLLM, etc.) to generate questions
+  (OpenAI, Anthropic-compatible proxies, local OpenAI-compatible servers, etc.) to generate questions
   and optionally verify answers.
 - **Static callable**: Any ``(topic, seed) -> question`` function.
 
@@ -110,7 +110,7 @@ class QuestionGenerator:
         Returns:
             A ``GeneratedQuestion`` with the question text and metadata.
         """
-        raise NotImplementedError
+        raise RuntimeError(f"{type(self).__name__}.generate() must be implemented by the question generator subclass.")
 
     def generate_batch(
         self,
@@ -497,7 +497,7 @@ class LocalQuestionGenerator(QuestionGenerator):
 class OpenAIQuestionGenerator(QuestionGenerator):
     """Generate questions and verify answers via an OpenAI-compatible API.
 
-    Works with OpenAI, Azure OpenAI, vLLM, Ollama, or any endpoint
+    Works with OpenAI, Azure OpenAI, Ollama, or any endpoint
     that implements the ``/v1/chat/completions`` API.
 
     Args:

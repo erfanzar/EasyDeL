@@ -201,5 +201,10 @@ class AgenticMoshPitConfig(GRPOConfig):
             raise ValueError(
                 f"Invalid advantage_estimator: {self.advantage_estimator}. Must be one of {valid_estimators}."
             )
+        if self.reward_mode != "episode" and self.advantage_estimator == "grpo":
+            self.advantage_estimator = {
+                "step": "step_reinforce",
+                "gigpo": "gigpo",
+            }[self.reward_mode]
 
     __hash__ = hash_fn
