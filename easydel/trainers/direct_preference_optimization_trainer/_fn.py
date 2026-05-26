@@ -95,6 +95,22 @@ def _compute_token_logps_chunked(
 _resolve_dpo_lmhead_chunksize = resolve_lmhead_chunksize
 
 
+def _ld_logp_weights(loss_mask: Array, num_examples: int, ld_alpha: float | None) -> Array:
+    """Return per-token LD-DPO weights for concatenated chosen/rejected rows."""
+    if ld_alpha is None:
+        return jnp.ones_like(loss_mask, dtype=jnp.float32)
+
+    completion_pos = jnp.cumsum(loss_mask.astype(jnp.int32), axis=1)
+    completion_lengths = loss_mask.sum(axis=1).astype(jnp.int32)
+    chosen_lengths = completion_lengths[:num_examples]
+    rejected_lengths = completion_lengths[num_examples:]
+    shared_lengths = jnp.minimum(chosen_lengths, rejected_lengths)
+    shared_lengths = jnp.concatenate([shared_lengths, shared_lengths], axis=0)
+    shared_mask = loss_mask & (completion_pos > 0) & (completion_pos <= shared_lengths[:, None])
+    tail_mask = loss_mask & (completion_pos > shared_lengths[:, None])
+    return shared_mask.astype(jnp.float32) + float(ld_alpha) * tail_mask.astype(jnp.float32)
+
+
 def _compute_dpo_outputs_from_hidden_states(
     model: tp.Any,
     hidden_states: Array,
@@ -105,6 +121,8 @@ def _compute_dpo_outputs_from_hidden_states(
     chunk_size: int,
     logprob_vocab_chunk_size: int | None,
     loss_type: LOSS_FN_VARIANTS,
+    use_weighting: bool = False,
+    ld_alpha: float | None = None,
     vocab_shard_stage: int | None = None,
 ) -> dict[str, Array]:
     """Project DPO hidden states through the LM head chunk-by-chunk across the sequence dimension.
@@ -126,9 +144,9 @@ def _compute_dpo_outputs_from_hidden_states(
     rows correspond to *chosen* completions and the remaining rows to
     *rejected* completions (as produced by ``concatenated_inputs``).
 
-    When ``loss_type`` is ``"ipo"``, the accumulated log-probabilities are
-    normalized by the number of loss-bearing tokens per example (as required
-    by the IPO objective).
+    The accumulated log-probabilities are always returned as sequence
+    sums. Losses that need length-normalized scores (IPO, sigmoid_norm)
+    use the returned token counts during loss reduction.
 
     Both the per-chunk projection and the per-chunk contribution helpers are
     wrapped with ``jax.checkpoint`` to trade compute for memory during the
@@ -151,16 +169,18 @@ def _compute_dpo_outputs_from_hidden_states(
         logprob_vocab_chunk_size: Vocabulary-dimension chunk size forwarded to
             :func:`_compute_token_logps_chunked` for the inner log-prob
             computation.
-        loss_type: The DPO loss variant in use (e.g. ``"sigmoid"``,
-            ``"ipo"``).  Only ``"ipo"`` triggers per-example length
-            normalization of the returned log-probabilities.
+        loss_type: The DPO loss variant in use. Retained as a static
+            compatibility knob for existing compiled call sites.
+        use_weighting: Whether to accumulate WPO per-example weights.
+        ld_alpha: Optional length-debiased DPO tail-token weight. When
+            set, log-probs after the shared chosen/rejected completion
+            length are multiplied by this value before summation.
 
     Returns:
         A dictionary with the following keys:
 
         - ``"chosen_logps"`` -- Float array of shape ``(num_examples,)`` with
-          the summed (or length-normalized for IPO) log-probabilities for the
-          chosen completions.
+          the summed log-probabilities for the chosen completions.
         - ``"rejected_logps"`` -- Float array of shape ``(num_examples,)`` for
           the rejected completions.
         - ``"mean_chosen_logits"`` -- Scalar float: the mean logit value
@@ -200,7 +220,8 @@ def _compute_dpo_outputs_from_hidden_states(
         chunk_hidden_states: Array,
         chunk_labels: Array,
         chunk_loss_mask: Array,
-    ) -> tuple[Array, Array, Array, Array, Array]:
+        chunk_logp_weights: Array,
+    ) -> tuple[Array, Array, Array, Array, Array, Array]:
         """Compute per-sequence per-chunk DPO log-prob and logit accumulators.
 
         Args:
@@ -208,11 +229,12 @@ def _compute_dpo_outputs_from_hidden_states(
                 chunk.
             chunk_labels: Label slice with the same sequence range.
             chunk_loss_mask: Boolean loss mask slice.
+            chunk_logp_weights: Per-token multipliers for LD-DPO.
 
         Returns:
-            A 5-tuple with masked log-prob sums, chosen / rejected
-            logit sums, and chosen / rejected token counts for the
-            current chunk.
+            A 6-tuple with masked log-prob sums, WPO log-prob sums,
+            chosen / rejected logit sums, and chosen / rejected token
+            counts for the current chunk.
         """
         chunk_logits = _project_chunk(chunk_hidden_states)
         chunk_logps = _compute_token_logps_chunked(
@@ -220,12 +242,20 @@ def _compute_dpo_outputs_from_hidden_states(
             chunk_labels,
             chunk_size=logprob_vocab_chunk_size,
         )
-        masked_logps = jnp.where(chunk_loss_mask, chunk_logps, 0.0)
+        masked_logps = jnp.where(chunk_loss_mask, chunk_logps * chunk_logp_weights, 0.0)
+        if use_weighting:
+            log_z = jax.nn.logsumexp(chunk_logits, axis=-1)
+            log_z_squared = jax.nn.logsumexp(2.0 * chunk_logits, axis=-1)
+            log_denom = log_z_squared - 2.0 * log_z
+            wpo_logps = jnp.where(chunk_loss_mask, chunk_logps - log_denom, 0.0)
+        else:
+            wpo_logps = jnp.zeros_like(masked_logps)
         chunk_token_logit_sums = chunk_logits.astype(jnp.float32).sum(axis=-1)
         chosen_mask = chunk_loss_mask[:num_examples].astype(jnp.float32)
         rejected_mask = chunk_loss_mask[num_examples:].astype(jnp.float32)
         return (
             masked_logps.sum(axis=-1),
+            wpo_logps.sum(axis=-1),
             jnp.sum(chunk_token_logit_sums[:num_examples] * chosen_mask),
             jnp.sum(chunk_token_logit_sums[num_examples:] * rejected_mask),
             jnp.sum(chosen_mask),
@@ -236,18 +266,19 @@ def _compute_dpo_outputs_from_hidden_states(
 
     zero_logps = jnp.zeros((batch_size,), dtype=jnp.float32)
     zero_scalar = jnp.array(0.0, dtype=jnp.float32)
+    logp_weights = _ld_logp_weights(loss_mask, num_examples, ld_alpha).astype(jnp.float32)
 
     def _accumulate_chunk(
         start: int,
         size: int,
-        carry: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[Array, Array, Array, Array, Array]:
+        carry: tuple[Array, Array, Array, Array, Array, Array],
+    ) -> tuple[Array, Array, Array, Array, Array, Array]:
         """Add the contributions of a sequence-chunk into the running totals.
 
         Args:
             start: Start index along the sequence axis.
             size: Number of tokens in this chunk.
-            carry: Running ``(logp_sums, chosen_logit_sum,
+            carry: Running ``(logp_sums, wpo_logp_sums, chosen_logit_sum,
                 rejected_logit_sum, chosen_count, rejected_count)``.
 
         Returns:
@@ -256,29 +287,32 @@ def _compute_dpo_outputs_from_hidden_states(
         chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, size, axis=1)
         chunk_labels = lax.dynamic_slice_in_dim(labels, start, size, axis=1)
         chunk_loss_mask = lax.dynamic_slice_in_dim(loss_mask, start, size, axis=1)
+        chunk_logp_weights = lax.dynamic_slice_in_dim(logp_weights, start, size, axis=1)
         (
             chunk_logp_sums,
+            chunk_wpo_logp_sums,
             chosen_logit_sum,
             rejected_logit_sum,
             chosen_denom,
             rejected_denom,
-        ) = _chunk_contributions(chunk_hidden_states, chunk_labels, chunk_loss_mask)
+        ) = _chunk_contributions(chunk_hidden_states, chunk_labels, chunk_loss_mask, chunk_logp_weights)
         return (
             carry[0] + chunk_logp_sums,
-            carry[1] + chosen_logit_sum,
-            carry[2] + rejected_logit_sum,
-            carry[3] + chosen_denom,
-            carry[4] + rejected_denom,
+            carry[1] + chunk_wpo_logp_sums,
+            carry[2] + chosen_logit_sum,
+            carry[3] + rejected_logit_sum,
+            carry[4] + chosen_denom,
+            carry[5] + rejected_denom,
         )
 
     num_full_chunks = seq_len // chunk_size
     tail = seq_len - num_full_chunks * chunk_size
-    carry = (zero_logps, zero_scalar, zero_scalar, zero_scalar, zero_scalar)
+    carry = (zero_logps, zero_logps, zero_scalar, zero_scalar, zero_scalar, zero_scalar)
 
     def _full_body(
         i: int,
-        inner_carry: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[Array, Array, Array, Array, Array]:
+        inner_carry: tuple[Array, Array, Array, Array, Array, Array],
+    ) -> tuple[Array, Array, Array, Array, Array, Array]:
         """``fori_loop`` body that processes the ``i``-th full-sized sequence chunk.
 
         Args:
@@ -295,13 +329,16 @@ def _compute_dpo_outputs_from_hidden_states(
     if tail:
         carry = _accumulate_chunk(num_full_chunks * chunk_size, tail, carry)
 
-    all_logps, chosen_logit_sum, rejected_logit_sum, chosen_denom, rejected_denom = carry
-    if loss_type == "ipo":
-        all_logps = all_logps / jnp.maximum(loss_mask.sum(axis=-1), 1)
+    all_logps, all_wpo_logps, chosen_logit_sum, rejected_logit_sum, chosen_denom, rejected_denom = carry
+    lengths = jnp.maximum(loss_mask.sum(axis=-1).astype(jnp.float32), 1.0)
+    wpo_weights = jnp.exp(all_wpo_logps / lengths)
 
     return {
         "chosen_logps": all_logps[:num_examples],
         "rejected_logps": all_logps[num_examples:],
+        "chosen_lengths": lengths[:num_examples],
+        "rejected_lengths": lengths[num_examples:],
+        "wpo_weights": wpo_weights[:num_examples] * wpo_weights[num_examples:],
         "mean_chosen_logits": chosen_logit_sum / jnp.maximum(chosen_denom, 1.0),
         "mean_rejected_logits": rejected_logit_sum / jnp.maximum(rejected_denom, 1.0),
     }
@@ -334,6 +371,161 @@ def _get_reference_logps_from_batch(batch: dict[str, tp.Any]) -> tuple[tp.Any | 
         ref_rejected_logps = batch.get("reference_rejected_log_probs")
 
     return ref_chosen_logps, ref_rejected_logps
+
+
+def _as_loss_type_tuple(loss_type: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Normalize one or more DPO loss names to an immutable tuple."""
+    if isinstance(loss_type, str):
+        return (loss_type,)
+    return tuple(loss_type)
+
+
+def _as_loss_weight_tuple(loss_weights: tuple[float, ...] | list[float] | None, loss_count: int) -> tuple[float, ...]:
+    """Normalize optional per-loss weights and validate their count."""
+    if loss_weights is None:
+        return (1.0,) * loss_count
+    weights = tuple(float(weight) for weight in loss_weights)
+    if len(weights) != loss_count:
+        raise ValueError(
+            "`loss_weights` must have the same length as `loss_type`; "
+            f"got {len(weights)} weights for {loss_count} loss types."
+        )
+    return weights
+
+
+def _compute_f_divergence_scores(
+    chosen_logratios: Array,
+    rejected_logratios: Array,
+    *,
+    f_divergence_type: str,
+    f_alpha_divergence_coef: float,
+) -> tuple[Array, Array]:
+    """Apply the f-DPO score transform to chosen/rejected log ratios."""
+    if f_divergence_type == "reverse_kl":
+        return chosen_logratios, rejected_logratios
+    if f_divergence_type == "forward_kl":
+        return -jnp.exp(-chosen_logratios), -jnp.exp(-rejected_logratios)
+    if f_divergence_type == "js_divergence":
+        return jax.nn.log_sigmoid(chosen_logratios), jax.nn.log_sigmoid(rejected_logratios)
+    if f_divergence_type == "alpha_divergence":
+        if abs(float(f_alpha_divergence_coef) - 1.0) < 1e-6:
+            return chosen_logratios, rejected_logratios
+        coef = 1.0 / (float(f_alpha_divergence_coef) - 1.0)
+        scale = float(f_alpha_divergence_coef) - 1.0
+        chosen_scores = jnp.exp(jnp.minimum(scale * chosen_logratios, 80.0)) * coef
+        rejected_scores = jnp.exp(jnp.minimum(scale * rejected_logratios, 80.0)) * coef
+        return chosen_scores, rejected_scores
+    raise ValueError(f"Unknown f_divergence_type: {f_divergence_type}")
+
+
+def compute_dpo_losses(
+    chosen_logps: Array,
+    rejected_logps: Array,
+    ref_chosen_logps: Array,
+    ref_rejected_logps: Array,
+    *,
+    beta: float,
+    label_smoothing: float,
+    loss_type: str | tuple[str, ...] | list[str],
+    loss_weights: tuple[float, ...] | list[float] | None = None,
+    f_divergence_type: str = "reverse_kl",
+    f_alpha_divergence_coef: float = 0.5,
+    discopop_tau: float = 0.05,
+    chosen_lengths: Array | None = None,
+    rejected_lengths: Array | None = None,
+    wpo_weights: Array | None = None,
+    rpo_alpha: float | None = None,
+) -> Array:
+    """Compute weighted single- or multi-objective DPO losses."""
+    loss_types = _as_loss_type_tuple(loss_type)
+    weights = _as_loss_weight_tuple(loss_weights, len(loss_types))
+    chosen_lengths = jnp.ones_like(chosen_logps) if chosen_lengths is None else jnp.maximum(chosen_lengths, 1.0)
+    rejected_lengths = jnp.ones_like(rejected_logps) if rejected_lengths is None else jnp.maximum(rejected_lengths, 1.0)
+
+    chosen_logratios = chosen_logps - ref_chosen_logps
+    rejected_logratios = rejected_logps - ref_rejected_logps
+    chosen_scores, rejected_scores = _compute_f_divergence_scores(
+        chosen_logratios,
+        rejected_logratios,
+        f_divergence_type=f_divergence_type,
+        f_alpha_divergence_coef=f_alpha_divergence_coef,
+    )
+    delta_score = chosen_scores - rejected_scores
+    losses = jnp.zeros_like(chosen_logps)
+
+    for single_loss_type, loss_weight in zip(loss_types, weights, strict=True):
+        if single_loss_type == "sigmoid":
+            per_sequence_loss = -(
+                jax.nn.log_sigmoid(beta * delta_score) * (1 - label_smoothing)
+                + jax.nn.log_sigmoid(-beta * delta_score) * label_smoothing
+            )
+        elif single_loss_type == "hinge":
+            per_sequence_loss = relu(1 - beta * delta_score)
+        elif single_loss_type == "ipo":
+            ipo_delta = chosen_scores / chosen_lengths - rejected_scores / rejected_lengths
+            per_sequence_loss = (ipo_delta - 1 / (2 * beta)) ** 2
+        elif single_loss_type == "exo_pair":
+            epsilon = jnp.asarray(label_smoothing, dtype=chosen_logps.dtype)
+            per_sequence_loss = sigmoid(beta * delta_score) * (
+                logsigmoid(beta * delta_score) - jnp.log1p(-epsilon)
+            ) + sigmoid(-beta * delta_score) * (logsigmoid(-beta * delta_score) - jnp.log(epsilon))
+        elif single_loss_type == "nca_pair":
+            chosen_rewards = beta * chosen_scores
+            rejected_rewards = beta * rejected_scores
+            per_sequence_loss = -(
+                logsigmoid(chosen_rewards) + 0.5 * logsigmoid(-chosen_rewards) + 0.5 * logsigmoid(-rejected_rewards)
+            )
+        elif single_loss_type == "robust":
+            clean_loss_term = -(1 - label_smoothing) * logsigmoid(beta * delta_score)
+            flipped_loss_term = -label_smoothing * logsigmoid(-beta * delta_score)
+            per_sequence_loss = (clean_loss_term - flipped_loss_term) / (1 - 2 * label_smoothing)
+        elif single_loss_type == "bco_pair":
+            chosen_rewards = beta * chosen_scores
+            rejected_rewards = beta * rejected_scores
+            per_sequence_loss = -logsigmoid(chosen_rewards) - logsigmoid(-rejected_rewards)
+        elif single_loss_type == "sppo_hard":
+            per_sequence_loss = (chosen_scores - 0.5 / beta) ** 2 + (rejected_scores + 0.5 / beta) ** 2
+        elif single_loss_type == "aot":
+            logratios_sorted = jnp.sort(chosen_logps - rejected_logps, axis=0)
+            ref_logratios_sorted = jnp.sort(ref_chosen_logps - ref_rejected_logps, axis=0)
+            delta = logratios_sorted - ref_logratios_sorted
+            per_sequence_loss = (
+                -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
+            )
+        elif single_loss_type in {"aot_pair", "aot_unpaired"}:
+            chosen_logratios_sorted = jnp.sort(chosen_logratios, axis=0)
+            rejected_logratios_sorted = jnp.sort(rejected_logratios, axis=0)
+            delta = chosen_logratios_sorted - rejected_logratios_sorted
+            per_sequence_loss = (
+                -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
+            )
+        elif single_loss_type == "apo_zero":
+            per_sequence_loss = 1 - sigmoid(beta * chosen_logratios) + sigmoid(beta * rejected_logratios)
+        elif single_loss_type == "apo_down":
+            per_sequence_loss = sigmoid(beta * chosen_logratios) + (1 - sigmoid(beta * delta_score))
+        elif single_loss_type == "discopop":
+            logits = beta * delta_score
+            log_ratio_modulation = sigmoid(logits / discopop_tau)
+            per_sequence_loss = (
+                -logsigmoid(logits) * (1 - log_ratio_modulation) + jnp.exp(-logits) * log_ratio_modulation
+            )
+        elif single_loss_type == "sft":
+            sft_loss = -jnp.sum(chosen_logps) / jnp.maximum(jnp.sum(chosen_lengths), 1.0)
+            per_sequence_loss = jnp.broadcast_to(sft_loss, chosen_logps.shape)
+        elif single_loss_type == "sigmoid_norm":
+            delta = chosen_scores / chosen_lengths - rejected_scores / rejected_lengths
+            per_sequence_loss = -logsigmoid(beta * delta)
+        else:
+            raise ValueError(f"given loss_type({single_loss_type}) is not valid")
+
+        if wpo_weights is not None:
+            per_sequence_loss = per_sequence_loss * jax.lax.stop_gradient(wpo_weights)
+        losses = losses + per_sequence_loss * float(loss_weight)
+
+    if rpo_alpha is not None and rpo_alpha > 0.0:
+        losses = losses + float(rpo_alpha) * (-chosen_logps / chosen_lengths)
+
+    return losses
 
 
 def concatenated_inputs(
@@ -490,6 +682,51 @@ def get_loss_function(
         ValueError: If ``loss_type`` is not one of the registered
             variants.
     """
+
+    def _combined_loss(
+        chosen_logps: Array,
+        rejected_logps: Array,
+        ref_chosen_logps: Array,
+        ref_rejected_logps: Array,
+        beta: float,
+        label_smoothing: float,
+        **kwargs,
+    ) -> Array:
+        """Compute the configured DPO-family objective through the shared path."""
+        return compute_dpo_losses(
+            chosen_logps,
+            rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+            beta=beta,
+            label_smoothing=label_smoothing,
+            loss_type=loss_type,
+            discopop_tau=kwargs.get("discopop_tau", 0.05),
+            chosen_lengths=kwargs.get("chosen_lengths"),
+            rejected_lengths=kwargs.get("rejected_lengths"),
+            wpo_weights=kwargs.get("wpo_weights"),
+            rpo_alpha=kwargs.get("rpo_alpha"),
+        )
+
+    if loss_type in {
+        "sigmoid",
+        "hinge",
+        "ipo",
+        "exo_pair",
+        "nca_pair",
+        "robust",
+        "bco_pair",
+        "sppo_hard",
+        "aot",
+        "aot_pair",
+        "aot_unpaired",
+        "apo_zero",
+        "apo_down",
+        "discopop",
+        "sft",
+        "sigmoid_norm",
+    }:
+        return _combined_loss
 
     def _base_dpo_loss(
         chosen_logps: Array,
@@ -771,13 +1008,11 @@ def get_loss_function(
         Returns:
             ``[batch]`` per-example loss tensor.
         """
-        import math
-
         logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
         label_smoothing = jnp.maximum(label_smoothing, 1e-3)
-        return sigmoid(beta * logits) * (logsigmoid(beta * logits) - math.log(1 - label_smoothing)) + sigmoid(
+        return sigmoid(beta * logits) * (logsigmoid(beta * logits) - jnp.log1p(-label_smoothing)) + sigmoid(
             -beta * logits
-        ) * (logsigmoid(-beta * logits) - math.log(label_smoothing))
+        ) * (logsigmoid(-beta * logits) - jnp.log(label_smoothing))
 
     def _bco_pair_dpo_loss(
         chosen_logps: Array,
@@ -789,12 +1024,10 @@ def get_loss_function(
     ) -> Array:
         """Compute the Binary Classifier Optimization (BCO) pair loss.
 
-        Trains an implicit reward classifier whose decision boundary is
-        the in-batch mean reward ``delta``. Each chosen example is
-        pushed above ``delta`` and each rejected example below it via
-        ``-logsigmoid(beta * r_w - delta) - logsigmoid(-(beta * r_l - delta))``
-        where ``r_* = logp_* - logp_ref_*``. ``delta`` is recomputed
-        per-batch from the concatenation of chosen/rejected rewards.
+        Trains an implicit reward classifier by pushing each chosen
+        reward positive and each rejected reward negative via
+        ``-logsigmoid(beta * r_w) - logsigmoid(-beta * r_l)`` where
+        ``r_* = logp_* - logp_ref_*``.
 
         Returns:
             ``[batch]`` per-example loss tensor.
@@ -803,8 +1036,7 @@ def get_loss_function(
         rejected_logratios = rejected_logps - ref_rejected_logps
         chosen_rewards = beta * chosen_logratios
         rejected_rewards = beta * rejected_logratios
-        delta = jnp.mean(jnp.concatenate([chosen_rewards, rejected_rewards]))
-        return -logsigmoid((beta * chosen_logratios) - delta) - logsigmoid(-(beta * rejected_logratios - delta))
+        return -logsigmoid(chosen_rewards) - logsigmoid(-rejected_rewards)
 
     def _sppo_hard_dpo_loss(
         chosen_logps: Array,
@@ -969,6 +1201,8 @@ def concatenated_forward(
     loss_type: str = "sigmoid",
     logprob_vocab_chunk_size: int | None = None,
     vocab_shard_stage: int | None = None,
+    use_weighting: bool = False,
+    ld_alpha: float | None = None,
 ) -> dict[str, Array]:
     """Run the model on concatenated chosen/rejected inputs and produce DPO log-probs.
 
@@ -1016,6 +1250,8 @@ def concatenated_forward(
             disables chunking.
         vocab_shard_stage: Optional MPMD pipeline stage rank used when
             sharding the LM head; forwarded to ``make_lm_head_fn``.
+        use_weighting: Whether to compute WPO example weights.
+        ld_alpha: Optional length-debiased DPO tail-token weight.
 
     Returns:
         Dictionary with:
@@ -1124,6 +1360,8 @@ def concatenated_forward(
             chunk_size=lmhead_chunksize,
             logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             loss_type=loss_type,
+            use_weighting=use_weighting,
+            ld_alpha=ld_alpha,
             vocab_shard_stage=vocab_shard_stage,
         )
     else:
@@ -1134,19 +1372,23 @@ def concatenated_forward(
             labels,
             chunk_size=logprob_vocab_chunk_size,
         )
-        per_token_logps = jnp.roll(
-            jnp.where(loss_mask, gathered_logps, 0.0),
-            shift=1,
-            axis=1,
-        )
+        logp_weights = _ld_logp_weights(loss_mask, num_examples, ld_alpha).astype(gathered_logps.dtype)
+        per_token_logps = jnp.where(loss_mask, gathered_logps * logp_weights, 0.0)
         all_logps = per_token_logps.sum(-1)
 
-        # Special handling for "ipo" loss type.
-        if loss_type == "ipo":
-            all_logps = all_logps / loss_mask.sum(-1)
+        lengths = jnp.maximum(loss_mask.sum(-1).astype(jnp.float32), 1.0)
         output = {}
         output["chosen_logps"] = all_logps[:num_examples]
         output["rejected_logps"] = all_logps[num_examples:]
+        output["chosen_lengths"] = lengths[:num_examples]
+        output["rejected_lengths"] = lengths[num_examples:]
+        if use_weighting:
+            log_z = jax.nn.logsumexp(logits, axis=-1)
+            log_z_squared = jax.nn.logsumexp(2.0 * logits, axis=-1)
+            log_denom = log_z_squared - 2.0 * log_z
+            aligned_logps = jnp.where(loss_mask, gathered_logps - log_denom, 0.0)
+            weights = jnp.exp(aligned_logps.sum(axis=-1) / lengths)
+            output["wpo_weights"] = weights[:num_examples] * weights[num_examples:]
 
         chosen_token_logit_sums = logits[:num_examples].sum(axis=-1)
         rejected_token_logit_sums = logits[num_examples:].sum(axis=-1)
@@ -1170,7 +1412,14 @@ def training_step(
     concatenated_forward: tp.Callable,
     beta: float = 0.1,
     label_smoothing: float = 0,
-    loss_type: LOSS_FN_VARIANTS = "sigmoid",
+    loss_type: LOSS_FN_VARIANTS | tuple[str, ...] = "sigmoid",
+    loss_weights: tuple[float, ...] | None = None,
+    f_divergence_type: str = "reverse_kl",
+    f_alpha_divergence_coef: float = 0.5,
+    use_weighting: bool = False,
+    discopop_tau: float = 0.05,
+    ld_alpha: float | None = None,
+    rpo_alpha: float | None = None,
     reference_free: bool = False,
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
@@ -1241,13 +1490,6 @@ def training_step(
         )
 
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
-    with jax.named_scope(scope_root + "/resolve_loss_function"):
-        _loss_func = get_loss_function(
-            loss_type=loss_type,
-            beta=beta,
-            label_smoothing=label_smoothing,
-        )
-
     if not reference_free:
         with jax.named_scope(scope_root + "/reference_forward"):
             # Pre-compute reference logps outside jax.value_and_grad to avoid
@@ -1256,7 +1498,7 @@ def training_step(
             ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
             if ref_chosen_logps is None or ref_rejected_logps is None:
                 rfm = reference_state.model
-                ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
+                ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch, ld_alpha=ld_alpha))
                 ref_chosen_logps = ref_out["chosen_logps"]
                 ref_rejected_logps = ref_out["rejected_logps"]
 
@@ -1307,7 +1549,7 @@ def training_step(
                 module = state.merge(tree=tree)
 
             with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
-                model_output = concatenated_forward(module, call_batch)
+                model_output = concatenated_forward(module, call_batch, ld_alpha=ld_alpha)
 
             chosen_logps = model_output["chosen_logps"]
             rejected_logps = model_output["rejected_logps"]
@@ -1319,13 +1561,22 @@ def training_step(
                     ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
                     ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
             with jax.named_scope(scope_root + "/loss_fn/compute_dpo_loss"):
-                losses = _loss_func(
+                losses = compute_dpo_losses(
                     chosen_logps,
                     rejected_logps,
                     ref_chosen_logps,
                     ref_rejected_logps,
-                    beta,
-                    label_smoothing,
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    loss_weights=loss_weights,
+                    f_divergence_type=f_divergence_type,
+                    f_alpha_divergence_coef=f_alpha_divergence_coef,
+                    discopop_tau=discopop_tau,
+                    chosen_lengths=model_output.get("chosen_lengths"),
+                    rejected_lengths=model_output.get("rejected_lengths"),
+                    wpo_weights=model_output.get("wpo_weights") if use_weighting else None,
+                    rpo_alpha=rpo_alpha,
                 )
 
             with jax.named_scope(scope_root + "/loss_fn/rewards_and_metrics"):
@@ -1393,6 +1644,7 @@ def _prepare_dpo_scheduled_batch(call) -> dict[str, tp.Any]:
             "chosen_logps": "ref_chosen_logps",
             "rejected_logps": "ref_rejected_logps",
         },
+        forward_kwargs={"ld_alpha": call.get("ld_alpha")} if call.get("ld_alpha") is not None else None,
         skip_field="reference_free",
         missing_error="DPO scheduled MPMD training requires reference_state and concatenated_forward.",
     )
@@ -1412,7 +1664,20 @@ def _dpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     """
     return scheduled_loss_cache_key(
         call,
-        value_fields=("beta", "label_smoothing", "loss_type", "reference_free", "partition_spec"),
+        value_fields=(
+            "beta",
+            "label_smoothing",
+            "loss_type",
+            "loss_weights",
+            "f_divergence_type",
+            "f_alpha_divergence_coef",
+            "use_weighting",
+            "discopop_tau",
+            "ld_alpha",
+            "rpo_alpha",
+            "reference_free",
+            "partition_spec",
+        ),
         object_fields=("concatenated_forward", "straight_through_emulator"),
     )
 
@@ -1432,13 +1697,15 @@ def _make_dpo_scheduled_loss(call):
     beta = call.get("beta", 0.1)
     label_smoothing = call.get("label_smoothing", 0)
     loss_type = call.get("loss_type", "sigmoid")
+    loss_weights = call.get("loss_weights")
+    f_divergence_type = call.get("f_divergence_type", "reverse_kl")
+    f_alpha_divergence_coef = call.get("f_alpha_divergence_coef", 0.5)
+    use_weighting = bool(call.get("use_weighting", False))
+    discopop_tau = call.get("discopop_tau", 0.05)
+    ld_alpha = call.get("ld_alpha")
+    rpo_alpha = call.get("rpo_alpha")
     reference_free = bool(call.get("reference_free", False))
     partition_spec = call.get("partition_spec")
-    loss_func = get_loss_function(
-        loss_type=loss_type,
-        beta=beta,
-        label_smoothing=label_smoothing,
-    )
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the scalar DPO loss inside the SpectraX scheduled VJP.
@@ -1461,7 +1728,9 @@ def _make_dpo_scheduled_loss(call):
                 batch = constrain_scheduled_batch(module, batch, partition_spec)
                 _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
             with jax.named_scope("easydel/trainer/dpo/scheduled_loss/policy_forward"):
-                model_output = concatenated_forward_fn(module, batch, vocab_shard_stage=_terminal_rank)
+                model_output = concatenated_forward_fn(
+                    module, batch, vocab_shard_stage=_terminal_rank, ld_alpha=ld_alpha
+                )
 
             chosen_logps = model_output["chosen_logps"]
             rejected_logps = model_output["rejected_logps"]
@@ -1479,13 +1748,22 @@ def _make_dpo_scheduled_loss(call):
                     ref_rejected_logps = jax.lax.stop_gradient(ref_rejected_logps)
 
             with jax.named_scope("easydel/trainer/dpo/scheduled_loss/compute_dpo_loss"):
-                losses = loss_func(
+                losses = compute_dpo_losses(
                     chosen_logps,
                     rejected_logps,
                     ref_chosen_logps,
                     ref_rejected_logps,
-                    beta,
-                    label_smoothing,
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    loss_weights=loss_weights,
+                    f_divergence_type=f_divergence_type,
+                    f_alpha_divergence_coef=f_alpha_divergence_coef,
+                    discopop_tau=discopop_tau,
+                    chosen_lengths=model_output.get("chosen_lengths"),
+                    rejected_lengths=model_output.get("rejected_lengths"),
+                    wpo_weights=model_output.get("wpo_weights") if use_weighting else None,
+                    rpo_alpha=rpo_alpha,
                 )
                 if "aux_loss" in model_output:
                     losses += model_output["aux_loss"]
@@ -1512,7 +1790,14 @@ def evaluation_step(
     concatenated_forward: tp.Callable,
     beta: float = 0.1,
     label_smoothing: float = 0,
-    loss_type: LOSS_FN_VARIANTS = "sigmoid",
+    loss_type: LOSS_FN_VARIANTS | tuple[str, ...] = "sigmoid",
+    loss_weights: tuple[float, ...] | None = None,
+    f_divergence_type: str = "reverse_kl",
+    f_alpha_divergence_coef: float = 0.5,
+    use_weighting: bool = False,
+    discopop_tau: float = 0.05,
+    ld_alpha: float | None = None,
+    rpo_alpha: float | None = None,
     reference_free: bool = False,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
@@ -1554,12 +1839,6 @@ def evaluation_step(
         )
 
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
-    with jax.named_scope(eval_scope + "/resolve_loss_function"):
-        _loss_func = get_loss_function(
-            loss_type=loss_type,
-            beta=beta,
-            label_smoothing=label_smoothing,
-        )
 
     def calculate_loss(tree: spx.State):
         """Compute DPO eval metrics on the captured ``batch``.
@@ -1581,7 +1860,7 @@ def evaluation_step(
         """
         with jax.named_scope(eval_scope + "/loss_fn"):
             with jax.named_scope(eval_scope + "/loss_fn/policy_forward"):
-                model_output = concatenated_forward(state.merge(tree), batch)
+                model_output = concatenated_forward(state.merge(tree), batch, ld_alpha=ld_alpha)
             chosen_logps = model_output["chosen_logps"]
             rejected_logps = model_output["rejected_logps"]
 
@@ -1593,20 +1872,29 @@ def evaluation_step(
                     ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
                     if ref_chosen_logps is None or ref_rejected_logps is None:
                         ref_model = state.model if reference_state is None else reference_state.model
-                        ref_output = concatenated_forward(ref_model, batch)
+                        ref_output = concatenated_forward(ref_model, batch, ld_alpha=ld_alpha)
                         ref_chosen_logps = ref_output["chosen_logps"]
                         ref_rejected_logps = ref_output["rejected_logps"]
                     ref_chosen_for_loss = ref_chosen_logps
                     ref_rejected_for_loss = ref_rejected_logps
 
             with jax.named_scope(eval_scope + "/loss_fn/compute_dpo_loss"):
-                losses = _loss_func(
+                losses = compute_dpo_losses(
                     chosen_logps,
                     rejected_logps,
                     ref_chosen_for_loss,
                     ref_rejected_for_loss,
-                    beta,
-                    label_smoothing,
+                    beta=beta,
+                    label_smoothing=label_smoothing,
+                    loss_type=loss_type,
+                    loss_weights=loss_weights,
+                    f_divergence_type=f_divergence_type,
+                    f_alpha_divergence_coef=f_alpha_divergence_coef,
+                    discopop_tau=discopop_tau,
+                    chosen_lengths=model_output.get("chosen_lengths"),
+                    rejected_lengths=model_output.get("rejected_lengths"),
+                    wpo_weights=model_output.get("wpo_weights") if use_weighting else None,
+                    rpo_alpha=rpo_alpha,
                 )
 
             with jax.named_scope(eval_scope + "/loss_fn/rewards_and_metrics"):

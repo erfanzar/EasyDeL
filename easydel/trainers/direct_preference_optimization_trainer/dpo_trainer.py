@@ -27,6 +27,7 @@ import typing as tp
 from collections import defaultdict
 from functools import partial
 
+import jax
 import numpy as np
 from eformer.loggings import get_logger
 from tqdm.autonotebook import tqdm
@@ -39,6 +40,7 @@ from easydel.utils import Registry
 from easydel.utils.traversals import deepcopy_model
 
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import DPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
@@ -144,6 +146,8 @@ class DPOTrainer(Trainer):
         self.is_encoder_decoder = arguments.is_encoder_decoder
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
+        self._apply_pad_token_override(processing_class, arguments.pad_token)
+        self.padding_free = self._resolve_padding_free(arguments)
 
         # Determine padding value
         if arguments.padding_value is not None:
@@ -170,6 +174,7 @@ class DPOTrainer(Trainer):
                 pad_token_id=self.padding_value,
                 label_pad_token_id=arguments.label_pad_token_id,
                 is_encoder_decoder=arguments.is_encoder_decoder,
+                pad_to_multiple_of=arguments.pad_to_multiple_of,
             )
             if data_collator is None
             else data_collator
@@ -181,6 +186,7 @@ class DPOTrainer(Trainer):
                 pad_token_id=self.padding_value,
                 label_pad_token_id=arguments.label_pad_token_id,
                 is_encoder_decoder=arguments.is_encoder_decoder,
+                pad_to_multiple_of=arguments.pad_to_multiple_of,
             )
             if data_collator is None
             else data_collator
@@ -188,7 +194,9 @@ class DPOTrainer(Trainer):
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
-        # Setup models
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        reference_model = self._resolve_reference_model(reference_model)
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
         if reference_model is None:
@@ -197,6 +205,9 @@ class DPOTrainer(Trainer):
             reference_model = reference_model.to_state(trainable_selector=arguments.trainable_selector)
 
         self.reference_state: EasyDeLState | None = reference_model
+        if arguments.disable_dropout:
+            model, reference_model = self._disable_state_dropout(model, reference_model)
+            self.reference_state = reference_model
 
         super().__init__(
             model_state=model,
@@ -206,6 +217,44 @@ class DPOTrainer(Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+
+    @staticmethod
+    def _resolve_reference_model(
+        reference_model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState | None:
+        """Reject accidental string references."""
+        if isinstance(reference_model, str):
+            reject_string_model_id(reference_model, role="reference model")
+        return reference_model
+
+    def _effective_reference_free(self) -> bool:
+        """Apply `force_use_ref_model` to the reference-free loss switch."""
+        return bool(self.arguments.reference_free and not self.arguments.force_use_ref_model)
+
+    @staticmethod
+    def _apply_pad_token_override(processing_class: object, pad_token: str | None) -> None:
+        """Apply a configured pad token to a tokenizer or processor wrapper."""
+        if pad_token is None:
+            return
+        tokenizer = getattr(processing_class, "tokenizer", processing_class)
+        tokenizer.pad_token = pad_token
+
+    @staticmethod
+    def _resolve_padding_free(arguments: DPOConfig) -> bool:
+        """Resolve DPO padding-free mode, matching TRL's temporary fallback."""
+        if not arguments.padding_free:
+            return False
+        logger.warning(
+            "`padding_free=True` is temporarily unavailable for DPO and is being disabled. "
+            "Falling back to standard padded preference batches."
+        )
+        arguments.padding_free = False
+        return False
+
+    @staticmethod
+    def _disable_state_dropout(*states: EasyDeLState | None) -> tuple[EasyDeLState | None, ...]:
+        """Put EasyDeL state modules into eval mode when requested."""
+        return tuple(disable_state_dropout(state) for state in states)
 
     def _get_preprocess_transform(self) -> DPOPreprocessTransform | None:
         """Get DPO preprocessing transform for ShardedDataSource.
@@ -347,6 +396,8 @@ class DPOTrainer(Trainer):
             aux_loss_enabled=self.arguments.aux_loss_enabled,
             loss_type=self.arguments.loss_type,
             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            use_weighting=self.arguments.use_weighting,
+            ld_alpha=self.arguments.ld_alpha,
         )
 
         jited_concatenated_forward = compile_trainer_auxiliary(
@@ -361,8 +412,10 @@ class DPOTrainer(Trainer):
                 "truncation_mode",
                 "aux_loss_enabled",
                 "loss_type",
+                "use_weighting",
             ),
         )
+        effective_reference_free = self._effective_reference_free()
 
         self._train_shared_fn_static_args = (
             self.scheduler,
@@ -370,14 +423,21 @@ class DPOTrainer(Trainer):
             self.arguments.beta,
             self.arguments.label_smoothing,
             self.arguments.loss_type,
-            self.arguments.reference_free,
+            self.arguments.loss_weights,
+            self.arguments.f_divergence_type,
+            self.arguments.f_alpha_divergence_coef,
+            self.arguments.use_weighting,
+            self.arguments.discopop_tau,
+            self.arguments.ld_alpha,
+            self.arguments.rpo_alpha,
+            effective_reference_free,
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             straight_through_emulator,
         )
 
-        sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+        sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             training_step,
@@ -399,11 +459,18 @@ class DPOTrainer(Trainer):
             self.arguments.beta,
             self.arguments.label_smoothing,
             self.arguments.loss_type,
-            self.arguments.reference_free,
+            self.arguments.loss_weights,
+            self.arguments.f_divergence_type,
+            self.arguments.f_alpha_divergence_coef,
+            self.arguments.use_weighting,
+            self.arguments.discopop_tau,
+            self.arguments.ld_alpha,
+            self.arguments.rpo_alpha,
+            effective_reference_free,
             self.arguments.step_partition_spec,
         )
 
-        sharded_evaluation_static_argnums = (3, 4, 5, 6, 7)
+        sharded_evaluation_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
@@ -499,7 +566,7 @@ class DPOTrainer(Trainer):
                 self._precomputed_train_ref_log_probs = self._precompute_reference_log_probs_for_split(
                     dataset_attr="dataset_train",
                     source_attr="_train_source",
-                    batch_size=self.training_batch_size,
+                    batch_size=self.arguments.precompute_ref_batch_size or self.training_batch_size,
                     is_train=True,
                     desc="Train dataset reference log probs",
                 )
@@ -511,7 +578,7 @@ class DPOTrainer(Trainer):
                 self._precomputed_eval_ref_log_probs = self._precompute_reference_log_probs_for_split(
                     dataset_attr="dataset_eval",
                     source_attr="_eval_source",
-                    batch_size=self.evaluation_batch_size,
+                    batch_size=self.arguments.precompute_ref_batch_size or self.evaluation_batch_size,
                     is_train=False,
                     desc="Eval dataset reference log probs",
                 )
@@ -631,6 +698,7 @@ class DPOTrainer(Trainer):
                 aux_loss_enabled=self.arguments.aux_loss_enabled,
                 loss_type=self.arguments.loss_type,
                 logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                use_weighting=self.arguments.use_weighting,
             )
         else:
             outs = forward_fn(reference_model, batch=padded_batch)
@@ -656,9 +724,9 @@ class DPOTrainer(Trainer):
 
         When ``arguments.sync_ref_model`` is enabled and ``step`` is a
         multiple of ``arguments.ref_model_sync_steps``, the reference
-        state's ``graphstate`` is replaced by a deep-copied snapshot of
-        the current policy ``graphstate``. This implements the periodic
-        target-network style sync used by some DPO variants.
+        state's ``graphstate`` is mixed toward the current policy using
+        ``arguments.ref_model_mixup_alpha``. This implements the
+        TR-DPO-style reference moving average used by TRL.
 
         Args:
             state: Current policy state after the step's optimizer update.
@@ -674,5 +742,11 @@ class DPOTrainer(Trainer):
             and self.reference_state is not None
             and (step % self.arguments.ref_model_sync_steps == 0)
         ):
-            self.reference_state = self.reference_state.replace(graphstate=deepcopy_model(state.graphstate))
+            alpha = self.arguments.ref_model_mixup_alpha
+            new_graphstate = jax.tree_util.tree_map(
+                lambda new, old: alpha * new + (1 - alpha) * old,
+                deepcopy_model(state.graphstate),
+                self.reference_state.graphstate,
+            )
+            self.reference_state = self.reference_state.replace(graphstate=new_graphstate)
         return state, metrics

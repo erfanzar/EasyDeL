@@ -68,6 +68,25 @@ def test_tfds_preference_collator_extracts_completion_tokens():
     assert batch["rejected_attention_mask"].tolist() == [[1, 0, 0]]
 
 
+def test_tfds_preference_collator_pads_to_multiple():
+    collator = DataCollatorForPreferenceTFDS(
+        max_prompt_length=3,
+        max_completion_length=3,
+        pad_token_id=0,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=4,
+    )
+
+    batch = collator([_full_sequence_feature()])
+
+    assert batch["prompt_input_ids"].shape == (1, 4)
+    assert batch["chosen_input_ids"].shape == (1, 4)
+    assert batch["rejected_input_ids"].shape == (1, 4)
+    assert batch["prompt_attention_mask"].tolist() == [[0, 0, 1, 1]]
+    assert batch["chosen_attention_mask"].tolist() == [[1, 1, 0, 0]]
+    assert batch["rejected_attention_mask"].tolist() == [[1, 0, 0, 0]]
+
+
 def test_grain_preference_collator_extracts_completion_tokens():
     collator = DataCollatorForPreferenceGrain(
         max_prompt_length=2,
@@ -84,6 +103,25 @@ def test_grain_preference_collator_extracts_completion_tokens():
     assert batch["chosen_attention_mask"].tolist() == [1, 1, 0]
     assert batch["rejected_input_ids"].tolist() == [31, 0, 0]
     assert batch["rejected_attention_mask"].tolist() == [1, 0, 0]
+
+
+def test_grain_preference_collator_pads_to_multiple():
+    collator = DataCollatorForPreferenceGrain(
+        max_prompt_length=3,
+        max_completion_length=3,
+        pad_token_id=0,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=4,
+    )
+
+    batch = collator(_full_sequence_feature())
+
+    assert batch["prompt_input_ids"].shape == (4,)
+    assert batch["chosen_input_ids"].shape == (4,)
+    assert batch["rejected_input_ids"].shape == (4,)
+    assert batch["prompt_attention_mask"].tolist() == [0, 0, 1, 1]
+    assert batch["chosen_attention_mask"].tolist() == [1, 1, 0, 0]
+    assert batch["rejected_attention_mask"].tolist() == [1, 0, 0, 0]
 
 
 def test_tfds_preference_collator_preserves_tools():
