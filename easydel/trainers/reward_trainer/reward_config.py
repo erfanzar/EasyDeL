@@ -19,6 +19,7 @@ reward-centring penalty (so the predicted scalar score has zero mean),
 dropout disabling, and the dataset preprocessing worker count.
 """
 
+import warnings
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
@@ -81,12 +82,33 @@ class RewardConfig(TrainingArguments):
         default="Reward",
         metadata={"help": "default prefix name for trainer."},
     )
+    learning_rate: float = field(
+        default=1e-4,
+        metadata={"help": "The initial learning rate for reward-model training."},
+    )
+    chat_template_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional local Jinja template path or tokenizer source whose chat template "
+                "should be copied onto the processing class."
+            )
+        },
+    )
     max_length: int | None = field(
         default=1024,
         metadata={
             "help": "Maximum length of the sequences (prompt + completion) in the batch, "
             "filters out entries that exceed the limit."
         },
+    )
+    eos_token: str | None = field(
+        default=None,
+        metadata={"help": "Optional EOS token override applied to the processing class."},
+    )
+    pad_to_multiple_of: int | None = field(
+        default=None,
+        metadata={"help": "If set, reward sequences are padded to a multiple of this value."},
     )
     disable_dropout: bool = field(
         default=True,
@@ -100,6 +122,10 @@ class RewardConfig(TrainingArguments):
         default=0.1,
         metadata={"help": "Coefficient to incentivize the reward model to output mean-zero rewards."},
     )
+    activation_offloading: bool = field(
+        default=False,
+        metadata={"help": "TRL compatibility field. EasyDeL RewardTrainer does not support activation offloading."},
+    )
     remove_unused_columns: bool = field(
         default=False,
         metadata={
@@ -107,5 +133,33 @@ class RewardConfig(TrainingArguments):
             "only if the dataset is pretokenized."
         },
     )
+    pad_token: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Deprecated tokenizer pad-token override. Prefer setting the processing class "
+                "before constructing the trainer."
+            )
+        },
+    )
+
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
+        if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:
+            raise ValueError("`pad_to_multiple_of` must be a positive integer when set.")
+        if self.pad_token is not None:
+            warnings.warn(
+                "`pad_token` is deprecated. Set `processing_class.pad_token` before constructing RewardTrainer.",
+                FutureWarning,
+                stacklevel=3,
+            )
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__(
+                max_sequence_length=max_sequence_length,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

@@ -25,10 +25,12 @@ etc.).
 from __future__ import annotations
 
 import typing as tp
+from pathlib import Path
 
 import jax
 from eformer.loggings import get_logger
 from jax.sharding import PartitionSpec
+from transformers import AutoTokenizer
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -36,6 +38,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.trainer_protocol import TrainerConfigureFunctionOutput
 from easydel.utils import Registry
 
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import RewardPreprocessTransform
 from ..trainer import Trainer
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
@@ -122,8 +125,14 @@ class RewardTrainer(Trainer):
         if processing_class is None:
             raise ValueError("processing_class must be specified.")
 
-        if getattr(processing_class, "pad_token", None) is None:
-            processing_class.pad_token = processing_class.eos_token
+        tokenizer = processing_class
+        if hasattr(processing_class, "tokenizer"):
+            tokenizer = processing_class.tokenizer
+        self._apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
+        if arguments.chat_template_path is not None:
+            self._apply_chat_template_path(tokenizer, arguments.chat_template_path)
+        if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
+            tokenizer.pad_token = tokenizer.eos_token
 
         self.arguments = arguments
 
@@ -133,18 +142,24 @@ class RewardTrainer(Trainer):
                 processing_class,
                 max_length=arguments.max_length,
                 truncation_mode=arguments.truncation_mode,
+                pad_to_multiple_of=arguments.pad_to_multiple_of,
             )
             self.input_data_collator_grain = RewardDataCollatorWithPaddingGrain(
                 processing_class,
                 max_length=arguments.max_length,
                 truncation_mode=arguments.truncation_mode,
+                pad_to_multiple_of=arguments.pad_to_multiple_of,
             )
         else:
             self.input_data_collator_tfds = data_collator
             self.input_data_collator_grain = data_collator
 
+        if isinstance(model, str):
+            reject_string_model_id(model, role="reward model")
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
+        if arguments.disable_dropout:
+            model = disable_state_dropout(model)
 
         super().__init__(
             arguments=arguments,
@@ -154,6 +169,33 @@ class RewardTrainer(Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+
+    @staticmethod
+    def _apply_tokenizer_overrides(tokenizer: object, *, eos_token: str | None, pad_token: str | None) -> None:
+        """Apply configured tokenizer token overrides in-place."""
+        if eos_token is not None:
+            tokenizer.eos_token = eos_token
+        if pad_token is not None:
+            tokenizer.pad_token = pad_token
+
+    @staticmethod
+    def _apply_chat_template_path(tokenizer: object, chat_template_path: str) -> None:
+        """Assign a chat template from a local file or tokenizer source."""
+        path = Path(chat_template_path)
+        if path.is_file():
+            tokenizer.chat_template = path.read_text(encoding="utf-8")
+            return
+
+        template_tokenizer = AutoTokenizer.from_pretrained(chat_template_path)
+        chat_template = template_tokenizer.chat_template
+        if chat_template is None:
+            raise ValueError(f"No chat_template found at {chat_template_path!r}.")
+        tokenizer.chat_template = chat_template
+
+    @staticmethod
+    def _disable_state_dropout(*states: EasyDeLState | None) -> tuple[EasyDeLState | None, ...]:
+        """Put reward state modules into eval mode when requested."""
+        return tuple(disable_state_dropout(state) for state in states)
 
     def _get_preprocess_transform(self) -> RewardPreprocessTransform | None:
         """Build the lazy preference-pair preprocessing transform.
@@ -180,6 +222,7 @@ class RewardTrainer(Trainer):
         return RewardPreprocessTransform(
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
+            pad_to_multiple_of=self.arguments.pad_to_multiple_of,
         )
 
     def _is_pretokenized(self) -> bool:

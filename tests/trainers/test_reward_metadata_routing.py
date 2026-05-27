@@ -124,6 +124,12 @@ class _EchoTool(Tool):
         return f"echo:{value}"
 
 
+class _LoopTokenizer(_TokenizerStub):
+    def encode(self, text, add_special_tokens=False):
+        del text, add_special_tokens
+        return [70]
+
+
 def test_agentic_generate_fn_keeps_raw_text_but_returns_post_strip_action_text():
     trainer = object.__new__(AgenticMoshPitTrainer)
     trainer._strip_thinking = lambda text: text.replace("<think>plan</think>", "")
@@ -504,6 +510,7 @@ def test_grpo_reward_models_render_structured_tool_calls():
     )
     trainer.ref_logps_chunk_size = None
     trainer.scale_rewards = "none"
+    trainer.multi_objective_aggregation = "sum_then_normalize"
     trainer.train_is_conversational = True
     trainer.eval_is_conversational = True
     trainer.log_table = None
@@ -513,6 +520,9 @@ def test_grpo_reward_models_render_structured_tool_calls():
     trainer._make_attn_mask = lambda ids: (ids != 0).astype(jnp.int32)
     trainer._all_gather = lambda value: value
     trainer.compute_refmodel_logps = lambda *args, **kwargs: jnp.zeros((1, 1), dtype=jnp.float32)
+    trainer.environment_factory = None
+    trainer._environment_tools = []
+    trainer._environment_tool_parser = None
 
     reward_model = EasyDeLState.__new__(EasyDeLState)
     object.__setattr__(reward_model, "graphdef", None)
@@ -570,6 +580,198 @@ def test_grpo_reward_models_render_structured_tool_calls():
     assert reward_processor.calls[-1][1] == [tool.chat_schema]
     assert processed_batch["advantages"].shape == (1,)
     assert metrics["reward_model"] == pytest.approx(1.0)
+
+
+def test_grpo_environment_factory_feedback_reaches_rewards_and_advantages():
+    captured = {}
+    trainer = object.__new__(GRPOTrainer)
+    trainer.arguments = SimpleNamespace(
+        max_length=64,
+        mask_truncated_completions=False,
+        max_tool_calls_per_step=1,
+    )
+    trainer.processing_class = _TokenizerStub()
+    trainer.reward_processing_classes = [None]
+    trainer.reward_weights = jnp.asarray([1.0], dtype=jnp.float32)
+    trainer.reward_func_names = ["capture_reward"]
+    trainer.ref_state = SimpleNamespace(
+        model=SimpleNamespace(__call__=lambda *args, **kwargs: None),
+        graphstate=None,
+        graphother=None,
+    )
+    trainer.ref_logps_chunk_size = None
+    trainer.scale_rewards = "none"
+    trainer.multi_objective_aggregation = "sum_then_normalize"
+    trainer.train_is_conversational = False
+    trainer.eval_is_conversational = False
+    trainer.log_table = None
+    trainer._pad_token_id = 0
+    trainer._eos_token_id = [99]
+    trainer._purify_batch = lambda batch: batch
+    trainer._make_attn_mask = lambda ids: (ids != 0).astype(jnp.int32)
+    trainer._all_gather = lambda value: value
+    trainer.compute_refmodel_logps = lambda *args, **kwargs: jnp.zeros((1, 1), dtype=jnp.float32)
+    trainer.environment_factory = _TerminalEnv
+    trainer._environment_tools = []
+    trainer._environment_tool_parser = None
+
+    def capture_reward(prompts, completions, environment_observations, environment_rewards, **kwargs):
+        del prompts, kwargs
+        captured["completions"] = completions
+        captured["environment_observations"] = environment_observations
+        captured["environment_rewards"] = environment_rewards
+        return [0.5]
+
+    trainer.reward_funcs = [capture_reward]
+
+    def fake_generate_unified(**kwargs):
+        del kwargs
+        return GenerationResults(
+            generation_results=["final"],
+            prompt_ids=jnp.asarray([[1, 2]], dtype=jnp.int32),
+            prompt_mask=jnp.asarray([[1, 1]], dtype=jnp.int32),
+            sequences=jnp.asarray([[1, 2, 11]], dtype=jnp.int32),
+            completion_ids=jnp.asarray([[11]], dtype=jnp.int32),
+            completion_mask=jnp.asarray([[1]], dtype=jnp.int32),
+            decoded_prompts=["Question"],
+            completion_prompts=["Question"],
+            text=["final"],
+            reasoning=[None],
+            tool_calls=[None],
+            raw_text=["final"],
+        )
+
+    trainer.generate_unified = fake_generate_unified
+
+    processed_batch, metrics = GRPOTrainer._preprocess_batch_input(
+        trainer,
+        state=SimpleNamespace(model=SimpleNamespace(__call__=lambda *args, **kwargs: None), step=jnp.asarray(0)),
+        batch={
+            "input_ids": jnp.asarray([[1, 2]], dtype=jnp.int32),
+            "attention_mask": jnp.asarray([[1, 1]], dtype=jnp.int32),
+        },
+        is_train=True,
+    )
+
+    assert captured["completions"] == ["final"]
+    assert captured["environment_observations"] == [""]
+    assert captured["environment_rewards"] == [1.0]
+    assert metrics["capture_reward"] == pytest.approx(0.5)
+    assert metrics["environment_reward"] == pytest.approx(1.0)
+    assert metrics["reward_mean"] == pytest.approx(1.5)
+    assert processed_batch["advantages"].shape == (1,)
+
+
+def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
+    tool = _EchoTool()
+    captured = {}
+    prompts_seen = []
+    trainer = object.__new__(GRPOTrainer)
+    trainer.arguments = SimpleNamespace(
+        max_length=64,
+        mask_truncated_completions=False,
+        max_tool_calls_per_step=1,
+        max_tool_calling_iterations=1,
+    )
+    trainer.processing_class = _LoopTokenizer()
+    trainer.reward_processing_classes = [None]
+    trainer.reward_weights = jnp.asarray([1.0], dtype=jnp.float32)
+    trainer.reward_func_names = ["capture_reward"]
+    trainer.ref_state = SimpleNamespace(
+        model=SimpleNamespace(__call__=lambda *args, **kwargs: None),
+        graphstate=None,
+        graphother=None,
+    )
+    trainer.ref_logps_chunk_size = None
+    trainer.scale_rewards = "none"
+    trainer.multi_objective_aggregation = "sum_then_normalize"
+    trainer.train_is_conversational = False
+    trainer.eval_is_conversational = False
+    trainer.log_table = None
+    trainer._pad_token_id = 0
+    trainer._eos_token_id = [99]
+    trainer._purify_batch = lambda batch: batch
+    trainer._make_attn_mask = lambda ids: (ids != 0).astype(jnp.int32)
+    trainer._all_gather = lambda value: value
+    trainer.compute_refmodel_logps = lambda graphstate, graphother, ids, mask, kwargs: jnp.zeros(
+        (ids.shape[0], 8),
+        dtype=jnp.float32,
+    )
+    trainer.environment_factory = None
+    trainer._environment_tools = [tool]
+    trainer._environment_tool_parser = None
+
+    def capture_reward(prompts, completions, raw_text, tool_calls, **kwargs):
+        del prompts, kwargs
+        captured["completions"] = completions
+        captured["raw_text"] = raw_text
+        captured["tool_calls"] = tool_calls
+        return [1.0]
+
+    trainer.reward_funcs = [capture_reward]
+    call_count = {"value": 0}
+
+    def fake_generate_unified(**kwargs):
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            return GenerationResults(
+                generation_results=["need tool"],
+                prompt_ids=jnp.asarray([[1, 2]], dtype=jnp.int32),
+                prompt_mask=jnp.asarray([[1, 1]], dtype=jnp.int32),
+                sequences=jnp.asarray([[1, 2, 11, 0, 0, 0, 0, 0, 0, 0]], dtype=jnp.int32),
+                completion_ids=jnp.asarray([[11, 0, 0, 0, 0, 0, 0, 0]], dtype=jnp.int32),
+                completion_mask=jnp.asarray([[1, 0, 0, 0, 0, 0, 0, 0]], dtype=jnp.int32),
+                decoded_prompts=["Question"],
+                completion_prompts=["Question"],
+                text=["need tool"],
+                reasoning=[None],
+                tool_calls=[
+                    [
+                        {
+                            "function": {
+                                "name": tool.name,
+                                "arguments": {"value": "ok"},
+                            }
+                        }
+                    ]
+                ],
+                raw_text=["<tool_call>{}</tool_call>"],
+            )
+        prompts_seen.extend(kwargs["prompts"])
+        return GenerationResults(
+            generation_results=["final"],
+            prompt_ids=jnp.asarray([[1, 2, 11, 70]], dtype=jnp.int32),
+            prompt_mask=jnp.asarray([[1, 1, 1, 1]], dtype=jnp.int32),
+            sequences=jnp.asarray([[1, 2, 11, 70, 12, 13, 0, 0]], dtype=jnp.int32),
+            completion_ids=jnp.asarray([[12, 13, 0, 0, 0, 0, 0]], dtype=jnp.int32),
+            completion_mask=jnp.asarray([[1, 1, 0, 0, 0, 0, 0]], dtype=jnp.int32),
+            decoded_prompts=kwargs["prompts"],
+            completion_prompts=kwargs["prompts"],
+            text=["final"],
+            reasoning=[None],
+            tool_calls=[None],
+            raw_text=["final"],
+        )
+
+    trainer.generate_unified = fake_generate_unified
+
+    processed_batch, metrics = GRPOTrainer._preprocess_batch_input(
+        trainer,
+        state=SimpleNamespace(model=SimpleNamespace(__call__=lambda *args, **kwargs: None), step=jnp.asarray(0)),
+        batch={
+            "input_ids": jnp.asarray([[1, 2]], dtype=jnp.int32),
+            "attention_mask": jnp.asarray([[1, 1]], dtype=jnp.int32),
+        },
+        is_train=True,
+    )
+
+    assert prompts_seen and "echo:ok" in prompts_seen[0]
+    assert captured["raw_text"] == [f"<tool_call>{{}}</tool_call>\n[{tool.name}]: echo:ok\nfinal"]
+    assert captured["completions"] == [f"need tool\n[{tool.name}]: echo:ok\nfinal"]
+    assert captured["tool_calls"] == [None]
+    assert processed_batch["completion_ids"].tolist()[0][:4] == [11, 70, 12, 13]
+    assert processed_batch["completion_mask"].tolist()[0][:4] == [1, 0, 1, 1]
+    assert metrics["capture_reward"] == pytest.approx(1.0)
 
 
 def test_tool_env_wrapper_resets_tool_limit_per_new_turn():
@@ -685,7 +887,7 @@ def test_nash_md_reward_callables_receive_reasoning_and_tool_calls():
     assert captured["batch"] == {"id": [1]}
 
 
-def test_nash_md_mixture_rewards_follow_sampled_policy_metadata():
+def test_nash_md_mixture_rewards_follow_generated_mixture_metadata():
     class _PromptTokenizer:
         eos_token_id = None
 
@@ -771,10 +973,10 @@ def test_nash_md_mixture_rewards_follow_sampled_policy_metadata():
 
     assert len(captured_calls) == 2
     assert captured_calls[0]["completions"] == ["Policy answer"]
-    assert captured_calls[1]["completions"] == ["Policy answer"]
-    assert captured_calls[1]["raw_text"] == ["<think>policy</think>Policy answer"]
-    assert captured_calls[1]["reasoning"] == ["policy"]
-    assert captured_calls[1]["tool_calls"] == [[{"name": "policy-tool"}]]
+    assert captured_calls[1]["completions"] == ["Reference answer"]
+    assert captured_calls[1]["raw_text"] == ["<think>reference</think>Reference answer"]
+    assert captured_calls[1]["reasoning"] == ["reference"]
+    assert captured_calls[1]["tool_calls"] == [[{"name": "reference-tool"}]]
 
 
 def test_xpo_preprocess_supports_reward_models_without_text_decoding():

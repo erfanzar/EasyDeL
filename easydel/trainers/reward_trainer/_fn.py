@@ -56,6 +56,33 @@ from ..training_utils import (
 )
 
 
+def _reward_scores_from_logits(logits: jax.Array) -> jax.Array:
+    """Return one scalar reward per row from sequence-classification logits."""
+    if logits.ndim == 1:
+        return logits
+    if logits.shape[-1] == 1:
+        return jax.numpy.squeeze(logits, axis=-1)
+    if logits.shape[-1] == 2:
+        return logits[..., 1] - logits[..., 0]
+    raise ValueError(f"Reward trainer expects scalar or binary classifier logits; got shape {logits.shape}.")
+
+
+def _reward_pair_loss(
+    rewards_chosen: jax.Array,
+    rewards_rejected: jax.Array,
+    margin: jax.Array | None,
+    center_rewards_coefficient: float | None,
+) -> jax.Array:
+    """Compute Bradley-Terry reward loss from per-example scalar rewards."""
+    reward_margin = rewards_chosen - rewards_rejected
+    if margin is not None:
+        reward_margin = reward_margin - margin
+    loss = -jax.numpy.mean(jax.nn.log_sigmoid(reward_margin))
+    if center_rewards_coefficient is not None:
+        loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+    return loss
+
+
 def training_step(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
@@ -149,23 +176,26 @@ def training_step(
                 module = state.merge(tree)
 
             with jax.named_scope(scope_root + "/loss_fn/forward_chosen"):
-                rewards_chosen = module(
-                    input_ids=minibatch["input_ids_chosen"],
-                    attention_mask=minibatch["attention_mask_chosen"],
-                ).logits
+                rewards_chosen = _reward_scores_from_logits(
+                    module(
+                        input_ids=minibatch["input_ids_chosen"],
+                        attention_mask=minibatch["attention_mask_chosen"],
+                    ).logits
+                )
             with jax.named_scope(scope_root + "/loss_fn/forward_rejected"):
-                rewards_rejected = module(
-                    input_ids=minibatch["input_ids_rejected"],
-                    attention_mask=minibatch["attention_mask_rejected"],
-                ).logits
+                rewards_rejected = _reward_scores_from_logits(
+                    module(
+                        input_ids=minibatch["input_ids_rejected"],
+                        attention_mask=minibatch["attention_mask_rejected"],
+                    ).logits
+                )
             with jax.named_scope(scope_root + "/loss_fn/bt_loss"):
-                if "margin" in minibatch:
-                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - minibatch["margin"]))
-                else:
-                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
-
-                if center_rewards_coefficient is not None:
-                    loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+                loss = _reward_pair_loss(
+                    rewards_chosen,
+                    rewards_rejected,
+                    minibatch.get("margin"),
+                    center_rewards_coefficient,
+                )
             metrics = LossMetrics(
                 loss=loss,
                 chosen_rewards=rewards_chosen,
@@ -260,17 +290,16 @@ def _make_reward_scheduled_loss(call):
                     axis=0,
                 )
             with jax.named_scope("easydel/trainer/reward/scheduled_loss/forward"):
-                rewards = module(input_ids=input_ids, attention_mask=attention_mask).logits
+                rewards = _reward_scores_from_logits(module(input_ids=input_ids, attention_mask=attention_mask).logits)
                 rewards_chosen, rewards_rejected = jax.numpy.split(rewards, 2, axis=0)
 
             with jax.named_scope("easydel/trainer/reward/scheduled_loss/bt_loss"):
-                if "margin" in call_batch:
-                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - call_batch["margin"]))
-                else:
-                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
-
-                if center_rewards_coefficient is not None:
-                    loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+                loss = _reward_pair_loss(
+                    rewards_chosen,
+                    rewards_rejected,
+                    call_batch.get("margin"),
+                    center_rewards_coefficient,
+                )
             return loss
 
     return scheduled_loss
@@ -353,23 +382,26 @@ def evaluation_step(
                 module = state.merge(tree)
 
             with jax.named_scope(eval_scope + "/loss_fn/forward_chosen"):
-                rewards_chosen = module(
-                    input_ids=batch["input_ids_chosen"],
-                    attention_mask=batch["attention_mask_chosen"],
-                ).logits
+                rewards_chosen = _reward_scores_from_logits(
+                    module(
+                        input_ids=batch["input_ids_chosen"],
+                        attention_mask=batch["attention_mask_chosen"],
+                    ).logits
+                )
             with jax.named_scope(eval_scope + "/loss_fn/forward_rejected"):
-                rewards_rejected = module(
-                    input_ids=batch["input_ids_rejected"],
-                    attention_mask=batch["attention_mask_rejected"],
-                ).logits
+                rewards_rejected = _reward_scores_from_logits(
+                    module(
+                        input_ids=batch["input_ids_rejected"],
+                        attention_mask=batch["attention_mask_rejected"],
+                    ).logits
+                )
             with jax.named_scope(eval_scope + "/loss_fn/bt_loss"):
-                if "margin" in batch:
-                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected - batch["margin"]))
-                else:
-                    loss = -jax.numpy.mean(jax.nn.log_sigmoid(rewards_chosen - rewards_rejected))
-
-                if center_rewards_coefficient is not None:
-                    loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
+                loss = _reward_pair_loss(
+                    rewards_chosen,
+                    rewards_rejected,
+                    batch.get("margin"),
+                    center_rewards_coefficient,
+                )
             metrics = LossMetrics(
                 loss=loss,
                 chosen_rewards=rewards_chosen,
