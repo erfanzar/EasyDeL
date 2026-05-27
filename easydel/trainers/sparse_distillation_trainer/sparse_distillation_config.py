@@ -141,7 +141,12 @@ class SparseDistillationConfig(DistillationConfig):
         if self.top_k_teacher < 1:
             raise ValueError(f"`top_k_teacher` must be >= 1, got {self.top_k_teacher}.")
 
+        default_prompt = type(self).__dataclass_fields__["max_prompt_length"].default
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
+        if self.max_prompt_length is None:
+            self.max_prompt_length = default_prompt
+        if self.max_completion_length is None:
+            self.max_completion_length = default_completion
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
                 raise ValueError(
@@ -159,10 +164,25 @@ class SparseDistillationConfig(DistillationConfig):
 
         self.max_length = self.max_prompt_length + self.max_completion_length
 
-        if hasattr(super(), "__post_init__"):
+        sparse_fields = {
+            "max_prompt_length": self.max_prompt_length,
+            "max_completion_length": self.max_completion_length,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+        }
+        self.max_prompt_length = None  # type: ignore[assignment]
+        self.max_completion_length = None  # type: ignore[assignment]
+        self.top_p = 1.0
+        self.top_k = 0
+        try:
             super().__post_init__(
                 max_sequence_length=None,
                 quantization_block=quantization_block,
             )
+        finally:
+            self.max_prompt_length = sparse_fields["max_prompt_length"]
+            self.max_completion_length = sparse_fields["max_completion_length"]
+            self.top_p = sparse_fields["top_p"]
+            self.top_k = sparse_fields["top_k"]
 
     __hash__ = hash_fn
