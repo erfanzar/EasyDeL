@@ -36,6 +36,7 @@ from eformer.loggings import get_logger
 from jax import numpy as jnp
 from spectrax import with_sharding_constraint
 
+from easydel.inference.logits_process import LogitsProcessor, LogitsProcessorList
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
@@ -81,14 +82,43 @@ def _ensure_state(
     return model.to_state(trainable_selector=trainable_selector)
 
 
+class GeometricMixtureLogitsProcessor(LogitsProcessor):
+    """Replace policy logits with the policy/reference geometric-mixture logits."""
+
+    def __init__(
+        self,
+        ref_model: EasyDeLBaseModule,
+        mixture_coef: float,
+        pad_token_id: int | None,
+    ):
+        self.ref_model = ref_model
+        self.mixture_coef = float(mixture_coef)
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        seq_positions = jnp.arange(input_ids.shape[1])[None, :]
+        attention_mask = seq_positions < cur_len
+        if self.pad_token_id is not None:
+            attention_mask = attention_mask & (input_ids != jnp.asarray(self.pad_token_id, dtype=input_ids.dtype))
+
+        ref_outputs = self.ref_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask.astype(jnp.int32),
+        )
+        ref_logits = jax.lax.dynamic_slice_in_dim(ref_outputs.logits, cur_len - 1, 1, axis=1)[:, 0, :]
+        mixed_logits = self.mixture_coef * ref_logits + (1.0 - self.mixture_coef) * scores
+        return jax.nn.log_softmax(mixed_logits, axis=-1)
+
+
 @Registry.register("trainer", ["nash-md", "nash_md"])
 class NashMDTrainer(GRPOTrainer):
     """Trainer for Nash Mirror Descent (Nash-MD) preference optimization.
 
     Implements the Nash-MD algorithm (Munos et al. 2024): each step
     samples auxiliary completions from the *geometric mixture* of the
-    policy and reference distributions
-    ``pi_mix = pi_policy^mixture_coef * pi_ref^(1 - mixture_coef)``,
+    policy and reference logits. Following TRL, ``mixture_coef`` is the
+    reference-logit coefficient:
+    ``logits_mix = mixture_coef * logits_ref + (1 - mixture_coef) * logits_policy``,
     treats those mixture samples as the opposing player, and updates
     the policy via a mirror-descent step regularised by the
     token-level KL against the reference. Both ``mixture_coef`` and
@@ -480,9 +510,9 @@ class NashMDTrainer(GRPOTrainer):
 
         Runs three logical phases:
 
-        1. Generate a policy completion for each prompt; when
-           ``mixture_coef < 1.0`` also generate a reference completion
-           and pick between the two per-row using a step-derived RNG.
+        1. Generate a policy completion for each prompt, then generate
+           an opposing completion from the policy/reference geometric
+           logit mixture.
         2. Score both the policy completion and the chosen mixture
            completion with the oracle reward function, apply the
            optional missing-EOS penalty, and convert the score
@@ -532,34 +562,46 @@ class NashMDTrainer(GRPOTrainer):
                 completion_mask = results.completion_mask
             generation_time = generation_time_fn()
 
-            # Sample mixture between policy and reference completions per prompt
+            # Sample mixture completions from the policy/reference geometric
+            # logit mixture, matching TRL's Nash-MD rollout semantics.
             mixture_coef = self._current_mixture_coef()
-            if mixture_coef >= 1.0:
-                mixture_results = results
-                mixture_completion_ids = completion_ids
-                mixture_completion_mask = completion_mask
-                take_policy = jnp.ones((completion_ids.shape[0], 1), dtype=jnp.bool_)
+            if mixture_coef <= 0.0:
+                mixture_state = state
+                mixture_logits_processor = None
+            elif mixture_coef >= 1.0:
+                mixture_state = self.ref_state
+                mixture_logits_processor = None
             else:
-                with capture_time() as _mixture_time_fn:
-                    mixture_results = self.generate_unified(
-                        input_ids=prompt_ids,
-                        attention_mask=prompt_mask,
-                        state=self.ref_state,
-                        apply_chat_template=False,
-                        shard_inputs=False,
-                        all_gather=False,
-                        config_overrides={"num_return_sequences": 1},
-                    )
-                    jax.block_until_ready(mixture_results.sequences)
-                    mixture_completion_ids = mixture_results.completion_ids
-                    mixture_completion_mask = mixture_results.completion_mask
+                mixture_state = state
+                mixture_logits_processor = LogitsProcessorList(
+                    [
+                        GeometricMixtureLogitsProcessor(
+                            ref_model=self.ref_state.model,
+                            mixture_coef=mixture_coef,
+                            pad_token_id=self._pad_token_id,
+                        )
+                    ]
+                )
 
-                step_int = int(jax.device_get(state.step))
-                mix_key = jax.random.PRNGKey(step_int & 0xFFFFFFFF)
-                take_policy = jax.random.uniform(mix_key, (completion_ids.shape[0],)) < mixture_coef
-                take_policy = take_policy[:, None]
-                mixture_completion_ids = jnp.where(take_policy, completion_ids, mixture_completion_ids)
-                mixture_completion_mask = jnp.where(take_policy, completion_mask, mixture_completion_mask)
+            with capture_time() as _mixture_time_fn:
+                mixture_generate_kwargs = {}
+                if mixture_logits_processor is not None:
+                    mixture_generate_kwargs["logits_processor"] = mixture_logits_processor
+                mixture_results = self.generate_unified(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=mixture_state,
+                    use_esurge=mixture_logits_processor is None,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
+                    **mixture_generate_kwargs,
+                )
+                jax.block_until_ready(mixture_results.sequences)
+                mixture_completion_ids = mixture_results.completion_ids
+                mixture_completion_mask = mixture_results.completion_mask
+            mixture_generation_time = _mixture_time_fn()
 
             prompt_completion_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
             attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)
@@ -577,7 +619,6 @@ class NashMDTrainer(GRPOTrainer):
 
         host_prompt_ids = np.asarray(jax.device_get(prompt_ids))
         prompts_text = list(self.processing_class.batch_decode(host_prompt_ids, skip_special_tokens=True))
-        host_take_policy = np.asarray(jax.device_get(take_policy)).reshape(-1).astype(bool)
         model_completions_text = self._coerce_generation_texts(results.text)
         ref_completions_text = self._coerce_generation_texts(mixture_results.text)
         if not model_completions_text:
@@ -615,22 +656,10 @@ class NashMDTrainer(GRPOTrainer):
             target_len=len(ref_completions_text),
         )
 
-        mixture_completions_text = [
-            model_completions_text[idx] if take_policy_row else ref_completions_text[idx]
-            for idx, take_policy_row in enumerate(host_take_policy)
-        ]
-        mixture_raw_texts = [
-            model_raw_texts[idx] if take_policy_row else ref_raw_texts[idx]
-            for idx, take_policy_row in enumerate(host_take_policy)
-        ]
-        mixture_reasoning = [
-            model_reasoning[idx] if take_policy_row else ref_reasoning[idx]
-            for idx, take_policy_row in enumerate(host_take_policy)
-        ]
-        mixture_tool_calls = [
-            model_tool_calls[idx] if take_policy_row else ref_tool_calls[idx]
-            for idx, take_policy_row in enumerate(host_take_policy)
-        ]
+        mixture_completions_text = ref_completions_text
+        mixture_raw_texts = ref_raw_texts
+        mixture_reasoning = ref_reasoning
+        mixture_tool_calls = ref_tool_calls
 
         model_scores, model_breakdown = self._score_rewards(
             prompts_text,
@@ -669,6 +698,7 @@ class NashMDTrainer(GRPOTrainer):
             "rewards/probabilities": float(jnp.mean(probabilities)),
             "completion_length": float(jnp.mean(completion_lengths)),
             "generation_time": generation_time,
+            "mixture_generation_time": mixture_generation_time,
             "reference_logps_time": ref_logps_time,
             "preprocessing_time": preprocessing_time,
             "mixture_coef": float(self._current_mixture_coef()),

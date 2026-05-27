@@ -14,8 +14,8 @@
 """Configuration dataclass for the Nash-MD trainer.
 
 Defines :class:`NashMDConfig`, which adds the mirror-descent step
-size ``mixture_coef`` (mixture probability between the policy and
-reference), KL clipping, and judge/oracle handling to the GRPO base
+size ``mixture_coef`` (reference-logit coefficient in the policy/reference
+mixture), KL clipping, and judge/oracle handling to the GRPO base
 config.
 """
 
@@ -39,8 +39,9 @@ class NashMDConfig(GRPOConfig):
     equilibrium between the policy and a frozen reference under a
     learned preference oracle. The trainer produces auxiliary
     completions from the *geometric mixture* of the policy and
-    reference distributions
-    ``pi_mix = pi_policy^mixture_coef * pi_ref^(1 - mixture_coef)``,
+    reference distributions. Following TRL's Nash-MD implementation,
+    ``mixture_coef`` is the reference-logit coefficient:
+    ``logits_mix = mixture_coef * logits_ref + (1 - mixture_coef) * logits_policy``,
     treats those mixture samples as the opposing player, and updates
     the policy via a mirror-descent style step regularised by the KL
     against the reference.
@@ -59,9 +60,9 @@ class NashMDConfig(GRPOConfig):
             (constant schedule) or a sequence consumed one entry per
             epoch (with the last entry reused thereafter). Default
             ``0.1``.
-        mixture_coef: Geometric-mixture weight on the policy logits
+        mixture_coef: Geometric-mixture weight on the reference logits
             when sampling the opposing player. ``0`` recovers the
-            reference, ``1`` recovers the policy. Either a scalar or
+            policy, ``1`` recovers the reference. Either a scalar or
             an epoch-wise schedule. Default ``[0.5]``.
         missing_eos_penalty: Optional reward penalty subtracted from
             completions that do not emit an EOS token within
@@ -85,7 +86,7 @@ class NashMDConfig(GRPOConfig):
     mixture_coef: float | Sequence[float] = field(
         default_factory=lambda: [0.5],
         metadata={
-            "help": "Logit mixture coefficient between the policy and reference models. Can be provided as a list to "
+            "help": "Reference-logit mixture coefficient between the policy and reference models. Can be provided as a list to "
             "schedule the value across epochs."
         },
     )
