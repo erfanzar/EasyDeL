@@ -46,6 +46,7 @@ from easydel.utils.helpers import get_logger
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from .reward_verifiers import (
+    CodeVerifier,
     FormatVerifier,
     LengthPenaltyVerifier,
     MathVerifier,
@@ -245,15 +246,19 @@ class RLVRTrainer(GRPOTrainer):
         Returns:
             tuple[list[tp.Callable], list[float]]: ``(verifier_list,
             weight_list)`` -- two equal-length lists ordered as
-            ``MathVerifier``, ``FormatVerifier``, ``LengthPenaltyVerifier``
-            (only the verifiers whose corresponding config fields are set
-            are included).
+            ``MathVerifier``, ``CodeVerifier``, ``FormatVerifier``,
+            ``LengthPenaltyVerifier`` (only the verifiers whose
+            corresponding config fields are set are included).
         """
         verifiers: list[tp.Callable] = []
         weights: list[float] = []
 
         if config.answer_key:
             verifiers.append(MathVerifier(answer_key=config.answer_key))
+            weights.append(1.0)
+
+        if config.test_key:
+            verifiers.append(CodeVerifier(test_key=config.test_key))
             weights.append(1.0)
 
         if config.format_pattern and config.format_reward_weight > 0:

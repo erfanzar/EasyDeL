@@ -55,8 +55,9 @@ class RLVRConfig(GRPOConfig):
             containing gold answers for math verification. Set to
             ``None`` to disable the built-in math verifier and rely
             entirely on external rewarders.
-        test_key (str): Column name containing code test cases for
-            code verification.
+        test_key (str | None): Optional column name containing code test
+            cases for code verification. Set to ``None`` to disable the
+            built-in code verifier.
         format_pattern (str | None): Optional regex pattern that
             completions must match to receive a format reward.
         format_reward_weight (float): Weight for the format compliance
@@ -101,9 +102,11 @@ class RLVRConfig(GRPOConfig):
             "help": "Dataset column containing gold answers for math verification. Set to None to disable the math verifier."
         },
     )
-    test_key: str = field(
-        default="tests",
-        metadata={"help": "Dataset column containing code test cases."},
+    test_key: str | None = field(
+        default=None,
+        metadata={
+            "help": "Dataset column containing code test cases. Set to None to disable the built-in code verifier."
+        },
     )
     format_pattern: str | None = field(
         default=None,

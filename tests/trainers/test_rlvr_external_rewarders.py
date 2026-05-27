@@ -18,10 +18,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from jax import numpy as jnp
 
 import easydel as ed
 from easydel.infra.elarge.model import eLargeModel
-from easydel.trainers.group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from easydel.trainers.group_relative_policy_optimization.grpo_trainer import (
+    GRPOTrainer,
+    _clip_rewards_if_configured,
+)
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
@@ -72,6 +76,32 @@ def test_rlvr_trainer_supports_explicit_external_rewarders(monkeypatch):
     assert reward_funcs[-1] is syntax_reward
     assert captured["reward_processing_classes"] == [None, None, "syntax-proc"]
     assert captured["arguments"].reward_weights == [1.0, 0.25, 0.7]
+
+
+def test_rlvr_trainer_wires_code_verifier_when_test_key_is_set(monkeypatch):
+    captured = {}
+
+    def fake_grpo_init(self, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(GRPOTrainer, "__init__", fake_grpo_init)
+
+    args = _make_args(answer_key=None, test_key="tests")
+
+    ed.RLVRTrainer(
+        arguments=args,
+        model=None,
+        processing_class=None,
+    )
+
+    reward_funcs = captured["reward_funcs"]
+    assert len(reward_funcs) == 1
+    assert captured["reward_processing_classes"] is None
+    assert captured["arguments"].reward_weights == [1.0]
+    assert reward_funcs[0](
+        completions=["```python\ndef add_one(x):\n    return x + 1\n```"],
+        batch={"tests": ["assert add_one(1) == 2"]},
+    ) == [1.0]
 
 
 def test_rlvr_trainer_allows_external_rewarders_without_math_verifier(monkeypatch):
@@ -192,3 +222,14 @@ def test_elarge_build_trainer_forwards_rlvr_external_rewarders():
     assert captured["external_reward_funcs"] == [syntax_reward]
     assert captured["external_reward_processing_classes"] == ["syntax-proc"]
     assert captured["external_reward_weights"] == [0.5]
+
+
+def test_rlvr_reward_clip_range_is_applied_to_combined_rewards():
+    args = _make_args(reward_clip_range=0.5)
+
+    rewards = _clip_rewards_if_configured(
+        jnp.array([-1.25, -0.25, 0.25, 1.25], dtype=jnp.float32),
+        args,
+    )
+
+    assert rewards.tolist() == pytest.approx([-0.5, -0.25, 0.25, 0.5])
