@@ -19,6 +19,8 @@ shared :class:`TrainingArguments` surface.  ORPO is reference-free, so
 the configuration intentionally omits any reference-model fields.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
@@ -136,7 +138,9 @@ class ORPOConfig(TrainingArguments):
     )
     generate_during_eval: bool = field(
         default=False,
-        metadata={"help": "Flag indicating whether to generate sequences during evaluation."},
+        metadata={
+            "help": ("Flag indicating whether to generate sequences during evaluation through EasyDeL/eSurge previews.")
+        },
     )
     is_encoder_decoder: bool | None = field(
         default=None,
@@ -173,6 +177,9 @@ class ORPOConfig(TrainingArguments):
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = self.max_length - self.max_prompt_length
         self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
+        if self.generate_during_eval:
+            self.generation_interval = self.generation_interval or self.evaluation_steps or 1
+            self.use_esurge_generation = True
 
         # Call the post_init of the parent class if it exists.
         if hasattr(super(), "__post_init__"):

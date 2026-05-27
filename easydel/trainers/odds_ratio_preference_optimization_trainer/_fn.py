@@ -65,6 +65,12 @@ from ..training_utils import (
 )
 
 
+def _log1mexp(x: Array) -> Array:
+    """Compute ``log(1 - exp(x))`` stably for non-positive log-probabilities."""
+    cutoff = jnp.array(-0.6931471805599453, dtype=x.dtype)
+    return jnp.where(x < cutoff, jnp.log1p(-jnp.exp(x)), jnp.log(-jnp.expm1(x)))
+
+
 def concatenated_forward(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, list | Array],
@@ -491,10 +497,9 @@ def odds_ratio_loss(
         ``mean_log_odds`` is the mean ``log_odds`` value.
     """
     log_odds = (policy_chosen_logps - policy_rejected_logps) - (
-        jnp.log1p(-jnp.exp(policy_chosen_logps)) - jnp.log1p(-jnp.exp(policy_rejected_logps))
+        _log1mexp(policy_chosen_logps) - _log1mexp(policy_rejected_logps)
     )
-    sig_ratio = jax.nn.sigmoid(log_odds)
-    ratio = jnp.log(sig_ratio)
+    ratio = jax.nn.log_sigmoid(log_odds)
     losses = beta * ratio
 
     chosen_rewards = beta * jax.lax.stop_gradient(policy_chosen_logps)

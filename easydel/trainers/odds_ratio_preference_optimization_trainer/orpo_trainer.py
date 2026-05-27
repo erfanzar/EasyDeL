@@ -34,6 +34,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import ORPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_utils import compile_trainer_auxiliary, compile_trainer_step, resolve_straight_through_emulator
@@ -98,9 +99,9 @@ class ORPOTrainer(Trainer):
 
         Args:
             arguments (ORPOConfig | None): Training configuration. Required.
-            model (EasyDeLBaseModule | EasyDeLState | None): Base module or
-                pre-built state to train. Plain modules are converted to a
-                state via ``model.to_state(...)``.
+            model (EasyDeLBaseModule | EasyDeLState | None): Base module
+                or pre-built state to train. Plain modules are converted to a state via
+                ``model.to_state(...)``.
             data_collator (DPODataCollatorWithPaddingTFDS |
                 DPODataCollatorWithPaddingGrain | None): Optional explicit
                 collator. When ``None`` default DPO-style padding collators
@@ -173,8 +174,11 @@ class ORPOTrainer(Trainer):
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
+        model = self._resolve_policy_model(model)
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
+        if arguments.disable_dropout:
+            (model,) = self._disable_state_dropout(model)
 
         super().__init__(
             model_state=model,
@@ -184,6 +188,20 @@ class ORPOTrainer(Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+
+    @staticmethod
+    def _resolve_policy_model(
+        model: EasyDeLBaseModule | EasyDeLState | None,
+    ) -> EasyDeLBaseModule | EasyDeLState | None:
+        """Reject string model ids and return a concrete ORPO policy object."""
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        return model
+
+    @staticmethod
+    def _disable_state_dropout(*states: EasyDeLState | None) -> tuple[EasyDeLState | None, ...]:
+        """Put ORPO policy state modules into eval mode when requested."""
+        return tuple(disable_state_dropout(state) for state in states)
 
     def _get_preprocess_transform(self) -> ORPOPreprocessTransform | None:
         """Build the lazy ORPO preprocessing transform attached to a :class:`ShardedDataSource`.
