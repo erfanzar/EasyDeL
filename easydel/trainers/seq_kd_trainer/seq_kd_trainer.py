@@ -22,6 +22,7 @@ so this works with API-based teachers via ``teacher_fn``.
 from __future__ import annotations
 
 import typing as tp
+from copy import deepcopy
 
 import numpy as np
 from eformer.loggings import get_logger
@@ -203,8 +204,9 @@ class SeqKDTrainer(Trainer):
         """
         if self._is_pretokenized():
             return None
+        preprocess_tokenizer = deepcopy(self.processing_class)
         return GRPOPreprocessTransform(
-            tokenizer=self.processing_class,
+            tokenizer=preprocess_tokenizer,
             max_prompt_length=self.arguments.max_prompt_length,
             skip_apply_chat_template=self.arguments.skip_apply_chat_template,
             tools=getattr(self.arguments, "tools", None),
