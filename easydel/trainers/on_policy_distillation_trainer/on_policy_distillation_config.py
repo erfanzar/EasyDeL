@@ -153,7 +153,12 @@ class OnPolicyDistillationConfig(DistillationConfig):
                 or if ``max_prompt_length + max_completion_length`` exceeds
                 ``max_length``.
         """
+        default_prompt = type(self).__dataclass_fields__["max_prompt_length"].default
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
+        if self.max_prompt_length is None:
+            self.max_prompt_length = default_prompt
+        if self.max_completion_length is None:
+            self.max_completion_length = default_completion
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
                 raise ValueError(
@@ -171,10 +176,26 @@ class OnPolicyDistillationConfig(DistillationConfig):
 
         self.max_length = self.max_prompt_length + self.max_completion_length
 
-        if hasattr(super(), "__post_init__"):
-            super().__post_init__(
-                max_sequence_length=None,
-                quantization_block=quantization_block,
-            )
+        on_policy_fields = {
+            "max_prompt_length": self.max_prompt_length,
+            "max_completion_length": self.max_completion_length,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+        }
+        self.max_prompt_length = None  # type: ignore[assignment]
+        self.max_completion_length = None  # type: ignore[assignment]
+        self.top_p = 1.0
+        self.top_k = 0
+        try:
+            if hasattr(super(), "__post_init__"):
+                super().__post_init__(
+                    max_sequence_length=None,
+                    quantization_block=quantization_block,
+                )
+        finally:
+            self.max_prompt_length = on_policy_fields["max_prompt_length"]
+            self.max_completion_length = on_policy_fields["max_completion_length"]
+            self.top_p = on_policy_fields["top_p"]
+            self.top_k = on_policy_fields["top_k"]
 
     __hash__ = hash_fn
