@@ -41,6 +41,8 @@ from transformers import AutoTokenizer
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
@@ -52,6 +54,7 @@ from .._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
+from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
@@ -129,7 +132,7 @@ class PPOTrainer(Trainer):
         self,
         arguments: PPOConfig,
         model: EasyDeLBaseModule | EasyDeLState | None,
-        reward_funcs: RewardFunc | list[RewardFunc],
+        reward_funcs: RewardFunc | list[RewardFunc] | None,
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType | None = None,
@@ -186,8 +189,7 @@ class PPOTrainer(Trainer):
             raise TypeError(f"arguments type must be `PPOConfig` but got {type(arguments)}")
         self.arguments = arguments
 
-        if model is None:
-            raise ValueError("`model` must be provided for PPO training.")
+        model = self._resolve_policy_model(model, arguments)
 
         # Ensure we have a value head attached.
         if isinstance(model, EasyDeLState):
@@ -214,6 +216,8 @@ class PPOTrainer(Trainer):
             pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
 
+        if reward_funcs is None:
+            raise ValueError("`reward_funcs` must be provided for PPO training.")
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
         self.reward_funcs = reward_funcs
@@ -232,19 +236,20 @@ class PPOTrainer(Trainer):
         for i, (reward_processing_class, reward_func) in enumerate(
             zip(reward_processing_classes, reward_funcs, strict=False)
         ):
+            reward_func = self._resolve_reward_func_model(reward_func)
             if isinstance(reward_func, EasyDeLBaseModule | EasyDeLState):
                 if isinstance(reward_func, EasyDeLBaseModule):
                     reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
                     sharding = reward_func.shardings
 
-                    def apply_fn(gd, gs, gt, batch):
+                    def apply_fn(gs, gt, batch, graphdef):
                         """Sharded reward-model forward used to score completions.
 
                         Args:
-                            gd: Reward model graph definition.
                             gs: Reward model graph state (parameters).
                             gt: Reward model auxiliary state.
                             batch: Tokenized batch passed to the reward model.
+                            graphdef: Reward model graph definition.
 
                         Returns:
                             The reward model's full output (typically with a
@@ -254,7 +259,7 @@ class PPOTrainer(Trainer):
                             lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                             gt,
                         )
-                        module = spx.bind(gd, gs.merge(gt, copy=False))
+                        module = spx.bind(graphdef, gs.merge(gt, copy=False))
                         batch = with_sharding_constraint(
                             arr=batch,
                             sharding=self.arguments.step_partition_spec,
@@ -266,9 +271,9 @@ class PPOTrainer(Trainer):
                         return module(**call_kwargs)
 
                     apply_fn = compile_trainer_step(
-                        apply_fn,
+                        partial(apply_fn, graphdef=reward_func.graphdef),
                         mesh=model.model.mesh,
-                        static_argnums=(0,),
+                        static_argnames=("graphdef",),
                         in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
                         out_shardings=empty_sharding,
                     )
@@ -310,6 +315,25 @@ class PPOTrainer(Trainer):
             processing_class=processing_class,
         )
 
+    @staticmethod
+    def _resolve_policy_model(
+        model: EasyDeLBaseModule | EasyDeLState | None,
+        arguments: PPOConfig,
+    ) -> EasyDeLBaseModule | EasyDeLState:
+        """Resolve PPO policy models from initialized EasyDeL objects."""
+        if model is None:
+            raise ValueError("`model` must be provided for PPO training.")
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        return model
+
+    @staticmethod
+    def _resolve_reward_func_model(reward_func: RewardFunc) -> RewardFunc:
+        """Reject string reward identifiers and prepare initialized reward modules."""
+        if isinstance(reward_func, str):
+            reject_string_model_id(reward_func, role="reward model")
+        return reward_func
+
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
         """Build the lazy prompt-only preprocessing transform for the rollout source.
 
@@ -336,6 +360,7 @@ class PPOTrainer(Trainer):
             max_prompt_length=self.arguments.max_prompt_length,
             tools=getattr(self.arguments, "tools", None),
             skip_apply_chat_template=self.arguments.skip_apply_chat_template,
+            chat_template_kwargs=self.arguments.chat_template_kwargs,
         )
 
     def _is_pretokenized(self) -> bool:
@@ -707,6 +732,90 @@ class PPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _execute_train_step(
+        self,
+        state: EasyDeLState,
+        batch,
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
+        """Execute one PPO update, including multiple PPO epochs when configured."""
+        if self.arguments.num_ppo_epochs == 1:
+            return super()._execute_train_step(state=state, batch=batch)
+
+        if self.pruning_module is not None:
+            state = state.replace(
+                graphstate=self.pruning_module.pre_forward_update(
+                    state.graphstate,
+                    state.opt_state,
+                )
+            )
+        metrics = LossMetrics()
+        try:
+            self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
+            batch, informations = self._preprocess_batch_input(
+                state=state,
+                batch=batch,
+                is_train=True,
+            )
+            self._runtime_trace(
+                "execute_train_step.preprocess.end",
+                batch=self._runtime_batch_summary(batch),
+                information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
+            )
+
+            for ppo_epoch in range(self.arguments.num_ppo_epochs):
+                self._runtime_trace("execute_train_step.compiled_call.begin", ppo_epoch=ppo_epoch)
+                state, metrics = jax.block_until_ready(
+                    self.sharded_training_step_function(
+                        state,
+                        batch,
+                        *self._train_shared_fn_extra_args,
+                        *self._train_shared_fn_static_args,
+                    )
+                )
+                self._runtime_trace(
+                    "execute_train_step.compiled_call.end",
+                    step=int(jax.device_get(state.step)),
+                    metrics_type=type(metrics).__name__,
+                    ppo_epoch=ppo_epoch,
+                )
+
+            if len(informations) != 0:
+                if metrics.other_metrics is not None:
+                    informations.update(metrics.other_metrics)
+                metrics = metrics.replace(other_metrics=informations)
+
+            if self.pruning_module is not None:
+                state = state.replace(
+                    graphstate=self.pruning_module.post_gradient_update(
+                        state.graphstate,
+                        state.opt_state,
+                    )
+                )
+            return state, metrics, None
+        except (
+            KeyboardInterrupt,
+            EasyDeLTimerError,
+            EasyDeLBreakRequest,
+            TypeError,
+        ) as run_exception:
+            self._runtime_trace(
+                "execute_train_step.control_exception",
+                exc_type=type(run_exception).__name__,
+                exc=str(run_exception),
+            )
+            return state, metrics, run_exception
+        except Exception as run_exception:
+            self._runtime_trace(
+                "execute_train_step.exception",
+                exc_type=type(run_exception).__name__,
+                exc=str(run_exception),
+            )
+            if self._is_memory_oom_exception(run_exception):
+                annotated_exception = self._augment_memory_oom_exception(run_exception)
+                logger.error(str(annotated_exception))
+                return state, metrics, annotated_exception
+            raise
+
     def _masked_whiten(self, x: jax.Array, mask: jax.Array, *, shift_mean: bool) -> jax.Array:
         """Whiten ``x`` over the masked elements (variance scaling, optional centering).
 
@@ -1013,7 +1122,6 @@ class PPOTrainer(Trainer):
                             texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
 
                         rew = reward_func.apply_fn(
-                            reward_func.graphdef,
                             reward_func.graphstate,
                             reward_func.graphother,
                             dict(

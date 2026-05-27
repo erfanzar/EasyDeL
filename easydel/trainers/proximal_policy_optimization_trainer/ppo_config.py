@@ -72,9 +72,8 @@ class PPOConfig(TrainingArguments):
             preprocessing transform. ``None`` runs sequentially.
         learning_rate: Optimiser step size for the joint
             policy + value-head update.
-        num_ppo_epochs: Minibatch epochs reused per rollout batch.
-            Currently best-effort -- keep at ``1`` for parity with the
-            v1 reference implementation.
+        num_ppo_epochs: Optimizer epochs run against each generated
+            rollout batch before sampling the next batch.
         kl_coef: Coefficient on the per-token KL penalty added to the
             score-only reward, i.e. ``r_kl_t = -kl_coef * KL_t``.
         kl_estimator: Choice of KL estimator: ``"k1"`` uses the
@@ -150,9 +149,77 @@ class PPOConfig(TrainingArguments):
         default=256,
         metadata={"help": "The maximum length of the completion (right-padded)."},
     )
+    response_length: int | None = field(
+        default=None,
+        metadata={"help": "TRL PPO alias for `max_completion_length`."},
+    )
     dataset_num_proc: int | None = field(
         default=None,
         metadata={"help": "Number of processes for dataset preprocessing."},
+    )
+    num_mini_batches: int = field(
+        default=1,
+        metadata={"help": "Number of PPO minibatches. EasyDeL PPO currently supports one minibatch per rollout batch."},
+    )
+    total_episodes: int | None = field(
+        default=None,
+        metadata={"help": "TRL episode-count bookkeeping field. Not used by EasyDeL PPO scheduling."},
+    )
+    local_rollout_forward_batch_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "TRL rollout forward microbatch size. EasyDeL PPO does not split rollout scoring this way yet."
+        },
+    )
+    num_sample_generations: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of debug sample generations in TRL PPO. Preview generation uses EasyDeL generation settings."
+        },
+    )
+    world_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL distributed world size bookkeeping field. Defaults to one EasyDeL process."},
+    )
+    num_total_batches: int | None = field(
+        default=None,
+        metadata={"help": "TRL total-batch bookkeeping field. EasyDeL derives steps from trainer scheduling."},
+    )
+    micro_batch_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL micro batch size bookkeeping field."},
+    )
+    local_batch_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL local batch size bookkeeping field."},
+    )
+    batch_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL global batch size bookkeeping field. Mirrors EasyDeL `total_batch_size`."},
+    )
+    local_mini_batch_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL local minibatch size bookkeeping field."},
+    )
+    mini_batch_size: int | None = field(
+        default=None,
+        metadata={"help": "TRL global minibatch size bookkeeping field."},
+    )
+    push_to_hub: bool = field(
+        default=False,
+        metadata={"help": "TRL Hub upload flag. EasyDeL PPO does not push from the trainer."},
+    )
+    model_adapter_name: str | None = field(
+        default=None,
+        metadata={"help": "TRL PEFT adapter name. EasyDeL PPO adapter switching is not supported yet."},
+    )
+    ref_adapter_name: str | None = field(
+        default=None,
+        metadata={"help": "TRL reference PEFT adapter name. EasyDeL PPO adapter switching is not supported yet."},
+    )
+    ds3_gather_for_generation: bool = field(
+        default=True,
+        metadata={"help": "TRL DeepSpeed ZeRO-3 generation knob; not applicable to EasyDeL's JAX runtime."},
     )
     learning_rate: float = field(
         default=1e-6,
@@ -160,7 +227,7 @@ class PPOConfig(TrainingArguments):
     )
     num_ppo_epochs: int = field(
         default=1,
-        metadata={"help": "Number of PPO epochs per rollout batch. (Currently best-effort; keep 1 for parity.)"},
+        metadata={"help": "Number of PPO optimizer epochs to run against each rollout batch."},
     )
     kl_coef: float = field(
         default=0.05,
@@ -207,6 +274,14 @@ class PPOConfig(TrainingArguments):
     missing_eos_penalty: float | None = field(
         default=None,
         metadata={"help": "Optional penalty subtracted from score when no EOS is generated."},
+    )
+    stop_token: tp.Literal["eos"] | None = field(
+        default=None,
+        metadata={"help": "Stop token selector. Only `None` and `'eos'` are supported."},
+    )
+    stop_token_id: int | None = field(
+        default=None,
+        metadata={"help": "Explicit EOS token id forwarded to generation."},
     )
     tools: list[dict | tp.Callable] | None = field(
         default=None,
@@ -309,6 +384,13 @@ class PPOConfig(TrainingArguments):
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
 
+        if self.response_length is not None:
+            if self.response_length <= 0:
+                raise ValueError("`response_length` must be positive when set.")
+            if self.max_length is not None and self.max_length != self.max_prompt_length + self.response_length:
+                raise ValueError("`max_length` must equal `max_prompt_length + response_length` when both are set.")
+            self.max_completion_length = int(self.response_length)
+
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
                 raise ValueError(
@@ -318,12 +400,68 @@ class PPOConfig(TrainingArguments):
 
         self.max_length = self.max_prompt_length + self.max_completion_length
 
+        if self.num_ppo_epochs < 1:
+            raise ValueError("`num_ppo_epochs` must be at least 1.")
+        if self.num_mini_batches != 1:
+            raise ValueError("EasyDeL PPO currently supports only `num_mini_batches=1`.")
+        if self.local_rollout_forward_batch_size is not None:
+            raise ValueError("`local_rollout_forward_batch_size` is not supported by EasyDeL PPO yet.")
+        if self.num_sample_generations is not None:
+            raise ValueError("`num_sample_generations` is not supported by EasyDeL PPO yet.")
+        if self.num_total_batches is not None:
+            raise ValueError("`num_total_batches` is not supported by EasyDeL PPO scheduling yet.")
+        if self.total_episodes is not None:
+            raise ValueError("`total_episodes` is not supported by EasyDeL PPO scheduling yet.")
+        if self.push_to_hub:
+            raise ValueError("`push_to_hub=True` is not supported by EasyDeL PPO.")
+        if not self.ds3_gather_for_generation:
+            raise ValueError(
+                "`ds3_gather_for_generation=False` is a DeepSpeed ZeRO-3 TRL feature and is not applicable to EasyDeL."
+            )
+        if self.model_adapter_name is not None or self.ref_adapter_name is not None:
+            raise ValueError("PPO adapter switching is not supported by EasyDeL yet.")
+        if self.stop_token is not None and self.stop_token != "eos":
+            raise ValueError("`stop_token` must be either None or 'eos'.")
+        if self.stop_token is not None and self.stop_token_id is not None:
+            raise ValueError("`stop_token` and `stop_token_id` are mutually exclusive.")
+        if self.stop_token_id is not None and self.stop_token_id < 0:
+            raise ValueError("`stop_token_id` must be non-negative when set.")
+
         if self.num_generations is None:
             self.num_generations = self.num_return_sequences
         else:
             self.num_return_sequences = self.num_generations
+        self.world_size = 1 if self.world_size is None else int(self.world_size)
+        if self.world_size != 1:
+            raise ValueError("`world_size` is a TRL multi-process bookkeeping field; EasyDeL PPO expects 1.")
+        expected_batch_size = int(self.total_batch_size)
+        if self.batch_size is None:
+            self.batch_size = expected_batch_size
+        elif int(self.batch_size) != expected_batch_size:
+            raise ValueError("`batch_size` must match EasyDeL `total_batch_size`.")
+        if self.local_batch_size is None:
+            self.local_batch_size = expected_batch_size
+        elif int(self.local_batch_size) != expected_batch_size:
+            raise ValueError("`local_batch_size` must match EasyDeL `total_batch_size`.")
+        expected_micro_batch_size = max(1, expected_batch_size // max(int(self.gradient_accumulation_steps), 1))
+        if self.micro_batch_size is None:
+            self.micro_batch_size = expected_micro_batch_size
+        elif int(self.micro_batch_size) != expected_micro_batch_size:
+            raise ValueError("`micro_batch_size` must match EasyDeL's derived micro batch size.")
+        if self.mini_batch_size is None:
+            self.mini_batch_size = expected_batch_size
+        elif int(self.mini_batch_size) != expected_batch_size:
+            raise ValueError("`mini_batch_size` must match EasyDeL `total_batch_size` when `num_mini_batches=1`.")
+        if self.local_mini_batch_size is None:
+            self.local_mini_batch_size = self.mini_batch_size
+        elif int(self.local_mini_batch_size) != int(self.mini_batch_size):
+            raise ValueError("`local_mini_batch_size` must match `mini_batch_size` when `world_size=1`.")
         if self.generation_temperature is None:
             self.generation_temperature = self.temperature
+        if self.stop_token_id is not None:
+            generation_extra_kwargs = dict(self.generation_extra_kwargs or {})
+            generation_extra_kwargs.setdefault("eos_token_id", int(self.stop_token_id))
+            self.generation_extra_kwargs = generation_extra_kwargs
         if self.entropy_coef is not None:
             normalized_entropy_coef = float(self.entropy_coef)
             self.entropy_coef = normalized_entropy_coef if normalized_entropy_coef > 0.0 else None
