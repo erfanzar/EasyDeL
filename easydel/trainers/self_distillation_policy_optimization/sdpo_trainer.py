@@ -39,6 +39,7 @@ Algorithmically, SDPO is identical to GRPO except that:
 
 from __future__ import annotations
 
+import re
 import typing as tp
 from functools import partial
 
@@ -82,6 +83,23 @@ _FEEDBACK_CORRECT = "Your previous attempt was correct.\n"
 _FEEDBACK_TEMPLATE_SOLUTION = "Correct solution:\n{solution}\n\n"
 _FEEDBACK_TEMPLATE_ENV = "The following is feedback from your unsuccessful earlier attempt:\n{feedback}\n\n"
 _FEEDBACK_TEMPLATE_SOLVE = "Correctly solve the original question.\n"
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _format_sdpo_template(template: str, **values: str) -> str:
+    """Format an SDPO prompt/feedback template with optional value keys."""
+    return template.format(
+        prompt=values.get("prompt", ""),
+        solution=values.get("solution", ""),
+        feedback=values.get("feedback", ""),
+        successful_previous_attempt=values.get("successful_previous_attempt", ""),
+        feedback_raw=values.get("feedback_raw", ""),
+    )
+
+
+def _strip_thinking_blocks(text: str) -> str:
+    """Remove XML-style thinking blocks before using generated feedback text."""
+    return _THINK_BLOCK_RE.sub("", text).strip()
 
 
 def _build_feedback_separator(
@@ -89,6 +107,11 @@ def _build_feedback_separator(
     is_successful: bool,
     env_feedback: str,
     correct_solution: str | None,
+    dont_reprompt_on_self_success: bool = False,
+    solution_template: str = _FEEDBACK_TEMPLATE_SOLUTION,
+    feedback_template: str = _FEEDBACK_TEMPLATE_ENV,
+    reprompt_template: str = "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE,
+    remove_thinking_from_demonstration: bool = False,
 ) -> str:
     """Return the text block inserted between the prompt and the completion.
 
@@ -102,16 +125,32 @@ def _build_feedback_separator(
     Returns:
         The separator string to be tokenised and inserted in the teacher input.
     """
+    if is_successful and dont_reprompt_on_self_success:
+        return ""
     if is_successful:
         return _FEEDBACK_CORRECT
 
-    parts: list[str] = []
+    solution_text = ""
     if correct_solution is not None:
-        parts.append(_FEEDBACK_TEMPLATE_SOLUTION.format(solution=correct_solution))
+        if remove_thinking_from_demonstration:
+            correct_solution = _strip_thinking_blocks(correct_solution)
+        solution_text = _format_sdpo_template(
+            solution_template,
+            solution=correct_solution,
+            successful_previous_attempt=correct_solution,
+        )
+    feedback_text = ""
     if env_feedback:
-        parts.append(_FEEDBACK_TEMPLATE_ENV.format(feedback=env_feedback))
-    parts.append(_FEEDBACK_TEMPLATE_SOLVE)
-    return "".join(parts)
+        feedback_text = _format_sdpo_template(
+            feedback_template,
+            feedback=env_feedback,
+            feedback_raw=env_feedback,
+        )
+    return _format_sdpo_template(
+        reprompt_template,
+        solution=solution_text,
+        feedback=feedback_text,
+    )
 
 
 @Registry.register("trainer", "sdpo")
@@ -263,7 +302,7 @@ class SDPOTrainer(GRPOTrainer):
                 even the prompt and completion (without any feedback).
         """
         base_len = int(self.arguments.max_prompt_length + self.arguments.max_completion_length)
-        requested_feedback_len = int(self.arguments.max_feedback_length)
+        requested_feedback_len = min(int(self.arguments.max_feedback_length), int(self.arguments.max_reprompt_len))
         requested_teacher_len = base_len + requested_feedback_len
 
         model_config = getattr(self.model_state.model, "config", None)
@@ -349,6 +388,7 @@ class SDPOTrainer(GRPOTrainer):
             self.teacher_prompt_length,
             self.arguments.beta,
             self.arguments.distillation_type,
+            self.arguments.distillation_weight,
             self.arguments.logprob_vocab_chunk_size,
             self.arguments.max_loss_completion_tokens,
             self.arguments.completion_chunk_size,
@@ -357,9 +397,23 @@ class SDPOTrainer(GRPOTrainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        static_argnames = tuple(range(2, 15))
+        num_loss_tokens_to_skip = int(getattr(self.arguments, "num_loss_tokens_to_skip", 0) or 0)
+        full_logit_distillation = bool(self.arguments.full_logit_distillation)
+        distillation_topk = self.arguments.distillation_topk
+        distillation_is_clip = self.arguments.distillation_is_clip
+        distillation_add_tail = bool(self.arguments.distillation_add_tail)
+        static_argnames = tuple(range(2, 21))
 
-        self._train_shared_fn_static_args = (*shared_static, True, straight_through_emulator)
+        self._train_shared_fn_static_args = (
+            *shared_static,
+            True,
+            straight_through_emulator,
+            num_loss_tokens_to_skip,
+            full_logit_distillation,
+            distillation_topk,
+            distillation_is_clip,
+            distillation_add_tail,
+        )
 
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
@@ -373,7 +427,16 @@ class SDPOTrainer(GRPOTrainer):
         )
         self._runtime_trace("train.compile_wrapper.end")
 
-        self._eval_shared_fn_static_args = (*shared_static, False, straight_through_emulator)
+        self._eval_shared_fn_static_args = (
+            *shared_static,
+            False,
+            straight_through_emulator,
+            num_loss_tokens_to_skip,
+            full_logit_distillation,
+            distillation_topk,
+            distillation_is_clip,
+            distillation_add_tail,
+        )
 
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
@@ -474,6 +537,14 @@ class SDPOTrainer(GRPOTrainer):
             interface consistency with the rich-feedback path.
         """
         rewards_np = np.asarray(jax.device_get(rewards))
+        arguments = getattr(self, "arguments", None)
+        threshold = float(getattr(arguments, "success_reward_threshold", 0.0))
+        use_successful_as_teacher = bool(getattr(arguments, "use_successful_as_teacher", True))
+        dont_reprompt_on_self_success = bool(getattr(arguments, "dont_reprompt_on_self_success", False))
+        solution_template = getattr(arguments, "solution_template", _FEEDBACK_TEMPLATE_SOLUTION)
+        feedback_template = getattr(arguments, "feedback_template", _FEEDBACK_TEMPLATE_ENV)
+        reprompt_template = getattr(arguments, "reprompt_template", "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE)
+        remove_thinking = bool(getattr(arguments, "remove_thinking_from_demonstration", False))
         n_prompts = len(completions) // generation_factor
         feedback_texts: list[str] = []
         env_feedbacks: list[str] = [""] * len(completions)
@@ -486,14 +557,19 @@ class SDPOTrainer(GRPOTrainer):
             best_idx = int(np.argmax(group_rewards))
             best_reward = group_rewards[best_idx]
             best_completion = group_completions[best_idx]
-            correct_solution = best_completion if best_reward > 0 else None
+            correct_solution = best_completion if use_successful_as_teacher and best_reward > threshold else None
 
             for j in range(generation_factor):
-                is_successful = bool(group_rewards[j] > 0)
+                is_successful = bool(group_rewards[j] > threshold)
                 sep = _build_feedback_separator(
                     is_successful=is_successful,
                     env_feedback="",
                     correct_solution=correct_solution if not is_successful else None,
+                    dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                    solution_template=solution_template,
+                    feedback_template=feedback_template,
+                    reprompt_template=reprompt_template,
+                    remove_thinking_from_demonstration=remove_thinking,
                 )
                 feedback_texts.append(sep)
 
@@ -517,6 +593,12 @@ class SDPOTrainer(GRPOTrainer):
             List of feedback separator strings, one per completion.
         """
         rewards_list = [float(r) for r in jax.device_get(rewards)]
+        arguments = getattr(self, "arguments", None)
+        threshold = float(getattr(arguments, "success_reward_threshold", 0.0))
+        include_environment_feedback = bool(getattr(arguments, "include_environment_feedback", True))
+        feedback_template = getattr(arguments, "feedback_template", _FEEDBACK_TEMPLATE_ENV)
+        reprompt_template = getattr(arguments, "reprompt_template", "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE)
+        dont_reprompt_on_self_success = bool(getattr(arguments, "dont_reprompt_on_self_success", False))
         raw_feedbacks = self.feedback_func(
             prompts=(
                 completion_prompts if isinstance(completion_prompts[0], str) else [str(p) for p in completion_prompts]
@@ -526,11 +608,14 @@ class SDPOTrainer(GRPOTrainer):
         )
         feedback_texts = []
         for raw_fb, reward in zip(raw_feedbacks, rewards_list, strict=False):
-            is_successful = reward > 0
+            is_successful = reward > threshold
             sep = _build_feedback_separator(
                 is_successful=is_successful,
-                env_feedback=raw_fb or "",
+                env_feedback=(raw_fb or "") if include_environment_feedback else "",
                 correct_solution=None,
+                dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                feedback_template=feedback_template,
+                reprompt_template=reprompt_template,
             )
             feedback_texts.append(sep)
         return feedback_texts
@@ -657,6 +742,7 @@ class SDPOTrainer(GRPOTrainer):
                     apply_chat_template=False,
                     shard_inputs=False,
                     all_gather=False,
+                    config_overrides={"num_return_sequences": int(self.num_generations)},
                 )
                 sequences = results.sequences
                 prompt_ids = results.prompt_ids

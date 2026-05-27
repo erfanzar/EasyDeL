@@ -112,6 +112,100 @@ class SDPOConfig(GRPOConfig):
         },
     )
 
+    distillation_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight applied to the SDPO self-distillation loss term."},
+    )
+    distillation_alpha: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "TRL-style divergence interpolation alias. None keeps `distillation_type`; "
+                "0.5 selects JSD and 1.0 selects KL in EasyDeL's sampled-token SDPO path."
+            )
+        },
+    )
+    distillation_topk: int | None = field(
+        default=None,
+        metadata={"help": "Top-k teacher support used by full-logit SDPO distillation."},
+    )
+    full_logit_distillation: bool = field(
+        default=False,
+        metadata={"help": "Whether to compute SDPO divergence over the full vocabulary instead of sampled tokens."},
+    )
+    distillation_is_clip: float | None = field(
+        default=None,
+        metadata={"help": "Optional per-token SDPO loss/importance clip."},
+    )
+    distillation_add_tail: bool = field(
+        default=False,
+        metadata={"help": "Add a tail probability bucket when `distillation_topk` is used."},
+    )
+    sdpo_policy_loss_mode: str = field(
+        default="distillation_only",
+        metadata={"help": "How to combine SDPO and policy losses. EasyDeL currently supports `distillation_only`."},
+    )
+    teacher_regularization: str = field(
+        default="none",
+        metadata={"help": "Teacher/reference update strategy. `ema` enables reference-model EMA sync."},
+    )
+    teacher_update_rate: float | None = field(
+        default=None,
+        metadata={"help": "EMA teacher update rate used when `teacher_regularization='ema'`."},
+    )
+    ema_update_rate: float = field(
+        default=0.05,
+        metadata={"help": "Deprecated TRL alias for `teacher_update_rate`."},
+    )
+    max_reprompt_len: int = field(
+        default=10240,
+        metadata={"help": "Maximum tokenized reprompt length before appending the sampled completion."},
+    )
+    use_successful_as_teacher: bool = field(
+        default=True,
+        metadata={"help": "Use successful rollouts from the same generation group as teacher demonstrations."},
+    )
+    success_reward_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Strict reward threshold above which a rollout is considered successful."},
+    )
+    dont_reprompt_on_self_success: bool = field(
+        default=False,
+        metadata={"help": "If True, successful samples are not reprompted with the success marker."},
+    )
+    reprompt_template: str = field(
+        default="{solution}{feedback}Correctly solve the original question.\n",
+        metadata={"help": "Template used to combine solution and environment feedback text."},
+    )
+    solution_template: str = field(
+        default="Correct solution:\n{successful_previous_attempt}\n\n",
+        metadata={"help": "Template used to format a successful demonstration."},
+    )
+    feedback_template: str = field(
+        default="The following is feedback from your unsuccessful earlier attempt:\n{feedback_raw}\n\n",
+        metadata={"help": "Template used to format environment feedback."},
+    )
+    include_environment_feedback: bool = field(
+        default=True,
+        metadata={"help": "Whether rich feedback strings are included in SDPO reprompts."},
+    )
+    environment_feedback_only_without_solution: bool = field(
+        default=False,
+        metadata={"help": "Use environment feedback only when no successful same-group solution is available."},
+    )
+    remove_thinking_from_demonstration: bool = field(
+        default=False,
+        metadata={"help": "Remove `<think>...</think>` blocks from successful demonstrations."},
+    )
+    diagnostics_warning_interval: int = field(
+        default=10,
+        metadata={"help": "Reserved interval for SDPO diagnostics warnings. Set 0 to disable."},
+    )
+    diagnostics_flat_tolerance: float = field(
+        default=1e-8,
+        metadata={"help": "Tolerance used by SDPO diagnostics to treat fractions as zero."},
+    )
+
     beta: float = field(
         default=0.0,
         metadata={
@@ -145,8 +239,49 @@ class SDPOConfig(GRPOConfig):
         Raises:
             ValueError: If ``distillation_type`` is not ``'kl'`` or ``'jsd'``.
         """
+        if self.teacher_update_rate is None:
+            self.teacher_update_rate = self.ema_update_rate
+        if self.distillation_alpha is not None:
+            if self.distillation_alpha == 0.5:
+                self.distillation_type = "jsd"
+            elif self.distillation_alpha == 1.0:
+                self.distillation_type = "kl"
+            else:
+                raise ValueError(
+                    "EasyDeL SDPO only supports token-level `distillation_alpha` values 0.5 (JSD) and 1.0 (KL)."
+                )
         if self.distillation_type not in ("kl", "jsd"):
             raise ValueError(f"`distillation_type` must be 'kl' or 'jsd', got '{self.distillation_type}'.")
+        if self.distillation_weight < 0.0:
+            raise ValueError("`distillation_weight` must be non-negative.")
+        if self.distillation_topk is not None:
+            if self.distillation_topk <= 0:
+                raise ValueError("`distillation_topk` must be positive when set.")
+            self.distillation_topk = int(self.distillation_topk)
+            self.full_logit_distillation = True
+        if self.distillation_is_clip is not None:
+            if self.distillation_is_clip <= 0.0:
+                raise ValueError("`distillation_is_clip` must be positive when set.")
+            self.distillation_is_clip = float(self.distillation_is_clip)
+        if self.distillation_add_tail and self.distillation_topk is None:
+            raise ValueError(
+                "`distillation_add_tail=True` requires `distillation_topk` so the non-top-k mass has a tail bucket."
+            )
+        if self.sdpo_policy_loss_mode != "distillation_only":
+            raise ValueError("EasyDeL SDPO currently supports only `sdpo_policy_loss_mode='distillation_only'`.")
+        if self.teacher_regularization not in {"none", "ema"}:
+            raise ValueError("`teacher_regularization` must be either 'none' or 'ema'.")
+        if not (0.0 <= self.teacher_update_rate <= 1.0):
+            raise ValueError("`teacher_update_rate` must be in [0, 1].")
+        if self.teacher_regularization == "ema":
+            self.sync_ref_model = True
+            self.ref_model_mixup_alpha = float(self.teacher_update_rate)
+        if self.max_reprompt_len <= 0:
+            raise ValueError("`max_reprompt_len` must be positive.")
+        if self.diagnostics_warning_interval < 0:
+            raise ValueError("`diagnostics_warning_interval` must be non-negative.")
+        if self.diagnostics_flat_tolerance < 0:
+            raise ValueError("`diagnostics_flat_tolerance` must be non-negative.")
         super().__post_init__(
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
