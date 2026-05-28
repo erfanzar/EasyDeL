@@ -207,8 +207,8 @@ def test_distillation_requires_initialized_teacher():
 def test_distillation_trl_compat_fields_are_guarded():
     unsupported_cases = [
         ("lmbda", {"lmbda": 0.5}),
-        ("max_prompt_length", {"max_prompt_length": 128}),
-        ("max_completion_length", {"max_completion_length": 64}),
+        ("max_prompt_length", {"max_prompt_length": 512}),
+        ("max_completion_length", {"max_completion_length": 512}),
         ("num_generations", {"num_generations": 2}),
         ("generation_batch_size", {"generation_batch_size": 4}),
         ("On-policy sampling", {"top_p": 0.9}),

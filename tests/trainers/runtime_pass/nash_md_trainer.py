@@ -48,9 +48,9 @@ def main():
     reference_model = None if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT") else load_causal_lm_model()
 
     overrides = {
-        "max_prompt_length": 64,
-        "max_completion_length": 32,
-        "max_length": 96,
+        "max_prompt_length": 512,
+        "max_completion_length": 512,
+        "max_length": 1024,
         "num_train_epochs": 1,
         "total_batch_size": 2,
     }

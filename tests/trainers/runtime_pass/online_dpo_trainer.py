@@ -38,7 +38,7 @@ def main():
     args = make_config(
         ed.OnlineDPOConfig,
         "online-dpo",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96, "max_new_tokens": 32},
+        overrides={"max_prompt_length": 512, "max_completion_length": 512, "max_length": 1024, "max_new_tokens": 512},
     )
     trainer = ed.OnlineDPOTrainer(
         arguments=args,

@@ -38,7 +38,7 @@ def main():
     args = make_config(
         ed.PRMConfig,
         "prm",
-        overrides={"total_batch_size": 1, "max_length": MAX_TOTAL_LENGTH, "max_completion_length": 256},
+        overrides={"total_batch_size": 1, "max_length": MAX_TOTAL_LENGTH, "max_completion_length": 512},
     )
     trainer = ed.PRMTrainer(
         arguments=args,

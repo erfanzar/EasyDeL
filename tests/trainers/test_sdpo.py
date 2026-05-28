@@ -48,7 +48,7 @@ class TestSDPOConfig:
     """SDPOConfig instantiation and validation."""
 
     def test_defaults(self):
-        cfg = SDPOConfig(max_prompt_length=128, max_completion_length=64)
+        cfg = SDPOConfig(max_prompt_length=512, max_completion_length=512)
         assert cfg.distillation_type == "jsd"
         assert cfg.beta == 0.0
         assert cfg.max_feedback_length == 256
@@ -59,29 +59,29 @@ class TestSDPOConfig:
         assert cfg.teacher_regularization == "none"
 
     def test_max_length_derived(self):
-        cfg = SDPOConfig(max_prompt_length=128, max_completion_length=64)
-        assert cfg.max_length == 128 + 64
+        cfg = SDPOConfig(max_prompt_length=512, max_completion_length=512)
+        assert cfg.max_length == 512 + 512
 
     def test_invalid_distillation_type(self):
         with pytest.raises(ValueError, match="distillation_type"):
             SDPOConfig(
-                max_prompt_length=128,
-                max_completion_length=64,
+                max_prompt_length=512,
+                max_completion_length=512,
                 distillation_type="mse",
             )
 
     def test_kl_distillation_type(self):
         cfg = SDPOConfig(
-            max_prompt_length=128,
-            max_completion_length=64,
+            max_prompt_length=512,
+            max_completion_length=512,
             distillation_type="kl",
         )
         assert cfg.distillation_type == "kl"
 
     def test_inherits_grpo_fields(self):
         cfg = SDPOConfig(
-            max_prompt_length=128,
-            max_completion_length=64,
+            max_prompt_length=512,
+            max_completion_length=512,
             num_generations=8,
             temperature=0.9,
         )
@@ -90,28 +90,29 @@ class TestSDPOConfig:
 
     def test_distillation_alpha_aliases_supported_token_losses(self):
         assert (
-            SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_alpha=0.5).distillation_type
+            SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_alpha=0.5).distillation_type
             == "jsd"
         )
         assert (
-            SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_alpha=1.0).distillation_type == "kl"
+            SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_alpha=1.0).distillation_type
+            == "kl"
         )
 
     def test_unsupported_sdpo_modes_fail_loudly(self):
         with pytest.raises(ValueError, match="distillation_alpha"):
-            SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_alpha=0.0)
-        cfg = SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_topk=10)
+            SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_alpha=0.0)
+        cfg = SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_topk=10)
         assert cfg.full_logit_distillation is True
         assert cfg.distillation_topk == 10
-        assert SDPOConfig(max_prompt_length=128, max_completion_length=64, full_logit_distillation=True)
-        assert SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_is_clip=2.0)
+        assert SDPOConfig(max_prompt_length=512, max_completion_length=512, full_logit_distillation=True)
+        assert SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_is_clip=2.0)
         with pytest.raises(ValueError, match="distillation_topk"):
-            SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_topk=0)
+            SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_topk=0)
         with pytest.raises(ValueError, match="distillation_add_tail"):
-            SDPOConfig(max_prompt_length=128, max_completion_length=64, distillation_add_tail=True)
+            SDPOConfig(max_prompt_length=512, max_completion_length=512, distillation_add_tail=True)
         with pytest.raises(ValueError, match="sdpo_policy_loss_mode"):
-            SDPOConfig(max_prompt_length=128, max_completion_length=64, sdpo_policy_loss_mode="hybrid")
-        ema_cfg = SDPOConfig(max_prompt_length=128, max_completion_length=64, teacher_regularization="ema")
+            SDPOConfig(max_prompt_length=512, max_completion_length=512, sdpo_policy_loss_mode="hybrid")
+        ema_cfg = SDPOConfig(max_prompt_length=512, max_completion_length=512, teacher_regularization="ema")
         assert ema_cfg.sync_ref_model is True
         assert ema_cfg.ref_model_mixup_alpha == ema_cfg.teacher_update_rate
 

@@ -672,7 +672,7 @@ def test_seq_kd_transform_passes_tools_to_chat_template():
     trainer = SeqKDTrainer.__new__(SeqKDTrainer)
     trainer.processing_class = tokenizer
     trainer.arguments = SimpleNamespace(
-        max_prompt_length=32,
+        max_prompt_length=512,
         skip_apply_chat_template=False,
         tools=[{"type": "function", "function": {"name": "lookup"}}],
     )
@@ -727,7 +727,7 @@ def test_seq_kd_transform_uses_example_tools_when_present():
     trainer = SeqKDTrainer.__new__(SeqKDTrainer)
     trainer.processing_class = tokenizer
     trainer.arguments = SimpleNamespace(
-        max_prompt_length=16,
+        max_prompt_length=512,
         skip_apply_chat_template=False,
         tools=None,
     )
@@ -776,7 +776,7 @@ def test_seq_kd_teacher_fn_repeats_prompts_for_multi_generation():
     trainer = SeqKDTrainer.__new__(SeqKDTrainer)
     trainer.processing_class = _Tokenizer()
     trainer.arguments = SimpleNamespace(
-        max_completion_length=4,
+        max_completion_length=512,
         generation_num_return_sequences=3,
         num_generations_per_prompt=3,
     )
@@ -836,7 +836,7 @@ def test_seq_kd_teacher_fn_validates_multi_generation_length():
     trainer = SeqKDTrainer.__new__(SeqKDTrainer)
     trainer.processing_class = _Tokenizer()
     trainer.arguments = SimpleNamespace(
-        max_completion_length=4,
+        max_completion_length=512,
         generation_num_return_sequences=2,
         num_generations_per_prompt=2,
     )

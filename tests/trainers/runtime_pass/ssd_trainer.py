@@ -30,7 +30,7 @@ def main():
     args = make_config(
         ed.SSDConfig,
         "ssd",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96},
+        overrides={"max_prompt_length": 512, "max_completion_length": 512, "max_length": 1024},
     )
     trainer = ed.SSDTrainer(
         arguments=args,

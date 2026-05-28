@@ -38,7 +38,7 @@ def main():
     args = make_config(
         ed.GSPOTokenConfig,
         "gspo-token",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96, "total_batch_size": 1},
+        overrides={"max_prompt_length": 512, "max_completion_length": 512, "max_length": 1024, "total_batch_size": 1},
     )
     trainer = ed.GSPOTokenTrainer(
         arguments=args,

@@ -639,19 +639,19 @@ class TestDPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
-        assert transform._max_prompt_length == 256
-        assert transform._max_completion_length == 128
+        assert transform._max_prompt_length == 512
+        assert transform._max_completion_length == 512
 
     def test_preference_example(self):
         """Test processing a preference example."""
         tokenizer = MockTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         example = {
@@ -670,8 +670,8 @@ class TestDPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         example = {
@@ -694,8 +694,8 @@ class TestDPOPreprocessTransform:
         tokenizer = ToolAwareTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         tools = [{"type": "function", "function": {"name": "lookup"}}]
@@ -720,8 +720,8 @@ class TestDPOPreprocessTransform:
         tokenizer = ToolAwareTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -750,8 +750,8 @@ class TestDPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -778,8 +778,8 @@ class TestDPOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -805,8 +805,8 @@ class TestDPOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = DPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -840,18 +840,18 @@ class TestORPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = ORPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
-        assert transform._max_prompt_length == 256
+        assert transform._max_prompt_length == 512
 
     def test_preference_example(self):
         """Test processing a preference example."""
         tokenizer = MockTokenizer()
         transform = ORPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         example = {
@@ -869,8 +869,8 @@ class TestORPOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = ORPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -905,8 +905,8 @@ class TestCPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = CPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         example = {
@@ -924,8 +924,8 @@ class TestCPOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = CPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -956,19 +956,19 @@ class TestKTOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = KTOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
-        assert transform._max_prompt_length == 256
-        assert transform._max_completion_length == 128
+        assert transform._max_prompt_length == 512
+        assert transform._max_completion_length == 512
 
     def test_kto_example(self):
         """Test processing a KTO example with binary label."""
         tokenizer = MockTokenizer()
         transform = KTOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         example = {
@@ -986,8 +986,8 @@ class TestKTOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = KTOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -1011,8 +1011,8 @@ class TestKTOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = KTOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = transform(
@@ -1040,8 +1040,8 @@ class TestKTOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = KTOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
         repr_str = repr(transform)
         assert "KTOPreprocessTransform" in repr_str
@@ -1055,8 +1055,8 @@ class TestBCOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = BCOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         example = {
@@ -1076,8 +1076,8 @@ class TestBCOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = BCOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = next(
@@ -1099,8 +1099,8 @@ class TestBCOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = BCOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         result = next(
@@ -1128,8 +1128,8 @@ class TestBCOPreprocessTransform:
         tokenizer = ToolAwareTokenizer()
         transform = BCOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         tools = [{"type": "function", "function": {"name": "lookup"}}]
@@ -1157,8 +1157,8 @@ class TestBCOPreprocessTransform:
         tokenizer = StrictChatTokenizer()
         transform = BCOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=256,
-            max_completion_length=128,
+            max_prompt_length=512,
+            max_completion_length=512,
         )
 
         results = list(
@@ -1281,7 +1281,7 @@ class TestGRPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = GRPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=32,
+            max_prompt_length=512,
         )
 
         example = {
@@ -1299,7 +1299,7 @@ class TestGRPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = GRPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=16,
+            max_prompt_length=512,
         )
 
         result = transform({"prompt": ""})
@@ -1311,7 +1311,7 @@ class TestGRPOPreprocessTransform:
         tokenizer = MockTokenizer()
         transform = GRPOPreprocessTransform(
             tokenizer=tokenizer,
-            max_prompt_length=16,
+            max_prompt_length=512,
         )
 
         example = {

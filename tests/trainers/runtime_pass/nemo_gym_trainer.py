@@ -41,7 +41,12 @@ def main():
     args = make_config(
         ed.NeMoGymConfig,
         "nemo-gym",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96, "num_generations_eval": 1},
+        overrides={
+            "max_prompt_length": 512,
+            "max_completion_length": 512,
+            "max_length": 1024,
+            "num_generations_eval": 1,
+        },
     )
     dataset = Dataset.from_list(
         [

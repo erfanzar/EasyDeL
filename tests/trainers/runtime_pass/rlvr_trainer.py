@@ -63,9 +63,9 @@ def main():
         ed.RLVRConfig,
         "rlvr-gsm8k",
         overrides={
-            "max_prompt_length": 64,
-            "max_completion_length": 32,
-            "max_length": 96,
+            "max_prompt_length": 512,
+            "max_completion_length": 512,
+            "max_length": 1024,
             "num_generations": 3,
             "num_return_sequences": 3,
             "answer_key": "answer",

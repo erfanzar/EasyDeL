@@ -39,9 +39,9 @@ def main():
         ed.SDFTConfig,
         "sdft",
         overrides={
-            "max_prompt_length": 64,
-            "max_completion_length": 32,
-            "max_length": 96,
+            "max_prompt_length": 512,
+            "max_completion_length": 512,
+            "max_length": 1024,
             "max_feedback_length": 32,
             "num_generations": 1,
             "num_return_sequences": 1,

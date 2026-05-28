@@ -1172,7 +1172,7 @@ def test_prepare_generation_input_prefers_max_prompt_length_for_preview_padding(
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         max_length=16,
-        max_prompt_length=8,
+        max_prompt_length=512,
         generation_dataset_prompt_field="prompt",
     )
 

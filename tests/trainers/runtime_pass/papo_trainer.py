@@ -38,7 +38,7 @@ def main():
     args = make_config(
         ed.PAPOConfig,
         "papo",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96},
+        overrides={"max_prompt_length": 512, "max_completion_length": 512, "max_length": 1024},
     )
     trainer = ed.PAPOTrainer(
         arguments=args,

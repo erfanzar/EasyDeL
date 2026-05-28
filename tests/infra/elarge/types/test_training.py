@@ -203,11 +203,11 @@ def test_normalize_trainer_config_auto_computes_max_completion_length_for_dpo():
     out = normalize_trainer_config(
         {
             "trainer_type": "dpo",
-            "max_length": 800,
-            "max_prompt_length": 200,
+            "max_length": 1024,
+            "max_prompt_length": 512,
         }
     )
-    assert out["max_completion_length"] == 600
+    assert out["max_completion_length"] == 512
 
 
 def test_normalize_trainer_config_skips_completion_for_sft():
@@ -215,8 +215,8 @@ def test_normalize_trainer_config_skips_completion_for_sft():
     out = normalize_trainer_config(
         {
             "trainer_type": "sft",
-            "max_length": 800,
-            "max_prompt_length": 200,
+            "max_length": 1024,
+            "max_prompt_length": 512,
         }
     )
     assert "max_completion_length" not in out or out.get("max_completion_length") is None

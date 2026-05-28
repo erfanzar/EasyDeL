@@ -66,11 +66,11 @@ def main() -> None:
         ed.PPOConfig,
         "proximal-policy-optimization",
         overrides={
-            "max_prompt_length": 128,
+            "max_prompt_length": 512,
             # Keep total sequence lengths TPU-friendly (blocksparse kernels often
             # require multiples of 128).
-            "max_completion_length": 128,
-            "max_length": 256,
+            "max_completion_length": 512,
+            "max_length": 1024,
             "num_return_sequences": 2,
             "generation_num_return_sequences": 2,
             "use_esurge_generation": True,

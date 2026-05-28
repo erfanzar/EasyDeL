@@ -208,13 +208,13 @@ def main():
         return GSM8KCodeEnvironment(questions=questions, answers=answers)
 
     python_tool = PythonCodeTool(timeout=5.0, max_output_length=2048)
-    max_length = 96
+    max_length = 1024
     trainer_args = make_config(
         ed.AgenticMoshPitConfig,
         "agentic-moshpit-gsm8k",
         overrides={
-            "max_prompt_length": 64,
-            "max_completion_length": 32,
+            "max_prompt_length": 512,
+            "max_completion_length": 512,
             "max_length": max_length,
             "max_steps": 1,
             "group_size": 2,

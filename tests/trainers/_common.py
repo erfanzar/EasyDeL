@@ -45,9 +45,9 @@ PREFERENCE_SPLIT = os.environ.get("EASYDEL_RUNTIME_DATASET_SPLIT") or (
     if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
     else "train[:50%]"
 )
-MAX_PROMPT_LENGTH = 256
-MAX_COMPLETION_LENGTH = 256
-MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH  # 512, divisible by 128
+MAX_PROMPT_LENGTH = 512
+MAX_COMPLETION_LENGTH = 512
+MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH  # 1024, divisible by 128
 MAX_TRAINING_STEP = 1024
 SAVE_ROOT = Path("tmp-files") / "trainer-smoke-tests"
 
@@ -242,9 +242,9 @@ def make_config(
             {
                 "total_batch_size": 1,
                 "gradient_accumulation_steps": 1,
-                "max_prompt_length": 32,
-                "max_completion_length": 8,
-                "max_length": 40,
+                "max_prompt_length": 512,
+                "max_completion_length": 512,
+                "max_length": 1024,
                 "generation_num_return_sequences": 1,
                 "generation_interval": 1_000_000,
                 "num_return_sequences": 1,

@@ -56,9 +56,9 @@ def main():
         ed.SeqKDConfig,
         "seq-kd",
         overrides={
-            "max_prompt_length": 64,
-            "max_completion_length": 32,
-            "max_length": 96,
+            "max_prompt_length": 512,
+            "max_completion_length": 512,
+            "max_length": 1024,
             "num_generations": 1,
             "num_return_sequences": 1,
             "num_generations_per_prompt": 1,

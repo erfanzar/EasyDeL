@@ -53,9 +53,9 @@ def main():
         overrides={
             "alpha": 0.9,
             "temperature": 2.0,
-            "max_prompt_length": 64,
-            "max_completion_length": 32,
-            "max_length": 96,
+            "max_prompt_length": 512,
+            "max_completion_length": 512,
+            "max_length": 1024,
             "num_generations": 1,
             "num_return_sequences": 1,
             "num_generations_per_prompt": 1,

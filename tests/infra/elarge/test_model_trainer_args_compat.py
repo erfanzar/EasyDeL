@@ -322,8 +322,8 @@ def test_ppo_penalties_inherit_into_generation_preview_fields():
     args = args_cls(
         model_name="dummy",
         total_batch_size=1,
-        max_length=256,
-        max_prompt_length=128,
+        max_length=1024,
+        max_prompt_length=512,
         presence_penalty=0.4,
         frequency_penalty=0.2,
         repetition_penalty=1.3,

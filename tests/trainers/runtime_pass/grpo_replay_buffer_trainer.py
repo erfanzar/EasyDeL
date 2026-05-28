@@ -38,7 +38,7 @@ def main():
     args = make_config(
         ed.GRPOWithReplayBufferConfig,
         "grpo-replay-buffer",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96, "replay_buffer_size": 8},
+        overrides={"max_prompt_length": 512, "max_completion_length": 512, "max_length": 1024, "replay_buffer_size": 8},
     )
     trainer = ed.GRPOWithReplayBufferTrainer(
         arguments=args,

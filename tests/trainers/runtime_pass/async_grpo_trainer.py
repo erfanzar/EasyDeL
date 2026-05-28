@@ -38,7 +38,7 @@ def main():
     args = make_config(
         ed.AsyncGRPOConfig,
         "async-grpo",
-        overrides={"max_prompt_length": 64, "max_completion_length": 32, "max_length": 96},
+        overrides={"max_prompt_length": 512, "max_completion_length": 512, "max_length": 1024},
     )
     trainer = ed.AsyncGRPOTrainer(
         arguments=args,
