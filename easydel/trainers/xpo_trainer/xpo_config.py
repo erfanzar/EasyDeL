@@ -142,10 +142,15 @@ class XPOConfig(GRPOConfig):
             self.alpha = self.alpha[0]
         if isinstance(self.beta, collections.abc.Sequence) and len(self.beta) == 1:
             self.beta = self.beta[0]
-        if hasattr(super(), "__post_init__"):
-            super().__post_init__(
-                max_sequence_length=None,
-                quantization_block=quantization_block,
-            )
+        xpo_loss_type = self.loss_type
+        self.loss_type = "grpo"
+        try:
+            if hasattr(super(), "__post_init__"):
+                super().__post_init__(
+                    max_sequence_length=None,
+                    quantization_block=quantization_block,
+                )
+        finally:
+            self.loss_type = xpo_loss_type
 
     __hash__ = hash_fn

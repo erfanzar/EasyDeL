@@ -403,7 +403,8 @@ def xpo_step(
         with jax.named_scope(scope_root + "/loss_fn/compute_xpo_loss"):
             loss_type = minibatch["loss_type"][0]
             sigmoid_losses = -jnn.log_sigmoid(beta * logits)
-            ipo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
+            safe_beta = jnp.where(beta == 0, jnp.ones_like(beta), beta)
+            ipo_losses = (logits - 1.0 / (2.0 * safe_beta)) ** 2
             dpo_losses = jnp.where(loss_type == 0, sigmoid_losses, ipo_losses)
 
             xpo_losses = alpha * policy_logps_ref
@@ -514,7 +515,8 @@ def _xpo_loss_from_logps(
     rejected_log_ratio = rejected_policy_logps - rejected_ref_logps
     logits = chosen_log_ratio - rejected_log_ratio
     sigmoid_losses = -jnn.log_sigmoid(beta * logits)
-    ipo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
+    safe_beta = jnp.where(beta == 0, jnp.ones_like(beta), beta)
+    ipo_losses = (logits - 1.0 / (2.0 * safe_beta)) ** 2
     dpo_losses = jnp.where(loss_type == 0, sigmoid_losses, ipo_losses)
     xpo_losses = alpha * policy_logps_ref
     return (dpo_losses + xpo_losses).mean()
