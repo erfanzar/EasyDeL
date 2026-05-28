@@ -25,17 +25,24 @@ sequences into fixed-length blocks.  Public entry point is
 from __future__ import annotations
 
 import typing as tp
+from pathlib import Path
 
 import numpy as np
 from eformer.loggings import get_logger
+from transformers import AutoTokenizer
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
+from ..model_loading import reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
+from ..trainer._fn import evaluation_step, training_step
+from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM, get_formatting_func_from_dataset
 from .sft_config import SFTConfig
 
@@ -125,13 +132,10 @@ class SFTTrainer(Trainer):
                 ``None``, an automatic formatter is inferred from the
                 dataset (when possible).
             data_collator (DataCollatorForCompletionOnlyLM | None):
-                Optional completion-only data collator. Allowed only
-                when ``arguments.packing`` is True.
+                Optional completion-only data collator.
 
         Raises:
             TypeError: If ``arguments`` is not an :class:`SFTConfig`.
-            ValueError: If ``data_collator`` is supplied while
-                ``arguments.packing`` is False.
         """
         if not isinstance(arguments, SFTConfig):
             raise TypeError("passed argument must be a `SFTConfig`.")
@@ -139,6 +143,9 @@ class SFTTrainer(Trainer):
         tokenizer = processing_class
         if hasattr(processing_class, "tokenizer"):
             tokenizer = processing_class.tokenizer
+        self._apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
+        if arguments.chat_template_path is not None:
+            self._apply_chat_template_path(tokenizer, arguments.chat_template_path)
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -146,18 +153,14 @@ class SFTTrainer(Trainer):
         if formatting_func is None and arguments.dataset_text_field is None and train_dataset is not None:
             formatting_func = get_formatting_func_from_dataset(train_dataset, processing_class)
 
-        if not arguments.packing and data_collator:
-            raise ValueError(
-                "You passed `packing=False` to the SFTTrainer, but you didn't pass a "
-                "`dataset_text_field` or `formatting_func` argument."
-            )
-
         # Store for use in _get_preprocess_transform
         self.arguments = arguments
         self.tokenizer = tokenizer
         self._formatting_func = formatting_func
         self._dataset_text_field = arguments.dataset_text_field
 
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
@@ -169,6 +172,14 @@ class SFTTrainer(Trainer):
             data_collator=data_collator,
             processing_class=processing_class,
         )
+
+    @staticmethod
+    def _apply_tokenizer_overrides(tokenizer: object, *, eos_token: str | None, pad_token: str | None) -> None:
+        """Apply configured tokenizer token overrides in-place."""
+        if eos_token is not None:
+            tokenizer.eos_token = eos_token
+        if pad_token is not None:
+            tokenizer.pad_token = pad_token
 
     def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
         """Build the lazy SFT preprocessing transform for the data source.
@@ -192,6 +203,10 @@ class SFTTrainer(Trainer):
             tokenized.
         """
 
+        dataset_kwargs = self.arguments.dataset_kwargs or {}
+        if bool(dataset_kwargs.get("skip_prepare_dataset", False)):
+            return None
+
         # Skip if already tokenized
         if self._is_pretokenized():
             return None
@@ -206,8 +221,29 @@ class SFTTrainer(Trainer):
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
             mask_prompt=mask_prompt,
+            padding=(
+                False
+                if getattr(self.arguments, "packing", False) or getattr(self.arguments, "padding_free", False)
+                else "max_length"
+            ),
+            truncation_mode=self.arguments.truncation_mode,
+            pad_to_multiple_of=self.arguments.pad_to_multiple_of,
             formatting_func=self._formatting_func,
         )
+
+    @staticmethod
+    def _apply_chat_template_path(tokenizer: object, chat_template_path: str) -> None:
+        """Assign a chat template from a local file or tokenizer source."""
+        path = Path(chat_template_path)
+        if path.is_file():
+            tokenizer.chat_template = path.read_text(encoding="utf-8")
+            return
+
+        template_tokenizer = AutoTokenizer.from_pretrained(chat_template_path)
+        chat_template = template_tokenizer.chat_template
+        if chat_template is None:
+            raise ValueError(f"No chat_template found at {chat_template_path!r}.")
+        tokenizer.chat_template = chat_template
 
     def _is_pretokenized(self) -> bool:
         """Detect whether the bound training source already exposes tokenised text.
@@ -276,6 +312,12 @@ class SFTTrainer(Trainer):
         # Map strategy names
         strategy_map = {"bfd": "first_fit", "wrapped": "greedy"}
         strategy = strategy_map.get(self.arguments.packing_strategy, "greedy")
+        preserve_completion_mask = bool(getattr(self.arguments, "assistant_only_loss", False))
+        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
+        if completion_only_loss is not None:
+            preserve_completion_mask = bool(completion_only_loss)
+        extra_field_pad_values = {"completion_mask": 0, "assistant_masks": 0} if preserve_completion_mask else None
+        extra_field_separator_values = {"completion_mask": 0, "assistant_masks": 0} if preserve_completion_mask else None
 
         # Apply packing to train source
         if self._train_source is not None:
@@ -286,6 +328,8 @@ class SFTTrainer(Trainer):
                 pad_token_id=pad_token_id,
                 strategy=strategy,
                 include_segment_ids=True,
+                extra_field_pad_values=extra_field_pad_values,
+                extra_field_separator_values=extra_field_separator_values,
             )
 
         # Apply packing to eval source if eval_packing is enabled
@@ -301,7 +345,60 @@ class SFTTrainer(Trainer):
                 pad_token_id=pad_token_id,
                 strategy=strategy,
                 include_segment_ids=True,
+                extra_field_pad_values=extra_field_pad_values,
+                extra_field_separator_values=extra_field_separator_values,
             )
+
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """Compile SFT train/eval steps with the active sharding and QAT config."""
+        empty_sharding = replicated_named_sharding(self.model.mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
+        self._train_shared_fn_static_args = (
+            self.arguments.loss_config,
+            self.scheduler,
+            self.arguments.step_partition_spec,
+            self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
+            self.arguments.loss_type,
+        )
+        sharded_training_step_function = compile_trainer_step(
+            training_step,
+            static_argnums=(2, 3, 4, 5, 6, 7),
+            in_shardings=(self.state_shardings, empty_sharding),
+            out_shardings=(self.state_shardings, empty_sharding),
+            donate_argnums=(0,),
+            schedule=self.arguments.mpmd_scheduler,
+            mesh=self.mesh,
+        )
+
+        self._eval_shared_fn_static_args = (
+            self.arguments.loss_config,
+            self.arguments.step_partition_spec,
+            self.arguments.loss_type,
+        )
+        sharded_evaluation_step_function = compile_trainer_step(
+            evaluation_step,
+            static_argnums=(2, 3, 4),
+            in_shardings=(self.state_shardings, empty_sharding),
+            out_shardings=empty_sharding,
+            schedule=self.arguments.mpmd_scheduler,
+            mesh=self.mesh,
+        )
+
+        self.arguments.ensure_checkpoint_path()
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+        return TrainerConfigureFunctionOutput(
+            sharded_training_step_function=sharded_training_step_function,
+            sharded_evaluation_step_function=sharded_evaluation_step_function,
+            mesh=self.model.mesh,
+            checkpoint_manager=checkpoint_manager,
+        )
 
     def _preprocess_batch_input(
         self,
@@ -332,7 +429,7 @@ class SFTTrainer(Trainer):
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 
         if "assistant_masks" in batch:
-            if "completion_mask" not in batch:
+            if "completion_mask" not in batch or not np.asarray(batch["completion_mask"]).any():
                 batch["completion_mask"] = batch["assistant_masks"]
             batch.pop("assistant_masks", None)
 
