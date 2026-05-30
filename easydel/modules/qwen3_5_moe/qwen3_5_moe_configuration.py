@@ -240,6 +240,9 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
         linear_attention_separate_proj: bool | None = None,
+        mtp_num_hidden_layers: int = 0,
+        mtp_use_dedicated_embeddings: bool = False,
+        mtp_loss_coef: float = 0.3,
         **kwargs,
     ):
         """Initialize Qwen3.5-MoE text config with hybrid attention and MoE parameters.
@@ -297,6 +300,12 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
             self.linear_attention_separate_proj = True
         else:
             self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
+        # Multi-Token-Prediction head config (DeepSeek-V3 style, depth-1). NOT forwarded to
+        # super().__init__ (Qwen3NextConfig does not accept these); stored here. The MTP head
+        # reuses qwen3_5's dense Qwen3_5MTPHead (see modeling_qwen3_5_moe).
+        self.mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        self.mtp_use_dedicated_embeddings = bool(mtp_use_dedicated_embeddings)
+        self.mtp_loss_coef = float(mtp_loss_coef)
         # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
 

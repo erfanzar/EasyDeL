@@ -16,12 +16,14 @@
 
 This module provides:
 - TransformedShardedSource: applies transforms during iteration
+- ShuffledShardedSource: globally shuffles rows via a streaming reservoir
 - LimitedShardedSource: caps the total number of rows exposed by a source
 """
 
 from __future__ import annotations
 
 import itertools
+import random
 import typing as tp
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
@@ -157,6 +159,192 @@ class TransformedShardedSource(ShardedDataSource[dict]):
             ``"TransformedShardedSource(<source>, <transform>)"``.
         """
         return f"TransformedShardedSource({self._source!r}, {self._transform!r})"
+
+
+class ShuffledShardedSource(ShardedDataSource[dict]):
+    """:class:`ShardedDataSource` wrapper that globally shuffles rows via a streaming reservoir.
+
+    Collapses the wrapped source into a single synthetic shard whose
+    iterator chains every underlying shard (optionally visiting the
+    shards in a shuffled order) and then draws rows through a
+    fixed-size reservoir, so the emitted order is decorrelated from the
+    on-disk / mix order. This is what turns a *mixed* stream — e.g.
+    :class:`~easydel.data.transforms.mixture.MixedShardedSource`, which
+    interleaves sources block-by-block but keeps each source's rows in
+    file order — into a genuinely *shuffled* one.
+
+    Place it **before** a tokenizing transform so the reservoir holds
+    small raw rows rather than padded token arrays: memory is bounded
+    by ``buffer_size`` rows, and a larger buffer gives a stronger
+    shuffle.
+
+    The reservoir is driven by a local RNG seeded from ``seed`` and
+    re-created on every iteration, so iteration order is deterministic
+    for a given seed. Checkpoint resume that re-creates the iterator
+    and fast-forwards by N batches therefore replays the identical
+    ordering. An infinite upstream (a mix with
+    ``stop_strategy="restart"``) streams forever; a finite upstream
+    drains the reservoir once exhausted.
+
+    Example:
+        >>> mixed = MixedShardedSource(sources, weights=weights)
+        >>> shuffled = ShuffledShardedSource(mixed, buffer_size=10_000, seed=42)
+        >>> for example in shuffled.open_shard(shuffled.shard_names[0]):
+        ...     train(example)
+    """
+
+    def __init__(
+        self,
+        source: ShardedDataSource[dict],
+        buffer_size: int = 1000,
+        seed: int | None = None,
+        shuffle_shards: bool = True,
+    ):
+        """Capture the wrapped source and the reservoir configuration.
+
+        Args:
+            source: Wrapped :class:`ShardedDataSource`. Its shards are
+                chained into a single synthetic shard for shuffling.
+            buffer_size: Number of rows held in the reservoir at once.
+                Trades memory for shuffle quality; must be ``>= 1``.
+            seed: Seed for the local RNG governing shard-order and
+                reservoir randomness. ``None`` is non-deterministic.
+            shuffle_shards: When ``True`` (and the source has more than
+                one shard), visit the underlying shards in a shuffled
+                order before reservoir-shuffling their rows.
+
+        Raises:
+            ValueError: If ``buffer_size`` is less than ``1``.
+        """
+        if buffer_size < 1:
+            raise ValueError(f"buffer_size must be >= 1, got {buffer_size}")
+        self._source = source
+        self._buffer_size = int(buffer_size)
+        self._seed = seed
+        self._shuffle_shards = shuffle_shards
+
+    @property
+    def shard_names(self) -> Sequence[str]:
+        """Return the single synthetic shard name for the shuffled view.
+
+        Returns:
+            One-element list ``["shuffled_shard_0"]``.
+        """
+        return ["shuffled_shard_0"]
+
+    def num_shards(self) -> int:
+        """Return the constant shard count of one.
+
+        Returns:
+            Always ``1``.
+        """
+        return 1
+
+    def _underlying_stream(self, rng: random.Random) -> Iterator[dict]:
+        """Chain every underlying shard into one stream, optionally shuffling shard order.
+
+        Args:
+            rng: RNG used to shuffle the shard visitation order.
+
+        Yields:
+            dict: Rows from the wrapped source in (optionally
+            shard-shuffled) concatenation order, before the reservoir
+            is applied.
+        """
+        shard_names = list(self._source.shard_names)
+        if self._shuffle_shards and len(shard_names) > 1:
+            rng.shuffle(shard_names)
+        for shard_name in shard_names:
+            yield from self._source.open_shard(shard_name)
+
+    def _shuffled_iter(self, skip: int = 0) -> Iterator[dict]:
+        """Reservoir-shuffle the chained upstream, dropping the first ``skip`` emitted rows.
+
+        Fills a reservoir of ``buffer_size`` rows, then for each new
+        row evicts a random slot (yielding the evicted row). When the
+        upstream is exhausted the reservoir is shuffled and drained.
+        ``skip`` discards the first ``skip`` *emitted* rows for resume;
+        because the RNG is reseeded identically, the emitted order
+        matches :meth:`open_shard` exactly.
+
+        Args:
+            skip: Number of leading emitted rows to drop (resume offset).
+
+        Yields:
+            dict: Rows in pseudo-random order.
+        """
+        rng = random.Random(self._seed)
+        buffer: list[dict] = []
+        emitted = 0
+        for item in self._underlying_stream(rng):
+            if len(buffer) < self._buffer_size:
+                buffer.append(item)
+                continue
+            idx = rng.randrange(self._buffer_size)
+            out = buffer[idx]
+            buffer[idx] = item
+            if emitted >= skip:
+                yield out
+            emitted += 1
+        rng.shuffle(buffer)
+        for out in buffer:
+            if emitted >= skip:
+                yield out
+            emitted += 1
+
+    def open_shard(self, _shard_name: str) -> Iterator[dict]:
+        """Open the synthetic shard and stream reservoir-shuffled rows.
+
+        Args:
+            _shard_name: Ignored — only one synthetic shard exists.
+
+        Returns:
+            Iterator[dict]: Rows in pseudo-random order.
+        """
+        return self._shuffled_iter(skip=0)
+
+    def open_shard_at_row(self, _shard_name: str, row: int) -> Iterator[dict]:
+        """Resume the synthetic shard after ``row`` already-emitted rows.
+
+        Args:
+            _shard_name: Ignored — only one synthetic shard exists.
+            row: Number of leading emitted rows to skip.
+
+        Returns:
+            Iterator[dict]: Rows in pseudo-random order, starting after
+            ``row`` items.
+        """
+        return self._shuffled_iter(skip=row)
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Synthetic shards carry no metadata.
+
+        Args:
+            shard_name: Ignored.
+
+        Returns:
+            Always ``None``.
+        """
+        return None
+
+    def __len__(self) -> int:
+        """Return the wrapped source length when it is known.
+
+        Returns:
+            ``len(self._source)``.
+
+        Raises:
+            TypeError: If the underlying source has no length (streaming).
+        """
+        return len(self._source)
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"ShuffledShardedSource(<source>, buffer_size=N)"``.
+        """
+        return f"ShuffledShardedSource({self._source!r}, buffer_size={self._buffer_size})"
 
 
 class LimitedShardedSource(ShardedDataSource[dict]):

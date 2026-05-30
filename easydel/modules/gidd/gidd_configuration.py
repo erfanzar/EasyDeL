@@ -200,7 +200,7 @@ class GiddConfig(EasyDeLBaseConfig):
         rope_theta: float = 10000.0,
         attention_bias: bool = False,
         mlp_bias: bool = False,
-        scan_layers: bool = True,
+        scan_layers: bool = False,
         **kwargs,
     ):
         """Mutate the config in place with a small set of training-time toggles.

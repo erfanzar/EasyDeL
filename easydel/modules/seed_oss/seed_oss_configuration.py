@@ -150,7 +150,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         gradient_checkpointing_targets: tuple[str, ...] | None = None,
-        scan_layers: bool = True,
+        scan_layers: bool = False,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,

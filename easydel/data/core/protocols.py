@@ -336,6 +336,46 @@ class ShardedDataSource(ABC, Generic[T_co]):
         transformed_source = source_mod.TransformedShardedSource
         return transformed_source(tp.cast("ShardedDataSource[dict[str, Any]]", self), transform)
 
+    def shuffle(
+        self,
+        buffer_size: int = 1000,
+        seed: int | None = None,
+        shuffle_shards: bool = True,
+    ) -> "ShardedDataSource":
+        """Wrap this source so rows are globally shuffled via a streaming reservoir.
+
+        Collapses the source into a single synthetic shard and draws
+        rows through a fixed-size reservoir, decorrelating the emitted
+        order from the on-disk / mix order. This is the piece that turns
+        a *mixed* stream (which only interleaves sources, keeping each
+        source's rows in file order) into a genuinely *shuffled* one.
+        Apply it **before** a tokenizing transform so the reservoir
+        holds small raw rows; a larger ``buffer_size`` gives a stronger
+        shuffle at higher memory cost. Deterministic for a fixed
+        ``seed`` (so checkpoint resume replays the same order). Backed
+        by :class:`~easydel.data.transforms.source.ShuffledShardedSource`.
+
+        Args:
+            buffer_size: Reservoir size in rows; trades memory for
+                shuffle quality.
+            seed: RNG seed governing shard-order and reservoir
+                randomness; ``None`` is non-deterministic.
+            shuffle_shards: Whether to visit the underlying shards in a
+                shuffled order before reservoir-shuffling their rows.
+
+        Returns:
+            ShardedDataSource: A new sharded source emitting the same
+            rows in pseudo-random order.
+        """
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        shuffled_source = source_mod.ShuffledShardedSource
+        return shuffled_source(
+            tp.cast("ShardedDataSource[dict[str, Any]]", self),
+            buffer_size=buffer_size,
+            seed=seed,
+            shuffle_shards=shuffle_shards,
+        )
+
     def rename_fields(
         self,
         mapping: dict[str, str],

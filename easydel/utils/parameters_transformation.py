@@ -1120,6 +1120,41 @@ class StateDictConverter:
         return new_state_dict
 
     @staticmethod
+    def reconcile_to_target_shapes(state_dict: dict, target_shapes: dict) -> dict:
+        """Fix 2-D weight orientation against the HF target's real shapes (data-driven).
+
+        The generic EasyDeL->torch export transposes every dense 2-D weight assuming the
+        JAX ``[in, out]`` convention. Some layers do not follow it (e.g. GPT-2 ``Conv1D``
+        already stores ``[out, in]``), and tied heads can be exported in a flipped layout.
+        Rather than special-casing each model, this consults the HF model's own parameter
+        shapes: for any key whose tensor shape does not match the target but whose
+        transpose does, transpose it. Square or already-correct tensors are left untouched.
+
+        Args:
+            state_dict: Converted torch state dict (keys already in HF naming).
+            target_shapes: ``{key: shape}`` from the instantiated HF model's ``state_dict``.
+
+        Returns:
+            The same dict with mis-oriented 2-D weights transposed in place.
+        """
+        for key, tensor in list(state_dict.items()):
+            tgt = target_shapes.get(key)
+            if tgt is None or not hasattr(tensor, "shape"):
+                continue
+            cur = tuple(tensor.shape)
+            tgt = tuple(tgt)
+            if cur == tgt:
+                continue
+            # Only the unambiguous 2-D transpose case is safe to auto-correct here: a
+            # weight stored as the exact reverse of the target with two DISTINCT dims.
+            # (Higher-rank / repeated-dim permutations are ambiguous — which axis maps to
+            # which can't be inferred from shape alone — so they are left to the model's
+            # own reform_param rules rather than guessed.)
+            if tensor.ndim == 2 and cur == tgt[::-1] and cur[0] != cur[1]:
+                state_dict[key] = tensor.transpose(0, 1).contiguous()
+        return state_dict
+
+    @staticmethod
     def easydel_to_torch(
         module: EasyDeLBaseModule, dtype: jnp.dtype | None = jnp.float16, **kwargs
     ) -> dict[str, tp.Any]:
@@ -1140,16 +1175,33 @@ class StateDictConverter:
         if dtype is None:
             dtype = module.param_dtype
 
-        graphtree = unflatten_dict(module.parameters)
-        model_parameters = flatten_dict(graphtree, sep=".")
+        # ``module.parameters`` is a spectrax ``State`` (post-migration). Its ``flatten()``
+        # yields ``{"<collection>/<dotted.path>": array}``; strip the leading collection
+        # ("parameters/") to get the ``{dotted.path: array}`` the converter expects.
+        flat_state = module.parameters.flatten()
+        model_parameters = {key.split("/", 1)[-1]: value for key, value in flat_state.items()}
 
-        from easydel.layers import BaseMoeModule, ParallelMoELinear
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
         from easydel.utils import traversals
 
         md = ParallelMoELinear
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
         md = BaseMoeModule
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
+
+        # spectrax names every leaf ".weight" (no kernel/embedding/scale distinction), so the
+        # export transpose must detect dense weights by module type, exactly like the load path:
+        # transpose 2D+ weights EXCEPT embeddings (and layernorm scales, which are 1D and skip the
+        # permute branches anyway). This feeds correctly-oriented tensors to the qkv/gate-up split.
+        embedding_names = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, Embed)]
+        try:
+            from flax import nnx as _nnx
+
+            embedding_names += [
+                ".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, _nnx.Embed)
+            ]
+        except Exception:  # noqa: BLE001
+            pass
 
         moe_names = list(set([names.split(".")[-1] for names in moe_path])) if moe_path else None
         moe_block_names = list(set([names.split(".")[-1] for names in moe_block_path])) if moe_block_path else None
@@ -1158,7 +1210,9 @@ class StateDictConverter:
         if moe_block_names and moe_names and moe_block_path:
             for block_path in moe_block_path:
                 for moe_name in moe_names:
-                    potential_key = f"{block_path}.experts.{moe_name}.kernel"
+                    # spectrax leaves are ".weight" (was ".kernel"); match that so stacked
+                    # expert tensors get the expert-specific permute (0, 2, 1), not the dense one.
+                    potential_key = f"{block_path}.experts.{moe_name}.weight"
                     if potential_key in model_parameters:
                         stacked_moe_keys.add(potential_key)
         torch_state_dict = {}
@@ -1174,8 +1228,12 @@ class StateDictConverter:
                     tensor = tensor.astype(DtypeHandler.get_dtype(dtype))
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
+                is_embedding = any(emb in key for emb in embedding_names)
 
-                if key.endswith(".kernel"):
+                # Transpose dense weights JAX [in, out] -> torch [out, in] (higher-rank
+                # analogues). Skip embeddings (kept [vocab, hidden]); 1D layernorm scales hit
+                # no permute branch. Keyed on module type, not the (now uniform) ".weight" name.
+                if not is_embedding:
                     if not is_stacked_moe:
                         if tensor.ndim == 2:
                             tensor = tensor.permute(1, 0)
@@ -1376,12 +1434,25 @@ class ModelConverter:
         base_config = base_huggingface_module.config_class.from_dict(config.to_dict())
         with torch.device("meta") if use_meta_torch else contextlib.nullcontext():
             model: torch.nn.Module = base_huggingface_module(config=base_config, **base_huggingface_module_kwarguments)
-            key_shape_checks = {k: v.shape for k, v in model.state_dict().items() if hasattr(v, "shape")}
-            if len(list(key_shape_checks.keys())) != len(list(state_dict.keys())):
-                warnings.warn("There might be an issue with converted `state_dict`.", stacklevel=1)
-            for key, shape in key_shape_checks.items():
-                if state_dict[key].shape != shape:
-                    warnings.warn(f"Shape conflict at {key}.", stacklevel=1)
+            target_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items() if hasattr(v, "shape")}
+            # Reconcile each converted tensor against the HF target's actual shape, driven
+            # by data (not model-specific rules): when a 2-D weight's orientation is the
+            # transpose of what HF expects, flip it. This self-corrects layers whose JAX vs
+            # torch storage convention matches (e.g. GPT-2 Conv1D, already [out, in]) where
+            # the generic export transpose would otherwise mis-orient them, and any tied
+            # head whose export layout differs — no per-model casing required.
+            state_dict = StateDictConverter.reconcile_to_target_shapes(state_dict, target_shapes)
+            if len(target_shapes) != len(state_dict):
+                warnings.warn(
+                    f"converted state_dict has {len(state_dict)} keys, HF model expects {len(target_shapes)}.",
+                    stacklevel=1,
+                )
+            for key, shape in target_shapes.items():
+                if key in state_dict and tuple(state_dict[key].shape) != shape:
+                    warnings.warn(
+                        f"Shape conflict at {key}: have {tuple(state_dict[key].shape)}, expected {shape}.",
+                        stacklevel=1,
+                    )
             model.load_state_dict(state_dict, assign=True, strict=True)
 
         return model

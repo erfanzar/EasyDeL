@@ -153,7 +153,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         scan_mlp_chunk_size: int = 1024,
         number_rep_kv: int = 1,
         bits: int | None = None,
-        scan_layers: bool = True,
+        scan_layers: bool = False,
         layer_types: list[str] | None = None,
         rope_scaling: Mapping[str, str | float] | None = None,
         **kwargs,

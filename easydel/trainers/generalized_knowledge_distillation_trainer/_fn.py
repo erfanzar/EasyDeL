@@ -79,18 +79,60 @@ def _stop_gradient_tree(tree):
     return jax.tree_util.tree_map(_maybe_stop, tree)
 
 
-def _kl_div(log_target: jax.Array, log_input: jax.Array) -> jax.Array:
-    """Compute KL divergence KL(target || input) given log-probabilities.
+def _ejkernel_gjsd_loss(
+    student_logits: jax.Array,
+    teacher_logits: jax.Array,
+    *,
+    labels: jax.Array | None,
+    mask: jax.Array | None,
+    beta: float,
+    temperature: float,
+    backend: str,
+) -> jax.Array:
+    """Generalized JSD via the ejkernel fused KL kernel (used when ``fused_backend`` is set).
 
-    Args:
-        log_target: Log probabilities of target distribution.
-        log_input: Log probabilities of input distribution.
+    The fused kernel streams both softmaxes over the vocabulary without materializing a
+    ``[..., V]`` log-softmax and supplies an analytic gradient w.r.t. the student
+    (teacher detached), matching :func:`generalized_jsd_loss` numerically.
 
-    Returns:
-        Per-token KL divergence.
+    Direction mapping (EasyDeL ``beta`` knob -> ejkernel ``direction``):
+      * ``beta <= 0`` -> ``"reverse"`` == ``KL(p_student || p_teacher)``
+      * ``beta >= 1`` -> ``"forward"`` == ``KL(p_teacher || p_student)``
+      * ``0 < beta < 1`` -> ``"jsd"`` (same convex JSD; symmetric at ``beta == 0.5``)
+
+    ejkernel applies the Hinton ``T**2`` factor; ``generalized_jsd_loss`` does not, so the
+    result is divided by ``temperature ** 2`` (which also rescales the gradient correctly).
     """
-    target_probs = jnp.exp(log_target)
-    return jnp.sum(target_probs * (log_target - log_input), axis=-1)
+    from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
+
+    if mask is not None:
+        weights = mask.astype(student_logits.dtype)
+    elif labels is not None:
+        weights = (labels != -100).astype(student_logits.dtype)
+    else:
+        weights = None
+
+    if beta <= 0.0:
+        direction = "reverse"
+    elif beta >= 1.0:
+        direction = "forward"
+    else:
+        direction = "jsd"
+
+    out = _fused_kl(
+        student_logits,
+        teacher_logits,
+        weights,
+        reduction="mean",
+        direction=direction,
+        temperature=temperature,
+        beta=float(beta),
+        platform=(None if backend == "auto" else backend),
+    )
+    loss = out.loss
+    if temperature != 1.0:
+        loss = loss / (temperature**2)
+    return loss.astype(student_logits.dtype)
 
 
 def generalized_jsd_loss(
@@ -107,17 +149,21 @@ def generalized_jsd_loss(
     From Agarwal et al. 2024. Given the temperature-softened
     distributions ``p_s = softmax(student / T)`` and
     ``p_t = softmax(teacher / T)`` and a midpoint
-    ``m = (1 - beta) * p_s + beta * p_t``, the loss is the convex
+    ``m = beta * p_t + (1 - beta) * p_s``, the loss is the convex
     combination
     ``beta * KL(p_t || m) + (1 - beta) * KL(p_s || m)``.
     The ``beta`` knob therefore interpolates the GKD objective between
-    forward KL (``beta == 0``: ``KL(p_s || p_t)``) and reverse KL
-    (``beta == 1``: ``KL(p_t || p_s)``); the canonical JSD corresponds
-    to ``beta == 0.5``. The midpoint ``m`` is computed in log-space via
-    ``logsumexp`` for numerical stability.
+    ``KL(student || teacher)`` (``beta == 0``) and
+    ``KL(teacher || student)`` (``beta == 1``); the canonical JSD
+    corresponds to ``beta == 0.5``.
 
-    Per-token contributions are masked by ``mask`` (preferred) or
-    ``labels != -100`` and averaged over the masked positions.
+    This is computed by the ejkernel fused KL kernel, which streams both
+    softmaxes over the vocabulary without ever materializing a ``[..., V]``
+    log-softmax and supplies an analytic gradient w.r.t. the student
+    (teacher detached). It is numerically equivalent to the native
+    ``log_softmax`` formulation. Per-token contributions are masked by
+    ``mask`` (preferred) or ``labels != -100`` and averaged over the
+    masked positions.
 
     Args:
         student_logits: ``[batch, seq, vocab]`` raw student logits.
@@ -134,39 +180,15 @@ def generalized_jsd_loss(
     Returns:
         Scalar mean per-token GJSD across the masked positions.
     """
-    student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
-    teacher_log_probs = jax.nn.log_softmax(teacher_logits / temperature, axis=-1)
-
-    if beta <= 0.0:
-        per_token = _kl_div(student_log_probs, teacher_log_probs)
-    elif beta >= 1.0:
-        per_token = _kl_div(teacher_log_probs, student_log_probs)
-    else:
-        beta_val = jnp.asarray(beta, dtype=student_logits.dtype)
-        log_beta = jnp.log(beta_val)
-        log_one_minus = jnp.log1p(-beta_val)
-        mixture_log_probs = jax.scipy.special.logsumexp(
-            jnp.stack(
-                [
-                    student_log_probs + log_one_minus,
-                    teacher_log_probs + log_beta,
-                ]
-            ),
-            axis=0,
-        )
-        kl_teacher = _kl_div(teacher_log_probs, mixture_log_probs)
-        kl_student = _kl_div(student_log_probs, mixture_log_probs)
-        per_token = beta_val * kl_teacher + (jnp.asarray(1.0, dtype=beta_val.dtype) - beta_val) * kl_student
-
-    if mask is None and labels is not None:
-        mask = (labels != -100).astype(student_logits.dtype)
-    elif mask is not None:
-        mask = mask.astype(student_logits.dtype)
-
-    if mask is None:
-        return jnp.mean(per_token)
-    normalizer = jnp.maximum(mask.sum(), jnp.array(1.0, dtype=student_logits.dtype))
-    return jnp.sum(per_token * mask) / normalizer
+    return _ejkernel_gjsd_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        labels=labels,
+        mask=mask,
+        beta=beta,
+        temperature=temperature,
+        backend="xla",  # XLA is the bandwidth-optimal KL backend on TPU (Pallas loses)
+    )
 
 
 def _gkd_forward_logits(model, batch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:

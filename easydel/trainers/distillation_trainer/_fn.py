@@ -520,8 +520,19 @@ def distillation_loss(
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
 
-    use_per_token_divergence = beta is not None or loss_top_k > 0
+    # Combined per-token loss mask: loss_mask > attention_mask, AND labels != -100.
+    if loss_mask is not None:
+        mask = loss_mask.astype(dtype)
+    elif attention_mask is not None:
+        mask = attention_mask.astype(dtype)
+    else:
+        mask = None
+    if labels is not None:
+        valid_label_mask = (labels != -100).astype(dtype)
+        mask = valid_label_mask if mask is None else mask * valid_label_mask
+
     if loss_top_k > 0:
+        # Teacher-top-k KD has no fused-kernel equivalent -> compute natively.
         per_token_distill_xent, per_token_teacher_entropy = _per_token_topk_xent(
             teacher_logits=teacher_logits,
             student_logits=student_logits,
@@ -531,51 +542,52 @@ def distillation_loss(
             dtype=dtype,
         )
         per_token_divergence = per_token_distill_xent - per_token_teacher_entropy
-    elif beta is not None:
-        per_token_divergence = _per_token_generalized_jsd(
-            teacher_logits=teacher_logits,
-            student_logits=student_logits,
-            temperature=temperature,
-            beta=beta,
-            dtype=dtype,
-        )
-        per_token_distill_xent = per_token_divergence
-        per_token_teacher_entropy = jnp.zeros_like(per_token_divergence)
-    else:
-        per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
-            teacher_logits,
-            student_logits,
-            temperature,
-            dtype,
-        )
-        per_token_divergence = per_token_distill_xent - per_token_teacher_entropy
-
-    if loss_mask is not None:
-        mask = loss_mask.astype(dtype)
-    elif attention_mask is not None:
-        mask = attention_mask.astype(dtype)
-    else:
-        mask = None
-
-    if labels is not None:
-        valid_label_mask = (labels != -100).astype(dtype)
-        mask = valid_label_mask if mask is None else mask * valid_label_mask
-
-    if mask is not None:
-        normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
-        distill_xent_loss = jnp.sum(per_token_distill_xent * mask) / normalizer
-        teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask) / normalizer
-        divergence_loss = jnp.sum(per_token_divergence * mask) / normalizer
-    else:
-        distill_xent_loss = jnp.mean(per_token_distill_xent)
-        teacher_entropy_loss = jnp.mean(per_token_teacher_entropy)
-        divergence_loss = jnp.mean(per_token_divergence)
-    distill_xent_loss = distill_xent_loss * temp_sq
-    teacher_entropy_loss = teacher_entropy_loss * temp_sq
-    if use_per_token_divergence:
+        if mask is not None:
+            normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
+            distill_xent_loss = jnp.sum(per_token_distill_xent * mask) / normalizer
+            teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask) / normalizer
+            divergence_loss = jnp.sum(per_token_divergence * mask) / normalizer
+        else:
+            distill_xent_loss = jnp.mean(per_token_distill_xent)
+            teacher_entropy_loss = jnp.mean(per_token_teacher_entropy)
+            divergence_loss = jnp.mean(per_token_divergence)
+        distill_xent_loss = distill_xent_loss * temp_sq
+        teacher_entropy_loss = teacher_entropy_loss * temp_sq
         kl_loss = divergence_loss * temp_sq
     else:
-        kl_loss = distill_xent_loss - teacher_entropy_loss
+        # ejkernel fused KL: forward KL by default (beta is None), or the generalized
+        # JSD when beta is set. The kernel streams both softmaxes over the vocabulary
+        # without materializing a [..., V] log-softmax and supplies the analytic student
+        # gradient (teacher detached). The loss is already masked-mean * T^2.
+        from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
+
+        if beta is None:
+            direction, want_entropy = "forward", True  # KL(p_t || p_s), report entropy split
+        elif beta <= 0.0:
+            direction, want_entropy = "reverse", False  # KL(p_s || p_t)
+        elif beta >= 1.0:
+            direction, want_entropy = "forward", False  # KL(p_t || p_s)
+        else:
+            direction, want_entropy = "jsd", False
+        out = _fused_kl(
+            student_logits,
+            teacher_logits,
+            mask,
+            reduction="mean",
+            direction=direction,
+            temperature=temperature,
+            beta=(0.5 if beta is None else float(beta)),
+            return_teacher_entropy=want_entropy,
+            platform="xla",  # XLA is the bandwidth-optimal KL backend on TPU (Pallas loses)
+        )
+        kl_loss = out.loss.astype(dtype)
+        if want_entropy:
+            teacher_entropy_loss = out.teacher_entropy.astype(dtype)
+            distill_xent_loss = kl_loss + teacher_entropy_loss
+        else:
+            teacher_entropy_loss = jnp.zeros((), dtype=dtype)
+            distill_xent_loss = kl_loss
+
     total_loss = alpha_s * kl_loss
     ce_loss = jnp.array(0.0, dtype=dtype)
     if use_hard_labels and labels is not None:
@@ -601,6 +613,141 @@ def distillation_loss(
         "ce_loss": jnp.asarray(ce_loss, dtype=dtype),
     }
     return total_loss, metrics
+
+
+def mtp_distillation_loss(
+    student_mtp_logits: Array,
+    teacher_logits: Array,
+    attention_mask: Array | None = None,
+    loss_mask: Array | None = None,
+    temperature: float = 4.0,
+    beta: float | None = None,
+) -> Array:
+    """Soft KD for a Multi-Token-Prediction head.
+
+    The student's MTP head at position ``t`` predicts token ``t + 2``, i.e. the
+    distribution ``P_student(x_{t+2} | x_{<=t+1})``. The *teacher's own ordinary
+    next-token head* at position ``t + 1`` is exactly the same conditional,
+    ``P_teacher(x_{t+2} | x_{<=t+1})`` — so the teacher needs no MTP head: we just
+    shift its logits left by one and use them as the soft target. Alignment and
+    masking mirror ``Qwen3_5ForCausalLM.compute_mtp_loss`` (shift-by-2 / ignore the
+    trailing two positions, which have no valid ``t + 2`` target).
+
+    Args:
+        student_mtp_logits: ``(B, S, V)`` student MTP logits (predicting ``t + 2``).
+        teacher_logits: ``(B, S, V)`` teacher next-token logits (predicting ``t + 1``).
+        attention_mask: ``(B, S)`` padding mask (fallback when ``loss_mask`` is None).
+        loss_mask: ``(B, S)`` completion/assistant mask (takes priority).
+        temperature: Softmax temperature, shared with the main KD term.
+        beta: Same divergence selector as :func:`distillation_loss` (``None`` ->
+            forward KL, ``<=0`` -> reverse, ``>=1`` -> forward, else generalized JSD).
+
+    Returns:
+        Scalar masked-mean divergence (already scaled by ``T**2`` by the kernel).
+    """
+    from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
+
+    dtype = student_mtp_logits.dtype
+    b = student_mtp_logits.shape[0]
+    # teacher target for position t = teacher_logits[:, t + 1]; pad the last column
+    # (masked out) so shapes match (B, S, V).
+    teacher_target = jnp.concatenate([teacher_logits[:, 1:], teacher_logits[:, -1:]], axis=1)
+    base = loss_mask if loss_mask is not None else attention_mask
+    if base is not None:
+        base = base.astype(dtype)
+        # mask[:, t] valid iff x_{t+2} is a real token -> base shifted by 2, trailing 2 zeroed.
+        mtp_mask = jnp.concatenate([base[:, 2:], jnp.zeros((b, 2), dtype=dtype)], axis=1)
+    else:
+        mtp_mask = None
+
+    if beta is None or beta >= 1.0:
+        direction = "forward"
+    elif beta <= 0.0:
+        direction = "reverse"
+    else:
+        direction = "jsd"
+    out = _fused_kl(
+        student_mtp_logits,
+        jax.lax.stop_gradient(teacher_target),
+        mtp_mask,
+        reduction="mean",
+        direction=direction,
+        temperature=temperature,
+        beta=(0.5 if beta is None else float(beta)),
+        return_teacher_entropy=False,
+        platform="xla",
+    )
+    return out.loss.astype(dtype)
+
+
+def mtp_chain_distillation_loss(
+    chain_logits: Array,
+    teacher_logits: Array,
+    attention_mask: Array | None = None,
+    loss_mask: Array | None = None,
+    temperature: float = 4.0,
+    beta: float | None = None,
+) -> tuple[Array, list[Array]]:
+    """Multi-step soft KD for a recursively-applied MTP head (FastMTP-style).
+
+    Given ``chain_logits`` of shape ``(K, B, S, V)`` from
+    ``Qwen3_5ForCausalLM.compute_mtp_chain`` — where step ``k`` (1-indexed) at
+    position ``t`` predicts ``x_{t+k+1}`` — each step is distilled against the
+    teacher's own next-token distribution at the matching offset: the teacher head
+    at position ``t+k`` is exactly ``P(x_{t+k+1} | x_{<=t+k})``, so step ``k`` uses
+    ``teacher_logits`` shifted left by ``k`` (with the trailing ``k+1`` positions
+    masked — no valid target there). This trains the head to draft ``K`` tokens
+    ahead, matching how the inference drafter recursively re-applies it.
+
+    Args:
+        chain_logits: ``(K, B, S, V)`` recursive MTP logits.
+        teacher_logits: ``(B, S, V)`` teacher next-token logits.
+        attention_mask / loss_mask: ``(B, S)`` masks (loss_mask takes priority).
+        temperature: Shared softmax temperature.
+        beta: Divergence selector (see :func:`distillation_loss`).
+
+    Returns:
+        ``(mean_kd_over_steps, [per_step_kd, ...])``.
+    """
+    from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
+
+    dtype = chain_logits.dtype
+    n_steps, b, s, _ = chain_logits.shape
+    base = loss_mask if loss_mask is not None else attention_mask
+    base = base.astype(dtype) if base is not None else None
+    if beta is None or beta >= 1.0:
+        direction = "forward"
+    elif beta <= 0.0:
+        direction = "reverse"
+    else:
+        direction = "jsd"
+
+    per_step: list[Array] = []
+    total = jnp.zeros((), dtype)
+    for j in range(int(n_steps)):
+        k = j + 1
+        # teacher target for step k = teacher_logits shifted left by k (pad tail, masked).
+        tail = jnp.broadcast_to(teacher_logits[:, -1:], (b, k, teacher_logits.shape[-1]))
+        teacher_target = jnp.concatenate([teacher_logits[:, k:], tail], axis=1)[:, :s]
+        if base is not None:
+            mask = jnp.concatenate([base[:, k + 1 :], jnp.zeros((b, k + 1), dtype=dtype)], axis=1)[:, :s]
+        else:
+            mask = None
+        out = _fused_kl(
+            chain_logits[j],
+            jax.lax.stop_gradient(teacher_target),
+            mask,
+            reduction="mean",
+            direction=direction,
+            temperature=temperature,
+            beta=(0.5 if beta is None else float(beta)),
+            return_teacher_entropy=False,
+            platform="xla",
+        )
+        step_loss = out.loss.astype(dtype)
+        per_step.append(step_loss)
+        total = total + step_loss
+    return total / jnp.asarray(n_steps, dtype), per_step
 
 
 def chunked_distillation_loss(
@@ -989,6 +1136,9 @@ def distillation_step(
     beta: float | None = None,
     loss_top_k: int = 0,
     loss_add_tail: bool = False,
+    mtp_distillation: bool = False,
+    mtp_kd_weight: float = 0.3,
+    mtp_draft_tokens: int = 1,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single knowledge-distillation training or evaluation step.
 
@@ -1229,6 +1379,57 @@ def distillation_step(
                 loss_add_tail=loss_add_tail,
             )
         metrics_map: dict[str, jax.Array] = dict(loss_components)
+
+        # Include the student's auxiliary loss (Qwen3.5 self-supervised MTP CE folded in via
+        # `mtp_loss_coef`, and/or MoE router losses) which the distillation loss otherwise drops.
+        aux_loss = getattr(student_outputs, "aux_loss", None)
+        if aux_loss is not None:
+            aux_loss = aux_loss.astype(total_loss.dtype)
+            total_loss = total_loss + aux_loss
+            metrics_map["aux_loss"] = aux_loss
+
+        # Soft MTP knowledge distillation: the teacher's next-token distribution at t+1
+        # supervises the student's MTP head (predicting t+2). The model exposes the MTP
+        # logits on the output (already computed for the aux loss), so no extra projection.
+        if mtp_distillation and not use_chunked:
+            compute_chain = getattr(module, "compute_mtp_chain", None)
+            if mtp_draft_tokens > 1 and compute_chain is not None:
+                # draft K tokens ahead: recursively apply the MTP head and distill
+                # each step against the teacher's next-token dist at the matching offset.
+                chain_logits = compute_chain(
+                    student_outputs,
+                    minibatch.get("input_ids"),
+                    int(mtp_draft_tokens),
+                    attention_mask=attention_mask,
+                )
+                if chain_logits is not None:
+                    mtp_kd_value, mtp_per_step = mtp_chain_distillation_loss(
+                        chain_logits=chain_logits,
+                        teacher_logits=teacher_logits,
+                        attention_mask=attention_mask,
+                        loss_mask=completion_mask,
+                        temperature=temperature,
+                        beta=beta,
+                    )
+                    mtp_kd_value = mtp_kd_value.astype(total_loss.dtype)
+                    total_loss = total_loss + jnp.asarray(mtp_kd_weight, dtype=total_loss.dtype) * mtp_kd_value
+                    metrics_map["mtp_kd_loss"] = mtp_kd_value
+                    for _i, _ps in enumerate(mtp_per_step):
+                        metrics_map[f"mtp_kd_step{_i + 1}"] = _ps.astype(total_loss.dtype)
+            else:
+                student_mtp_logits = getattr(student_outputs, "mtp_logits", None)
+                if student_mtp_logits is not None:
+                    mtp_kd_value = mtp_distillation_loss(
+                        student_mtp_logits=student_mtp_logits,
+                        teacher_logits=teacher_logits,
+                        attention_mask=attention_mask,
+                        loss_mask=completion_mask,
+                        temperature=temperature,
+                        beta=beta,
+                    )
+                    mtp_kd_value = mtp_kd_value.astype(total_loss.dtype)
+                    total_loss = total_loss + jnp.asarray(mtp_kd_weight, dtype=total_loss.dtype) * mtp_kd_value
+                    metrics_map["mtp_kd_loss"] = mtp_kd_value
 
         if request_hidden_states:
             student_hidden = getattr(student_outputs, "hidden_states", None)

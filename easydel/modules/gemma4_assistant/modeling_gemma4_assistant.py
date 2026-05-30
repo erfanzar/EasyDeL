@@ -296,6 +296,7 @@ class Gemma4AssistantMLP(spx.Module):
             precision: Matmul precision.
             rngs: PRNG.
         """
+        self.config = config
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
             (config.intermediate_size, config.intermediate_size),

@@ -277,6 +277,43 @@ class DistillationConfig(TrainingArguments):
             )
         },
     )
+    mtp_distillation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable Multi-Token-Prediction (MTP) knowledge distillation. When the student has "
+                "an MTP head (e.g. Qwen3.5 with `mtp_num_hidden_layers > 0` and `mtp_loss_coef > 0`), "
+                "adds a soft-KD term that supervises the student's MTP head (predicting token t+2) "
+                "with the teacher's own next-token distribution at position t+1 — the same conditional "
+                "P(x_{t+2} | x_<=t+1). The teacher needs NO MTP head; its ordinary logits are reused. "
+                "The student's self-supervised MTP CE (folded into `aux_loss` via `mtp_loss_coef`) is "
+                "always included on top. Incompatible with `logits_chunk_size`."
+            )
+        },
+    )
+    mtp_kd_weight: float = field(
+        default=0.3,
+        metadata={
+            "help": (
+                "Weight on the soft MTP-KD term added to the total loss when `mtp_distillation=True`. "
+                "Analogous to the model's `mtp_loss_coef` (which weights the self-supervised MTP CE)."
+            )
+        },
+    )
+    mtp_draft_tokens: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of tokens to draft ahead and distill through the MTP head (requires "
+                "`mtp_distillation=True`). With 1 (default) the depth-1 head is distilled on its single "
+                "t+2 prediction. With K>1 the head is recursively applied K times (teacher-forced, "
+                "FastMTP-style) and each step k is distilled against the teacher's next-token "
+                "distribution at offset k — training the head to draft K tokens ahead, matching how the "
+                "inference drafter (`num_draft_tokens=K`) recursively re-applies it. Costs K large-vocab "
+                "projections per step, so keep it modest (e.g. 4-8)."
+            )
+        },
+    )
 
     def __post_init__(
         self,
@@ -340,6 +377,25 @@ class DistillationConfig(TrainingArguments):
         if self.logits_chunk_size is not None:
             normalized_logits_chunk_size = int(self.logits_chunk_size)
             self.logits_chunk_size = normalized_logits_chunk_size if normalized_logits_chunk_size > 0 else None
+        self.mtp_distillation = bool(self.mtp_distillation)
+        self.mtp_kd_weight = float(self.mtp_kd_weight)
+        if self.mtp_kd_weight < 0.0:
+            raise ValueError("`mtp_kd_weight` must be non-negative.")
+        self.mtp_draft_tokens = int(self.mtp_draft_tokens)
+        if self.mtp_draft_tokens < 1:
+            raise ValueError("`mtp_draft_tokens` must be >= 1.")
+        if self.mtp_draft_tokens > 1 and not self.mtp_distillation:
+            raise ValueError("`mtp_draft_tokens > 1` requires `mtp_distillation=True`.")
+        if self.mtp_distillation and self.logits_chunk_size is not None:
+            raise ValueError(
+                "`mtp_distillation` is incompatible with `logits_chunk_size` (the MTP soft-KD term "
+                "needs the full teacher/student logits). Set `logits_chunk_size=None`."
+            )
+        if self.mtp_distillation and getattr(self, "mpmd_scheduler", None) is not None:
+            raise ValueError(
+                "`mtp_distillation` is not yet supported on the MPMD scheduled-loss path "
+                "(the stage-local loss does not include the MTP-KD term). Set `mpmd_scheduler=None`."
+            )
         if not 0.0 <= float(self.alpha) <= 1.0:
             raise ValueError("`alpha` must be within [0, 1].")
         if float(self.temperature) <= 0.0:

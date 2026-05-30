@@ -88,6 +88,7 @@ from easydel.utils import Timers, is_remote_path, readme_generator
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
+from . import fused_optimizers as _fused_optimizers  # noqa: F401  registers fused_adamw/fused_lion/fused_rmsprop
 from .metrics import BaseProgressBar, JSONProgressBar, NullProgressBar, RichProgressBar, TqdmProgressBar
 from .trainer_protocol import (
     BaseTrainerProtocol,

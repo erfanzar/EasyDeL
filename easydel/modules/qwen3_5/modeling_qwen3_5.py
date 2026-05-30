@@ -193,11 +193,6 @@ def _maybe_flatten_position_ids_for_text(config: Qwen3_5TextConfig, position_ids
     return position_ids
 
 
-#
-#
-#
-#
-
 
 @dataclass(frozen=True)
 class Qwen3_5MTPOutput:
@@ -679,6 +674,61 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         h = self.prepare_lm_head_inputs(mtp_output.last_hidden_state)
         return self.compute_lm_logits(h)
 
+    def compute_mtp_chain(
+        self,
+        outputs: MoeCausalLMOutput,
+        input_ids: jax.Array,
+        n_steps: int,
+        attention_mask: jax.Array | None = None,
+    ) -> jax.Array | None:
+        """Recursively apply the (depth-1) MTP head ``n_steps`` times, teacher-forced.
+
+        This mirrors how the inference drafter chains the inline MTP block to draft
+        more than one token ahead (feed the block's output hidden + the next token
+        back in). Step ``k`` (1-indexed) fuses the *previous* MTP hidden state with
+        the embedding of the ground-truth token at offset ``k`` and predicts the
+        token at position ``t + k + 1``:
+
+            h^0 = outputs.last_hidden_state
+            h^k = MTP(prev=h^{k-1}, next_embed=Emb(input_ids shifted left by k))
+            logits^k = LMHead(h^k)            # predicts x_{t+k+1}
+
+        Teacher-forcing (feeding ground-truth tokens, like DeepSeek-V3's MTP
+        training) keeps it fully differentiable. ``n_steps == 1`` reproduces
+        :meth:`compute_mtp_outputs` + :meth:`compute_mtp_logits` exactly.
+
+        Args:
+            outputs: Main causal-LM forward output (``last_hidden_state`` required).
+            input_ids: ``(B, S)`` token IDs of the main forward pass.
+            n_steps: Number of recursive draft steps (>= 1).
+            attention_mask: Optional padding mask.
+
+        Returns:
+            ``(n_steps, B, S, vocab)`` MTP logits — entry ``k-1`` predicts
+            ``input_ids[t + k + 1]`` — or ``None`` when the model has no MTP head.
+        """
+        if self.mtp is None or n_steps < 1:
+            return None
+        b = input_ids.shape[0]
+        embed = self.model.get_embedding()
+        frequencies = getattr(self.model, "frequencies", None)
+        prev_hidden = outputs.last_hidden_state
+        step_logits: list[jax.Array] = []
+        for k in range(1, n_steps + 1):
+            shifted = jnp.concatenate(
+                [input_ids[:, k:], jnp.zeros((b, k), dtype=input_ids.dtype)],
+                axis=-1,
+            )
+            mtp_out = self.mtp(
+                prev_hidden_states=prev_hidden,
+                next_token_embeds=embed(shifted.astype("i4")),
+                frequencies=frequencies,
+                attention_mask=attention_mask,
+            )
+            prev_hidden = mtp_out.last_hidden_state
+            step_logits.append(self.compute_mtp_logits(mtp_out))
+        return jnp.stack(step_logits, axis=0)
+
     def compute_mtp_loss(
         self,
         mtp_logits: jax.Array,
@@ -793,7 +843,10 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         mtp_loss = self.compute_mtp_loss(mtp_logits, input_ids, attention_mask) * coef
         existing = getattr(outputs, "aux_loss", None)
         new_aux = mtp_loss if existing is None else existing + mtp_loss
-        return outputs.replace(aux_loss=new_aux)
+        # Expose the MTP logits (already computed here) so a distillation/training step
+        # can supervise the MTP head with a teacher distribution without recomputing the
+        # large-vocab projection. Reused by the offline DistillationTrainer.
+        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits)
 
     def forward(
         self,
@@ -1232,8 +1285,67 @@ class Qwen3_5ForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5Model, Qwe
 
     def compute_mtp_logits(self, mtp_output: Qwen3_5MTPOutput) -> jax.Array:
         """Project MTP hidden states through the shared LM head."""
-        h = self.prepare_lm_head_inputs(mtp_output.last_hidden_state)
+        # prepare_lm_head_inputs is a BaseCausalLMModule method; the vision-language
+        # MRO lacks it, so fall back to the raw hidden state on that path.
+        h = mtp_output.last_hidden_state
+        if hasattr(self, "prepare_lm_head_inputs"):
+            h = self.prepare_lm_head_inputs(h)
         return self.compute_lm_logits(h)
+
+    def compute_mtp_chain(
+        self,
+        outputs: MoeCausalLMOutput,
+        input_ids: jax.Array,
+        n_steps: int,
+        attention_mask: jax.Array | None = None,
+    ) -> jax.Array | None:
+        """Recursively apply the (depth-1) MTP head ``n_steps`` times, teacher-forced.
+
+        This mirrors how the inference drafter chains the inline MTP block to draft
+        more than one token ahead (feed the block's output hidden + the next token
+        back in). Step ``k`` (1-indexed) fuses the *previous* MTP hidden state with
+        the embedding of the ground-truth token at offset ``k`` and predicts the
+        token at position ``t + k + 1``:
+
+            h^0 = outputs.last_hidden_state
+            h^k = MTP(prev=h^{k-1}, next_embed=Emb(input_ids shifted left by k))
+            logits^k = LMHead(h^k)            # predicts x_{t+k+1}
+
+        Teacher-forcing (feeding ground-truth tokens, like DeepSeek-V3's MTP
+        training) keeps it fully differentiable. ``n_steps == 1`` reproduces
+        :meth:`compute_mtp_outputs` + :meth:`compute_mtp_logits` exactly.
+
+        Args:
+            outputs: Main causal-LM forward output (``last_hidden_state`` required).
+            input_ids: ``(B, S)`` token IDs of the main forward pass.
+            n_steps: Number of recursive draft steps (>= 1).
+            attention_mask: Optional padding mask.
+
+        Returns:
+            ``(n_steps, B, S, vocab)`` MTP logits — entry ``k-1`` predicts
+            ``input_ids[t + k + 1]`` — or ``None`` when the model has no MTP head.
+        """
+        if self.mtp is None or n_steps < 1:
+            return None
+        b = input_ids.shape[0]
+        embed = self.model.get_embedding()
+        frequencies = getattr(self.model, "frequencies", None)
+        prev_hidden = outputs.last_hidden_state
+        step_logits: list[jax.Array] = []
+        for k in range(1, n_steps + 1):
+            shifted = jnp.concatenate(
+                [input_ids[:, k:], jnp.zeros((b, k), dtype=input_ids.dtype)],
+                axis=-1,
+            )
+            mtp_out = self.mtp(
+                prev_hidden_states=prev_hidden,
+                next_token_embeds=embed(shifted.astype("i4")),
+                frequencies=frequencies,
+                attention_mask=attention_mask,
+            )
+            prev_hidden = mtp_out.last_hidden_state
+            step_logits.append(self.compute_mtp_logits(mtp_out))
+        return jnp.stack(step_logits, axis=0)
 
     def compute_mtp_loss(
         self,
@@ -1293,7 +1405,10 @@ class Qwen3_5ForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5Model, Qwe
         mtp_loss = self.compute_mtp_loss(mtp_logits, input_ids, attention_mask) * coef
         existing = getattr(outputs, "aux_loss", None)
         new_aux = mtp_loss if existing is None else existing + mtp_loss
-        return outputs.replace(aux_loss=new_aux)
+        # Expose the MTP logits (already computed here) so a distillation/training step
+        # can supervise the MTP head with a teacher distribution without recomputing the
+        # large-vocab projection. Reused by the offline DistillationTrainer.
+        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits)
 
     def forward(self, *args, **kwargs):
         """Vision-language forward with the MTP auxiliary loss folded in.

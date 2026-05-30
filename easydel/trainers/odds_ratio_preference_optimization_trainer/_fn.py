@@ -36,13 +36,14 @@ import typing as tp
 
 import jax
 import spectrax as spx
+from ejkernel.modules.operations import fused_cross_entropy as _fused_cross_entropy
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.loss_utils import LossConfig, LossMetrics, dynamic_cross_entropy_loss
+from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.trainers._logprob_utils import (
     compute_sequence_scores_from_hidden_states,
     compute_token_logps_and_entropies_chunked,
@@ -200,11 +201,14 @@ def concatenated_forward(
         if not is_encoder_decoder:
             logits = logits[..., :-1, :]
             labels = labels[..., 1:]
-        loss, _ = dynamic_cross_entropy_loss(
+        # masked-mean NLL over non-padding tokens via the ejkernel fused kernel (XLA backend)
+        loss = _fused_cross_entropy(
             logits,
             labels,
             ignore_index=label_pad_token_id,
-        )
+            reduction="mean",
+            platform="xla",
+        ).loss
         valid = labels != label_pad_token_id
         safe_labels = jnp.where(valid, labels, 0)
         accuracy = jnp.sum(

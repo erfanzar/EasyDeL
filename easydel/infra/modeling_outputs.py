@@ -1408,6 +1408,11 @@ class MoeCausalLMOutput(MaskedLMOutput):
     router_logits: tuple[Array] | None = None
     all_router_losses: tuple[Array] | None = None
     loss: Array | None = None
+    mtp_logits: Array | None = None
+    """Multi-Token-Prediction logits over the *skip-one* targets (``input_ids[t+2]``),
+    shape ``(batch, seq_len, vocab)``. Set by models with an MTP head (e.g. Qwen3.5)
+    when the head is active; ``None`` otherwise. Exposed so distillation/training can
+    supervise the MTP head without recomputing the (large-vocab) projection."""
 
 
 @auto_pytree
@@ -1462,6 +1467,10 @@ class VLMCausalLMOutput(ModelOutput):
     router_logits: tuple[Array] | None = None
     aux_loss: Array | None = None
     loss: Array | None = None
+    mtp_logits: Array | None = None
+    """Multi-Token-Prediction logits (predicting ``input_ids[t+2]``), set by VLM models
+    with an MTP head (e.g. multimodal Qwen3.5) when active; ``None`` otherwise. Mirrors
+    the field on :class:`MoeCausalLMOutput` so the shared MTP code path is uniform."""
 
 
 @auto_pytree

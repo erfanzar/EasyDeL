@@ -1851,6 +1851,12 @@ class EasyDeLBaseModule(
         """
         from easydel.utils.parameters_transformation import ModelConverter
 
+        # Build the torch model on a real device by default so non-persistent buffers
+        # (e.g. rope ``inv_freq``) are computed and the returned model is immediately
+        # usable for ``forward``. Creating under ``torch.device("meta")`` leaves those
+        # buffers un-materialized. Callers converting very large models can opt back in
+        # via ``use_meta_torch=True`` (and materialize buffers themselves).
+        kwargs.setdefault("use_meta_torch", False)
         return ModelConverter.easydel_to_huggingface(
             module=self,
             base_huggingface_module=self.get_torch_loader()._model_mapping[type(self.config)],

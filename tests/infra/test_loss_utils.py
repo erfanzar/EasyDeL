@@ -17,7 +17,6 @@ import types
 
 import jax
 import jax.numpy as jnp
-import pytest
 
 import easydel.infra.loss_utils as loss_utils_module
 from easydel.infra.loss_utils import (
@@ -209,6 +208,36 @@ def test_causal_lm_loss_chunked_lm_head_keeps_projection_checkpointed():
     assert "remat2[" in grad_jaxpr or "checkpoint[" in grad_jaxpr
 
 
+def test_causal_lm_loss_chunked_lm_head_checkpoint_false_removes_remat_keeps_value():
+    hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
+    labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
+    config = LossConfig(chunk_block_size=4)
+
+    def lm_head_fn(h):
+        return jnp.einsum("bth,hv->btv", h, kernel)
+
+    def loss_fn(x, ckpt):
+        return causal_lm_loss_chunked_lm_head(
+            hidden_states=x,
+            labels=labels,
+            lm_head_fn=lm_head_fn,
+            vocab_size=kernel.shape[1],
+            config=config,
+            token_chunk_size=2,
+            checkpoint=ckpt,
+        ).loss
+
+    jaxpr_off = str(jax.make_jaxpr(jax.grad(lambda x: loss_fn(x, False)))(hidden_states))
+    assert "remat2[" not in jaxpr_off and "checkpoint[" not in jaxpr_off
+
+    # value/grad must be unchanged by the memory/compute tradeoff
+    assert jnp.allclose(loss_fn(hidden_states, True), loss_fn(hidden_states, False), atol=1e-6)
+    g_on = jax.grad(lambda x: loss_fn(x, True))(hidden_states)
+    g_off = jax.grad(lambda x: loss_fn(x, False))(hidden_states)
+    assert jnp.allclose(g_on, g_off, atol=1e-6)
+
+
 def test_causal_lm_loss_chunked_lm_head_supports_fp32_compute_dtype_with_bf16_hidden_states():
     hidden_states = (jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17).astype(jnp.bfloat16)
     kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
@@ -272,31 +301,36 @@ def test_causal_lm_loss_chunked_lm_head_preserves_decoder_loss_weights():
     assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
 
 
-def test_causal_lm_loss_chunked_lm_head_disables_inner_ce_chunking(monkeypatch: pytest.MonkeyPatch):
+def test_causal_lm_loss_chunked_lm_head_ignores_inner_ce_chunk_config():
+    # The LM-head-chunked loss delegates the per-chunk math to ejkernel's fused
+    # linear cross-entropy and does NOT apply a second (inner) vocab/block CE
+    # chunking pass. Setting chunk_vocab_size / chunk_block_size / chunk_token_size
+    # must therefore leave the result identical to the dense reference.
     hidden_states = jnp.arange(2 * 5 * 4, dtype=jnp.float32).reshape(2, 5, 4) / 17
+    kernel = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8) / 19
     labels = jnp.array([[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]], dtype=jnp.int32)
-    seen_configs: list[tuple[int | None, int | None, int | None]] = []
 
-    def fake_fixed_cross_entropy(*, source, target, config=None, **kwargs):
-        del source, target, kwargs
-        seen_configs.append((config.chunk_vocab_size, config.chunk_block_size, config.chunk_token_size))
-        one = jnp.array(1.0, dtype=jnp.float32)
-        return LossMetrics(loss=one, z_loss=one, weight_sum=one, accuracy=one)
+    def lm_head_fn(x):
+        return jnp.einsum("bth,hv->btv", x, kernel)
 
-    monkeypatch.setattr(loss_utils_module, "fixed_cross_entropy", fake_fixed_cross_entropy)
-
-    causal_lm_loss_chunked_lm_head(
+    expected = fixed_cross_entropy(
+        source=lm_head_fn(hidden_states[:, :-1, :]),
+        target=labels[:, 1:],
+        config=LossConfig(),
+    )
+    actual = causal_lm_loss_chunked_lm_head(
         hidden_states=hidden_states,
         labels=labels,
-        lm_head_fn=lambda x: x,
-        vocab_size=hidden_states.shape[-1],
+        lm_head_fn=lm_head_fn,
+        vocab_size=kernel.shape[1],
         config=LossConfig(chunk_vocab_size=3, chunk_block_size=4, chunk_token_size=2),
+        token_chunk_size=2,
     )
 
-    assert seen_configs
-    assert all(chunk_vocab_size is None for chunk_vocab_size, _, _ in seen_configs)
-    assert all(chunk_block_size is None for _, chunk_block_size, _ in seen_configs)
-    assert all(chunk_token_size is None for _, _, chunk_token_size in seen_configs)
+    assert jnp.allclose(actual.loss, expected.loss, atol=1e-5)
+    assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
+    assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
+    assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
 
 
 def test_causal_lm_loss_strategy_disables_lm_head_for_large_blockwise_loss():
@@ -439,6 +473,12 @@ def test_base_task_module_compute_lm_logits_chunks_tokens_from_config():
 
         @staticmethod
         def apply_logit_cap(logits):
+            return logits
+
+        @staticmethod
+        def _constrain_lm_logits(logits):
+            # passthrough: the real method applies logical-axis sharding via
+            # config.runtime_sharding_resolver, which this lightweight mock omits.
             return logits
 
     module = _Module()

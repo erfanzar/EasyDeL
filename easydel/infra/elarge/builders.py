@@ -1886,6 +1886,20 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
     else:
         source = next(iter(sources.values()))
 
+    # Globally shuffle the (still raw) row stream when a shuffle buffer is configured.
+    # Runs after mixing — so rows from every source are both interleaved *and*
+    # decorrelated from on-disk order — and before tokenization (applied later by the
+    # trainer's preprocess transform), so the reservoir buffers small raw rows rather
+    # than padded token arrays. `mixture.shuffle_buffer_size` (default 1000) controls
+    # it; set it to 0/None to disable, or raise it (e.g. several x `mixture_block_size`)
+    # for a stronger shuffle at higher host-memory cost.
+    shuffle_buffer_size = mixture_cfg.get("shuffle_buffer_size")
+    if shuffle_buffer_size:
+        source = source.shuffle(
+            buffer_size=int(shuffle_buffer_size),
+            seed=mixture_cfg.get("seed", 42),
+        )
+
     # Apply packing if enabled
     if mixture_cfg.get("pack_tokens"):
         source = PackedShardedSource(

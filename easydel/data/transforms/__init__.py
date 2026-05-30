@@ -56,7 +56,7 @@ from .pack import (
     pack_constant_length,
     pack_pre_tokenized,
 )
-from .source import LimitedShardedSource, TransformedShardedSource
+from .source import LimitedShardedSource, ShuffledShardedSource, TransformedShardedSource
 from .tokenize import (
     TokenizedShardedSource,
     TokenizerManager,
@@ -150,6 +150,7 @@ __all__ = [
     "RewardPreprocessTransform",
     "SFTPreprocessTransform",
     "SelectFields",
+    "ShuffledShardedSource",
     "TokenizeStage",
     "TokenizedShardedSource",
     "TokenizerManager",
