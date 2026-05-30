@@ -185,7 +185,7 @@ def test_hf_easydel_roundtrip(model_type, request):
     pytest.importorskip("torch")
     try:
         config_cls, module_cls = ed.get_modules_by_type(model_type, ed.TaskType.CAUSAL_LM)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         pytest.skip(f"{model_type}: not registered for CAUSAL_LM ({exc})")
 
     config = _small_config(config_cls, model_type)

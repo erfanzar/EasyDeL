@@ -90,6 +90,8 @@ class BCOTrainer(Trainer):
             back to a deep copy of the policy when none is provided.
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     arguments: BCOConfig
 
     def __init__(

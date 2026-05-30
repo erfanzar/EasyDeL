@@ -835,6 +835,19 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to track memory usage. If a float, it sets the memory tracking interval in seconds."},
     )
+    sequence_packing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Pack multiple short sequences into fixed-length blocks of `max_length` tokens to cut padding "
+                "waste. Documents stay isolated (block-diagonal attention + per-document position reset; "
+                "linear-attention/SSM state is reset at boundaries where supported). Honored by "
+                "supervised/offline trainers (SFT and the eLarge data-mixture path); RL/online trainers "
+                "(GRPO family, PPO, OnlineDPO, on-policy distillation) and paired-preference trainers "
+                "(DPO/KTO/CPO/BCO/ORPO) warn and ignore it."
+            )
+        },
+    )
     use_data_collator: bool = field(
         default=True,
         metadata={"help": "Whether to use a data collator."},
@@ -1063,6 +1076,8 @@ class TrainingArguments:
         """
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("`gradient_accumulation_steps` can't be lower than 1.")
+
+        self.sequence_packing = bool(self.sequence_packing)
 
         if self.backend not in AVAILABLE_BACKENDS:
             raise ValueError(f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}")

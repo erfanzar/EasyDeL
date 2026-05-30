@@ -99,6 +99,8 @@ class GKDTrainer(SFTTrainer):
         seq_kd: Cached sequence-level KD flag.
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     arguments: GKDConfig
 
     def __init__(

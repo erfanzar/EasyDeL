@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import typing as tp
+
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
@@ -31,6 +33,8 @@ class GOLDTrainer(DistillationTrainer):
     distillation path. GOLD-specific config knobs are normalized by
     :class:`GOLDConfig` before the shared distillation step is compiled.
     """
+
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
 
     arguments: GOLDConfig
 

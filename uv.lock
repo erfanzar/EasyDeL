@@ -113,6 +113,9 @@ conflicts = [[
     { package = "easydel", extra = "tensorflow" },
 ]]
 
+[options]
+prerelease-mode = "allow"
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -257,25 +260,25 @@ wheels = [
 
 [[package]]
 name = "apache-tvm-ffi"
-version = "0.1.9"
+version = "0.1.8.post2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6f/60/1e787a0b5ebf318483235be2a689ee367173983067e441b8379564f667c0/apache_tvm_ffi-0.1.9.tar.gz", hash = "sha256:d2d402587e8906de0a07f4746aa78f3d452c7efe3625d4bb39ac2ad693bce530", size = 2513731, upload-time = "2026-02-27T19:28:06.602Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/e9/a13952726228fa6282154ecf927092396bc759739e5e045019f6ab92f3ca/apache_tvm_ffi-0.1.8.post2.tar.gz", hash = "sha256:4513e38852894f290172ecfefcbc18d34e817fd29c16a0f1770e130c82b4067e", size = 2441111, upload-time = "2026-01-13T18:11:27.864Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b0/44/130571cede8704b1412e48b3dd78de41b4d31b68241f954743d1a9925bd9/apache_tvm_ffi-0.1.9-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:932d94e29595a47109f0ef6e0b4209a934451582954ea8b426e758d6b3e307e3", size = 2070368, upload-time = "2026-02-27T19:27:13.779Z" },
-    { url = "https://files.pythonhosted.org/packages/42/b1/9f2cfd6d49b03c5d4ec5c12548d911e2e01265be783f343103b4df716765/apache_tvm_ffi-0.1.9-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c0449fc3802987c3652bea266ffda2934a6f69c80bba791a3f55b91040656a18", size = 2231154, upload-time = "2026-02-27T19:27:15.691Z" },
-    { url = "https://files.pythonhosted.org/packages/55/43/63faedea83494e99122466a993bcdccd31cf93c7e8a0d56731120e82e2b9/apache_tvm_ffi-0.1.9-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:6f16d73a82a9e68a439b7d233d48b1b929be17fe92df4bbf1ee2274e573144a3", size = 2323130, upload-time = "2026-02-27T19:27:17.259Z" },
-    { url = "https://files.pythonhosted.org/packages/27/96/d735bc4c528efaf0a8a954076963c727aad2dde8577641aa9025ec4f2d52/apache_tvm_ffi-0.1.9-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:01ebb1308b2666c206aa9a4015eb48f03a5d98ea2e9cfb002bd5e2ca0b9c7ef3", size = 2159854, upload-time = "2026-02-27T19:27:18.789Z" },
-    { url = "https://files.pythonhosted.org/packages/e4/3b/6cfc82a3ab5d9e501bbcee5df36eebe09da1c384461d7a55e2a17776d117/apache_tvm_ffi-0.1.9-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:21365abd2a2a1a6d3b4e6e4f048309651125becfa795440c3607f3cc27d30ac7", size = 2307140, upload-time = "2026-02-27T19:27:20.222Z" },
-    { url = "https://files.pythonhosted.org/packages/5f/61/3ffe1fe3190e12807a12b72ed0d291c7f66569c2e7c3571fde18175f19e1/apache_tvm_ffi-0.1.9-cp311-cp311-win_amd64.whl", hash = "sha256:9ee710a9fba3d9ff9747870bbd7e2175eb8d5b9c791f17fd645f35f6dab3f8aa", size = 1993218, upload-time = "2026-02-27T19:27:22.043Z" },
-    { url = "https://files.pythonhosted.org/packages/df/f2/b8c4b151169f6d7ba8773c8af68b2e0c1013d7fb3f1bdf87573f47157ce9/apache_tvm_ffi-0.1.9-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:49e52350b0470654847de752e65603b604a4d3323e7e9f5e8a982f44acc4c143", size = 2041756, upload-time = "2026-02-27T19:27:23.931Z" },
-    { url = "https://files.pythonhosted.org/packages/a7/c0/6d3d54f50012255b41bc3e24944c086f63c4707c8686c7c6780e9283eb96/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7d503029e66c43b1a1cb1a42a1e9bb428c8a28dcbdec31c28e705472ca648a3a", size = 2203712, upload-time = "2026-02-27T19:27:25.867Z" },
-    { url = "https://files.pythonhosted.org/packages/c6/dd/2bab4c6cd86257dbf99e93452a1af833113f8dc3e25a25579f6e4e4c8a94/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:28241371934ea8af10d5067087ba1229ebddded7b2c02d33a258ec2a96df8c46", size = 2299704, upload-time = "2026-02-27T19:27:27.477Z" },
-    { url = "https://files.pythonhosted.org/packages/7a/4a/b469bcb2e1014cb84d336d2a59f42958a058251c577a4c2680cacad346e2/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:87cacce81df55685fc6a76e1e3c5db1200e85e87bf5974b692c59d131b7bc622", size = 2130865, upload-time = "2026-02-27T19:27:29.092Z" },
-    { url = "https://files.pythonhosted.org/packages/70/ef/5402da5d37f5270fd88ea0348acca78dba9be8bdbf6c2bcae0935eb03ef1/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f45eb43499acac45ff6c93564f0ff2d3ca27b69656d540fd56ce59d51c0b4c65", size = 2278991, upload-time = "2026-02-27T19:27:30.729Z" },
-    { url = "https://files.pythonhosted.org/packages/b5/23/1b7dc5f0807f83098183a57db6ee85b2c93b646d74a6e03781c9208aaeb0/apache_tvm_ffi-0.1.9-cp312-abi3-win_amd64.whl", hash = "sha256:d1dcf4c041d5ec05e3da1d545800c33cdbb95c113baa7705085ff79fa262752b", size = 1973200, upload-time = "2026-02-27T19:27:32.367Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/86/7db24692281d80204d07d77346ad4cb87f6183f1364ed94311993a47ed1a/apache_tvm_ffi-0.1.8.post2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:40f5fba3e06617f16888a0fdaf7ab4049841ff6e741644be822400438b771fe7", size = 1840013, upload-time = "2026-01-13T18:10:33.724Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/cc/fbaef883c6ba8e2c56ffcca997f2c076d1c14787799a62f39bd52c7126d5/apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9eb6d228fa22b6a5da140d761962f022a154746c91fe7608c49062deaf671f9f", size = 1995159, upload-time = "2026-01-13T18:10:35.727Z" },
+    { url = "https://files.pythonhosted.org/packages/49/08/f1e984e3573d0cbd6d53f3f73a12691fba153afc529fbd506d78e739b330/apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:581c0acf845859be0cc26ac79f3663a83393b662c97c7125ebb78f0228b69d96", size = 2068543, upload-time = "2026-01-13T18:10:39.12Z" },
+    { url = "https://files.pythonhosted.org/packages/35/1f/5336d430a133cf66ca9dac8ae9b6e25d8b99275a6687656421a1deee9f1b/apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:beadc7bb480ae02d02e2108543f6f4b4170d77e361ab3ccb43697d174ec185b0", size = 1939018, upload-time = "2026-01-13T18:10:40.621Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/67/969c66a27a128cf738d0c068e0d4451d691d8197929c797cbe8e59c6cfc9/apache_tvm_ffi-0.1.8.post2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e593d191c7ca0726ebcd3b024a4bc8140694fdfce2e7b02493f38ad5c4c9ecf7", size = 2053068, upload-time = "2026-01-13T18:10:43.241Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/f1/84881a799d227fdc4a61fbf0cb8d5ceb6a72ad788fa9070e5853ed9759b6/apache_tvm_ffi-0.1.8.post2-cp311-cp311-win_amd64.whl", hash = "sha256:1c685f19d0f26d9356c7c77a1cb652a3632ec9ee6cd21aa1d8cfb968743ec1fd", size = 1809557, upload-time = "2026-01-13T18:10:44.743Z" },
+    { url = "https://files.pythonhosted.org/packages/12/8b/a39d6c6eb1a87f6003e2717695cc6d44cc65ccd57dae5a0af944c0d25751/apache_tvm_ffi-0.1.8.post2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:c13ec7fc8f255767998b301ace0cd1e7d17ba76b48ffeb97ca9eb22a3314e250", size = 1811882, upload-time = "2026-01-13T18:10:46.317Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/3a/7b1c9edcaeaebb945038144896cf17eb828a40b6ace0371823e133132664/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8c78b4caf17304a1f47881bccdb2f9ac24d98b3b7fbe761a6dd4fd0585934d96", size = 1967259, upload-time = "2026-01-13T18:10:47.851Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/b6/463602f57dda2e1c69165c044c07061cd59404593f313a427a3ad9c02cf3/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4a48da3fa8f47130f3502134f01e97044388c5217e7b91be4b0acec4feab81a0", size = 2044821, upload-time = "2026-01-13T18:10:49.396Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/e6/9cdc7f4814b2fbdfceba5dc640c3704d07d8db18e3d1aef5aa49bbf1ba7e/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:61cc98e489ebc03bc96d1a966dc863eb1c0a607383f6bf4a416ff0a96170ca85", size = 1910964, upload-time = "2026-01-13T18:10:51.345Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/f5/a2e5487cdad575fe6cf34f8a23f8c49e08ce5808fa75dc19d98bcebc20ec/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:caa48509f0c7d9b896823b492a9ee42afac2548065c1ec7ef07f9a0dc30d2796", size = 2025814, upload-time = "2026-01-13T18:10:52.804Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/0d/8922c142281187ae6b989579876d00d20b84ccd3878aad487b91d951d254/apache_tvm_ffi-0.1.8.post2-cp312-abi3-win_amd64.whl", hash = "sha256:985831722d1dd562d13e8e34102fd99f42f964c53fc7cf9d80fc4f7602f89196", size = 1790204, upload-time = "2026-01-13T18:10:54.558Z" },
 ]
 
 [[package]]
@@ -592,7 +595,7 @@ name = "cuda-bindings"
 version = "13.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-pathfinder" },
+    { name = "cuda-pathfinder", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/a9/3a8241c6e19483ac1f1dcf5c10238205dcb8a6e9d0d4d4709240dff28ff4/cuda_bindings-13.2.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:721104c603f059780d287969be3d194a18d0cc3b713ed9049065a1107706759d", size = 5730273, upload-time = "2026-03-11T00:12:37.18Z" },
@@ -619,8 +622,8 @@ name = "cuda-python"
 version = "13.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings" },
-    { name = "cuda-pathfinder" },
+    { name = "cuda-bindings", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "cuda-pathfinder", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4a/da/b4dbe129f941afe1c24a09ba53521b78875626763d96414798a74763282f/cuda_python-13.2.0-py3-none-any.whl", hash = "sha256:2f092b0ec13a860115fa595411889ee939ad203450ea4f91e9461b174ea7b084", size = 8145, upload-time = "2026-03-11T13:55:19.143Z" },
@@ -763,8 +766,8 @@ dependencies = [
 
 [package.optional-dependencies]
 cuda = [
-    { name = "ejkernel", extra = ["cuda", "triton"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
-    { name = "jax", extra = ["cuda13"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "ejkernel", extra = ["cuda", "triton"], marker = "(sys_platform == 'linux' and extra == 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax", extra = ["cuda13"], marker = "(sys_platform == 'linux' and extra == 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 lm-eval = [
     { name = "lm-eval" },
@@ -801,9 +804,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.101" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.79" },
-    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.79" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.79" },
+    { name = "ejkernel", specifier = "==0.0.80" },
+    { name = "ejkernel", extras = ["cuda", "triton"], marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = "==0.0.80" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.80" },
     { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.36" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -811,7 +814,7 @@ requires-dist = [
     { name = "grafanalib", specifier = ">=0.7.1" },
     { name = "grain", specifier = "~=0.2.11" },
     { name = "jax", specifier = ">=0.10.0" },
-    { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.10.0" },
+    { name = "jax", extras = ["cuda13"], marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=0.10.0" },
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.10.0" },
     { name = "jaxlib", specifier = ">=0.10.0" },
     { name = "jinja2", specifier = ">=3.1.5" },
@@ -829,8 +832,8 @@ requires-dist = [
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = "~=2.19.0" },
     { name = "tensorflow-datasets", marker = "extra == 'tensorflow'", specifier = "~=4.9.9" },
-    { name = "torch", marker = "extra == 'cuda' and extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "extra == 'cuda' and extra != 'torch'", specifier = "==2.8.0" },
+    { name = "torch", marker = "sys_platform == 'linux' and extra == 'cuda' and extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "sys_platform == 'linux' and extra == 'cuda' and extra != 'torch'", specifier = "==2.8.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "~=5.5.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
@@ -882,7 +885,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.79"
+version = "0.0.80"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -894,23 +897,28 @@ dependencies = [
     { name = "pydantic" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a8/b5/1c408bfad35ba36f8ed58e2a209f16c9ea370dc85e73d784969e8badc26e/ejkernel-0.0.79.tar.gz", hash = "sha256:859347fab0d7dfca0cd849d6910bd20625538323e26a858d42ad7d949be0ac26", size = 1608257, upload-time = "2026-04-26T22:04:40.393Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a5/9f/738e91bdf10048e2b67275a48e42d751a1ad3bf0394e20ff236559b0dbed/ejkernel-0.0.80.tar.gz", hash = "sha256:8b885daa807afd4e8ad805821bf91d720cdd785e7159200c1e02a34b2da5f1ac", size = 1794847, upload-time = "2026-05-30T14:25:24.463Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9c/45/bae961cfed3aca45187cf262e53c1ea00852aafd69e486ad80b214e1dcf9/ejkernel-0.0.79-py3-none-any.whl", hash = "sha256:fbf23eea8cc3de113151ba9077f1b45cbac5c77db1520c4ee7e194f683d59d87", size = 3401677, upload-time = "2026-04-26T22:04:36.955Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/b7/8c1b8301f745b3386750023f0be0f177189a714e165ef5e5be3f726f7671/ejkernel-0.0.80-py3-none-any.whl", hash = "sha256:ab592aeb7034fe0dae7af5ea6b5545fbe0d3a43a1beb1d4883e05e610c688cb8", size = 3780280, upload-time = "2026-05-30T14:25:26.295Z" },
 ]
 
 [package.optional-dependencies]
 cuda = [
-    { name = "jax", extra = ["cuda13"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
-    { name = "jax-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
-    { name = "triton" },
+    { name = "apache-tvm-ffi", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax", extra = ["cuda13"], marker = "(sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax-cuda13-pjrt", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax-cuda13-plugin", extra = ["with-cuda"], marker = "(sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax-tvm-ffi", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "(sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cutlass-dsl-libs-cu13", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "triton", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 tpu = [
     { name = "jax", extra = ["tpu"], marker = "(extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu')" },
 ]
 triton = [
-    { name = "triton" },
+    { name = "triton", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 
 [[package]]
@@ -1807,8 +1815,8 @@ wheels = [
 
 [package.optional-dependencies]
 cuda13 = [
-    { name = "jax-cuda13-plugin", extra = ["with-cuda"], marker = "extra == 'extra-7-easydel-cuda' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
-    { name = "jaxlib" },
+    { name = "jax-cuda13-plugin", extra = ["with-cuda"], marker = "(sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-7-easydel-cuda') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform == 'win32' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jaxlib", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 tpu = [
     { name = "jaxlib" },
@@ -1830,7 +1838,7 @@ name = "jax-cuda13-plugin"
 version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "jax-cuda13-pjrt" },
+    { name = "jax-cuda13-pjrt", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/45/d6/969708896a4b870b55efc7b93e8f0d2956f641b77bd0dc0eb2ca5048b81a/jax_cuda13_plugin-0.10.0-cp311-cp311-manylinux_2_27_aarch64.whl", hash = "sha256:e3627f3378b93edb78ae9af097cf40e5f1f9ef47f7ed1f8f90f461a5dafebd03", size = 6079483, upload-time = "2026-04-16T12:32:54.327Z" },
@@ -1857,7 +1865,7 @@ with-cuda = [
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux' or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
-    { name = "nvidia-nvvm" },
+    { name = "nvidia-nvvm", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 
 [[package]]
@@ -1865,8 +1873,8 @@ name = "jax-tvm-ffi"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "apache-tvm-ffi" },
-    { name = "jax" },
+    { name = "apache-tvm-ffi", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "jax", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cc/a8/215d2e53aca8b663e3695d1527aa48f17562b862e6bfcf058bf59f9c7d86/jax_tvm_ffi-0.1.2.tar.gz", hash = "sha256:e3146f2c3ad9cf1fc380f7d41decd2c76491c58c60e4c9cda71080ffd83be001", size = 41269, upload-time = "2025-12-10T22:53:46.339Z" }
 wheels = [
@@ -2655,55 +2663,55 @@ wheels = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.4.1"
+version = "4.4.0.dev1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cutlass-dsl-libs-base" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0d/a8/d9f2b82bf6f6b48502267fcf2fa7b229392affb68a6092da92b0edef7476/nvidia_cutlass_dsl-4.4.1-py3-none-any.whl", hash = "sha256:7b8ffa0117be35ef6c9a88f4462ee2a794efd0f7d9f65090e10a953e434fbfce", size = 10167, upload-time = "2026-02-27T09:37:34.551Z" },
+    { url = "https://files.pythonhosted.org/packages/85/0f/caa8497bc69da9b7910a43ed5de758b39920cc13d1fccd95fd2e21622c93/nvidia_cutlass_dsl-4.4.0.dev1-py3-none-any.whl", hash = "sha256:20cc1902522f262becae9222e9ac4fb8cc5ae3444784a350365dd775f49fcf18", size = 10226, upload-time = "2026-02-04T01:18:31.415Z" },
 ]
 
 [package.optional-dependencies]
 cu13 = [
-    { name = "nvidia-cutlass-dsl-libs-cu13" },
+    { name = "nvidia-cutlass-dsl-libs-cu13", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-base"
-version = "4.4.1"
+version = "4.4.0.dev1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy" },
-    { name = "typing-extensions" },
+    { name = "cuda-python", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "numpy", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "typing-extensions", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/84/8601ac8308f8cd3121663d934d645458ebc92849aae4b78f811db36ff3e8/nvidia_cutlass_dsl_libs_base-4.4.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:f7e9f9c2407a5397482dfca6f5e649c36f508f7cc9e059b9be12093154b14dcb", size = 75459322, upload-time = "2026-02-27T09:44:32.765Z" },
-    { url = "https://files.pythonhosted.org/packages/85/82/02999d772e2cbdf203299d4389278c2c5f4261a10bf54fb69e26eea2b12d/nvidia_cutlass_dsl_libs_base-4.4.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:649b422f166bd7905b69d1a089b2d1c68ac70f58d34d8f2ecd9403b6b574751a", size = 74346984, upload-time = "2026-02-27T09:43:10.223Z" },
-    { url = "https://files.pythonhosted.org/packages/f5/cd/d09f6c998a9d52372d97d85d6561392d745ca00cf46de956d7cd7ec608cf/nvidia_cutlass_dsl_libs_base-4.4.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:74192716b18c1825382723891842f87fa2a045b4b100c5c0f474042731e21e86", size = 75458464, upload-time = "2026-02-27T09:45:01.155Z" },
-    { url = "https://files.pythonhosted.org/packages/b4/c1/acca814bc209562ef6cefbdec2ca36520f9a0380cdc7c6feaa69874bb50d/nvidia_cutlass_dsl_libs_base-4.4.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:ba5e3d7148f7882911bb3cb453c313c790d1c2096bdfdd2d96da2123cf562201", size = 74347149, upload-time = "2026-02-27T09:45:56.602Z" },
-    { url = "https://files.pythonhosted.org/packages/8b/bb/65b4a2fa4d3196e7f27d90986972a4c7d5b575600f64b2b84943d64023a4/nvidia_cutlass_dsl_libs_base-4.4.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:deef87f979201f8dd0da517a12cd8b27031d44eaa996051d123b7387e91aebc4", size = 75462825, upload-time = "2026-02-27T09:43:38.759Z" },
-    { url = "https://files.pythonhosted.org/packages/18/37/980fc6d6a6e2832669fb01dda3e6e0ffed6a4a6a4de43eee1fe6e9838990/nvidia_cutlass_dsl_libs_base-4.4.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:cc63f01f10b6ac0a0e6ee8066120dee0cfa45da76f76e10ce4660f0dff22c07a", size = 74346092, upload-time = "2026-02-27T09:42:42.579Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/43/af92db2167ee4eb30620641bf14ec9aebfae8ff27f1cfc5a1f2552a4d855/nvidia_cutlass_dsl_libs_base-4.4.0.dev1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8556f9397e9e3290c9f46cb4bee30b77a1af2bfc4347fa8f5a6777152310017d", size = 75513521, upload-time = "2026-02-04T01:22:29.847Z" },
+    { url = "https://files.pythonhosted.org/packages/56/06/fddc523dc6ffea1f76614383998744c9c1adab1a7ee17b0ebb49d1d63bdf/nvidia_cutlass_dsl_libs_base-4.4.0.dev1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:0da11c56935ac9034ecaed5282b43dcdebb22d96f08f3328e8472343442f95cb", size = 74631284, upload-time = "2026-02-04T01:24:52.52Z" },
+    { url = "https://files.pythonhosted.org/packages/07/c2/3882dff5398f57ed8eea1cac898b7484a4482503622edd76e69a9c723170/nvidia_cutlass_dsl_libs_base-4.4.0.dev1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:bea93ac1064067cb85a26584cf486f35e929082beaacf24fb7201f420017e055", size = 75511841, upload-time = "2026-02-04T01:22:01.021Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/d6/e9a11c14827cf36e339dcc6903e715c03307739c0c1e44f270143f9d23e5/nvidia_cutlass_dsl_libs_base-4.4.0.dev1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:492a8d53127ad3008c939cbfbdf809ebb164272bb6ccac4dbe20461cad41df6f", size = 74630827, upload-time = "2026-02-04T01:23:28.682Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/15/d778704dc46bed1c3c2a01b28d079653b856c4c1628d7dc16ed5b3cdc6c9/nvidia_cutlass_dsl_libs_base-4.4.0.dev1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:34eb0329587ac61fd3b9b2378ab9c1280bde69d740336ecf4fcb53249e371c62", size = 75514449, upload-time = "2026-02-04T01:23:56.592Z" },
+    { url = "https://files.pythonhosted.org/packages/34/8c/b9d22253223f33de35baec6e76e786f1dc2055b3a03a3ee62af8a34d99e4/nvidia_cutlass_dsl_libs_base-4.4.0.dev1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:196fde5a2411aa9b497625977b71cf1f17e9c80a98f56ace9313f901f10bf5de", size = 74630623, upload-time = "2026-02-04T01:25:22.142Z" },
 ]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.4.1"
+version = "4.4.0.dev1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy" },
-    { name = "nvidia-cutlass-dsl-libs-base" },
-    { name = "typing-extensions" },
+    { name = "cuda-python", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "numpy", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "typing-extensions", marker = "(sys_platform != 'emscripten' and sys_platform != 'win32') or (sys_platform == 'emscripten' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'win32' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/7e/eb39e3254c0fea886d9861b2df67a4bec527b717ec52ca69d2f70b6ae7e2/nvidia_cutlass_dsl_libs_cu13-4.4.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:23b27545762feb8e3353d1ee4436290a9ae582645083c92d42a17ba30032e626", size = 78655468, upload-time = "2026-02-27T09:38:45.174Z" },
-    { url = "https://files.pythonhosted.org/packages/52/8c/3a64f59d282f1d8077c5c5dc8691bf33673a66ba4abec78ffbb3224c1472/nvidia_cutlass_dsl_libs_cu13-4.4.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:54f82a9e92a5274078f42e1e9f1d22bcb73804f442a026581fad82b679a6fe40", size = 78379082, upload-time = "2026-02-27T09:41:44.802Z" },
-    { url = "https://files.pythonhosted.org/packages/ac/47/2e913ff28c76cbce1fc90d18bedd3a8904f9820c6aa0fb3641e8812e2dc0/nvidia_cutlass_dsl_libs_cu13-4.4.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:09f5327711c740211e26eae3c34be260cf8d5e305204a87c634cb535117e57e8", size = 78652874, upload-time = "2026-02-27T09:39:46.64Z" },
-    { url = "https://files.pythonhosted.org/packages/81/36/a8ea89547d3a7a73e1bde28010e744b10f4c866f43532b286b1e62ac50d5/nvidia_cutlass_dsl_libs_cu13-4.4.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:39feed15c293960afe7beca4d1009d091fbd2d762d921cc0018a7e63e501cac7", size = 78379632, upload-time = "2026-02-27T09:41:13.391Z" },
-    { url = "https://files.pythonhosted.org/packages/b4/5f/995e2ac5bc2cac43c6f27ec746554f184064e46932cc5318606cc7685b22/nvidia_cutlass_dsl_libs_cu13-4.4.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7c3605162408caa605937046149d73610d3355283b1fa3a9559540b2c393db39", size = 78658475, upload-time = "2026-02-27T09:39:12.805Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/47/4905cac297d5b8e6d657ff0a23c22dd3d13647e2581e8b266a542d6aa93a/nvidia_cutlass_dsl_libs_cu13-4.4.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:054c4f6fff51b22a33f0cf1c65e48ed2015c58d42b2a17d2749a4bad3b9b744c", size = 78379474, upload-time = "2026-02-27T09:40:46.113Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/57/9759b30a5e3ac2691133efc6a4e5c7cfa887cf3c945d2188b3b815cc4730/nvidia_cutlass_dsl_libs_cu13-4.4.0.dev1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:a4a37bdb60105136917d278fce6314da1574a32bf650b6c8ca6e395f1e0ab919", size = 78481795, upload-time = "2026-02-04T01:17:37.667Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/8b/16e8ebbe271523f30b3d1f00a57635cf4e0002b0b28a5f35f8990c670b2a/nvidia_cutlass_dsl_libs_cu13-4.4.0.dev1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:cadb3d1c5b39b5e24bf5cba609879bacaf79acb4e3304f34d7434acee9d37e08", size = 78452473, upload-time = "2026-02-04T01:20:32.018Z" },
+    { url = "https://files.pythonhosted.org/packages/14/4c/49a81cb22b9c68951d491a0f6db1215e80c7688f602b138e6d2f13ff9f57/nvidia_cutlass_dsl_libs_cu13-4.4.0.dev1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:8311423849eb77dbed2eecba44fb0ed8317bc8a70daa0ed321cb958d81c8a4f0", size = 78477780, upload-time = "2026-02-04T01:19:27.545Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/20/b35af920f6b897fad398173996957dd280cf7f93c2a6d0297394c9f713b0/nvidia_cutlass_dsl_libs_cu13-4.4.0.dev1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:af819669fd96b2b94728eb96cdb10fab93f68f7296eb522e6447520bfe6f078e", size = 78452794, upload-time = "2026-02-04T01:21:01.028Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/88/db80d7c5bb0bd95f670740f6a32bda201e14bdce80adefb9dffd9f8bb0ba/nvidia_cutlass_dsl_libs_cu13-4.4.0.dev1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:a382e03349be92f815d9827cbe3b77e42758cc9df783c28b9f914662ca379992", size = 78479602, upload-time = "2026-02-04T01:18:06.289Z" },
+    { url = "https://files.pythonhosted.org/packages/da/e4/eeb211eff8e4379245a2d4a707513159aae01caa7fe48d1adac5d19008d9/nvidia_cutlass_dsl_libs_cu13-4.4.0.dev1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:962bfdc784ea27f6051d2064adf5dad8fe12ec1c197858d0345f457e17a3f4a0", size = 78452814, upload-time = "2026-02-04T01:21:29.704Z" },
 ]
 
 [[package]]

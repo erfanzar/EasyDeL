@@ -54,7 +54,7 @@ from tqdm.autonotebook import tqdm
 from easydel.utils.helpers import check_bool_flag
 
 from .analyze_memory import SMPMemoryMonitor
-from .traversals import flatten_dict, unflatten_dict
+from .traversals import unflatten_dict
 
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -1200,7 +1200,7 @@ class StateDictConverter:
             embedding_names += [
                 ".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, _nnx.Embed)
             ]
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
         moe_names = list(set([names.split(".")[-1] for names in moe_path])) if moe_path else None

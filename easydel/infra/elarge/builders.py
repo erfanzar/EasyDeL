@@ -1900,8 +1900,7 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
             seed=mixture_cfg.get("seed", 42),
         )
 
-    # Apply packing if enabled
-    if mixture_cfg.get("pack_tokens"):
+    if mixture_cfg.get("pack_tokens") or mixture_cfg.get("sequence_packing"):
         source = PackedShardedSource(
             source=source,
             seq_length=mixture_cfg.get("pack_seq_length", 2048),

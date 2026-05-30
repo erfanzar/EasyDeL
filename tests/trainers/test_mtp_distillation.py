@@ -30,16 +30,16 @@ import traceback
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 
-import easydel  # noqa: E402,F401
-import easydel.trainers  # noqa: E402,F401
-import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-import spectrax as spx  # noqa: E402
+import jax
+import jax.numpy as jnp
+import spectrax as spx
 
-from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM  # noqa: E402
-from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig  # noqa: E402
-from easydel.trainers import DistillationConfig  # noqa: E402
-from easydel.trainers.distillation_trainer._fn import (  # noqa: E402
+import easydel
+import easydel.trainers  # noqa: F401
+from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM
+from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
+from easydel.trainers import DistillationConfig
+from easydel.trainers.distillation_trainer._fn import (
     mtp_chain_distillation_loss,
     mtp_distillation_loss,
 )
@@ -156,8 +156,10 @@ def test_mtp_chain_perfect_alignment():
     teacher = jax.random.normal(jax.random.PRNGKey(9), (b, s, v)) * 2.0
     # step j (k=j+1) target = teacher shifted left by k -> a perfect student equals that
     perfect = jnp.stack(
-        [jnp.concatenate([teacher[:, kk:], jnp.broadcast_to(teacher[:, -1:], (b, kk, v))], axis=1)[:, :s]
-         for kk in range(1, k + 1)],
+        [
+            jnp.concatenate([teacher[:, kk:], jnp.broadcast_to(teacher[:, -1:], (b, kk, v))], axis=1)[:, :s]
+            for kk in range(1, k + 1)
+        ],
         axis=0,
     )
     mean_kd, per_step = mtp_chain_distillation_loss(perfect, teacher, attention_mask=jnp.ones((b, s)), temperature=1.0)

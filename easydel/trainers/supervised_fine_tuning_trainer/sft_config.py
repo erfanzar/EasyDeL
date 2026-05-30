@@ -260,6 +260,10 @@ class SFTConfig(TrainingArguments):
             self.assistant_only_loss = bool(self.completion_only_loss)
         if self.shuffle_dataset is not None:
             self.shuffle_train_dataset = bool(self.shuffle_dataset)
+        # The shared `sequence_packing` flag (base TrainingArguments) feeds SFT's existing
+        # `packing` machinery, which already emits segment_ids + completion masks.
+        if getattr(self, "sequence_packing", False) and not self.packing:
+            self.packing = True
         if self.padding_free and not self.packing:
             self.packing = True
         if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:

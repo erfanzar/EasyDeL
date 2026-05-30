@@ -102,8 +102,15 @@ class _Qwen3_5MoeMTPMixin:
         return self.mtp is not None
 
     def compute_mtp_outputs(
-        self, outputs, input_ids, attention_mask=None, mask_info=None,
-        position_ids=None, mode=None, mtp_past_key_values=None, cache_metadata=None,
+        self,
+        outputs,
+        input_ids,
+        attention_mask=None,
+        mask_info=None,
+        position_ids=None,
+        mode=None,
+        mtp_past_key_values=None,
+        cache_metadata=None,
     ) -> Qwen3_5MTPOutput | None:
         if self.mtp is None:
             return None
@@ -113,9 +120,13 @@ class _Qwen3_5MoeMTPMixin:
         return self.mtp(
             prev_hidden_states=outputs.last_hidden_state,
             next_token_embeds=self._mtp_embed(next_input_ids.astype("i4")),
-            mask_info=mask_info, position_ids=position_ids, mode=mode,
-            past_key_values=mtp_past_key_values, cache_metadata=cache_metadata,
-            frequencies=self._mtp_frequencies(), attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=mtp_past_key_values,
+            cache_metadata=cache_metadata,
+            frequencies=self._mtp_frequencies(),
+            attention_mask=attention_mask,
         )
 
     def compute_mtp_logits(self, mtp_output: Qwen3_5MTPOutput):
@@ -136,13 +147,12 @@ class _Qwen3_5MoeMTPMixin:
         prev_hidden = outputs.last_hidden_state
         step_logits: list = []
         for k in range(1, n_steps + 1):
-            shifted = jnp.concatenate(
-                [input_ids[:, k:], jnp.zeros((b, k), dtype=input_ids.dtype)], axis=-1
-            )
+            shifted = jnp.concatenate([input_ids[:, k:], jnp.zeros((b, k), dtype=input_ids.dtype)], axis=-1)
             mtp_out = self.mtp(
                 prev_hidden_states=prev_hidden,
                 next_token_embeds=self._mtp_embed(shifted.astype("i4")),
-                frequencies=frequencies, attention_mask=attention_mask,
+                frequencies=frequencies,
+                attention_mask=attention_mask,
             )
             prev_hidden = mtp_out.last_hidden_state
             step_logits.append(self.compute_mtp_logits(mtp_out))
@@ -233,7 +243,9 @@ class Qwen3_5MoeForCausalLM(_Qwen3_5MoeMTPMixin, Qwen3NextForCausalLM):
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
         if int(getattr(config, "mtp_num_hidden_layers", 0)) > 0:
-            self.mtp = Qwen3_5MTPHead(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
+            self.mtp = Qwen3_5MTPHead(
+                config=config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
+            )
         else:
             self.mtp = None
 
@@ -269,8 +281,10 @@ class Qwen3_5MoeForCausalLM(_Qwen3_5MoeMTPMixin, Qwen3NextForCausalLM):
         )
         mtp_mode = mode
         if mtp_mode is None and (past_key_values is not None or cache_metadata is not None):
-            seq_len = input_ids.shape[1] if input_ids is not None else (
-                inputs_embeds.shape[1] if inputs_embeds is not None else None
+            seq_len = (
+                input_ids.shape[1]
+                if input_ids is not None
+                else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
             )
             mtp_mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
         return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mtp_mode)
@@ -528,7 +542,9 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
-class Qwen3_5MoeForConditionalGeneration(_Qwen3_5MoeMTPMixin, BaseVisionLanguageModule[Qwen3_5MoeModel, Qwen3_5MoeConfig]):
+class Qwen3_5MoeForConditionalGeneration(
+    _Qwen3_5MoeMTPMixin, BaseVisionLanguageModule[Qwen3_5MoeModel, Qwen3_5MoeConfig]
+):
     """Qwen3.5-MoE multimodal conditional generation model.
 
     End-to-end vision-language model that wraps :class:`Qwen3_5MoeModel` and
@@ -627,8 +643,10 @@ class Qwen3_5MoeForConditionalGeneration(_Qwen3_5MoeMTPMixin, BaseVisionLanguage
         cache_metadata = kwargs.get("cache_metadata")
         if mode is None and (past_key_values is not None or cache_metadata is not None):
             inputs_embeds = kwargs.get("inputs_embeds")
-            seq_len = input_ids.shape[1] if input_ids is not None else (
-                inputs_embeds.shape[1] if inputs_embeds is not None else None
+            seq_len = (
+                input_ids.shape[1]
+                if input_ids is not None
+                else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
             )
             mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
         return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mode)

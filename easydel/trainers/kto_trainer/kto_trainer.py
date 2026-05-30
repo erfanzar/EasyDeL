@@ -87,6 +87,8 @@ class KTOTrainer(Trainer):
             anchor is computed (``True`` for ``loss_type == "kto"``).
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     arguments: KTOConfig
 
     def __init__(

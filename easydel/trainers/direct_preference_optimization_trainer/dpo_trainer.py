@@ -96,6 +96,8 @@ class DPOTrainer(Trainer):
         These will be automatically tokenized via lazy transforms during iteration.
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     arguments: DPOConfig
 
     def __init__(

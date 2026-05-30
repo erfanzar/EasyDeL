@@ -84,6 +84,8 @@ class ORPOTrainer(Trainer):
         >>> trainer.train()
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     arguments: ORPOConfig
 
     def __init__(

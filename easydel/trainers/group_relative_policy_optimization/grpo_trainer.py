@@ -315,6 +315,8 @@ class GRPOTrainer(Trainer):
         >>> trainer.train()
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     arguments: GRPOConfig  # type hinting
     reward_processing_classes: list | None
 

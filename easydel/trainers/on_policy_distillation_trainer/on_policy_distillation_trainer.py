@@ -88,6 +88,8 @@ class OnPolicyDistillationTrainer(Trainer):
         >>> trainer.train()
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+
     teacher_state: EasyDeLState
     arguments: OnPolicyDistillationConfig  # type hinting
 

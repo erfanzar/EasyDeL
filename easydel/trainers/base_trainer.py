@@ -254,6 +254,11 @@ class BaseTrainer(BaseTrainerProtocol):
     model_state: EasyDeLState | None
     _train_source: ShardedDataSource | None
     _eval_source: ShardedDataSource | None
+
+    # Whether this trainer can honor ``arguments.sequence_packing``. Supervised/offline
+    # trainers (SFT, ...) leave this True; RL/online and paired-preference trainers whose
+    # data path is incompatible override it to False so the flag is warned-and-ignored.
+    supports_sequence_packing: tp.ClassVar[bool] = True
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = frozenset(
         {
             "model_state",
@@ -386,6 +391,15 @@ class BaseTrainer(BaseTrainerProtocol):
         if arguments.model_name is None:
             arguments.model_name = getattr(model_state.model, "_model_type", "module")
         self.arguments = arguments
+        # Warn-and-ignore sequence packing on trainers whose data path can't support it
+        # (RL/online rollout, paired-preference). Never crash — just disable the flag.
+        if getattr(self.arguments, "sequence_packing", False) and not self.supports_sequence_packing:
+            _msg = (
+                f"{type(self).__name__} does not support `sequence_packing=True` "
+                "(its on-policy / paired-sequence data path is incompatible); ignoring the flag."
+            )
+            logger.warning(_msg)
+            self.arguments.sequence_packing = False
         self._preemption_checkpoint_path = None
         self._tpu_preemption_sync_available = None
 

@@ -193,7 +193,6 @@ def _maybe_flatten_position_ids_for_text(config: Qwen3_5TextConfig, position_ids
     return position_ids
 
 
-
 @dataclass(frozen=True)
 class Qwen3_5MTPOutput:
     """Output of the Qwen3.5 MTP head.

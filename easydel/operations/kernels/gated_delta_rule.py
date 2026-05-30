@@ -909,6 +909,17 @@ class GatedDeltaRuleOp(OperationImpl):
             preserved_indices=[0, 2],
         )
 
+        seg_ids = kwargs.get("seg_ids", None)
+
+        seg_source = None
+        if query_sharding is not None:
+            seg_source = PartitionSpec(query_sharding[0], None)
+        seg_sharding = self.create_stable_sharding(
+            seg_source,
+            dep=seg_ids,
+            tensor=seg_ids,
+        )
+
         in_specs = None
         out_specs = None
         mesh = self.metadata.mesh
@@ -922,6 +933,10 @@ class GatedDeltaRuleOp(OperationImpl):
                 decay_sharding,
                 state_in_sharding,
             )
+            # When packing, the shard_map wrapper appends seg_ids to its operands; supply the
+            # matching trailing in_spec here so the wrapper never has to invent a PartitionSpec.
+            if seg_ids is not None:
+                in_specs = (*in_specs, seg_sharding)
             out_specs = (output_sharding, state_out_sharding)
 
         platform = None
@@ -932,12 +947,14 @@ class GatedDeltaRuleOp(OperationImpl):
                 platform = "pallas"
 
         use_chunked_gdr = check_bool_flag("EASYDEL_GDR_CHUNKED", False) and not is_inference_mode()
+        # ``seg_ids`` is positional-only (between ``decay`` and ``initial_state``) on the op.
         outputs, new_recurrent_state = gated_delta_rule(
             query,
             key,
             value,
             beta,
             decay,
+            seg_ids,
             recurrent_state,
             use_qk_l2norm=use_qk_l2norm,
             use_chunked=use_chunked_gdr,

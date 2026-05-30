@@ -2785,6 +2785,50 @@ class Qwen3NextLinearAttention(spx.Module):
         )
         return typing.cast(Array, with_sharding_constraint(conv_output, replicated_3d, mesh=stage_mesh))
 
+    def _segment_aware_depthwise_conv(
+        self,
+        conv_input: Float[Array, "batch seq conv_dim"],
+        seg_ids: Int[Array, "batch seq"],
+    ) -> Float[Array, "batch seq conv_dim"]:
+        """Causal depthwise conv that does not mix across packed-document boundaries.
+
+        The standard causal conv computes
+        ``out[t] = sum_j w[j] * in[t - (K-1) + j]`` (left-padded by ``K-1``). For sequence
+        packing, any tap whose source position ``t - (K-1) + j`` belongs to a different
+        document than ``t`` must be dropped, otherwise the first ``K-1`` tokens of a packed
+        document leak the previous document's tail. Implemented as an explicit shifted sum
+        (``K`` is small, e.g. 4) with a per-tap same-segment mask — numerically identical to
+        the monolithic conv when there are no boundaries.
+
+        Args:
+            conv_input: ``(batch, seq, conv_dim)`` Q/K/V projection stream.
+            seg_ids: ``(batch, seq)`` per-token document id (padding may be ``-1``).
+
+        Returns:
+            Convolution output, same shape as ``conv_input`` (pre-activation).
+        """
+        kernel = self.conv1d.weight.value  # [kernel_size, 1, conv_dim] (HIO, depthwise)
+        k_size = kernel.shape[0]
+        w = kernel[:, 0, :].astype(jnp.float32)  # [K, conv_dim]
+        x = conv_input.astype(jnp.float32)  # [B, S, C]
+        b, s, _ = x.shape
+        seg = seg_ids[:, :s]
+        acc = jnp.zeros_like(x)
+        # tap j (0..K-1) reads position t - (K-1-j); j=K-1 is the current token.
+        for j in range(k_size):
+            shift = k_size - 1 - j
+            if shift == 0:
+                shifted_x = x
+                same_seg = jnp.ones((b, s), dtype=jnp.bool_)
+            else:
+                shifted_x = jnp.concatenate([jnp.zeros((b, shift, x.shape[2]), x.dtype), x[:, :-shift]], axis=1)
+                src_seg = jnp.concatenate(
+                    [jnp.full((b, shift), -2, seg.dtype), seg[:, :-shift]], axis=1
+                )  # segment id of the source token for this tap
+                same_seg = src_seg == seg
+            acc = acc + jnp.where(same_seg[..., None], shifted_x * w[j][None, None, :], 0.0)
+        return acc.astype(conv_input.dtype)
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: Float[Array, "batch seq proj_dim"],
@@ -2904,6 +2948,14 @@ class Qwen3NextLinearAttention(spx.Module):
         decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
         beta = jax.nn.sigmoid(beta)
 
+        # Sequence packing: per-token document ids (from ``mask_info.q_segment_ids``, built by
+        # the model forward). Threaded into the segment-aware conv and the GDR kernel so a
+        # packed document never mixes conv taps or carries recurrent state across a boundary.
+        # ``None`` (no packing) keeps every path on its original code.
+        seg_ids = getattr(mask_info, "q_segment_ids", None) if mask_info is not None else None
+        if seg_ids is not None:
+            seg_ids = seg_ids[:, :seq_len]
+
         new_conv_state = None
 
         packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
@@ -2994,6 +3046,12 @@ class Qwen3NextLinearAttention(spx.Module):
                 output_dtype=conv_output_dtype,
                 reuse_partial_state=False,
             )
+        elif seg_ids is not None:
+            # Sequence packing: the causal depthwise conv reaches back ``d_conv-1`` tokens,
+            # so the first tokens of a packed document would otherwise mix in the previous
+            # document's tail. Run a segment-aware conv that zeros any tap crossing a
+            # document boundary (exact; ``d_conv`` is small).
+            conv_output = jax.nn.silu(self._segment_aware_depthwise_conv(conv_input, seg_ids))
         else:
             # Training/prefill without cache: use the full convolution directly.
             if self.uses_split_proj:
@@ -3054,6 +3112,9 @@ class Qwen3NextLinearAttention(spx.Module):
                 partition_axis=self.config.partition_axis,
             )
         else:
+            gdr_extra = {}
+            if seg_ids is not None:
+                gdr_extra["seg_ids"] = seg_ids  # packed training: reset recurrence per document
             gdr_output: GatedDeltaRuleOutput = self.gdr_op(
                 query=query,
                 key=key,
@@ -3062,6 +3123,7 @@ class Qwen3NextLinearAttention(spx.Module):
                 decay=decay,
                 conv_state=None,  # conv_state is handled separately above
                 recurrent_state=recurrent_state,
+                **gdr_extra,
             )
             output = gdr_output.attention_outputs
             new_recurrent_state = gdr_output.recurrent_state
