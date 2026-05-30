@@ -1207,6 +1207,44 @@ class EasyDeLBaseModule(
         bound.train(self.training)
         return tp.cast(Self, bound)
 
+    def materialize_meta_state(self: Self, *, seed: int = 0) -> Self:
+        """Concretize any leftover abstract (``ShapeDtypeStruct``) state leaves.
+
+        ``lazy_init`` builds the whole module under ``jax.eval_shape``, so
+        non-parameter state created by the constructor — most importantly the
+        ``spx.Rngs`` PRNG-key leaves — comes back abstract. Checkpoint loading
+        (``merge_model_and_tree``) fills only the *parameter* tree, so those
+        ``rng``-collection leaves remain ``ShapeDtypeStruct``. They slip past
+        :meth:`assert_parameters_materialized` (which only inspects the trainable
+        ``parameters`` collection) and then crash ``spx.export``-based
+        serialization in :meth:`save_pretrained` with
+        ``'ShapeDtypeStruct' object has no attribute 'addressable_shards'``.
+
+        This must be called only AFTER parameters are concrete: ``rng`` leaves
+        become real keys, while any other abstract leaf would be zero-filled by
+        :func:`materialize_meta_leaves`. Already-materialized leaves (the loaded
+        weights) are left untouched, and when nothing is abstract the same module
+        is returned without an unnecessary re-bind.
+
+        Args:
+            seed: Seed used to derive concrete PRNG keys for abstract ``rng``
+                leaves.
+
+        Returns:
+            Self: A module whose state contains no abstract leaves.
+        """
+        graphdef, state = spx.export(self)
+        materialized = materialize_meta_leaves(state, seed=seed)
+        if materialized is state:
+            return self
+        bound = spx.bind(graphdef, materialized)
+        object.__setattr__(bound, "_spx_opaque", dict(self._spx_opaque))
+        for opaque_name in self._spx_attr_order:
+            if opaque_name not in bound._spx_attr_order:
+                bound._spx_attr_order.append(opaque_name)
+        bound.train(self.training)
+        return tp.cast(Self, bound)
+
     @property
     def graphdef(self: Self) -> spx.GraphDef:
         """Get the graph definition (structure without parameters) of the module.

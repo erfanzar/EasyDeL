@@ -1439,7 +1439,11 @@ class EasyBridgeMixin(PushToHubMixin):
             with _phase_timer("  load: merge_model_and_tree"):
                 model = merge_model_and_tree(model=model, tree=unflatten_dict(state), silence=silence_merge)
             with _phase_timer("  load: assert_parameters_materialized"):
-                return model.assert_parameters_materialized(context=f"loading weights from {resolved_archive_file}")
+                model.assert_parameters_materialized(context=f"loading weights from {resolved_archive_file}")
+            # Concretize any abstract non-parameter leaves (e.g. lazy_init's eval_shape-abstract
+            # spx.Rngs keys) that merge_model_and_tree left unfilled, so the returned model can
+            # be serialized by save_pretrained without hitting ShapeDtypeStruct leaves.
+            return model.materialize_meta_state()
 
         else:
             return model
@@ -2068,6 +2072,10 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug("merging model and parameters pytree.")
         model = merge_model_and_tree(model=model, tree=params)
         model.assert_parameters_materialized(context=f"converting torch checkpoint {pretrained_model_name_or_path}")
+        # lazy_init builds spx.Rngs under jax.eval_shape, so the rng PRNG-key leaves return
+        # abstract and merge_model_and_tree (parameters only) never fills them. Concretize the
+        # remaining meta leaves now so the model is fully materialized and safe to serialize.
+        model = model.materialize_meta_state()
         logger.debug("model and parameters pytree merged.")
 
         model = model.quantize(
