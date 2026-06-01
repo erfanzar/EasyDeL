@@ -105,7 +105,7 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
     if cp2 != num_attention_heads:
         extra_base = jnp.asarray(2 ** (-(2 ** -(math.log2(2 * cp2) - 3))), dtype=jnp.float32)
         num_rem_heads = min(cp2, num_attention_heads - cp2)
-        extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.dtype)
+        extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.float32)
         slops = jnp.concatenate([slops, jnp.power(extra_base, extra_power)], axis=0)
     arange_tensor = (((jnp.cumsum(attention_mask, axis=-1)) - 1) * attention_mask)[:, jnp.newaxis, :]
     alibi = slops[..., jnp.newaxis].astype(jnp.bfloat16) * arange_tensor

@@ -1491,7 +1491,7 @@ class EasyDeLBaseModule(
                     loss_type = None
         if loss_type is None or (loss_type not in LOSS_MAPPING and getattr(self.config, "loss_type", None) is not None):
             warnings.warn(
-                f"`loss_type={loss_type}` was set in the config but it is unrecognised."
+                f"`loss_type={loss_type}` was set in the config but it is unrecognised. "
                 f"Using the default loss: `ForCausalLMLoss`.",
                 stacklevel=1,
             )

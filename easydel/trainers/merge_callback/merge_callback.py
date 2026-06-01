@@ -66,6 +66,9 @@ class MergeModelCallback:
         self.merge_config = merge_config or MergeConfig()
         self.merge_at_every_checkpoint = bool(merge_at_every_checkpoint)
         self.push_to_hub = bool(push_to_hub)
+        # Holds the most recent merge result; None until on_save/on_train_end runs a merge, so callers
+        # (and the docstring's promised attribute) never hit AttributeError when reading it early.
+        self.last_merged_state = None
 
     def merge_states(self, policy_state: object, target_state: object) -> object:
         """Merge two states or raw pytrees with this callback's config.

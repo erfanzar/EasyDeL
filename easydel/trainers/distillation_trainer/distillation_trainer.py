@@ -252,6 +252,51 @@ class DistillationTrainer(Trainer):
         )
         mesh = self.model.mesh
 
+        # Zero-config large-vocab fit on a tensor-parallel mesh: enable the memory-safe LM-head paths
+        # automatically (explicit user values are always preserved). On TP>1 the row-parallel LM head
+        # otherwise materializes full ``[B, S, V]`` logits -- the distillation-KL and MTP-aux OOM:
+        #   * ``logits_chunk_size`` -> single full-sequence pass through the COLUMN-PARALLEL projection
+        #     so the distillation KL never all-reduces the full vocabulary;
+        #   * ``lmhead_chunksize``  -> chunk + ``jax.checkpoint`` the LM-head / MTP-aux projection so the
+        #     vocab-sized logits are recomputed in the backward instead of held as residuals.
+        try:
+            _tp_size = int(mesh.shape["tp"]) if (mesh is not None and "tp" in getattr(mesh, "axis_names", ())) else 1
+        except Exception:
+            _tp_size = 1
+        if _tp_size > 1:
+            _adv_vocab = (
+                self.arguments.beta is not None
+                or int(self.arguments.loss_top_k or 0) > 0
+                or bool(self.arguments.loss_add_tail)
+            )
+            _seq_len = int(getattr(self.arguments, "max_length", None) or 0)
+            if (
+                self.arguments.logits_chunk_size is None
+                and _seq_len > 0
+                and not bool(self.arguments.mtp_distillation)
+                and not _adv_vocab
+            ):
+                self.arguments.logits_chunk_size = _seq_len
+                logger.info(
+                    "Auto-enabled column-parallel distillation KL (logits_chunk_size=%d) on a TP=%d mesh.",
+                    _seq_len,
+                    _tp_size,
+                )
+            if getattr(self.model.config, "lmhead_chunksize", None) is None:
+                _lh = min(_seq_len, 2048) if _seq_len > 0 else 2048
+                try:
+                    self.model.config.lmhead_chunksize = _lh
+                    _t_model = getattr(self.teacher_state, "model", None)
+                    if _t_model is not None and getattr(_t_model.config, "lmhead_chunksize", None) is None:
+                        _t_model.config.lmhead_chunksize = _lh
+                    logger.info(
+                        "Auto-enabled chunked+checkpointed LM-head/MTP projection (lmhead_chunksize=%d) on a TP=%d mesh.",
+                        _lh,
+                        _tp_size,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not auto-set lmhead_chunksize: %s", exc)
+
         empty_sharding = replicated_named_sharding(mesh)
 
         hidden_layers = self.arguments.hidden_state_layers

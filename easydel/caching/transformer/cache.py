@@ -728,8 +728,17 @@ class TransformerCacheView(BaseCacheView):
                 return lax.dynamic_update_slice(old_cache, new_values.astype(old_cache.dtype), (current_index, 0, 0))
 
             def _overflow_window():
-                """Branch: shift older tokens out and append the new ones."""
-                return jnp.concatenate([old_cache[new_len:, :, :], new_values.astype(old_cache.dtype)], axis=0)
+                """Branch: drop the oldest tokens so the window keeps the most recent ``window_size``.
+
+                The window must become the last ``window_size`` of ``(old[0:current_index] ++ new)``: drop
+                ``shift = total_tokens - window_size`` from the front. The head is the still-valid tail of the
+                old window (``old_cache[shift:current_index]``) and ``new_values`` (guaranteed shorter than the
+                window here) fills the rest. The previous ``old_cache[new_len:]`` only matched when the window
+                was already full (``current_index == window_size``); otherwise it spliced in stale slots.
+                """
+                shift = total_tokens - window_size
+                head = lax.dynamic_slice_in_dim(old_cache, shift, window_size - new_len, axis=0)
+                return jnp.concatenate([head, new_values.astype(old_cache.dtype)], axis=0)
 
             return lax.cond(total_tokens <= window_size, _fits_in_window, _overflow_window)
 

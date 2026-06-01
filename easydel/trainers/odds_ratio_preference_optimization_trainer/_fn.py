@@ -41,6 +41,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 from spectrax import with_sharding_constraint
+from spectrax.common_types import BATCH, LENGTH, MODE_TRAIN, VOCAB
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -201,14 +202,37 @@ def concatenated_forward(
         if not is_encoder_decoder:
             logits = logits[..., :-1, :]
             labels = labels[..., 1:]
-        # masked-mean NLL over non-padding tokens via the ejkernel fused kernel (XLA backend)
-        loss = _fused_cross_entropy(
-            logits,
-            labels,
-            ignore_index=label_pad_token_id,
-            reduction="mean",
-            platform="xla",
-        ).loss
+        # masked-mean NLL over non-padding tokens via the ejkernel fused kernel (XLA backend). On a real
+        # (>1) TP mesh, resolve [BATCH, LENGTH, VOCAB] / [BATCH, LENGTH] specs and run inside shard_map so
+        # the vocab stays TP-sharded -- the full [B, S, V] logits are never all-reduced for the softmax.
+        ce_kwargs: dict[str, tp.Any] = dict(ignore_index=label_pad_token_id, reduction="mean", platform="xla")
+        ce_mesh = spx.get_current_stage_mesh(spx.get_incontext_mesh(raise_error=False), raise_error=False)
+        ce_logits, ce_labels = logits, labels
+        # Vocab-parallel NLL only for a real (>1) ``tp`` axis (no vocab to shard at tp=1). shard_map needs
+        # every meshed leading dim evenly divisible -- the chosen-only half is frequently indivisible
+        # (e.g. 1 row over fsdp=2), so pad [batch, seq] up to the sharded-axis product first. Padded rows
+        # carry ``label_pad_token_id`` and are dropped by the masked mean (and excluded from accuracy).
+        if ce_mesh is not None and "tp" in ce_mesh.axis_names and int(ce_mesh.shape["tp"]) > 1:
+            _pm = spx.PartitionManager(paxis=model.config.partition_axis)
+            _logit_spec = _pm.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
+            _token_spec = _pm.resolve([BATCH, LENGTH], MODE_TRAIN)
+
+            def _axis_prod(entry):
+                names = entry if isinstance(entry, tuple) else ((entry,) if entry is not None else ())
+                prod = 1
+                for nm in names:
+                    prod *= int(ce_mesh.shape[nm])
+                return prod
+
+            pads = [
+                (-int(d)) % max(_axis_prod(_token_spec[i]) if i < len(_token_spec) else 1, 1)
+                for i, d in enumerate(logits.shape[:-1])
+            ]
+            if any(p > 0 for p in pads):
+                ce_logits = jnp.pad(logits, [(0, p) for p in pads] + [(0, 0)])
+                ce_labels = jnp.pad(labels, [(0, p) for p in pads], constant_values=label_pad_token_id)
+            ce_kwargs.update(mesh=ce_mesh, in_specs=(_logit_spec, _token_spec), out_specs=PartitionSpec())
+        loss = _fused_cross_entropy(ce_logits, ce_labels, **ce_kwargs).loss
         valid = labels != label_pad_token_id
         safe_labels = jnp.where(valid, labels, 0)
         accuracy = jnp.sum(
@@ -460,10 +484,16 @@ def concatenated_inputs(
                 (concatenated_batch[concatenated_key], batch[k]), axis=0
             )
 
-    # For encoder-decoder models, repeat prompt inputs and attention masks.
+    # For encoder-decoder models, duplicate prompt inputs along the BATCH axis to line up with the
+    # chosen/rejected completions (which are concatenated on axis 0 above). ``.repeat(2, 1)`` wrongly doubled
+    # the sequence axis -> (batch, 2*seq); use a batch-axis concatenate to get (2*batch, seq), matching DPO.
     if is_encoder_decoder:
-        concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1)
-        concatenated_batch["concatenated_attention_mask"] = batch["prompt_attention_mask"].repeat(2, 1)
+        concatenated_batch["concatenated_input_ids"] = jnp.concatenate(
+            [batch["prompt_input_ids"], batch["prompt_input_ids"]], axis=0
+        )
+        concatenated_batch["concatenated_attention_mask"] = jnp.concatenate(
+            [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], axis=0
+        )
 
     return concatenated_batch
 

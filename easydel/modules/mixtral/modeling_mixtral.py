@@ -326,6 +326,11 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
+        # Router exploration noise (HF ``router_jitter_noise``). Stored + applied in ``forward`` during
+        # training; previously the config was documented but never wired (dead). Mirrors the MiniMax block.
+        self.jitter_noise = getattr(config, "router_jitter_noise", 0.0) or 0.0
+        self.rngs = rngs
+
     def forward(self, hidden_state: Array) -> tuple[Array, Array]:
         """Forward pass through the Sparse MoE block.
 
@@ -339,6 +344,15 @@ class MixtralSparseMoeBlock(BaseMoeModule):
                 - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
                 - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
+        if self.training and self.jitter_noise > 0:
+            # HF Mixtral router jitter: scale inputs by Uniform(1 - noise, 1 + noise) during training only.
+            hidden_state = hidden_state * jax.random.uniform(
+                self.rngs.param,
+                shape=hidden_state.shape,
+                minval=1.0 - self.jitter_noise,
+                maxval=1.0 + self.jitter_noise,
+                dtype=hidden_state.dtype,
+            )
         out, router_logits = self.moe_call(
             hidden_state=hidden_state,
             gate_layer=self.gate,

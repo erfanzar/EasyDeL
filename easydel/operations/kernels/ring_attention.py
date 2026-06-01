@@ -203,13 +203,13 @@ class RingAttn(OperationImpl):
         if softmax_aux is not None:
             softmax_aux = softmax_aux.reshape(-1)
 
-        model_mode = self.get_mode(query=query, BTHD=False)
+        model_mode = self.get_mode(query=query, BTHD=True)
         is_decode_mode = model_mode == common_types.MODE_DECODE
         causal_computed: bool = causal if not is_decode_mode else False
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         dtype_runtime: jnp.dtype = self.metadata.runtime_dtype
-        model_mode = self.get_mode(query=query, BTHD=False)
+        model_mode = self.get_mode(query=query, BTHD=True)
 
         shardings = self.metadata.get_shardings(
             mode=model_mode,

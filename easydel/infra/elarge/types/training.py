@@ -208,6 +208,7 @@ class LossConfig(TypedDict, total=False):
     chunk_token_size: NotRequired[int | None]
     chunk_block_size: NotRequired[int | None]
     compute_dtype: NotRequired[Literal["fp32", "bf16"] | None]
+    sparse_loss: NotRequired[bool]
 
 
 class BaseTrainerCfg(TypedDict, total=False):
@@ -590,6 +591,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     esurge_async_scheduling: NotRequired[bool | None]
     esurge_overlap_execution: NotRequired[bool | None]
     esurge_max_num_seq_buckets: NotRequired[list[int] | None]
+    sequence_packing: NotRequired[bool]
 
 
 class DPOTrainerCfg(BaseTrainerCfg):
@@ -694,6 +696,17 @@ class DPOTrainerCfg(BaseTrainerCfg):
     rpo_alpha: NotRequired[float | None]
     logprob_vocab_chunk_size: NotRequired[int | None]
     tools: NotRequired[list[dict | Any] | None]
+    activation_offloading: NotRequired[bool]
+    discopop_tau: NotRequired[float]
+    f_alpha_divergence_coef: NotRequired[float]
+    f_divergence_type: NotRequired[Literal["reverse_kl", "forward_kl", "js_divergence", "alpha_divergence"]]
+    generate_during_eval: NotRequired[bool]
+    ld_alpha: NotRequired[float | None]
+    loss_weights: NotRequired[tuple[float, ...] | list[float] | None]
+    pad_to_multiple_of: NotRequired[int | None]
+    pad_token: NotRequired[str | None]
+    padding_free: NotRequired[bool]
+    precompute_ref_batch_size: NotRequired[int | None]
 
 
 class ORPOTrainerCfg(BaseTrainerCfg):
@@ -857,6 +870,34 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     min_p: NotRequired[float | None]
     generation_kwargs: NotRequired[dict | None]
     chat_template_kwargs: NotRequired[dict | None]
+    cast_lm_head_to_fp32: NotRequired[bool]
+    disable_dropout: NotRequired[bool]
+    environment_factory: NotRequired[Any]
+    esurge_importance_sampling_cap: NotRequired[float]
+    esurge_importance_sampling_correction: NotRequired[bool]
+    esurge_importance_sampling_mode: NotRequired[str]
+    generation_batch_size: NotRequired[int | None]
+    log_completions: NotRequired[bool]
+    log_completions_hub_repo: NotRequired[str | None]
+    log_unique_prompts: NotRequired[bool]
+    max_tool_calling_iterations: NotRequired[int | None]
+    max_tool_calls_per_step: NotRequired[int]
+    multi_objective_aggregation: NotRequired[str]
+    num_completions_to_print: NotRequired[int | None]
+    num_generations_eval: NotRequired[int | None]
+    off_policy_mask_threshold: NotRequired[float | None]
+    pad_to_multiple_of: NotRequired[int | None]
+    sapo_temperature_neg: NotRequired[float]
+    sapo_temperature_pos: NotRequired[float]
+    shuffle_dataset: NotRequired[bool | None]
+    steps_per_generation: NotRequired[int | None]
+    tool_caller: NotRequired[str | None]
+    use_bias_correction_kl: NotRequired[bool]
+    use_transformers_paged: NotRequired[bool]
+    vespo_k_neg: NotRequired[float]
+    vespo_k_pos: NotRequired[float]
+    vespo_lambda_neg: NotRequired[float]
+    vespo_lambda_pos: NotRequired[float]
 
 
 class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
@@ -1032,6 +1073,28 @@ class SDPOTrainerCfg(GRPOTrainerCfg):
     max_feedback_length: NotRequired[int]
     distillation_type: NotRequired[Literal["kl", "jsd"]]
     beta: NotRequired[float]
+    diagnostics_flat_tolerance: NotRequired[float]
+    diagnostics_warning_interval: NotRequired[int]
+    distillation_add_tail: NotRequired[bool]
+    distillation_alpha: NotRequired[float | None]
+    distillation_is_clip: NotRequired[float | None]
+    distillation_topk: NotRequired[int | None]
+    distillation_weight: NotRequired[float]
+    dont_reprompt_on_self_success: NotRequired[bool]
+    ema_update_rate: NotRequired[float]
+    environment_feedback_only_without_solution: NotRequired[bool]
+    feedback_template: NotRequired[str]
+    full_logit_distillation: NotRequired[bool]
+    include_environment_feedback: NotRequired[bool]
+    max_reprompt_len: NotRequired[int]
+    remove_thinking_from_demonstration: NotRequired[bool]
+    reprompt_template: NotRequired[str]
+    sdpo_policy_loss_mode: NotRequired[str]
+    solution_template: NotRequired[str]
+    success_reward_threshold: NotRequired[float]
+    teacher_regularization: NotRequired[str]
+    teacher_update_rate: NotRequired[float | None]
+    use_successful_as_teacher: NotRequired[bool]
 
 
 class PPOTrainerCfg(BaseTrainerCfg):
@@ -1126,6 +1189,24 @@ class PPOTrainerCfg(BaseTrainerCfg):
     generation_kwargs: NotRequired[dict | None]
     chat_template_kwargs: NotRequired[dict | None]
     mask_truncated_completions: NotRequired[bool]
+    batch_size: NotRequired[int | None]
+    ds3_gather_for_generation: NotRequired[bool]
+    local_batch_size: NotRequired[int | None]
+    local_mini_batch_size: NotRequired[int | None]
+    local_rollout_forward_batch_size: NotRequired[int | None]
+    micro_batch_size: NotRequired[int | None]
+    mini_batch_size: NotRequired[int | None]
+    model_adapter_name: NotRequired[str | None]
+    num_mini_batches: NotRequired[int]
+    num_sample_generations: NotRequired[int | None]
+    num_total_batches: NotRequired[int | None]
+    push_to_hub: NotRequired[bool]
+    ref_adapter_name: NotRequired[str | None]
+    response_length: NotRequired[int | None]
+    stop_token: NotRequired[Literal["eos"] | None]
+    stop_token_id: NotRequired[int | None]
+    total_episodes: NotRequired[int | None]
+    world_size: NotRequired[int | None]
 
 
 class SFTTrainerCfg(BaseTrainerCfg):
@@ -1178,6 +1259,16 @@ class SFTTrainerCfg(BaseTrainerCfg):
     dataset_kwargs: NotRequired[dict[str, Any] | None]
     eval_packing: NotRequired[bool | None]
     num_of_sequences: NotRequired[int]
+    activation_offloading: NotRequired[bool]
+    chat_template_path: NotRequired[str | None]
+    completion_loss_chunk_size: NotRequired[int | None]
+    completion_only_loss: NotRequired[bool | None]
+    eos_token: NotRequired[str | None]
+    loss_type: NotRequired[Literal["nll", "dft", "chunked_nll"]]
+    pad_to_multiple_of: NotRequired[int | None]
+    pad_token: NotRequired[str | None]
+    padding_free: NotRequired[bool]
+    shuffle_dataset: NotRequired[bool | None]
 
 
 class RewardTrainerCfg(BaseTrainerCfg):
@@ -1211,6 +1302,11 @@ class RewardTrainerCfg(BaseTrainerCfg):
     disable_dropout: NotRequired[bool]
     dataset_num_proc: NotRequired[int | None]
     center_rewards_coefficient: NotRequired[float | None]
+    activation_offloading: NotRequired[bool]
+    chat_template_path: NotRequired[str | None]
+    eos_token: NotRequired[str | None]
+    pad_to_multiple_of: NotRequired[int | None]
+    pad_token: NotRequired[str | None]
 
 
 class DistillationTrainerCfg(BaseTrainerCfg):
@@ -1282,6 +1378,27 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     attention_loss_weight: NotRequired[float | None]
     attention_layers: NotRequired[tuple[int, ...] | None]
     attention_normalize: NotRequired[bool]
+    beta: NotRequired[float | None]
+    disable_dropout: NotRequired[bool]
+    generation_batch_size: NotRequired[int | None]
+    lmbda: NotRequired[float]
+    log_completions: NotRequired[bool]
+    log_completions_steps: NotRequired[int]
+    loss_add_tail: NotRequired[bool]
+    loss_top_k: NotRequired[int]
+    max_completion_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    mtp_distillation: NotRequired[bool]
+    mtp_draft_tokens: NotRequired[int]
+    mtp_kd_weight: NotRequired[float]
+    num_completions_to_print: NotRequired[int | None]
+    num_generations: NotRequired[int]
+    reverse_kl_top_1_mode: NotRequired[Literal["sampled", "argmax"]]
+    teacher_model_revision: NotRequired[str | None]
+    top_k: NotRequired[int]
+    top_p: NotRequired[float]
+    wandb_project: NotRequired[str | None]
+    wandb_run_group: NotRequired[str | None]
 
 
 class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
@@ -1452,6 +1569,7 @@ class KTOTrainerCfg(BaseTrainerCfg):
     disable_dropout: NotRequired[bool]
     dataset_num_proc: NotRequired[int | None]
     precompute_ref_log_probs: NotRequired[bool]
+    precompute_ref_batch_size: NotRequired[int | None]
 
 
 class BCOTrainerCfg(BaseTrainerCfg):
@@ -1568,6 +1686,7 @@ class CPOTrainerCfg(BaseTrainerCfg):
     logprob_vocab_chunk_size: NotRequired[int | None]
     is_encoder_decoder: NotRequired[bool | None]
     dataset_num_proc: NotRequired[int | None]
+    generate_during_eval: NotRequired[bool]
 
 
 class GKDTrainerCfg(SFTTrainerCfg):
@@ -1712,6 +1831,129 @@ class EmbeddingTrainerCfg(BaseTrainerCfg):
     dataset_num_proc: NotRequired[int | None]
 
 
+class AsyncGRPOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``async_grpo`` trainer (AsyncGRPOConfig); extends GRPOTrainerCfg."""
+
+    heartbeat_stale_after_s: NotRequired[float]
+    max_inflight_tasks: NotRequired[int]
+    max_staleness: NotRequired[int]
+    queue_maxsize: NotRequired[int]
+    request_timeout: NotRequired[float]
+    weight_sync_steps: NotRequired[int]
+
+
+class DPPOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``dppo`` trainer (DPPOConfig); extends GRPOTrainerCfg."""
+
+    clip_ratio_c: NotRequired[float]
+    divergence_topk: NotRequired[int]
+    divergence_type: NotRequired[Literal["binary_tv", "binary_kl", "topk_tv", "topk_kl"]]
+
+
+class GRPOWithReplayBufferTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``grpo_with_replay_buffer`` trainer (GRPOWithReplayBufferConfig); extends GRPOTrainerCfg."""
+
+    replay_buffer_size: NotRequired[int]
+
+
+class GSPOTokenTrainerCfg(GSPOTrainerCfg):
+    """eLarge config for the ``gspo_token`` trainer (GSPOTokenConfig); extends GSPOTrainerCfg."""
+
+
+class MiniLLMTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``minillm`` trainer (MiniLLMConfig); extends GRPOTrainerCfg."""
+
+    gamma: NotRequired[float]
+    kd_temperature: NotRequired[float]
+    length_normalization: NotRequired[bool]
+    rkl_advantage: NotRequired[bool]
+    single_step_decomposition: NotRequired[bool]
+
+
+class NeMoGymTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``nemo_gym`` trainer (NeMoGymConfig); extends GRPOTrainerCfg."""
+
+    agent_ref_key: NotRequired[str]
+    environment_reward_weight: NotRequired[float]
+    metadata_key: NotRequired[str]
+    request_timeout: NotRequired[float]
+
+
+class PAPOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``papo`` trainer (PAPOConfig); extends GRPOTrainerCfg."""
+
+    der_loss_weight1: NotRequired[float]
+    der_loss_weight2: NotRequired[float]
+    mask_ratio: NotRequired[float]
+    mask_type: NotRequired[str]
+    perception_loss_weight: NotRequired[float]
+
+
+class RLOOTrainerCfg(GRPOTrainerCfg):
+    """eLarge config for the ``rloo`` trainer (RLOOConfig); extends GRPOTrainerCfg."""
+
+    advantage_estimator: NotRequired[Literal["leave_one_out"]]
+
+
+class OnlineDPOTrainerCfg(DPOTrainerCfg):
+    """eLarge config for the ``online_dpo`` trainer (OnlineDPOConfig); extends DPOTrainerCfg."""
+
+    max_new_tokens: NotRequired[int | None]
+    missing_eos_penalty: NotRequired[float | None]
+    repetition_penalty: NotRequired[float]
+    reward_weights: NotRequired[list[float] | tuple[float, ...] | None]
+    temperature: NotRequired[float]
+    top_k: NotRequired[int]
+    top_p: NotRequired[float]
+
+
+class TPOTrainerCfg(DPOTrainerCfg):
+    """eLarge config for the ``tpo`` trainer (TPOConfig); extends DPOTrainerCfg."""
+
+    tpo_alpha: NotRequired[float]
+    tpo_l_gamma: NotRequired[float]
+
+
+class GOLDTrainerCfg(DistillationTrainerCfg):
+    """eLarge config for the ``gold`` trainer (GOLDConfig); extends DistillationTrainerCfg."""
+
+    seq_kd: NotRequired[bool]
+    teacher_tokenizer_name_or_path: NotRequired[str | None]
+    uld_crossentropy_weight: NotRequired[float]
+    uld_distillation_weight: NotRequired[float]
+    uld_hybrid_matched_weight: NotRequired[float | None]
+    uld_hybrid_unmatched_weight: NotRequired[float | None]
+    uld_skip_student_eos: NotRequired[bool]
+    uld_skip_teacher_eos: NotRequired[bool]
+    uld_student_temperature: NotRequired[float]
+    uld_teacher_temperature: NotRequired[float]
+    uld_use_hybrid_loss: NotRequired[bool]
+    use_extended_uld: NotRequired[bool]
+    use_uld_loss: NotRequired[bool]
+
+
+class PRMTrainerCfg(RewardTrainerCfg):
+    """eLarge config for the ``prm`` trainer (PRMConfig); extends RewardTrainerCfg."""
+
+    max_completion_length: NotRequired[int | None]
+    step_separator: NotRequired[str]
+    train_on_last_step_only: NotRequired[bool]
+
+
+class SDFTTrainerCfg(SDPOTrainerCfg):
+    """eLarge config for the ``sdft`` trainer (SDFTConfig); extends SDPOTrainerCfg."""
+
+    generate_from_teacher: NotRequired[bool]
+    num_loss_tokens_to_skip: NotRequired[int]
+    teacher_prompt_template: NotRequired[str | None]
+
+
+class SSDTrainerCfg(SDPOTrainerCfg):
+    """eLarge config for the ``ssd`` trainer (SSDConfig); extends SDPOTrainerCfg."""
+
+    filter_empty: NotRequired[bool]
+
+
 class TrainerConfig(
     ORPOTrainerCfg,
     GRPOTrainerCfg,
@@ -1734,6 +1976,20 @@ class TrainerConfig(
     NashMDTrainerCfg,
     XPOTrainerCfg,
     EmbeddingTrainerCfg,
+    AsyncGRPOTrainerCfg,
+    DPPOTrainerCfg,
+    GRPOWithReplayBufferTrainerCfg,
+    GSPOTokenTrainerCfg,
+    MiniLLMTrainerCfg,
+    NeMoGymTrainerCfg,
+    PAPOTrainerCfg,
+    RLOOTrainerCfg,
+    OnlineDPOTrainerCfg,
+    TPOTrainerCfg,
+    GOLDTrainerCfg,
+    PRMTrainerCfg,
+    SDFTTrainerCfg,
+    SSDTrainerCfg,
     BaseTrainerCfg,
     DPOTrainerCfg,
 ):

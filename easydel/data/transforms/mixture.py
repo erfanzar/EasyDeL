@@ -113,8 +113,9 @@ class WeightScheduler:
         to 1.0.
 
         Args:
-            step: Training step (0-indexed) at which to evaluate the
-                schedule.
+            step: Schedule position (0-indexed) at which to evaluate the schedule. NOTE: when driven by
+                ``MixedShardedSource`` this is the cumulative count of EMITTED EXAMPLES, not optimizer steps
+                (the data mixer has no batch size); a point for optimizer step ``N`` is at ``N * batch_size``.
 
         Returns:
             dict[str, float]: Mapping from dataset name to its weight
@@ -362,11 +363,14 @@ class MixedShardedSource(ShardedDataSource[dict]):
             iters[name] = self._chain_shards(source)
 
         block_idx = 0
-        global_step = 0
+        examples_emitted = 0
 
         while True:
-            # Get weights for current step (for dynamic scheduling)
-            weights = self._get_weights_for_step(global_step)
+            # Resolve the mixing weights for the current schedule position. NOTE: the mixer is a pure data
+            # iterator with no knowledge of batch size, so the schedule is driven by the cumulative count of
+            # EMITTED EXAMPLES -- not optimizer steps. To target an optimizer step N, set the schedule point
+            # at ``N * global_batch_size`` examples.
+            weights = self._get_weights_for_step(examples_emitted)
             counts = self._compute_counts(weights)
 
             # Create deterministic RNG per block
@@ -387,7 +391,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
                     # Add source metadata
                     example["__source__"] = name
                     yield example
-                    global_step += 1
+                    examples_emitted += 1
                 except StopIteration:
                     if self._stop_strategy == "restart":
                         iters[name] = self._chain_shards(self._sources[name])
@@ -395,7 +399,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
                             example = next(iters[name])
                             example["__source__"] = name
                             yield example
-                            global_step += 1
+                            examples_emitted += 1
                         except StopIteration:
                             # Empty dataset
                             logger.warning(f"Dataset '{name}' is empty")

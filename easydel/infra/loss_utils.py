@@ -35,7 +35,6 @@ Utility Functions:
         (thin adapter over ejkernel's chunked fused cross-entropy).
     causal_lm_loss_chunked_lm_head: LM-head-chunked causal-LM loss (delegates the
         projection + CE math to ejkernel's fused linear cross-entropy / FLCE).
-    compute_weighted_cross_entropy: Standard weighted CE with z-loss.
     auxiliary_load_balancing_loss_func: MoE load balancing loss.
 
 Note:
@@ -83,17 +82,16 @@ import enum
 import inspect
 import typing as tp
 from dataclasses import fields
-from functools import reduce
-from operator import mul
 
 import jax
 import jax.numpy as jnp
 import spectrax as spx
 from eformer.pytree import auto_pytree
-from jax import lax
+from ejkernel.modules.operations import fused_cross_entropy as _fused_ce
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 from spectrax import PartitionAxis, with_sharding_constraint
+from spectrax.common_types import BATCH, LENGTH, MODE_TRAIN, VOCAB
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -392,6 +390,14 @@ class LossConfig:
             size. Alternative memory optimization strategy (default=None).
         compute_dtype: Data type for computation. One of "fp32" or "bf16".
             If None, uses the input dtype.
+        sparse_loss: If True, the chunked LM-head (FLCE) loss skips fully-masked
+            token chunks (all ``ignore_index`` / zero-weight) -- it stops the
+            ``fori_loop`` after the last chunk containing a real token, so the
+            trailing-padding chunks pay no LM-head projection or softmax. A win
+            for heavily right-padded / packed batches (forward is dense-neutral
+            and up to ~3x faster; full fwd+bwd is ~1.4-1.9x at >50% padding but
+            ~1.7x slower on dense, since differentiating the gate costs even when
+            nothing is skipped). Default False -- enable only for padded inputs.
 
     Example:
         >>> # Standard configuration with label smoothing
@@ -426,6 +432,7 @@ class LossConfig:
     chunk_token_size: int | None = None
     chunk_block_size: int | None = None
     compute_dtype: tp.Literal["fp32", "bf16"] | None = None
+    sparse_loss: bool = False
 
     def __repr__(self):
         """Return a detailed string representation of the configuration.
@@ -537,8 +544,6 @@ def cross_entropy_blockwise_logits(
         weighted SUM (divide by ``weight_sum`` for the mean); ``accuracy`` is the
         weight-weighted fraction of correct argmax predictions.
     """
-    from ejkernel.modules.operations import fused_cross_entropy as _fused_ce
-
     out = _fused_ce(
         logits,
         targets,
@@ -608,340 +613,6 @@ def sigmoid_cross_entropy_with_logits(
         return jnp.mean(loss)
     else:
         return jnp.mean(loss, axis=axis)
-
-
-def onehot(labels, num_classes, on_value=1.0, off_value=0.0):
-    """Create one-hot encoded representations of integer labels.
-
-    This function converts integer class labels to one-hot vectors, with support
-    for custom on/off values to enable label smoothing or other soft target
-    distributions.
-
-    Args:
-        labels: Array of integer labels with arbitrary shape. Values should be
-            in [0, num_classes).
-        num_classes: Total number of classes. Determines the size of the last
-            dimension in the output.
-        on_value: Value to use for the "on" position (the true class).
-            Defaults to 1.0.
-        off_value: Value to use for all "off" positions (non-true classes).
-            Defaults to 0.0.
-
-    Returns:
-        One-hot encoded array with shape labels.shape + (num_classes,). The
-        position corresponding to each label value contains on_value, and all
-        other positions contain off_value.
-
-    Example:
-        >>> labels = jnp.array([0, 2, 1])
-        >>> onehot(labels, num_classes=3)
-        Array([[1., 0., 0.],
-               [0., 0., 1.],
-               [0., 1., 0.]], dtype=float32)
-        >>>
-        >>> # With label smoothing (confidence 0.9, smoothing 0.1)
-        >>> onehot(labels, 3, on_value=0.9, off_value=0.05)
-    """
-    x = lax.eq(labels[..., None], jnp.arange(num_classes)[(None,) * labels.ndim])
-    y = lax.select(x, jnp.full(x.shape, on_value), jnp.full(x.shape, off_value))
-    return y
-
-
-@jax.custom_vjp
-def cross_entropy_with_logits(
-    logits: Array,
-    targets: Array,
-    z_loss: float,
-) -> tuple[Array, Array]:
-    """Compute cross-entropy loss with optional z-loss regularization.
-
-    This function calculates the standard cross-entropy loss between logits and
-    soft targets (typically one-hot encoded). It includes an optional z-loss
-    term that penalizes large log-partition function values, encouraging the
-    model to produce smaller logits.
-
-    A custom VJP (vector-Jacobian product) is defined for efficient gradient
-    computation, avoiding redundant softmax calculations in the backward pass.
-
-    Args:
-        logits: Model logits with shape (batch_size, ..., num_classes). The last
-            dimension is the class dimension.
-        targets: Target distribution with same shape as logits. Typically one-hot
-            encoded but can be soft targets for label smoothing.
-        z_loss: Coefficient for z-loss regularization. The z-loss term is
-            z_loss * logsumexp(logits)^2. Set to 0 to disable.
-
-    Returns:
-        Tuple of two arrays:
-            - loss: Cross-entropy loss plus z-loss for each sample, shape
-              (batch_size, ...).
-            - z_loss_value: The z-loss contribution for each sample, shape
-              (batch_size, ...). Returns zeros if z_loss coefficient is 0.
-
-    Note:
-        This function expects soft targets (probability distributions). For
-        integer labels, first convert using `onehot()` or use
-        `compute_weighted_cross_entropy()` which handles this internally.
-
-    Example:
-        >>> logits = jnp.randn(4, 1000)
-        >>> targets = jax.nn.one_hot(jnp.array([5, 10, 3, 7]), 1000)
-        >>> loss, z_loss_val = cross_entropy_with_logits(logits, targets, z_loss=1e-4)
-    """
-    logsumexp = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=False)
-    log_softmax = logits - logsumexp[..., None]
-    ce = -jnp.sum(targets * log_softmax, axis=-1)
-    z = z_loss * jnp.square(logsumexp)
-    return ce + z, z
-
-
-def _cross_entropy_with_logits_fwd(
-    logits: Array,
-    targets: Array,
-    z_loss: float = 0.0,
-) -> tuple[
-    tuple[
-        Array,
-        Array,
-    ],
-    tuple[
-        Array,
-        float,
-        Array,
-        Array,
-        Array,
-        Array,
-    ],
-]:
-    """Forward pass for cross_entropy_with_logits custom VJP.
-
-    Computes cross-entropy loss with z-loss regularization and saves intermediate
-    values needed for efficient gradient computation in the backward pass. This
-    implementation uses the numerically stable max-subtraction trick.
-
-    Args:
-        logits: Model predictions with shape (batch_size, ..., num_classes).
-        targets: One-hot encoded targets with same shape as logits.
-        z_loss: Coefficient for z-loss regularization.
-
-    Returns:
-        Tuple containing:
-            - (loss, z_loss_value): The computed losses, both with shape
-              (batch_size, ...).
-            - Residuals tuple for backward pass containing:
-              (targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z)
-              where exp_shifted and sum_exp are intermediate values from the
-              softmax computation.
-    """
-    max_logit = logits.max(axis=-1, keepdims=True)
-    shifted = logits - max_logit
-    exp_shifted = jnp.exp(shifted)
-    sum_exp = jnp.sum(exp_shifted, axis=-1, keepdims=True)
-    log_softmax = shifted - jnp.log(sum_exp)
-    ce = -jnp.sum(targets * log_softmax, axis=-1)
-    log_z = jnp.squeeze(jnp.log(sum_exp) + max_logit, axis=-1)
-    z = z_loss * jax.lax.square(log_z)
-    ce_plus_z = ce + z
-    y = (ce_plus_z, z)
-    res = (targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z)
-    return y, res
-
-
-def _cross_entropy_with_logits_bwd(
-    res: tuple[
-        Array,
-        float,
-        Array,
-        Array,
-        Array,
-        Array,
-    ],
-    g: tuple[Array, Array],
-) -> tuple[Array, Array, Array]:
-    """Backward pass for cross_entropy_with_logits custom VJP.
-
-    Computes gradients with respect to logits and targets using saved intermediate
-    values from the forward pass. This avoids recomputing the softmax, making the
-    backward pass more efficient.
-
-    The gradient with respect to logits is:
-        d_loss/d_logits = softmax - targets + 2 * z_loss * log_z * softmax
-
-    The gradient with respect to targets is:
-        d_loss/d_targets = -log_softmax
-
-    Args:
-        res: Residuals from forward pass containing:
-            (targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z)
-        g: Gradient tuple (g_loss, g_z_loss) where g_loss is the gradient of the
-            final loss with respect to the cross-entropy output.
-
-    Returns:
-        Tuple of gradients (g_logits, g_targets, g_z_loss) with respect to the
-        three inputs of the forward function.
-    """
-    g0 = g[0]
-    targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z = res
-    softmax = exp_shifted / sum_exp
-    deriv = softmax - targets + jnp.expand_dims(2 * z_loss * log_z, -1) * softmax
-    g_logits = jnp.expand_dims(g0, -1) * deriv
-    g_targets = -jnp.expand_dims(g0, -1) * log_softmax
-    return (
-        jnp.asarray(g_logits, dtype=log_softmax.dtype),
-        jnp.asarray(g_targets, dtype=targets.dtype),
-        jnp.array(0.0, dtype=log_softmax.dtype),
-    )
-
-
-cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_with_logits_bwd)
-
-
-def compute_weighted_cross_entropy(
-    logits: Array,
-    targets: Array,
-    weights: Array | None = None,
-    label_smoothing: float = 0.0,
-    z_loss: float = 0.0,
-    loss_normalizing_factor: float | None = None,
-    compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[Array, Array, Array]:
-    """Compute weighted cross-entropy loss with label smoothing and z-loss.
-
-    This function provides a complete cross-entropy computation pipeline including:
-    - Label smoothing for regularization
-    - Z-loss for numerical stability
-    - Optional weighting for masked or importance-weighted training
-    - Optional normalization factor
-
-    The label smoothing modifies the target distribution from a one-hot encoding
-    to a mixture of the one-hot with a uniform distribution.
-
-    Args:
-        logits: Model logits with shape (..., num_classes).
-        targets: Integer class labels with shape (...). Must have one fewer
-            dimension than logits.
-        weights: Optional weights with shape (...) matching targets. If provided,
-            the loss is multiplied by these weights element-wise.
-        label_smoothing: Smoothing factor in [0, 1). The target distribution
-            becomes (1 - eps) * one_hot + eps / (num_classes - 1) * (1 - one_hot).
-        z_loss: Coefficient for z-loss regularization.
-        loss_normalizing_factor: If provided, divides the total loss and z-loss
-            by this factor.
-        compute_dtype: Data type for internal computation.
-
-    Returns:
-        Tuple of three arrays:
-            - total_loss: Sum of weighted cross-entropy losses (scalar).
-            - total_z_loss: Sum of weighted z-loss terms (scalar).
-            - weight_sum: Sum of weights or total number of elements (scalar).
-
-    Raises:
-        TypeError: If logits, targets, or weights are not JAX arrays (or None
-            for weights).
-        ValueError: If label_smoothing is not in [0, 1), z_loss is negative,
-            or shapes are incompatible.
-
-    Example:
-        >>> logits = jnp.randn(4, 10, 1000)
-        >>> targets = jnp.randint(0, 1000, (4, 10))
-        >>> mask = jnp.ones((4, 10))
-        >>> loss, z_loss, w_sum = compute_weighted_cross_entropy(
-        ...     logits, targets, weights=mask, label_smoothing=0.1
-        ... )
-        >>> normalized_loss = loss / w_sum
-    """
-    if not isinstance(logits, jax.Array):
-        raise TypeError(f"logits must be a JAX array, got {type(logits)}")
-    if not isinstance(targets, jax.Array):
-        raise TypeError(f"targets must be a JAX array, got {type(targets)}")
-    if weights is not None and not isinstance(weights, jax.Array):
-        raise TypeError(f"weights must be a JAX array or None, got {type(weights)}")
-    if not 0.0 <= label_smoothing < 1.0:
-        raise ValueError(f"label_smoothing must be in range 0~1, got {label_smoothing}")
-    if z_loss < 0.0:
-        raise ValueError(f"z_loss must be non-negative, got {z_loss}")
-    if logits.ndim != targets.ndim + 1:
-        raise ValueError(f"Incorrect shapes. Got shape {logits.shape} logits and {targets.shape} targets")
-    vocab_size = logits.shape[-1]
-    confidence = 1.0 - label_smoothing
-    low_confidence = (1.0 - confidence) / (vocab_size - 1)
-    normalizing_constant = -(
-        confidence * jnp.log(confidence) + (vocab_size - 1) * low_confidence * jnp.log(low_confidence + 1e-20)
-    )
-    soft_targets = onehot(targets, vocab_size, on_value=confidence, off_value=low_confidence).astype(compute_dtype)
-    total_loss, total_z_loss = cross_entropy_with_logits(logits.astype(compute_dtype), soft_targets, z_loss=z_loss)
-    total_loss = total_loss - normalizing_constant
-
-    weight_sum = jnp.array(reduce(mul, targets.shape, 1), dtype=compute_dtype)
-    if weights is not None:
-        total_loss = total_loss * weights
-        total_z_loss = total_z_loss * weights
-        weight_sum = jnp.sum(weights.astype(compute_dtype))
-
-    if loss_normalizing_factor is not None:
-        total_loss /= loss_normalizing_factor
-        total_z_loss /= loss_normalizing_factor
-
-    return jnp.sum(total_loss), jnp.sum(total_z_loss), weight_sum
-
-
-def compute_weighted_cross_entropy_and_accuracy(
-    logits: Array,
-    targets: Array,
-    weights: Array | None = None,
-    label_smoothing: float = 0.0,
-    z_loss: float = 0.0,
-    loss_normalizing_factor: float | None = None,
-    compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[Array, Array, Array, Array]:
-    """Compute weighted cross-entropy loss, z-loss, weight sum, and accuracy.
-
-    This is an extension of `compute_weighted_cross_entropy` that also computes
-    the prediction accuracy, useful for monitoring training progress.
-
-    Args:
-        logits: Model logits with shape (..., num_classes).
-        targets: Integer class labels with shape (...).
-        weights: Optional weights with shape (...) matching targets.
-        label_smoothing: Smoothing factor in [0, 1).
-        z_loss: Coefficient for z-loss regularization.
-        loss_normalizing_factor: Optional factor to divide the loss.
-        compute_dtype: Data type for internal computation.
-
-    Returns:
-        Tuple of four arrays:
-            - total_loss: Sum of weighted cross-entropy losses (scalar).
-            - total_z_loss: Sum of weighted z-loss terms (scalar).
-            - weight_sum: Sum of weights (scalar).
-            - accuracy: Weighted accuracy as fraction of correct predictions (scalar).
-
-    Example:
-        >>> logits = jnp.randn(4, 10, 1000)
-        >>> targets = jnp.randint(0, 1000, (4, 10))
-        >>> loss, z_loss, w_sum, acc = compute_weighted_cross_entropy_and_accuracy(
-        ...     logits, targets, label_smoothing=0.1
-        ... )
-        >>> print(f"Loss: {loss/w_sum:.4f}, Accuracy: {acc:.2%}")
-    """
-    total_loss, total_z_loss, weight_sum = compute_weighted_cross_entropy(
-        logits=logits,
-        targets=targets,
-        weights=weights,
-        label_smoothing=label_smoothing,
-        z_loss=z_loss,
-        loss_normalizing_factor=loss_normalizing_factor,
-        compute_dtype=compute_dtype,
-    )
-
-    predictions = jnp.argmax(logits, axis=-1)
-    correct = (predictions == targets).astype(compute_dtype)
-    if weights is None:
-        accuracy = jnp.mean(correct)
-    else:
-        w = weights.astype(compute_dtype)
-        denom = jnp.maximum(jnp.sum(w), 1e-8)
-        accuracy = jnp.sum(correct * w) / denom
-    return total_loss, total_z_loss, weight_sum, accuracy
 
 
 def cross_entropy_loss_and_accuracy(
@@ -1323,6 +994,7 @@ def _ejkernel_cross_entropy(
     *,
     reduction: str = "sum",
     z_loss: float | None = None,
+    paxis: PartitionAxis | None = None,
 ) -> tuple[Array, Array, Array, Array]:
     """Sparse cross-entropy via the ejkernel fused-loss kernel.
 
@@ -1344,7 +1016,57 @@ def _ejkernel_cross_entropy(
     folded into ``total_loss`` and returned separately; ``accuracy`` is the weight-weighted
     fraction of correct argmax predictions.
     """
-    from ejkernel.modules.operations import fused_cross_entropy as _fused_ce
+    # ``ignore_index`` tokens must never contribute to the loss or its normalizer. The fused CE kernel does
+    # not zero ignored rows internally -- it relies on ``weights`` -- and the dense vs vocab-parallel cores
+    # produce *different* garbage for a ``weight != 0`` ignored row (dense gathers ``logit[clip(-100)->0]``;
+    # vp gathers ``0`` since the clipped target is on no shard). Enforce zero weight on ignored rows here so
+    # both paths agree and match standard CE semantics. Idempotent for the common ``mask = labels != -100``
+    # case; only changes a caller that passes a raw ``attention_mask`` that is 1 over ``-100`` (prompt-masked
+    # / assistant-only SFT), where it correctly drops the prompt tokens from the loss + normalizer.
+    weights = weights * (target != config.ignore_index).astype(weights.dtype)
+    ce_mesh = None
+    ce_in_specs = None
+    ce_out_specs = None
+    _orig_leading = source.shape[:-1]
+    _pad_leading: list[int] | None = None
+    if paxis is not None:
+        ce_mesh = spx.get_current_stage_mesh(spx.get_incontext_mesh(raise_error=False), raise_error=False)
+        _eff_z_loss = config.z_loss if z_loss is None else z_loss
+        # Vocab-parallel CE only engages with a real (>1) ``tp`` axis -- at ``tp == 1`` there is no vocab
+        # dimension to shard, so it is a pure-overhead no-op. The vocab-parallel core also does not support
+        # ``label_smoothing``/``z_loss``; those fall back to the dense (full-vocab) path here -- the
+        # non-chunked CE is only used for small vocabularies, so the full softmax is cheap regardless.
+        if (
+            ce_mesh is not None
+            and "tp" in ce_mesh.axis_names
+            and int(ce_mesh.shape["tp"]) > 1
+            and (config.label_smoothing or 0.0) == 0.0
+            and (_eff_z_loss or 0.0) == 0.0
+        ):
+            _pm = spx.PartitionManager(paxis=paxis)
+            _logit_spec = _pm.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
+            _token_spec = _pm.resolve([BATCH, LENGTH], MODE_TRAIN)
+            ce_in_specs = (_logit_spec, _token_spec, _token_spec)
+            ce_out_specs = _token_spec if reduction == "none" else PartitionSpec()
+
+            def _axis_prod(entry):
+                names = entry if isinstance(entry, tuple) else ((entry,) if entry is not None else ())
+                prod = 1
+                for nm in names:
+                    prod *= int(ce_mesh.shape[nm])
+                return prod
+
+            pads = [
+                (-int(dim)) % max(_axis_prod(_token_spec[i]) if i < len(_token_spec) else 1, 1)
+                for i, dim in enumerate(_orig_leading)
+            ]
+            if any(p > 0 for p in pads):
+                _pad_leading = pads
+                source = jnp.pad(source, [(0, p) for p in pads] + [(0, 0)])
+                target = jnp.pad(target, [(0, p) for p in pads], constant_values=config.ignore_index)
+                weights = jnp.pad(weights, [(0, p) for p in pads])
+        else:
+            ce_mesh = None
 
     out = _fused_ce(
         source.astype(compute_dtype),
@@ -1355,12 +1077,30 @@ def _ejkernel_cross_entropy(
         z_loss=(config.z_loss if z_loss is None else z_loss),
         reduction=reduction,
         platform=(None if platform == "auto" else platform),
+        mesh=ce_mesh,
+        in_specs=ce_in_specs,
+        out_specs=ce_out_specs,
     )
     total_loss = out.loss.astype(compute_dtype)
+    if _pad_leading is not None and reduction == "none":
+        # Drop the masked padding rows so the per-token loss matches the caller's [*leading] shape.
+        total_loss = total_loss[tuple(slice(0, d) for d in _orig_leading)]
     total_z_loss = out.z_loss.astype(compute_dtype)
     weight_sum = out.weight_sum.astype(compute_dtype)
-    # accuracy is None only in dense (soft_targets) / vocab-parallel modes, neither used here.
-    accuracy = (out.accuracy if out.accuracy is not None else jnp.asarray(0.0)).astype(compute_dtype)
+    if out.accuracy is not None:
+        accuracy = out.accuracy.astype(compute_dtype)
+    elif reduction != "none" and target.ndim == source.ndim - 1:
+        # Vocab-parallel: the kernel cannot return accuracy from inside shard_map (it comes back ``None``,
+        # which would surface as a misleading 0.0 on TP dashboards). Recompute it from a cross-shard argmax
+        # over the vocab axis -- a cheap [B, S] collective that never materializes [B, S, V]. Weight by the
+        # same ``weights`` the kernel saw (already zeroed on ignore_index + padded rows) so the metric matches
+        # the dense kernel's ``sum(correct * loss_weights) / sum(loss_weights)`` exactly.
+        preds = jnp.argmax(source, axis=-1)
+        accuracy = (
+            jnp.sum((preds == target).astype(compute_dtype) * weights) / jnp.maximum(jnp.sum(weights), 1e-8)
+        ).astype(compute_dtype)
+    else:
+        accuracy = jnp.asarray(0.0, compute_dtype)
     return total_loss, total_z_loss, weight_sum, accuracy
 
 
@@ -1371,6 +1111,7 @@ def fixed_cross_entropy(
     config: LossConfig | None = None,
     num_items_in_batch: int | None = None,
     batch: collections.abc.Mapping[str, Array] | None = None,
+    paxis: PartitionAxis | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """Compute cross-entropy loss with comprehensive configuration options.
@@ -1427,6 +1168,11 @@ def fixed_cross_entropy(
         else (jnp.bfloat16 if config.compute_dtype == "bf16" else source.dtype)
     )
     mask = attention_mask if attention_mask is not None else (target != config.ignore_index)
+    # ignore_index tokens must never contribute to the loss OR its normalizer. AND the loss mask with label
+    # validity so completion-only SFT (labels = -100 on prompt, attention_mask = 1 there) drops the prompt
+    # tokens from both the numerator and the NUM_REAL_TARGET_TOKENS normalizer -- standard CE semantics.
+    # Idempotent when the mask already excludes them (attention_mask=None / full-sequence / completion mask).
+    mask = mask * (target != config.ignore_index).astype(mask.dtype)
     loss_factor = config.loss_normalizing_factor
 
     if config.reduction is not None:
@@ -1440,6 +1186,7 @@ def fixed_cross_entropy(
             compute_dtype,
             "xla",  # XLA is the bandwidth-optimal CE backend on TPU (Pallas loses; TileLang wins only on GPU)
             reduction=config.reduction,
+            paxis=paxis,
         )
         w = mask.astype(compute_dtype)
         # per-element weights for "none", else the floored weight sum
@@ -1456,8 +1203,19 @@ def fixed_cross_entropy(
         loss, accuracy = cross_entropy_loss_and_accuracy(
             source.astype(compute_dtype), target, mask.astype(compute_dtype)
         )
-        total_z_loss = jnp.array(0.0, compute_dtype)
         weight_sum = jnp.sum(mask.astype(compute_dtype))
+        # ``cross_entropy_loss_and_accuracy`` has no z_loss support, so this branch silently dropped
+        # ``config.z_loss``. Fold in the standard term -- ``z_loss * mean(logsumexp(logits)**2)`` over the
+        # same valid tokens as the CE -- so this normalization mode honors z_loss too. No-op when z_loss==0.
+        if (config.z_loss or 0.0) > 0.0:
+            _zm = mask.astype(jnp.float32)
+            _lse = jax.nn.logsumexp(source.astype(jnp.float32), axis=-1)
+            total_z_loss = (config.z_loss * jnp.sum((_lse**2) * _zm) / jnp.maximum(jnp.sum(_zm), 1e-8)).astype(
+                compute_dtype
+            )
+            loss = loss + total_z_loss
+        else:
+            total_z_loss = jnp.array(0.0, compute_dtype)
 
     else:
         if batch is None:
@@ -1481,7 +1239,7 @@ def fixed_cross_entropy(
         # (chunk_token_size still sizes the distinct LM-head chunking). The kernel returns a
         # SUM-reduced loss, so divide by the normalizing factor here.
         total_loss, total_z_loss, weight_sum, accuracy = _ejkernel_cross_entropy(
-            source, target, loss_weights, config, compute_dtype, "xla"
+            source, target, loss_weights, config, compute_dtype, "xla", paxis=paxis
         )
         if loss_normalizing_factor is not None:
             total_loss = total_loss / loss_normalizing_factor
@@ -1661,6 +1419,13 @@ def causal_lm_loss_chunked_lm_head(
         else:
             global_loss_batch["decoder_loss_weights"] = (shift_labels != config.ignore_index).astype(compute_dtype)
 
+    # ignore_index tokens must never contribute to the loss or its normalizer; AND the weights with label
+    # validity so a raw ``attention_mask`` that is 1 over ``-100`` (completion-only SFT) drops those tokens
+    # from both. Idempotent when the weights already exclude them (explicit completion mask / attn=None).
+    global_loss_batch["decoder_loss_weights"] = global_loss_batch["decoder_loss_weights"] * (
+        shift_labels != config.ignore_index
+    ).astype(compute_dtype)
+
     global_loss_factor, _ = get_factor_and_weight(
         config.loss_normalizing_factor,
         global_loss_batch,
@@ -1691,8 +1456,6 @@ def causal_lm_loss_chunked_lm_head(
     # logit cap is folded into the projection callable. Inner vocab/block CE
     # chunking is intentionally not applied — it cannot shrink the dominant
     # [B, chunk, V] allocation and only adds a redundant loop.
-    from ejkernel.modules.operations import fused_cross_entropy as _fused_ce
-
     if logit_cap_fn is None:
         projection_fn = lm_head_fn
     else:
@@ -1714,6 +1477,7 @@ def causal_lm_loss_chunked_lm_head(
         chunk_size=int(chunk_size),
         compute_dtype=compute_dtype,
         checkpoint=checkpoint,
+        sparse_skip=config.sparse_loss,
     )
     total_loss = flce_out.loss
     total_z_loss = flce_out.z_loss
@@ -2065,6 +1829,7 @@ def ForCausalLMLoss(
         config=config,
         num_items_in_batch=num_items_in_batch,
         batch=batch,
+        paxis=paxis,
         **kwargs,
     )
     return loss

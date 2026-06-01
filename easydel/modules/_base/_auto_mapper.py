@@ -541,7 +541,7 @@ def create_conditional_generation_class(
             "__init__": __init__,
             "__module__": base_model_class.__module__,
             "__qualname__": class_name,
-            "_task_type": TaskType.SEQ_2_SEQ_LM,
+            "_task_type": TaskType.SEQUENCE_TO_SEQUENCE,
             "_model_type": model_type,
             "_config_class": config_class,
         },

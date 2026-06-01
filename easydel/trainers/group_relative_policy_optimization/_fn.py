@@ -1110,7 +1110,10 @@ def grpo_step(
             if loss_type in {"grpo", "sapo"}:
                 loss = loss_numerator / jnp.maximum(grpo_weight_den, 1.0)
             elif loss_type == "luspo":
-                loss = loss_numerator / jnp.maximum(completion_ids.shape[0], 1.0)
+                # Match the non-chunked path's ``jnp.mean(per_token_loss * completion_lengths)`` which divides
+                # by batch*seq; dividing by batch alone made the chunked loss ~seq_len larger, so the gradient
+                # magnitude depended on whether LM-head chunking was enabled.
+                loss = loss_numerator / jnp.maximum(completion_ids.shape[0] * completion_ids.shape[1], 1.0)
             elif loss_type == "bnpo":
                 weighted_token_count = jnp.sum(completion_mask * difficulty_weights)
                 loss = loss_numerator / jnp.maximum(weighted_token_count, 1.0)

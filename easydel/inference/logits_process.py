@@ -985,7 +985,7 @@ class MinPLogitsWarper(LogitsWarper):
             final_scores = jnp.where(indices_to_remove_mask, self.filter_value, x)
             return final_scores
 
-        return jax.lax.cond((min_p > 0) & (min_p < 1), _apply, lambda x: x, scores)
+        return jax.lax.cond((min_p > 0) & (min_p <= 1), _apply, lambda x: x, scores)
 
 
 @auto_pytree

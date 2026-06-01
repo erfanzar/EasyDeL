@@ -72,7 +72,7 @@ if tp.TYPE_CHECKING:
 logger = get_logger("RayTrainer")
 
 
-@Registry.register("trainer", "ray_dist")
+@Registry.register("trainer-arguments", "ray_dist")
 class RayDistributedConfig(BaseModel):
     """JSON-persistable configuration payload for :class:`RayDistributedTrainer`.
 

@@ -21,11 +21,15 @@ import jax.numpy as jnp
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils import Registry
 
-from ..direct_preference_optimization_trainer import DPOTrainer
+from ..direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .bema_config import BEMACallback
 
+Registry.register("trainer-arguments", "bema_dpo")(DPOConfig)
 
+
+@Registry.register("trainer", "bema_dpo")
 class BEMADPOTrainer(DPOTrainer):
     """DPO trainer with native JAX BEMA reference-state updates.
 

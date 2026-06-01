@@ -271,18 +271,24 @@ class MoEGate(spx.Module):
             )
 
     def forward(self, hidden_states):
-        """Compute expert routing weights for input tokens.
+        """Compute the full-expert ``noaux_tc`` choice scores for ``moe_call`` to route on.
 
-        Implements sigmoid scoring with noaux_tc group-based top-k expert selection.
+        Returns the ``[batch * seq_len, n_routed_experts]`` ``scores_for_choice`` (sigmoid scores + learnable
+        correction bias). Expert SELECTION (grouped top-k), re-normalization and ``routed_scaling_factor``
+        now happen in :meth:`DeepseekV3MoE._select_experts_static` (wired as ``moe_hooks.select_hook``),
+        which returns both the weights AND the expert indices.
+
+        The previous implementation collapsed this to the top-k weight *values* and discarded the expert
+        indices; ``moe_call`` then ran its own ``top_k`` on that ``[*, top_k]`` array, selecting positions
+        ``0..top_k-1`` instead of the real experts -- silently mis-routing every token. Returning the full
+        per-expert scores (mirroring DeepSeek-V2 / GLM4-MoE) lets the dispatcher pick the correct experts.
 
         Args:
             hidden_states (Array): Input tensor of shape [batch * seq_len, hidden_dim].
 
         Returns:
-            Array: Top-k expert weights for each token [batch * seq_len, top_k],
-                scaled by routed_scaling_factor.
+            Array: Per-expert choice scores ``[batch * seq_len, n_routed_experts]``.
         """
-        squ, _ = hidden_states.shape
         logits = jnp.dot(
             hidden_states.astype(jnp.float32),
             self.weight.value.astype(jnp.float32),
@@ -294,35 +300,10 @@ class MoEGate(spx.Module):
         else:
             raise NotImplementedError(f"insupportable scoring function for MoE gating: {self.scoring_func}")
 
-        if self.topk_method == "noaux_tc":
-            scores_for_choice = scores + self.e_score_correction_bias
-            group_scores = scores_for_choice.reshape(squ, self.n_group, -1)
-            top2_scores = jax.lax.top_k(group_scores, k=2)[0]
-            group_scores = jnp.sum(top2_scores, axis=-1)
-
-            group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
-
-            group_mask = jnp.zeros_like(group_scores)
-            indices = jnp.arange(group_mask.shape[0])[:, None]
-            group_mask = group_mask.at[indices, group_idx].set(1.0)
-
-            assert self.n_routed_experts is not None
-            score_mask = jnp.repeat(
-                group_mask[:, :, None],
-                self.n_routed_experts // self.n_group,
-                axis=2,
-            ).reshape(squ, -1)
-
-            masked_scores = jnp.where(score_mask > 0, scores_for_choice, 0.0)
-            topk_weight, _ = jax.lax.top_k(masked_scores, k=self.top_k)
-        else:
+        if self.topk_method != "noaux_tc":
             raise NotImplementedError(f"insupportable TopK function for MoE gating: {self.topk_method}")
 
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-            topk_weight = topk_weight / denominator
-
-        return topk_weight * self.routed_scaling_factor
+        return scores + self.e_score_correction_bias
 
 
 class DeepseekV3MLPMoE(spx.Module):
@@ -523,6 +504,21 @@ class DeepseekV3MoE(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
+        # Route on the gate's full per-expert scores: identity-normalize (the gate already emits scores) and
+        # run DeepSeek-V3 noaux_tc grouped top-k in the select_hook, which returns weights AND expert indices
+        # (mirrors DeepSeek-V2 / GLM4-MoE). Without this, moe_call's default top_k ran over the gate's
+        # already-collapsed [*, top_k] output and mis-routed every token to experts 0..top_k-1.
+        self.moe_hooks = self.moe_hooks.replace(
+            normalize_gate_logits=lambda x: x,
+            select_hook=functools.partial(
+                self._select_experts_static,
+                n_group=config.n_group,
+                topk_group=config.topk_group,
+                n_routed_experts=config.n_routed_experts,
+                norm_topk_prob=config.norm_topk_prob,
+                routed_scaling_factor=config.routed_scaling_factor,
+            ),
+        )
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV3MLP(
@@ -533,6 +529,42 @@ class DeepseekV3MoE(BaseMoeModule):
                 intermediate_size=intermediate_size,
                 rngs=rngs,
             )
+
+    @staticmethod
+    def _select_experts_static(
+        gate_logits: Array,
+        pre_bias_logits: Array | None,
+        k: int,
+        *,
+        n_group: int,
+        topk_group: int,
+        n_routed_experts: int,
+        norm_topk_prob: bool,
+        routed_scaling_factor: float,
+    ) -> tuple[Array, Array]:
+        """DeepSeek-V3 ``noaux_tc`` grouped top-k over the gate's full-expert choice scores.
+
+        ``gate_logits`` is ``[tokens, n_routed_experts]`` ``scores_for_choice`` (sigmoid + correction bias).
+        Restricts selection to the ``topk_group`` groups with the largest top-2 mass, picks ``k`` experts
+        within them, renormalizes when ``norm_topk_prob and k > 1``, then scales by ``routed_scaling_factor``
+        -- returning BOTH the weights and the expert indices. Numerically identical to the routing the gate
+        used to perform internally (which discarded the indices). Mirrors DeepSeek-V2's select_hook.
+        """
+        scores_for_choice = gate_logits.astype(jnp.float32)
+        token_count = scores_for_choice.shape[0]
+        group_scores = scores_for_choice.reshape(token_count, n_group, n_routed_experts // n_group)
+        group_scores = jnp.sum(jax.lax.top_k(group_scores, k=2)[0], axis=-1)
+        group_idx = jax.lax.top_k(group_scores, k=topk_group)[1]
+        group_mask = jnp.zeros_like(group_scores)
+        row_idx = jnp.arange(token_count)[:, None]
+        group_mask = group_mask.at[row_idx, group_idx].set(1.0)
+        score_mask = jnp.repeat(group_mask[:, :, None], n_routed_experts // n_group, axis=2).reshape(token_count, -1)
+        masked_scores = jnp.where(score_mask > 0, scores_for_choice, 0.0)
+        topk_weight, topk_idx = jax.lax.top_k(masked_scores, k=k)
+        if k > 1 and norm_topk_prob:
+            topk_weight = topk_weight / (jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20)
+        topk_weight = topk_weight * routed_scaling_factor
+        return topk_weight, topk_idx
 
     def forward(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.

@@ -32,7 +32,7 @@ dependencies = [
 	"jax>=0.10.0",
 	"jaxlib>=0.10.0",
 	"eformer==0.0.101",
-	"ejkernel==0.0.80",
+	"ejkernel==0.0.80.3",
 	"spectrax-lib==0.1.4",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
@@ -81,11 +81,11 @@ torch = ["torch==2.8.0"]
 # nvidia-cutlass-dsl[cu13], which only ships manylinux wheels. Gate the whole extra to linux
 # so win32/darwin resolution forks see an empty cuda extra instead of an unsatisfiable one.
 cuda = [
-	"jax[cuda13]>=0.10.0; sys_platform == 'linux'",
-	"torch==2.8.0; sys_platform == 'linux'",
-	"ejkernel[cuda,triton]==0.0.80; sys_platform == 'linux'",
+	"jax[cuda13]>=0.10.0",
+	"torch==2.8.0",
+	"ejkernel[cuda,triton]==0.0.80.3",
 ]
-tpu = ["jax[tpu]>=0.10.0", "ejkernel[tpu]==0.0.80"]
+tpu = ["jax[tpu]>=0.10.0", "ejkernel[tpu]==0.0.80.3"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.11"]
 profile = [
@@ -214,7 +214,7 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.uv]
-prerelease = "allow"
+prerelease = "if-necessary-or-explicit"
 conflicts = [
 	[
 		{ extra = "cuda" },
