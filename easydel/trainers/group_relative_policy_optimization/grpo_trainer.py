@@ -53,6 +53,7 @@ from ..agentic_moshpit.tools import function_to_json, make_tool
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
+from ..reward_protocol import RewardProtocol
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
@@ -77,7 +78,7 @@ if tp.TYPE_CHECKING:
     from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 
 class _ToolLike(tp.Protocol):
@@ -189,12 +190,18 @@ def _compute_rewards_and_advantages(
     scale_rewards: str,
     multi_objective_aggregation: str,
     arguments: GRPOConfig,
+    group_reduction: str = "mean",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Aggregate reward-function outputs and compute grouped advantages.
 
     Returns the scalar reward per completion, normalized advantages, per-group
     reward means, and per-group reward standard deviations used by the GRPO
     loss and logging path.
+
+    ``group_reduction`` selects how the per-group baseline subtracted from the
+    rewards is reduced over the ``num_generations`` completions: ``"mean"``
+    (the classic GRPO baseline) or ``"sum"``.  It applies to the ``group_mean``
+    advantage estimator only; ``leave_one_out`` keeps its own RLOO baseline.
     """
     if multi_objective_aggregation == "sum_then_normalize":
         rewards = jnp.nansum(rewards_per_func * reward_weights[None, :], axis=1)
@@ -208,8 +215,11 @@ def _compute_rewards_and_advantages(
             )
             advantages = (grouped_rewards - grouped_baseline).reshape(-1)
         else:
-            mean_grouped_rewards = jnp.nanmean(grouped_rewards, axis=-1)
-            advantages = rewards - mean_grouped_rewards.repeat(generation_factor, axis=0)
+            if group_reduction == "sum":
+                grouped_baseline = jnp.nansum(grouped_rewards, axis=-1)
+            else:
+                grouped_baseline = jnp.nanmean(grouped_rewards, axis=-1)
+            advantages = rewards - grouped_baseline.repeat(generation_factor, axis=0)
 
         if scale_rewards in ("group", "none"):
             std_rewards = jnp.nanstd(grouped_rewards, axis=-1)
@@ -396,9 +406,18 @@ class GRPOTrainer(Trainer):
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
-        self.ref_state = deepcopy_model(model=model)
-        if arguments.disable_dropout:
-            model, self.ref_state = self._disable_state_dropout(model, self.ref_state)
+        if arguments.beta != 0.0:
+            self.ref_state = deepcopy_model(model=model)
+            if arguments.disable_dropout:
+                model, self.ref_state = self._disable_state_dropout(model, self.ref_state)
+        else:
+            # beta == 0 -> no KL term. Skip the reference model entirely: no
+            # deep-copy (saves ~13.6 GB/chip for a 27B) and no reference forward
+            # (which would otherwise alias the donated policy buffers under the
+            # async rollout overlap and crash with "Buffer has been deleted").
+            if arguments.disable_dropout:
+                (model,) = self._disable_state_dropout(model)
+            self.ref_state = None
 
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(
@@ -501,11 +520,17 @@ class GRPOTrainer(Trainer):
                 f"Expected {len(reward_funcs)} reward weights, but got {len(arguments.reward_weights)} instead."
             )
 
+        # Weights come from each reward's own `weight` (RewardProtocol.weight, default
+        # 1.0; plain callables/models -> 1.0). An explicit `reward_weights` in the
+        # trainer config overrides them.
         self.reward_weights = jnp.asarray(
-            arguments.reward_weights if arguments.reward_weights is not None else [1.0] * len(reward_funcs),
+            arguments.reward_weights
+            if arguments.reward_weights is not None
+            else [float(getattr(func, "weight", 1.0)) for func in reward_funcs],
             dtype="f4",
         )
         self.reward_func_names = [getattr(func, "__name__", None) or func.__class__.__name__ for func in reward_funcs]
+        self._group_reduction = self._resolve_group_reduction(reward_funcs)
 
         self.num_generations = arguments.num_generations
         self.eval_num_generations = arguments.num_generations_eval or arguments.num_generations
@@ -525,6 +550,33 @@ class GRPOTrainer(Trainer):
             processing_class=processing_class,
         )
         self._setup_completion_hub_logging()
+
+    @staticmethod
+    def _resolve_group_reduction(reward_funcs: list[RewardFunc]) -> str:
+        """Resolve the group-baseline reduction used by advantage estimation.
+
+        Reads the ``reduction`` attribute of any :class:`RewardProtocol` in
+        ``reward_funcs``.  When at least one is present its reduction is used
+        (all protocols must agree); otherwise the classic ``"mean"`` baseline is
+        kept so plain reward callables / models are unaffected.
+
+        Args:
+            reward_funcs: The normalized list of reward functions/models.
+
+        Returns:
+            ``"sum"`` or ``"mean"``.
+
+        Raises:
+            ValueError: If two ``RewardProtocol`` instances request conflicting
+                reductions.
+        """
+        reductions = {func.reduction for func in reward_funcs if isinstance(func, RewardProtocol)}
+        if len(reductions) > 1:
+            raise ValueError(
+                f"Conflicting RewardProtocol.reduction values {sorted(reductions)}; "
+                "all RewardProtocols passed together must use the same reduction."
+            )
+        return reductions.pop() if reductions else "mean"
 
     @staticmethod
     def _resolve_reward_func_model(reward_func: RewardFunc) -> RewardFunc:
@@ -1357,19 +1409,23 @@ class GRPOTrainer(Trainer):
                     logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                 )
 
-        self.compute_refmodel_logps = compile_trainer_step(
-            partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
-            mesh=mesh,
-            static_argnames=("graphdef"),
-            in_shardings=(
-                self.ref_state.shardings.graphstate,
-                self.ref_state.shardings.graphother,
-                empty_sharding,
-                empty_sharding,
-                {key: None for key in normalize_generation_model_kwargs(None).keys()},
-            ),
-            out_shardings=empty_sharding,
-        )
+        if self.ref_state is not None:
+            self.compute_refmodel_logps = compile_trainer_step(
+                partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
+                mesh=mesh,
+                static_argnames=("graphdef"),
+                in_shardings=(
+                    self.ref_state.shardings.graphstate,
+                    self.ref_state.shardings.graphother,
+                    empty_sharding,
+                    empty_sharding,
+                    {key: None for key in normalize_generation_model_kwargs(None).keys()},
+                ),
+                out_shardings=empty_sharding,
+            )
+        else:
+            # beta == 0: no reference model, so no reference-logps function.
+            self.compute_refmodel_logps = None
 
         def _compute_state_logps(
             model_state: EasyDeLState,
@@ -1573,10 +1629,6 @@ class GRPOTrainer(Trainer):
                 generation_factor,
                 prompt_batch_size=prompt_mask.shape[0],
             )
-            normalized_repeated_model_kwargs = normalize_generation_model_kwargs(
-                repeated_prompt_model_kwargs,
-                model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
-            )
             policy_repeated_model_kwargs = normalize_generation_model_kwargs(
                 repeated_prompt_model_kwargs,
                 model_callable=getattr(state.model, "forward", state.model),
@@ -1585,34 +1637,49 @@ class GRPOTrainer(Trainer):
             old_per_token_logps = None
 
             with capture_time() as token_logps_time_fn:
-                if self.ref_logps_chunk_size is not None and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
-                    ref_chunks: list[jax.Array] = []
-                    full_batch_size = int(prompt_completion_ids.shape[0])
-                    for start in range(0, full_batch_size, self.ref_logps_chunk_size):
-                        end = min(start + self.ref_logps_chunk_size, full_batch_size)
-                        ref_chunks.append(
-                            self.compute_refmodel_logps(
-                                self.ref_state.graphstate,
-                                self.ref_state.graphother,
-                                prompt_completion_ids[start:end],
-                                prompt_completion_mask[start:end],
-                                slice_prompt_aligned_model_kwargs(
-                                    normalized_repeated_model_kwargs,
-                                    start,
-                                    end,
-                                    prompt_batch_size=full_batch_size,
-                                ),
-                            )
-                        )
-                    ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
-                else:
-                    ref_per_token_logps = self.compute_refmodel_logps(
-                        self.ref_state.graphstate,
-                        self.ref_state.graphother,
-                        prompt_completion_ids,
-                        prompt_completion_mask,
-                        normalized_repeated_model_kwargs,
+                if self.ref_state is None:
+                    # beta == 0: KL term disabled -> skip the reference forward
+                    # entirely. The placeholder is never read by the loss.
+                    ref_per_token_logps = jnp.zeros(
+                        (completion_ids.shape[0], completion_ids.shape[1]),
+                        dtype=jnp.float32,
                     )
+                else:
+                    normalized_repeated_model_kwargs = normalize_generation_model_kwargs(
+                        repeated_prompt_model_kwargs,
+                        model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
+                    )
+                    if (
+                        self.ref_logps_chunk_size is not None
+                        and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size
+                    ):
+                        ref_chunks: list[jax.Array] = []
+                        full_batch_size = int(prompt_completion_ids.shape[0])
+                        for start in range(0, full_batch_size, self.ref_logps_chunk_size):
+                            end = min(start + self.ref_logps_chunk_size, full_batch_size)
+                            ref_chunks.append(
+                                self.compute_refmodel_logps(
+                                    self.ref_state.graphstate,
+                                    self.ref_state.graphother,
+                                    prompt_completion_ids[start:end],
+                                    prompt_completion_mask[start:end],
+                                    slice_prompt_aligned_model_kwargs(
+                                        normalized_repeated_model_kwargs,
+                                        start,
+                                        end,
+                                        prompt_batch_size=full_batch_size,
+                                    ),
+                                )
+                            )
+                        ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
+                    else:
+                        ref_per_token_logps = self.compute_refmodel_logps(
+                            self.ref_state.graphstate,
+                            self.ref_state.graphother,
+                            prompt_completion_ids,
+                            prompt_completion_mask,
+                            normalized_repeated_model_kwargs,
+                        )
             token_logps_time = token_logps_time_fn()
             old_token_logps_time = 0.0
             sampling_topk_indices = None
@@ -1695,6 +1762,30 @@ class GRPOTrainer(Trainer):
                 results.tool_calls,
                 target_len=target_len,
             )
+            # Per-completion generation signals exposed to reward functions:
+            # finish_reason / truncated (hit the length cap), token-level length,
+            # and the (padding-trimmed) completion token ids.
+            finish_reason_records = self._coerce_generation_metadata_list(
+                results.finish_reason,
+                target_len=target_len,
+            )
+            truncated_records = [
+                (reason == "length") if isinstance(reason, str) else None for reason in finish_reason_records
+            ]
+            host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+            host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
+            completion_token_lengths = host_completion_mask.sum(axis=-1).tolist()
+            completion_length_records = self._coerce_generation_metadata_list(
+                [int(length) for length in completion_token_lengths],
+                target_len=target_len,
+            )
+            completion_ids_records = self._coerce_generation_metadata_list(
+                [
+                    row[: int(length)]
+                    for row, length in zip(host_completion_ids.tolist(), completion_token_lengths, strict=False)
+                ],
+                target_len=target_len,
+            )
             structured_clean_completions = (
                 self._build_structured_assistant_messages(
                     clean_completions_text,
@@ -1762,6 +1853,10 @@ class GRPOTrainer(Trainer):
                             raw_text=raw_completions_text,
                             reasoning=reasoning_records,
                             tool_calls=tool_call_records,
+                            finish_reason=finish_reason_records,
+                            truncated=truncated_records,
+                            completion_length=completion_length_records,
+                            completion_ids=completion_ids_records,
                             max_length=self.arguments.max_length,
                             batch=reward_batch,
                             **(environment_feedback or {}),
@@ -1812,6 +1907,7 @@ class GRPOTrainer(Trainer):
                     scale_rewards=self.scale_rewards,
                     multi_objective_aggregation=self.multi_objective_aggregation,
                     arguments=self.arguments,
+                    group_reduction=getattr(self, "_group_reduction", "mean"),
                 )
             grouped_comp_time = grouped_comp_time_fn()
         preprocessing_time = preprocessing_time_fn()

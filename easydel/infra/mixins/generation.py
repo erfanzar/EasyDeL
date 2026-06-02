@@ -456,6 +456,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
     layer_indices: tp.Iterable[int] | None = None,
     num_pages_override: int | None = None,
     stage_layer_groups: tp.Iterable[tp.Iterable[int]] | None = None,
+    max_cache_tokens: int | None = None,
 ):
     """Create per-layer ragged configs that share a common page pool budget.
 
@@ -624,6 +625,25 @@ def _create_mixed_standard_ragged_page_cache_configs(
         num_pages = int(free) // int(page_bytes)
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        # Optionally cap the total KV-cache token capacity (num_pages * page_size)
+        # so a generous hbm_utilization can't allocate, say, a 1M-token cache when
+        # the run only needs 64k. Effective capacity = min(hbm-derived, cap).
+        if max_cache_tokens is not None and int(max_cache_tokens) > 0:
+            capped_pages = max(1, int(max_cache_tokens) // int(page_size))
+            if data_parallel_size > 1:
+                capped_pages = max(data_parallel_size, (capped_pages // data_parallel_size) * data_parallel_size)
+            if capped_pages < num_pages:
+                logger.info(
+                    "Capping mixed KV pages %s -> %s (sequence_capacity %sK -> %sK) via "
+                    "max_cache_tokens=%s, page_size=%s.",
+                    num_pages,
+                    capped_pages,
+                    int(num_pages * int(page_size) / 1000),
+                    int(capped_pages * int(page_size) / 1000),
+                    int(max_cache_tokens),
+                    page_size,
+                )
+                num_pages = capped_pages
         if num_pages <= 0:
             raise ValueError(
                 "Computed `num_pages` is non-positive for mixed standard ragged cache geometry; "
@@ -712,6 +732,7 @@ def _create_mixed_standard_unified_attention_cache_configs(
     layer_indices: tp.Iterable[int] | None = None,
     num_pages_override: int | None = None,
     stage_layer_groups: tp.Iterable[tp.Iterable[int]] | None = None,
+    max_cache_tokens: int | None = None,
 ):
     """Create per-layer unified configs that share one mixed-geometry page pool.
 
@@ -783,6 +804,24 @@ def _create_mixed_standard_unified_attention_cache_configs(
         num_pages = int(free) // int(page_bytes)
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        # Optionally cap total KV-cache token capacity (num_pages * page_size) so a
+        # generous hbm_utilization can't allocate a huge cache. min(hbm-derived, cap).
+        if max_cache_tokens is not None and int(max_cache_tokens) > 0:
+            capped_pages = max(1, int(max_cache_tokens) // int(page_size))
+            if data_parallel_size > 1:
+                capped_pages = max(data_parallel_size, (capped_pages // data_parallel_size) * data_parallel_size)
+            if capped_pages < num_pages:
+                logger.info(
+                    "Capping mixed unified KV pages %s -> %s (sequence_capacity %sK -> %sK) via "
+                    "max_cache_tokens=%s, page_size=%s.",
+                    num_pages,
+                    capped_pages,
+                    int(num_pages * int(page_size) / 1000),
+                    int(capped_pages * int(page_size) / 1000),
+                    int(max_cache_tokens),
+                    page_size,
+                )
+                num_pages = capped_pages
         if num_pages <= 0:
             raise ValueError(
                 "Computed `num_pages` is non-positive for mixed unified cache geometry; "
@@ -1439,6 +1478,7 @@ class EasyGenerationMixin:
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
+        max_cache_tokens: int | None = None,
     ) -> RaggedPagesCache | MLARaggedPagesCache | UnifiedAttentionCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
@@ -1480,6 +1520,7 @@ class EasyGenerationMixin:
                 max_length=max_model_length,
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
+                max_cache_tokens=max_cache_tokens,
             )
         quantizer = self._quant_class(
             quantization_config=text_config.kv_cache_quantization_config,
@@ -2123,6 +2164,7 @@ class EasyGenerationMixin:
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create a non-MLA :class:`RaggedPagesCacheConfig` for this model.
 
@@ -2140,6 +2182,9 @@ class EasyGenerationMixin:
             num_hidden_layers_override: Forces a specific number of cache
                 layers (used by callers that already know the per-stage
                 layer count).
+            max_cache_tokens: Optional hard ceiling on total KV-cache tokens;
+                forwarded to ``RaggedPagesCacheConfig.create`` so the page
+                count becomes ``min(hbm-derived, this)``. ``None`` = no cap.
 
         Returns:
             RaggedPagesCacheConfig: Ready-to-use config sized for the
@@ -2190,6 +2235,7 @@ class EasyGenerationMixin:
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
                 version=version,
+                max_cache_tokens=max_cache_tokens,
             )
             return representative
 
@@ -2204,6 +2250,7 @@ class EasyGenerationMixin:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             version=version,
+            max_cache_tokens=max_cache_tokens,
         )
 
     def _create_mla_ragged_page_cache_config(
@@ -2214,6 +2261,7 @@ class EasyGenerationMixin:
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create an MLA-specific :class:`MLARaggedPagesCacheConfig`.
 
@@ -2289,6 +2337,7 @@ class EasyGenerationMixin:
             qk_rope_head_dim=int(qk_rope_head_dim),
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
         )
 
     def create_ragged_page_cache_config(
@@ -2298,6 +2347,7 @@ class EasyGenerationMixin:
         page_size: int = 128,
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create the paged-cache config matching the active attention mechanism.
 
@@ -2310,6 +2360,11 @@ class EasyGenerationMixin:
             hbm_utilization: Fraction of free HBM to allocate to the page pool.
             dtype: Cache dtype override. ``None`` defers to the model's
                 ``kvdtype``.
+            max_cache_tokens: Optional hard ceiling on the total number of
+                tokens the KV-cache page pool may hold. When set, the page
+                count is ``min(hbm_utilization-derived, cap)`` so a generous
+                ``hbm_utilization`` cannot create (e.g.) a 1M-token cache.
+                ``None`` (default) keeps the pure ``hbm_utilization`` sizing.
 
         Returns:
             RaggedPagesCacheConfig | MLARaggedPagesCacheConfig: A
@@ -2324,6 +2379,7 @@ class EasyGenerationMixin:
                 page_size=page_size,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
+                max_cache_tokens=max_cache_tokens,
             )
 
         return self._create_standard_ragged_page_cache_config(
@@ -2331,6 +2387,7 @@ class EasyGenerationMixin:
             page_size=page_size,
             hbm_utilization=hbm_utilization,
             dtype=dtype,
+            max_cache_tokens=max_cache_tokens,
         )
 
     def create_unified_attention_cache_config(
@@ -2341,6 +2398,7 @@ class EasyGenerationMixin:
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
         layer_indices: tp.Iterable[int] | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create :class:`UnifiedAttentionCacheConfig` for vLLM-style unified attention.
 
@@ -2360,6 +2418,9 @@ class EasyGenerationMixin:
                 ``kvdtype``.
             layer_indices: Optional iterable of layer indices to consider.
                 ``None`` means "all KV-bearing layers".
+            max_cache_tokens: Optional hard ceiling on total KV-cache tokens;
+                forwarded so the page count becomes ``min(hbm-derived, this)``.
+                ``None`` = no cap.
 
         Returns:
             UnifiedAttentionCacheConfig: Either a representative config
@@ -2390,6 +2451,7 @@ class EasyGenerationMixin:
                     layer_indices,
                     total_layers=int(getattr(text_config, "num_hidden_layers", len(layer_indices))),
                 ),
+                max_cache_tokens=max_cache_tokens,
             )
             return representative_config
 
@@ -2410,6 +2472,7 @@ class EasyGenerationMixin:
             head_dim=head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
         )
 
     def init_operations_cache_config(
@@ -5693,6 +5756,7 @@ class EasyGenerationMixin:
         max_num_batched_tokens: int | None = None,
         hbm_utilization: float | None = None,
         page_size: int | None = None,
+        max_cache_tokens: int | None = None,
         enable_prefix_caching: bool | None = None,
         runner_verbose: bool | None = None,
         decode_truncated_prompt: bool | None = None,
@@ -5720,6 +5784,10 @@ class EasyGenerationMixin:
             max_num_batched_tokens: Maximum tokens per batch. Defaults to None.
             hbm_utilization: Fraction of HBM to use for KV cache. Defaults to 0.85.
             page_size: Size of memory pages for paged attention. Defaults to 128.
+            max_cache_tokens: Optional hard ceiling on the total KV-cache token
+                capacity. The page pool is sized to ``min(hbm_utilization-derived,
+                this)`` so a generous ``hbm_utilization`` cannot create (e.g.) a
+                1M-token cache. ``None`` (default) keeps pure HBM sizing.
             enable_prefix_caching: Enable prefix caching. Defaults to True.
             runner_verbose: Enable verbose logging. Defaults to False.
             decode_truncated_prompt: Decode truncated prompts. Defaults to True.
@@ -5757,6 +5825,7 @@ class EasyGenerationMixin:
                 max_num_batched_tokens,
                 hbm_utilization,
                 page_size,
+                max_cache_tokens,
                 enable_prefix_caching,
                 data_parallelism_axis,
                 async_scheduling,
@@ -5797,6 +5866,7 @@ class EasyGenerationMixin:
                 max_num_batched_tokens,
                 hbm_utilization,
                 page_size,
+                max_cache_tokens,
                 enable_prefix_caching,
                 data_parallelism_axis,
                 async_scheduling,
@@ -5842,6 +5912,8 @@ class EasyGenerationMixin:
             hbm_utilization = getattr(cached_engine, "_hbm_utilization", 0.85) if cached_engine else 0.85
         if page_size is None:
             page_size = getattr(cached_engine, "_page_size", 128) if cached_engine else 128
+        if max_cache_tokens is None and cached_engine is not None:
+            max_cache_tokens = getattr(getattr(cached_engine, "cache_config", None), "max_cache_tokens", None)
         if enable_prefix_caching is None:
             enable_prefix_caching = getattr(cached_engine, "_enable_prefix_caching", True) if cached_engine else True
         if data_parallelism_axis is None:
@@ -5872,6 +5944,7 @@ class EasyGenerationMixin:
             max_num_batched_tokens=max_num_batched_tokens,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
             enable_prefix_caching=enable_prefix_caching,
             data_parallelism_axis=data_parallelism_axis,
             async_scheduling=async_scheduling,
@@ -5917,6 +5990,7 @@ class EasyGenerationMixin:
                 cache=eSurgeCacheRuntimeConfig.from_dict(
                     hbm_utilization=extra_dict["hbm_utilization"],
                     page_size=extra_dict["page_size"],
+                    max_cache_tokens=extra_dict["max_cache_tokens"],
                     enable_prefix_caching=extra_dict["enable_prefix_caching"],
                     data_parallelism_axis=extra_dict["data_parallelism_axis"],
                     destroy_pages_on_pause=extra_dict["destroy_pages_on_pause"],
@@ -6019,6 +6093,7 @@ class EasyGenerationMixin:
         max_num_batched_tokens: int | None = None,
         hbm_utilization: float | None = None,
         page_size: int | None = None,
+        max_cache_tokens: int | None = None,
         enable_prefix_caching: bool | None = None,
         data_parallelism_axis: str | None = None,
         runner_verbose: bool | None = None,
@@ -6100,6 +6175,7 @@ class EasyGenerationMixin:
             max_num_batched_tokens=max_num_batched_tokens,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
             enable_prefix_caching=enable_prefix_caching,
             data_parallelism_axis=data_parallelism_axis,
             runner_verbose=runner_verbose,

@@ -580,6 +580,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     use_esurge_generation: NotRequired[bool]
     esurge_use_tqdm: NotRequired[bool]
     esurge_hbm_utilization: NotRequired[float | None]
+    esurge_max_cache_tokens: NotRequired[int | None]
     esurge_max_num_seqs: NotRequired[int | None]
     esurge_min_input_pad: NotRequired[int | None]
     esurge_page_size: NotRequired[int | None]
@@ -2092,7 +2093,13 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "benchmarks": [],
     # eSurge integration defaults
     "use_esurge_generation": True,
-    "esurge_hbm_utilization": 0.45,
+    # Both KV-cache sizing knobs default to None: when neither is set the trainer
+    # auto-computes a tight token budget from the rollout shape (see
+    # TrainingArguments.esurge_hbm_utilization). Must mirror the dataclass default
+    # — normalize_trainer_config setdefault()s these, so a non-None value here would
+    # silently override the dataclass None and defeat the auto-compute path.
+    "esurge_hbm_utilization": None,
+    "esurge_max_cache_tokens": None,
     "esurge_page_size": 32,
     "esurge_silent_mode": True,
     "esurge_runner_verbose": False,

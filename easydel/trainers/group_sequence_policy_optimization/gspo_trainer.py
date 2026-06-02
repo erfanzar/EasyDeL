@@ -29,6 +29,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from ..group_relative_policy_optimization import GRPOTrainer
+from ..reward_protocol import RewardProtocol
 from .gspo_config import GSPOConfig
 
 if tp.TYPE_CHECKING:
@@ -37,7 +38,7 @@ if tp.TYPE_CHECKING:
     from easydel.data.core.protocols import ShardedDataSource
 
 
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 
 @Registry.register("trainer", "gspo")

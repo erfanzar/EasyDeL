@@ -743,6 +743,9 @@ class ParallelLinearQuantized(spx.Module):
         """
         self.in_features = in_features
         self.out_features = out_features
+        # Fused projections pass a sequence of output widths (e.g. qkv = (q, k, v));
+        # the stored quantized kernel/bias use the summed width like the dense layer.
+        out_features_sum = sum(out_features) if isinstance(out_features, (tuple, list)) else out_features
         self.use_bias = use_bias
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -763,7 +766,7 @@ class ParallelLinearQuantized(spx.Module):
         # Set by _quantize_array during __init__; used by _resolve_ejkernel_params afterwards.
         self._ej_group_size: int | None = None
 
-        kernel = kernel_init(rngs.parameters, (in_features, out_features), param_dtype)
+        kernel = kernel_init(rngs.parameters, (in_features, out_features_sum), param_dtype)
         quant_kernel, quant_scales, quant_biases = self._quantize_array(kernel)
         mode, group_size, _bits, needs_biases = self._resolve_ejkernel_params()
         layout_specs = _quantized_linear_layout_spec(
@@ -789,7 +792,7 @@ class ParallelLinearQuantized(spx.Module):
 
         if use_bias:
             self.bias = spx.Parameter(
-                bias_init(rngs.parameters, (out_features,), param_dtype),
+                bias_init(rngs.parameters, (out_features_sum,), param_dtype),
                 sharding=sharding_for_layout(layout_specs.get("bias")),
             )
 

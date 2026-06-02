@@ -1270,6 +1270,22 @@ class EasyBridgeMixin(PushToHubMixin):
                     state = flatten_dict(state)
                 state = string_key_to_int(state)
                 state = _rename_legacy_checkpoint_leaves(state)
+                # Drop any saved RNG-state leaves (``...rng.rngs.*``). PRNG keys are
+                # per-run, not weights, and a checkpoint serialized under a
+                # low-precision ``param_dtype`` can store them downcast (e.g. as
+                # bfloat16), which is an invalid PRNG key on reload (JAX requires
+                # uint32 key_data). Skipping them lets the model keep the fresh
+                # uint32 rngs from ``lazy_init`` + ``materialize_meta_state``.
+                rng_state_keys = [
+                    key for key in state if isinstance(key, tuple) and any(str(part) in ("rng", "rngs") for part in key)
+                ]
+                if rng_state_keys:
+                    for key in rng_state_keys:
+                        del state[key]
+                    logger.info(
+                        "Skipping %d saved RNG-state leaf(s) during load; using freshly-seeded uint32 rngs instead.",
+                        len(rng_state_keys),
+                    )
                 model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
             has_quantized_keys = any(

@@ -49,7 +49,7 @@ class _TeacherModule:
             attentions=(attention,) if output_attentions else None,
         )
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage=None):
         def lm_head(hidden):
             h0 = hidden[..., 0]
             h1 = hidden[..., 1]
@@ -92,7 +92,7 @@ class _StudentModule:
             attentions=(attention,) if output_attentions else None,
         )
 
-    def make_lm_head_fn(self):
+    def make_lm_head_fn(self, vocab_shard_stage=None):
         def lm_head(hidden):
             h0 = hidden[..., 0]
             h1 = hidden[..., 1]

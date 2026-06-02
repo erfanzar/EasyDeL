@@ -29,9 +29,6 @@ from easydel.utils.helpers import capture_time
 
 from ..direct_preference_optimization_trainer import DPOTrainer
 from ..trainer import Trainer
-from ..training_utils import (
-    filter_kwargs_for_callable,
-)
 from .online_dpo_config import OnlineDPOConfig
 
 
@@ -270,13 +267,16 @@ class OnlineDPOTrainer(DPOTrainer):
                 )
                 reward_values = reward_output.logits[:, 0]
             else:
-                reward_kwargs = {
-                    "prompts": prompts,
-                    "completions": completions,
-                    "completion_ids": np.asarray(jax.device_get(completion_ids)).tolist(),
+                reward_call_kwargs = self._build_reward_call_kwargs(
+                    reward_func,
+                    prompts=prompts,
+                    completions=completions,
+                    completion_ids=np.asarray(jax.device_get(completion_ids)).tolist(),
+                    max_length=self.arguments.max_length,
+                    batch=batch,
                     **sidechannels,
-                }
-                reward_values = reward_func(**filter_kwargs_for_callable(reward_func, reward_kwargs))
+                )
+                reward_values = reward_func(**reward_call_kwargs)
             reward_rows.append(
                 jnp.asarray([jnp.nan if value is None else value for value in reward_values], dtype=jnp.float32)
             )

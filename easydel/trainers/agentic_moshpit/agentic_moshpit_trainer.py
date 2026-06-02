@@ -55,6 +55,7 @@ except ImportError:
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..prompt_utils import apply_chat_template
+from ..reward_protocol import RewardProtocol
 from ..training_utils import (
     normalize_generation_model_kwargs,
     slice_prompt_aligned_model_kwargs,
@@ -77,7 +78,7 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 
 class _InfiniteRolloutDataset:

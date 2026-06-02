@@ -57,6 +57,7 @@ from .._logprob_utils import (
 from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
+from ..reward_protocol import RewardProtocol
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import (
@@ -75,7 +76,7 @@ if tp.TYPE_CHECKING:
     from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 
 @Registry.register("trainer", "ppo")

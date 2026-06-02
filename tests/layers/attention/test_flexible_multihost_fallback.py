@@ -133,6 +133,12 @@ def test_flexible_attention_routes_multihost_varlen_vanilla_to_sdpa(monkeypatch)
     )
 
     class _MeshCtx:
+        # Must look like a valid mesh: forward() now resolves the stage mesh via
+        # resolve_stage_mesh (is_valid_mesh needs non-None `shape` and falsy `empty`)
+        # instead of `with self.config.mesh:` directly.
+        shape = (1,)
+        empty = False
+
         def __enter__(self):
             return self
 
@@ -230,6 +236,12 @@ def test_flexible_attention_multihost_varlen_reroute_rejects_unsupported_sdpa_fe
     monkeypatch.setattr("easydel.layers.attention._flexible.jax.process_count", lambda: 2)
 
     class _MeshCtx:
+        # Must look like a valid mesh: forward() now resolves the stage mesh via
+        # resolve_stage_mesh (is_valid_mesh needs non-None `shape` and falsy `empty`)
+        # instead of `with self.config.mesh:` directly.
+        shape = (1,)
+        empty = False
+
         def __enter__(self):
             return self
 
@@ -277,6 +289,12 @@ def test_flexible_attention_multihost_varlen_mla_requires_explicit_failure(monke
     monkeypatch.setattr("easydel.layers.attention._flexible.jax.process_count", lambda: 2)
 
     class _MeshCtx:
+        # Must look like a valid mesh: forward() now resolves the stage mesh via
+        # resolve_stage_mesh (is_valid_mesh needs non-None `shape` and falsy `empty`)
+        # instead of `with self.config.mesh:` directly.
+        shape = (1,)
+        empty = False
+
         def __enter__(self):
             return self
 

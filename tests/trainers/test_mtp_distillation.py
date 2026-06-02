@@ -47,7 +47,7 @@ from easydel.trainers.distillation_trainer._fn import (
 _RESULTS = []
 
 
-def test(name):
+def _case(name):
     def deco(fn):
         def wrapper():
             t0 = time.time()
@@ -86,7 +86,7 @@ def _cfg(mtp_layers=1, mtp_coef=0.3, hidden=64, vocab=128):
     )
 
 
-@test("model exposes outputs.mtp_logits when the MTP head is active")
+@_case("model exposes outputs.mtp_logits when the MTP head is active")
 def test_model_exposes_mtp_logits():
     b, s, v = 2, 16, 128
     ids = jax.random.randint(jax.random.PRNGKey(1), (b, s), 0, v)
@@ -98,7 +98,7 @@ def test_model_exposes_mtp_logits():
     assert out.aux_loss is not None, "aux_loss (self-supervised MTP CE) should be present"
 
 
-@test("model exposes no mtp_logits when MTP disabled")
+@_case("model exposes no mtp_logits when MTP disabled")
 def test_model_no_mtp_logits_when_disabled():
     b, s, v = 2, 16, 128
     ids = jax.random.randint(jax.random.PRNGKey(1), (b, s), 0, v)
@@ -107,7 +107,7 @@ def test_model_no_mtp_logits_when_disabled():
     assert getattr(out, "mtp_logits", None) is None, "mtp_logits should be None when MTP disabled"
 
 
-@test("mtp_distillation_loss: KL >= 0 and finite")
+@_case("mtp_distillation_loss: KL >= 0 and finite")
 def test_mtp_kd_nonnegative():
     b, s, v = 2, 16, 128
     teacher = jax.random.normal(jax.random.PRNGKey(3), (b, s, v)) * 2.0
@@ -117,7 +117,7 @@ def test_mtp_kd_nonnegative():
     assert float(loss) >= -1e-5, f"KL must be >= 0, got {float(loss)}"
 
 
-@test("mtp_distillation_loss: perfect match (student=teacher shifted by 1) -> KL ~ 0")
+@_case("mtp_distillation_loss: perfect match (student=teacher shifted by 1) -> KL ~ 0")
 def test_mtp_kd_perfect_match():
     # student MTP[:, t] predicts x_{t+2}; teacher[:, t+1] is that same conditional.
     b, s, v = 2, 16, 128
@@ -127,7 +127,7 @@ def test_mtp_kd_perfect_match():
     assert abs(float(loss)) < 1e-3, f"perfect-match KL should be ~0, got {float(loss)}"
 
 
-@test("mtp_distillation_loss: completion mask restricts the loss window")
+@_case("mtp_distillation_loss: completion mask restricts the loss window")
 def test_mtp_kd_mask():
     b, s, v = 2, 16, 128
     teacher = jax.random.normal(jax.random.PRNGKey(3), (b, s, v)) * 2.0
@@ -137,7 +137,7 @@ def test_mtp_kd_mask():
     assert jnp.isfinite(loss), "masked loss must be finite"
 
 
-@test("compute_mtp_chain: shape + step-1 matches the single-step path")
+@_case("compute_mtp_chain: shape + step-1 matches the single-step path")
 def test_mtp_chain_shape_and_consistency():
     b, s, v, k = 2, 32, 128, 6
     ids = jax.random.randint(jax.random.PRNGKey(1), (b, s), 0, v)
@@ -150,7 +150,7 @@ def test_mtp_chain_shape_and_consistency():
     assert jnp.allclose(chain[0], out.mtp_logits, atol=1e-4), "chain[0] != single-step mtp_logits"
 
 
-@test("mtp_chain_distillation_loss: per-step alignment (perfect chain -> KL ~ 0)")
+@_case("mtp_chain_distillation_loss: per-step alignment (perfect chain -> KL ~ 0)")
 def test_mtp_chain_perfect_alignment():
     b, s, v, k = 2, 32, 128, 6
     teacher = jax.random.normal(jax.random.PRNGKey(9), (b, s, v)) * 2.0
@@ -168,7 +168,7 @@ def test_mtp_chain_perfect_alignment():
     assert len(per_step) == k
 
 
-@test("DistillationConfig: MTP knobs + validation")
+@_case("DistillationConfig: MTP knobs + validation")
 def test_config_validation():
     c = DistillationConfig(mtp_distillation=True, mtp_kd_weight=0.5, mtp_draft_tokens=6, save_directory="/tmp/_mtp_cfg")
     assert c.mtp_distillation is True and c.mtp_kd_weight == 0.5 and c.mtp_draft_tokens == 6

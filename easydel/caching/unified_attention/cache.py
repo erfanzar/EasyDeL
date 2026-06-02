@@ -261,6 +261,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         *,
         hbm_utilization: float = 0.9,
         page_size: int = 128,
+        max_cache_tokens: int | None = None,
     ) -> "UnifiedAttentionCacheConfig":
         """Create a UnifiedAttentionCacheConfig with automatic capacity calculation.
 
@@ -277,6 +278,9 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             head_dim: Dimension of each attention head.
             hbm_utilization: Target HBM utilization (0.0-1.0). Default: 0.9.
             page_size: Tokens per cache page. Default: 128.
+            max_cache_tokens: Optional hard ceiling on the total tokens the page
+                pool may hold (``num_pages * page_size``); the final page count is
+                ``min(hbm_utilization-derived, this)``. ``None`` keeps pure HBM sizing.
 
         Returns:
             UnifiedAttentionCacheConfig: Configured cache metadata.
@@ -311,6 +315,25 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         num_pages = int(free) // int(page_bytes)
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        # Optionally cap total KV-cache token capacity (num_pages * page_size) so a
+        # generous hbm_utilization can't allocate a 1M-token cache when the run only
+        # needs (e.g.) 64k. Effective capacity = min(hbm-derived, max_cache_tokens).
+        if max_cache_tokens is not None and int(max_cache_tokens) > 0:
+            capped_pages = max(1, int(max_cache_tokens) // int(page_size))
+            if data_parallel_size > 1:
+                capped_pages = max(data_parallel_size, (capped_pages // data_parallel_size) * data_parallel_size)
+            if capped_pages < num_pages:
+                logger.info(
+                    "Capping unified-attention KV pages %s -> %s (sequence_capacity %sK -> %sK) via "
+                    "max_cache_tokens=%s, page_size=%s.",
+                    num_pages,
+                    capped_pages,
+                    int(num_pages * page_size / 1000),
+                    int(capped_pages * page_size / 1000),
+                    int(max_cache_tokens),
+                    page_size,
+                )
+                num_pages = capped_pages
         if num_pages <= 0:
             raise ValueError(
                 "Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce page footprint."

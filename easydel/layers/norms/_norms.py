@@ -69,10 +69,6 @@ from spectrax.common_types import Replicated
 
 from easydel.infra.sharding import sharding_for_layout
 
-# ---------------------------------------------------------------------------
-# Local replacements for former SpecTrax Linen utility references
-# ---------------------------------------------------------------------------
-
 Axes = int | tp.Sequence[int]
 Initializer = jax.nn.initializers.Initializer
 PromoteDtypeFn = tp.Callable[..., tuple]

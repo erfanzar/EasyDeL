@@ -567,8 +567,15 @@ class TrainingArguments:
         metadata={"help": "Whether to use tqdm progress bars for eSurge generations."},
     )
     esurge_hbm_utilization: float | None = field(
-        default=0.45,
-        metadata={"help": "HBM memory utilization target for eSurge engine (0.0-1.0). None uses eSurge default."},
+        default=None,
+        metadata={
+            "help": "HBM utilization target (0.0-1.0) for eSurge KV-cache sizing. Sizing priority: "
+            "(1) esurge_max_cache_tokens if set -> cap the pool to that many tokens; "
+            "(2) else this hbm_utilization if set -> size the pool from that HBM fraction; "
+            "(3) else (both None, default) -> the trainer auto-computes a budget from the generation batch "
+            "(max_length x total_batch_size x num_generations) so it doesn't over-allocate a huge pool from a "
+            "blanket HBM fraction against the model's full context window."
+        },
     )
     esurge_max_num_seqs: int | None = field(
         default=None,
@@ -587,6 +594,15 @@ class TrainingArguments:
     esurge_page_size: int | None = field(
         default=32,
         metadata={"help": "Page size for eSurge KV cache management. None uses eSurge default."},
+    )
+    esurge_max_cache_tokens: int | None = field(
+        default=None,
+        metadata={
+            "help": "Hard ceiling on the total eSurge KV-cache token capacity. When set, the page pool is "
+            "sized to min(esurge_hbm_utilization-derived, this), so a generous hbm_utilization can't allocate "
+            "(e.g.) a 1M-token cache when the run only needs 64k. When None AND esurge_hbm_utilization is also "
+            "None (both default), the trainer auto-computes the budget as max_length x total_batch_size x num_generations."
+        },
     )
     esurge_silent_mode: bool = field(
         default=True,

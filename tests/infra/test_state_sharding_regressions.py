@@ -157,4 +157,6 @@ def test_init_tx_skips_redundant_device_put_for_already_sharded_slots(monkeypatc
     assert updated.tx is not None
     assert updated.opt_state is not None
     assert calls["matched"] > 0
-    assert calls["placed"] > 0
+    # Already-sharded slots need no re-placement; replicated setup scalars are now
+    # pre-placed before place_setup_tree_with_shardings, so nothing reaches it here.
+    assert calls["placed"] == 0

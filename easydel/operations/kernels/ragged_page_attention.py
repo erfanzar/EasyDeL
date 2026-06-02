@@ -76,6 +76,7 @@ References:
     - EasyDeL serving documentation
 """
 
+import os
 from functools import partial
 
 import jax
@@ -276,6 +277,13 @@ def _default_tpu_rpa_v3_cfg(
     """
     if jax.default_backend() != "tpu":
         return cfg
+    # Opt into ejkernel's autotuner: when EASYDEL_RPA_AUTOTUNE is truthy, skip
+    # this static block-size heuristic and leave num_queries_per_block /
+    # num_kv_pages_per_block unset so ragged_page_attention_v3's Executor
+    # (cache_miss_fallback="autotune") searches the candidate space and keeps
+    # only configs that actually fit the 16MB TPU scoped-VMEM limit.
+    if os.getenv("EASYDEL_RPA_AUTOTUNE", "1").strip().lower() in ("1", "true", "yes", "on"):
+        return cfg
     if _cfg_value(cfg, "num_kv_pages_per_block") is not None or _cfg_value(cfg, "num_queries_per_block") is not None:
         return cfg
 
@@ -297,14 +305,23 @@ def _default_tpu_rpa_v3_cfg(
     max_q = _next_power_of_2(max_num_tokens)
     max_kv = pages_per_seq * page_size
     q_heads_per_kv = _next_power_of_2(actual_num_q_heads // actual_num_kv_heads)
+    # The token/head budgets below were tuned for head_dim ~= 128. Larger head
+    # dims (e.g. 256 on Qwen3.5) scale the per-block scratchpad linearly, so
+    # shrink the budgets by head_dim/128 to keep the kernel within the 16MB TPU
+    # scoped-VMEM limit (otherwise the chosen block_q overflows it).
+    try:
+        head_dim = int(query.shape[2])
+    except (IndexError, TypeError, ValueError):
+        head_dim = 128
+    head_dim_factor = max(1, head_dim // 128)
 
     match _tpu_version():
         case 5 | 6:
-            block_q = min(1024 // q_heads_per_kv, max_q // 2)
-            block_kv_tokens = min(1024, max_kv)
+            block_q = min((1024 // head_dim_factor) // q_heads_per_kv, max_q // 2)
+            block_kv_tokens = min(1024 // head_dim_factor, max_kv)
         case 7:
-            block_q = min(2048 // q_heads_per_kv, max_q // 2)
-            block_kv_tokens = min(2048, max_kv // 2)
+            block_q = min((2048 // head_dim_factor) // q_heads_per_kv, max_q // 2)
+            block_kv_tokens = min(2048 // head_dim_factor, max_kv // 2)
         case _:
             return cfg
 

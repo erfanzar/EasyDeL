@@ -60,6 +60,7 @@ from easydel.utils.traversals import deepcopy_model
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..prompt_utils import apply_chat_template
+from ..reward_protocol import RewardProtocol
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
@@ -77,7 +78,7 @@ FeedbackFunc = tp.Callable[
     [list[str], list[str], list[float]],
     list[str],
 ]
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 _FEEDBACK_CORRECT = "Your previous attempt was correct.\n"
 _FEEDBACK_TEMPLATE_SOLUTION = "Correct solution:\n{solution}\n\n"

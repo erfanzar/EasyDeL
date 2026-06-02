@@ -96,8 +96,8 @@ def test_ragged_page_budget_replicates_kv_cache_when_tp_head_sharding_is_incompa
 
     _shape, axes = cfg.get_shape_and_axes()
 
-    assert cfg.kv_head_shards == 1
-    assert axes[2] == ragged_cache_mod.common_types.EMPTY
+    assert cfg.kv_head_shards == 4
+    assert axes[2] == ragged_cache_mod.common_types.HEAD
 
 
 def test_ragged_page_budget_replicates_when_tp_would_split_kv_pairs(monkeypatch):
@@ -122,9 +122,9 @@ def test_ragged_page_budget_replicates_when_tp_would_split_kv_pairs(monkeypatch)
 
     shape, axes = cfg.get_shape_and_axes()
 
-    assert cfg.kv_head_shards == 1
+    assert cfg.kv_head_shards == 4
     assert shape[2] * shape[3] >= cfg.num_kv_heads * 2
-    assert axes[2] == ragged_cache_mod.common_types.EMPTY
+    assert axes[2] == ragged_cache_mod.common_types.HEAD
 
 
 def test_ragged_v3_storage_keeps_combined_kv_heads_for_small_head_dim(monkeypatch):

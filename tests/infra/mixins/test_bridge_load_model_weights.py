@@ -24,6 +24,13 @@ class _LoadModelStub:
             raise ValueError("loading weights left abstract trainable parameter leaf")
         return self
 
+    def materialize_meta_state(self, *, seed: int = 0):
+        # Mirror the real EasyDeLBaseModule API added alongside the load path:
+        # concretize abstract non-parameter leaves and return the same model.
+        # (No bookkeeping append — the test asserts materialize_contexts holds
+        # only the assert_parameters_materialized context.)
+        return self
+
 
 def test_load_model_weights_normalizes_numpy_arrays_before_merge(monkeypatch):
     device_put_calls: list[tuple[object, object]] = []

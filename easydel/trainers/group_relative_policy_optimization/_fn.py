@@ -46,6 +46,7 @@ from easydel.trainers._logprob_utils import (
     resolve_lmhead_chunksize,
 )
 
+from ..reward_protocol import RewardProtocol
 from ..training_utils import (
     ScheduledLossAdapter,
     compact_generation_model_kwargs,
@@ -62,7 +63,7 @@ from ..training_utils import (
     update_state_respectfully,
 )
 
-RewardFunc = EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 
 def _masked_sum_and_count(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:

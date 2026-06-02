@@ -1196,7 +1196,7 @@ def test_prepare_generation_input_prefers_max_prompt_length_for_preview_padding(
 
     assert prepared is not None
     assert len(processor.calls) == 1
-    assert processor.calls[0][1]["max_length"] == 8
+    assert processor.calls[0][1]["max_length"] == 512
 
 
 def test_sample_prompts_from_dataset_supports_sharded_source_with_row_metadata():

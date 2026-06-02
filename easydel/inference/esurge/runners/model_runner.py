@@ -422,18 +422,30 @@ class eSurgeRunner:
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
                 max_length=max_model_len,
+                # Born-capped here too, so the global token cap is honored for
+                # unified_attention even when cap_metadata_pages (below) is a no-op
+                # outside pipeline parallelism.
+                max_cache_tokens=max_cache_tokens,
             )
         else:
             self.metadata = self.model.create_ragged_page_cache_config(
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
                 max_length=max_model_len,
+                # Born-capped: honor the global token cap at creation time so the
+                # page pool is never sized to the full HBM-derived count first.
+                # cap_metadata_pages below still applies the capacity margin (and
+                # is a no-op for the cap itself once this has already capped).
+                max_cache_tokens=max_cache_tokens,
             )
         cap_metadata_pages(self.metadata, self.pipeline_plan)
         self.max_num_batched_tokens = (
             int(max_model_len)
             if max_num_batched_tokens is None
-            else max(1, min(int(max_num_batched_tokens), int(max_model_len)))
+            # Per-step token budget is a SUM across batched sequences, so it may
+            # legitimately exceed a single sequence's max_model_len (continuous
+            # batching of multiple prefills). Don't clamp it down to max_model_len.
+            else max(1, int(max_num_batched_tokens))
         )
         self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
         self.max_model_len = max_model_len
@@ -460,7 +472,11 @@ class eSurgeRunner:
         min_token_pad_i = min(min_token_pad_i, int(self.max_model_len))
         self.num_tokens_paddings = self._get_token_paddings(
             min_token_size=min_token_pad_i,
-            max_token_size=self.max_model_len,
+            # Compile token buckets up to the per-step batched-token budget, not
+            # just one sequence's length, so a multi-prefill step (sum of tokens
+            # > max_model_len) still has a bucket and doesn't overflow the
+            # scheduler's static budget.
+            max_token_size=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
             padding_gap=0,
         )
         self.max_num_tokens = self.num_tokens_paddings[-1]

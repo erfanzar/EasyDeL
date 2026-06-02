@@ -73,8 +73,13 @@ def test_inline_assign_stage_sets_pipeline_metadata():
 
 
 def test_base_config_mesh_is_spxmesh_with_pp_axis():
-    cfg = EasyDeLBaseConfig()
-
+    assert isinstance(EasyDeLBaseConfig().mesh, spx.SpxMesh)
+    # mpmd_axis is "pp" only when the pp mesh dim > 1 (a default pp=1 mesh returns
+    # None so spx.jit doesn't route every call through MPMD). Exercise a real pp>1
+    # mesh, which needs >=2 devices (mirrors the other pp tests in this file).
+    if jax.device_count() < 2:
+        pytest.skip("requires at least two devices for a pp>1 mesh")
+    cfg = EasyDeLBaseConfig(sharding_axis_dims=(2, 1, -1, 1, 1, 1))
     assert isinstance(cfg.mesh, spx.SpxMesh)
     assert cfg.mesh.mpmd_axis == "pp"
     assert cfg.mesh.mpmd_mesh is not None

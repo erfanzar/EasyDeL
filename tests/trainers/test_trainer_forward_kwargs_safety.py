@@ -685,8 +685,9 @@ def test_seq_kd_transform_passes_tools_to_chat_template():
 
     assert transformed["input_ids"][-3:] == [1, 2, 3]
     assert transformed["attention_mask"][-3:] == [1, 1, 1]
-    assert tokenizer.calls
-    assert tokenizer.calls[-1]["tools"] == trainer.arguments.tools
+    # The transform clones the tokenizer (self._tokenizer); calls land on the clone.
+    assert transform._tokenizer.calls
+    assert transform._tokenizer.calls[-1]["tools"] == trainer.arguments.tools
 
 
 def test_seq_kd_transform_uses_example_tools_when_present():
@@ -744,8 +745,9 @@ def test_seq_kd_transform_uses_example_tools_when_present():
 
     assert transformed["input_ids"][-2:] == [4, 5]
     assert transformed["attention_mask"][-2:] == [1, 1]
-    assert tokenizer.calls
-    assert tokenizer.calls[-1]["tools"] == example_tools
+    # The transform clones the tokenizer (self._tokenizer); calls land on the clone.
+    assert transform._tokenizer.calls
+    assert transform._tokenizer.calls[-1]["tools"] == example_tools
 
 
 def test_seq_kd_teacher_fn_repeats_prompts_for_multi_generation():

@@ -83,6 +83,7 @@ from .prompt_transforms import (
 )
 from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
 from .ray_scaler import RayDistributedTrainer
+from .reward_protocol import RewardProtocol
 from .reward_trainer import RewardConfig, RewardTrainer
 from .rloo_trainer import RLOOConfig, RLOOTrainer
 from .rlvr_trainer import RLVRConfig, RLVRTrainer
@@ -173,6 +174,7 @@ __all__ = (
     "RayDistributedTrainer",
     "RewardConfig",
     "RewardPreprocessTransform",
+    "RewardProtocol",
     "RewardTrainer",
     "SDFTConfig",
     "SDFTTrainer",

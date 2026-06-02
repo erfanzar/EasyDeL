@@ -568,6 +568,10 @@ def distillation_loss(
         with ``labels != -100`` when labels are provided.
     """
     dtype = student_logits.dtype
+    # The teacher is frozen in distillation: detach it so no gradient leaks into the
+    # teacher branch (the fused-KL forward path only stop-grads in some temperature
+    # regimes). No-op for real training where teacher params aren't trainable.
+    teacher_logits = jax.lax.stop_gradient(teacher_logits)
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
 

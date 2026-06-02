@@ -37,6 +37,7 @@ from easydel.utils.helpers import capture_time
 from ..group_relative_policy_optimization import GRPOTrainer
 from ..group_relative_policy_optimization.grpo_trainer import _clip_rewards_if_configured
 from ..prompt_utils import apply_chat_template
+from ..reward_protocol import RewardProtocol
 from ..training_utils import (
     extract_generation_model_kwargs,
     normalize_generation_model_kwargs,
@@ -53,7 +54,7 @@ if tp.TYPE_CHECKING:
     from easydel.data.core.protocols import ShardedDataSource
 
 
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 GroupFilterFunc = tp.Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 

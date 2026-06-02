@@ -45,6 +45,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import get_logger
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..reward_protocol import RewardProtocol
 from .reward_verifiers import (
     CodeVerifier,
     FormatVerifier,
@@ -60,7 +61,7 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
 
 
 @Registry.register("trainer", "rlvr")

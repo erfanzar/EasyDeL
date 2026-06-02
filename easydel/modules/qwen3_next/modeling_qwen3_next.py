@@ -1648,7 +1648,7 @@ def _apply_qwen3_next_packed_updates_ragged(
             n_v=num_v_heads,
             d_k=head_k_dim,
             d_v=head_v_dim,
-            chunk_size=32,
+            chunk_size=16,
             use_qk_norm_in_gdn=True,
             pre_sharded_mixed_qkv=use_head_sharded_conv,
             flat_tp_shard=use_head_sharded_conv,

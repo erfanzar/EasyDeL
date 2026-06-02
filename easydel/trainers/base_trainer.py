@@ -205,6 +205,8 @@ class GenerationResults(NamedTuple):
         raw_text: Raw unsplit completion text aligned with generated completions,
             before reasoning/tool separation and without special-token stripping.
         completion_prompts: Optional prompt objects (text or chat dicts) aligned one-to-one with completions.
+        finish_reason: Per-completion generation stop reason ("stop"/"length"/"eos_token"/"abort"),
+            aligned one-to-one with completions; ``None`` when the backend does not report it.
     """
 
     generation_results: str | list[str]
@@ -219,6 +221,7 @@ class GenerationResults(NamedTuple):
     reasoning: list[str | None] | None = None
     tool_calls: list[list | None] | None = None
     raw_text: str | list[str] | None = None
+    finish_reason: list[str | None] | None = None
 
 
 class BaseTrainer(BaseTrainerProtocol):
@@ -1321,6 +1324,10 @@ class BaseTrainer(BaseTrainerProtocol):
         raw_text: list[str] | None = None,
         reasoning: list[str | None] | None = None,
         tool_calls: list[tp.Any | None] | None = None,
+        finish_reason: list[str | None] | None = None,
+        truncated: list[bool | None] | None = None,
+        completion_length: list[int] | None = None,
+        completion_ids: list[list[int]] | None = None,
         batch: dict[str, tp.Any] | None = None,
         **extra_kwargs: tp.Any,
     ) -> dict[str, tp.Any]:
@@ -1341,6 +1348,13 @@ class BaseTrainer(BaseTrainerProtocol):
             raw_text: Raw, unstripped completion strings.
             reasoning: Per-completion reasoning text (when split out).
             tool_calls: Per-completion structured tool-call payloads.
+            finish_reason: Per-completion generation stop reason
+                ("stop"/"length"/"eos_token"/"abort"; ``None`` if unreported).
+            truncated: Per-completion bool, ``True`` when generation hit the
+                length cap (``finish_reason == "length"``); ``None`` if unknown.
+            completion_length: Per-completion generated-token count.
+            completion_ids: Per-completion list of generated token ids
+                (padding trimmed).
             batch: The original batch dict (for side-channel access).
             **extra_kwargs: Additional fields to expose to the reward function.
 
@@ -1358,6 +1372,10 @@ class BaseTrainer(BaseTrainerProtocol):
                 "raw_text": raw_text,
                 "reasoning": reasoning,
                 "tool_calls": tool_calls,
+                "finish_reason": finish_reason,
+                "truncated": truncated,
+                "completion_length": completion_length,
+                "completion_ids": completion_ids,
                 "max_length": max_length,
                 "batch": batch,
                 **extra_kwargs,
@@ -3092,6 +3110,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 reasoning_records: list[str | None] = []
                 tool_call_records: list[list | None] = []
                 raw_output_records: list[str] = []
+                finish_reason_records: list[str | None] = []
                 completion_prompts: list[str | list[dict[str, str]]] = []
                 prompt_indices: list[int | None] = []
 
@@ -3178,6 +3197,11 @@ class BaseTrainer(BaseTrainerProtocol):
                             )
                         raw_output_records.append(completion_raw_text)
 
+                        completion_finish_reason = getattr(completion, "finish_reason", None)
+                        finish_reason_records.append(
+                            completion_finish_reason if isinstance(completion_finish_reason, str) else None
+                        )
+
                         completion_tokens: list[int] = []
                         if completion:
                             completion_tokens = list(getattr(completion, "token_ids", []) or [])
@@ -3219,6 +3243,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     reasoning_records = [reasoning_records[i] for i in new_order]
                     tool_call_records = [tool_call_records[i] for i in new_order]
                     raw_output_records = [raw_output_records[i] for i in new_order]
+                    finish_reason_records = [finish_reason_records[i] for i in new_order]
                     sequence_rows = [sequence_rows[i] for i in new_order]
 
                 base_prompt_ids = jnp.array(np.asarray(prompt_id_rows, dtype=np.int32))
@@ -3252,6 +3277,7 @@ class BaseTrainer(BaseTrainerProtocol):
                         reasoning=reasoning_records,
                         tool_calls=tool_call_records,
                         raw_text=raw_output_records,
+                        finish_reason=finish_reason_records,
                     ),
                     state=state,
                     release_runtime_after_generation=release_runtime_after_generation,
@@ -4114,6 +4140,38 @@ class BaseTrainer(BaseTrainerProtocol):
             esurge_kwargs["min_input_pad"] = args.esurge_min_input_pad
         if args.esurge_page_size is not None:
             esurge_kwargs["page_size"] = args.esurge_page_size
+        # eSurge KV-cache pool sizing. Both knobs default to None; pick the source:
+        #   1. explicit max_cache_tokens   -> cap the pool to that many tokens
+        #   2. else explicit hbm_utilization-> size the pool from that HBM fraction
+        #   3. else (neither provided)      -> auto-compute a token budget from the
+        #      rollout shape. Without this, get_esurge falls back to a blanket
+        #      0.85-HBM cut sized against the model's full context window (e.g. 128k),
+        #      which over-allocates the KV pool by orders of magnitude. The budget
+        #      targets the concurrent rollout working set (all slots at full length).
+        explicit_cache_tokens = getattr(args, "esurge_max_cache_tokens", None)
+        if explicit_cache_tokens is not None:
+            esurge_kwargs["max_cache_tokens"] = int(explicit_cache_tokens)
+        elif args.esurge_hbm_utilization is None:
+            # Neither knob set: size the KV pool to hold one full generation batch —
+            # max_length * batch_size * num_generations — i.e. every rollout completion at
+            # full length, instead of a blanket hbm_utilization cut against the model's full
+            # context window. max_length is enforced == max_prompt_length + max_completion_length
+            # by the GRPO config, and num_pages (total allocation) is independent of the
+            # model's max_model_len, so capping tokens directly shrinks the pool.
+            seq_len = int(getattr(args, "max_length", 0) or 0)
+            batch_size = int(getattr(args, "total_batch_size", 0) or 0)
+            num_generations = int(getattr(args, "generation_num_return_sequences", None) or 1)
+            if seq_len > 0 and batch_size > 0:
+                computed_cache_tokens = seq_len * batch_size * num_generations
+                esurge_kwargs["max_cache_tokens"] = computed_cache_tokens
+                logger.info(
+                    "eSurge KV-cache auto-sized (no hbm_utilization/max_cache_tokens set): "
+                    "max_cache_tokens=%s (max_length=%s x batch_size=%s x num_generations=%s).",
+                    computed_cache_tokens,
+                    seq_len,
+                    batch_size,
+                    num_generations,
+                )
         if hasattr(args, "esurge_silent_mode"):
             esurge_kwargs["silent_mode"] = args.esurge_silent_mode
         if hasattr(args, "esurge_runner_verbose"):

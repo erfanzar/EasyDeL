@@ -52,12 +52,6 @@ __all__ = (
 )
 
 
-# ---------------------------------------------------------------------------
-# New pattern: one class definition that is BOTH a TypedDict (for ``Unpack``)
-# and a runtime container with ``from_dict`` / attribute access.
-# ---------------------------------------------------------------------------
-
-
 class ConfigDict(dict):
     """Runtime instance type for classes decorated with :func:`typed_config`.
 

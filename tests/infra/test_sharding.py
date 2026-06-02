@@ -101,8 +101,8 @@ def test_normalize_logical_axis_rules_iterable_of_pairs():
 
 def test_normalize_logical_axis_rules_coerces_to_strings():
     """Non-str names get str()'d; None mesh axis stays None."""
-    result = _normalize_logical_axis_rules({1: 2, "x": None})
-    assert result == (("1", "2"), ("x", None))
+    result = _normalize_logical_axis_rules({1: "dp", "x": None})
+    assert result == (("1", "dp"), ("x", None))
 
 
 def _stub_mesh(shape: dict[str, int]) -> SimpleNamespace:
