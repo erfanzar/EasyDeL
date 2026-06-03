@@ -313,7 +313,11 @@ def _merge_multimodal_embeddings(
     flat_embeds = inputs_embeds.reshape(-1, hidden)
     flat_mask = is_multimodal.reshape(-1)
 
-    dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
+    # Pad with an explicit (1, hidden) zero row (not zeros_like(mm[0:1])): on a 0-row
+    # multimodal_embeddings the [0:1] slice is itself (0, hidden), leaving no index-0
+    # slot for the cumsum gather. An all-text batch (0 placeholders -> all-zero indices)
+    # then gathers the dummy row and where() leaves flat_embeds untouched (true no-op).
+    dummy_row = jnp.zeros((1, hidden), dtype=multimodal_embeddings.dtype)
     flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
 
     gather_indices = jnp.cumsum(flat_mask)

@@ -498,6 +498,13 @@ class LoadStageConfig:
             ``True`` the prefetch worker reshapes and moves the batch onto
             its target devices instead of leaving the host->device
             transfer to the training thread.
+        collate_fn (Callable[[list[dict]], dict] | None): Optional override
+            for how a list of buffered rows is assembled into one batch
+            dict. ``None`` (the default) uses
+            :func:`~easydel.data.execution.loader.collate_batch` — the
+            stack-or-object-array collation — preserving prior behaviour.
+            Supply a custom collator (e.g. a static-shape padder for a
+            precomputed-embed VLM pack) to control padding/scatter layout.
     """
 
     batch_size: int = 8
@@ -507,6 +514,7 @@ class LoadStageConfig:
     shuffle_buffer_size: int | None = None
     drop_last: bool = True
     prefetch_to_device: bool = False
+    collate_fn: Callable[[list[dict]], dict] | None = None
 
 
 @dataclass

@@ -1004,6 +1004,7 @@ class Qwen3_5Model(Qwen3VLModel):
         visual_pos_masks: jax.Array | None = None,  # compatibility no-op
         deepstack_visual_embeds: list[jax.Array] | None = None,  # compatibility no-op
         pixel_values: jax.Array | None = None,
+        image_embeds: jax.Array | None = None,
         pixel_values_videos: jax.Array | None = None,
         image_grid_thw: tuple | None = None,
         video_grid_thw: tuple | None = None,
@@ -1049,6 +1050,11 @@ class Qwen3_5Model(Qwen3VLModel):
             deepstack_visual_embeds: Compatibility no-op (Qwen3.5 does
                 not use deepstack mergers).
             pixel_values: Packed image pixel values for the vision tower.
+            image_embeds: Pre-computed post-vision-tower image embeds of
+                shape ``(num_image_tokens, hidden_size)`` scattered at
+                image placeholder positions, letting training skip the
+                vision tower. Used only when ``pixel_values`` is ``None``;
+                still requires ``image_grid_thw`` for correct 3-D mRoPE.
             pixel_values_videos: Packed video pixel values for the vision tower.
             image_grid_thw: Per-image ``(T, H, W)`` grid dimensions.
             video_grid_thw: Per-video ``(T, H, W)`` grid dimensions.
@@ -1077,7 +1083,6 @@ class Qwen3_5Model(Qwen3VLModel):
         if inputs_embeds is None:
             inputs_embeds = self.compute_embedding(input_ids)
 
-        image_embeds = None
         video_embeds = None
         if pixel_values is not None:
             image_embeds_tuple, _deepstack_image_embeds = self.get_image_features(
@@ -1115,7 +1120,7 @@ class Qwen3_5Model(Qwen3VLModel):
             else:
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids=input_ids,
-                    image_grid_thw=image_grid_thw if pixel_values is not None else None,
+                    image_grid_thw=image_grid_thw if (pixel_values is not None or image_embeds is not None) else None,
                     video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
                     attention_mask=attention_mask,
                 )

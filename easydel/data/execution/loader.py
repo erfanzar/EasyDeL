@@ -86,11 +86,12 @@ def batch_iterator(
     source: "Iterator[dict]",
     batch_size: int,
     drop_last: bool = True,
+    collate_fn: "tp.Callable[[list[dict]], dict] | None" = None,
 ) -> "Iterator[dict[str, np.ndarray]]":
     """Group rows from a streaming source into fixed-size batches and collate each.
 
     Walks ``source`` accumulating rows into a buffer; once the buffer
-    reaches ``batch_size`` it is collated via :func:`collate_batch` and
+    reaches ``batch_size`` it is collated via ``collate_fn`` and
     yielded, and the buffer is reset. Whether the final, possibly
     incomplete batch is yielded is controlled by ``drop_last``.
 
@@ -103,20 +104,26 @@ def batch_iterator(
             not fill a complete batch are discarded. When ``False``,
             they are emitted as a final, smaller batch — useful for
             evaluation where shape stability is not required.
+        collate_fn: Optional callable mapping a list of buffered rows to
+            one batch dict. ``None`` (the default) uses
+            :func:`collate_batch`, preserving prior behaviour. A custom
+            collator can impose static padding / a precomputed-embed
+            scatter layout without changing the iteration logic.
 
     Yields:
         dict[str, np.ndarray]: Each batch as a key-aligned dict of
-        numpy arrays produced by :func:`collate_batch`.
+        arrays produced by ``collate_fn``.
     """
+    collate = collate_fn if collate_fn is not None else collate_batch
     batch = []
     for item in source:
         batch.append(item)
         if len(batch) >= batch_size:
-            yield collate_batch(batch)
+            yield collate(batch)
             batch = []
 
     if batch and not drop_last:
-        yield collate_batch(batch)
+        yield collate(batch)
 
 
 class PrefetchIterator:
@@ -379,6 +386,7 @@ class AsyncDataLoader(AsyncDataset[dict]):
         drop_last: bool = True,
         sharding_map: "Mapping[str, NamedSharding] | None" = None,
         seed: int | None = None,
+        collate_fn: "tp.Callable[[list[dict]], dict] | None" = None,
     ):
         """Capture loader configuration without performing any I/O.
 
@@ -405,6 +413,9 @@ class AsyncDataLoader(AsyncDataset[dict]):
                 to pre-shard each batch via :func:`preshard_batch`.
             seed: RNG seed for the shuffle reservoir; ``None`` keeps
                 Python's default (non-deterministic) randomness.
+            collate_fn: Optional per-batch collation override forwarded
+                to :func:`batch_iterator`; ``None`` uses
+                :func:`collate_batch` (unchanged default behaviour).
         """
         self._source = source
         self._batch_size = batch_size
@@ -415,6 +426,7 @@ class AsyncDataLoader(AsyncDataset[dict]):
         self._drop_last = drop_last
         self._sharding_map = sharding_map
         self._seed = seed
+        self._collate_fn = collate_fn
         self._exhausted = False
 
     async def aget(self, _index: int) -> dict:
@@ -518,7 +530,7 @@ class AsyncDataLoader(AsyncDataset[dict]):
             examples = self._shuffle_stream(examples, self._shuffle_buffer_size)
 
         # Batch
-        batches = batch_iterator(examples, self._batch_size, self._drop_last)
+        batches = batch_iterator(examples, self._batch_size, self._drop_last, collate_fn=self._collate_fn)
 
         if self._sharding_map:
             batches = (preshard_batch(b, self._sharding_map) for b in batches)
@@ -677,6 +689,7 @@ class LoadStage(BaseStage):
                 shuffle_buffer_size=self._stage_config.shuffle_buffer_size,
                 drop_last=self._stage_config.drop_last,
                 seed=context.seed,
+                collate_fn=self._stage_config.collate_fn,
             )
             result[ds_name] = loader
             logger.info(f"Created loader for '{ds_name}' with batch_size={self._stage_config.batch_size}")
