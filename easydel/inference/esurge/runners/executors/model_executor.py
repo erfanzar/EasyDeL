@@ -235,7 +235,7 @@ class ModelStepExecutor:
         self._pipeline_lm_head_cache: OrderedDict[tuple[int, tuple[int, ...], str, str], tp.Any] = OrderedDict()
         # Legacy combined cache (kept for backward compat with tests)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
-        self._pipeline_kv_carry_map_cache: dict[int, dict[int, dict[int, int]]] = {}
+        self._pipeline_kv_carry_map_cache: dict[tuple[int, tuple[tp.Hashable, ...]], dict[int, dict[int, int]]] = {}
         self._lm_head_graphdef: tp.Any | None = None
         self._lm_head_state: tp.Any | None = None
         self._lm_head_clip_cap: float | None = None
@@ -399,6 +399,33 @@ class ModelStepExecutor:
         value = cache[key]
         cache.move_to_end(key)
         return value
+
+    @staticmethod
+    def _kv_prepare_signature(kv_pages: tp.Any, metadata: tp.Any) -> tuple[tp.Hashable, ...]:
+        """Compact static signature for SpectraX PP prepare-cache keys.
+
+        SpectraX prepare plans bake in operand tensor shapes. The resident PP
+        path can reallocate or shrink KV pages after warm-up, so token bucket
+        alone is not enough to safely reuse a prepared stage plan.
+        """
+        leaf_sigs = {
+            (
+                tuple(int(dim) for dim in getattr(leaf, "shape", ())),
+                str(getattr(leaf, "dtype", type(leaf).__name__)),
+            )
+            for leaf in jax.tree_util.tree_leaves(kv_pages)
+            if hasattr(leaf, "shape")
+        }
+        return (
+            type(kv_pages).__name__,
+            type(metadata).__name__,
+            str(getattr(metadata, "version", "")),
+            int(getattr(metadata, "num_pages", -1) or -1),
+            int(getattr(metadata, "page_size", -1) or -1),
+            int(getattr(metadata, "max_num_pages_per_req", -1) or -1),
+            len(jax.tree_util.tree_leaves(kv_pages)),
+            tuple(sorted(leaf_sigs)),
+        )
 
     def _metadata_sharding_template(self, *, include_vlm: bool = False) -> BatchMetadata:
         """Build the BatchMetadata sharding tree for compiled model steps.
@@ -1420,6 +1447,7 @@ class ModelStepExecutor:
             prepare_cache_key=(
                 "backbone",
                 int(metadata_.input_ids_buf.shape[0]),
+                self._kv_prepare_signature(kv_pages_, metadata_),
                 id(self.graphdef),
             ),
             runtime_static_argnums=(0, 1, 2),
@@ -1460,6 +1488,7 @@ class ModelStepExecutor:
                 "model_step",
                 int(metadata_.input_ids_buf.shape[0]),
                 int(padded_num_reqs),
+                self._kv_prepare_signature(kv_pages_, metadata_),
                 id(self.graphdef),
             ),
             runtime_static_argnums=(0, 1),
@@ -1483,7 +1512,7 @@ class ModelStepExecutor:
         information to carry each stage's local cache from microbatch N to
         microbatch N+1 while the other stages continue their own wavefront.
         """
-        cache_key = int(num_tokens)
+        cache_key = (int(num_tokens), self._kv_prepare_signature(kv_pages_, metadata_))
         cached = self._pipeline_kv_carry_map_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -1613,7 +1642,12 @@ class ModelStepExecutor:
             self._backbone_fn,
             backbone_arg_batches,
             carry_input_output_map=carry_map,
-            prepare_cache_key=("backbone", int(num_tokens), id(self.graphdef)),
+            prepare_cache_key=(
+                "backbone",
+                int(num_tokens),
+                self._kv_prepare_signature(kv_pages0, metadata0),
+                id(self.graphdef),
+            ),
             runtime_static_argnums=(0, 1, 2),
         )
 
