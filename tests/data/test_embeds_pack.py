@@ -22,7 +22,7 @@ that contract:
 1. ``test_data_contract``           - per-row byte/shape/count invariants on real parquet.
 2. ``test_scatter_places_real_embeds`` - ``merge_multimodal_embeddings`` puts the k-th
    decoded embed at the k-th placeholder and leaves text positions untouched.
-3. ``test_collate_embeds_pack``     - a batch collator (defined here) that pads ids/labels
+3. ``test_collate_embeds_pack``     - a batch collator (in ``easydel.data.transforms.collators``) that pads ids/labels
    and concatenates+zero-pads embeds keeps per-sample placeholder/embed alignment.
 4. ``test_embeds_pack_e2e_no_vision_tower`` (slow) - merged embeddings flow through the
    real Qwen3.5 causal-LM stack via ``inputs_embeds`` (no vision tower) to finite logits.
@@ -58,11 +58,17 @@ import pytest
 
 jax.config.update("jax_platform_name", "cpu")
 
-# Pack contract constants (Qwen3_5Config defaults / teacher hidden size).
-IMAGE_PLACEHOLDER_ID = 248056
+from easydel.data.transforms.collators import (  # noqa: E402
+    HIDDEN,
+    IMAGE_PLACEHOLDER_ID,
+    _decode_row_embeds,
+    collate_bucket_static,
+    collate_embeds_pack,
+)
+
+# Vision span special-token ids; IMAGE_PLACEHOLDER_ID + HIDDEN are imported from the collators module above.
 VISION_START_ID = 248053
 VISION_END_ID = 248054
-HIDDEN = 5120
 
 _DATA_GLOB = os.environ.get(
     "EMBEDS_PACK_GLOB",
@@ -72,146 +78,6 @@ _DATA_GLOB = os.environ.get(
 
 def _parquet_paths() -> list[str]:
     return sorted(glob.glob(_DATA_GLOB, recursive=True))
-
-
-def _decode_row_embeds(row: dict) -> np.ndarray:
-    """Decode a row's per-image bf16 blobs to a single ``(sum(embed_n_tok), embed_dim)`` f32 array."""
-    import ml_dtypes
-
-    ed = int(row["embed_dim"])
-    ent = list(row["embed_n_tok"])
-    blobs = row["image_embeds"]
-    mats = [np.frombuffer(b, dtype=ml_dtypes.bfloat16).reshape(ent[i], ed).astype(np.float32) for i, b in enumerate(blobs)]
-    if not mats:
-        return np.zeros((0, ed), dtype=np.float32)
-    return np.concatenate(mats, axis=0)
-
-
-def collate_embeds_pack(rows: list[dict], pad_id: int, max_total: int) -> dict:
-    """Collate embed-pack rows into a static-shape batch for training (no vision tower).
-
-    Pads ``input_ids`` with ``pad_id`` (must differ from the image placeholder so it is not
-    mistaken for a visual slot), ``labels`` with ``-100``, and ``attention_mask`` with ``0`` to
-    the batch-max length. All rows' decoded embeds are concatenated row-major and zero-padded to
-    a fixed ``max_total`` rows so the scatter target has a static shape. ``image_grid_thw`` is
-    stacked to ``(total_images, 3)``.
-    """
-    import jax.numpy as jnp
-
-    assert pad_id != IMAGE_PLACEHOLDER_ID, "pad_id must not collide with the image placeholder id"
-    bsz = len(rows)
-    max_len = max(len(r["input_ids"]) for r in rows)
-
-    input_ids = np.full((bsz, max_len), pad_id, dtype=np.int32)
-    attention_mask = np.zeros((bsz, max_len), dtype=np.int32)
-    labels = np.full((bsz, max_len), -100, dtype=np.int32)
-
-    embeds_list, grids = [], []
-    for bi, r in enumerate(rows):
-        ids = np.asarray(r["input_ids"], dtype=np.int32)
-        length = ids.shape[0]
-        input_ids[bi, :length] = ids
-        attention_mask[bi, :length] = np.asarray(r["attention_mask"], dtype=np.int32)
-        labels[bi, :length] = np.asarray(r["labels"], dtype=np.int32)
-        embeds_list.append(_decode_row_embeds(r))
-        grids.append(np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3))
-
-    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, HIDDEN), np.float32)
-    n_real = all_embeds.shape[0]
-    assert n_real <= max_total, f"decoded embed rows {n_real} exceed max_total {max_total}"
-    padded = np.zeros((max_total, HIDDEN), dtype=np.float32)
-    padded[:n_real] = all_embeds
-    grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
-
-    return {
-        "input_ids": jnp.asarray(input_ids),
-        "attention_mask": jnp.asarray(attention_mask),
-        "labels": jnp.asarray(labels),
-        "image_embeds": jnp.asarray(padded),
-        "image_grid_thw": jnp.asarray(grid_thw),
-        "n_real_embeds": n_real,
-    }
-
-
-def collate_bucket_static(rows: list[dict], pad_id: int, seq_len: int, max_embed_rows: int) -> dict:
-    """Bucketed STATIC-shape collator: pad every batch to a caller-fixed ``seq_len`` (the area_bucket
-    sequence ceiling) and a fixed ``max_embed_rows`` embed-row cap, so all batches drawn from one
-    bucket share an identical jitted shape and the training step compiles once per bucket (no
-    per-batch recompiles). Contrast ``collate_embeds_pack``, which pads to the per-batch max length
-    (variable shape -> a recompile whenever the batch-max changes).
-
-    Hard overflow guard: a row with ``len(input_ids) > seq_len`` raises. The producer caps IMAGE
-    tokens per bucket but NOT total seq_len (build.py records seq_len, never truncates), so a
-    text-heavy row can exceed the static window. Silently overflowing would drop trailing tokens —
-    including image placeholders — breaking the ``#placeholders == #embed rows`` invariant and making
-    the scatter OOB-clamp wrong embeds onto real positions. The guard forces an explicit upstream
-    policy (raise the ceiling / route to a larger bucket / truncate TEXT before collation) instead.
-    """
-    import jax.numpy as jnp
-
-    assert pad_id != IMAGE_PLACEHOLDER_ID, "pad_id must not collide with the image placeholder id"
-
-    # Belt-and-suspenders to the seq_len overflow assert below: a static-S batch must be homogeneous
-    # in its partition key -- every row from ONE (source x area_bucket x slen_band) partition. The
-    # loader guarantees this only when each AsyncDataLoader wraps a single partition dir (no glob
-    # spanning partitions, no cross-partition shuffle); a misconfig that interleaves partitions would
-    # force a single wrong static window. Key on the HIVE PARTITION columns (source/area_bucket/
-    # slen_band), NOT on `subset`: at full-pack scale one source can hold many subsets, so a subset
-    # check would falsely reject a valid single-source partition. Tolerant of rows lacking a label --
-    # skip that level rather than raise KeyError for the wrong reason.
-    for key in ("source", "area_bucket", "slen_band"):
-        vals = {r[key] for r in rows if key in r}
-        assert len(vals) <= 1, (
-            f"heterogeneous batch: static-S collation requires one source x area_bucket x slen_band "
-            f"partition per batch, got mixed {key} {sorted(vals)} -- configure one loader per "
-            "partition dir (no spanning glob / no cross-partition shuffle)"
-        )
-
-    # static-S must equal this partition's slen_band upper edge -- the band IS the compiled window
-    # (sink keys slen_band on band(seq_len); the collator's seq_len must be that same edge). Skipped
-    # for rows lacking the label (pre-sub-band fixtures), where seq_len is the area_bucket ceiling.
-    band_vals = {int(r["slen_band"]) for r in rows if "slen_band" in r}
-    if band_vals:
-        (band_edge,) = band_vals  # homogeneity asserted above
-        assert band_edge == seq_len, (
-            f"static-S mismatch: collator seq_len {seq_len} != partition slen_band edge {band_edge} -- "
-            "the bucketed window must equal the band's upper edge"
-        )
-
-    bsz = len(rows)
-    input_ids = np.full((bsz, seq_len), pad_id, dtype=np.int32)
-    attention_mask = np.zeros((bsz, seq_len), dtype=np.int32)
-    labels = np.full((bsz, seq_len), -100, dtype=np.int32)
-
-    embeds_list, grids = [], []
-    for bi, r in enumerate(rows):
-        ids = np.asarray(r["input_ids"], dtype=np.int32)
-        length = ids.shape[0]
-        assert length <= seq_len, (
-            f"overflow guard: row seq_len {length} exceeds bucket static window {seq_len} -- "
-            "raise the bucket ceiling, route to a larger bucket, or truncate TEXT before collation"
-        )
-        input_ids[bi, :length] = ids
-        attention_mask[bi, :length] = np.asarray(r["attention_mask"], dtype=np.int32)
-        labels[bi, :length] = np.asarray(r["labels"], dtype=np.int32)
-        embeds_list.append(_decode_row_embeds(r))
-        grids.append(np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3))
-
-    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, HIDDEN), np.float32)
-    n_real = all_embeds.shape[0]
-    assert n_real <= max_embed_rows, f"decoded embed rows {n_real} exceed max_embed_rows {max_embed_rows}"
-    padded = np.zeros((max_embed_rows, HIDDEN), dtype=np.float32)
-    padded[:n_real] = all_embeds
-    grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
-
-    return {
-        "input_ids": jnp.asarray(input_ids),
-        "attention_mask": jnp.asarray(attention_mask),
-        "labels": jnp.asarray(labels),
-        "image_embeds": jnp.asarray(padded),
-        "image_grid_thw": jnp.asarray(grid_thw),
-        "n_real_embeds": n_real,
-    }
 
 
 @pytest.fixture(scope="module")
