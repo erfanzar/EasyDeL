@@ -29,6 +29,7 @@ from .chat_template import (
     ConvertToChatML,
     MaybeApplyChatTemplate,
 )
+from .collators import collate_packed_embeds
 from .field_ops import (
     AddField,
     CombineFields,
@@ -56,6 +57,7 @@ from .pack import (
     pack_constant_length,
     pack_pre_tokenized,
 )
+from .packer import EmbedsWindowPacker
 from .source import LimitedShardedSource, ShuffledShardedSource, TransformedShardedSource
 from .tokenize import (
     TokenizedShardedSource,
@@ -125,6 +127,7 @@ __all__ = [
     "ConvertToChatML",
     "DPOPreprocessTransform",
     "DropFields",
+    "EmbedsWindowPacker",
     "ExpandTransform",
     "ExtractField",
     "FilterByField",
@@ -159,6 +162,7 @@ __all__ = [
     "WeightScheduler",
     "batched_tokenize_iterator",
     "block_mixture_interleave",
+    "collate_packed_embeds",
     "compute_tokenizer_hash",
     "pack_constant_length",
     "pack_pre_tokenized",
