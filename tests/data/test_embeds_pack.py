@@ -1383,5 +1383,52 @@ def test_collate_packed_embeds_equivalence():
         assert max_abs < 1e-3, f"packed segment {k} logits diverge from the unpacked run, max|Δ|={max_abs:.2e}"
 
 
+@pytest.mark.slow
+def test_collate_packed_embeds_underfill_backward_finite():
+    """Training feeds ALL ``n_windows`` rows through forward+BACKWARD -- the inert all-pad windows
+    that underfill produces CANNOT be skipped (that is the entire point of the static leading dim).
+    An all-pad window (attention 0 -> ``segment_ids`` all -1) is the classic all-masked-softmax NaN
+    footgun: softmax over a fully-masked row -> 0/0 -> NaN in the FORWARD, and ``labels`` -100 does
+    NOT save the backward -- the NaN is upstream in the forward graph and backprops into NaN grads on
+    the SHARED params (a where-masked loss can't undo an already-NaN activation). Per the standing
+    "empirically backstop degenerate shapes" rule this is RUN, not argued: real trainer entry
+    (``compute_loss`` folds ``segment_ids`` -> ``mask_info``) on a batch with a trailing all-pad
+    window, asserting the scalar loss AND every param gradient are finite."""
+    import jax
+
+    rows = [_text_row([5, 9, 2, 7, 1]), _text_row([3, 8, 4])]
+    seq_len = sum(len(r["input_ids"]) for r in rows)  # 8 -> both rows pack into ONE window (M=1)
+    n_windows = 2  # ask for 2 -> exactly one trailing all-pad window
+    batch = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=n_windows)
+    attn = np.asarray(batch["attention_mask"])
+    assert attn.shape == (n_windows, seq_len) and np.all(attn[1] == 0), "need a fully-masked pad window"
+
+    model = _build_tiny_text_model(seq_len)
+    # Mirror the trainer's grad path (trainers/trainer/_fn.py): differentiate the scalar loss w.r.t.
+    # the trainable graphstate, re-binding the module each call via merge_module (== state.merge(tree)).
+    gdef, params, others = model.split_module()
+
+    def loss_fn(params):
+        m = model.merge_module(gdef, params, others)
+        loss_out, _ = m.compute_loss(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            segment_ids=batch["segment_ids"],
+            labels=batch["labels"],
+        )
+        return loss_out.loss
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    loss = float(loss)
+    leaves = jax.tree_util.tree_leaves(grads)
+    assert np.isfinite(loss), f"scalar loss non-finite ({loss}) with a trailing all-pad window present"
+    assert leaves, "expected differentiable param gradients"
+    bad = sum(1 for g in leaves if not bool(np.all(np.isfinite(np.asarray(g)))))
+    assert not bad, (
+        f"{bad}/{len(leaves)} param-grad tensors non-finite with a trailing all-pad window -- "
+        "all-masked-softmax NaN backprops into shared params; pad windows must self-attend"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
