@@ -64,6 +64,7 @@ from easydel.data.transforms.collators import (  # noqa: E402
     _decode_row_embeds,
     collate_bucket_static,
     collate_embeds_pack,
+    collate_packed_embeds,
 )
 
 # Vision span special-token ids; IMAGE_PLACEHOLDER_ID + HIDDEN are imported from the collators module above.
@@ -1115,6 +1116,214 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
     )
     assert logits.shape == (B, S, _RM_VOCAB)
     assert np.isfinite(logits).all(), "real-loader bucket batch did not flow through the jitted step to finite logits"
+
+
+# --- packed-sequence collator (collate_packed_embeds) -------------------------------------------
+def _packable_row(text_len: int, imgs: list[int], source: str = "pixmo-points", area_bucket: int = 1024,
+                  slen_band: int | None = None) -> dict:
+    """Synthetic pack row for the packing collator. ``imgs`` = per-image post-merge token counts; each
+    image is laid down as a contiguous placeholder run followed by a single text token so it forms its
+    own modality group, with ``image_grid_thw = (1, 2*nt, 2)`` which under spatial_merge_size=2 yields
+    exactly ``nt`` LLM image tokens (matching the placeholder run). Then ``text_len`` trailing text
+    tokens. embed blobs are deterministic bf16."""
+    import ml_dtypes
+
+    ent = list(imgs)
+    blobs: list[bytes] = []
+    grid: list[int] = []
+    ids: list[int] = []
+    for nt in ent:
+        arr = (np.arange(nt * HIDDEN, dtype=np.float32).reshape(nt, HIDDEN) % 7).astype(ml_dtypes.bfloat16)
+        blobs.append(arr.tobytes())
+        ids += [IMAGE_PLACEHOLDER_ID] * nt + [5]  # trailing text token splits consecutive images into groups
+        grid += [1, 2 * nt, 2]
+    ids += [5] * text_len
+    row = {
+        "embed_dim": HIDDEN,
+        "embed_n_tok": ent,
+        "image_embeds": blobs,
+        "n_images": len(ent),
+        "input_ids": ids,
+        "attention_mask": [1] * len(ids),
+        "labels": ids,
+        "image_grid_thw": grid,
+        "seq_len": len(ids),
+        "source": source,
+        "area_bucket": area_bucket,
+    }
+    if slen_band is not None:
+        row["slen_band"] = slen_band
+    return row
+
+
+def _text_row(tokens: list[int]) -> dict:
+    """All-text pack row (no images) from explicit token ids."""
+    return {
+        "embed_dim": HIDDEN,
+        "embed_n_tok": [],
+        "image_embeds": [],
+        "n_images": 0,
+        "input_ids": list(tokens),
+        "attention_mask": [1] * len(tokens),
+        "labels": list(tokens),
+        "image_grid_thw": [],
+        "seq_len": len(tokens),
+        "source": "pixmo-points",
+        "area_bucket": 1024,
+    }
+
+
+def test_collate_packed_embeds_contract():
+    """Greedy packing into a fixed ``seq_len`` window: static shapes, example-order embed concat,
+    placeholder<->embed parity, contiguous per-window ``segment_ids`` (pad tail = -1), masked tail,
+    and per-segment-reset 3D M-RoPE positions (each segment == its standalone-example layout)."""
+    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+
+    rows = [_packable_row(text_len=6, imgs=[]), _packable_row(text_len=3, imgs=[2]), _packable_row(text_len=4, imgs=[3])]
+    filled = sum(len(r["input_ids"]) for r in rows)
+    seq_len = filled + 5  # all rows fit -> a single window with a padded tail
+    total_real = sum(sum(r["embed_n_tok"]) for r in rows)  # 0 + 2 + 3 = 5
+    cap = total_real + 4  # exercise the zero-padded embed tail
+
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+    ids = np.asarray(out["input_ids"])
+    emb = np.asarray(out["image_embeds"])
+    seg = np.asarray(out["segment_ids"])
+    pos = np.asarray(out["position_ids"])
+    attn = np.asarray(out["attention_mask"])
+    labels = np.asarray(out["labels"])
+
+    assert ids.shape == (1, seq_len), "short rows should pack into one fixed-width window"
+    assert emb.shape == (cap, HIDDEN)
+    assert seg.shape == (1, seq_len)
+    assert pos.shape == (3, 1, seq_len), "positions must be 3D M-RoPE (3, windows, seq_len)"
+
+    # (a) placeholder <-> embed parity, embeds concatenated in EXAMPLE order, zero-padded tail.
+    assert int((ids == IMAGE_PLACEHOLDER_ID).sum()) == total_real == out["n_real_embeds"]
+    assert np.array_equal(emb[total_real:], np.zeros((cap - total_real, HIDDEN), np.float32))
+    cursor = 0
+    for r in rows:
+        dec = _decode_row_embeds(r)
+        assert np.array_equal(emb[cursor : cursor + dec.shape[0]], dec), "embeds not concatenated in example order"
+        cursor += dec.shape[0]
+    assert np.asarray(out["image_grid_thw"]).shape == (sum(int(r["n_images"]) for r in rows), 3)
+
+    # segment_ids: contiguous per-example index over the filled span, -1 over the padded tail.
+    expected_seg = [k for k, r in enumerate(rows) for _ in range(len(r["input_ids"]))] + [-1] * (seq_len - filled)
+    assert np.array_equal(seg[0], np.asarray(expected_seg, dtype=np.int32))
+    assert np.all(attn[0, :filled] == 1) and np.all(attn[0, filled:] == 0), "padded tail not attention-masked"
+    assert np.all(labels[0, filled:] == -100), "padded tail labels not -100"
+    assert not (ids[0, filled:] == IMAGE_PLACEHOLDER_ID).any(), "placeholder leaked into the padded tail"
+
+    # (c) per-segment-reset positions: each segment's columns equal the helper's output for that
+    # example ALONE (current_pos starts at 0) -> no cumulative drift, every segment resets to 0.
+    offset = 0
+    for k, r in enumerate(rows):
+        ids_e = np.asarray(r["input_ids"], dtype=np.int32)
+        length = ids_e.shape[0]
+        grid = np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3)
+        mm = (ids_e == IMAGE_PLACEHOLDER_ID).astype(np.int32).reshape(1, -1)
+        pos_e, _ = _get_rope_index_from_mm_token_types(
+            input_ids=ids_e.reshape(1, -1),
+            mm_token_type_ids=mm,
+            image_grid_thw=grid if grid.shape[0] else None,
+            attention_mask=None,
+            spatial_merge_size=2,
+        )
+        pos_e = np.asarray(pos_e)[:, 0, :]
+        seg_slice = slice(offset, offset + length)
+        assert np.array_equal(pos[:, 0, seg_slice], pos_e), f"segment {k}: positions are not the per-example reset layout"
+        assert int(pos[:, 0, seg_slice].min()) == 0, f"segment {k}: positions did not reset to 0"
+        offset += length
+
+
+def test_collate_packed_embeds_greedy_window_count():
+    """FCFS greedy fill: rows that overflow the current window start the next one, yielding a
+    ``(num_windows, seq_len)`` batch with per-window ``segment_ids`` restarting at 0."""
+    rows = [_packable_row(text_len=8, imgs=[]) for _ in range(3)]  # each row is length 8
+    seq_len = 20  # two rows (16) fit; the third (24) spills into a second window
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0)
+    ids = np.asarray(out["input_ids"])
+    seg = np.asarray(out["segment_ids"])
+
+    assert ids.shape == (2, seq_len), "greedy packing should produce exactly two windows here"
+    assert np.array_equal(seg[0, :16], np.asarray([0] * 8 + [1] * 8, dtype=np.int32))
+    assert np.all(seg[0, 16:] == -1)
+    assert np.array_equal(seg[1, :8], np.asarray([0] * 8, dtype=np.int32)), "second window must restart segment ids at 0"
+    assert np.all(seg[1, 8:] == -1)
+
+
+def test_collate_packed_embeds_guards():
+    """Guard suite: pad/placeholder collision, single-row overflow, and source/area_bucket
+    homogeneity all RAISE; ``slen_band`` is DELIBERATELY not checked (packing mixes lengths by design)."""
+    a = _packable_row(text_len=4, imgs=[2])
+    b = _packable_row(text_len=3, imgs=[2])
+    seq_len, cap = 64, 8
+
+    with pytest.raises(AssertionError, match="collide"):
+        collate_packed_embeds([a], pad_id=IMAGE_PLACEHOLDER_ID, seq_len=seq_len, max_embed_rows=cap)
+
+    big = _packable_row(text_len=seq_len + 1, imgs=[])  # single row longer than the window
+    with pytest.raises(AssertionError, match="overflow guard"):
+        collate_packed_embeds([big], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+
+    a_src, b_src = dict(a), dict(b)
+    a_src["source"], b_src["source"] = "src_a", "src_b"
+    with pytest.raises(AssertionError, match=r"heterogeneous batch.*source"):
+        collate_packed_embeds([a_src, b_src], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+
+    a_ab, b_ab = dict(a), dict(b)
+    a_ab["area_bucket"], b_ab["area_bucket"] = 1024, 1536
+    with pytest.raises(AssertionError, match=r"heterogeneous batch.*area_bucket"):
+        collate_packed_embeds([a_ab, b_ab], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+
+    # mixed slen_band is allowed: packing deliberately concatenates examples of different lengths.
+    a_sb, b_sb = dict(a), dict(b)
+    a_sb["slen_band"], b_sb["slen_band"] = 192, 448
+    out = collate_packed_embeds([a_sb, b_sb], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+    assert np.asarray(out["input_ids"]).shape[1] == seq_len
+
+
+@pytest.mark.slow
+def test_collate_packed_embeds_equivalence():
+    """(b)+(d): a packed batch of N short examples gives the SAME per-example logits as running each
+    example unpacked. ``segment_ids`` (-> block-diagonal ``mask_info``) isolates the documents
+    (cross-example attention masked) and the per-segment-reset ``position_ids`` reproduce each
+    example's own positions, so packed per-segment logits match the unpacked references within tol."""
+    import jax.numpy as jnp
+
+    from ejkernel.types import MaskInfo
+
+    docs = [[5, 9, 2, 7, 1], [3, 8, 4], [6, 2, 9, 5]]
+    rows = [_text_row(d) for d in docs]
+    seq_len = sum(len(d) for d in docs)  # exact fit -> one fully-packed window, no padding
+    model = _build_tiny_text_model(seq_len)
+
+    # unpacked references: each document run on its own.
+    refs = [
+        np.asarray(model(input_ids=jnp.asarray([d], dtype=jnp.int32), apply_lm_head=True).logits.astype(jnp.float32))[0]
+        for d in docs
+    ]
+
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0)
+    assert np.asarray(out["input_ids"]).shape == (1, seq_len), "the docs should fully pack into one window"
+    seg = np.asarray(out["segment_ids"])
+    pos = np.asarray(out["position_ids"])  # (3, 1, seq_len); text -> all 3 axes equal, feed the 1D row
+    mask_info = MaskInfo.from_segments(q_segment_ids=jnp.asarray(seg, dtype=jnp.int32))
+
+    packed = model(
+        input_ids=out["input_ids"],
+        mask_info=mask_info,
+        position_ids=jnp.asarray(pos[0]),
+        apply_lm_head=True,
+    )
+    lp = np.asarray(packed.logits.astype(jnp.float32))[0]
+
+    for k, d in enumerate(docs):
+        cols = np.where(seg[0] == k)[0]
+        assert cols.shape[0] == len(d)
+        max_abs = float(np.max(np.abs(lp[cols] - refs[k])))
+        assert max_abs < 1e-3, f"packed segment {k} logits diverge from the unpacked run, max|Δ|={max_abs:.2e}"
 
 
 if __name__ == "__main__":
