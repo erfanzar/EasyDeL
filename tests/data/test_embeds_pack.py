@@ -1185,7 +1185,7 @@ def test_collate_packed_embeds_contract():
     total_real = sum(sum(r["embed_n_tok"]) for r in rows)  # 0 + 2 + 3 = 5
     cap = total_real + 4  # exercise the zero-padded embed tail
 
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
     ids = np.asarray(out["input_ids"])
     emb = np.asarray(out["image_embeds"])
     seg = np.asarray(out["segment_ids"])
@@ -1238,19 +1238,68 @@ def test_collate_packed_embeds_contract():
 
 
 def test_collate_packed_embeds_greedy_window_count():
-    """FCFS greedy fill: rows that overflow the current window start the next one, yielding a
-    ``(num_windows, seq_len)`` batch with per-window ``segment_ids`` restarting at 0."""
+    """FCFS greedy fill: rows that overflow the current window start the next one. With the leading
+    dim pinned to ``n_windows`` the batch is ALWAYS ``(n_windows, seq_len)``; per-window
+    ``segment_ids`` restart at 0. A row-list that packs into more than ``n_windows`` windows RAISES."""
     rows = [_packable_row(text_len=8, imgs=[]) for _ in range(3)]  # each row is length 8
-    seq_len = 20  # two rows (16) fit; the third (24) spills into a second window
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0)
+    seq_len = 20  # two rows (16) fit; the third (24) spills into a second window -> M=2
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=2)
     ids = np.asarray(out["input_ids"])
     seg = np.asarray(out["segment_ids"])
 
-    assert ids.shape == (2, seq_len), "greedy packing should produce exactly two windows here"
+    assert ids.shape == (2, seq_len), "leading dim must equal n_windows (=2) here"
     assert np.array_equal(seg[0, :16], np.asarray([0] * 8 + [1] * 8, dtype=np.int32))
     assert np.all(seg[0, 16:] == -1)
     assert np.array_equal(seg[1, :8], np.asarray([0] * 8, dtype=np.int32)), "second window must restart segment ids at 0"
     assert np.all(seg[1, 8:] == -1)
+
+    # M (=2) > n_windows (=1) -> raise, never silently drop the spilled rows.
+    with pytest.raises(AssertionError, match="window overflow"):
+        collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
+
+
+def test_collate_packed_embeds_underfill():
+    """Static leading dim: when greedy packing yields fewer windows than ``n_windows`` the batch is
+    STILL ``(n_windows, seq_len)`` and the trailing ``n_windows - M`` windows are emitted whole-padded
+    -- attention 0, ``segment_ids`` -1, ``labels`` -100, no image placeholders -- so they contribute
+    zero loss and zero attention. The real window's content is unchanged by the padding rows."""
+    rows = [_packable_row(text_len=6, imgs=[2]), _packable_row(text_len=4, imgs=[3])]
+    filled = sum(len(r["input_ids"]) for r in rows)
+    seq_len = filled + 5  # both rows fit one window -> M=1
+    total_real = sum(sum(r["embed_n_tok"]) for r in rows)
+    n_windows = 3  # ask for 3 -> windows 1 and 2 are all-pad
+
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=n_windows)
+    ids = np.asarray(out["input_ids"])
+    seg = np.asarray(out["segment_ids"])
+    attn = np.asarray(out["attention_mask"])
+    labels = np.asarray(out["labels"])
+
+    # leading dim == n_windows regardless of the (smaller) real window count.
+    assert ids.shape == (n_windows, seq_len) and seg.shape == (n_windows, seq_len)
+    assert np.asarray(out["position_ids"]).shape == (3, n_windows, seq_len)
+    # placeholder<->embed parity counts only the real window (trailing pad windows carry none).
+    assert int((ids == IMAGE_PLACEHOLDER_ID).sum()) == total_real == out["n_real_embeds"]
+
+    # window 0 is the real packed window; windows 1..2 are fully inert.
+    assert np.any(attn[0] == 1), "the real window must have live tokens"
+    for w in range(1, n_windows):
+        assert np.all(attn[w] == 0), f"pad window {w} must be fully attention-masked"
+        assert np.all(seg[w] == -1), f"pad window {w} segment_ids must all be -1"
+        assert np.all(labels[w] == -100), f"pad window {w} labels must all be ignore (-100)"
+        assert np.all(ids[w] == 0), f"pad window {w} must be pure pad_id"
+        assert not (ids[w] == IMAGE_PLACEHOLDER_ID).any(), f"pad window {w} must carry no placeholders"
+
+    # Equivalence on the real segments under underfill: the real window (row 0) is BYTE-IDENTICAL to
+    # the same rows collated with n_windows == M. Combined with batch-row independence in the forward,
+    # the trailing pad windows cannot change the real window's logits -- so the model-level equivalence
+    # proven in test_collate_packed_embeds_equivalence carries over unchanged. (Asserting it this way
+    # avoids running the forward on an all-masked pad row, whose softmax behaviour is out of scope.)
+    base = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=1)
+    for key in ("input_ids", "attention_mask", "labels", "segment_ids"):
+        assert np.array_equal(np.asarray(out[key])[0], np.asarray(base[key])[0]), f"real window {key} changed under underfill"
+    assert np.array_equal(np.asarray(out["position_ids"])[:, 0], np.asarray(base["position_ids"])[:, 0]), "real window positions changed under underfill"
+    assert np.array_equal(np.asarray(out["image_embeds"]), np.asarray(base["image_embeds"])), "embed side-channel changed under underfill"
 
 
 def test_collate_packed_embeds_guards():
@@ -1261,27 +1310,27 @@ def test_collate_packed_embeds_guards():
     seq_len, cap = 64, 8
 
     with pytest.raises(AssertionError, match="collide"):
-        collate_packed_embeds([a], pad_id=IMAGE_PLACEHOLDER_ID, seq_len=seq_len, max_embed_rows=cap)
+        collate_packed_embeds([a], pad_id=IMAGE_PLACEHOLDER_ID, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
 
     big = _packable_row(text_len=seq_len + 1, imgs=[])  # single row longer than the window
     with pytest.raises(AssertionError, match="overflow guard"):
-        collate_packed_embeds([big], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+        collate_packed_embeds([big], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
 
     a_src, b_src = dict(a), dict(b)
     a_src["source"], b_src["source"] = "src_a", "src_b"
     with pytest.raises(AssertionError, match=r"heterogeneous batch.*source"):
-        collate_packed_embeds([a_src, b_src], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+        collate_packed_embeds([a_src, b_src], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
 
     a_ab, b_ab = dict(a), dict(b)
     a_ab["area_bucket"], b_ab["area_bucket"] = 1024, 1536
     with pytest.raises(AssertionError, match=r"heterogeneous batch.*area_bucket"):
-        collate_packed_embeds([a_ab, b_ab], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
+        collate_packed_embeds([a_ab, b_ab], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
 
     # mixed slen_band is allowed: packing deliberately concatenates examples of different lengths.
     a_sb, b_sb = dict(a), dict(b)
     a_sb["slen_band"], b_sb["slen_band"] = 192, 448
-    out = collate_packed_embeds([a_sb, b_sb], pad_id=0, seq_len=seq_len, max_embed_rows=cap)
-    assert np.asarray(out["input_ids"]).shape[1] == seq_len
+    out = collate_packed_embeds([a_sb, b_sb], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+    assert np.asarray(out["input_ids"]).shape == (2, seq_len), "leading dim must equal n_windows"
 
 
 @pytest.mark.slow
@@ -1289,7 +1338,15 @@ def test_collate_packed_embeds_equivalence():
     """(b)+(d): a packed batch of N short examples gives the SAME per-example logits as running each
     example unpacked. ``segment_ids`` (-> block-diagonal ``mask_info``) isolates the documents
     (cross-example attention masked) and the per-segment-reset ``position_ids`` reproduce each
-    example's own positions, so packed per-segment logits match the unpacked references within tol."""
+    example's own positions, so packed per-segment logits match the unpacked references within tol.
+
+    This is the collator-side equivalence check. The MODEL side -- that ``MaskInfo.from_segments``
+    truly yields block-diagonal full attention AND resets the GDR linear-attention recurrence, forward
+    and backward, across full/hybrid/linear-only layer mixes -- is proven in
+    tests/modules/test_qwen3_5_packing.py; we cite it rather than re-prove it here. Underfill
+    (M < n_windows) equivalence on the real window is covered structurally in
+    ``test_collate_packed_embeds_underfill`` (trailing pad windows are byte-inert and, by batch-row
+    independence, cannot perturb the real window's logits)."""
     import jax.numpy as jnp
 
     from ejkernel.types import MaskInfo
@@ -1305,7 +1362,7 @@ def test_collate_packed_embeds_equivalence():
         for d in docs
     ]
 
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0)
+    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
     assert np.asarray(out["input_ids"]).shape == (1, seq_len), "the docs should fully pack into one window"
     seg = np.asarray(out["segment_ids"])
     pos = np.asarray(out["position_ids"])  # (3, 1, seq_len); text -> all 3 axes equal, feed the 1D row
