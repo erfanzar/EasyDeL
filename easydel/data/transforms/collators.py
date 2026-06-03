@@ -31,16 +31,22 @@ Three collators:
   * :func:`collate_bucket_static` - pads every batch to a caller-fixed ``seq_len`` and
     ``max_embed_rows`` so one bucket compiles once (no per-batch recompiles). Use for
     training throughput.
-  * :func:`collate_packed_embeds` - TRAINING-STATIC packing: greedily concatenates several examples
-    into each fixed ``seq_len`` window and emits EXACTLY ``n_windows`` windows -> a constant
-    ``(n_windows, seq_len)`` shape that compiles once (the packed sibling of
+  * :func:`collate_packed_embeds` - TRAINING-STATIC packed MATERIALIZER: turns one batch's
+    per-window row assignments (``list[list[dict]]``, produced by
+    :class:`~easydel.data.transforms.packer.EmbedsWindowPacker`) into a constant
+    ``(n_windows, seq_len)`` batch that compiles once (the packed sibling of
     ``collate_bucket_static``; kills the per-example padding it leaves). Carries ``segment_ids`` +
     per-segment-reset 3D M-RoPE ``position_ids`` so packed documents stay isolated (block-diagonal
     attention + GDR recurrence reset, both folded off ``segment_ids`` by the trainer's
-    ``compute_loss``). Highest MFU when examples are short relative to the bucket.
-    All three are single-``list[dict]`` callables once their hyper-params are bound
-    (``functools.partial``), matching the ``collate_fn`` hook on ``AsyncDataLoader`` /
-    ``batch_iterator``.
+    ``compute_loss``). Highest MFU when examples are short relative to the bucket. Packing
+    (which rows share a window) is the packer's job; this function is the pure deterministic shape
+    layer -- the two-layer split keeps placement policy and M-RoPE/embed-scatter independent.
+
+The first two are single-``list[dict]`` callables once their hyper-params are bound
+(``functools.partial``), matching the ``collate_fn`` hook on ``AsyncDataLoader`` /
+``batch_iterator``. The packed path is driven instead by an ``EmbedsWindowPacker`` (stateful,
+carries rows across batches) whose ``emit()`` / ``flush()`` output is handed to
+:func:`collate_packed_embeds`.
 
 WIRING (no new abstraction needed)
 ----------------------------------
@@ -238,31 +244,30 @@ def collate_bucket_static(rows: list[dict], pad_id: int, seq_len: int, max_embed
 
 
 def collate_packed_embeds(
-    rows: list[dict],
+    packs: list[list[dict]],
     pad_id: int,
     seq_len: int,
     max_embed_rows: int,
     n_windows: int,
     spatial_merge_size: int = SPATIAL_MERGE_SIZE,
 ) -> dict:
-    """Packed TRAINING-STATIC collator: greedily concatenate several examples into each fixed
-    ``seq_len`` window (FCFS; a row that will not fit starts the next window) and emit EXACTLY
-    ``n_windows`` windows, so the output shape is a constant ``(n_windows, seq_len)`` on EVERY call.
-    This removes the per-example padding ``collate_bucket_static`` leaves (it pads EVERY short
-    example out to the full bucket ceiling) -- denser windows -> less wasted compute -> higher MFU --
-    while keeping the whole leading dim static so the pod compiles the step once instead of
-    recompiling per data-dependent window count (the reason this is the ``collate_bucket_static``
-    sibling, not the ``collate_embeds_pack`` one).
+    """Packed TRAINING-STATIC MATERIALIZER: turn one batch's per-window row assignments into a
+    constant ``(n_windows, seq_len)`` batch on EVERY call (so the pod compiles the step once).
+    ``packs`` is ``list[list[dict]]`` -- the ``M`` (<= ``n_windows``) non-empty windows produced by
+    one :meth:`~easydel.data.transforms.packer.EmbedsWindowPacker.emit` / ``flush`` step; window
+    ``wi`` holds ``packs[wi]`` concatenated in order. PLACEMENT (which rows share a window) is the
+    packer's job -- this is the pure deterministic shape layer. Versus ``collate_bucket_static`` this
+    kills the per-example padding (it pads EVERY short example out to the bucket ceiling): denser
+    windows -> less wasted compute -> higher MFU.
 
-    Window-count contract (caller owns batch sizing, exactly as it owns ``seq_len`` /
-    ``max_embed_rows``):
-      * greedy packing yields ``M`` real windows;
+    Window-count contract (the packer owns row sizing; this layer pins the static shape):
+      * ``M`` real windows are filled from ``packs``;
       * ``M < n_windows`` -> the trailing ``n_windows - M`` windows are emitted WHOLE-padded
         (``attention_mask`` 0, ``segment_ids`` -1, ``labels`` -100, no image placeholders) so they
-        contribute zero loss and zero attention -- a fully inert pad batch row;
-      * ``M > n_windows`` -> RAISE (the row-list packs into more windows than ``n_windows``), mirroring
-        the single-row ``> seq_len`` guard below. Rows are NEVER silently dropped; the caller sizes
-        the row-list to fit ``n_windows``.
+        contribute zero loss and zero attention -- a fully inert pad batch row (proven backward-finite);
+      * ``M > n_windows`` -> raise. The packer never produces this (it opens exactly ``n_windows``
+        bins per emit and carries overflow to the next batch, never dropping rows); the assert is a
+        defensive shape contract against a hand-built ``packs``.
 
     Document isolation inside a window is carried by ``segment_ids`` -- a per-token example index
     that RESTARTS at 0 in each window. The trainer's ``compute_loss`` folds it into the universal
@@ -283,13 +288,9 @@ def collate_packed_embeds(
     ``image_grid_thw`` concatenated likewise. ASSERTS #image-placeholder tokens == #decoded embed
     rows so the scatter target stays aligned.
 
-    Overflow guards (mirror :func:`collate_bucket_static`): a single row longer than ``seq_len``, or a
-    row-list that greedily packs into more than ``n_windows`` windows, raises rather than silently
-    truncating placeholders or dropping rows.
-
-    Packing is done here per-batch over the ``list[dict]`` contract of the sibling collators; the
-    eventual home for cross-batch/global packing is the token-aligned ``PackStage`` (it lacks the
-    ``image_embeds`` / ``image_grid_thw`` / ``embed_n_tok`` side-channel today, so it is not wired in).
+    The per-row admission guards (``len(input_ids) <= seq_len`` and ``embed_rows <= max_embed_rows``)
+    live on the packer (:meth:`EmbedsWindowPacker.push`); the defensive per-window capacity assert
+    below catches a hand-built ``packs`` whose rows overflow ``seq_len``.
     """
     import jax.numpy as jnp
 
@@ -301,38 +302,21 @@ def collate_packed_embeds(
     # docstring). Keep source/area_bucket: decoded embeds + the scatter assume one teacher/resolution
     # regime. Do NOT check slen_band: packing DELIBERATELY mixes sub-band lengths into one window, so
     # the ``collate_bucket_static`` ``slen_band == seq_len`` equality does not apply here.
+    flat_rows = [r for pack in packs for r in pack]
     for key in ("source", "area_bucket"):
-        vals = {r[key] for r in rows if key in r}
+        vals = {r[key] for r in flat_rows if key in r}
         assert len(vals) <= 1, (
             f"heterogeneous batch: packing requires one source x area_bucket partition per batch, "
             f"got mixed {key} {sorted(vals)} -- configure one loader per source/area_bucket dir"
         )
 
-    # Greedy FCFS packing into fixed seq_len windows. A row that would overflow the current window
-    # flushes it and starts the next; a single row longer than the window is unpackable -> raise.
-    packs: list[list[dict]] = []
-    current: list[dict] = []
-    current_len = 0
-    for r in rows:
-        length = len(r["input_ids"])
-        assert length <= seq_len, (
-            f"overflow guard: row seq_len {length} exceeds packed window {seq_len} -- "
-            "raise the window, route to a larger bucket, or truncate TEXT before collation"
-        )
-        if current and current_len + length > seq_len:
-            packs.append(current)
-            current, current_len = [], 0
-        current.append(r)
-        current_len += length
-    if current:
-        packs.append(current)
-
-    # Static leading-dim guard: greedy packing must fit in the caller-pinned n_windows. Raising (not
-    # dropping rows or growing the batch) keeps (n_windows, seq_len) constant so the step compiles
-    # once; the caller sizes the row-list, same ownership contract as seq_len / max_embed_rows.
+    # Static leading-dim contract: at most n_windows real windows so (n_windows, seq_len) is constant
+    # and the step compiles once. The packer guarantees this (opens exactly n_windows bins per emit,
+    # carries overflow forward); the assert defends against a bad hand-built packs. Rows are never
+    # dropped -- overflow rows are carried to the next batch by the packer.
     assert len(packs) <= n_windows, (
-        f"window overflow: {len(rows)} rows greedily pack into {len(packs)} windows but "
-        f"n_windows={n_windows} -- raise n_windows or hand in fewer rows (rows are never dropped)"
+        f"window overflow: {len(packs)} windows handed in but n_windows={n_windows} -- the packer "
+        "opens exactly n_windows bins per emit and carries overflow forward (it never drops rows)"
     )
 
     # Allocate the FULL static (n_windows, seq_len). Windows M..n_windows-1 are left at these init
@@ -350,6 +334,10 @@ def collate_packed_embeds(
         for seg_idx, r in enumerate(pack):
             ids = np.asarray(r["input_ids"], dtype=np.int32)
             length = ids.shape[0]
+            assert offset + length <= seq_len, (
+                f"window capacity exceeded: window {wi} fills to {offset + length} tokens > seq_len "
+                f"{seq_len} -- the packer must never overfill a bin (hand-built packs?)"
+            )
             window_slice = slice(offset, offset + length)
             input_ids[wi, window_slice] = ids
             attention_mask[wi, window_slice] = np.asarray(r["attention_mask"], dtype=np.int32)

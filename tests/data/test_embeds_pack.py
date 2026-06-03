@@ -66,6 +66,7 @@ from easydel.data.transforms.collators import (  # noqa: E402
     collate_embeds_pack,
     collate_packed_embeds,
 )
+from easydel.data.transforms.packer import EmbedsWindowPacker  # noqa: E402
 
 # Vision span special-token ids; IMAGE_PLACEHOLDER_ID + HIDDEN are imported from the collators module above.
 VISION_START_ID = 248053
@@ -1173,10 +1174,86 @@ def _text_row(tokens: list[int]) -> dict:
     }
 
 
+def test_packed_packer_best_fit_placement():
+    """Best-fit drops a row into the TIGHTEST bin that still fits (vs first-fit's lowest-index bin).
+    With three bins (cap 10) and rows of length 5, 7, 3: the len-5 row opens bin 0, the len-7 opens
+    bin 1, and the len-3 lands in bin 1 (remaining 3) rather than bin 0 (remaining 5) -- the choice
+    that distinguishes best-fit from first-fit. The empty third bin is not returned."""
+    packer = EmbedsWindowPacker(n_windows=3, seq_len=10, max_embed_rows=0)
+    packer.push([_text_row([5] * 5), _text_row([5] * 7), _text_row([5] * 3)])
+    packs = packer.emit()
+    assert [[len(r["input_ids"]) for r in w] for w in packs] == [[5], [7, 3]], "not best-fit placement"
+    assert len(packer) == 0, "all rows fit this emit -> empty carry"
+
+
+def test_packed_packer_carry_across_emits():
+    """A row that fits no bin in the current emit is CARRIED to the next emit, never dropped. One
+    window of cap 10 with three length-8 rows places exactly one row per emit (8+8 > 10), so the carry
+    drains 3 -> 2 -> 1 -> 0 across three emits."""
+    packer = EmbedsWindowPacker(n_windows=1, seq_len=10, max_embed_rows=0)
+    packer.push([_text_row([5] * 8) for _ in range(3)])
+    trace = []
+    for _ in range(3):
+        packs = packer.emit()
+        trace.append((sum(len(w) for w in packs), len(packer)))
+    assert trace == [(1, 2), (1, 1), (1, 0)], "carry did not shrink one row per emit"
+
+
+def test_packed_packer_never_overflow():
+    """Stress: 40 seeded random-length rows through one emit + flush. Invariants: no batch exceeds
+    ``n_windows`` windows, no window's token-sum exceeds ``seq_len``, and every pushed row comes back
+    out exactly once (rows are never split and never dropped)."""
+    import random
+
+    rng = random.Random(0)
+    n_windows, seq_len = 4, 16
+    rows = [_text_row([5] * rng.randint(1, seq_len)) for _ in range(40)]
+    packer = EmbedsWindowPacker(n_windows=n_windows, seq_len=seq_len, max_embed_rows=10_000)
+    packer.push(rows)
+    batches = [packer.emit()]
+    batches.extend(packer.flush())
+    seen = 0
+    for packs in batches:
+        assert len(packs) <= n_windows, "emit produced more than n_windows windows"
+        for w in packs:
+            assert sum(len(r["input_ids"]) for r in w) <= seq_len, "window token-sum overflowed seq_len"
+            seen += len(w)
+    assert seen == 40, "rows were dropped or duplicated"
+    assert len(packer) == 0, "flush left rows in the carry"
+
+
+def test_packed_packer_oversized_row_raises():
+    """``push`` rejects rows that can NEVER be placed -- they would starve in the carry forever -- and
+    fails loud with the offending magnitude: a row longer than ``seq_len`` and a row with more embed
+    rows than ``max_embed_rows``."""
+    packer = EmbedsWindowPacker(n_windows=2, seq_len=8, max_embed_rows=3)
+    with pytest.raises(ValueError, match="exceeds seq_len"):
+        packer.push([_text_row([5] * 9)])  # 9 tokens > seq_len 8
+    with pytest.raises(ValueError, match="exceed max_embed_rows"):
+        packer.push([_packable_row(text_len=1, imgs=[4])])  # 4 embed rows > max_embed_rows 3 (6 tokens fit)
+    assert len(packer) == 0, "a rejected row must not enter the carry"
+
+
+def test_packed_packer_flush_drains_carry():
+    """``flush`` drains the WHOLE carry across as many batches as needed. Five length-7 rows with two
+    windows of cap 10 (only one row fits a window, 7+7 > 10) come out across three batches with the
+    carry fully emptied and every row accounted for."""
+    packer = EmbedsWindowPacker(n_windows=2, seq_len=10, max_embed_rows=0)
+    packer.push([_text_row([5] * 7) for _ in range(5)])
+    batches = list(packer.flush())
+    assert len(packer) == 0, "flush did not empty the carry"
+    seen = 0
+    for packs in batches:
+        for w in packs:
+            assert len(w) == 1, "each window holds a single length-7 row (7+7 > 10)"
+            seen += 1
+    assert seen == 5, "flush lost or duplicated rows"
+
+
 def test_collate_packed_embeds_contract():
-    """Greedy packing into a fixed ``seq_len`` window: static shapes, example-order embed concat,
-    placeholder<->embed parity, contiguous per-window ``segment_ids`` (pad tail = -1), masked tail,
-    and per-segment-reset 3D M-RoPE positions (each segment == its standalone-example layout)."""
+    """Materializing one window's worth of rows (``packs=[rows]``): static shapes, example-order embed
+    concat, placeholder<->embed parity, contiguous per-window ``segment_ids`` (pad tail = -1), masked
+    tail, and per-segment-reset 3D M-RoPE positions (each segment == its standalone-example layout)."""
     from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
 
     rows = [_packable_row(text_len=6, imgs=[]), _packable_row(text_len=3, imgs=[2]), _packable_row(text_len=4, imgs=[3])]
@@ -1185,7 +1262,7 @@ def test_collate_packed_embeds_contract():
     total_real = sum(sum(r["embed_n_tok"]) for r in rows)  # 0 + 2 + 3 = 5
     cap = total_real + 4  # exercise the zero-padded embed tail
 
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
     ids = np.asarray(out["input_ids"])
     emb = np.asarray(out["image_embeds"])
     seg = np.asarray(out["segment_ids"])
@@ -1237,13 +1314,15 @@ def test_collate_packed_embeds_contract():
         offset += length
 
 
-def test_collate_packed_embeds_greedy_window_count():
-    """FCFS greedy fill: rows that overflow the current window start the next one. With the leading
-    dim pinned to ``n_windows`` the batch is ALWAYS ``(n_windows, seq_len)``; per-window
-    ``segment_ids`` restart at 0. A row-list that packs into more than ``n_windows`` windows RAISES."""
-    rows = [_packable_row(text_len=8, imgs=[]) for _ in range(3)]  # each row is length 8
-    seq_len = 20  # two rows (16) fit; the third (24) spills into a second window -> M=2
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=2)
+def test_collate_packed_embeds_multiwindow():
+    """Explicit multi-window ``packs``: the materializer fills window ``wi`` from ``packs[wi]`` with
+    per-window ``segment_ids`` restarting at 0 and a -1 pad tail, and RAISES if more windows are
+    handed in than ``n_windows`` (the packer carries overflow forward, so it never produces this --
+    the assert is a defensive shape contract against a hand-built ``packs``)."""
+    rows = [_packable_row(text_len=8, imgs=[]) for _ in range(3)]  # each row is length 8 (pure [5]*8)
+    seq_len = 20
+    packs = [[rows[0], rows[1]], [rows[2]]]  # window 0 holds two rows (16 <= 20); window 1 holds one
+    out = collate_packed_embeds(packs, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=2)
     ids = np.asarray(out["input_ids"])
     seg = np.asarray(out["segment_ids"])
 
@@ -1253,9 +1332,9 @@ def test_collate_packed_embeds_greedy_window_count():
     assert np.array_equal(seg[1, :8], np.asarray([0] * 8, dtype=np.int32)), "second window must restart segment ids at 0"
     assert np.all(seg[1, 8:] == -1)
 
-    # M (=2) > n_windows (=1) -> raise, never silently drop the spilled rows.
+    # more windows handed in than n_windows -> raise, never silently drop the overflow.
     with pytest.raises(AssertionError, match="window overflow"):
-        collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
+        collate_packed_embeds(packs, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
 
 
 def test_collate_packed_embeds_underfill():
@@ -1269,7 +1348,7 @@ def test_collate_packed_embeds_underfill():
     total_real = sum(sum(r["embed_n_tok"]) for r in rows)
     n_windows = 3  # ask for 3 -> windows 1 and 2 are all-pad
 
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=n_windows)
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=n_windows)
     ids = np.asarray(out["input_ids"])
     seg = np.asarray(out["segment_ids"])
     attn = np.asarray(out["attention_mask"])
@@ -1295,7 +1374,7 @@ def test_collate_packed_embeds_underfill():
     # the trailing pad windows cannot change the real window's logits -- so the model-level equivalence
     # proven in test_collate_packed_embeds_equivalence carries over unchanged. (Asserting it this way
     # avoids running the forward on an all-masked pad row, whose softmax behaviour is out of scope.)
-    base = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=1)
+    base = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=1)
     for key in ("input_ids", "attention_mask", "labels", "segment_ids"):
         assert np.array_equal(np.asarray(out[key])[0], np.asarray(base[key])[0]), f"real window {key} changed under underfill"
     assert np.array_equal(np.asarray(out["position_ids"])[:, 0], np.asarray(base["position_ids"])[:, 0]), "real window positions changed under underfill"
@@ -1303,33 +1382,36 @@ def test_collate_packed_embeds_underfill():
 
 
 def test_collate_packed_embeds_guards():
-    """Guard suite: pad/placeholder collision, single-row overflow, and source/area_bucket
-    homogeneity all RAISE; ``slen_band`` is DELIBERATELY not checked (packing mixes lengths by design)."""
+    """Materializer guard suite (input is ``packs`` -- ``list[list[dict]]``): pad/placeholder
+    collision, per-window capacity overflow, and source/area_bucket homogeneity all RAISE;
+    ``slen_band`` is DELIBERATELY not checked (packing mixes lengths by design). The PRIMARY
+    oversized-row guard is on the packer (``EmbedsWindowPacker.push``); the capacity assert here is the
+    defensive backstop against a hand-built ``packs`` that overfills a window."""
     a = _packable_row(text_len=4, imgs=[2])
     b = _packable_row(text_len=3, imgs=[2])
     seq_len, cap = 64, 8
 
     with pytest.raises(AssertionError, match="collide"):
-        collate_packed_embeds([a], pad_id=IMAGE_PLACEHOLDER_ID, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
+        collate_packed_embeds([[a]], pad_id=IMAGE_PLACEHOLDER_ID, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
 
     big = _packable_row(text_len=seq_len + 1, imgs=[])  # single row longer than the window
-    with pytest.raises(AssertionError, match="overflow guard"):
-        collate_packed_embeds([big], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
+    with pytest.raises(AssertionError, match="window capacity exceeded"):
+        collate_packed_embeds([[big]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
 
     a_src, b_src = dict(a), dict(b)
     a_src["source"], b_src["source"] = "src_a", "src_b"
     with pytest.raises(AssertionError, match=r"heterogeneous batch.*source"):
-        collate_packed_embeds([a_src, b_src], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+        collate_packed_embeds([[a_src], [b_src]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
 
     a_ab, b_ab = dict(a), dict(b)
     a_ab["area_bucket"], b_ab["area_bucket"] = 1024, 1536
     with pytest.raises(AssertionError, match=r"heterogeneous batch.*area_bucket"):
-        collate_packed_embeds([a_ab, b_ab], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+        collate_packed_embeds([[a_ab], [b_ab]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
 
     # mixed slen_band is allowed: packing deliberately concatenates examples of different lengths.
     a_sb, b_sb = dict(a), dict(b)
     a_sb["slen_band"], b_sb["slen_band"] = 192, 448
-    out = collate_packed_embeds([a_sb, b_sb], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+    out = collate_packed_embeds([[a_sb], [b_sb]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
     assert np.asarray(out["input_ids"]).shape == (2, seq_len), "leading dim must equal n_windows"
 
 
@@ -1362,7 +1444,7 @@ def test_collate_packed_embeds_equivalence():
         for d in docs
     ]
 
-    out = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
     assert np.asarray(out["input_ids"]).shape == (1, seq_len), "the docs should fully pack into one window"
     seg = np.asarray(out["segment_ids"])
     pos = np.asarray(out["position_ids"])  # (3, 1, seq_len); text -> all 3 axes equal, feed the 1D row
@@ -1399,7 +1481,7 @@ def test_collate_packed_embeds_underfill_backward_finite():
     rows = [_text_row([5, 9, 2, 7, 1]), _text_row([3, 8, 4])]
     seq_len = sum(len(r["input_ids"]) for r in rows)  # 8 -> both rows pack into ONE window (M=1)
     n_windows = 2  # ask for 2 -> exactly one trailing all-pad window
-    batch = collate_packed_embeds(rows, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=n_windows)
+    batch = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=n_windows)
     attn = np.asarray(batch["attention_mask"])
     assert attn.shape == (n_windows, seq_len) and np.all(attn[1] == 0), "need a fully-masked pad window"
 
