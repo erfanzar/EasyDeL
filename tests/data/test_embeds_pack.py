@@ -64,7 +64,9 @@ from easydel.data.transforms.collators import (  # noqa: E402
     _decode_row_embeds,
     collate_bucket_static,
     collate_embeds_pack,
+    collate_packed_embeds,
 )
+from easydel.data.transforms.packer import EmbedsWindowPacker  # noqa: E402
 
 # Vision span special-token ids; IMAGE_PLACEHOLDER_ID + HIDDEN are imported from the collators module above.
 VISION_START_ID = 248053
@@ -1115,6 +1117,399 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
     )
     assert logits.shape == (B, S, _RM_VOCAB)
     assert np.isfinite(logits).all(), "real-loader bucket batch did not flow through the jitted step to finite logits"
+
+
+# --- packed-sequence collator (collate_packed_embeds) -------------------------------------------
+def _packable_row(text_len: int, imgs: list[int], source: str = "pixmo-points", area_bucket: int = 1024,
+                  slen_band: int | None = None) -> dict:
+    """Synthetic pack row for the packing collator. ``imgs`` = per-image post-merge token counts; each
+    image is laid down as a contiguous placeholder run followed by a single text token so it forms its
+    own modality group, with ``image_grid_thw = (1, 2*nt, 2)`` which under spatial_merge_size=2 yields
+    exactly ``nt`` LLM image tokens (matching the placeholder run). Then ``text_len`` trailing text
+    tokens. embed blobs are deterministic bf16."""
+    import ml_dtypes
+
+    ent = list(imgs)
+    blobs: list[bytes] = []
+    grid: list[int] = []
+    ids: list[int] = []
+    for nt in ent:
+        arr = (np.arange(nt * HIDDEN, dtype=np.float32).reshape(nt, HIDDEN) % 7).astype(ml_dtypes.bfloat16)
+        blobs.append(arr.tobytes())
+        ids += [IMAGE_PLACEHOLDER_ID] * nt + [5]  # trailing text token splits consecutive images into groups
+        grid += [1, 2 * nt, 2]
+    ids += [5] * text_len
+    row = {
+        "embed_dim": HIDDEN,
+        "embed_n_tok": ent,
+        "image_embeds": blobs,
+        "n_images": len(ent),
+        "input_ids": ids,
+        "attention_mask": [1] * len(ids),
+        "labels": ids,
+        "image_grid_thw": grid,
+        "seq_len": len(ids),
+        "source": source,
+        "area_bucket": area_bucket,
+    }
+    if slen_band is not None:
+        row["slen_band"] = slen_band
+    return row
+
+
+def _text_row(tokens: list[int]) -> dict:
+    """All-text pack row (no images) from explicit token ids."""
+    return {
+        "embed_dim": HIDDEN,
+        "embed_n_tok": [],
+        "image_embeds": [],
+        "n_images": 0,
+        "input_ids": list(tokens),
+        "attention_mask": [1] * len(tokens),
+        "labels": list(tokens),
+        "image_grid_thw": [],
+        "seq_len": len(tokens),
+        "source": "pixmo-points",
+        "area_bucket": 1024,
+    }
+
+
+def test_packed_packer_best_fit_placement():
+    """Best-fit drops a row into the TIGHTEST bin that still fits (vs first-fit's lowest-index bin).
+    With three bins (cap 10) and rows of length 5, 7, 3: the len-5 row opens bin 0, the len-7 opens
+    bin 1, and the len-3 lands in bin 1 (remaining 3) rather than bin 0 (remaining 5) -- the choice
+    that distinguishes best-fit from first-fit. The empty third bin is not returned."""
+    packer = EmbedsWindowPacker(n_windows=3, seq_len=10, max_embed_rows=0)
+    packer.push([_text_row([5] * 5), _text_row([5] * 7), _text_row([5] * 3)])
+    packs = packer.emit()
+    assert [[len(r["input_ids"]) for r in w] for w in packs] == [[5], [7, 3]], "not best-fit placement"
+    assert len(packer) == 0, "all rows fit this emit -> empty carry"
+
+
+def test_packed_packer_carry_across_emits():
+    """A row that fits no bin in the current emit is CARRIED to the next emit, never dropped. One
+    window of cap 10 with three length-8 rows places exactly one row per emit (8+8 > 10), so the carry
+    drains 3 -> 2 -> 1 -> 0 across three emits."""
+    packer = EmbedsWindowPacker(n_windows=1, seq_len=10, max_embed_rows=0)
+    packer.push([_text_row([5] * 8) for _ in range(3)])
+    trace = []
+    for _ in range(3):
+        packs = packer.emit()
+        trace.append((sum(len(w) for w in packs), len(packer)))
+    assert trace == [(1, 2), (1, 1), (1, 0)], "carry did not shrink one row per emit"
+
+
+def test_packed_packer_never_overflow():
+    """Stress: 40 seeded random-length rows through one emit + flush. Invariants: no batch exceeds
+    ``n_windows`` windows, no window's token-sum exceeds ``seq_len``, and every pushed row comes back
+    out exactly once (rows are never split and never dropped)."""
+    import random
+
+    rng = random.Random(0)
+    n_windows, seq_len = 4, 16
+    rows = [_text_row([5] * rng.randint(1, seq_len)) for _ in range(40)]
+    packer = EmbedsWindowPacker(n_windows=n_windows, seq_len=seq_len, max_embed_rows=10_000)
+    packer.push(rows)
+    batches = [packer.emit()]
+    batches.extend(packer.flush())
+    seen = 0
+    for packs in batches:
+        assert len(packs) <= n_windows, "emit produced more than n_windows windows"
+        for w in packs:
+            assert sum(len(r["input_ids"]) for r in w) <= seq_len, "window token-sum overflowed seq_len"
+            seen += len(w)
+    assert seen == 40, "rows were dropped or duplicated"
+    assert len(packer) == 0, "flush left rows in the carry"
+
+
+def test_packed_packer_oversized_row_raises():
+    """``push`` rejects rows that can NEVER be placed -- they would starve in the carry forever -- and
+    fails loud with the offending magnitude: a row longer than ``seq_len`` and a row with more embed
+    rows than ``max_embed_rows``."""
+    packer = EmbedsWindowPacker(n_windows=2, seq_len=8, max_embed_rows=3)
+    with pytest.raises(ValueError, match="exceeds seq_len"):
+        packer.push([_text_row([5] * 9)])  # 9 tokens > seq_len 8
+    with pytest.raises(ValueError, match="exceed max_embed_rows"):
+        packer.push([_packable_row(text_len=1, imgs=[4])])  # 4 embed rows > max_embed_rows 3 (6 tokens fit)
+    assert len(packer) == 0, "a rejected row must not enter the carry"
+
+
+def test_packed_packer_flush_drains_carry():
+    """``flush`` drains the WHOLE carry across as many batches as needed. Five length-7 rows with two
+    windows of cap 10 (only one row fits a window, 7+7 > 10) come out across three batches with the
+    carry fully emptied and every row accounted for."""
+    packer = EmbedsWindowPacker(n_windows=2, seq_len=10, max_embed_rows=0)
+    packer.push([_text_row([5] * 7) for _ in range(5)])
+    batches = list(packer.flush())
+    assert len(packer) == 0, "flush did not empty the carry"
+    seen = 0
+    for packs in batches:
+        for w in packs:
+            assert len(w) == 1, "each window holds a single length-7 row (7+7 > 10)"
+            seen += 1
+    assert seen == 5, "flush lost or duplicated rows"
+
+
+def test_collate_packed_embeds_contract():
+    """Materializing one window's worth of rows (``packs=[rows]``): static shapes, example-order embed
+    concat, placeholder<->embed parity, contiguous per-window ``segment_ids`` (pad tail = -1), masked
+    tail, and per-segment-reset 3D M-RoPE positions (each segment == its standalone-example layout)."""
+    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+
+    rows = [_packable_row(text_len=6, imgs=[]), _packable_row(text_len=3, imgs=[2]), _packable_row(text_len=4, imgs=[3])]
+    filled = sum(len(r["input_ids"]) for r in rows)
+    seq_len = filled + 5  # all rows fit -> a single window with a padded tail
+    total_real = sum(sum(r["embed_n_tok"]) for r in rows)  # 0 + 2 + 3 = 5
+    cap = total_real + 4  # exercise the zero-padded embed tail
+
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
+    ids = np.asarray(out["input_ids"])
+    emb = np.asarray(out["image_embeds"])
+    seg = np.asarray(out["segment_ids"])
+    pos = np.asarray(out["position_ids"])
+    attn = np.asarray(out["attention_mask"])
+    labels = np.asarray(out["labels"])
+
+    assert ids.shape == (1, seq_len), "short rows should pack into one fixed-width window"
+    assert emb.shape == (cap, HIDDEN)
+    assert seg.shape == (1, seq_len)
+    assert pos.shape == (3, 1, seq_len), "positions must be 3D M-RoPE (3, windows, seq_len)"
+
+    # (a) placeholder <-> embed parity, embeds concatenated in EXAMPLE order, zero-padded tail.
+    assert int((ids == IMAGE_PLACEHOLDER_ID).sum()) == total_real == out["n_real_embeds"]
+    assert np.array_equal(emb[total_real:], np.zeros((cap - total_real, HIDDEN), np.float32))
+    cursor = 0
+    for r in rows:
+        dec = _decode_row_embeds(r)
+        assert np.array_equal(emb[cursor : cursor + dec.shape[0]], dec), "embeds not concatenated in example order"
+        cursor += dec.shape[0]
+    assert np.asarray(out["image_grid_thw"]).shape == (sum(int(r["n_images"]) for r in rows), 3)
+
+    # segment_ids: contiguous per-example index over the filled span, -1 over the padded tail.
+    expected_seg = [k for k, r in enumerate(rows) for _ in range(len(r["input_ids"]))] + [-1] * (seq_len - filled)
+    assert np.array_equal(seg[0], np.asarray(expected_seg, dtype=np.int32))
+    assert np.all(attn[0, :filled] == 1) and np.all(attn[0, filled:] == 0), "padded tail not attention-masked"
+    assert np.all(labels[0, filled:] == -100), "padded tail labels not -100"
+    assert not (ids[0, filled:] == IMAGE_PLACEHOLDER_ID).any(), "placeholder leaked into the padded tail"
+
+    # (c) per-segment-reset positions: each segment's columns equal the helper's output for that
+    # example ALONE (current_pos starts at 0) -> no cumulative drift, every segment resets to 0.
+    offset = 0
+    for k, r in enumerate(rows):
+        ids_e = np.asarray(r["input_ids"], dtype=np.int32)
+        length = ids_e.shape[0]
+        grid = np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3)
+        mm = (ids_e == IMAGE_PLACEHOLDER_ID).astype(np.int32).reshape(1, -1)
+        pos_e, _ = _get_rope_index_from_mm_token_types(
+            input_ids=ids_e.reshape(1, -1),
+            mm_token_type_ids=mm,
+            image_grid_thw=grid if grid.shape[0] else None,
+            attention_mask=None,
+            spatial_merge_size=2,
+        )
+        pos_e = np.asarray(pos_e)[:, 0, :]
+        seg_slice = slice(offset, offset + length)
+        assert np.array_equal(pos[:, 0, seg_slice], pos_e), f"segment {k}: positions are not the per-example reset layout"
+        assert int(pos[:, 0, seg_slice].min()) == 0, f"segment {k}: positions did not reset to 0"
+        offset += length
+
+
+def test_collate_packed_embeds_multiwindow():
+    """Explicit multi-window ``packs``: the materializer fills window ``wi`` from ``packs[wi]`` with
+    per-window ``segment_ids`` restarting at 0 and a -1 pad tail, and RAISES if more windows are
+    handed in than ``n_windows`` (the packer carries overflow forward, so it never produces this --
+    the assert is a defensive shape contract against a hand-built ``packs``)."""
+    rows = [_packable_row(text_len=8, imgs=[]) for _ in range(3)]  # each row is length 8 (pure [5]*8)
+    seq_len = 20
+    packs = [[rows[0], rows[1]], [rows[2]]]  # window 0 holds two rows (16 <= 20); window 1 holds one
+    out = collate_packed_embeds(packs, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=2)
+    ids = np.asarray(out["input_ids"])
+    seg = np.asarray(out["segment_ids"])
+
+    assert ids.shape == (2, seq_len), "leading dim must equal n_windows (=2) here"
+    assert np.array_equal(seg[0, :16], np.asarray([0] * 8 + [1] * 8, dtype=np.int32))
+    assert np.all(seg[0, 16:] == -1)
+    assert np.array_equal(seg[1, :8], np.asarray([0] * 8, dtype=np.int32)), "second window must restart segment ids at 0"
+    assert np.all(seg[1, 8:] == -1)
+
+    # more windows handed in than n_windows -> raise, never silently drop the overflow.
+    with pytest.raises(AssertionError, match="window overflow"):
+        collate_packed_embeds(packs, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
+
+
+def test_collate_packed_embeds_underfill():
+    """Static leading dim: when greedy packing yields fewer windows than ``n_windows`` the batch is
+    STILL ``(n_windows, seq_len)`` and the trailing ``n_windows - M`` windows are emitted whole-padded
+    -- attention 0, ``segment_ids`` -1, ``labels`` -100, no image placeholders -- so they contribute
+    zero loss and zero attention. The real window's content is unchanged by the padding rows."""
+    rows = [_packable_row(text_len=6, imgs=[2]), _packable_row(text_len=4, imgs=[3])]
+    filled = sum(len(r["input_ids"]) for r in rows)
+    seq_len = filled + 5  # both rows fit one window -> M=1
+    total_real = sum(sum(r["embed_n_tok"]) for r in rows)
+    n_windows = 3  # ask for 3 -> windows 1 and 2 are all-pad
+
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=n_windows)
+    ids = np.asarray(out["input_ids"])
+    seg = np.asarray(out["segment_ids"])
+    attn = np.asarray(out["attention_mask"])
+    labels = np.asarray(out["labels"])
+
+    # leading dim == n_windows regardless of the (smaller) real window count.
+    assert ids.shape == (n_windows, seq_len) and seg.shape == (n_windows, seq_len)
+    assert np.asarray(out["position_ids"]).shape == (3, n_windows, seq_len)
+    # placeholder<->embed parity counts only the real window (trailing pad windows carry none).
+    assert int((ids == IMAGE_PLACEHOLDER_ID).sum()) == total_real == out["n_real_embeds"]
+
+    # window 0 is the real packed window; windows 1..2 are fully inert.
+    assert np.any(attn[0] == 1), "the real window must have live tokens"
+    for w in range(1, n_windows):
+        assert np.all(attn[w] == 0), f"pad window {w} must be fully attention-masked"
+        assert np.all(seg[w] == -1), f"pad window {w} segment_ids must all be -1"
+        assert np.all(labels[w] == -100), f"pad window {w} labels must all be ignore (-100)"
+        assert np.all(ids[w] == 0), f"pad window {w} must be pure pad_id"
+        assert not (ids[w] == IMAGE_PLACEHOLDER_ID).any(), f"pad window {w} must carry no placeholders"
+
+    # Equivalence on the real segments under underfill: the real window (row 0) is BYTE-IDENTICAL to
+    # the same rows collated with n_windows == M. Combined with batch-row independence in the forward,
+    # the trailing pad windows cannot change the real window's logits -- so the model-level equivalence
+    # proven in test_collate_packed_embeds_equivalence carries over unchanged. (Asserting it this way
+    # avoids running the forward on an all-masked pad row, whose softmax behaviour is out of scope.)
+    base = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=1)
+    for key in ("input_ids", "attention_mask", "labels", "segment_ids"):
+        assert np.array_equal(np.asarray(out[key])[0], np.asarray(base[key])[0]), f"real window {key} changed under underfill"
+    assert np.array_equal(np.asarray(out["position_ids"])[:, 0], np.asarray(base["position_ids"])[:, 0]), "real window positions changed under underfill"
+    assert np.array_equal(np.asarray(out["image_embeds"]), np.asarray(base["image_embeds"])), "embed side-channel changed under underfill"
+
+
+def test_collate_packed_embeds_guards():
+    """Materializer guard suite (input is ``packs`` -- ``list[list[dict]]``): pad/placeholder
+    collision, per-window capacity overflow, and source/area_bucket homogeneity all RAISE;
+    ``slen_band`` is DELIBERATELY not checked (packing mixes lengths by design). The PRIMARY
+    oversized-row guard is on the packer (``EmbedsWindowPacker.push``); the capacity assert here is the
+    defensive backstop against a hand-built ``packs`` that overfills a window."""
+    a = _packable_row(text_len=4, imgs=[2])
+    b = _packable_row(text_len=3, imgs=[2])
+    seq_len, cap = 64, 8
+
+    with pytest.raises(AssertionError, match="collide"):
+        collate_packed_embeds([[a]], pad_id=IMAGE_PLACEHOLDER_ID, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
+
+    big = _packable_row(text_len=seq_len + 1, imgs=[])  # single row longer than the window
+    with pytest.raises(AssertionError, match="window capacity exceeded"):
+        collate_packed_embeds([[big]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=1)
+
+    a_src, b_src = dict(a), dict(b)
+    a_src["source"], b_src["source"] = "src_a", "src_b"
+    with pytest.raises(AssertionError, match=r"heterogeneous batch.*source"):
+        collate_packed_embeds([[a_src], [b_src]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+
+    a_ab, b_ab = dict(a), dict(b)
+    a_ab["area_bucket"], b_ab["area_bucket"] = 1024, 1536
+    with pytest.raises(AssertionError, match=r"heterogeneous batch.*area_bucket"):
+        collate_packed_embeds([[a_ab], [b_ab]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+
+    # mixed slen_band is allowed: packing deliberately concatenates examples of different lengths.
+    a_sb, b_sb = dict(a), dict(b)
+    a_sb["slen_band"], b_sb["slen_band"] = 192, 448
+    out = collate_packed_embeds([[a_sb], [b_sb]], pad_id=0, seq_len=seq_len, max_embed_rows=cap, n_windows=2)
+    assert np.asarray(out["input_ids"]).shape == (2, seq_len), "leading dim must equal n_windows"
+
+
+@pytest.mark.slow
+def test_collate_packed_embeds_equivalence():
+    """(b)+(d): a packed batch of N short examples gives the SAME per-example logits as running each
+    example unpacked. ``segment_ids`` (-> block-diagonal ``mask_info``) isolates the documents
+    (cross-example attention masked) and the per-segment-reset ``position_ids`` reproduce each
+    example's own positions, so packed per-segment logits match the unpacked references within tol.
+
+    This is the collator-side equivalence check. The MODEL side -- that ``MaskInfo.from_segments``
+    truly yields block-diagonal full attention AND resets the GDR linear-attention recurrence, forward
+    and backward, across full/hybrid/linear-only layer mixes -- is proven in
+    tests/modules/test_qwen3_5_packing.py; we cite it rather than re-prove it here. Underfill
+    (M < n_windows) equivalence on the real window is covered structurally in
+    ``test_collate_packed_embeds_underfill`` (trailing pad windows are byte-inert and, by batch-row
+    independence, cannot perturb the real window's logits)."""
+    import jax.numpy as jnp
+
+    from ejkernel.types import MaskInfo
+
+    docs = [[5, 9, 2, 7, 1], [3, 8, 4], [6, 2, 9, 5]]
+    rows = [_text_row(d) for d in docs]
+    seq_len = sum(len(d) for d in docs)  # exact fit -> one fully-packed window, no padding
+    model = _build_tiny_text_model(seq_len)
+
+    # unpacked references: each document run on its own.
+    refs = [
+        np.asarray(model(input_ids=jnp.asarray([d], dtype=jnp.int32), apply_lm_head=True).logits.astype(jnp.float32))[0]
+        for d in docs
+    ]
+
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
+    assert np.asarray(out["input_ids"]).shape == (1, seq_len), "the docs should fully pack into one window"
+    seg = np.asarray(out["segment_ids"])
+    pos = np.asarray(out["position_ids"])  # (3, 1, seq_len); text -> all 3 axes equal, feed the 1D row
+    mask_info = MaskInfo.from_segments(q_segment_ids=jnp.asarray(seg, dtype=jnp.int32))
+
+    packed = model(
+        input_ids=out["input_ids"],
+        mask_info=mask_info,
+        position_ids=jnp.asarray(pos[0]),
+        apply_lm_head=True,
+    )
+    lp = np.asarray(packed.logits.astype(jnp.float32))[0]
+
+    for k, d in enumerate(docs):
+        cols = np.where(seg[0] == k)[0]
+        assert cols.shape[0] == len(d)
+        max_abs = float(np.max(np.abs(lp[cols] - refs[k])))
+        assert max_abs < 1e-3, f"packed segment {k} logits diverge from the unpacked run, max|Δ|={max_abs:.2e}"
+
+
+@pytest.mark.slow
+def test_collate_packed_embeds_underfill_backward_finite():
+    """Training feeds ALL ``n_windows`` rows through forward+BACKWARD -- the inert all-pad windows
+    that underfill produces CANNOT be skipped (that is the entire point of the static leading dim).
+    An all-pad window (attention 0 -> ``segment_ids`` all -1) is the classic all-masked-softmax NaN
+    footgun: softmax over a fully-masked row -> 0/0 -> NaN in the FORWARD, and ``labels`` -100 does
+    NOT save the backward -- the NaN is upstream in the forward graph and backprops into NaN grads on
+    the SHARED params (a where-masked loss can't undo an already-NaN activation). Per the standing
+    "empirically backstop degenerate shapes" rule this is RUN, not argued: real trainer entry
+    (``compute_loss`` folds ``segment_ids`` -> ``mask_info``) on a batch with a trailing all-pad
+    window, asserting the scalar loss AND every param gradient are finite."""
+    import jax
+
+    rows = [_text_row([5, 9, 2, 7, 1]), _text_row([3, 8, 4])]
+    seq_len = sum(len(r["input_ids"]) for r in rows)  # 8 -> both rows pack into ONE window (M=1)
+    n_windows = 2  # ask for 2 -> exactly one trailing all-pad window
+    batch = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=n_windows)
+    attn = np.asarray(batch["attention_mask"])
+    assert attn.shape == (n_windows, seq_len) and np.all(attn[1] == 0), "need a fully-masked pad window"
+
+    model = _build_tiny_text_model(seq_len)
+    # Mirror the trainer's grad path (trainers/trainer/_fn.py): differentiate the scalar loss w.r.t.
+    # the trainable graphstate, re-binding the module each call via merge_module (== state.merge(tree)).
+    gdef, params, others = model.split_module()
+
+    def loss_fn(params):
+        m = model.merge_module(gdef, params, others)
+        loss_out, _ = m.compute_loss(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            segment_ids=batch["segment_ids"],
+            labels=batch["labels"],
+        )
+        return loss_out.loss
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    loss = float(loss)
+    leaves = jax.tree_util.tree_leaves(grads)
+    assert np.isfinite(loss), f"scalar loss non-finite ({loss}) with a trailing all-pad window present"
+    assert leaves, "expected differentiable param gradients"
+    bad = sum(1 for g in leaves if not bool(np.all(np.isfinite(np.asarray(g)))))
+    assert not bad, (
+        f"{bad}/{len(leaves)} param-grad tensors non-finite with a trailing all-pad window -- "
+        "all-masked-softmax NaN backprops into shared params; pad windows must self-attend"
+    )
 
 
 if __name__ == "__main__":

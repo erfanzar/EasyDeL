@@ -25,14 +25,28 @@ They were originally reference fixtures inside ``tests/data/test_embeds_pack.py`
 promoted here so a real training run can import them; the contract test now imports from this
 module, keeping a single source of truth.
 
-Two collators:
+Three collators:
   * :func:`collate_embeds_pack`   - pads to the per-batch-max length (variable shape -> a JIT
     recompile whenever the batch-max changes). Simple; fine for eval / dynamic shapes.
   * :func:`collate_bucket_static` - pads every batch to a caller-fixed ``seq_len`` and
     ``max_embed_rows`` so one bucket compiles once (no per-batch recompiles). Use for
-    training throughput. Both are single-``list[dict]`` callables once their hyper-params are
-    bound (``functools.partial``), matching the ``collate_fn`` hook on ``AsyncDataLoader`` /
-    ``batch_iterator``.
+    training throughput.
+  * :func:`collate_packed_embeds` - TRAINING-STATIC packed MATERIALIZER: turns one batch's
+    per-window row assignments (``list[list[dict]]``, produced by
+    :class:`~easydel.data.transforms.packer.EmbedsWindowPacker`) into a constant
+    ``(n_windows, seq_len)`` batch that compiles once (the packed sibling of
+    ``collate_bucket_static``; kills the per-example padding it leaves). Carries ``segment_ids`` +
+    per-segment-reset 3D M-RoPE ``position_ids`` so packed documents stay isolated (block-diagonal
+    attention + GDR recurrence reset, both folded off ``segment_ids`` by the trainer's
+    ``compute_loss``). Highest MFU when examples are short relative to the bucket. Packing
+    (which rows share a window) is the packer's job; this function is the pure deterministic shape
+    layer -- the two-layer split keeps placement policy and M-RoPE/embed-scatter independent.
+
+The first two are single-``list[dict]`` callables once their hyper-params are bound
+(``functools.partial``), matching the ``collate_fn`` hook on ``AsyncDataLoader`` /
+``batch_iterator``. The packed path is driven instead by an ``EmbedsWindowPacker`` (stateful,
+carries rows across batches) whose ``emit()`` / ``flush()`` output is handed to
+:func:`collate_packed_embeds`.
 
 WIRING (no new abstraction needed)
 ----------------------------------
@@ -81,6 +95,10 @@ import numpy as np
 # Pack contract constants (Qwen3_5Config ``image_token_id`` default / teacher hidden size).
 IMAGE_PLACEHOLDER_ID = 248056
 HIDDEN = 5120
+# Teacher vision ``spatial_merge_size`` (Qwen3.5-VL = 2). The pack's per-image placeholder run
+# length equals ``T * (grid_h // SPATIAL_MERGE_SIZE) * (grid_w // SPATIAL_MERGE_SIZE)``; the M-RoPE
+# helper needs this to lay out image position ids that line up with those placeholder runs.
+SPATIAL_MERGE_SIZE = 2
 
 
 def _decode_row_embeds(row: dict) -> np.ndarray:
@@ -219,6 +237,150 @@ def collate_bucket_static(rows: list[dict], pad_id: int, seq_len: int, max_embed
         "input_ids": jnp.asarray(input_ids),
         "attention_mask": jnp.asarray(attention_mask),
         "labels": jnp.asarray(labels),
+        "image_embeds": jnp.asarray(padded),
+        "image_grid_thw": jnp.asarray(grid_thw),
+        "n_real_embeds": n_real,
+    }
+
+
+def collate_packed_embeds(
+    packs: list[list[dict]],
+    pad_id: int,
+    seq_len: int,
+    max_embed_rows: int,
+    n_windows: int,
+    spatial_merge_size: int = SPATIAL_MERGE_SIZE,
+) -> dict:
+    """Packed TRAINING-STATIC MATERIALIZER: turn one batch's per-window row assignments into a
+    constant ``(n_windows, seq_len)`` batch on EVERY call (so the pod compiles the step once).
+    ``packs`` is ``list[list[dict]]`` -- the ``M`` (<= ``n_windows``) non-empty windows produced by
+    one :meth:`~easydel.data.transforms.packer.EmbedsWindowPacker.emit` / ``flush`` step; window
+    ``wi`` holds ``packs[wi]`` concatenated in order. PLACEMENT (which rows share a window) is the
+    packer's job -- this is the pure deterministic shape layer. Versus ``collate_bucket_static`` this
+    kills the per-example padding (it pads EVERY short example out to the bucket ceiling): denser
+    windows -> less wasted compute -> higher MFU.
+
+    Window-count contract (the packer owns row sizing; this layer pins the static shape):
+      * ``M`` real windows are filled from ``packs``;
+      * ``M < n_windows`` -> the trailing ``n_windows - M`` windows are emitted WHOLE-padded
+        (``attention_mask`` 0, ``segment_ids`` -1, ``labels`` -100, no image placeholders) so they
+        contribute zero loss and zero attention -- a fully inert pad batch row (proven backward-finite);
+      * ``M > n_windows`` -> raise. The packer never produces this (it opens exactly ``n_windows``
+        bins per emit and carries overflow to the next batch, never dropping rows); the assert is a
+        defensive shape contract against a hand-built ``packs``.
+
+    Document isolation inside a window is carried by ``segment_ids`` -- a per-token example index
+    that RESTARTS at 0 in each window. The trainer's ``compute_loss`` folds it into the universal
+    ``mask_info`` (``MaskInfo.from_segments``), which drives BOTH block-diagonal full attention and
+    the GDR linear-attention recurrence/conv reset, so examples neither attend to nor carry state
+    across one another (proven equal to per-document runs in tests/modules/test_qwen3_5_packing.py,
+    forward and backward).
+
+    3D M-RoPE ``position_ids`` are reset per example: each segment's positions restart at 0. This is
+    obtained by calling the model's own ``_get_rope_index_from_mm_token_types`` on each example in
+    isolation (its ``current_pos`` starts at 0) and concatenating -- no reimplementation of the
+    mRoPE math, and it keeps positions from running cumulatively past ``max_position_embeddings``.
+    The forward consumes caller ``position_ids`` directly (modeling_qwen3_5.py:1110) and flattens
+    3D->1D itself when the text config does not enable mRoPE.
+
+    Image embeds are decoded and concatenated in EXAMPLE order (== the row-major placeholder scan of
+    the flattened ``(n_windows, seq_len)`` batch) and zero-padded to ``max_embed_rows``;
+    ``image_grid_thw`` concatenated likewise. ASSERTS #image-placeholder tokens == #decoded embed
+    rows so the scatter target stays aligned.
+
+    The per-row admission guards (``len(input_ids) <= seq_len`` and ``embed_rows <= max_embed_rows``)
+    live on the packer (:meth:`EmbedsWindowPacker.push`); the defensive per-window capacity assert
+    below catches a hand-built ``packs`` whose rows overflow ``seq_len``.
+    """
+    import jax.numpy as jnp
+
+    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+
+    assert pad_id != IMAGE_PLACEHOLDER_ID, "pad_id must not collide with the image placeholder id"
+
+    # Partition homogeneity (best-effort; no-op when rows lack the path-only Hive keys -- see module
+    # docstring). Keep source/area_bucket: decoded embeds + the scatter assume one teacher/resolution
+    # regime. Do NOT check slen_band: packing DELIBERATELY mixes sub-band lengths into one window, so
+    # the ``collate_bucket_static`` ``slen_band == seq_len`` equality does not apply here.
+    flat_rows = [r for pack in packs for r in pack]
+    for key in ("source", "area_bucket"):
+        vals = {r[key] for r in flat_rows if key in r}
+        assert len(vals) <= 1, (
+            f"heterogeneous batch: packing requires one source x area_bucket partition per batch, "
+            f"got mixed {key} {sorted(vals)} -- configure one loader per source/area_bucket dir"
+        )
+
+    # Static leading-dim contract: at most n_windows real windows so (n_windows, seq_len) is constant
+    # and the step compiles once. The packer guarantees this (opens exactly n_windows bins per emit,
+    # carries overflow forward); the assert defends against a bad hand-built packs. Rows are never
+    # dropped -- overflow rows are carried to the next batch by the packer.
+    assert len(packs) <= n_windows, (
+        f"window overflow: {len(packs)} windows handed in but n_windows={n_windows} -- the packer "
+        "opens exactly n_windows bins per emit and carries overflow forward (it never drops rows)"
+    )
+
+    # Allocate the FULL static (n_windows, seq_len). Windows M..n_windows-1 are left at these init
+    # values -> whole-padded inert rows: pad_id ids, attn 0, labels -100, segment_ids -1 (== the
+    # masked "no segment" value), positions 0. They carry no placeholders and contribute zero loss.
+    input_ids = np.full((n_windows, seq_len), pad_id, dtype=np.int32)
+    attention_mask = np.zeros((n_windows, seq_len), dtype=np.int32)
+    labels = np.full((n_windows, seq_len), -100, dtype=np.int32)
+    segment_ids = np.full((n_windows, seq_len), -1, dtype=np.int32)
+    position_ids = np.zeros((3, n_windows, seq_len), dtype=np.int32)
+
+    embeds_list, grids = [], []
+    for wi, pack in enumerate(packs):
+        offset = 0
+        for seg_idx, r in enumerate(pack):
+            ids = np.asarray(r["input_ids"], dtype=np.int32)
+            length = ids.shape[0]
+            assert offset + length <= seq_len, (
+                f"window capacity exceeded: window {wi} fills to {offset + length} tokens > seq_len "
+                f"{seq_len} -- the packer must never overfill a bin (hand-built packs?)"
+            )
+            window_slice = slice(offset, offset + length)
+            input_ids[wi, window_slice] = ids
+            attention_mask[wi, window_slice] = np.asarray(r["attention_mask"], dtype=np.int32)
+            labels[wi, window_slice] = np.asarray(r["labels"], dtype=np.int32)
+            segment_ids[wi, window_slice] = seg_idx
+
+            # Per-example reset 3D M-RoPE: run the model helper on THIS example alone so its
+            # current_pos starts at 0, then drop the result into the window slice -> the segment's
+            # positions reset at its start. mm_token_type_ids marks image placeholders (1) vs text
+            # (0); image groups consume image_grid_thw to lay out 2D spatial positions.
+            grid = np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3)
+            mm_token_type_ids = (ids == IMAGE_PLACEHOLDER_ID).astype(np.int32).reshape(1, -1)
+            example_positions, _ = _get_rope_index_from_mm_token_types(
+                input_ids=ids.reshape(1, -1),
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=grid if grid.shape[0] else None,
+                attention_mask=None,
+                spatial_merge_size=spatial_merge_size,
+            )
+            position_ids[:, wi, window_slice] = np.asarray(example_positions)[:, 0, :]
+
+            embeds_list.append(_decode_row_embeds(r))
+            grids.append(grid)
+            offset += length
+
+    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, HIDDEN), np.float32)
+    n_real = all_embeds.shape[0]
+    n_place = int((input_ids == IMAGE_PLACEHOLDER_ID).sum())
+    assert n_place == n_real, (
+        f"placeholder/embed mismatch: {n_place} image-placeholder tokens but {n_real} decoded embed "
+        "rows -- packing must preserve the per-example placeholder<->embed alignment"
+    )
+    assert n_real <= max_embed_rows, f"decoded embed rows {n_real} exceed max_embed_rows {max_embed_rows}"
+    padded = np.zeros((max_embed_rows, HIDDEN), dtype=np.float32)
+    padded[:n_real] = all_embeds
+    grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
+
+    return {
+        "input_ids": jnp.asarray(input_ids),
+        "attention_mask": jnp.asarray(attention_mask),
+        "labels": jnp.asarray(labels),
+        "segment_ids": jnp.asarray(segment_ids),
+        "position_ids": jnp.asarray(position_ids),
         "image_embeds": jnp.asarray(padded),
         "image_grid_thw": jnp.asarray(grid_thw),
         "n_real_embeds": n_real,
