@@ -52,6 +52,7 @@ from jaxtyping import Array, Float
 from spectrax import with_sharding_constraint
 
 from easydel.caching import KDACacheView
+from easydel.infra.sequence_packing import normalize_packed_segment_ids
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -156,6 +157,7 @@ def _recurrent_kda_fwd(
     decay: Float[Array, "batch num_heads seq_len"] | None,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
+    segment_ids: Array | None = None,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -213,8 +215,12 @@ def _recurrent_kda_fwd(
     v_seq = value.transpose(2, 0, 1, 3)  # (L, B, H, V)
     g_seq = decay.transpose(2, 0, 1)  # (L, B, H)
     b_seq = beta.transpose(2, 0, 1)  # (L, B, H)
+    if segment_ids is not None:
+        segment_ids = normalize_packed_segment_ids(segment_ids, L, pad_from_last=False)
+        seg_seq = segment_ids.swapaxes(0, 1)  # (L, B)
+        initial_segment = jnp.full((B,), -1, dtype=seg_seq.dtype)
 
-    def step_fn(state, inputs):
+    def step_fn(carry, inputs):
         """Single-token KDA recurrence step used by ``lax.scan``.
 
         Updates the running ``state`` with the per-token gated delta rule
@@ -230,7 +236,18 @@ def _recurrent_kda_fwd(
             tuple: ``(new_state, output)`` where ``new_state`` has the same
             shape as ``state`` and ``output`` has shape ``(B, H, V)``.
         """
-        q_t, k_t, v_t, g_t, beta_t = inputs
+        if segment_ids is None:
+            state = carry
+            q_t, k_t, v_t, g_t, beta_t = inputs
+            valid = None
+            next_segment = None
+        else:
+            state, prev_segment = carry
+            q_t, k_t, v_t, g_t, beta_t, segment_t = inputs
+            valid = segment_t >= 0
+            new_segment = valid & (segment_t != prev_segment)
+            state = jnp.where(new_segment[:, None, None, None], jnp.zeros_like(state), state)
+            next_segment = jnp.where(valid, segment_t, -1)
         g_exp = jnp.exp(g_t)[:, :, None, None]
         beta_scaled = beta_t[:, :, None]
         state = state * g_exp
@@ -239,10 +256,21 @@ def _recurrent_kda_fwd(
         delta = (v_t - kv_mem) * beta_scaled
         state = state + k_t[:, :, :, None] * delta[:, :, None, :]
         output = jnp.sum(state * q_t[:, :, :, None], axis=-2)
+        if valid is not None:
+            output = jnp.where(valid[:, None, None], output, jnp.zeros_like(output))
+            state = jnp.where(valid[:, None, None, None], state, jnp.zeros_like(state))
+            return (state, next_segment), output
 
         return state, output
 
-    final_state, outputs = lax.scan(step_fn, initial_state, (q_seq, k_seq, v_seq, g_seq, b_seq))
+    if segment_ids is None:
+        final_state, outputs = lax.scan(step_fn, initial_state, (q_seq, k_seq, v_seq, g_seq, b_seq))
+    else:
+        (final_state, _), outputs = lax.scan(
+            step_fn,
+            (initial_state, initial_segment),
+            (q_seq, k_seq, v_seq, g_seq, b_seq, seg_seq),
+        )
     outputs = outputs.transpose(1, 2, 0, 3)
 
     return outputs, final_state
@@ -726,6 +754,7 @@ class KernelDeltaAttnOp(OperationImpl):
         k_conv_state: Float[Array, "batch key_dim d_conv"] | None = None,
         v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
         recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+        segment_ids: Array | None = None,
         chunk_size: int = 64,
         **kwargs,
     ) -> KDAOutput:
@@ -794,16 +823,28 @@ class KernelDeltaAttnOp(OperationImpl):
             if decay is not None and decay.ndim == 3:
                 decay = decay.transpose(0, 2, 1)
 
-            outputs, new_recurrent_state = _chunk_kda_fwd(
-                query=query,
-                key=key,
-                value=value,
-                beta=beta,
-                decay=decay,
-                chunk_size=chunk_size,
-                initial_state=recurrent_state,
-                use_qk_l2norm=True,
-            )
+            if segment_ids is None:
+                outputs, new_recurrent_state = _chunk_kda_fwd(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta,
+                    decay=decay,
+                    chunk_size=chunk_size,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm=True,
+                )
+            else:
+                outputs, new_recurrent_state = _recurrent_kda_fwd(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta,
+                    decay=decay,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm=True,
+                    segment_ids=segment_ids,
+                )
 
             outputs = outputs.transpose(0, 2, 1, 3)
 
@@ -851,6 +892,7 @@ class KernelDeltaAttnOp(OperationImpl):
         k_conv_state: Float[Array, "batch key_dim d_conv"] | None = None,
         v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
         recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+        segment_ids: Array | None = None,
         chunk_size: int = 64,
         **kwargs,
     ) -> KDAOutput:
@@ -884,6 +926,7 @@ class KernelDeltaAttnOp(OperationImpl):
             k_conv_state=k_conv_state,
             v_conv_state=v_conv_state,
             recurrent_state=recurrent_state,
+            segment_ids=segment_ids,
             chunk_size=chunk_size,
             **kwargs,
         )

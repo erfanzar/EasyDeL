@@ -49,6 +49,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
 from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
@@ -313,7 +314,7 @@ class GiddAttention(AttentionModule):
         # Validate that query and key have matching sequence lengths
         assert query.shape[1] == key.shape[1], "Query and Key lengths must match for GIDD attention."
 
-        attention_mask = mask_info.attention_mask
+        attention_mask = pairwise_attention_mask_from_mask_info(mask_info, query.shape[1], key.shape[1])
         if attention_mask is not None:
             if attention_mask.dtype != jnp.bool:
                 warnings.warn("attention_mask should be a boolean array", stacklevel=1)
@@ -321,8 +322,11 @@ class GiddAttention(AttentionModule):
 
         # Expand attention mask to match attention computation dimensions
         assert attention_mask is not None, "attention_mask must not be None for GIDD attention"
-        attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-        attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)  # [Batch, 1, q_len, kv_len]
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)  # [Batch, 1, q_len, kv_len]
+        elif attention_mask.ndim == 3:
+            attention_mask = attention_mask[:, None, :, :]
 
         if noise_mask is not None:
             if noise_mask.dtype != jnp.bool:

@@ -858,9 +858,8 @@ class TrainingArguments:
                 "Pack multiple short sequences into fixed-length blocks of `max_length` tokens to cut padding "
                 "waste. Documents stay isolated (block-diagonal attention + per-document position reset; "
                 "linear-attention/SSM state is reset at boundaries where supported). Honored by "
-                "supervised/offline trainers (SFT and the eLarge data-mixture path); RL/online trainers "
-                "(GRPO family, PPO, OnlineDPO, on-policy distillation) and paired-preference trainers "
-                "(DPO/KTO/CPO/BCO/ORPO) warn and ignore it."
+                "single-stream supervised/offline trainers such as SFT, distillation, and GOLD; rollout, "
+                "pairwise-preference, reward, and embedding trainers warn and ignore it."
             )
         },
     )

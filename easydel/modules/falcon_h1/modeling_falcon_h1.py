@@ -65,6 +65,7 @@ from easydel.infra.modeling_outputs import (
     CausalLMOutput,
     DecoderLayerOutput,
 )
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, segmented_depthwise_causal_conv1d
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     ColumnParallelLinear,
@@ -612,6 +613,7 @@ class FalconH1Mixer(spx.Module):
             q_mask = tp.cast("Array | None", mask_info.q_attention_mask)
             if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
                 q_mask = q_mask[:, : hidden_states.shape[1]]
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, hidden_states.shape[1])
         hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
 
         dtype = hidden_states.dtype
@@ -767,17 +769,30 @@ class FalconH1Mixer(spx.Module):
             conv_out = self.act(conv_out_full[:, :, self.conv_kernel_size - 1]).astype(dtype)[:, None, :]
         else:
             # Prefill mode: use full convolution
-            conv_out = self.conv1d(jnp.swapaxes(hidden_states_B_C, 2, 1))[..., :seq_len]
-            conv_out = self.act(jnp.swapaxes(conv_out, 2, 1)).astype(dtype)
+            if segment_ids is None:
+                conv_out = self.conv1d(jnp.swapaxes(hidden_states_B_C, 2, 1))[..., :seq_len]
+                conv_out = self.act(jnp.swapaxes(conv_out, 2, 1)).astype(dtype)
+            else:
+                kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
+                conv_bias = self.conv1d.bias if self.use_conv_bias else None
+                conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
+                    hidden_states_B_C,
+                    kernel,
+                    segment_ids,
+                    bias=conv_bias,
+                    activation=self.act,
+                    output_dtype=dtype,
+                )
 
             # Update cache with conv_state for future decoding
             if cache_view is not None:
-                conv_in_t = hidden_states_B_C.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
-                if seq_len >= self.conv_kernel_size:
-                    new_conv_state = conv_in_t[:, :, -self.conv_kernel_size :]
-                else:
-                    pad_width = self.conv_kernel_size - seq_len
-                    new_conv_state = jnp.pad(conv_in_t, ((0, 0), (0, 0), (pad_width, 0)))
+                if segment_ids is None:
+                    conv_in_t = hidden_states_B_C.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
+                    if seq_len >= self.conv_kernel_size:
+                        new_conv_state = conv_in_t[:, :, -self.conv_kernel_size :]
+                    else:
+                        pad_width = self.conv_kernel_size - seq_len
+                        new_conv_state = jnp.pad(conv_in_t, ((0, 0), (0, 0), (pad_width, 0)))
                 updated_cache_view = cache_view.replace(conv_state=new_conv_state)
 
         if q_mask is not None:
@@ -818,12 +833,13 @@ class FalconH1Mixer(spx.Module):
             dt=dt,
             gate=None,
             ssm_state=ssm_state0,
+            segment_ids=segment_ids,
             n_groups=self.n_groups,
             use_gated_rmsnorm=False,
             precision=self.precision,
         )
 
-        y = ssm_output.attention_outputs
+        y = ssm_output.attention_outputs.reshape(batch_size, seq_len, self.intermediate_size)
 
         # Update cache with final SSM state
         if updated_cache_view is not None:

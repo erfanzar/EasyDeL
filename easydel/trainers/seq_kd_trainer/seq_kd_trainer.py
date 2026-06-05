@@ -102,6 +102,8 @@ class SeqKDTrainer(Trainer):
         >>> trainer.train()
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False
+
     teacher_state: EasyDeLState | None
     teacher_fn: tp.Callable[[list[str]], list[str]] | None
     arguments: SeqKDConfig

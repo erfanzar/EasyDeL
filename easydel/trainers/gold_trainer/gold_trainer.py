@@ -34,7 +34,7 @@ class GOLDTrainer(DistillationTrainer):
     :class:`GOLDConfig` before the shared distillation step is compiled.
     """
 
-    supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+    supports_sequence_packing: tp.ClassVar[bool] = True
 
     arguments: GOLDConfig
 

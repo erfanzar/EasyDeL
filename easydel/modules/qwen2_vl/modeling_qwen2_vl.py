@@ -63,6 +63,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     VLMCausalLMOutput,
 )
+from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
@@ -2628,9 +2629,10 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             inputs_embeds=others.get("inputs_embeds"),
             attention_mask=attention_mask,
         )
-        attention_mask = mask_info.attention_mask
 
         input_ids = others.get("input_ids", None)
+        target_length = input_ids.shape[1] if input_ids is not None else None
+        attention_mask = token_attention_mask_from_mask_info(mask_info, target_length)
         rope_deltas = others.get("rope_deltas", None)
         position_ids = others.get("position_ids", None)
 

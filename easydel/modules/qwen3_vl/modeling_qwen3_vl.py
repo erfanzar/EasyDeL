@@ -60,6 +60,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     VLMCausalLMOutput,
 )
+from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
@@ -1683,7 +1684,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
-        attention_mask = mask_info.attention_mask
+        attention_mask = token_attention_mask_from_mask_info(mask_info, sequence_length)
 
         if position_ids is None:
             batch_size = inputs_embeds.shape[0]

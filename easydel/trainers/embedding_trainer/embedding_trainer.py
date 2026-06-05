@@ -97,6 +97,8 @@ class EmbeddingTrainer(Trainer):
         >>> trainer.train()
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False
+
     arguments: EmbeddingConfig
 
     def __init__(

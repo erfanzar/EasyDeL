@@ -1972,16 +1972,109 @@ class BaseTrainer(BaseTrainerProtocol):
         """Apply preprocessing transforms to data sources.
 
         Gets the trainer-specific transform via _get_preprocess_transform()
-        and applies it to both train and eval sources if available.
+        and applies it to both train and eval sources if available. When
+        ``sequence_packing`` is enabled for a trainer that supports it, wraps
+        the transformed token stream in a packed fixed-length source.
         """
         transform = self._get_preprocess_transform()
-        if transform is None:
-            return
-
-        if self._train_source is not None:
+        if transform is not None and self._train_source is not None:
             self._train_source = self._train_source.transform(transform)
-        if self._eval_source is not None:
+        if transform is not None and self._eval_source is not None:
             self._eval_source = self._eval_source.transform(transform)
+
+        if getattr(self.arguments, "sequence_packing", False):
+            self._apply_sequence_packing_to_sources()
+
+    def _apply_sequence_packing_to_sources(
+        self,
+        *,
+        train_enabled: bool = True,
+        eval_enabled: bool | None = None,
+        strategy: str | None = None,
+    ) -> None:
+        """Wrap train/eval sharded sources in ``PackedShardedSource``.
+
+        The wrapper expects tokenized rows with an ``input_ids`` field. It
+        preserves token-aligned supervision fields when the upstream rows
+        already expose them, avoiding fake labels for KD-only data while still
+        supporting label-bearing single-stream trainers.
+        """
+        if eval_enabled is None:
+            eval_enabled = train_enabled
+
+        if train_enabled and self._train_source is not None:
+            self._train_source = self._pack_token_source(self._train_source, strategy=strategy)
+        if eval_enabled and self._eval_source is not None:
+            self._eval_source = self._pack_token_source(self._eval_source, strategy=strategy)
+
+    def _pack_token_source(self, source: ShardedDataSource, *, strategy: str | None = None) -> ShardedDataSource:
+        """Return a packed view of a tokenized source unless it is already packed."""
+        if type(source).__name__ == "PackedShardedSource":
+            return source
+
+        from easydel.data.transforms.pack import PackedShardedSource
+
+        seq_length = int(getattr(self.arguments, "max_length", 0) or 0)
+        if seq_length <= 0:
+            raise ValueError("`max_length` must be positive when `sequence_packing=True`.")
+
+        pad_token_id = self._tokenizer_int_attr("pad_token_id", 0)
+        eos_token_id = self._tokenizer_int_attr("eos_token_id", pad_token_id)
+        if eos_token_id is None:
+            logger.warning("No eos_token_id found, using pad_token_id for sequence packing.")
+            eos_token_id = pad_token_id
+
+        extra_field_pad_values, extra_field_separator_values = self._sequence_packing_extra_fields(source)
+
+        return PackedShardedSource(
+            source=source,
+            seq_length=seq_length,
+            eos_token_id=int(eos_token_id),
+            pad_token_id=int(pad_token_id),
+            strategy=strategy or self._sequence_packing_strategy(),
+            include_segment_ids=True,
+            extra_field_pad_values=extra_field_pad_values,
+            extra_field_separator_values=extra_field_separator_values,
+            shuffle=False,
+        )
+
+    def _tokenizer_int_attr(self, name: str, default: int | None = None) -> int | None:
+        """Read an integer tokenizer attribute from tokenizer or nested processor."""
+        candidates = [self.processing_class, getattr(self.processing_class, "tokenizer", None)]
+        for candidate in candidates:
+            value = getattr(candidate, name, None)
+            if value is not None:
+                return int(value)
+        return default
+
+    def _sequence_packing_strategy(self) -> str:
+        """Resolve public packing strategy names to ``PackedShardedSource`` names."""
+        strategy = getattr(self.arguments, "packing_strategy", None)
+        return {
+            "bfd": "first_fit",
+            "bfd_split": "first_fit",
+            "wrapped": "greedy",
+            "first_fit": "first_fit",
+            "greedy": "greedy",
+            "pool": "pool",
+        }.get(strategy, "first_fit")
+
+    def _sequence_packing_extra_fields(self, source: ShardedDataSource) -> tuple[dict[str, int], dict[str, int]]:
+        """Detect token-aligned fields that should be packed with ``input_ids``."""
+        sample: dict[str, tp.Any] = {}
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+        except (StopIteration, IndexError, KeyError, TypeError, AttributeError):
+            pass
+
+        field_pad_values = {
+            "completion_mask": 0,
+            "assistant_masks": 0,
+            "labels": -100,
+        }
+        pad_values = {field: pad for field, pad in field_pad_values.items() if field in sample}
+        separator_values = dict(pad_values)
+        return pad_values, separator_values
 
     def _get_preprocess_transform(self) -> Transform | None:
         """Get trainer-specific preprocessing transform.

@@ -117,6 +117,8 @@ class SparseDistillationTrainer(Trainer):
         >>> trainer.train()
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False
+
     teacher_state: EasyDeLState | None
     teacher_fn: SparseTeacherFn | None
     arguments: SparseDistillationConfig

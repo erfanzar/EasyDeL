@@ -50,6 +50,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.infra.sequence_packing import fold_sequence_packing_segments
 from easydel.infra.sharding import MeshLike
 from easydel.utils.helpers import check_bool_flag, get_logger
 
@@ -696,7 +697,16 @@ def filter_kwargs_for_callable(
         return dict(kwargs)
 
     parameters = signature.parameters
-    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+    has_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    model_like_packed_call = (
+        "segment_ids" in kwargs
+        and ("input_ids" in kwargs or "inputs_embeds" in kwargs)
+        and (has_var_kwargs or "mask_info" in parameters)
+    )
+    if model_like_packed_call:
+        kwargs = fold_sequence_packing_segments(kwargs)
+
+    if has_var_kwargs:
         return dict(kwargs)
 
     accepted_keys = set(parameters.keys())
@@ -709,7 +719,7 @@ def sanitize_model_call_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> 
     Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
     but not both at the same time. Prefer token IDs when both are present.
     """
-    normalized_kwargs = dict(kwargs)
+    normalized_kwargs = fold_sequence_packing_segments(kwargs)
     if normalized_kwargs.get("input_ids", None) is not None and normalized_kwargs.get("inputs_embeds", None) is not None:
         normalized_kwargs.pop("inputs_embeds", None)
     return normalized_kwargs

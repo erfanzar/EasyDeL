@@ -88,6 +88,8 @@ class RewardTrainer(Trainer):
         text examples representing preferred and non-preferred responses.
     """
 
+    supports_sequence_packing: tp.ClassVar[bool] = False
+
     def __init__(
         self,
         arguments: RewardConfig,

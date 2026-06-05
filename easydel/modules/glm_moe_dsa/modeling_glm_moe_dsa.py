@@ -62,6 +62,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
+from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -1200,11 +1201,8 @@ class GlmMoeDsaAttention(UnifiedAttention):
             sliding_window_for_kernel = None
 
         indexer_mask = None
-        if mask_info is not None and mask_info.attention_mask is not None:
-            if mask_info.attention_mask.ndim == 4:
-                indexer_mask = mask_info.attention_mask[:, -1, :, :]
-            elif mask_info.attention_mask.ndim == 3:
-                indexer_mask = mask_info.attention_mask
+        if mask_info is not None:
+            indexer_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, q_len)
 
         indexer_cached_keys = None
         if cache_view is not None and hasattr(cache_view, "recurrent_state"):
@@ -1265,15 +1263,11 @@ class GlmMoeDsaAttention(UnifiedAttention):
                 if indexer_output.cached_keys is not None
                 else int(hidden_states.shape[1])
             )
-            if topk_kv_len == kv_len and mask_info is not None and mask_info.attention_mask is not None:
+            if topk_kv_len == kv_len and mask_info is not None:
                 topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
-                if mask_info.attention_mask.ndim == 4:
-                    attention_mask = mask_info.attention_mask[..., :q_len, :kv_len] & topk_mask[:, None, :, :]
-                elif mask_info.attention_mask.ndim == 3:
-                    attention_mask = mask_info.attention_mask[..., :kv_len] & topk_mask
-                else:
-                    attention_mask = mask_info.attention_mask
-                mask_info = mask_info.replace(attention_mask=attention_mask)
+                attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
+                if attention_mask is not None:
+                    mask_info = mask_info.replace(attention_mask=attention_mask & topk_mask)
 
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)

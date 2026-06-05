@@ -60,6 +60,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -1094,6 +1095,7 @@ class KimiDeltaAttention(spx.Module):
             if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
                 q_mask = q_mask[:, : hidden_states.shape[1]]
             hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, hidden_states.shape[1])
 
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
@@ -1115,6 +1117,7 @@ class KimiDeltaAttention(spx.Module):
             d_conv=self.d_conv,
             output_dtype=conv_output_dtype,
             reuse_partial_state=True,
+            segment_ids=segment_ids,
         )
         key, new_k_conv_state = apply_conv_with_state(
             key,
@@ -1124,6 +1127,7 @@ class KimiDeltaAttention(spx.Module):
             d_conv=self.d_conv,
             output_dtype=conv_output_dtype,
             reuse_partial_state=True,
+            segment_ids=segment_ids,
         )
         value, new_v_conv_state = apply_conv_with_state(
             value,
@@ -1133,6 +1137,7 @@ class KimiDeltaAttention(spx.Module):
             d_conv=self.d_conv,
             output_dtype=conv_output_dtype,
             reuse_partial_state=True,
+            segment_ids=segment_ids,
         )
 
         query = query.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
@@ -1176,6 +1181,7 @@ class KimiDeltaAttention(spx.Module):
             k_conv_state=new_k_conv_state,
             v_conv_state=new_v_conv_state,
             recurrent_state=recurrent_state,
+            segment_ids=segment_ids,
             chunk_size=self.chunk_size,
         )
 

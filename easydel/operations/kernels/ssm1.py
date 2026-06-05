@@ -50,6 +50,7 @@ from ejkernel.modules import state_space_v1  # pyright: ignore[reportMissingType
 from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
+from easydel.infra.sequence_packing import normalize_packed_segment_ids
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -102,6 +103,67 @@ def _single_step_ssm1_fwd(
     y = jnp.sum(ssm_state_new * C[:, None, :], axis=-1) + D[None, :] * hidden_states
 
     return y, ssm_state_new
+
+
+def _segmented_ssm1_fwd(
+    hidden_states: Float[Array, "batch seq_len intermediate_size"],
+    A_real: Float[Array, "intermediate_size ssm_state_size"],
+    B: Float[Array, "batch seq_len ssm_state_size"],
+    C: Float[Array, "batch seq_len ssm_state_size"],
+    D: Float[Array, "intermediate_size"],  # noqa:F821
+    discrete_time_step: Float[Array, "batch seq_len intermediate_size"],
+    segment_ids: Array,
+    *,
+    gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
+    ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
+    act_fn=None,
+) -> tuple[Float[Array, "batch seq_len intermediate_size"], Float[Array, "batch intermediate_size ssm_state_size"]]:
+    """Reference SSM1 scan that resets recurrent state at packed boundaries."""
+    batch_size, seq_len, intermediate_size = hidden_states.shape
+    state_size = A_real.shape[-1]
+    segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
+    if ssm_state is None:
+        ssm_state = jnp.zeros((batch_size, intermediate_size, state_size), dtype=jnp.float32)
+    else:
+        ssm_state = ssm_state.astype(jnp.float32)
+    previous_segment = jnp.full((batch_size,), -1, dtype=segment_ids.dtype)
+
+    gate_seq = None if gate is None else gate.swapaxes(0, 1)
+
+    def _step(carry, step_inputs):
+        state, prev_segment = carry
+        x_t, b_t, c_t, dt_t, segment_t = step_inputs[:5]
+        gate_t = None if gate_seq is None else step_inputs[5]
+        valid = segment_t >= 0
+        new_segment = valid & (segment_t != prev_segment)
+        state = jnp.where(new_segment[:, None, None], jnp.zeros_like(state), state)
+        y_t, next_state = _single_step_ssm1_fwd(
+            hidden_states=x_t,
+            A=A_real,
+            B=b_t,
+            C=c_t,
+            D=D,
+            dt=dt_t,
+            ssm_state=state,
+        )
+        if gate_t is not None and act_fn is not None:
+            y_t = y_t * act_fn(gate_t)
+        y_t = jnp.where(valid[:, None], y_t, jnp.zeros_like(y_t))
+        next_state = jnp.where(valid[:, None, None], next_state, jnp.zeros_like(next_state))
+        next_segment = jnp.where(valid, segment_t, -1)
+        return (next_state, next_segment), y_t
+
+    scan_inputs = (
+        hidden_states.swapaxes(0, 1),
+        B.swapaxes(0, 1),
+        C.swapaxes(0, 1),
+        discrete_time_step.swapaxes(0, 1),
+        segment_ids.swapaxes(0, 1),
+    )
+    if gate_seq is not None:
+        scan_inputs = (*scan_inputs, gate_seq)
+    (final_state, _), outputs = jax.lax.scan(_step, (ssm_state, previous_segment), scan_inputs)
+    return outputs.swapaxes(0, 1), final_state
 
 
 @auto_pytree
@@ -189,6 +251,7 @@ class SSM1Op(OperationImpl):
         gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
         conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
         ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
+        segment_ids: Array | None = None,
         activation: str = "silu",
         **kwargs,
     ) -> SSM1Output:
@@ -222,6 +285,26 @@ class SSM1Op(OperationImpl):
 
         # Get activation function
         act_fn = ACT2FN.get(activation, jax.nn.silu) if gate is not None else None
+
+        if segment_ids is not None and hidden_states.shape[1] > 1:
+            y, new_ssm_state = _segmented_ssm1_fwd(
+                hidden_states=hidden_states,
+                A_real=A_real,
+                B=B,
+                C=C,
+                D=D,
+                discrete_time_step=discrete_time_step,
+                segment_ids=segment_ids,
+                gate=gate,
+                ssm_state=ssm_state,
+                act_fn=act_fn,
+            )
+            return SSM1Output(
+                attention_outputs=y.astype(dtype),
+                attention_weights=None,
+                conv_state=conv_state,
+                ssm_state=new_ssm_state.astype(dtype),
+            )
 
         # Call ejKernel's state_space_v1
         # It handles both training (full sequence) and inference (single step) modes
@@ -268,6 +351,7 @@ class SSM1Op(OperationImpl):
         gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
         conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
         ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
+        segment_ids: Array | None = None,
         activation: str = "silu",
         **kwargs,
     ) -> SSM1Output:
@@ -300,6 +384,7 @@ class SSM1Op(OperationImpl):
             gate=gate,
             conv_state=conv_state,
             ssm_state=ssm_state,
+            segment_ids=segment_ids,
             activation=activation,
             **kwargs,
         )

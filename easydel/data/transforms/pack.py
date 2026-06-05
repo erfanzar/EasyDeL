@@ -551,7 +551,13 @@ class FirstFitPacker:
         bins: list[tuple[list[int], list[int], list[str], dict[str, list[int]]]] = []
 
         for tokens, source_id, extra_fields in sorted_pending:
-            token_len = len(tokens) + 1  # +1 for EOS
+            tokens = tokens[: self.seq_length]
+            extra_fields = {
+                field_name: values[: len(tokens)]
+                for field_name, values in extra_fields.items()
+            }
+            append_eos = len(tokens) < self.seq_length
+            token_len = len(tokens) + int(append_eos)
             placed = False
 
             # Find first bin that fits
@@ -560,11 +566,13 @@ class FirstFitPacker:
                     # Add to this bin
                     segment_id = max(bin_segments) + 1 if bin_segments else 0
                     bin_tokens.extend(tokens)
-                    bin_tokens.append(self.eos_token_id)
-                    bin_segments.extend([segment_id] * (len(tokens) + 1))
+                    if append_eos:
+                        bin_tokens.append(self.eos_token_id)
+                    bin_segments.extend([segment_id] * token_len)
                     for field_name, values in extra_fields.items():
                         bin_extra_fields[field_name].extend(values)
-                        bin_extra_fields[field_name].append(self.extra_field_separator_values[field_name])
+                        if append_eos:
+                            bin_extra_fields[field_name].append(self.extra_field_separator_values[field_name])
                     if source_id:
                         bin_sources.append(source_id)
                     placed = True
@@ -572,13 +580,17 @@ class FirstFitPacker:
 
             if not placed:
                 # Create new bin
-                new_tokens = [*tokens, self.eos_token_id]
+                new_tokens = [*tokens]
+                if append_eos:
+                    new_tokens.append(self.eos_token_id)
                 new_segments = [0] * len(new_tokens)
                 new_sources = [source_id] if source_id else []
-                new_extra_fields = {
-                    field_name: [*values, self.extra_field_separator_values[field_name]]
-                    for field_name, values in extra_fields.items()
-                }
+                new_extra_fields = {}
+                for field_name, values in extra_fields.items():
+                    field_values = [*values]
+                    if append_eos:
+                        field_values.append(self.extra_field_separator_values[field_name])
+                    new_extra_fields[field_name] = field_values
                 bins.append((new_tokens, new_segments, new_sources, new_extra_fields))
 
         # Convert bins to PackedSequences

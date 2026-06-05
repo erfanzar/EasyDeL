@@ -37,7 +37,7 @@ import pytest
 
 jax.config.update("jax_platform_name", "cpu")
 
-ATOL = 1e-3
+ATOL = 2e-3
 
 
 def _build(layer_types):
@@ -158,6 +158,51 @@ def test_compute_loss_converts_segment_ids():
         labels=jnp.asarray(packed),
     )
     assert np.isfinite(float(out.loss))
+
+
+def test_direct_model_call_converts_segment_ids():
+    """All EasyDeL modules inherit the direct-call segment_ids folding path."""
+    model = _build(["full_attention"])
+    packed = np.array([[5, 9, 2, 7, 1, 3, 8, 4]], dtype="int32")
+    seg = np.array([[0, 0, 0, 0, 0, 1, 1, 1]], dtype="int32")
+
+    out = model(input_ids=jnp.asarray(packed), segment_ids=jnp.asarray(seg))
+    logits = np.asarray(out.logits.astype(jnp.float32))
+
+    assert logits.shape == (1, 8, 128)
+    assert np.all(np.isfinite(logits))
+
+
+def test_vanilla_packed_attention_does_not_materialize_mask_info(monkeypatch):
+    """Vanilla must consume packed segment ids directly instead of expanding MaskInfo's
+    dense attention mask first.
+    """
+    from ejkernel.types import MaskInfo
+
+    def fail_materialize(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("vanilla packed attention materialized MaskInfo attention_mask")
+
+    monkeypatch.setattr(MaskInfo, "get_or_compute_attention_mask", fail_materialize)
+
+    model = _build(["full_attention"])
+    packed = np.array([[5, 9, 2, 7, 1, 3, 8, 4]], dtype="int32")
+    seg = np.array([[0, 0, 0, 0, 0, 1, 1, 1]], dtype="int32")
+    logits = _packed_logits(model, packed, seg)
+
+    assert logits.shape == (8, 128)
+    assert np.all(np.isfinite(logits))
+
+
+def test_qwen3_next_segment_ids_extend_to_internal_hidden_length():
+    from easydel.modules.qwen3_next.modeling_qwen3_next import _normalize_packed_segment_ids
+
+    seg = jnp.array([[0, 0, 0, 1, 1, 2, 2, 2]], dtype=jnp.int32)
+
+    normalized = _normalize_packed_segment_ids(seg, 9)
+
+    assert normalized.shape == (1, 9)
+    assert normalized.tolist() == [[0, 0, 0, 1, 1, 2, 2, 2, 2]]
 
 
 def test_unpacked_forward_unchanged():

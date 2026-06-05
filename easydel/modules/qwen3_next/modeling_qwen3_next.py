@@ -93,6 +93,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
+from easydel.infra.sequence_packing import normalize_packed_segment_ids as _normalize_packed_segment_ids
 from easydel.infra.sharding import (
     RuntimeShardingResolver,
     coerce_runtime_sharding_resolver,
@@ -2954,7 +2955,7 @@ class Qwen3NextLinearAttention(spx.Module):
         # ``None`` (no packing) keeps every path on its original code.
         seg_ids = getattr(mask_info, "q_segment_ids", None) if mask_info is not None else None
         if seg_ids is not None:
-            seg_ids = seg_ids[:, :seq_len]
+            seg_ids = _normalize_packed_segment_ids(seg_ids, seq_len)
 
         new_conv_state = None
 

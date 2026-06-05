@@ -81,7 +81,6 @@ import jax
 import jax.tree_util
 import spectrax as spx
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
@@ -106,6 +105,7 @@ from .loss_utils import (
 )
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, EasyShardingMixin, OperationCacheMixin
 from .modeling_outputs import EmbeddingInfo
+from .sequence_packing import fold_sequence_packing_segments
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
@@ -869,6 +869,10 @@ class EasyDeLBaseModule(
             wrapped in an :func:`spx.sxstage_region` when pipeline-region
             annotation is enabled.
         """
+        if "segment_ids" in kwargs:
+            from easydel.infra.sequence_packing import fold_sequence_packing_segments
+
+            kwargs = fold_sequence_packing_segments(kwargs)
         if self._pipeline_stage_regions_enabled():
             return self._pipeline_stage_region()(super().__call__)(*args, **kwargs)
         return super().__call__(*args, **kwargs)
@@ -3092,20 +3096,8 @@ class EasyDeLBaseModule(
         if labels is None:
             raise ValueError("`labels` can not be `None` for computing loss.")
         loss_kwargs = loss_kwargs or {}
+        batch = fold_sequence_packing_segments(batch)
         forward_batch = batch
-        # Sequence packing: the data pipeline emits a per-token ``segment_ids`` array. The
-        # model forwards do not take ``segment_ids`` directly — instead it is folded into the
-        # universal ``mask_info`` (block-diagonal attention + GDR segment reset are both driven
-        # off ``mask_info.q_segment_ids``). Do the conversion once here, at the shared entry,
-        # so it works uniformly for every trainer (SFT, distillation, ...) and model.
-        if batch.get("segment_ids", None) is not None and batch.get("mask_info", None) is None:
-            seg = jnp.asarray(batch["segment_ids"], dtype=jnp.int32)
-            attn = batch.get("attention_mask", None)
-            if attn is not None:
-                seg = jnp.where(jnp.asarray(attn, dtype=jnp.bool_), seg, -1)
-            batch = dict(batch)
-            batch["mask_info"] = MaskInfo.from_segments(q_segment_ids=seg)
-            batch.pop("segment_ids", None)
 
         try:
             call_signature = inspect.signature(self.forward)

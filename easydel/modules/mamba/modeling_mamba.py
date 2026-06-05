@@ -45,6 +45,7 @@ from easydel.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCache
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, segmented_depthwise_causal_conv1d
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed
 from easydel.layers import RMSNorm as MambaRMSNorm
@@ -419,6 +420,7 @@ class MambaMixer(spx.Module):
         cache: RecurrentCacheView | None = None,
         position_ids: Array | None = None,
         attention_mask: Array | None = None,
+        segment_ids: Array | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
         """Run the gated selective-scan over a chunk of tokens.
 
@@ -485,15 +487,29 @@ class MambaMixer(spx.Module):
             hidden_states = jnp.expand_dims(self.act(hidden_states).astype(dtype), -1)
         else:
             conv_input = hidden_states
-            conv_out = self.conv1d(conv_input)[..., :seq_len]
-            hidden_states = self.act(conv_out).astype(dtype)
+            if segment_ids is None:
+                conv_out = self.conv1d(conv_input)[..., :seq_len]
+                hidden_states = self.act(conv_out).astype(dtype)
+            else:
+                kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
+                bias = self.conv1d.bias if self.conv1d.use_bias else None
+                conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
+                    conv_input.swapaxes(1, 2),
+                    kernel,
+                    segment_ids,
+                    bias=bias,
+                    activation=self.act,
+                    output_dtype=dtype,
+                )
+                hidden_states = conv_out.swapaxes(1, 2)
 
             if cache is not None:
-                if seq_len >= self.conv_kernel_size:
-                    new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
-                else:
-                    pad_width = self.conv_kernel_size - seq_len
-                    new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
+                if segment_ids is None:
+                    if seq_len >= self.conv_kernel_size:
+                        new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
+                    else:
+                        pad_width = self.conv_kernel_size - seq_len
+                        new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
 
                 cache_view = cache.replace(conv_state=new_conv_state) if cache_view is not None else cache_view
 
@@ -531,6 +547,7 @@ class MambaMixer(spx.Module):
             discrete_time_step=discrete_time_step,
             gate=gate_t,
             ssm_state=ssm_state,
+            segment_ids=segment_ids,
             activation=self.activation,
         )
 
@@ -624,6 +641,7 @@ class MambaBlock(spx.Module):
         cache: RecurrentCacheView | None = None,
         position_ids: Array | None = None,
         attention_mask: Array | None = None,
+        segment_ids: Array | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
         """Apply the pre-norm Mamba block ``x = x + mixer(RMSNorm(x))``.
 
@@ -650,6 +668,7 @@ class MambaBlock(spx.Module):
             cache,
             position_ids,
             attention_mask,
+            segment_ids,
         )
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(
@@ -738,6 +757,7 @@ class MambaModel(EasyDeLBaseModule):
         cache: RecurrentCache | None = None,
         position_ids: Array | None = None,
         attention_mask: Array | None = None,
+        mask_info: MaskInfo | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaOutput:
@@ -797,11 +817,12 @@ class MambaModel(EasyDeLBaseModule):
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
 
         mask_info = MaskInfo.dynamic_init(
-            mask_info=None,
+            mask_info=mask_info,
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, sequence_length)
 
         if position_ids is None:
             position_ids = mask_info.q_position_ids
@@ -825,6 +846,7 @@ class MambaModel(EasyDeLBaseModule):
                     cache=cache.views[idx],
                     attention_mask=attention_mask,
                     position_ids=position_ids,
+                    segment_ids=segment_ids,
                 )
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             cache[idx] = cache_view

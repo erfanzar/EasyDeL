@@ -48,6 +48,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 from spectrax import nn
 
+from easydel.infra.sequence_packing import normalize_packed_segment_ids, segmented_depthwise_causal_conv1d
 from easydel.layers.norms import lowfloats
 
 
@@ -128,6 +129,7 @@ def apply_conv_with_state(
     output_dtype: jnp.dtype,
     activation: tp.Callable[[Array], Array] | None = jax.nn.silu,
     reuse_partial_state: bool = False,
+    segment_ids: Array | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len dim"],
     Float[Array, "batch dim d_conv"] | None,
@@ -165,6 +167,8 @@ def apply_conv_with_state(
             Defaults to ``jax.nn.silu``.
         reuse_partial_state: When ``True`` and ``seq_len < d_conv``, preserve
             the rightmost cached prefix instead of zero-padding.
+        segment_ids: Optional packed segment ids. When provided, the prefill
+            convolution resets its rolling window at segment boundaries.
 
     Returns:
         A tuple of ``(output, new_state)`` where:
@@ -185,6 +189,22 @@ def apply_conv_with_state(
             output_dtype=output_dtype,
             activation=activation,
         )[:, None, :]
+        return output, new_state
+
+    if segment_ids is not None:
+        kernel = conv_layer.weight.value.squeeze(1).T
+        bias = getattr(conv_layer, "bias", None)
+        bias_value = None if bias is None else bias.value
+        segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
+        output, new_state = segmented_depthwise_causal_conv1d(
+            x,
+            kernel,
+            segment_ids,
+            bias=bias_value,
+            initial_state=conv_state if reuse_partial_state else None,
+            activation=activation,
+            output_dtype=output_dtype,
+        )
         return output, new_state
 
     # Match the decode path by promoting the conv result before the activation.

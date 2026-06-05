@@ -62,9 +62,11 @@ from easydel.caching import OperationsMetadata, RecurrentCache, RecurrentCacheCo
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, segmented_depthwise_causal_conv1d
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers import RMSNorm as FalconMambaRMSNorm
+from easydel.layers.attention import MaskInfo
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM1Op
@@ -465,6 +467,7 @@ class FalconMambaMixer(spx.Module):
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
         cache_metadata: OperationsMetadata | None = None,
+        segment_ids: Array | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
         """Apply selective SSM transformation to input hidden states.
 
@@ -629,15 +632,29 @@ class FalconMambaMixer(spx.Module):
             hidden_states = jnp.expand_dims(self.act(conv_out).astype(dtype), -1)
         else:
             conv_input = hidden_states
-            conv_out = self.conv1d(conv_input)[..., :seq_len]
-            hidden_states = self.act(conv_out).astype(dtype)
+            if segment_ids is None:
+                conv_out = self.conv1d(conv_input)[..., :seq_len]
+                hidden_states = self.act(conv_out).astype(dtype)
+            else:
+                kernel = jnp.asarray(self.conv1d.weight).squeeze(1).T
+                bias = self.conv1d.bias if self.config.use_conv_bias else None
+                conv_out, new_conv_state = segmented_depthwise_causal_conv1d(
+                    conv_input.swapaxes(1, 2),
+                    kernel,
+                    segment_ids,
+                    bias=bias,
+                    activation=self.act,
+                    output_dtype=dtype,
+                )
+                hidden_states = conv_out.swapaxes(1, 2)
 
             if cache_params is not None:
-                if seq_len >= self.conv_kernel_size:
-                    new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
-                else:
-                    pad_width = self.conv_kernel_size - seq_len
-                    new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
+                if segment_ids is None:
+                    if seq_len >= self.conv_kernel_size:
+                        new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
+                    else:
+                        pad_width = self.conv_kernel_size - seq_len
+                        new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
                 cache_view = cache_params.replace(conv_state=new_conv_state) if cache_view is not None else cache_view
 
         if attention_mask is not None:
@@ -675,6 +692,7 @@ class FalconMambaMixer(spx.Module):
             discrete_time_step=discrete_time_step,
             gate=gate_t,
             ssm_state=ssm_state0,
+            segment_ids=segment_ids,
             activation=self.activation,
         )
 
@@ -771,6 +789,7 @@ class FalconMambaBlock(spx.Module):
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
         cache_metadata: "OperationsMetadata | None" = None,
+        segment_ids: Array | None = None,
     ) -> tuple[Array, RecurrentCacheView | None]:
         """Process hidden states through the FalconMamba block.
 
@@ -802,6 +821,7 @@ class FalconMambaBlock(spx.Module):
             cache_position,
             attention_mask,
             cache_metadata=cache_metadata,
+            segment_ids=segment_ids,
         )
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(
@@ -909,6 +929,7 @@ class FalconMambaModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
+        mask_info: MaskInfo | None = None,
         cache_metadata: "OperationsMetadata | None" = None,
         **kwargs,
     ) -> tuple | FalconMambaOutput:
@@ -975,6 +996,13 @@ class FalconMambaModel(EasyDeLBaseModule):
             else:
                 attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
 
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, inputs_embeds.shape[1])
         hidden_states = inputs_embeds
 
         def _layer_loop(block, carry):
@@ -994,6 +1022,7 @@ class FalconMambaModel(EasyDeLBaseModule):
                     cache_position=cache_position,
                     attention_mask=attention_mask,
                     cache_metadata=cache_metadata,
+                    segment_ids=segment_ids,
                 )
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
             cache_params[idx] = cache_view

@@ -51,6 +51,7 @@ Example:
     >>> attention_weights = output.attention_weights  # Available for inspection
 """
 
+import math
 import typing as tp
 
 import jax
@@ -71,6 +72,36 @@ from ..requirements import (
     MetadataField,
     OperationRequirements,
 )
+
+
+def _segment_ids_2d(segment_ids: Array | None) -> Array | None:
+    if segment_ids is None:
+        return None
+    if segment_ids.ndim == 3:
+        return segment_ids[:, 0, :]
+    return segment_ids
+
+
+def _match_sequence_length(segment_ids: Array, target_length: int) -> Array:
+    if segment_ids.shape[-1] == target_length:
+        return segment_ids
+    segment_ids = segment_ids[..., :target_length]
+    if segment_ids.shape[-1] == target_length:
+        return segment_ids
+    pad = jnp.full(
+        (*segment_ids.shape[:-1], target_length - segment_ids.shape[-1]),
+        -1,
+        dtype=segment_ids.dtype,
+    )
+    return jnp.concatenate([segment_ids, pad], axis=-1)
+
+
+def _positions_or_range(positions: Array | None, batch_size: int, seq_len: int) -> Array:
+    if positions is not None:
+        positions = positions[..., :seq_len]
+        if positions.shape[-1] == seq_len:
+            return positions
+    return jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len))
 
 
 @OperationRegistry.register
@@ -186,6 +217,28 @@ class VanillaAttn(OperationImpl):
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
             is_decode_mode: bool = model_mode == common_types.MODE_DECODE
             causal_computed: bool = causal if not is_decode_mode else False
+            if self._can_use_segmented_attention(mask_info):
+                outputs, weights = self._forward_segmented(
+                    query=query,
+                    key=key,
+                    value=value,
+                    mask_info=tp.cast("MaskInfo", mask_info),
+                    bias=bias,
+                    init_bias=init_bias,
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng,
+                    softmax_aux=softmax_aux,
+                    softmax_scale=softmax_scale,
+                    logits_soft_cap=logits_soft_cap,
+                    dropout_prob=dropout_prob,
+                    causal=causal_computed,
+                    sliding_window=sliding_window,
+                    runtime_dtype=runtime_dtype,
+                    softmax_dtype=softmax_dtype,
+                )
+                outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
+                return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
+
             if mask_info is not None:
                 attention_mask = mask_info.attention_mask
                 if attention_mask is not None and attention_mask.ndim == 4:
@@ -220,6 +273,120 @@ class VanillaAttn(OperationImpl):
             # Apply output sharding
             outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
             return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
+
+    @staticmethod
+    def _can_use_segmented_attention(mask_info: MaskInfo | None) -> bool:
+        if mask_info is None:
+            return False
+        if getattr(mask_info, "_attention_mask", None) is not None:
+            return False
+        return getattr(mask_info, "_q_segment_ids", None) is not None or getattr(mask_info, "_kv_segment_ids", None) is not None
+
+    def _forward_segmented(
+        self,
+        query: Float[Array, "batch seq_len num_q_heads head_dim"],
+        key: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
+        mask_info: MaskInfo,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None,
+        deterministic: bool,
+        dropout_rng: PRNGKeyArray | None,
+        softmax_aux: Array | None,
+        softmax_scale: float | None,
+        logits_soft_cap: float | None,
+        dropout_prob: float,
+        causal: bool,
+        sliding_window: int | tuple[int, int] | None,
+        runtime_dtype: jnp.dtype,
+        softmax_dtype: jnp.dtype | None,
+    ) -> tuple[Array, Array]:
+        batch_size, q_len, num_q_heads, head_dim = query.shape
+        kv_len = key.shape[1]
+        num_kv_heads = key.shape[2]
+        if num_kv_heads != num_q_heads:
+            if num_q_heads % num_kv_heads != 0:
+                raise ValueError(
+                    f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for vanilla GQA."
+                )
+            key, value = self.repeat_kv_heads(key, value, num_q_heads // num_kv_heads)
+
+        compute_dtype = softmax_dtype or runtime_dtype or query.dtype
+        scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+        logits = jnp.einsum(
+            "bqhd,bkhd->bhqk",
+            query.astype(compute_dtype),
+            key.astype(compute_dtype),
+            preferred_element_type=compute_dtype,
+        )
+        logits = logits * jnp.asarray(scale, dtype=compute_dtype)
+        if logits_soft_cap is not None:
+            cap = jnp.asarray(logits_soft_cap, dtype=compute_dtype)
+            logits = cap * jnp.tanh(logits / cap)
+
+        # In the standard attention stack this closure materializes
+        # ``mask_info.create_bias()``, which expands packed segment ids to a
+        # dense mask. Segment/causal/sliding masks are applied below directly.
+        if bias is None and init_bias is not None and not self._can_use_segmented_attention(mask_info):
+            bias = init_bias()
+        if bias is not None:
+            logits = logits + bias.astype(logits.dtype)
+
+        q_segment_ids = _segment_ids_2d(getattr(mask_info, "_q_segment_ids", None))
+        kv_segment_ids = _segment_ids_2d(getattr(mask_info, "_kv_segment_ids", None))
+        if q_segment_ids is None and kv_segment_ids is None:
+            raise ValueError("Segmented vanilla attention requires q_segment_ids or kv_segment_ids.")
+        if q_segment_ids is None:
+            q_segment_ids = _match_sequence_length(tp.cast("Array", kv_segment_ids), q_len)
+        if kv_segment_ids is None:
+            kv_segment_ids = q_segment_ids
+
+        q_segment_ids = _match_sequence_length(q_segment_ids.astype(jnp.int32), q_len)
+        kv_segment_ids = _match_sequence_length(kv_segment_ids.astype(jnp.int32), kv_len)
+        valid = (
+            (q_segment_ids[:, :, None] >= 0)
+            & (kv_segment_ids[:, None, :] >= 0)
+            & (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :])
+        )
+
+        q_positions = _positions_or_range(mask_info.q_positions, batch_size, q_len)
+        kv_positions = _positions_or_range(mask_info.kv_positions, batch_size, kv_len)
+        if causal and not mask_info.causal_mask_baked_in:
+            valid = valid & (kv_positions[:, None, :] <= q_positions[:, :, None])
+        if sliding_window is not None and not mask_info.sliding_window_baked_in:
+            if isinstance(sliding_window, tuple):
+                left_window, right_window = sliding_window
+            else:
+                left_window = right_window = sliding_window
+            valid = valid & (kv_positions[:, None, :] >= q_positions[:, :, None] - int(left_window))
+            valid = valid & (kv_positions[:, None, :] <= q_positions[:, :, None] + int(right_window))
+
+        mask_value = jnp.finfo(logits.dtype).min
+        logits = jnp.where(valid[:, None, :, :], logits, mask_value)
+
+        if softmax_aux is not None:
+            aux = jnp.asarray(softmax_aux, dtype=logits.dtype)
+            if aux.ndim == 1:
+                aux = jnp.broadcast_to(aux[None, :], (num_q_heads, aux.shape[0]))
+            aux = jnp.broadcast_to(aux[None, :, None, :], (batch_size, num_q_heads, q_len, aux.shape[-1]))
+            weights = jax.nn.softmax(jnp.concatenate([logits, aux], axis=-1), axis=-1)[..., :kv_len]
+        else:
+            weights = jax.nn.softmax(logits, axis=-1)
+
+        if dropout_prob > 0.0 and not deterministic:
+            if dropout_rng is None:
+                raise ValueError("dropout_rng must be provided when deterministic=False and dropout_prob > 0.")
+            keep_prob = 1.0 - dropout_prob
+            keep = jr.bernoulli(dropout_rng, keep_prob, weights.shape)
+            weights = jnp.where(keep, weights / keep_prob, 0)
+
+        outputs = jnp.einsum(
+            "bhqk,bkhd->bqhd",
+            weights.astype(runtime_dtype),
+            value.astype(runtime_dtype),
+            preferred_element_type=runtime_dtype,
+        )
+        return outputs.astype(runtime_dtype), weights
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """GPU forward pass. Delegates to `forward_native`.

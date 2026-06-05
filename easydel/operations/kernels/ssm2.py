@@ -51,6 +51,7 @@ from jax import lax
 from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
+from easydel.infra.sequence_packing import normalize_packed_segment_ids
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -111,6 +112,63 @@ def _single_step_ssm2_fwd(
     y = y + D[None, :, None] * x
 
     return y, ssm_state_new
+
+
+def _segmented_ssm2_fwd(
+    x: Float[Array, "batch seq_len num_heads head_dim"],
+    A_real: Float[Array, "num_heads"],
+    B: Float[Array, "batch seq_len n_groups ssm_state_size"],
+    C: Float[Array, "batch seq_len n_groups ssm_state_size"],
+    D: Float[Array, "num_heads"],
+    dt: Float[Array, "batch seq_len num_heads"],
+    segment_ids: Array,
+    *,
+    ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None,
+    n_groups: int = 1,
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim ssm_state_size"]]:
+    """Reference SSM2 scan that resets recurrent state at packed boundaries."""
+    batch_size, seq_len, num_heads, head_dim = x.shape
+    state_size = B.shape[-1]
+    segment_ids = normalize_packed_segment_ids(segment_ids, seq_len, pad_from_last=False)
+    if ssm_state is None:
+        ssm_state = jnp.zeros((batch_size, num_heads, head_dim, state_size), dtype=jnp.float32)
+    else:
+        ssm_state = ssm_state.astype(jnp.float32)
+    previous_segment = jnp.full((batch_size,), -1, dtype=segment_ids.dtype)
+
+    def _step(carry, step_inputs):
+        state, prev_segment = carry
+        x_t, b_t, c_t, dt_t, segment_t = step_inputs
+        valid = segment_t >= 0
+        new_segment = valid & (segment_t != prev_segment)
+        state = jnp.where(new_segment[:, None, None, None], jnp.zeros_like(state), state)
+        y_t, next_state = _single_step_ssm2_fwd(
+            x=x_t,
+            A=A_real,
+            B=b_t,
+            C=c_t,
+            D=D,
+            dt=dt_t,
+            ssm_state=state,
+            n_groups=n_groups,
+        )
+        y_t = jnp.where(valid[:, None, None], y_t, jnp.zeros_like(y_t))
+        next_state = jnp.where(valid[:, None, None, None], next_state, jnp.zeros_like(next_state))
+        next_segment = jnp.where(valid, segment_t, -1)
+        return (next_state, next_segment), y_t
+
+    (final_state, _), outputs = jax.lax.scan(
+        _step,
+        (ssm_state, previous_segment),
+        (
+            x.swapaxes(0, 1),
+            B.swapaxes(0, 1),
+            C.swapaxes(0, 1),
+            dt.swapaxes(0, 1),
+            segment_ids.swapaxes(0, 1),
+        ),
+    )
+    return outputs.swapaxes(0, 1), final_state
 
 
 @auto_pytree
@@ -198,6 +256,7 @@ class SSM2Op(OperationImpl):
         gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
         conv_state: Float[Array, "batch conv_dim d_conv"] | None = None,
         ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None,
+        segment_ids: Array | None = None,
         n_groups: int = 1,
         use_gated_rmsnorm: bool = False,
         rmsnorm_eps: float = 1e-5,
@@ -232,6 +291,27 @@ class SSM2Op(OperationImpl):
 
         # Convert A from log form to real form (negative for stability)
         A_real = -jnp.exp(A.astype(jnp.float32))
+
+        if segment_ids is not None and x.shape[1] > 1:
+            if gate is not None or use_gated_rmsnorm:
+                raise ValueError("Segmented SSM2 fallback expects gating to be applied by the caller.")
+            y, new_ssm_state = _segmented_ssm2_fwd(
+                x=x,
+                A_real=A_real,
+                B=B,
+                C=C,
+                D=D,
+                dt=dt,
+                segment_ids=segment_ids,
+                ssm_state=ssm_state,
+                n_groups=n_groups,
+            )
+            return SSM2Output(
+                attention_outputs=y.astype(dtype),
+                attention_weights=None,
+                conv_state=conv_state,
+                ssm_state=new_ssm_state.astype(dtype),
+            )
 
         # Call ejKernel's state_space_v2
         # It handles both training (full sequence) and inference (single step) modes
@@ -282,6 +362,7 @@ class SSM2Op(OperationImpl):
         gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
         conv_state: Float[Array, "batch conv_dim d_conv"] | None = None,
         ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None,
+        segment_ids: Array | None = None,
         n_groups: int = 1,
         use_gated_rmsnorm: bool = False,
         rmsnorm_eps: float = 1e-5,
@@ -320,6 +401,7 @@ class SSM2Op(OperationImpl):
             gate=gate,
             conv_state=conv_state,
             ssm_state=ssm_state,
+            segment_ids=segment_ids,
             n_groups=n_groups,
             use_gated_rmsnorm=use_gated_rmsnorm,
             rmsnorm_eps=rmsnorm_eps,

@@ -272,82 +272,28 @@ class SFTTrainer(Trainer):
         """Run the base preprocessor and optionally wrap the source in a packer.
 
         After the standard tokenisation transform attached by the base
-        :class:`Trainer` runs, this override consults
-        ``arguments.packing`` and ``arguments.eval_packing`` and, when
-        either is enabled, wraps the corresponding shard source in a
-        :class:`PackedShardedSource`. The packer fills fixed-length
-        blocks of ``arguments.max_length`` tokens with multiple
-        sequences separated by EOS, exposing per-sequence
-        ``segment_ids`` so attention can be restricted to within-document
-        boundaries.
-
-        Strategy mapping mirrors the public ``packing_strategy`` field:
-        ``"bfd"`` (the SFT default) maps to the underlying
-        ``"first_fit"`` packer; ``"wrapped"`` maps to ``"greedy"``. When
-        the tokenizer has no ``eos_token_id`` the pad token is used as a
-        fallback delimiter and a warning is logged.
+        :class:`Trainer` runs, this override preserves the legacy SFT
+        ``packing=True`` knob. The shared ``sequence_packing=True`` flag
+        is handled by the base implementation so other offline
+        single-stream trainers use the same wrapper.
 
         Side effects:
             Replaces ``self._train_source`` (and, when configured,
             ``self._eval_source``) with packed views in place.
         """
-        # First apply standard tokenization transform
         super()._apply_preprocess_transforms()
 
-        # Then apply packing if enabled
-        if not getattr(self.arguments, "packing", False):
+        if getattr(self.arguments, "sequence_packing", False) or not getattr(self.arguments, "packing", False):
             return
 
-        from easydel.data.transforms.pack import PackedShardedSource
-
-        # Get packing parameters
-        seq_length = self.arguments.max_length
-        eos_token_id = getattr(self.processing_class, "eos_token_id", None)
-        pad_token_id = getattr(self.processing_class, "pad_token_id", 0)
-
-        if eos_token_id is None:
-            logger.warning("No eos_token_id found, using pad_token_id for packing")
-            eos_token_id = pad_token_id
-
-        # Map strategy names
-        strategy_map = {"bfd": "first_fit", "wrapped": "greedy"}
-        strategy = strategy_map.get(self.arguments.packing_strategy, "greedy")
-        preserve_completion_mask = bool(getattr(self.arguments, "assistant_only_loss", False))
-        completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
-        if completion_only_loss is not None:
-            preserve_completion_mask = bool(completion_only_loss)
-        extra_field_pad_values = {"completion_mask": 0, "assistant_masks": 0} if preserve_completion_mask else None
-        extra_field_separator_values = {"completion_mask": 0, "assistant_masks": 0} if preserve_completion_mask else None
-
-        # Apply packing to train source
-        if self._train_source is not None:
-            self._train_source = PackedShardedSource(
-                source=self._train_source,
-                seq_length=seq_length,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                strategy=strategy,
-                include_segment_ids=True,
-                extra_field_pad_values=extra_field_pad_values,
-                extra_field_separator_values=extra_field_separator_values,
-            )
-
-        # Apply packing to eval source if eval_packing is enabled
         eval_packing = getattr(self.arguments, "eval_packing", None)
         if eval_packing is None:
             eval_packing = self.arguments.packing
 
-        if eval_packing and self._eval_source is not None:
-            self._eval_source = PackedShardedSource(
-                source=self._eval_source,
-                seq_length=seq_length,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                strategy=strategy,
-                include_segment_ids=True,
-                extra_field_pad_values=extra_field_pad_values,
-                extra_field_separator_values=extra_field_separator_values,
-            )
+        self._apply_sequence_packing_to_sources(
+            train_enabled=True,
+            eval_enabled=bool(eval_packing),
+        )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Compile SFT train/eval steps with the active sharding and QAT config."""
