@@ -446,6 +446,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self._model = jax.eval_shape(lambda: self.model_state.model)
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
+        self._user_data_collator = data_collator is not None
         self.data_collator = data_collator
         self.finetune = finetune
         self.processing_class = processing_class
@@ -2345,9 +2346,16 @@ class BaseTrainer(BaseTrainerProtocol):
         such as data augmentation, masking, or format conversion.
         The batch is automatically purified to remove non-array fields.
         """
+        batch = self._apply_user_data_collator(batch)
         # Purify batch to keep only JAX-compatible array fields
         batch = self._purify_batch(batch)
         return batch, {}
+
+    def _apply_user_data_collator(self, batch: tp.Any) -> tp.Any:
+        """Apply an explicitly supplied data collator to raw list batches."""
+        if self._user_data_collator and self.data_collator is not None and isinstance(batch, (list, tuple)):
+            return self.data_collator(batch)
+        return batch
 
     def _purify_batch(self, batch: dict) -> dict:
         """Remove non-JAX-compatible fields from a batch.

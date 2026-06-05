@@ -384,6 +384,7 @@ class GFPOTrainer(GRPOTrainer):
             and ``info`` carries reward / timing / filter-time metrics
             including ``filter_time`` for the filtering step.
         """
+        batch = self._apply_user_data_collator(batch)
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
         if reward_batch:

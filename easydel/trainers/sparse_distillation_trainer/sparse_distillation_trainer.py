@@ -429,6 +429,7 @@ class SparseDistillationTrainer(Trainer):
             ``completion_mask``, ``teacher_top_k_indices``, and
             ``teacher_top_k_logprobs``.
         """
+        batch = self._apply_user_data_collator(batch)
         batch = self._purify_batch(batch)
 
         scoring_time: float = 0.0

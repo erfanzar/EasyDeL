@@ -203,6 +203,7 @@ class PAPOTrainer(GRPOTrainer):
         or transforms it. The shaped batch and PAPO metrics are merged with the
         parent GRPO preprocessing output.
         """
+        batch = self._apply_user_data_collator(batch)
         reward_columns = self._extract_papo_reward_columns(batch)
         model_batch, metrics = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
         model_batch, papo_metrics = self._apply_papo_objective_shaping(model_batch, reward_columns)

@@ -176,6 +176,7 @@ class SSDTrainer(GRPOTrainer):
             cached = self._take_buffered_grpo_batch()
             if cached is not None:
                 return cached
+        batch = self._apply_user_data_collator(batch)
         batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]

@@ -317,6 +317,7 @@ class GKDTrainer(SFTTrainer):
         Returns:
             Processed batch and metrics dictionary.
         """
+        batch = self._apply_user_data_collator(batch)
         # Purify batch first to handle list of dicts (uncollated batch)
         batch = self._purify_batch(batch)
         if not is_train or self.gkd_generate_function is None:

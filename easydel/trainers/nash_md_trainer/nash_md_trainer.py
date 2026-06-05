@@ -540,6 +540,7 @@ class NashMDTrainer(GRPOTrainer):
             ``metrics_dict`` carries reward/length/timing diagnostics
             for the trainer's logger.
         """
+        batch = self._apply_user_data_collator(batch)
         batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids = batch["input_ids"]

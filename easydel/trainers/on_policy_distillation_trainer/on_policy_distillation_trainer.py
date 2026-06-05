@@ -396,6 +396,7 @@ class OnPolicyDistillationTrainer(Trainer):
             full prompt+completion sequence; auxiliary metrics include
             generation/preprocessing wallclock and mean completion length.
         """
+        batch = self._apply_user_data_collator(batch)
         batch = self._purify_batch(batch)
 
         with capture_time() as preprocessing_time_fn:

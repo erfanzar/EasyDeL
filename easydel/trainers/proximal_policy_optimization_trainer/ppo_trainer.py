@@ -985,6 +985,7 @@ class PPOTrainer(Trainer):
             wall-clock stats and aggregate score / KL diagnostics, plus
             one entry per reward function.
         """
+        batch = self._apply_user_data_collator(batch)
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
         if reward_batch:

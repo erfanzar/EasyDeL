@@ -719,6 +719,7 @@ class SDPOTrainer(GRPOTrainer):
             tuple[dict[str, jax.Array], dict[str, float | int | str]]:
             ``(processed_batch, metrics_dict)``.
         """
+        batch = self._apply_user_data_collator(batch)
         reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
         if reward_batch:

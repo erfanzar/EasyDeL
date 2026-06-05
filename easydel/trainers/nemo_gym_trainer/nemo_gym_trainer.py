@@ -241,6 +241,7 @@ class NeMoGymTrainer(GRPOTrainer):
         call and cleared in ``finally``. This prevents stale side-channel data
         from leaking into later batches if generation or scoring raises.
         """
+        batch = self._apply_user_data_collator(batch)
         metadata, agent_refs = self._extract_nemo_sidechannels(batch)
         self._nemo_active_metadata = metadata
         self._nemo_active_agent_refs = agent_refs

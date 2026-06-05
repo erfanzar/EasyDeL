@@ -371,6 +371,7 @@ class OnlineDPOTrainer(DPOTrainer):
         converted into chosen/rejected tensors, and then passed through the DPO
         shared step path.
         """
+        batch = self._apply_user_data_collator(batch)
         if "chosen_input_ids" in batch and "rejected_input_ids" in batch:
             return super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 

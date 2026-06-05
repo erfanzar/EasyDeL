@@ -810,6 +810,7 @@ class BCOTrainer(Trainer):
             dict of scalar diagnostics (currently the mean UDM ratio
             when UDM is active).
         """
+        batch = self._apply_user_data_collator(batch)
         # Purify batch first to handle list of dicts (uncollated batch)
         batch = self._purify_batch(batch)
         batch["running_mean"] = jnp.asarray(self.running.mean, dtype=jnp.float32)

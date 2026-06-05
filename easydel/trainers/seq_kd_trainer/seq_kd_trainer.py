@@ -327,6 +327,7 @@ class SeqKDTrainer(Trainer):
             ValueError: If ``teacher_fn`` returns a list whose length
                 does not match the expected number of repeated prompts.
         """
+        batch = self._apply_user_data_collator(batch)
         batch = self._purify_batch(batch)
 
         generation_time: float = 0.0

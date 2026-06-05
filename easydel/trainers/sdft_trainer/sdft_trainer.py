@@ -182,6 +182,7 @@ class SDFTTrainer(SDPOTrainer):
         rollout generation is delegated to the frozen reference state while the
         returned batch is still optimized by the normal training step.
         """
+        batch = self._apply_user_data_collator(batch)
         context = batch.get("privileged_context")
         if context is None:
             context = batch.get("context")
