@@ -47,6 +47,9 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+_PYARROW_NESTED_CHUNKED_ARRAY_ERROR = "Nested data conversions not implemented for chunked array outputs"
+_PARQUET_NESTED_FALLBACK_BATCH_SIZE = 1
+
 
 def _is_pathlike(s: str) -> bool:
     """Heuristic that distinguishes filesystem/URL strings from Hub repo identifiers.
@@ -312,6 +315,8 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         self._storage_options = storage_options or {}
         self._columns = columns
         self._shard_info_cache: dict[str, ParquetShardInfo] = {}
+        self._warned_projection_fallback = False
+        self._force_single_threaded_reads = False
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -342,6 +347,177 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         return fsspec.open(path, "rb", **self._storage_options)
+
+    @staticmethod
+    def _is_nested_projection_error(exc: Exception) -> bool:
+        """Return whether *exc* is PyArrow's nested projected-read bug."""
+        return type(exc).__name__ == "ArrowNotImplementedError" and _PYARROW_NESTED_CHUNKED_ARRAY_ERROR in str(exc)
+
+    def _warn_projection_fallback_once(self) -> None:
+        """Log the nested Parquet fallback warning at most once per source."""
+        if self._warned_projection_fallback:
+            return
+        logger.warning(
+            "Projected Parquet row-group reads failed for nested columns; "
+            "retrying with single-threaded Parquet reads."
+        )
+        self._warned_projection_fallback = True
+
+    def _project_row(self, row: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Apply the configured top-level projection to one row dict."""
+        if self._columns is None:
+            return row
+
+        projected: dict[str, tp.Any] = {}
+        for column in self._columns:
+            key = column if column in row else column.split(".", 1)[0]
+            if key in row and key not in projected:
+                projected[key] = row[key]
+        return projected
+
+    @staticmethod
+    def _table_to_rows(table: tp.Any) -> "Iterator[dict]":
+        """Yield row dictionaries from an Arrow table."""
+        try:
+            cols = table.to_pydict()
+        except Exception as exc:
+            if not ParquetShardedSource._is_nested_projection_error(exc):
+                raise
+            combine_chunks = getattr(table, "combine_chunks", None)
+            if combine_chunks is None:
+                raise
+            cols = combine_chunks().to_pydict()
+        if not cols:
+            return
+        n = len(next(iter(cols.values()), []))
+        for i in range(n):
+            yield {k: v[i] for k, v in cols.items()}
+
+    @staticmethod
+    def _column_output_key(column: str) -> str:
+        """Return the top-level row key produced for a projected column."""
+        return column.split(".", 1)[0]
+
+    @classmethod
+    def _projection_pairs(cls, columns: list[str]) -> list[tuple[str, str]]:
+        """Return deduplicated ``(parquet_column, row_key)`` projection pairs."""
+        pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for column in columns:
+            key = cls._column_output_key(column)
+            if key not in seen:
+                pairs.append((column, key))
+                seen.add(key)
+        return pairs
+
+    def _iter_row_group_batches(
+        self,
+        pf: tp.Any,
+        rg_idx: int,
+        columns: list[str] | None,
+        *,
+        batch_size: int | None = None,
+    ) -> "Iterator[dict]":
+        """Yield row dictionaries from a row group through RecordBatch reads."""
+        kwargs = {"row_groups": [rg_idx], "columns": columns, "use_threads": False}
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        for batch in pf.iter_batches(**kwargs):
+            yield from self._table_to_rows(batch)
+
+    def _iter_row_group_columns(self, pf: tp.Any, rg_idx: int, columns: list[str]) -> "Iterator[dict]":
+        """Yield rows by reading projected columns one at a time."""
+        values_by_key: dict[str, list[tp.Any]] = {}
+        expected_rows: int | None = None
+        for parquet_column, key in self._projection_pairs(columns):
+            values: list[tp.Any] = []
+            for row in self._iter_row_group_batches(
+                pf,
+                rg_idx,
+                [parquet_column],
+                batch_size=_PARQUET_NESTED_FALLBACK_BATCH_SIZE,
+            ):
+                if key not in row:
+                    continue
+                values.append(row[key])
+
+            if expected_rows is None:
+                expected_rows = len(values)
+            elif len(values) != expected_rows:
+                raise ValueError(
+                    f"Projected Parquet column {parquet_column!r} yielded {len(values)} rows; "
+                    f"expected {expected_rows}."
+                )
+            values_by_key[key] = values
+
+        for i in range(expected_rows or 0):
+            yield {key: values[i] for key, values in values_by_key.items()}
+
+    def _iter_row_group_rows(self, pf: tp.Any, rg_idx: int) -> "Iterator[dict]":
+        """Yield rows from one row group, avoiding PyArrow's nested table bug."""
+        use_threads = not self._force_single_threaded_reads
+        try:
+            table = pf.read_row_group(
+                rg_idx,
+                columns=self._columns,
+                use_threads=use_threads,
+            )
+            yield from self._table_to_rows(table)
+            return
+        except Exception as exc:
+            if not self._is_nested_projection_error(exc):
+                raise
+
+        self._warn_projection_fallback_once()
+        self._force_single_threaded_reads = True
+
+        if use_threads:
+            try:
+                table = pf.read_row_group(rg_idx, columns=self._columns, use_threads=False)
+                yield from self._table_to_rows(table)
+                return
+            except Exception as exc:
+                if not self._is_nested_projection_error(exc):
+                    raise
+
+        try:
+            for row in self._iter_row_group_batches(pf, rg_idx, self._columns):
+                yield row
+            return
+        except Exception as exc:
+            if not self._is_nested_projection_error(exc):
+                raise
+
+        try:
+            for row in self._iter_row_group_batches(
+                pf,
+                rg_idx,
+                self._columns,
+                batch_size=_PARQUET_NESTED_FALLBACK_BATCH_SIZE,
+            ):
+                yield row
+            return
+        except Exception as exc:
+            if not self._is_nested_projection_error(exc):
+                raise
+
+        if self._columns is not None:
+            try:
+                yield from self._iter_row_group_columns(pf, rg_idx, self._columns)
+                return
+            except Exception as exc:
+                if not self._is_nested_projection_error(exc):
+                    raise
+
+        for row in self._iter_row_group_batches(
+            pf,
+            rg_idx,
+            None,
+            batch_size=_PARQUET_NESTED_FALLBACK_BATCH_SIZE,
+        ):
+            projected = self._project_row(row)
+            if projected:
+                yield projected
 
     @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def get_shard_info(self, shard_name: str) -> ParquetShardInfo:
@@ -388,13 +564,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         with self._open_file(shard_name) as fh:
             pf = pq.ParquetFile(fh)
             for rg_idx in range(pf.num_row_groups):
-                table = pf.read_row_group(rg_idx, columns=self._columns)
-                cols = table.to_pydict()
-                if not cols:
-                    continue
-                n = len(next(iter(cols.values()), []))
-                for i in range(n):
-                    yield {k: v[i] for k, v in cols.items()}
+                yield from self._iter_row_group_rows(pf, rg_idx)
 
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
         """Open a Parquet shard starting at a specific row.
@@ -428,15 +598,10 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
             # Iterate from the target row group
             for rg_idx in range(start_rg, pf.num_row_groups):
-                table = pf.read_row_group(rg_idx, columns=self._columns)
-                cols = table.to_pydict()
-                if not cols:
-                    continue
-                n = len(next(iter(cols.values()), []))
-
                 start_i = skip_in_rg if rg_idx == start_rg else 0
-                for i in range(start_i, n):
-                    yield {k: v[i] for k, v in cols.items()}
+                for i, example in enumerate(self._iter_row_group_rows(pf, rg_idx)):
+                    if i >= start_i:
+                        yield example
 
     def __len__(self) -> int:
         """Return total number of rows across all parquet files.

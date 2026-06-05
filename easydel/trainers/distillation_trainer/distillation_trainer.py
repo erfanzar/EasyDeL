@@ -460,11 +460,25 @@ class DistillationTrainer(Trainer):
         """
         if self._train_source is None:
             return False
+        if self._source_requires_row_preprocessing(self._train_source):
+            return False
         try:
             sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
             return "input_ids" in sample
         except (StopIteration, IndexError):
             return False
+
+    @staticmethod
+    def _source_requires_row_preprocessing(source: tp.Any) -> bool:
+        """Return whether a source wrapper can expose heterogeneous row schemas."""
+        current = source
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if type(current).__name__ in {"MixedShardedSource", "ShuffledShardedSource"}:
+                return True
+            current = getattr(current, "_source", None)
+        return False
 
     def _preprocess_batch_input(
         self,
