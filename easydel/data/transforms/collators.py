@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Collators for the precomputed "embeds-only" VLM data pack.
+"""Collators for precomputed "embeds-only" VLM data packs.
 
-QAT-distillation of the Qwen3.5-VL teacher consumes parquet rows that already carry
-POST-vision-tower image embeddings (bf16). Training decodes those blobs, scatters them into
-the ``<image>`` placeholder positions (``IMAGE_PLACEHOLDER_ID``) and SKIPS the vision tower.
-``HIDDEN`` is the teacher hidden size. These collators turn a list of pack rows into a
-batch dict the Qwen3.5 / Qwen3.5-MoE forward consumes via its ``image_embeds`` /
-``image_grid_thw`` arguments.
+These rows already carry post-vision-tower image embeddings. Training decodes those blobs,
+scatters them into caller-specified image placeholder positions, and skips the vision tower.
+The collators do not own model-family constants: callers pass the image token id, optional
+embedding width for all-text batches, and the model-specific mRoPE position helper when needed.
 
 They were originally reference fixtures inside ``tests/data/test_embeds_pack.py`` and are
 promoted here so a real training run can import them; the contract test now imports from this
@@ -90,31 +88,87 @@ parquet source, so it is intentionally left as a separate decision rather than b
 
 from __future__ import annotations
 
+import typing as tp
+
 import numpy as np
 
-# Pack contract constants (Qwen3_5Config ``image_token_id`` default / teacher hidden size).
-IMAGE_PLACEHOLDER_ID = 248056
-HIDDEN = 5120
-# Teacher vision ``spatial_merge_size`` (Qwen3.5-VL = 2). The pack's per-image placeholder run
-# length equals ``T * (grid_h // SPATIAL_MERGE_SIZE) * (grid_w // SPATIAL_MERGE_SIZE)``; the M-RoPE
-# helper needs this to lay out image position ids that line up with those placeholder runs.
-SPATIAL_MERGE_SIZE = 2
+PositionIdFn = tp.Callable[..., tuple[tp.Any, tp.Any]]
 
 
-def _decode_row_embeds(row: dict) -> np.ndarray:
+def _as_list(value: tp.Any) -> list[tp.Any]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return list(value)
+
+
+def _infer_row_embed_dim(row: dict, embed_dim: int | None = None) -> int:
+    """Resolve one row's image-embed width from explicit value, row metadata, or bf16 blob bytes."""
+    if embed_dim is not None:
+        return int(embed_dim)
+    row_dim = row.get("embed_dim")
+    if row_dim is not None:
+        return int(row_dim)
+
+    embed_n_tok = [int(v) for v in _as_list(row.get("embed_n_tok"))]
+    blobs = _as_list(row.get("image_embeds"))
+    for n_tok, blob in zip(embed_n_tok, blobs, strict=False):
+        if n_tok <= 0:
+            continue
+        byte_len = len(blob)
+        denom = n_tok * 2
+        if byte_len % denom != 0:
+            raise ValueError(f"cannot infer embed_dim: blob has {byte_len} bytes for {n_tok} bf16 rows")
+        return byte_len // denom
+
+    raise ValueError("embed_dim is required for an all-text batch/row with no image embedding blobs")
+
+
+def _infer_batch_embed_dim(rows: list[dict], embeds_list: list[np.ndarray], embed_dim: int | None = None) -> int:
+    """Resolve a single embed width for the materialized batch and reject mixed-width packs."""
+    dims: set[int] = set()
+    if embed_dim is not None:
+        dims.add(int(embed_dim))
+    for row in rows:
+        row_dim = row.get("embed_dim")
+        if row_dim is not None:
+            dims.add(int(row_dim))
+    for embeds in embeds_list:
+        if embeds.ndim == 2 and embeds.shape[1] > 0:
+            dims.add(int(embeds.shape[1]))
+    if not dims:
+        raise ValueError("embed_dim is required when every packed row is text-only")
+    if len(dims) != 1:
+        raise ValueError(f"mixed embed_dim values in one packed batch: {sorted(dims)}")
+    return dims.pop()
+
+
+def _decode_row_embeds(row: dict, embed_dim: int | None = None) -> np.ndarray:
     """Decode a row's per-image bf16 blobs to a single ``(sum(embed_n_tok), embed_dim)`` f32 array."""
     import ml_dtypes
 
-    ed = int(row["embed_dim"])
-    ent = list(row["embed_n_tok"])
-    blobs = row["image_embeds"]
-    mats = [np.frombuffer(b, dtype=ml_dtypes.bfloat16).reshape(ent[i], ed).astype(np.float32) for i, b in enumerate(blobs)]
+    ed = _infer_row_embed_dim(row, embed_dim)
+    ent = [int(v) for v in _as_list(row.get("embed_n_tok"))]
+    blobs = _as_list(row.get("image_embeds"))
+    if len(ent) != len(blobs):
+        raise ValueError(f"embed_n_tok/image_embeds length mismatch: {len(ent)} != {len(blobs)}")
+    mats = [
+        np.frombuffer(b, dtype=ml_dtypes.bfloat16).reshape(ent[i], ed).astype(np.float32) for i, b in enumerate(blobs)
+    ]
     if not mats:
         return np.zeros((0, ed), dtype=np.float32)
     return np.concatenate(mats, axis=0)
 
 
-def collate_embeds_pack(rows: list[dict], pad_id: int, max_total: int) -> dict:
+def collate_embeds_pack(
+    rows: list[dict],
+    pad_id: int,
+    max_total: int,
+    *,
+    image_token_id: int,
+    embed_dim: int | None = None,
+) -> dict:
     """Collate embed-pack rows into a static-shape batch for training (no vision tower).
 
     Pads ``input_ids`` with ``pad_id`` (must differ from the image placeholder so it is not
@@ -125,7 +179,7 @@ def collate_embeds_pack(rows: list[dict], pad_id: int, max_total: int) -> dict:
     """
     import jax.numpy as jnp
 
-    assert pad_id != IMAGE_PLACEHOLDER_ID, "pad_id must not collide with the image placeholder id"
+    assert pad_id != image_token_id, "pad_id must not collide with the image placeholder id"
     bsz = len(rows)
     max_len = max(len(r["input_ids"]) for r in rows)
 
@@ -140,13 +194,14 @@ def collate_embeds_pack(rows: list[dict], pad_id: int, max_total: int) -> dict:
         input_ids[bi, :length] = ids
         attention_mask[bi, :length] = np.asarray(r["attention_mask"], dtype=np.int32)
         labels[bi, :length] = np.asarray(r["labels"], dtype=np.int32)
-        embeds_list.append(_decode_row_embeds(r))
+        embeds_list.append(_decode_row_embeds(r, embed_dim))
         grids.append(np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3))
 
-    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, HIDDEN), np.float32)
+    resolved_embed_dim = _infer_batch_embed_dim(rows, embeds_list, embed_dim)
+    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, resolved_embed_dim), np.float32)
     n_real = all_embeds.shape[0]
     assert n_real <= max_total, f"decoded embed rows {n_real} exceed max_total {max_total}"
-    padded = np.zeros((max_total, HIDDEN), dtype=np.float32)
+    padded = np.zeros((max_total, resolved_embed_dim), dtype=np.float32)
     padded[:n_real] = all_embeds
     grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
 
@@ -160,7 +215,15 @@ def collate_embeds_pack(rows: list[dict], pad_id: int, max_total: int) -> dict:
     }
 
 
-def collate_bucket_static(rows: list[dict], pad_id: int, seq_len: int, max_embed_rows: int) -> dict:
+def collate_bucket_static(
+    rows: list[dict],
+    pad_id: int,
+    seq_len: int,
+    max_embed_rows: int,
+    *,
+    image_token_id: int,
+    embed_dim: int | None = None,
+) -> dict:
     """Bucketed STATIC-shape collator: pad every batch to a caller-fixed ``seq_len`` (the area_bucket
     sequence ceiling) and a fixed ``max_embed_rows`` embed-row cap, so all batches drawn from one
     bucket share an identical jitted shape and the training step compiles once per bucket (no
@@ -176,7 +239,7 @@ def collate_bucket_static(rows: list[dict], pad_id: int, seq_len: int, max_embed
     """
     import jax.numpy as jnp
 
-    assert pad_id != IMAGE_PLACEHOLDER_ID, "pad_id must not collide with the image placeholder id"
+    assert pad_id != image_token_id, "pad_id must not collide with the image placeholder id"
 
     # Belt-and-suspenders to the seq_len overflow assert below: a static-S batch must be homogeneous
     # in its partition key -- every row from ONE (source x area_bucket x slen_band) partition. The
@@ -223,13 +286,14 @@ def collate_bucket_static(rows: list[dict], pad_id: int, seq_len: int, max_embed
         input_ids[bi, :length] = ids
         attention_mask[bi, :length] = np.asarray(r["attention_mask"], dtype=np.int32)
         labels[bi, :length] = np.asarray(r["labels"], dtype=np.int32)
-        embeds_list.append(_decode_row_embeds(r))
+        embeds_list.append(_decode_row_embeds(r, embed_dim))
         grids.append(np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3))
 
-    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, HIDDEN), np.float32)
+    resolved_embed_dim = _infer_batch_embed_dim(rows, embeds_list, embed_dim)
+    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, resolved_embed_dim), np.float32)
     n_real = all_embeds.shape[0]
     assert n_real <= max_embed_rows, f"decoded embed rows {n_real} exceed max_embed_rows {max_embed_rows}"
-    padded = np.zeros((max_embed_rows, HIDDEN), dtype=np.float32)
+    padded = np.zeros((max_embed_rows, resolved_embed_dim), dtype=np.float32)
     padded[:n_real] = all_embeds
     grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
 
@@ -249,7 +313,10 @@ def collate_packed_embeds(
     seq_len: int,
     max_embed_rows: int,
     n_windows: int,
-    spatial_merge_size: int = SPATIAL_MERGE_SIZE,
+    *,
+    image_token_id: int,
+    embed_dim: int | None = None,
+    position_id_fn: PositionIdFn | None = None,
 ) -> dict:
     """Packed TRAINING-STATIC MATERIALIZER: turn one batch's per-window row assignments into a
     constant ``(n_windows, seq_len)`` batch on EVERY call (so the pod compiles the step once).
@@ -277,11 +344,9 @@ def collate_packed_embeds(
     forward and backward).
 
     3D M-RoPE ``position_ids`` are reset per example: each segment's positions restart at 0. This is
-    obtained by calling the model's own ``_get_rope_index_from_mm_token_types`` on each example in
-    isolation (its ``current_pos`` starts at 0) and concatenating -- no reimplementation of the
-    mRoPE math, and it keeps positions from running cumulatively past ``max_position_embeddings``.
-    The forward consumes caller ``position_ids`` directly (modeling_qwen3_5.py:1110) and flattens
-    3D->1D itself when the text config does not enable mRoPE.
+    obtained by calling the caller-supplied model position helper on each example in isolation and
+    concatenating. Text-only examples use a simple per-example 1D sequence repeated over the 3 mRoPE
+    axes when no helper is supplied.
 
     Image embeds are decoded and concatenated in EXAMPLE order (== the row-major placeholder scan of
     the flattened ``(n_windows, seq_len)`` batch) and zero-padded to ``max_embed_rows``;
@@ -294,9 +359,7 @@ def collate_packed_embeds(
     """
     import jax.numpy as jnp
 
-    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
-
-    assert pad_id != IMAGE_PLACEHOLDER_ID, "pad_id must not collide with the image placeholder id"
+    assert pad_id != image_token_id, "pad_id must not collide with the image placeholder id"
 
     # Partition homogeneity (best-effort; no-op when rows lack the path-only Hive keys -- see module
     # docstring). Keep source/area_bucket: decoded embeds + the scatter assume one teacher/resolution
@@ -344,34 +407,40 @@ def collate_packed_embeds(
             labels[wi, window_slice] = np.asarray(r["labels"], dtype=np.int32)
             segment_ids[wi, window_slice] = seg_idx
 
-            # Per-example reset 3D M-RoPE: run the model helper on THIS example alone so its
-            # current_pos starts at 0, then drop the result into the window slice -> the segment's
-            # positions reset at its start. mm_token_type_ids marks image placeholders (1) vs text
-            # (0); image groups consume image_grid_thw to lay out 2D spatial positions.
+            # Per-example reset 3D M-RoPE: run the caller's model helper on THIS example alone,
+            # then drop the result into the window slice. The generic collator only marks image
+            # placeholders; model-family details live in ``position_id_fn``.
             grid = np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3)
-            mm_token_type_ids = (ids == IMAGE_PLACEHOLDER_ID).astype(np.int32).reshape(1, -1)
-            example_positions, _ = _get_rope_index_from_mm_token_types(
-                input_ids=ids.reshape(1, -1),
-                mm_token_type_ids=mm_token_type_ids,
-                image_grid_thw=grid if grid.shape[0] else None,
-                attention_mask=None,
-                spatial_merge_size=spatial_merge_size,
-            )
+            has_images = bool(np.any(ids == image_token_id))
+            if has_images:
+                if position_id_fn is None:
+                    raise ValueError("position_id_fn is required for packed rows containing image placeholders")
+                mm_token_type_ids = (ids == image_token_id).astype(np.int32).reshape(1, -1)
+                example_positions, _ = position_id_fn(
+                    input_ids=ids.reshape(1, -1),
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=grid if grid.shape[0] else None,
+                    attention_mask=None,
+                )
+            else:
+                example_positions = np.arange(length, dtype=np.int32).reshape(1, 1, -1).repeat(3, axis=0)
             position_ids[:, wi, window_slice] = np.asarray(example_positions)[:, 0, :]
 
-            embeds_list.append(_decode_row_embeds(r))
+            embeds_list.append(_decode_row_embeds(r, embed_dim))
             grids.append(grid)
             offset += length
 
-    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, HIDDEN), np.float32)
+    flat_rows = [r for pack in packs for r in pack]
+    resolved_embed_dim = _infer_batch_embed_dim(flat_rows, embeds_list, embed_dim)
+    all_embeds = np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, resolved_embed_dim), np.float32)
     n_real = all_embeds.shape[0]
-    n_place = int((input_ids == IMAGE_PLACEHOLDER_ID).sum())
+    n_place = int((input_ids == image_token_id).sum())
     assert n_place == n_real, (
         f"placeholder/embed mismatch: {n_place} image-placeholder tokens but {n_real} decoded embed "
         "rows -- packing must preserve the per-example placeholder<->embed alignment"
     )
     assert n_real <= max_embed_rows, f"decoded embed rows {n_real} exceed max_embed_rows {max_embed_rows}"
-    padded = np.zeros((max_embed_rows, HIDDEN), dtype=np.float32)
+    padded = np.zeros((max_embed_rows, resolved_embed_dim), dtype=np.float32)
     padded[:n_real] = all_embeds
     grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
 

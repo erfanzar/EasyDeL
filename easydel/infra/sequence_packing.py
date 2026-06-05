@@ -84,7 +84,9 @@ def normalize_packed_segment_ids(segment_ids: tp.Any, target_length: int, *, pad
     if seq_len == 0:
         return jnp.full((segment_ids.shape[0], target_length), -1, dtype=segment_ids.dtype)
     pad_len = target_length - seq_len
-    pad_value = segment_ids[:, -1:] if pad_from_last else jnp.full((segment_ids.shape[0], 1), -1, dtype=segment_ids.dtype)
+    pad_value = (
+        segment_ids[:, -1:] if pad_from_last else jnp.full((segment_ids.shape[0], 1), -1, dtype=segment_ids.dtype)
+    )
     pad = jnp.broadcast_to(pad_value, (segment_ids.shape[0], pad_len))
     return jnp.concatenate([segment_ids, pad], axis=1)
 
@@ -171,7 +173,9 @@ def segmented_depthwise_causal_conv1d(
     return outputs, final_state
 
 
-def token_attention_mask_from_mask_info(mask_info: MaskInfo | None, target_length: int | None = None) -> jnp.ndarray | None:
+def token_attention_mask_from_mask_info(
+    mask_info: MaskInfo | None, target_length: int | None = None
+) -> jnp.ndarray | None:
     """Return a token-level valid mask without materializing pairwise attention.
 
     Prefer segment ids when available. Falling back to an already-materialized

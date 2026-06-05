@@ -35,7 +35,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-jax.config.update("jax_platform_name", "cpu")
+if not jax.config.jax_platforms:
+    jax.config.update("jax_platform_name", "cpu")
 
 ATOL = 2e-3
 

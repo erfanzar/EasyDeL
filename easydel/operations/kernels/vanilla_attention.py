@@ -280,7 +280,10 @@ class VanillaAttn(OperationImpl):
             return False
         if getattr(mask_info, "_attention_mask", None) is not None:
             return False
-        return getattr(mask_info, "_q_segment_ids", None) is not None or getattr(mask_info, "_kv_segment_ids", None) is not None
+        return (
+            getattr(mask_info, "_q_segment_ids", None) is not None
+            or getattr(mask_info, "_kv_segment_ids", None) is not None
+        )
 
     def _forward_segmented(
         self,

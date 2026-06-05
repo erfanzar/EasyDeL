@@ -444,7 +444,9 @@ class DistillationTrainer(Trainer):
             max_length=self.arguments.max_length,
             text_field=text_field,
             mask_prompt=mask_prompt,
-            padding=False if getattr(self.arguments, "sequence_packing", False) or self._user_data_collator else "max_length",
+            padding=False
+            if getattr(self.arguments, "sequence_packing", False) or self._user_data_collator
+            else "max_length",
             truncation_mode=self.arguments.truncation_mode,
         )
 

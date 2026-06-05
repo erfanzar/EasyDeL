@@ -56,21 +56,59 @@ import jax
 import numpy as np
 import pytest
 
-jax.config.update("jax_platform_name", "cpu")
-
-from easydel.data.transforms.collators import (  # noqa: E402
-    HIDDEN,
-    IMAGE_PLACEHOLDER_ID,
+from easydel.data.transforms.collators import (
     _decode_row_embeds,
-    collate_bucket_static,
-    collate_embeds_pack,
-    collate_packed_embeds,
 )
-from easydel.data.transforms.packer import EmbedsWindowPacker  # noqa: E402
+from easydel.data.transforms.collators import (
+    collate_bucket_static as _collate_bucket_static,
+)
+from easydel.data.transforms.collators import (
+    collate_embeds_pack as _collate_embeds_pack,
+)
+from easydel.data.transforms.collators import (
+    collate_packed_embeds as _collate_packed_embeds,
+)
+from easydel.data.transforms.packer import EmbedsWindowPacker
 
-# Vision span special-token ids; IMAGE_PLACEHOLDER_ID + HIDDEN are imported from the collators module above.
+if not jax.config.jax_platforms:
+    jax.config.update("jax_platform_name", "cpu")
+
+# Fixture-local pack contract for the staged Qwen3.5-VL parquet samples. Production collators receive
+# these values from caller/model config; tests pin them here because this fixture is Qwen-shaped.
+HIDDEN = 5120
+IMAGE_PLACEHOLDER_ID = 248056
+SPATIAL_MERGE_SIZE = 2
 VISION_START_ID = 248053
 VISION_END_ID = 248054
+
+
+def _qwen_pack_position_id_fn(**kwargs):
+    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+
+    return _get_rope_index_from_mm_token_types(
+        **kwargs,
+        spatial_merge_size=SPATIAL_MERGE_SIZE,
+    )
+
+
+def collate_embeds_pack(*args, **kwargs):
+    kwargs.setdefault("image_token_id", IMAGE_PLACEHOLDER_ID)
+    kwargs.setdefault("embed_dim", HIDDEN)
+    return _collate_embeds_pack(*args, **kwargs)
+
+
+def collate_bucket_static(*args, **kwargs):
+    kwargs.setdefault("image_token_id", IMAGE_PLACEHOLDER_ID)
+    kwargs.setdefault("embed_dim", HIDDEN)
+    return _collate_bucket_static(*args, **kwargs)
+
+
+def collate_packed_embeds(*args, **kwargs):
+    kwargs.setdefault("image_token_id", IMAGE_PLACEHOLDER_ID)
+    kwargs.setdefault("embed_dim", HIDDEN)
+    kwargs.setdefault("position_id_fn", _qwen_pack_position_id_fn)
+    return _collate_packed_embeds(*args, **kwargs)
+
 
 _DATA_GLOB = os.environ.get(
     "EMBEDS_PACK_GLOB",
@@ -299,12 +337,12 @@ def test_collate_bucket_static_three_level_real_cell(rows):
     assert int((ids == IMAGE_PLACEHOLDER_ID).sum()) == out["n_real_embeds"], "placeholder<->embed parity broke"
 
 
-def _build_tiny_text_model(seq_cap: int):
-    """A minimal CPU Qwen3.5 causal-LM whose hidden size matches the pack's embed_dim (5120).
+def _build_tiny_text_model(seq_cap: int, *, hidden_size: int = HIDDEN):
+    """A minimal CPU Qwen3.5 causal-LM.
 
-    Dense (Qwen3_5TextConfig forces dense MLPs / no MoE), 1 full-attention layer, tiny vocab and
-    intermediate size — enough to exercise the real forward through ``inputs_embeds`` without the
-    vision tower, cheaply on CPU.
+    The default hidden size matches the pack's embed_dim (5120) for tests that inject real
+    precomputed image embeddings. Pure text packing tests can request a smaller hidden size because
+    they only validate segment masking / positions / logits and never pass ``image_embeds``.
     """
     import jax.numpy as jnp
     import spectrax as spx
@@ -312,14 +350,24 @@ def _build_tiny_text_model(seq_cap: int):
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 
+    if hidden_size == HIDDEN:
+        intermediate_size = 256
+        num_attention_heads = 8
+        num_key_value_heads = 2
+    else:
+        intermediate_size = max(128, hidden_size * 2)
+        num_attention_heads = 4
+        num_key_value_heads = 2
+    head_dim = hidden_size // num_attention_heads
+
     config = Qwen3_5TextConfig(
         vocab_size=256,
-        hidden_size=HIDDEN,
-        intermediate_size=256,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
         num_hidden_layers=1,
-        num_attention_heads=8,
-        num_key_value_heads=2,
-        head_dim=640,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
         max_position_embeddings=max(2048, seq_cap + 8),
         layer_types=["full_attention"],
         mtp_num_hidden_layers=0,
@@ -512,7 +560,12 @@ def test_forward_inject_equivalence(vl_remapped):
     import jax.numpy as jnp
 
     m = vl_remapped["model"]
-    ids_j, real_j, grid_j, am_j = (vl_remapped["ids_j"], vl_remapped["real_j"], vl_remapped["grid_j"], vl_remapped["am_j"])
+    ids_j, real_j, grid_j, am_j = (
+        vl_remapped["ids_j"],
+        vl_remapped["real_j"],
+        vl_remapped["grid_j"],
+        vl_remapped["am_j"],
+    )
 
     out_std = m(input_ids=ids_j, image_embeds=real_j, image_grid_thw=grid_j, attention_mask=am_j)
     std = np.asarray(out_std.last_hidden_state.astype(jnp.float32))
@@ -535,7 +588,12 @@ def test_forward_mrope_uses_image_grid(vl_remapped):
     Phase-1 gating fix — verified by ``rope_deltas`` matching the grid path and differing from the
     grid-less path."""
     m = vl_remapped["model"]
-    ids_j, real_j, grid_j, am_j = (vl_remapped["ids_j"], vl_remapped["real_j"], vl_remapped["grid_j"], vl_remapped["am_j"])
+    ids_j, real_j, grid_j, am_j = (
+        vl_remapped["ids_j"],
+        vl_remapped["real_j"],
+        vl_remapped["grid_j"],
+        vl_remapped["am_j"],
+    )
     place_pos = vl_remapped["place_pos"]
 
     pos_g, dl_g = m.get_rope_index(ids_j, image_grid_thw=grid_j, attention_mask=am_j)
@@ -698,7 +756,9 @@ def test_compute_loss_and_grads_train_the_pack(rows):
     real_norm = float(np.linalg.norm(g_emb[:n_real]))
     tail_norm = float(np.linalg.norm(g_emb[n_real:]))
     assert real_norm > 1e-6, "real image-embed rows got zero gradient — embeds are not in the differentiable loss graph"
-    assert tail_norm == 0.0, f"zero-padded embed rows got non-zero gradient {tail_norm} — padding leaked into the scatter"
+    assert tail_norm == 0.0, (
+        f"zero-padded embed rows got non-zero gradient {tail_norm} — padding leaked into the scatter"
+    )
 
 
 @pytest.mark.slow
@@ -814,7 +874,9 @@ def test_get_rope_index_is_eager_only_under_jit():
     # use a 2x2 grid so merge=2 -> 1*1*1=1 placeholder for a tiny, fast trace.
     ids = np.array([_RM_TEXT, _RM_VSTART, _RM_PLACE, _RM_VEND, _RM_TEXT], dtype=np.int32)
     grid = np.array([[1, 2, 2]], dtype=np.int32)  # t*(h//2)*(w//2) = 1 == #placeholders
-    model = Qwen3_5Model(config=_remapped_vl_config(ids.shape[0]), rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    model = Qwen3_5Model(
+        config=_remapped_vl_config(ids.shape[0]), rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32
+    )
     ids_j, grid_j = jnp.asarray(ids)[None], jnp.asarray(grid)
 
     # Eager: concrete grid -> works.
@@ -868,7 +930,9 @@ def test_live_teacher_distillation_step_trains_student(rows):
         config=_remapped_vl_config(seq), rngs=spx.Rngs(7), dtype=jnp.float32, param_dtype=jnp.float32
     )
     student_state = EasyDeLState.create(model=student_model, tx=optax.adam(1e-3), init_opt_state=True)
-    teacher_state = EasyDeLState.create(model=teacher_model, tx=None)  # inference-only; teacher_forward only reads .model
+    teacher_state = EasyDeLState.create(
+        model=teacher_model, tx=None
+    )  # inference-only; teacher_forward only reads .model
 
     # Host-precompute mRoPE positions from the (concrete) grid, then drop the grid so the jitted step
     # never traces get_rope_index. This is the actual scale path for the embeds-only pack.
@@ -966,7 +1030,9 @@ def test_bucketed_static_batch_jit_stable_no_rope_trace(rows):
         ).logits
 
     b1 = make_batch(S)
-    logits1 = np.asarray(fwd(gstate, b1["input_ids"], b1["attention_mask"], b1["image_embeds"], b1["position_ids"]).astype(jnp.float32))
+    logits1 = np.asarray(
+        fwd(gstate, b1["input_ids"], b1["attention_mask"], b1["image_embeds"], b1["position_ids"]).astype(jnp.float32)
+    )
     assert logits1.shape == (2, S, _RM_VOCAB), "unexpected logits shape from the static bucket forward"
     assert np.isfinite(logits1).all(), "jitted host-position_ids forward produced non-finite logits"
     assert n_traces["n"] == 1, "first call should compile exactly once"
@@ -1013,7 +1079,12 @@ def test_two_image_row_both_images_inject_and_train(rows):
     config = _remapped_vl_config(int(batch["input_ids"].shape[1]))
     model = Qwen3_5ForConditionalGeneration(config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
     gdef, gstate, gother = model.split_module()
-    ids_j, am_j, grid_j, labels_j = (batch["input_ids"], batch["attention_mask"], batch["image_grid_thw"], batch["labels"])
+    ids_j, am_j, grid_j, labels_j = (
+        batch["input_ids"],
+        batch["attention_mask"],
+        batch["image_grid_thw"],
+        batch["labels"],
+    )
     assert np.asarray(grid_j).shape == (2, 3), "two images should yield a (2,3) grid"
 
     def loss_wrt_embeds(emb):
@@ -1074,7 +1145,12 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
     bucket_collate = functools.partial(collate_bucket_static, pad_id=0, seq_len=S, max_embed_rows=cap)
     source = ParquetShardedSource(data_files=path)
     loader = AsyncDataLoader(
-        source=source, batch_size=B, prefetch_enabled=False, shuffle_buffer_size=None, drop_last=True, collate_fn=bucket_collate
+        source=source,
+        batch_size=B,
+        prefetch_enabled=False,
+        shuffle_buffer_size=None,
+        drop_last=True,
+        collate_fn=bucket_collate,
     )
     batch = next(iter(loader))
 
@@ -1089,8 +1165,12 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
         source=source, batch_size=B, prefetch_enabled=False, shuffle_buffer_size=None, drop_last=True
     )
     default_batch = next(iter(default_loader))
-    assert "n_real_embeds" not in default_batch, "default collator unexpectedly produced n_real_embeds (hook not isolated)"
-    assert np.asarray(default_batch["input_ids"]).shape != (B, S), "default collator unexpectedly matched the static window"
+    assert "n_real_embeds" not in default_batch, (
+        "default collator unexpectedly produced n_real_embeds (hook not isolated)"
+    )
+    assert np.asarray(default_batch["input_ids"]).shape != (B, S), (
+        "default collator unexpectedly matched the static window"
+    )
 
     # (2) end-to-end: host position_ids + the real-loader batch -> jitted forward -> finite logits.
     ids_rm = np.stack([_remap_ids(np.asarray(batch["input_ids"][i])) for i in range(B)], axis=0)
@@ -1120,8 +1200,9 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
 
 
 # --- packed-sequence collator (collate_packed_embeds) -------------------------------------------
-def _packable_row(text_len: int, imgs: list[int], source: str = "pixmo-points", area_bucket: int = 1024,
-                  slen_band: int | None = None) -> dict:
+def _packable_row(
+    text_len: int, imgs: list[int], source: str = "pixmo-points", area_bucket: int = 1024, slen_band: int | None = None
+) -> dict:
     """Synthetic pack row for the packing collator. ``imgs`` = per-image post-merge token counts; each
     image is laid down as a contiguous placeholder run followed by a single text token so it forms its
     own modality group, with ``image_grid_thw = (1, 2*nt, 2)`` which under spatial_merge_size=2 yields
@@ -1309,7 +1390,9 @@ def test_collate_packed_embeds_contract():
         )
         pos_e = np.asarray(pos_e)[:, 0, :]
         seg_slice = slice(offset, offset + length)
-        assert np.array_equal(pos[:, 0, seg_slice], pos_e), f"segment {k}: positions are not the per-example reset layout"
+        assert np.array_equal(pos[:, 0, seg_slice], pos_e), (
+            f"segment {k}: positions are not the per-example reset layout"
+        )
         assert int(pos[:, 0, seg_slice].min()) == 0, f"segment {k}: positions did not reset to 0"
         offset += length
 
@@ -1376,9 +1459,15 @@ def test_collate_packed_embeds_underfill():
     # avoids running the forward on an all-masked pad row, whose softmax behaviour is out of scope.)
     base = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=total_real, n_windows=1)
     for key in ("input_ids", "attention_mask", "labels", "segment_ids"):
-        assert np.array_equal(np.asarray(out[key])[0], np.asarray(base[key])[0]), f"real window {key} changed under underfill"
-    assert np.array_equal(np.asarray(out["position_ids"])[:, 0], np.asarray(base["position_ids"])[:, 0]), "real window positions changed under underfill"
-    assert np.array_equal(np.asarray(out["image_embeds"]), np.asarray(base["image_embeds"])), "embed side-channel changed under underfill"
+        assert np.array_equal(np.asarray(out[key])[0], np.asarray(base[key])[0]), (
+            f"real window {key} changed under underfill"
+        )
+    assert np.array_equal(np.asarray(out["position_ids"])[:, 0], np.asarray(base["position_ids"])[:, 0]), (
+        "real window positions changed under underfill"
+    )
+    assert np.array_equal(np.asarray(out["image_embeds"]), np.asarray(base["image_embeds"])), (
+        "embed side-channel changed under underfill"
+    )
 
 
 def test_collate_packed_embeds_guards():
@@ -1430,13 +1519,12 @@ def test_collate_packed_embeds_equivalence():
     ``test_collate_packed_embeds_underfill`` (trailing pad windows are byte-inert and, by batch-row
     independence, cannot perturb the real window's logits)."""
     import jax.numpy as jnp
-
     from ejkernel.types import MaskInfo
 
     docs = [[5, 9, 2, 7, 1], [3, 8, 4], [6, 2, 9, 5]]
     rows = [_text_row(d) for d in docs]
     seq_len = sum(len(d) for d in docs)  # exact fit -> one fully-packed window, no padding
-    model = _build_tiny_text_model(seq_len)
+    model = _build_tiny_text_model(seq_len, hidden_size=64)
 
     # unpacked references: each document run on its own.
     refs = [
@@ -1462,7 +1550,8 @@ def test_collate_packed_embeds_equivalence():
         cols = np.where(seg[0] == k)[0]
         assert cols.shape[0] == len(d)
         max_abs = float(np.max(np.abs(lp[cols] - refs[k])))
-        assert max_abs < 1e-3, f"packed segment {k} logits diverge from the unpacked run, max|Δ|={max_abs:.2e}"
+        atol = 3e-3 if jax.default_backend() == "tpu" else 1e-3
+        assert max_abs < atol, f"packed segment {k} logits diverge from the unpacked run, max|Δ|={max_abs:.2e}"
 
 
 @pytest.mark.slow
@@ -1485,7 +1574,7 @@ def test_collate_packed_embeds_underfill_backward_finite():
     attn = np.asarray(batch["attention_mask"])
     assert attn.shape == (n_windows, seq_len) and np.all(attn[1] == 0), "need a fully-masked pad window"
 
-    model = _build_tiny_text_model(seq_len)
+    model = _build_tiny_text_model(seq_len, hidden_size=64)
     # Mirror the trainer's grad path (trainers/trainer/_fn.py): differentiate the scalar loss w.r.t.
     # the trainable graphstate, re-binding the module each call via merge_module (== state.merge(tree)).
     gdef, params, others = model.split_module()

@@ -74,9 +74,27 @@ USAGE
     for row in source:                      # or packer.push(chunk_of_rows)
         packer.push([row])
         if len(packer) >= enough_to_fill_a_batch:   # caller-owned cadence
-            yield collate_packed_embeds(packer.emit(), pad_id, S, E, N)
+            yield collate_packed_embeds(
+                packer.emit(),
+                pad_id,
+                S,
+                E,
+                N,
+                image_token_id=image_token_id,
+                embed_dim=embed_dim,
+                position_id_fn=position_id_fn,
+            )
     for packs in packer.flush():            # drain the tail (trailing windows whole-padded)
-        yield collate_packed_embeds(packs, pad_id, S, E, N)
+        yield collate_packed_embeds(
+            packs,
+            pad_id,
+            S,
+            E,
+            N,
+            image_token_id=image_token_id,
+            embed_dim=embed_dim,
+            position_id_fn=position_id_fn,
+        )
 
 The caller owns the emit cadence: calling :meth:`emit` on a small carry produces a sparse batch
 (few real windows, the rest inert pad) -- still correct and statically shaped, just lower MFU. Emit

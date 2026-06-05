@@ -552,10 +552,7 @@ class FirstFitPacker:
 
         for tokens, source_id, extra_fields in sorted_pending:
             tokens = tokens[: self.seq_length]
-            extra_fields = {
-                field_name: values[: len(tokens)]
-                for field_name, values in extra_fields.items()
-            }
+            extra_fields = {field_name: values[: len(tokens)] for field_name, values in extra_fields.items()}
             append_eos = len(tokens) < self.seq_length
             token_len = len(tokens) + int(append_eos)
             placed = False

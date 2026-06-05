@@ -1630,7 +1630,7 @@ def _apply_qwen3_next_packed_updates_ragged(
             head_axis=head_axis,
             d_conv=d_conv,
             apply_silu=not use_recurrent_scan_prefill,
-           pre_sharded=False,
+            pre_sharded=False,
         )
         conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
 
