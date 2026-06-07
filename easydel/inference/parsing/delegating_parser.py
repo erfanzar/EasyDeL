@@ -18,7 +18,7 @@ Wraps a ReasoningParser and a ToolParser behind a single interface with an
 explicit phase state machine, eliminating the ad-hoc orchestration and
 expensive retokenization previously done in EngineParsingMixin._run_output_parsers().
 
-Design inspired by vLLM's DelegatingParser pattern.
+Design inspired by a delegating parser pattern.
 """
 
 from __future__ import annotations

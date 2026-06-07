@@ -44,7 +44,9 @@ def test_parquet_source_retries_nested_projection_error_single_threaded(tmp_path
         read_calls.append((i, tuple(columns) if columns is not None else None, use_threads))
         if columns is not None and use_threads:
             raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
-        return original_read_row_group(self, i, columns=columns, *args, **kwargs)
+        if args:
+            return original_read_row_group(self, i, columns, *args, **kwargs)
+        return original_read_row_group(self, i, columns=columns, **kwargs)
 
     monkeypatch.setattr(pq.ParquetFile, "read_row_group", flaky_read_row_group)
 
@@ -116,7 +118,9 @@ def test_parquet_source_projection_fallback_respects_start_row(tmp_path, monkeyp
     def flaky_read_row_group(self, i, columns=None, *args, **kwargs):
         if columns is not None:
             raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
-        return original_read_row_group(self, i, columns=columns, *args, **kwargs)
+        if args:
+            return original_read_row_group(self, i, columns, *args, **kwargs)
+        return original_read_row_group(self, i, columns=columns, **kwargs)
 
     monkeypatch.setattr(pq.ParquetFile, "read_row_group", flaky_read_row_group)
 

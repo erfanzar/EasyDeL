@@ -74,7 +74,10 @@ from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
 
-from easydel.inference.esurge.config import ESURGE_MIN_TOKEN_PAD, KernelTilePolicy
+from easydel.inference.esurge.config import (
+    ESURGE_MIN_TOKEN_PAD,
+    KernelTilePolicy,
+)
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
@@ -107,6 +110,7 @@ if typing.TYPE_CHECKING:
     from easydel.infra.etils import MpMdSchedulers
 
 logger = get_logger("eSurge")
+MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
 
 
 @dataclass(frozen=True)
@@ -454,6 +458,8 @@ class eSurgeRunner:
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = self.max_num_seq_buckets[-1]
+        if self._uses_spmd_dp():
+            self._validate_spmd_dp_support(attn_mechanism=attn_mechanism)
         self.async_scheduling = bool(async_scheduling)
         self.min_input_pad = max(min_input_pad, self.max_num_seq_buckets[0])
         self.page_size = int(self.metadata.page_size)
@@ -479,6 +485,13 @@ class eSurgeRunner:
             max_token_size=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
             padding_gap=0,
         )
+        if self._uses_spmd_dp():
+            dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+            self.num_tokens_paddings = [int(bucket) for bucket in self.num_tokens_paddings if int(bucket) % dp_size == 0]
+            if not self.num_tokens_paddings:
+                raise ValueError(
+                    f"Rank-major SPMD DP requires at least one token bucket divisible by DP size {dp_size}."
+                )
         self.max_num_tokens = self.num_tokens_paddings[-1]
         spec_full_hidden_max_tokens = 0
         if drafter is not None:
@@ -540,6 +553,103 @@ class eSurgeRunner:
         self._handoff_scalar_cache: dict[int, jax.Array] = {}
         logger.debug("eSurgeRunner initialization complete")
         self._log_startup_summary()
+
+    def _validate_spmd_dp_support(self, *, attn_mechanism: str | None) -> None:
+        """Fail early for features not wired into rank-major DP execution yet."""
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if jax.default_backend() != "tpu":
+            raise ValueError("Rank-major SPMD DP is currently TPU-only.")
+        if dp_size <= 1:
+            raise ValueError("Rank-major SPMD DP requires a data-parallel cache axis with size > 1.")
+        if self.pipeline_plan.is_enabled:
+            raise ValueError("Rank-major SPMD DP does not support MPMD/PP execution yet.")
+        if self.drafter is not None:
+            raise ValueError("Rank-major SPMD DP does not support speculative decoding yet.")
+        if attn_mechanism not in ("ragged_page_attention_v3", MLA_RAGGED_ATTN_MECHANISM):
+            raise ValueError(
+                "Rank-major SPMD DP currently supports "
+                f"ragged TPU attention only, got attn_mechanism={attn_mechanism!r}."
+            )
+        if int(self.max_num_reqs) % dp_size != 0:
+            raise ValueError(
+                "Rank-major SPMD DP requires max_num_reqs divisible by DP size: "
+                f"max_num_reqs={self.max_num_reqs}, dp_size={dp_size}."
+            )
+        runtime_rows = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
+        if runtime_rows != int(self.max_num_reqs):
+            raise ValueError(
+                "Rank-major SPMD DP currently requires the cache runtime request cap "
+                f"to cover all request rows: runtime_rows={runtime_rows}, max_num_reqs={self.max_num_reqs}."
+            )
+
+    def _uses_spmd_dp(self) -> bool:
+        """Return whether the runner is using rank-major data-parallel execution."""
+        return int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1
+
+    def _recurrent_rows_per_dp_rank(self) -> int:
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if int(self.max_num_reqs) % dp_size != 0:
+            raise ValueError(
+                "Rank-major SPMD DP requires recurrent slots divisible by DP size: "
+                f"max_num_reqs={self.max_num_reqs}, dp_size={dp_size}."
+            )
+        return int(self.max_num_reqs) // dp_size
+
+    def _reset_recurrent_slot_pools(self) -> None:
+        """Initialize physical recurrent-state slots partitioned by DP rank."""
+        self._recurrent_slot_by_req: dict[str, int] = {}
+        self._request_dp_rank_by_req: dict[str, int] = {}
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if not self._uses_spmd_dp():
+            self._free_recurrent_slots_by_rank = [list(range(int(self.max_num_reqs)))]
+            return
+        rows_per_rank = self._recurrent_rows_per_dp_rank()
+        self._free_recurrent_slots_by_rank = [
+            list(range(rank * rows_per_rank, (rank + 1) * rows_per_rank)) for rank in range(dp_size)
+        ]
+
+    def _assign_recurrent_slot(self, req_id: str, dp_rank: int | None) -> int | None:
+        """Assign or return the stable physical recurrent-state slot for a request."""
+        if not self._uses_spmd_dp():
+            return None
+        existing = self._recurrent_slot_by_req.get(req_id)
+        rows_per_rank = self._recurrent_rows_per_dp_rank()
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if existing is not None:
+            existing_rank = min(max(int(existing), 0) // rows_per_rank, dp_size - 1)
+            if dp_rank is not None and existing_rank != int(dp_rank):
+                raise RuntimeError(
+                    "Existing recurrent slot rank does not match scheduler DP rank: "
+                    f"req_id={req_id} slot={existing} slot_rank={existing_rank} dp_rank={dp_rank}."
+                )
+            return int(existing)
+
+        rank = 0 if dp_rank is None else int(dp_rank)
+        if rank < 0 or rank >= len(self._free_recurrent_slots_by_rank):
+            raise RuntimeError(f"Invalid DP rank for recurrent slot assignment: req_id={req_id} dp_rank={rank}.")
+        free_slots = self._free_recurrent_slots_by_rank[rank]
+        if not free_slots:
+            raise RuntimeError(f"No free recurrent state slots in DP rank {rank} for request {req_id}.")
+        slot = int(free_slots.pop(0))
+        self._recurrent_slot_by_req[req_id] = slot
+        self._request_dp_rank_by_req[req_id] = rank
+        return slot
+
+    def _release_recurrent_slot(self, req_id: str, *, forget_rank: bool) -> int | None:
+        """Release a request's physical recurrent-state slot and return it for clearing."""
+        slot = self._recurrent_slot_by_req.pop(req_id, None)
+        if forget_rank:
+            self._request_dp_rank_by_req.pop(req_id, None)
+        if slot is None or not self._uses_spmd_dp():
+            return slot
+        rows_per_rank = self._recurrent_rows_per_dp_rank()
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        rank = min(max(int(slot), 0) // rows_per_rank, dp_size - 1)
+        free_slots = self._free_recurrent_slots_by_rank[rank]
+        if int(slot) not in free_slots:
+            free_slots.append(int(slot))
+            free_slots.sort()
+        return int(slot)
 
     def _build_kv_cache_groups(self):
         """Build cache-group specs for runtime-cap and scheduler estimation.
@@ -965,6 +1075,7 @@ class eSurgeRunner:
             page_sizes=[self.metadata.page_size] * num_cache_groups,
             sharding=self._empty_sharding,
         )
+        self._reset_recurrent_slot_pools()
 
         self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
         self.arange_np = jnp.arange(self.max_num_reqs, dtype=jnp.int32)
@@ -988,6 +1099,7 @@ class eSurgeRunner:
         self._window_presence_penalties_cpu = np.zeros_like(self.sequence_buffer.presence_penalties)
         self._window_repetition_penalties_cpu = np.ones_like(self.sequence_buffer.repetition_penalties)
         self._window_row_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._window_recurrent_slot_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._spec_recurrent_commit_cpu = np.zeros((2, self.max_num_reqs), dtype=np.int32)
         self._pending_spec_recurrent_commit_by_req: dict[str, int] = {}
         self.executor_manager.invalidate_sampler_penalty_state(
@@ -1710,7 +1822,14 @@ class eSurgeRunner:
                         return None
             return inferred
 
+        for req_id, dp_rank in getattr(scheduler_output, "req_id_to_dp_rank", {}).items():
+            self._request_dp_rank_by_req[str(req_id)] = int(dp_rank)
+
+        removed_recurrent_slots: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
+            slot = self._release_recurrent_slot(str(req_id), forget_rank=True)
+            if slot is not None:
+                removed_recurrent_slots.append(int(slot))
             self.requests.pop(req_id, None)
             self._pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
 
@@ -1731,14 +1850,18 @@ class eSurgeRunner:
         for req_id in scheduler_output.preempted_req_ids:
             req_index = self.sequence_buffer.remove_request(req_id)
             self._pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
+            slot = self._release_recurrent_slot(str(req_id), forget_rank=False)
+            if slot is not None:
+                removed_recurrent_slots.append(int(slot))
             if req_index is not None:
                 removed_req_indices.append(req_index)
                 removed_req_index_by_id[req_id] = req_index
 
         # 3b) Clear recurrent/SSM state for freed slots so the next request
         # assigned to the same slot starts from a clean state.
-        if removed_req_indices:
-            self.executor_manager.clear_recurrent_slots(removed_req_indices)
+        slots_to_clear = removed_recurrent_slots if self._uses_spmd_dp() else removed_req_indices
+        if slots_to_clear:
+            self.executor_manager.clear_recurrent_slots(slots_to_clear)
             if self.spec_decode_recurrent_candidates:
                 for req_index in removed_req_indices:
                     if 0 <= int(req_index) < int(self._spec_recurrent_commit_cpu.shape[1]):
@@ -1749,7 +1872,11 @@ class eSurgeRunner:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             if new_req_data.sampling_params is None:
                 raise ValueError("Pooling not supported in TPU")
+            if self._uses_spmd_dp() and new_req_data.has_vision:
+                raise ValueError("Rank-major SPMD DP currently supports text-only requests.")
             req_id = new_req_data.req_id
+            if new_req_data.dp_rank is not None:
+                self._request_dp_rank_by_req[str(req_id)] = int(new_req_data.dp_rank)
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -1777,6 +1904,8 @@ class eSurgeRunner:
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
+            if i < len(req_data.dp_ranks) and req_data.dp_ranks[i] is not None:
+                self._request_dp_rank_by_req[str(req_id)] = int(req_data.dp_ranks[i])
 
             nct = req_data.num_computed_tokens[i]
             new_page_ids = req_data.new_page_ids[i]
@@ -1793,6 +1922,8 @@ class eSurgeRunner:
             if req_index is None:
                 req_ids_to_add.append(req_id)
                 continue
+            if self._uses_spmd_dp():
+                self._assign_recurrent_slot(req_id, self._request_dp_rank_by_req.get(str(req_id)))
 
             upd_req_indices.append(req_index)
             upd_num_computed_vals.append(int(nct))
@@ -1852,7 +1983,11 @@ class eSurgeRunner:
             if reuse_index is not None and reuse_index not in removed_pool:
                 reuse_index = None
 
-            target_shard = infer_req_shard(req_state.page_ids)
+            target_shard = self._request_dp_rank_by_req.get(str(req_id))
+            if target_shard is None:
+                target_shard = infer_req_shard(req_state.page_ids)
+            if target_shard is not None:
+                self._request_dp_rank_by_req[str(req_id)] = int(target_shard)
             if target_shard is not None and use_dp_local_rows:
                 lo = target_shard * rows_per_shard
                 hi = lo + rows_per_shard
@@ -1887,6 +2022,8 @@ class eSurgeRunner:
 
             if reuse_index is not None:
                 removed_pool.discard(reuse_index)
+            if self._uses_spmd_dp():
+                self._assign_recurrent_slot(req_id, target_shard)
             self.sequence_buffer.add_request(req_state, reuse_index)
 
         # 7) Condense to remove holes
@@ -2091,6 +2228,10 @@ class eSurgeRunner:
             return False
         if not scheduler_output.async_scheduling:
             return False
+        if int(scheduler_output.total_num_scheduled_tokens or 0) <= 0:
+            return False
+        if any(int(n) != 1 for n in scheduler_output.num_scheduled_tokens.values()):
+            return False
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
             return False
         if is_vlm_model:
@@ -2110,6 +2251,7 @@ class eSurgeRunner:
         req_ids_window: list[str | None],
         scheduled_list: list[int],
         window_row_indices: np.ndarray,
+        num_tokens_static: int,
     ) -> DeviceInputTokenHandoff | None:
         """Build a device-side patch for decode placeholders in one window.
 
@@ -2130,6 +2272,22 @@ class eSurgeRunner:
                 if is_valid:
                     sampled_by_req[str(req_id)] = (window_idx, window.sampled_token_ids, int(row_pos))
 
+        use_spmd_dp = self._uses_spmd_dp()
+        if use_spmd_dp:
+            dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+            if int(num_tokens_static) % dp_size != 0:
+                return None
+            if int(self.num_reqs_max_model_len) % dp_size != 0:
+                return None
+            tokens_per_rank = int(num_tokens_static) // dp_size
+            rows_per_rank = int(self.num_reqs_max_model_len) // dp_size
+            rank_used_tokens = [0] * dp_size
+        else:
+            dp_size = 1
+            tokens_per_rank = int(num_tokens_static)
+            rows_per_rank = int(self.num_reqs_max_model_len)
+            rank_used_tokens = [0]
+
         patch_positions: list[int] = []
         patch_token_sources: list[tuple[jax.Array, int]] = []
         patch_sources: list[tuple[int, int]] = []
@@ -2138,15 +2296,27 @@ class eSurgeRunner:
             scheduled = int(scheduled_list[local_row])
             if scheduled <= 0:
                 continue
+            global_row = int(window_row_indices[local_row])
+            if use_spmd_dp:
+                rank = min(max(global_row, 0) // rows_per_rank, dp_size - 1)
+                packed_row_offset = rank * tokens_per_rank + int(rank_used_tokens[rank])
+                if packed_row_offset + scheduled > (rank + 1) * tokens_per_rank:
+                    return None
+            else:
+                rank = 0
+                packed_row_offset = flat_offset
             if rid is None:
+                if use_spmd_dp:
+                    rank_used_tokens[rank] += scheduled
                 flat_offset += scheduled
                 continue
 
-            global_row = int(window_row_indices[local_row])
             start_tok = int(self.sequence_buffer.num_computed_tokens[global_row])
             placeholder_pos = int(self.sequence_buffer.num_tokens_no_spec[global_row]) - 1
             touches_placeholder = start_tok <= placeholder_pos < start_tok + scheduled
             if not touches_placeholder:
+                if use_spmd_dp:
+                    rank_used_tokens[rank] += scheduled
                 flat_offset += scheduled
                 continue
             if scheduled != 1 or start_tok != placeholder_pos:
@@ -2156,9 +2326,11 @@ class eSurgeRunner:
                 return None
 
             sampled_window_idx, sampled_tokens, sampled_row_pos = sampled
-            patch_positions.append(flat_offset)
+            patch_positions.append(packed_row_offset + (placeholder_pos - start_tok))
             patch_token_sources.append((sampled_tokens, sampled_row_pos))
             patch_sources.append((sampled_window_idx, sampled_row_pos))
+            if use_spmd_dp:
+                rank_used_tokens[rank] += scheduled
             flat_offset += scheduled
 
         if not patch_token_sources:
@@ -2168,7 +2340,6 @@ class eSurgeRunner:
         if len(patch_positions) > max_handoff:
             return None
 
-        input_positions = self._get_handoff_positions(max_handoff)
         count = self._get_handoff_scalar(len(patch_positions))
         offset = self._get_handoff_scalar(0)
         fast_dense_handoff = (
@@ -2177,8 +2348,13 @@ class eSurgeRunner:
             and int(pre_results.windows[patch_sources[0][0]].sampled_token_ids.shape[0]) >= max_handoff
         )
         if fast_dense_handoff:
+            input_positions = self._get_handoff_positions(max_handoff)
             token_ids = pre_results.windows[patch_sources[0][0]].sampled_token_ids
         else:
+            input_positions_np = np.asarray(patch_positions, dtype=np.int32)
+            if input_positions_np.shape[0] < max_handoff:
+                input_positions_np = np.pad(input_positions_np, (0, max_handoff - int(input_positions_np.shape[0])))
+            input_positions = jax.device_put(input_positions_np, self.executor_manager._empty_sharding)
             token_ids = jnp.stack(
                 [
                     jnp.asarray(sampled_tokens[row_pos], dtype=jnp.int32)
@@ -2617,7 +2793,7 @@ class eSurgeRunner:
         draft_tokens: list[int],
         req_state: CachedRequestState,
     ) -> tuple[int, int]:
-        """vLLM-style compiled rejection sampler for one non-greedy spec window."""
+        """Compiled rejection sampler for one non-greedy spec window."""
         draft_token_arr = jnp.asarray(draft_tokens, dtype=jnp.int32)
         key = (
             tuple(target_logits.shape),
@@ -2714,7 +2890,7 @@ class eSurgeRunner:
         token_ids_window_cpu: np.ndarray,
         token_offset: int,
     ) -> _SpecVerifyMetadata:
-        """Build vLLM-style target-logit/draft-token verification indices.
+        """Build target-logit/draft-token verification indices.
 
         A hidden/logit row for token position ``p`` predicts the token at
         ``p + 1``. For a spec window containing ``real_count`` real tokens
@@ -3136,8 +3312,8 @@ class eSurgeRunner:
     def _record_spec_acceptance_for_backoff(self, req_id: str, accepted: int, num_drafts: int) -> None:
         """Update the adaptive drafter stop-loss after a verify window.
 
-        vLLM's hybrid path keeps alternate recurrent states for speculative
-        tokens. EasyDeL does not yet have that cache layout, so low-acceptance
+        Hybrid recurrent decode can keep alternate states for speculative
+        tokens. Without that cache layout, low-acceptance
         prompts can spend more wallclock on MTP + verification than they save.
         This small gate is intentionally drafter-only: after a full rejection,
         skip a configurable number of future drafter calls and let normal
@@ -3201,7 +3377,7 @@ class eSurgeRunner:
 
         A future step overwrites rejected draft positions before those positions
         are admitted by ``context_lens``. Recurrent layers are different: their
-        state is a single rolling row, so they need either vLLM-style candidate
+        state is a single rolling row, so they need either candidate
         rows or an explicit replay from the pre-verify snapshot.
         """
         if not self._cache_has_recurrent_state():
@@ -3209,7 +3385,7 @@ class eSurgeRunner:
         return self._recurrent_candidate_count() <= 0
 
     def _commit_speculative_recurrent_candidate_state(self, row_pos: int, prefix_len: int) -> bool:
-        """Copy a vLLM-style speculative recurrent candidate row into the live row."""
+        """Copy a speculative recurrent candidate row into the live row."""
         candidate_count = self._recurrent_candidate_count()
         if candidate_count <= 0 or prefix_len <= 0 or prefix_len > candidate_count:
             return False
@@ -3317,6 +3493,7 @@ class eSurgeRunner:
         pre_step_kv_pages: typing.Any,
         commit_scheduled_list: list[int],
         window_row_indices: np.ndarray,
+        recurrent_slot_indices_cpu: np.ndarray | None,
         num_tokens_static_original: int,
         padded_num_reqs: int,
         token_ids_window_cpu: np.ndarray,
@@ -3392,6 +3569,7 @@ class eSurgeRunner:
             req_num_tokens_full_cpu=commit_req_num_tokens,
             active_mask_full_cpu=self._active_mask_full_cpu,
             window_row_indices_cpu=window_row_indices,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
             input_ids_buf=self.input_ids_buf,
             position_ids_buf=self.position_ids_buf,
             padded_num_reqs=padded_num_reqs,
@@ -3580,7 +3758,9 @@ class eSurgeRunner:
         discard_sampled_tokens_req_indices: list[int] = []
 
         is_vlm_model = self._model_uses_vlm_inputs()
-        uses_mrope_model = model_uses_mrope(self.model)
+        if self._uses_spmd_dp():
+            is_vlm_model = False
+        uses_mrope_model = is_vlm_model and model_uses_mrope(self.model)
 
         def _window_hidden_row(
             hidden_states: jax.Array,
@@ -3633,7 +3813,18 @@ class eSurgeRunner:
             sequential_greedy_spec_rows: dict[int, int] = {}
 
             total_scheduled = sum(model_scheduled_list)
-            idx = bisect_left(self.num_tokens_paddings, total_scheduled)
+            token_bucket_target = total_scheduled
+            if self._uses_spmd_dp():
+                dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+                rows_per_rank = int(self.num_reqs_max_model_len) // dp_size
+                rank_scheduled_tokens = [0] * dp_size
+                for row_pos, scheduled_tokens in enumerate(model_scheduled_list):
+                    global_row = int(window_row_indices[row_pos])
+                    rank = min(max(global_row, 0) // rows_per_rank, dp_size - 1)
+                    rank_scheduled_tokens[rank] += int(scheduled_tokens)
+                peak_rank_scheduled = max(rank_scheduled_tokens) if rank_scheduled_tokens else 0
+                token_bucket_target = peak_rank_scheduled * dp_size
+            idx = bisect_left(self.num_tokens_paddings, token_bucket_target)
             if idx >= len(self.num_tokens_paddings):
                 idx = len(self.num_tokens_paddings) - 1
             num_tokens_static = int(self.num_tokens_paddings[idx])
@@ -3647,6 +3838,7 @@ class eSurgeRunner:
             active_mask_full_cpu = self._active_mask_full_cpu
             req_num_tokens_np = self._req_num_tokens_cpu
             window_row_indices_cpu = self._window_row_indices_cpu
+            recurrent_slot_indices_cpu = self._window_recurrent_slot_indices_cpu
             if num_reqs > 0:
                 # Keep scheduled and active_mask as CPU arrays
                 scheduled_full_cpu = self._scheduled_full_cpu
@@ -3670,6 +3862,22 @@ class eSurgeRunner:
 
                 window_row_indices_cpu.fill(0)
                 window_row_indices_cpu[:num_reqs] = window_row_indices
+
+                recurrent_slot_indices_cpu.fill(0)
+                for row_pos, rid in enumerate(req_ids_window):
+                    if rid is None:
+                        continue
+                    slot = self._recurrent_slot_by_req.get(str(rid))
+                    if slot is None:
+                        if self._uses_spmd_dp():
+                            rank = self._request_dp_rank_by_req.get(str(rid))
+                            if rank is None:
+                                rows_per_rank = self._recurrent_rows_per_dp_rank()
+                                rank = min(max(int(window_row_indices[row_pos]), 0) // rows_per_rank, dp_size - 1)
+                            slot = self._assign_recurrent_slot(str(rid), int(rank))
+                        else:
+                            slot = int(window_row_indices[row_pos])
+                    recurrent_slot_indices_cpu[row_pos] = int(slot)
 
                 if jax.process_count() > 1:
                     req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
@@ -3847,6 +4055,7 @@ class eSurgeRunner:
                         req_ids_window=req_ids_window,
                         scheduled_list=model_scheduled_list,
                         window_row_indices=window_row_indices,
+                        num_tokens_static=num_tokens_static,
                     )
                 if device_token_handoff is None:
                     prev_async_start = time.time()
@@ -3926,6 +4135,7 @@ class eSurgeRunner:
                 req_num_tokens_full_cpu=req_num_tokens_np,
                 active_mask_full_cpu=active_mask_full_cpu,
                 window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
                 padded_num_reqs=padded_num_reqs,
@@ -4102,6 +4312,7 @@ class eSurgeRunner:
                 *,
                 num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
                 window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                 padded_num_reqs=padded_num_reqs,
                 token_ids_window_cpu=token_ids_window_cpu,
                 temperature_window_cpu=temperature_window_cpu,
@@ -4155,6 +4366,7 @@ class eSurgeRunner:
                     req_num_tokens_full_cpu=suffix_req_num_tokens,
                     active_mask_full_cpu=suffix_active,
                     window_row_indices_cpu=window_row_indices_cpu,
+                    recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                     input_ids_buf=self.input_ids_buf,
                     position_ids_buf=self.position_ids_buf,
                     padded_num_reqs=padded_num_reqs,
@@ -4196,6 +4408,7 @@ class eSurgeRunner:
                 num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
                 num_tokens_static=num_tokens_static,
                 window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                 padded_num_reqs=padded_num_reqs,
                 token_ids_window_cpu=token_ids_window_cpu,
                 temperature_window_cpu=temperature_window_cpu,
@@ -4244,6 +4457,7 @@ class eSurgeRunner:
                     req_num_tokens_full_cpu=replay_req_num_tokens,
                     active_mask_full_cpu=replay_active,
                     window_row_indices_cpu=window_row_indices_cpu,
+                    recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                     input_ids_buf=self.input_ids_buf,
                     position_ids_buf=self.position_ids_buf,
                     padded_num_reqs=padded_num_reqs,
@@ -4286,6 +4500,7 @@ class eSurgeRunner:
                 pre_step_kv_pages=pre_step_kv_pages,
                 num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
                 window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                 padded_num_reqs=padded_num_reqs,
                 token_ids_window_cpu=token_ids_window_cpu,
                 temperature_window_cpu=temperature_window_cpu,
@@ -4347,6 +4562,7 @@ class eSurgeRunner:
                         req_num_tokens_full_cpu=replay_req_num_tokens,
                         active_mask_full_cpu=replay_active,
                         window_row_indices_cpu=window_row_indices_cpu,
+                        recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                         input_ids_buf=self.input_ids_buf,
                         position_ids_buf=self.position_ids_buf,
                         padded_num_reqs=padded_num_reqs,
@@ -4804,6 +5020,7 @@ class eSurgeRunner:
                     pre_step_kv_pages=pre_step_kv_pages,
                     commit_scheduled_list=spec_commit_scheduled_list,
                     window_row_indices=window_row_indices_cpu,
+                    recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
                     num_tokens_static_original=num_tokens_static,
                     padded_num_reqs=padded_num_reqs,
                     token_ids_window_cpu=token_ids_window_cpu,

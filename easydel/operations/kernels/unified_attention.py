@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vLLM-style Unified (paged) Attention for ragged-query continuous batching.
+"""serving-style Unified (paged) Attention for ragged-query continuous batching.
 
 This module exposes :class:`UnifiedAttn`, an :class:`OperationImpl` that
-wraps ejkernel's Triton implementation of vLLM's *unified* attention
+wraps ejkernel's Triton implementation of paged unified attention
 kernel: a single fused kernel that consumes ragged queries packed into a
 ``[total_tokens, num_q_heads, head_dim]`` buffer, reads K/V from a paged
 cache addressed via ``pages_tables``, and emits one output row per query
@@ -76,7 +76,7 @@ def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
 
 @OperationRegistry.register
 class UnifiedAttn(OperationImpl):
-    """vLLM-style unified (paged) attention over ragged queries on GPU.
+    """serving-style unified (paged) attention over ragged queries on GPU.
 
     Executes ejkernel's Triton ``unified_attention`` kernel against
     ``[total_tokens, num_q_heads, head_dim]`` ragged queries and a paged

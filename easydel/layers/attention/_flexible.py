@@ -154,7 +154,7 @@ class AttentionMechanisms(StrEnum):
         RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
         MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1: MLA ragged page attention for
             compressed-KV inference.
-        UNIFIED_ATTENTION: vLLM-style unified paged attention (Triton).
+        UNIFIED_ATTENTION: serving-style unified paged attention (Triton).
         PAGED_FLASH_ATTENTION: FlashAttention with paged KV cache (CUDA).
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """

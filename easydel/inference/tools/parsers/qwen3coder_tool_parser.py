@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3 Coder tool parser aligned with vLLM.
+"""Qwen3 Coder tool parser aligned with reference serving behavior.
 
 Parses tool calls emitted by Qwen3 Coder models in the ``<tool_call>``
 XML envelope::
@@ -90,7 +90,7 @@ class Qwen3CoderToolParser(ToolParser):
 
         self.current_tool_name_sent: bool = False
         self.prev_tool_call_arr: list[dict] = []
-        # Override the base class type: vLLM uses string call IDs here.
+        # Override the base class type: string call IDs are used here.
         self.current_tool_id: str | None = None  # type: ignore[assignment]
         self.streamed_args_for_tool: list[str] = []
 
@@ -122,7 +122,7 @@ class Qwen3CoderToolParser(ToolParser):
         if self.tool_call_start_token_id is None or self.tool_call_end_token_id is None:
             raise RuntimeError("Qwen3 XML Tool parser could not locate tool call start/end tokens in the tokenizer!")
 
-        logger.debug("vLLM Successfully import tool parser %s !", self.__class__.__name__)
+        logger.debug("Successfully imported tool parser %s !", self.__class__.__name__)
 
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID.

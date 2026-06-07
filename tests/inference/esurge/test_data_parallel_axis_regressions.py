@@ -46,3 +46,6 @@ def test_esurge_does_not_mutate_model_partition_axis():
     eSurge._apply_data_parallel_axis_to_model(engine, model)
 
     assert cfg.partition_axis.data_parallel_axis == "dp"
+    assert cfg.partition_axis.tensor_parallel_axis == "tp"
+    assert cfg.partition_axis.mlp_intermediate_axis == "tp"
+    assert cfg.partition_axis.vocab_axis == "tp"

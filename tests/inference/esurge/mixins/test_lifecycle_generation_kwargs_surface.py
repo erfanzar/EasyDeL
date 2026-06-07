@@ -41,7 +41,11 @@ def test_esurge_generation_surface_includes_required_engine_kwargs():
     esurge_generate_params = signature(EasyGenerationMixin.esurge_generate).parameters
     pause_esurge_params = signature(EasyGenerationMixin.pause_esurge).parameters
 
-    for name in ("data_parallelism_axis", "enable_prefix_caching", "max_num_seq_buckets"):
+    for name in (
+        "data_parallelism_axis",
+        "enable_prefix_caching",
+        "max_num_seq_buckets",
+    ):
         assert name in get_esurge_params
         assert name in esurge_generate_params
     for name in ("release_model_state", "clear_compiled_cache"):
@@ -94,6 +98,7 @@ def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
         max_num_batched_tokens=64,
         hbm_utilization=0.5,
         page_size=32,
+        max_cache_tokens=None,
         enable_prefix_caching=True,
         data_parallelism_axis="dp",
         async_scheduling=True,
@@ -894,6 +899,7 @@ def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monke
         max_num_batched_tokens=64,
         hbm_utilization=0.5,
         page_size=32,
+        max_cache_tokens=None,
         enable_prefix_caching=True,
         data_parallelism_axis="dp",
         async_scheduling=True,
@@ -914,6 +920,7 @@ def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monke
         max_num_batched_tokens=kwargs["max_num_batched_tokens"],
         hbm_utilization=kwargs["hbm_utilization"],
         page_size=kwargs["page_size"],
+        max_cache_tokens=kwargs["max_cache_tokens"],
         enable_prefix_caching=kwargs["enable_prefix_caching"],
         data_parallelism_axis=kwargs["data_parallelism_axis"],
         async_scheduling=kwargs["async_scheduling"],

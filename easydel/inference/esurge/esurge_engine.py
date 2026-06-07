@@ -81,7 +81,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DrafterProtocol
-from easydel.utils import Registry
+from easydel.utils import Registry, set_inference_mode
 
 if typing.TYPE_CHECKING:
     from easydel.modules.auto.auto_modeling import PreTrainedLoading
@@ -955,7 +955,8 @@ class eSurge(
                 **user_config_kwargs,
             )
 
-            model = AutoEasyDeLModelForCausalLM.from_pretrained(**loading)
+            with set_inference_mode():
+                model = AutoEasyDeLModelForCausalLM.from_pretrained(**loading)
             text_config = model.config.get_text_config()
             has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(model, text_config)
 
@@ -1372,9 +1373,9 @@ class eSurge(
     def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
         """Keep model partition axes unchanged.
 
-        eSurge's KV-page parallelism uses the dedicated ``ATTN_DP`` semantic
-        axis registered during engine setup. Rewriting the model's standard
-        data-parallel axis here can alias DP with EP and break MoE shard maps.
+        Request-level DP is represented in scheduler, cache, and batch-preparer
+        metadata. It must not be folded into the model's tensor/MLP/vocab axes;
+        those remain the normal TP/FSDP/SP sharding policy.
 
         Args:
             model (EasyDeLBaseModule): Loaded model whose partition axes are

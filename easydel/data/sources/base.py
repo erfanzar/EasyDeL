@@ -358,8 +358,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         if self._warned_projection_fallback:
             return
         logger.warning(
-            "Projected Parquet row-group reads failed for nested columns; "
-            "retrying with single-threaded Parquet reads."
+            "Projected Parquet row-group reads failed for nested columns; retrying with single-threaded Parquet reads."
         )
         self._warned_projection_fallback = True
 
@@ -445,8 +444,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 expected_rows = len(values)
             elif len(values) != expected_rows:
                 raise ValueError(
-                    f"Projected Parquet column {parquet_column!r} yielded {len(values)} rows; "
-                    f"expected {expected_rows}."
+                    f"Projected Parquet column {parquet_column!r} yielded {len(values)} rows; expected {expected_rows}."
                 )
             values_by_key[key] = values
 

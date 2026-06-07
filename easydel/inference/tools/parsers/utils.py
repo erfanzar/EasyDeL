@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility shim for vLLM-style imports.
+"""Compatibility shim for serving-style imports.
 
-This module provides a compatibility layer for vLLM-style imports, allowing code
-ported from vLLM to work seamlessly with EasyDeL's internal structure.
+This module provides a compatibility layer for serving-style imports, allowing code
+ported from external parser layouts to work seamlessly with EasyDeL's internal structure.
 
-vLLM keeps tool parsing helpers under `tool_parsers/utils.py`, while EasyDeL
+External parser packages keep tool parsing helpers under `tool_parsers/utils.py`, while EasyDeL
 keeps them under `easydel.inference.tools.utils`. This module re-exports
-EasyDeL's utilities to maintain API compatibility with vLLM's layout.
+EasyDeL's utilities to maintain API compatibility with that layout.
 
 Re-exported Functions:
     consume_space: Skip whitespace characters in a string starting from an index.

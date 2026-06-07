@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility shim for vLLM-style imports.
+"""Compatibility shim for serving-style imports.
 
-This module provides a compatibility layer for vLLM-style imports of the
+This module provides a compatibility layer for serving-style imports of the
 ToolParser base class and ToolParserManager registry.
 
-vLLM keeps the ToolParser base class under `tool_parsers/abstract_tool_parser.py`,
+External parser packages keep the ToolParser base class under `tool_parsers/abstract_tool_parser.py`,
 while EasyDeL keeps it under `easydel.inference.tools.abstract_tool`. This module
-exists so code ported from vLLM (or referencing that layout) can import from
+exists so code ported from external parser layouts (or referencing that layout) can import from
 `easydel.inference.tools.parsers.abstract_tool_parser` without needing to know
 EasyDeL's internal path.
 

@@ -16,6 +16,7 @@ from easydel.inference.esurge.core.interface import (
 )
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
+from easydel.inference.esurge.scheduler.async_scheduler import AsyncScheduler
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 
@@ -97,6 +98,40 @@ def step(sched: Scheduler) -> tuple:
     return out, engine_outs
 
 
+def make_async_scheduler(
+    max_num_seqs: int = 4,
+    max_num_batched_tokens: int = 64,
+    max_model_len: int = 128,
+    num_pages: int = 64,
+    page_size: int = 16,
+) -> AsyncScheduler:
+    kv = CacheGroupsConfig(
+        num_pages=num_pages,
+        kv_cache_groups=[
+            CacheGroupSpec(
+                kv_cache_spec=FullAttentionSpec(
+                    page_size=page_size,
+                    num_kv_heads=1,
+                    head_size=4,
+                    dtype=jnp.float32,
+                    use_mla=False,
+                ),
+                layer_names=None,
+            )
+        ],
+    )
+    return AsyncScheduler(
+        kv_cache_config=kv,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        num_pages=num_pages,
+        page_size=page_size,
+        enable_prefix_caching=False,
+        async_scheduling=True,
+    )
+
+
 def prefill_request(sched: Scheduler, rid: str, prompt_len: int, max_tokens: int = 8192):
     sched.add_request(make_req(rid, prompt_len, max_tokens))
     return step(sched)[0]
@@ -117,6 +152,25 @@ class TestBasicScheduling:
         step(s)
         out2, _ = step(s)
         assert out2.num_scheduled_tokens.get("r1") == 1
+
+    def test_async_scheduler_counts_final_placeholder_against_max_tokens(self):
+        s = make_async_scheduler()
+        req = make_req("r1", prompt_len=4, max_tokens=1)
+        s.add_request(req)
+
+        prefill = s.schedule()
+
+        assert prefill.total_num_scheduled_tokens == 4
+        assert req.num_output_placeholders == 1
+        assert req.num_output_tokens == 0
+
+        stale = s.schedule()
+
+        assert stale.total_num_scheduled_tokens == 0
+        assert stale.num_scheduled_tokens == {}
+
+        s.update_from_output(prefill, fake_output(prefill))
+        assert req.is_finished()
 
 
 class TestBatching:

@@ -31,10 +31,9 @@ from .states import CachedRequestState
 class DeviceInputTokenHandoff:
     """Device-resident sampled tokens that should replace decode placeholders.
 
-    This is the eSurge equivalent of vLLM's PP sampled-token handoff: the final
-    stage samples token ``N`` on device, and the next decode step consumes that
-    token directly from a device array instead of waiting for the host-side
-    sequence buffer to be repaired first.
+    The final stage samples token ``N`` on device, and the next decode step
+    consumes that token directly from a device array instead of waiting for the
+    host-side sequence buffer to be repaired first.
 
     The handoff is intentionally narrow:
         * ``input_positions`` index the flattened ``BatchMetadata.input_ids``

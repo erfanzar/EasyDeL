@@ -668,7 +668,7 @@ def test_esurge_eval_chat_template_strips_literal_empty_reasoning_scaffold_witho
     assert rendered == "<|im_start|>assistant\nprefix"
 
 
-def test_esurge_eval_uses_vllm_style_detokenization_defaults_for_generation():
+def test_esurge_eval_uses_backend_compatible_detokenization_defaults_for_generation():
     """Eval generations should disable spaces_between_special_tokens by default."""
     surge = _RecordingSurge()
     adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
@@ -746,7 +746,7 @@ def test_esurge_eval_preserves_indentation_after_think_end_token():
     assert outputs == ["\n    return 42"]
 
 
-def test_esurge_eval_pretruncates_generation_prompts_like_vllm():
+def test_esurge_eval_pretruncates_generation_prompts_before_dispatch():
     """Prompt text should be truncated before dispatch so eval matches lm-eval backends more closely."""
     surge = _RecordingSurge()
     adapter = eSurgeLMEvalAdapter(

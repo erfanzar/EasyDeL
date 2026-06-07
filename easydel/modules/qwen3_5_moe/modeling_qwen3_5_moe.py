@@ -56,7 +56,10 @@ from easydel.modules.qwen3_5.modeling_qwen3_5 import (
     _get_rope_index_from_mm_token_types,
     _maybe_flatten_position_ids_for_text,
 )
-from easydel.modules.qwen3_next.modeling_qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
+from easydel.modules.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextForCausalLM,
+    Qwen3NextModel,
+)
 from easydel.modules.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModel,
     Qwen3VLMoeModelOutputWithPast,

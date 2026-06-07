@@ -359,7 +359,7 @@ def test_qwen3xml_streaming_emits_completed_bare_function(dummy_tokenizer):
     assert json.loads(second.tool_calls[0].function.arguments) == {"query": "AI"}
 
 
-def test_qwen3coder_extract_tool_calls_converts_types_like_vllm(dummy_tokenizer):
+def test_qwen3coder_extract_tool_calls_converts_types_like_reference_backend(dummy_tokenizer):
     parser = Qwen3CoderToolParser(dummy_tokenizer)
     request = _make_request_with_tools(
         [

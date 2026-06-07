@@ -18,7 +18,7 @@ parsing in the pipeline:
     Model Output -> ReasoningParser -> {reasoning, content} -> ToolParser(content) -> {tool_calls}
 
 Note:
-    Ideas and design patterns are inspired by vLLM's reasoning parser implementation.
+    Ideas and design patterns are inspired by external reasoning parser implementations.
 """
 
 from .abstract_reasoning import ReasoningParser, ReasoningParserManager

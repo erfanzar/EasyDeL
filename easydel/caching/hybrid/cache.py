@@ -103,7 +103,7 @@ LayerType = tp.Literal["full_attention", "linear_attention", "kda_linear_attenti
 def _linear_recurrent_state_dtype(cache_dtype: jnp.dtype) -> jnp.dtype:
     """Return storage dtype for GDN/KDA recurrent state.
 
-    vLLM TPU stores convolution state in the cache dtype but keeps the
+    the TPU serving path stores convolution state in the cache dtype but keeps the
     recurrent GDN matrix in fp32. EasyDeL's GDN kernels also run the recurrent
     math in fp32; storing the row in fp32 avoids a full bf16->fp32 cast of the
     state pool on every decode step.

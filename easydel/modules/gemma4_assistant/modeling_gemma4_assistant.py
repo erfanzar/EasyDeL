@@ -139,7 +139,7 @@ class Gemma4AssistantCentroidHead(spx.Module):
        centroid path requires a gather over the 262K-row embedding
        table that is slow on TPU. Measured speedups on v5p:
        ``B=1 S=32 → 0.57x``, ``B=4 S=256 → 0.12x``. The win is real on
-       GPU (where vLLM ships a fused gather kernel) and at much larger
+       GPU (where fused gather kernels are commonly used) and at much larger
        ``V``. The implementation here matches the HF checkpoint
        semantics; pick the dense fallback (``use_ordered_embeddings=False``)
        on TPU until a fused TPU kernel exists.

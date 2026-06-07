@@ -149,10 +149,17 @@ class BatchMetadata:
 
     # Packed int32: [5] => (num_requests, padded_num_reqs, request_distribution[0:3])
     packed_misc_i32: jax.Array
-
     pages_tables: jax.Array
     input_ids_buf: jax.Array
     position_ids_buf: jax.Array
+    # Optional int32[dp, rows_per_dp+1] rank-local query starts for rank-major DP batches.
+    dp_query_start_loc: jax.Array | None = None
+    # Optional int32[dp, 3] per-rank request distributions for rank-major DP model batches.
+    dp_request_distribution: jax.Array | None = None
+    # Optional int32[dp, rows_per_dp] rank-major context lengths for model metadata.
+    dp_context_lens: jax.Array | None = None
+    # Optional int32[dp, rows_per_dp] physical recurrent-state slots per rank-local request row.
+    dp_recurrent_state_indices: jax.Array | None = None
     input_token_handoff_positions: jax.Array | None = None
     input_token_handoff_ids: jax.Array | None = None
     input_token_handoff_count: jax.Array | None = None
@@ -387,6 +394,32 @@ class BatchMetadata:
                 based on whether requests are in decode or prefill phase.
         """
         return self.packed_misc_i32[2:5]
+
+    @property
+    def rank_request_distribution(self) -> jax.Array:
+        """Get rank-local request distributions when rank-major DP is active."""
+        if self.dp_request_distribution is not None:
+            return self.dp_request_distribution
+        return self.request_distribution
+
+    @property
+    def rank_query_start_loc(self) -> jax.Array:
+        """Get rank-local query starts when rank-major DP is active."""
+        if self.dp_query_start_loc is not None:
+            return self.dp_query_start_loc
+        return self.query_start_loc
+
+    @property
+    def rank_context_lens(self) -> jax.Array:
+        """Get context lengths aligned with rank-major DP page tables."""
+        if self.dp_context_lens is not None:
+            return self.dp_context_lens.reshape(-1)
+        return self.seq_lens
+
+    @property
+    def rank_recurrent_state_indices(self) -> jax.Array | None:
+        """Get physical recurrent-state slots aligned with rank-local request rows."""
+        return self.dp_recurrent_state_indices
 
 
 @auto_pytree(frozen=True)

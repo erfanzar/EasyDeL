@@ -87,8 +87,10 @@ from eformer.pytree import key_path_to_str
 from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
+from jax.sharding import NamedSharding, PartitionSpec
 from numpy.typing import DTypeLike
 
+from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
     HybridCache,
     ParallelHybridCacheView,
@@ -505,6 +507,13 @@ class ExecutionManager:
         self._verbose = verbose
 
         self._empty_sharding = replicated_named_sharding(model.mesh)
+        self._input_sharding = self._empty_sharding
+        if int(getattr(metadata, "data_parallel_size", 1) or 1) > 1:
+            resolver = getattr(metadata, "runtime_sharding_resolver", None) or text_config.runtime_sharding_resolver
+            self._input_sharding = NamedSharding(
+                model.mesh,
+                PartitionSpec(resolve_attention_data_parallel_axis(resolver)),
+            )
 
         self._sampler_sharding = self._empty_sharding
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._sampler_sharding)
@@ -519,6 +528,7 @@ class ExecutionManager:
             max_model_len=self.max_model_len,
             min_input_pad=self.min_input_pad,
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
+            input_sharding=self._input_sharding,
         )
         self._model_executor = ModelStepExecutor(
             model=self.model,
@@ -535,6 +545,7 @@ class ExecutionManager:
             pipeline_plan=self.pipeline_plan,
             full_hidden_state_max_tokens=self.full_hidden_state_max_tokens,
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
+            input_sharding=self._input_sharding,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_executor = SamplerExecutor(
@@ -1230,6 +1241,7 @@ class ExecutionManager:
         presence_penalties_cpu: numpy.ndarray,
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
         # VLM prefill helpers (optional)
@@ -1273,6 +1285,9 @@ class ExecutionManager:
             window_row_indices_cpu: Per-row global request indices for the
                 current window. Used to map compact sampler rows back to the
                 full-table layout.
+            recurrent_slot_indices_cpu: Optional physical recurrent-state slots
+                aligned with compact window rows. Rank-major DP uses this to
+                keep GDN/Mamba state independent of movable sampler rows.
             input_ids_buf: Contiguous token ID buffer [max_num_tokens]. Flattened
                 across requests for efficient batch processing.
             position_ids_buf: Contiguous position ID buffer [max_num_tokens].
@@ -1411,6 +1426,8 @@ class ExecutionManager:
             repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
             spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             padded_num_reqs_in=padded_num_reqs,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
@@ -1791,6 +1808,10 @@ class ExecutionManager:
             pages_tables=batch_metadata.pages_tables,
             input_ids_buf=batch_metadata.input_ids_buf,
             position_ids_buf=batch_metadata.position_ids_buf,
+            dp_query_start_loc=batch_metadata.dp_query_start_loc,
+            dp_request_distribution=batch_metadata.dp_request_distribution,
+            dp_context_lens=batch_metadata.dp_context_lens,
+            dp_recurrent_state_indices=batch_metadata.dp_recurrent_state_indices,
             input_token_handoff_positions=handoff.input_positions,
             input_token_handoff_ids=handoff.token_ids,
             input_token_handoff_count=handoff.count,
@@ -3335,6 +3356,8 @@ class ExecutionManager:
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
+        window_row_indices_cpu: numpy.ndarray | None = None,
+        recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         # VLM prefill helpers (optional)
@@ -3407,6 +3430,8 @@ class ExecutionManager:
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs_in,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
             spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
             prefill_embeds_cpu=prefill_embeds_cpu,
@@ -3437,6 +3462,8 @@ class ExecutionManager:
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
         padded_num_reqs_in: int,
+        window_row_indices_cpu: numpy.ndarray | None = None,
+        recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
     ) -> None:
@@ -3488,6 +3515,8 @@ class ExecutionManager:
             page_table_version=page_table_version,
             spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             padded_num_reqs_in=padded_num_reqs_in,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
         )
 
     def get_async_prep_result(
@@ -3561,6 +3590,8 @@ class ExecutionManager:
 
         scheduled_full_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
         active_mask_full_cpu = numpy.zeros((max_num_reqs,), dtype=bool)
+        window_row_indices_cpu = numpy.arange(max_num_reqs, dtype=numpy.int32)
+        recurrent_slot_indices_cpu = numpy.arange(max_num_reqs, dtype=numpy.int32)
         # Ensure the dummy schedule never exceeds the token bucket used for this
         # compilation variant (otherwise CPU batch-prep will correctly reject it).
         active_reqs = max(1, min(padded_num_reqs, max_num_reqs, num_tokens))
@@ -3582,7 +3613,9 @@ class ExecutionManager:
             and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
             and callable(getattr(self.model, "get_image_features", None))
         )
-        uses_mrope_model = model_uses_mrope(self.model)
+        if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
+            is_vlm_model = False
+        uses_mrope_model = is_vlm_model and model_uses_mrope(self.model)
 
         if is_vlm_model:
             hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
@@ -3626,6 +3659,8 @@ class ExecutionManager:
             repetition_penalties_cpu=temp_buffer.repetition_penalties,
             page_table_cpu=page_table_cpu_dummy,
             padded_num_reqs_in=padded_num_reqs,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
             prefill_embeds_cpu=prefill_embeds_cpu,
             prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,

@@ -38,7 +38,7 @@ Attention Operations:
         Specialized for autoregressive generation with KV-cache.
 
     UnifiedAttn: Unified attention for continuous batching.
-        Combines prefill and decode in a single kernel for vLLM-style serving.
+        Combines prefill and decode in a single kernel for continuous serving.
 
     RaggedPageAttnV2, RaggedPageAttnV3: Paged attention variants.
         Memory-efficient attention with page-based KV-cache management.

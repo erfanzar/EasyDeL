@@ -21,7 +21,7 @@ The module supports both batch and streaming extraction of reasoning content, wi
 model-specific parsers handling different formats (<think>, [THINK], text delimiters, etc.).
 
 Note:
-    Ideas and design patterns are inspired by vLLM's reasoning parser implementation.
+    Ideas and design patterns are inspired by external reasoning parser implementations.
 """
 
 from __future__ import annotations

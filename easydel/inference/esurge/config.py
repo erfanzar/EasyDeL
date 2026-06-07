@@ -201,7 +201,7 @@ class eSurgeRuntimeConfig(TypedDict, total=False):
             request-count floor and token-count floor should differ. Must be
             positive when set. Decode token buckets are clamped to at least
             16 tokens for normal model lengths, matching the TPU serving path
-            used by vLLM-style decode benchmarks.
+            used by decode benchmarks.
         max_num_seqs: Hard ceiling on concurrent in-flight sequences. The
             actual runtime concurrency may be smaller when KV pages are
             scarce.

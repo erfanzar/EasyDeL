@@ -152,6 +152,7 @@ class ModelStepExecutor:
         pipeline_plan: PipelineInferencePlan | None = None,
         full_hidden_state_max_tokens: int = 0,
         enable_spec_recurrent_commit: bool = False,
+        input_sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         """Initialize the ModelStepExecutor.
 
@@ -190,6 +191,7 @@ class ModelStepExecutor:
         self.mpmd_scheduler = mpmd_scheduler
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
+        self._input_sharding = input_sharding if input_sharding is not None else empty_sharding
         self._flat_state_args = not self._uses_mpmd_mesh()
         self._graphstate_treedef = jax.tree_util.tree_structure(graphstate_template)
         self._graphother_treedef = jax.tree_util.tree_structure(graphother_template)
@@ -271,6 +273,23 @@ class ModelStepExecutor:
     def runtime_graph_args(self) -> tuple[tp.Any, tp.Any]:
         """Return cached graph-state arguments for hot-path dispatch."""
         return self._runtime_graphstate_arg, self._runtime_graphother_arg
+
+    def _uses_spmd_dp(self) -> bool:
+        """Return whether compiled model inputs use rank-major DP layout."""
+        return int(getattr(self.metadata, "data_parallel_size", 1)) > 1
+
+    def _as_model_batch(self, flat: jax.Array) -> jax.Array:
+        """View a flat token buffer as the model batch expected by the active mode."""
+        if not self._uses_spmd_dp():
+            return jnp.expand_dims(flat, 0)
+        dp_size = int(getattr(self.metadata, "data_parallel_size", 1))
+        return flat.reshape((dp_size, int(flat.shape[0]) // dp_size))
+
+    def _flatten_model_hidden(self, hidden_states: jax.Array) -> jax.Array:
+        """Flatten model hidden states back to token-major rows."""
+        if not self._uses_spmd_dp():
+            return hidden_states.squeeze(0)
+        return hidden_states.reshape((-1, hidden_states.shape[-1]))
 
     def clear_runtime_graph_args(self) -> None:
         """Drop cached graph-state call arguments."""
@@ -444,14 +463,19 @@ class ModelStepExecutor:
         Returns:
             BatchMetadata pytree populated with sharding placeholders.
         """
+        use_spmd_dp = self._uses_spmd_dp()
         return BatchMetadata(
             packed_qsl_seqlens=self._empty_sharding,
             packed_i32_padded=self._empty_sharding,
             packed_f32_padded=self._empty_sharding,
             packed_misc_i32=self._empty_sharding,
             pages_tables=self._empty_sharding,
-            input_ids_buf=self._empty_sharding,
-            position_ids_buf=self._empty_sharding,
+            input_ids_buf=self._input_sharding if use_spmd_dp else self._empty_sharding,
+            position_ids_buf=self._input_sharding if use_spmd_dp else self._empty_sharding,
+            dp_query_start_loc=self._empty_sharding if use_spmd_dp else None,
+            dp_request_distribution=self._empty_sharding if use_spmd_dp else None,
+            dp_context_lens=self._empty_sharding if use_spmd_dp else None,
+            dp_recurrent_state_indices=self._empty_sharding if use_spmd_dp else None,
             input_token_handoff_positions=self._empty_sharding,
             input_token_handoff_ids=self._empty_sharding,
             input_token_handoff_count=self._empty_sharding,
@@ -1933,15 +1957,26 @@ class ModelStepExecutor:
                     with jax.named_scope("easydel/esurge/backbone_step/cache_metadata"):
                         cache_metadata = RaggedPagesMetadata(
                             pages_tables=metadata.pages_tables,
-                            context_lens=metadata.seq_lens[:num_reqs_max_model_len],
-                            query_start_loc=metadata.query_start_loc[: num_reqs_max_model_len + 1],
+                            context_lens=(
+                                metadata.rank_context_lens[:num_reqs_max_model_len]
+                                if self._uses_spmd_dp()
+                                else metadata.seq_lens[:num_reqs_max_model_len]
+                            ),
+                            query_start_loc=(
+                                metadata.rank_query_start_loc
+                                if self._uses_spmd_dp()
+                                else metadata.query_start_loc[: num_reqs_max_model_len + 1]
+                            ),
                             num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
                             num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
                             page_size=self.metadata.page_size,
-                            request_distribution=metadata.request_distribution,
+                            request_distribution=metadata.rank_request_distribution,
                             slot_mapping=metadata.slot_mapping,
                             num_kv_update_slices=metadata.num_kv_update_slices,
                             spec_recurrent_commit=metadata.spec_recurrent_commit,
+                            recurrent_state_indices=(
+                                metadata.rank_recurrent_state_indices if self._uses_spmd_dp() else None
+                            ),
                             version=self._metadata_version,
                         )
 
@@ -1973,18 +2008,18 @@ class ModelStepExecutor:
                     if use_mrope:
                         position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
                     else:
-                        position_ids = jnp.expand_dims(position_ids_view, 0)
+                        position_ids = self._as_model_batch(position_ids_view)
 
                     with jax.named_scope("easydel/esurge/backbone_step/prepare_inputs"):
                         model_inputs: dict[str, tp.Any]
                         if use_prefill_embeds:
-                            base_embeds = model.compute_embedding(jnp.expand_dims(input_ids_view, 0))
+                            base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
                             override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
                             mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
                             inputs_embeds = jnp.where(mask, override, base_embeds)
                             model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
                         else:
-                            model_inputs = {"input_ids": jnp.expand_dims(input_ids_view, 0)}
+                            model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
 
                     with jax.named_scope("easydel/esurge/backbone_step/model_forward"):
                         with set_inference_mode():
@@ -1997,7 +2032,7 @@ class ModelStepExecutor:
                                 **external_inputs,
                             )
                     with jax.named_scope("easydel/esurge/backbone_step/output"):
-                        hs = output.last_hidden_state.squeeze(0)
+                        hs = self._flatten_model_hidden(output.last_hidden_state)
                         return BackboneOutputs(kv_pages=output.past_key_values, hidden_states=hs)
 
         return _backbone_step
@@ -2106,15 +2141,26 @@ class ModelStepExecutor:
                     with jax.named_scope("easydel/esurge/pp_model_step/cache_metadata"):
                         cache_metadata = RaggedPagesMetadata(
                             pages_tables=metadata.pages_tables,
-                            context_lens=metadata.seq_lens[:num_reqs_max_model_len],
-                            query_start_loc=metadata.query_start_loc[: num_reqs_max_model_len + 1],
+                            context_lens=(
+                                metadata.rank_context_lens[:num_reqs_max_model_len]
+                                if self._uses_spmd_dp()
+                                else metadata.seq_lens[:num_reqs_max_model_len]
+                            ),
+                            query_start_loc=(
+                                metadata.rank_query_start_loc
+                                if self._uses_spmd_dp()
+                                else metadata.query_start_loc[: num_reqs_max_model_len + 1]
+                            ),
                             num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
                             num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
                             page_size=self.metadata.page_size,
-                            request_distribution=metadata.request_distribution,
+                            request_distribution=metadata.rank_request_distribution,
                             slot_mapping=metadata.slot_mapping,
                             num_kv_update_slices=metadata.num_kv_update_slices,
                             spec_recurrent_commit=metadata.spec_recurrent_commit,
+                            recurrent_state_indices=(
+                                metadata.rank_recurrent_state_indices if self._uses_spmd_dp() else None
+                            ),
                             version=self._metadata_version,
                         )
 
@@ -2146,18 +2192,18 @@ class ModelStepExecutor:
                     if use_mrope:
                         position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
                     else:
-                        position_ids = jnp.expand_dims(position_ids_view, 0)
+                        position_ids = self._as_model_batch(position_ids_view)
 
                     with jax.named_scope("easydel/esurge/pp_model_step/prepare_inputs"):
                         model_inputs: dict[str, tp.Any]
                         if use_prefill_embeds:
-                            base_embeds = model.compute_embedding(jnp.expand_dims(input_ids_view, 0))
+                            base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
                             override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
                             mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
                             inputs_embeds = jnp.where(mask, override, base_embeds)
                             model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
                         else:
-                            model_inputs = {"input_ids": jnp.expand_dims(input_ids_view, 0)}
+                            model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
 
                     with jax.named_scope("easydel/esurge/pp_model_step/model_forward"):
                         with set_inference_mode():
@@ -2170,7 +2216,7 @@ class ModelStepExecutor:
                                 **external_inputs,
                             )
                     with jax.named_scope("easydel/esurge/pp_model_step/gather_hidden"):
-                        hidden_states = output.last_hidden_state.squeeze(0)
+                        hidden_states = self._flatten_model_hidden(output.last_hidden_state)
                         gathered_hidden_states = hidden_states[metadata.logits_indices[:padded_num_reqs]]
                     with jax.named_scope("easydel/esurge/pp_model_step/lm_head"):
                         logits = model.apply_lm_head(gathered_hidden_states)
@@ -2254,15 +2300,26 @@ class ModelStepExecutor:
                     with jax.named_scope("easydel/esurge/spmd_model_step/cache_metadata"):
                         cache_metadata = RaggedPagesMetadata(
                             pages_tables=metadata.pages_tables,
-                            context_lens=metadata.seq_lens[:num_reqs_max_model_len],
-                            query_start_loc=metadata.query_start_loc[: num_reqs_max_model_len + 1],
+                            context_lens=(
+                                metadata.rank_context_lens[:num_reqs_max_model_len]
+                                if self._uses_spmd_dp()
+                                else metadata.seq_lens[:num_reqs_max_model_len]
+                            ),
+                            query_start_loc=(
+                                metadata.rank_query_start_loc
+                                if self._uses_spmd_dp()
+                                else metadata.query_start_loc[: num_reqs_max_model_len + 1]
+                            ),
                             num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
                             num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
                             page_size=self.metadata.page_size,
-                            request_distribution=metadata.request_distribution,
+                            request_distribution=metadata.rank_request_distribution,
                             slot_mapping=metadata.slot_mapping,
                             num_kv_update_slices=metadata.num_kv_update_slices,
                             spec_recurrent_commit=metadata.spec_recurrent_commit,
+                            recurrent_state_indices=(
+                                metadata.rank_recurrent_state_indices if self._uses_spmd_dp() else None
+                            ),
                             version=self._metadata_version,
                         )
 
@@ -2294,17 +2351,17 @@ class ModelStepExecutor:
                     if use_mrope:
                         position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
                     else:
-                        position_ids = jnp.expand_dims(position_ids_view, 0)
+                        position_ids = self._as_model_batch(position_ids_view)
 
                     with jax.named_scope("easydel/esurge/spmd_model_step/prepare_inputs"):
                         if use_prefill_embeds:
-                            base_embeds = model.compute_embedding(jnp.expand_dims(input_ids_view, 0))
+                            base_embeds = model.compute_embedding(self._as_model_batch(input_ids_view))
                             override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
                             mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
                             inputs_embeds = jnp.where(mask, override, base_embeds)
                             model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
                         else:
-                            model_inputs = {"input_ids": jnp.expand_dims(input_ids_view, 0)}
+                            model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
 
                     with jax.named_scope("easydel/esurge/spmd_model_step/model_forward"):
                         with set_inference_mode():
@@ -2317,7 +2374,7 @@ class ModelStepExecutor:
                                 **external_inputs,
                             )
                     with jax.named_scope("easydel/esurge/spmd_model_step/gather_hidden"):
-                        hidden_states = output.last_hidden_state.squeeze(0)
+                        hidden_states = self._flatten_model_hidden(output.last_hidden_state)
                         gathered_hidden_states = hidden_states[metadata.logits_indices[:padded_num_reqs]]
                     with jax.named_scope("easydel/esurge/spmd_model_step/lm_head"):
                         logits = model.apply_lm_head(gathered_hidden_states)

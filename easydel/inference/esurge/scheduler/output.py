@@ -93,6 +93,9 @@ class NewRequestData:
     num_computed_tokens: int
     """Number of tokens already computed from prefix cache."""
 
+    dp_rank: int | None = None
+    """Persistent data-parallel rank assigned to this request, if any."""
+
     # Vision-language model support
     pixel_values: Any | None = None
     """Pixel values for image inputs (vision models)."""
@@ -114,6 +117,7 @@ class NewRequestData:
         cls,
         request: EngineRequest,
         page_ids: tuple[list[int], ...],
+        dp_rank: int | None = None,
     ) -> NewRequestData:
         """Create a NewRequestData instance from an EngineRequest.
 
@@ -137,6 +141,7 @@ class NewRequestData:
             sampling_params=request.sampling_params,
             page_ids=page_ids,
             num_computed_tokens=request.num_computed_tokens,
+            dp_rank=dp_rank,
             # Vision-language model data
             pixel_values=request.pixel_values,
             image_grid_thw=request.image_grid_thw,
@@ -168,6 +173,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"page_ids={self.page_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"dp_rank={self.dp_rank},"
             f"has_vision={self.has_vision}"
             ")"
         )
@@ -193,6 +199,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"page_ids={self.page_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"dp_rank={self.dp_rank},"
             f"has_vision={self.has_vision}"
             ")"
         )
@@ -240,6 +247,9 @@ class CachedRequestData:
     num_computed_tokens: list[int]
     """List of computed token counts per request."""
 
+    dp_ranks: list[int | None] = field(default_factory=list)
+    """Persistent data-parallel ranks aligned with ``req_ids``."""
+
     @property
     def num_reqs(self) -> int:
         """Get the number of cached requests.
@@ -270,6 +280,7 @@ class CachedRequestData:
             new_token_ids=[],
             new_page_ids=[],
             num_computed_tokens=[],
+            dp_ranks=[],
         )
 
 
@@ -347,3 +358,12 @@ class SchedulerOutput:
 
     token_budget_remaining: int | None = None
     """Token budget remaining after scheduling."""
+
+    req_id_to_dp_rank: dict[str, int] = field(default_factory=dict)
+    """Persistent request-to-DP-rank assignments for scheduled requests."""
+
+    max_num_scheduled_tokens_per_dp_rank: int = 0
+    """Maximum tokens scheduled by any single DP rank this step."""
+
+    req_ids_per_rank: dict[int, list[str]] = field(default_factory=dict)
+    """Scheduled request IDs grouped by their owning DP rank."""

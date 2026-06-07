@@ -489,7 +489,7 @@ class GemmaModel(EasyDeLBaseModule):
 
     The model supports two cache flavours via ``past_key_values`` —
     :class:`TransformerCache` for dense KV layouts and
-    :class:`RaggedPagesCache` for paged (vLLM-style) attention used by the
+    :class:`RaggedPagesCache` for paged (serving-style) attention used by the
     eSurge inference engine. Layers are stage-assigned for pipeline
     parallelism (see :meth:`assign_layer_stage`) and optionally
     ``ModuleList.stack`` ed when ``config.scan_layers`` is set and there is

@@ -185,6 +185,8 @@ class ParallelLinear(spx.Module):
         bias_init: Initializer = default_bias_init,
         rngs: spx.Rngs | None = None,
         layout: FusedProjectionLayout | None = None,
+        sharding_layout: TensorLayout | tp.Any | None = None,
+        bias_sharding_layout: TensorLayout | tp.Any | None = None,
     ):
         """Initialize a parallel linear layer.
 
@@ -214,6 +216,13 @@ class ParallelLinear(spx.Module):
                 Defaults to zeros.
             rngs: Random number generators for initialization. If None,
                 creates a default Rngs with seed 0.
+            layout: Optional fused projection layout used by checkpoint reform
+                and activation split helpers.
+            sharding_layout: Optional explicit weight layout. When omitted,
+                the layer keeps the legacy row/column layout derived from
+                ``_direction``.
+            bias_sharding_layout: Optional explicit bias layout. When omitted,
+                bias placement follows the legacy row/column rule.
         """
         rngs_computed: spx.Rngs
         if rngs is None:
@@ -253,6 +262,8 @@ class ParallelLinear(spx.Module):
         self.in_features: int = in_features
         self.out_features: int | collections.abc.Sequence[int] = out_features
         self.layout: FusedProjectionLayout | None = layout
+        self.sharding_layout: TensorLayout | None = TensorLayout.from_any(sharding_layout)
+        self.bias_sharding_layout: TensorLayout | None = TensorLayout.from_any(bias_sharding_layout)
 
         self.use_bias: bool = use_bias
         self.dtype: Dtype | None = dtype
@@ -264,11 +275,12 @@ class ParallelLinear(spx.Module):
         weight_key: tp.Any = rngs_computed.parameters
         weight_shape: tuple[int, int] = (in_features, out_features_sum)
         weight_initialized: Array = kernel_init(weight_key, weight_shape, param_dtype)
-        weight_layout = None
-        if self._direction == "row":
-            weight_layout = TensorLayout.from_any(RowWise)
-        elif self._direction == "column":
-            weight_layout = TensorLayout.from_any(ColumnWise)
+        weight_layout = self.sharding_layout
+        if weight_layout is None:
+            if self._direction == "row":
+                weight_layout = TensorLayout.from_any(RowWise)
+            elif self._direction == "column":
+                weight_layout = TensorLayout.from_any(ColumnWise)
         self.weight: spx.Parameter = spx.Parameter(weight_initialized, sharding=sharding_for_layout(weight_layout))
 
         if use_bias:
@@ -283,7 +295,9 @@ class ParallelLinear(spx.Module):
             #  * row-parallel weight is (TP, [FSDP,SP]) — output is the
             #    second axis, replicated across TP, so bias is replicated.
             #  * unspecified direction: replicated (safe default).
-            if self._direction == "column":
+            if self.bias_sharding_layout is not None:
+                bias_layout = self.bias_sharding_layout
+            elif self._direction == "column":
                 bias_layout = TensorLayout.from_any(SRowWise)
             else:
                 bias_layout = TensorLayout.from_any(Replicated)
@@ -362,27 +376,18 @@ class ParallelLinear(spx.Module):
             inputs_promoted, kernel_promoted = promote_dtype((inputs, kernel), dtype=self.dtype)
             bias_promoted = None
 
-        inputs_ndim: int = inputs_promoted.ndim
-        inputs_gt_one_dim: bool = inputs_ndim > 1
-        if inputs_gt_one_dim:
-            leading_shape = inputs_promoted.shape[:-1]
-            flat_inputs = jnp.reshape(inputs_promoted, (-1, inputs_promoted.shape[-1]))
-            flat_y = jnp.matmul(flat_inputs, kernel_promoted, precision=self.precision)
-            y: Shaped[Array, "... out_features"] = jnp.reshape(flat_y, (*leading_shape, kernel_promoted.shape[-1]))
-        else:
-            y = jnp.matmul(inputs_promoted, kernel_promoted, precision=self.precision)
+        y: Shaped[Array, "... out_features"] = jnp.einsum(
+            "...i,io->...o",
+            inputs_promoted,
+            kernel_promoted,
+            precision=self.precision,
+        )
 
         y_scaled: Shaped[Array, "... out_features"] = self._scale_operator(y)
 
         y_final: Shaped[Array, "... out_features"]
         if bias_promoted is not None:
-            y_ndim: int = y_scaled.ndim
-            num_ones: int = y_ndim - 1
-            ones_tuple: tuple[int, ...] = (1,) * num_ones
-            final_dim: tuple[int] = (-1,)
-            reshape_spec: tuple[int, ...] = ones_tuple + final_dim
-            bias_reshaped: Array = jnp.reshape(bias_promoted, reshape_spec)
-            y_final = y_scaled + bias_reshaped
+            y_final = y_scaled + bias_promoted
         else:
             y_final = y_scaled
 

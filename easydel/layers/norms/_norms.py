@@ -264,7 +264,7 @@ class RMSNorm(spx.Module):
     Numerical stability rules implemented in :meth:`forward`:
 
     * ``eps`` is added *inside* the square root via ``rsqrt(var + eps)``, not
-      after. This is the standard placement and matches HuggingFace / vLLM.
+      after. This is the standard placement and matches HuggingFace and common inference backends.
     * If either ``param_dtype`` or ``dtype`` is one of the low-precision floats
       in :data:`lowfloats` (float4 / float8 family), the input is promoted to
       ``float32`` for the entire normalization. Otherwise the input is promoted

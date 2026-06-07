@@ -11,9 +11,9 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM-style fused recurrent GDN decode kernel for TPU.
+"""serving-style fused recurrent GDN decode kernel for TPU.
 
-This is adapted from the TPU-inference/vLLM branch. It differs from the
+This is adapted from the TPU-inference branch. It differs from the
 older EasyDeL decode kernel in one critical way: the recurrent state cache is
 an input/output alias and is updated directly by the Pallas program. That
 avoids building a separate ``new_state`` prefix and scattering it back after

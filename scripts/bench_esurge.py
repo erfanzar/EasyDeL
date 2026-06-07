@@ -14,8 +14,7 @@
 
 """Qwen3.5-9B eSurge throughput benchmark, no speculative decoding.
 
-This is the EasyDeL side of an apples-to-apples TPU comparison against
-``vllm bench throughput``:
+This is the EasyDeL side of an apples-to-apples TPU throughput comparison:
 
   - Qwen/Qwen3.5-9B
   - 4-way tensor parallelism
@@ -68,6 +67,20 @@ SHARDING_AXIS_DIMS = (1, 1, 1, 1, -1, 1)
 SHARDING_AXIS_NAMES = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
 
+def parse_axis_dims(value: str) -> tuple[int, int, int, int, int, int]:
+    """Parse a comma-separated sharding axis tuple."""
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(parts) != len(SHARDING_AXIS_NAMES):
+        raise argparse.ArgumentTypeError(
+            f"--sharding-axis-dims must contain exactly {len(SHARDING_AXIS_NAMES)} integers for {SHARDING_AXIS_NAMES}."
+        )
+    try:
+        dims = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--sharding-axis-dims accepts only integers.") from exc
+    return dims
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the throughput benchmark.
 
@@ -92,6 +105,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
     parser.add_argument("--hbm-utilization", type=float, default=0.80)
     parser.add_argument("--page-size", type=int, default=32)
+    parser.add_argument(
+        "--sharding-axis-dims",
+        type=parse_axis_dims,
+        default=SHARDING_AXIS_DIMS,
+        help="Comma-separated axis dims in pp,dp,fsdp,ep,tp,sp order.",
+    )
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -462,6 +481,7 @@ def main() -> int:
 
     import easydel as ed
     from easydel.inference.esurge.runners import eSurgeRunner
+    from easydel.utils import set_inference_mode
 
     if jax.default_backend() != "tpu":
         raise SystemExit(f"Refusing to benchmark on {jax.default_backend()!r}; TPU is required.")
@@ -480,30 +500,32 @@ def main() -> int:
     )
     print(
         "runtime     : "
-        f"TP=4 hbm={args.hbm_utilization} page_size={args.page_size} "
+        f"axis_dims={args.sharding_axis_dims} "
+        f"hbm={args.hbm_utilization} page_size={args.page_size} "
         f"max_num_batched_tokens={args.max_num_batched_tokens} "
         f"async={not args.no_async} overlap={not args.no_overlap} aot={args.use_aot_forward}"
     )
 
     partition_axis = ed.PartitionAxis()
     partition_axis.hidden_state_axis = None
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=str(model_path),
-        dtype=jnp.bfloat16,
-        param_dtype=jnp.bfloat16,
-        config_kwargs={
-            "attn_mechanism": "ragged_page_attention_v3",
-            "decode_attn_mechanism": "ragged_page_attention_v3",
-            "attn_dtype": jnp.bfloat16,
-            "kvdtype": jnp.bfloat16,
-            "freq_max_position_embeddings": args.max_model_len,
-            "mask_max_position_embeddings": args.max_model_len,
-        },
-        sharding_axis_dims=SHARDING_AXIS_DIMS,
-        sharding_axis_names=SHARDING_AXIS_NAMES,
-        partition_axis=partition_axis,
-        auto_shard_model=True,
-    )
+    with set_inference_mode():
+        model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=str(model_path),
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            config_kwargs={
+                "attn_mechanism": "ragged_page_attention_v3",
+                "decode_attn_mechanism": "ragged_page_attention_v3",
+                "attn_dtype": jnp.bfloat16,
+                "kvdtype": jnp.bfloat16,
+                "freq_max_position_embeddings": args.max_model_len,
+                "mask_max_position_embeddings": args.max_model_len,
+            },
+            sharding_axis_dims=args.sharding_axis_dims,
+            sharding_axis_names=SHARDING_AXIS_NAMES,
+            partition_axis=partition_axis,
+            auto_shard_model=True,
+        )
     text_config = model.config.get_text_config()
     vocab_size = int(getattr(text_config, "vocab_size", getattr(model.config, "vocab_size", 151936)))
     prompts = make_prompts(

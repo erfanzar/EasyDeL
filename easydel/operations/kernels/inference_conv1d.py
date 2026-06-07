@@ -59,7 +59,7 @@ def _reorder_concatenated_tensor_for_sharding(
     Reorders the channel axis of a tensor that concatenates several fused
     feature groups so that, after the same axis is split into ``n_shards``
     along the mesh, each shard holds an equal slice of *every* original
-    group. This matches the layout that vLLM TPU uses for sharded conv /
+    group. This matches the layout that the TPU serving path uses for sharded conv /
     QKV projections.
 
     Args:

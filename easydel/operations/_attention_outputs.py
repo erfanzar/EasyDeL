@@ -81,7 +81,7 @@ class AttentionOutput(OperationOutput):
             for autoregressive generation. Can be one of:
             - TransformerCacheView: Standard transformer KV-cache
             - RaggedPagesCacheView: Paged attention cache for continuous batching
-            - UnifiedAttentionCacheView: vLLM-style unified paged attention cache
+            - UnifiedAttentionCacheView: serving-style unified paged attention cache
             - None: When caching is not used (e.g., during training)
 
     Example:

@@ -1300,7 +1300,7 @@ def _write_qwen3_next_spec_candidate_states(
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
 ]:
-    """Write vLLM-style speculative GDN candidate states into extra cache rows.
+    """Write speculative GDN candidate states into extra cache rows.
 
     eSurge stores live recurrent state in rows ``[0, max_num_reqs)``. When the
     runner allocates speculative candidate rows, they are laid out as
@@ -1449,6 +1449,7 @@ def _apply_qwen3_next_packed_updates_ragged(
     dt_bias: Float[Array, "num_v_heads"],
     context_lens: Int[Array, "num_slots"] | None = None,
     spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+    disable_recurrent_scan_prefill: bool = False,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -1536,7 +1537,6 @@ def _apply_qwen3_next_packed_updates_ragged(
     slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
     scheduled_tokens = query_start_loc[1 : num_slots + 1] - query_start_loc[:num_slots]
     active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
-    single_slot_mask = active_slots & (scheduled_tokens == 1)
 
     if num_slots == 0:
         return conv_states, recurrent_states, token_outputs
@@ -1564,15 +1564,17 @@ def _apply_qwen3_next_packed_updates_ragged(
         )
 
     state_indices = jnp.arange(num_slots, dtype=jnp.int32)
-    decode_count = jnp.sum(single_slot_mask)
-    num_active = jnp.sum(active_slots)
-    distribution = jnp.stack([decode_count, num_active, num_active])
     qsl = query_start_loc[: num_slots + 1]
     if context_lens is None:
         has_initial_state = jnp.ones((num_slots,), dtype=jnp.bool_)
     else:
         context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:num_slots]
         has_initial_state = ((context_lens_i - scheduled_tokens) > 0) & active_slots
+    single_slot_mask = active_slots & (scheduled_tokens == 1)
+    decode_count = jnp.sum(single_slot_mask)
+    num_active = jnp.sum(active_slots)
+    distribution = jnp.stack([decode_count, num_active, num_active])
+
     gdr_metadata = ragged_gdr_op.get_impl_metadata()
     gdr_mode = ragged_gdr_op.get_mode(query=jnp.expand_dims(conv_input[0], 0), BTHD=False)
     shardings_bthd = gdr_metadata.get_shardings(gdr_mode, layout="bthd")
@@ -1587,8 +1589,14 @@ def _apply_qwen3_next_packed_updates_ragged(
     use_head_sharded_conv = (
         mesh is not None and head_axis is not None and tp_size > 1 and all(size % tp_size == 0 for size in split_sizes)
     )
-    use_recurrent_scan_prefill = jax.default_backend() == "tpu" and seq_len >= 128
-
+    force_recurrent_scan_prefill = os.environ.get("EASYDEL_QWEN3_NEXT_RECURRENT_SCAN_PREFILL", "0") == "1"
+    recurrent_scan_max_prefill = int(os.environ.get("EASYDEL_QWEN3_NEXT_RECURRENT_SCAN_MAX_PREFILL", "64"))
+    use_recurrent_scan_prefill = (
+        jax.default_backend() == "tpu"
+        and seq_len >= 128
+        and not bool(disable_recurrent_scan_prefill)
+        and (force_recurrent_scan_prefill or seq_len <= recurrent_scan_max_prefill)
+    )
     candidate_conv_states, candidate_recurrent_states = _write_qwen3_next_spec_candidate_states(
         conv_states=conv_states,
         recurrent_states=recurrent_states,
@@ -1649,10 +1657,10 @@ def _apply_qwen3_next_packed_updates_ragged(
             n_v=num_v_heads,
             d_k=head_k_dim,
             d_v=head_v_dim,
-            chunk_size=16,
             use_qk_norm_in_gdn=True,
             pre_sharded_mixed_qkv=use_head_sharded_conv,
             flat_tp_shard=use_head_sharded_conv,
+            chunk_size=16,
             apply_silu_in_gdr=use_recurrent_scan_prefill,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
         )
@@ -1694,6 +1702,7 @@ def _apply_qwen3_next_packed_updates(
     dt_bias: Float[Array, "num_v_heads"] | None = None,
     context_lens: Int[Array, "num_slots"] | None = None,
     spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+    disable_recurrent_scan_prefill: bool = False,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -1703,7 +1712,7 @@ def _apply_qwen3_next_packed_updates(
 
     This is the public entry point called by ``Qwen3NextLinearAttention`` during
     packed-batch (continuous batching) inference. In inference mode it uses the
-    vLLM-style ragged conv + ragged GDR path by default; the older unified path
+    Rank-major ragged conv + ragged GDR path by default; the older unified path
     remains the non-inference fallback.
 
     Args:
@@ -1782,6 +1791,7 @@ def _apply_qwen3_next_packed_updates(
         dt_bias=dt_bias,
         context_lens=context_lens,
         spec_recurrent_commit=spec_recurrent_commit,
+        disable_recurrent_scan_prefill=disable_recurrent_scan_prefill,
     )
 
 
@@ -2274,7 +2284,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
         )
 
     def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create vLLM-style packed ``[Q(+gate) | K | V]`` projection.
+        """Create packed ``[Q(+gate) | K | V]`` projection.
 
         Builds a single column-parallel projection whose output is
         partitioned into Q (optionally doubled for the gate), K, and V
@@ -2962,14 +2972,18 @@ class Qwen3NextLinearAttention(spx.Module):
         packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
         packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
         packed_context_lens = getattr(cache_metadata, "context_lens", None) if cache_metadata is not None else None
+        packed_recurrent_state_indices = (
+            getattr(cache_metadata, "recurrent_state_indices", None) if cache_metadata is not None else None
+        )
         packed_spec_recurrent_commit = (
             getattr(cache_metadata, "spec_recurrent_commit", None) if cache_metadata is not None else None
         )
+        rank_major_packed = packed_query_start_loc is not None and getattr(packed_query_start_loc, "ndim", 0) == 2
         use_packed_state_updates = (
             cache_view is not None
             and cache_view.conv_state is not None
             and cache_view.recurrent_state is not None
-            and batch_size == 1
+            and (batch_size == 1 or rank_major_packed)
             and packed_query_start_loc is not None
             and packed_num_seqs is not None
         )
@@ -2982,40 +2996,187 @@ class Qwen3NextLinearAttention(spx.Module):
             # bf16 is the smallest dtype that preserves silu precision for conv outputs.
             conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
 
-            query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
-            num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
-            num_requests = num_seqs_arr[0]
-
             kernel = self.conv1d.weight  # [kernel_size, 1, conv_dim]
             kernel = jnp.squeeze(kernel, axis=1).T  # [conv_dim, kernel_size]
 
-            conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
-                conv_states=conv_states,
-                recurrent_states=recurrent_states,
-                conv_input=conv_input,
-                beta=beta,
-                decay=decay,
-                kernel=kernel,
-                query_start_loc=query_start_loc,
-                num_requests=num_requests,
-                key_dim=self.key_dim,
-                num_k_heads=self.num_k_heads,
-                head_k_dim=self.head_k_dim,
-                num_v_heads=self.num_v_heads,
-                head_v_dim=self.head_v_dim,
-                expand_ratio=expand_ratio,
-                conv_output_dtype=conv_output_dtype,
-                gdr_op=self.gdr_op,
-                ragged_gdr_op=self.ragged_gdr_op,
-                alpha_raw=alpha_raw,
-                beta_raw=beta_raw,
-                A_log=self.A_log.value,
-                dt_bias=self.dt_bias.value,
-                context_lens=packed_context_lens,
-                spec_recurrent_commit=packed_spec_recurrent_commit,
-            )
+            if rank_major_packed:
+                force_dp_recurrent_scan_prefill = (
+                    os.environ.get("EASYDEL_QWEN3_NEXT_DP_RECURRENT_SCAN_PREFILL", "0") == "1"
+                )
+                dp_recurrent_scan_max_prefill = int(
+                    os.environ.get("EASYDEL_QWEN3_NEXT_DP_RECURRENT_SCAN_MAX_PREFILL", "64")
+                )
+                seq_len_static = int(conv_input.shape[1])
+                use_dp_recurrent_scan_prefill = (
+                    jax.default_backend() == "tpu"
+                    and seq_len_static >= 128
+                    and (force_dp_recurrent_scan_prefill or seq_len_static <= dp_recurrent_scan_max_prefill)
+                )
+                query_start_loc_by_rank = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
+                rows_per_rank = int(query_start_loc_by_rank.shape[1] - 1)
+                dp_size = int(query_start_loc_by_rank.shape[0])
+                state_rows = dp_size * rows_per_rank
+                if conv_states.shape[0] < state_rows or recurrent_states.shape[0] < state_rows:
+                    raise ValueError("Rank-major Qwen3-Next packed updates require one recurrent row per DP-local slot.")
 
-            output = token_outputs[None, ...]
+                request_distribution = getattr(cache_metadata, "request_distribution", None)
+                if request_distribution is not None and getattr(request_distribution, "ndim", 0) == 2:
+                    num_requests_by_rank = jnp.asarray(request_distribution[:, 2], dtype=jnp.int32)
+                else:
+                    scheduled_by_rank = query_start_loc_by_rank[:, 1:] - query_start_loc_by_rank[:, :-1]
+                    num_requests_by_rank = jnp.sum(scheduled_by_rank > 0, axis=1).astype(jnp.int32)
+
+                conv_states_by_rank = conv_states[:state_rows].reshape(dp_size, rows_per_rank, *conv_states.shape[1:])
+                recurrent_states_by_rank = recurrent_states[:state_rows].reshape(
+                    dp_size,
+                    rows_per_rank,
+                    *recurrent_states.shape[1:],
+                )
+                if packed_recurrent_state_indices is None:
+                    state_indices_by_rank = jnp.broadcast_to(
+                        jnp.arange(rows_per_rank, dtype=jnp.int32)[None, :],
+                        (dp_size, rows_per_rank),
+                    )
+                else:
+                    state_indices_raw = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32)
+                    state_indices_by_rank = state_indices_raw.reshape(dp_size, rows_per_rank)
+
+                if packed_context_lens is None:
+                    context_lens_by_rank = jnp.zeros((dp_size, rows_per_rank), dtype=jnp.int32)
+                    use_context_lens = False
+                else:
+                    context_lens_by_rank = jnp.asarray(packed_context_lens, dtype=jnp.int32)[:state_rows].reshape(
+                        dp_size,
+                        rows_per_rank,
+                    )
+                    use_context_lens = True
+
+                def _rank_update(args):
+                    (
+                        conv_state_i,
+                        recurrent_state_i,
+                        conv_input_i,
+                        qsl_i,
+                        num_requests_i,
+                        alpha_i,
+                        beta_i,
+                        ctx_i,
+                        state_idx_i,
+                    ) = args
+                    row_ids = jnp.arange(rows_per_rank, dtype=jnp.int32)
+                    active_rows = row_ids < num_requests_i
+                    safe_state_idx = jnp.clip(state_idx_i, 0, rows_per_rank - 1)
+                    selected_conv_state = conv_state_i[safe_state_idx]
+                    selected_recurrent_state = recurrent_state_i[safe_state_idx]
+                    updated_conv_state, updated_recurrent_state, token_output = _apply_qwen3_next_packed_updates(
+                        conv_states=selected_conv_state,
+                        recurrent_states=selected_recurrent_state,
+                        conv_input=conv_input_i[None, ...],
+                        beta=beta_i[None, ...],
+                        decay=None,
+                        kernel=kernel,
+                        query_start_loc=qsl_i,
+                        num_requests=num_requests_i,
+                        key_dim=self.key_dim,
+                        num_k_heads=self.num_k_heads,
+                        head_k_dim=self.head_k_dim,
+                        num_v_heads=self.num_v_heads,
+                        head_v_dim=self.head_v_dim,
+                        expand_ratio=expand_ratio,
+                        conv_output_dtype=conv_output_dtype,
+                        gdr_op=self.gdr_op,
+                        ragged_gdr_op=self.ragged_gdr_op,
+                        alpha_raw=alpha_i[None, ...],
+                        beta_raw=beta_i[None, ...],
+                        A_log=self.A_log.value,
+                        dt_bias=self.dt_bias.value,
+                        context_lens=ctx_i if use_context_lens else None,
+                        spec_recurrent_commit=None,
+                        disable_recurrent_scan_prefill=not use_dp_recurrent_scan_prefill,
+                    )
+                    scatter_idx = jnp.where(active_rows, safe_state_idx, rows_per_rank)
+                    conv_state_i = conv_state_i.at[scatter_idx].set(updated_conv_state, mode="drop")
+                    recurrent_state_i = recurrent_state_i.at[scatter_idx].set(updated_recurrent_state, mode="drop")
+                    return conv_state_i, recurrent_state_i, token_output
+
+                if use_dp_recurrent_scan_prefill:
+                    updated_conv_by_rank_list = []
+                    updated_recurrent_by_rank_list = []
+                    token_outputs_list = []
+                    for rank_idx in range(dp_size):
+                        conv_i, recurrent_i, output_i = _rank_update(
+                            (
+                                conv_states_by_rank[rank_idx],
+                                recurrent_states_by_rank[rank_idx],
+                                conv_input[rank_idx],
+                                query_start_loc_by_rank[rank_idx],
+                                num_requests_by_rank[rank_idx],
+                                alpha_raw[rank_idx],
+                                beta_raw[rank_idx],
+                                context_lens_by_rank[rank_idx],
+                                state_indices_by_rank[rank_idx],
+                            )
+                        )
+                        updated_conv_by_rank_list.append(conv_i)
+                        updated_recurrent_by_rank_list.append(recurrent_i)
+                        token_outputs_list.append(output_i)
+                    updated_conv_by_rank = jnp.stack(updated_conv_by_rank_list, axis=0)
+                    updated_recurrent_by_rank = jnp.stack(updated_recurrent_by_rank_list, axis=0)
+                    token_outputs = jnp.stack(token_outputs_list, axis=0)
+                else:
+                    updated_conv_by_rank, updated_recurrent_by_rank, token_outputs = jax.vmap(_rank_update)(
+                        (
+                            conv_states_by_rank,
+                            recurrent_states_by_rank,
+                            conv_input,
+                            query_start_loc_by_rank,
+                            num_requests_by_rank,
+                            alpha_raw,
+                            beta_raw,
+                            context_lens_by_rank,
+                            state_indices_by_rank,
+                        )
+                    )
+
+                conv_states = conv_states.at[:state_rows].set(
+                    updated_conv_by_rank.reshape(state_rows, *conv_states.shape[1:])
+                )
+                recurrent_states = recurrent_states.at[:state_rows].set(
+                    updated_recurrent_by_rank.reshape(state_rows, *recurrent_states.shape[1:])
+                )
+                output = token_outputs
+            else:
+                query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
+                num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
+                num_requests = num_seqs_arr[0]
+
+                conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
+                    conv_states=conv_states,
+                    recurrent_states=recurrent_states,
+                    conv_input=conv_input,
+                    beta=beta,
+                    decay=decay,
+                    kernel=kernel,
+                    query_start_loc=query_start_loc,
+                    num_requests=num_requests,
+                    key_dim=self.key_dim,
+                    num_k_heads=self.num_k_heads,
+                    head_k_dim=self.head_k_dim,
+                    num_v_heads=self.num_v_heads,
+                    head_v_dim=self.head_v_dim,
+                    expand_ratio=expand_ratio,
+                    conv_output_dtype=conv_output_dtype,
+                    gdr_op=self.gdr_op,
+                    ragged_gdr_op=self.ragged_gdr_op,
+                    alpha_raw=alpha_raw,
+                    beta_raw=beta_raw,
+                    A_log=self.A_log.value,
+                    dt_bias=self.dt_bias.value,
+                    context_lens=packed_context_lens,
+                    spec_recurrent_commit=packed_spec_recurrent_commit,
+                )
+                output = token_outputs[None, ...]
+
             new_cache_view = cache_view.replace(
                 conv_state=conv_states,
                 recurrent_state=recurrent_states,

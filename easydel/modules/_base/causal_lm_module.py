@@ -165,6 +165,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
         lm_head_class: spx.Module = ColumnParallelLinear,
+        lm_head_sharding_layout: object | None = None,
+        lm_head_bias_sharding_layout: object | None = None,
     ):
         """Initialize the Causal LM module.
 
@@ -208,6 +210,10 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 If None, uses the default SpecTrax initializer.
             lm_head_class: Module class for the LM head.
                 Defaults to ColumnParallelLinear for tensor parallelism support.
+            lm_head_sharding_layout: Optional explicit weight layout forwarded
+                to LM head classes that support it.
+            lm_head_bias_sharding_layout: Optional explicit bias layout
+                forwarded to LM head classes that support it.
 
         Example:
             Creating a model with weight tying::
@@ -282,16 +288,19 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 spx.Module: A freshly built LM head projecting
                 ``config.hidden_size`` to ``config.vocab_size``.
             """
-            return lm_head_class(
-                config.hidden_size,
-                config.vocab_size,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                use_bias=self._head_bias,
-                kernel_init=self._head_kernel_init,
-                precision=precision,
-                rngs=rngs,
-            )
+            head_kwargs = {
+                "dtype": dtype,
+                "param_dtype": param_dtype,
+                "use_bias": self._head_bias,
+                "kernel_init": self._head_kernel_init,
+                "precision": precision,
+                "rngs": rngs,
+            }
+            if lm_head_sharding_layout is not None:
+                head_kwargs["sharding_layout"] = lm_head_sharding_layout
+            if lm_head_bias_sharding_layout is not None:
+                head_kwargs["bias_sharding_layout"] = lm_head_bias_sharding_layout
+            return lm_head_class(config.hidden_size, config.vocab_size, **head_kwargs)
 
         lm_head = self._create_task_head_on_last_stage(_build_lm_head)
         setattr(self, lm_head_name, lm_head)

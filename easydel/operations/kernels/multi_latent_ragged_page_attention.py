@@ -885,26 +885,38 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
         resolver = self.metadata.runtime_sharding_resolver.with_mesh(self.metadata.mesh)
         resolve = resolver.resolve
         request_distribution = _resolve_distribution(cache_metadata)
-        request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
+        use_rank_major_dp = getattr(request_distribution, "ndim", 0) == 2
+        if use_rank_major_dp:
+            request_distribution = jnp.stack(
+                (
+                    jnp.zeros_like(request_distribution[:, 2]),
+                    jnp.zeros_like(request_distribution[:, 2]),
+                    request_distribution[:, 2],
+                ),
+                axis=1,
+            ).astype(jnp.int32)
+        else:
+            request_distribution = jnp.array([0, 0, request_distribution[2]], dtype=jnp.int32)
         page_axis = _dp_page_axis(cache_view)
         head_aware_kv = keys_values.ndim == 3
+        q_token_axis = ATTN_DP if use_rank_major_dp else ct.EMPTY
 
         qaxes_nope = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY] if head_aware_kv else [ct.EMPTY, ct.HEAD, ct.EMPTY],
+            axes=[q_token_axis, ct.EMPTY, ct.EMPTY] if head_aware_kv else [q_token_axis, ct.HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=queries_nope.shape,
         )
         qaxes_pe = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.EMPTY] if head_aware_kv else [ct.EMPTY, ct.HEAD, ct.EMPTY],
+            axes=[q_token_axis, ct.EMPTY, ct.EMPTY] if head_aware_kv else [q_token_axis, ct.HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=queries_pe.shape,
         )
         kv_values_axes = resolve(
-            axes=[ct.EMPTY, ct.EMPTY] if keys_values.ndim == 2 else [ct.EMPTY, ct.EMPTY, ct.EMPTY],
+            axes=[q_token_axis, ct.EMPTY] if keys_values.ndim == 2 else [q_token_axis, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=keys_values.shape,
         )
-        keys_pe_axes = resolve(axes=[ct.EMPTY, ct.EMPTY], mode=ct.MODE_PREFILL, shape=keys_pe.shape)
+        keys_pe_axes = resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=keys_pe.shape)
 
         kv_pages_spec = resolve(
             axes=[page_axis, ct.EMPTY, ct.EMPTY, ct.EMPTY],
@@ -974,6 +986,8 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
             and len(page_axis_names) > 0
             and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
         )
+        if use_rank_major_dp and not can_use_dp_local:
+            raise ValueError("Rank-major DP MLA ragged attention requires the DP-local page path.")
 
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
@@ -1007,7 +1021,6 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 full_query_start_loc,
                 full_distribution,
             ):
-                del full_distribution
                 shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
 
@@ -1024,15 +1037,18 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                     axis=0,
                 )
                 local_block_tables = local_pages_rows.reshape((rows_per_shard * max_pages_per_req,))
-                local_query_start_loc = jax.lax.dynamic_slice_in_dim(
-                    full_query_start_loc,
-                    start_index=row_start,
-                    slice_size=rows_per_shard + 1,
-                    axis=0,
-                )
-
-                local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                if use_rank_major_dp:
+                    local_query_start_loc = full_query_start_loc[shard_idx]
+                    local_distribution = full_distribution[shard_idx]
+                else:
+                    local_query_start_loc = jax.lax.dynamic_slice_in_dim(
+                        full_query_start_loc,
+                        start_index=row_start,
+                        slice_size=rows_per_shard + 1,
+                        axis=0,
+                    )
+                    local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
+                    local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
                 local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
@@ -1052,6 +1068,9 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                     local_distribution,
                     **common_call_kwargs,
                 )
+
+                if use_rank_major_dp:
+                    return local_output, local_kv_pages
 
                 row_ids = jnp.arange(rows_per_shard, dtype=jnp.int32)[:, None]
                 token_ids = jnp.arange(local_queries_nope.shape[0], dtype=jnp.int32)[None, :]

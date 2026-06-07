@@ -70,6 +70,7 @@ Note:
 """
 
 from .async_scheduler import AsyncScheduler
+from .dp_scheduler import DPScheduler
 from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
 from .request_queue import FCFSRequestQueue, PriorityRequestQueue, RequestQueue
@@ -79,6 +80,7 @@ from .token_budget import TokenBudgetManager
 __all__ = (
     "AsyncScheduler",
     "CachedRequestData",
+    "DPScheduler",
     "FCFSRequestQueue",
     "NewRequestData",
     "PriorityRequestQueue",

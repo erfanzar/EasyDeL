@@ -1643,7 +1643,7 @@ class EasyGenerationMixin:
     ) -> UnifiedAttentionCache:
         """Initialize and return the unified-attention paged KV cache tensors.
 
-        Creates a UnifiedAttentionCache for use with vLLM-style unified attention
+        Creates a UnifiedAttentionCache for use with serving-style unified attention
         kernels. The cache layout matches ejkernel's Triton UnifiedAttention kernel:
         `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
 
@@ -2400,7 +2400,7 @@ class EasyGenerationMixin:
         layer_indices: tp.Iterable[int] | None = None,
         max_cache_tokens: int | None = None,
     ):
-        """Create :class:`UnifiedAttentionCacheConfig` for vLLM-style unified attention.
+        """Create :class:`UnifiedAttentionCacheConfig` for serving-style unified attention.
 
         This cache layout matches ejkernel's Triton UnifiedAttention kernel:
         ``[num_blocks, block_size, num_kv_heads, head_dim]`` for both K and V.

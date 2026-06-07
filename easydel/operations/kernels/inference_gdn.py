@@ -1199,8 +1199,8 @@ def ragged_gated_delta_rule_decode_only(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
     )
 
-    use_vllm_fused_decode = os.environ.get("EASYDEL_FUSED_GDN_DECODE", "0").lower() in {"1", "true", "yes"}
-    if use_vllm_fused_decode and jax.default_backend() == "tpu" and d_k == 128 and d_v == 128 and num_tokens <= max_reqs:
+    use_fused_gdn_decode = os.environ.get("EASYDEL_FUSED_GDN_DECODE", "0").lower() in {"1", "true", "yes"}
+    if use_fused_gdn_decode and jax.default_backend() == "tpu" and d_k == 128 and d_v == 128 and num_tokens <= max_reqs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         g_tiled = jnp.broadcast_to(g[..., None], (num_tokens, n_v, d_k)).astype(jnp.float32)
         b_tiled = jnp.broadcast_to(b_reshaped[..., None], (num_tokens, n_v, num_lanes)).astype(query.dtype)
@@ -1484,7 +1484,7 @@ def ragged_gated_delta_rule(
 
 @OperationRegistry.register
 class RaggedGatedDeltaRule(OperationImpl):
-    """Ragged Gated Delta Rule operation wrapping the inlined vLLM kernel.
+    """Ragged Gated Delta Rule operation wrapping the inlined fused kernel.
 
     Provides a first-class EasyDeL operation for the ragged GDN kernel with
     ``jax.shard_map`` support for head-parallel sharding across mesh axes.

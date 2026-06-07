@@ -49,6 +49,7 @@ from ._runtime import split_interleaved_pair_last_axis, split_interleaved_segmen
 
 if TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
+    from easydel.infra.sharding import TensorLayout
 
 Initializer: TypeAlias = Callable[[jax.Array, tuple[int, ...], DTypeLike], jax.Array]
 ReformRule: TypeAlias = dict[str, object]
@@ -86,6 +87,8 @@ def build_fused_gate_up_projection(
     gate_prefix: str = "gate_proj",
     up_prefix: str = "up_proj",
     kernel_init: Initializer | None = None,
+    sharding_layout: "TensorLayout | object | None" = None,
+    bias_sharding_layout: "TensorLayout | object | None" = None,
 ) -> ColumnParallelLinear:
     """Build a column-parallel fused ``[gate | up]`` MLP projection.
 
@@ -109,6 +112,8 @@ def build_fused_gate_up_projection(
         up_prefix: Source-tensor prefix for the up half (HF naming).
         kernel_init: Optional initializer override; defaults to
             :func:`_default_kernel_init`.
+        sharding_layout: Optional explicit weight layout for the fused kernel.
+        bias_sharding_layout: Optional explicit bias layout.
 
     Returns:
         :class:`ColumnParallelLinear` mapping
@@ -129,6 +134,8 @@ def build_fused_gate_up_projection(
         precision=precision,
         kernel_init=kernel_init or _default_kernel_init(config),
         layout=layout,
+        sharding_layout=sharding_layout,
+        bias_sharding_layout=bias_sharding_layout,
     )
 
 

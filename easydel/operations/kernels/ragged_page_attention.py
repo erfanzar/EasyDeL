@@ -23,7 +23,7 @@ Key features:
 - Support for variable-length sequences in the same batch
 - TPU-optimized Pallas kernels with GPU/CPU fallbacks
 - Ragged tensor format for handling batches without padding waste
-- Integration with vLLM-style paged memory management
+- Integration with serving-style paged memory management
 
 Two versions are provided:
 
@@ -72,7 +72,7 @@ Note:
     FlashAttn or VanillaAttn instead.
 
 References:
-    - vLLM PagedAttention: https://arxiv.org/abs/2309.06180
+    - PagedAttention: https://arxiv.org/abs/2309.06180
     - EasyDeL serving documentation
 """
 
@@ -252,11 +252,11 @@ def _default_tpu_rpa_v3_cfg(
     context_lens: Array,
     pages_tables: Array,
 ):
-    """Choose vLLM-style TPU RPA block geometry when no user override exists.
+    """Choose serving-style TPU RPA block geometry when no user override exists.
 
     Inspects the runtime tensor shapes plus the local TPU version to derive
     sensible ``num_kv_pages_per_block`` and ``num_queries_per_block`` values
-    that mirror vLLM's TPU defaults. Returns the input config unchanged if
+    that mirror the TPU serving defaults. Returns the input config unchanged if
     the user already supplied either knob, if the backend is not TPU, or
     if the shape introspection fails.
 
@@ -337,12 +337,12 @@ def _default_tpu_rpa_v3_cfg(
 
 
 def _tpu_mixed_request_distribution(request_distribution: Array, cfg) -> Array:
-    """Match vLLM TPU's RPA request-distribution convention.
+    """Match the TPU serving path's RPA request-distribution convention.
 
-    vLLM routes every non-decode request through the mixed RPA case unless a
+    The mixed-prefill convention routes every non-decode request through the mixed RPA case unless a
     chunk-prefill size is configured. The native ejkernel TPU path supports the
     same case layout, and using the same distribution keeps the EasyDeL call
-    geometry aligned with vLLM's runner.
+    geometry aligned with the rank-major runner.
 
     Args:
         request_distribution: ``int32[3]`` distribution vector
@@ -951,9 +951,11 @@ class _RaggedPageAttn(OperationImpl):
         resolver = _runtime_sharding_resolver(self.metadata, cache_view)
         resolve = resolver.resolve
         request_distribution = cache_metadata.request_distribution
+        use_rank_major_dp = getattr(request_distribution, "ndim", 0) == 2
         page_axis = _dp_page_axis(cache_view)
         kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
         kv_page_axis = _kv_axis(cache_view, ct.HEAD)
+        q_token_axis = ATTN_DP if use_rank_major_dp else ct.EMPTY
 
         sinks_axis = None
 
@@ -961,8 +963,8 @@ class _RaggedPageAttn(OperationImpl):
             sinks_axis = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
             softmax_aux = softmax_aux.astype("f4")
 
-        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-        kvaxes = resolve(axes=[ct.EMPTY, kv_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
+        qaxes = resolve(axes=[q_token_axis, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+        kvaxes = resolve(axes=[q_token_axis, kv_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
 
         kv_pages_spec = resolve(
             axes=[page_axis, ct.EMPTY, kv_page_axis, ct.EMPTY, ct.EMPTY],
@@ -1004,6 +1006,8 @@ class _RaggedPageAttn(OperationImpl):
             and len(page_axis_names) > 0
             and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
         )
+        if use_rank_major_dp and not can_use_dp_local:
+            raise ValueError("Rank-major DP ragged attention requires the DP-local page path.")
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
             max_pages_per_req = int(cache_metadata.pages_tables.shape[1])
@@ -1042,15 +1046,18 @@ class _RaggedPageAttn(OperationImpl):
                     axis=0,
                 )
                 local_block_tables = local_pages_rows.reshape((rows_per_shard * max_pages_per_req,))
-                local_query_start_loc = jax.lax.dynamic_slice_in_dim(
-                    full_query_start_loc,
-                    start_index=row_start,
-                    slice_size=rows_per_shard + 1,
-                    axis=0,
-                )
-
-                local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                if use_rank_major_dp:
+                    local_query_start_loc = full_query_start_loc[shard_idx]
+                    local_distribution = full_distribution[shard_idx]
+                else:
+                    local_query_start_loc = jax.lax.dynamic_slice_in_dim(
+                        full_query_start_loc,
+                        start_index=row_start,
+                        slice_size=rows_per_shard + 1,
+                        axis=0,
+                    )
+                    local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
+                    local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
                 local_kernel_distribution = _tpu_mixed_request_distribution(local_distribution, cfg)
                 local_total = local_distribution[2]
 
@@ -1071,6 +1078,9 @@ class _RaggedPageAttn(OperationImpl):
                     local_softmax_aux,
                     **common_call_kwargs,
                 )
+
+                if use_rank_major_dp:
+                    return local_output, local_kv_pages
 
                 # Keep only this shard's request spans, then reduce over dp to reconstruct
                 # the full token output while KV pages stay sharded.
@@ -1339,7 +1349,7 @@ class _RaggedPageAttn(OperationImpl):
 
 @OperationRegistry.register
 class RaggedPageAttnV2(_RaggedPageAttn):
-    """Ragged paged attention using vLLM-style slot mappings (read-only over cache).
+    """Ragged paged attention using serving-style slot mappings (read-only over cache).
 
     Variant of the ragged paged-attention operation that consumes
     pre-populated paged KV pools (the cache update step is performed

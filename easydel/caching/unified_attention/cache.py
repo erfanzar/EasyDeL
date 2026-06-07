@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified attention KV-cache for vLLM-style paged attention.
+"""Unified attention KV-cache for serving-style paged attention.
 
 This module provides a paged KV-cache implementation compatible with
-vLLM-style unified attention kernels. Unlike RaggedPagesCache which
+serving-style unified attention kernels. Unlike RaggedPagesCache which
 interleaves K and V, this cache stores keys and values in separate
 tensors for direct compatibility with Triton unified attention kernels.
 
@@ -158,7 +158,7 @@ def _previous_power_of_2(n: int) -> int:
 
 @auto_pytree
 class UnifiedAttentionCacheConfig(BaseCacheConfig):
-    """Configuration for vLLM-style unified attention paged KV-cache.
+    """Configuration for serving-style unified attention paged KV-cache.
 
     This configuration defines the storage layout and dimensions for a paged
     KV-cache compatible with unified attention kernels. Keys and values are
@@ -169,7 +169,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         - value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
 
     This matches ejkernel's Triton UnifiedAttention kernel input contract
-    and is designed for high-performance inference with vLLM-style scheduling.
+    and is designed for high-performance inference with serving-style scheduling.
 
     Attributes:
         num_hidden_layers (int): Number of transformer layers.

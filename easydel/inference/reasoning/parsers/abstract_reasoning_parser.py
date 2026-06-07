@@ -9,9 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility shim for vLLM-style import paths.
+"""Compatibility shim for serving-style import paths.
 
-vLLM and third-party plugins import the abstract reasoning base classes from
+External parser packages and third-party plugins import the abstract reasoning base classes from
 ``...parsers.abstract_reasoning_parser``. EasyDeL keeps the canonical
 definitions one level up in :mod:`easydel.inference.reasoning.abstract_reasoning`;
 this module re-exports them under the legacy path so existing imports continue

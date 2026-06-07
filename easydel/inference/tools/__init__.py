@@ -80,7 +80,7 @@ Usage:
     ...         )
 
 Note:
-    Ideas and design patterns are inspired by vLLM's tool calling implementation.
+    Ideas and design patterns are inspired by external tool-calling parser implementations.
 
 See Also:
     - easydel.inference.tools.abstract_tool: Base classes for tool parsers
@@ -89,7 +89,7 @@ See Also:
     - easydel.inference.tools.utils: Utility functions for parsing
 """
 
-# ideas are coming from vLLM.
+# ideas follow common tool-calling parser designs.
 
 from .abstract_tool import ToolParser, ToolParserManager
 from .auto_detect import detect_tool_parser

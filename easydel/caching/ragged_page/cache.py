@@ -381,11 +381,11 @@ def _resolve_ragged_cache_layout(
 
 
 def _pad_v3_kv_heads_to_shards(num_kv_heads: int, kv_head_shards: int) -> int:
-    """Return the vLLM-style padded KV-head count for TP cache sharding.
+    """Return the serving-style padded KV-head count for TP cache sharding.
 
     TPU TP meshes can be wider than the model's GQA/MQA KV-head count. In that
     case a v3 packed cache with the raw head count may be impossible to shard,
-    so older EasyDeL code replicated the whole cache across TP. vLLM instead
+    so older EasyDeL code replicated the whole cache across TP. The sharded serving path instead
     repeats KV heads up to the TP width before the paged-attention shard map.
     This helper mirrors that behavior for the static cache shape.
 
@@ -1412,6 +1412,9 @@ class RaggedPagesMetadata:
             Shape: [num_tokens]
         request_distribution (Array, optional): v3 distribution bounds.
             Shape: [3] containing [decode_end, prefill_end, total_count]
+        recurrent_state_indices (Array, optional): Physical recurrent-state
+            slot ids aligned with request rows. Rank-major DP passes this as
+            [dp, rows_per_dp].
         num_kv_update_slices (Array, optional): v2 update slice count.
             Shape: [1]
         version (str): Metadata format version ("v2" or "v3").
@@ -1440,6 +1443,7 @@ class RaggedPagesMetadata:
     request_distribution: Int[Array, "3"] | None = None
     num_kv_update_slices: Int[Array, "1"] | None = None
     spec_recurrent_commit: Int[Array, "2 max_num_reqs"] | None = None
+    recurrent_state_indices: Int[Array, "..."] | None = None
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 

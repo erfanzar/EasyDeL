@@ -258,6 +258,7 @@ class Scheduler(SchedulerInterface):
         # Maintained from model-runner outputs; used to keep DP-shard hints
         # aligned with actual sequence-buffer row placement.
         self.req_id_to_row_index: dict[str, int] = {}
+        self.req_id_to_dp_rank: dict[str, int] = {}
 
         self.finished_req_ids: set[str] = set()
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -355,6 +356,19 @@ class Scheduler(SchedulerInterface):
             long_prefill_token_threshold=long_prefill_token_threshold,
             num_speculative_tokens=int(num_speculative_tokens),
         )
+
+        data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
+        if data_parallel_size > 1:
+            from .dp_scheduler import DPScheduler
+
+            return DPScheduler.from_runner(
+                runner=runner,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_prefix_caching=enable_prefix_caching,
+                async_scheduling=async_scheduling,
+                long_prefill_token_threshold=long_prefill_token_threshold,
+                num_speculative_tokens=num_speculative_tokens,
+            )
 
         if async_scheduling:
             from .async_scheduler import AsyncScheduler
@@ -454,16 +468,11 @@ class Scheduler(SchedulerInterface):
             and int(self.max_num_running_reqs) % dp_size == 0
             and pages_per_shard is not None
         )
+        use_dp_rank_affinity = use_dp_local_shard_hints
         rows_per_shard = int(self.max_num_running_reqs) // dp_size if use_dp_local_shard_hints else 0
         pages_per_shard = int(pages_per_shard) if use_dp_local_shard_hints else 0
 
         _shard_occupancy: list[int] = [0] * dp_size if use_dp_local_shard_hints else []
-        if use_dp_local_shard_hints:
-            for _req in self.running:
-                _row = self.req_id_to_row_index.get(_req.request_id)
-                if _row is not None:
-                    _s = min(max(int(_row), 0) // rows_per_shard, dp_size - 1)
-                    _shard_occupancy[_s] += 1
 
         def _row_to_dp_shard(row_index: int | None) -> int | None:
             if not use_dp_local_shard_hints or row_index is None:
@@ -488,10 +497,37 @@ class Scheduler(SchedulerInterface):
                         return None
             return inferred
 
+        def _assigned_dp_shard(request: EngineRequest) -> int | None:
+            if not use_dp_rank_affinity:
+                return None
+            assigned = self.req_id_to_dp_rank.get(request.request_id)
+            if assigned is not None and 0 <= int(assigned) < dp_size:
+                return int(assigned)
+
+            inferred = _infer_dp_shard_from_pages(request)
+            if inferred is None:
+                inferred = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
+            if inferred is not None:
+                self.req_id_to_dp_rank[request.request_id] = int(inferred)
+                return int(inferred)
+            return None
+
+        if use_dp_local_shard_hints:
+            for _req in self.running:
+                if use_dp_rank_affinity:
+                    _s = _assigned_dp_shard(_req)
+                else:
+                    _s = _row_to_dp_shard(self.req_id_to_row_index.get(_req.request_id))
+                if _s is not None:
+                    _shard_occupancy[_s] += 1
+
         def _pick_running_shard(request: EngineRequest) -> int | None:
             """Shard hint for a RUNNING request — always its existing shard."""
             if not use_dp_local_shard_hints:
                 return None
+            shard = _assigned_dp_shard(request)
+            if shard is not None:
+                return shard
             shard = _infer_dp_shard_from_pages(request)
             if shard is not None:
                 return shard
@@ -504,16 +540,26 @@ class Scheduler(SchedulerInterface):
             """Shard hint for a NEW/WAITING request — balanced distribution."""
             if not use_dp_local_shard_hints:
                 return None
+            shard = _assigned_dp_shard(request)
+            if shard is not None:
+                return shard
             shard = _infer_dp_shard_from_pages(request)
             if shard is not None:
+                if use_dp_rank_affinity:
+                    self.req_id_to_dp_rank[request.request_id] = int(shard)
                 return shard
             shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
             if shard is not None:
+                if use_dp_rank_affinity:
+                    self.req_id_to_dp_rank[request.request_id] = int(shard)
                 return shard
             candidates = [sid for sid in range(dp_size) if _shard_occupancy[sid] < rows_per_shard]
             if not candidates:
                 return None
-            return min(candidates, key=lambda sid: (_shard_occupancy[sid], sid))
+            shard = min(candidates, key=lambda sid: (_shard_occupancy[sid], sid))
+            if use_dp_rank_affinity:
+                self.req_id_to_dp_rank[request.request_id] = int(shard)
+            return shard
 
         def _reserve_new_shard(shard_hint: int | None) -> None:
             """Increment shard occupancy when a new request is assigned."""
@@ -527,6 +573,14 @@ class Scheduler(SchedulerInterface):
         self._ensure_capacity(len(self.running))
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                self.async_scheduling
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and request.num_output_tokens + request.num_output_placeholders >= request.max_tokens
+            ):
+                req_index += 1
+                continue
 
             num_new_tokens = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
             if self.long_prefill_token_threshold is not None and 0 < self.long_prefill_token_threshold < num_new_tokens:
@@ -578,9 +632,11 @@ class Scheduler(SchedulerInterface):
 
                     # Decrement shard occupancy so new requests can use freed rows
                     if use_dp_local_shard_hints:
-                        _preempt_row = self.req_id_to_row_index.get(preempted_req.request_id)
-                        if _preempt_row is not None:
-                            _preempt_shard = min(max(int(_preempt_row), 0) // rows_per_shard, dp_size - 1)
+                        if use_dp_rank_affinity:
+                            _preempt_shard = self.req_id_to_dp_rank.get(preempted_req.request_id)
+                        else:
+                            _preempt_shard = _row_to_dp_shard(self.req_id_to_row_index.get(preempted_req.request_id))
+                        if _preempt_shard is not None:
                             _shard_occupancy[_preempt_shard] = max(0, _shard_occupancy[_preempt_shard] - 1)
 
                     self.waiting.prepend_request(preempted_req)
@@ -798,7 +854,12 @@ class Scheduler(SchedulerInterface):
                 )
 
         new_reqs_data = [
-            NewRequestData.from_request(req, req_to_new_page_ids[req.request_id]) for req in scheduled_new_reqs
+            NewRequestData.from_request(
+                req,
+                req_to_new_page_ids[req.request_id],
+                dp_rank=self.req_id_to_dp_rank.get(req.request_id),
+            )
+            for req in scheduled_new_reqs
         ]
 
         cached_reqs_data = self._make_cached_request_data(
@@ -808,6 +869,11 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_page_ids,
         )
+        output_req_id_to_dp_rank = {
+            req_id: int(rank)
+            for req_id, rank in self.req_id_to_dp_rank.items()
+            if req_id in num_scheduled_tokens and rank is not None
+        }
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -825,6 +891,7 @@ class Scheduler(SchedulerInterface):
             free_pages=self.kv_cache_manager.page_pool.get_num_free_pages(),
             token_budget_initial=token_budget_initial,
             token_budget_remaining=int(token_budget),
+            req_id_to_dp_rank=output_req_id_to_dp_rank,
         )
         self._update_after_schedule(scheduler_output)
         # Log scheduler metrics
@@ -906,6 +973,7 @@ class Scheduler(SchedulerInterface):
         new_token_ids: list[list[int]] = []
         new_page_ids: list[tuple[list[int], ...]] = []
         num_computed_tokens: list[int] = []
+        dp_ranks: list[int | None] = []
 
         for req in itertools.chain(running_reqs, resumed_reqs):
             req_id = req.request_id
@@ -916,6 +984,7 @@ class Scheduler(SchedulerInterface):
 
             new_page_ids.append(req_to_new_page_ids[req_id])
             num_computed_tokens.append(req.num_computed_tokens)
+            dp_ranks.append(self.req_id_to_dp_rank.get(req_id))
         resumed_from_preemption = [False] * len(running_reqs)
         resumed_from_preemption += [True] * len(resumed_reqs)
 
@@ -925,6 +994,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids=new_token_ids,
             new_page_ids=new_page_ids,
             num_computed_tokens=num_computed_tokens,
+            dp_ranks=dp_ranks,
         )
 
     def update_from_output(
@@ -1180,6 +1250,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         self.kv_cache_manager.free_page_hashes(request)
         self.req_id_to_row_index.pop(request.request_id, None)
+        self.req_id_to_dp_rank.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     def get_num_unfinished_requests(self) -> int:

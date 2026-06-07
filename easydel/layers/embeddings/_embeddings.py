@@ -57,7 +57,7 @@ from jax import Array
 from jax import numpy as jnp
 from spectrax.common_types import ColumnWise
 
-from easydel.infra.sharding import sharding_for_layout
+from easydel.infra.sharding import TensorLayout, sharding_for_layout
 
 Dtype = jnp.dtype | type
 Initializer = jax.nn.initializers.Initializer
@@ -151,6 +151,7 @@ class Embed(spx.Module):
         param_dtype: Dtype = jnp.float32,
         embedding_init: Initializer = default_embed_init,
         promote_dtype: PromoteDtypeFn = _promote_dtype,
+        sharding_layout: TensorLayout | tp.Any | None = None,
         rngs: spx.Rngs,
     ):
         """Initialize the embedding layer.
@@ -171,6 +172,8 @@ class Embed(spx.Module):
             promote_dtype: Function to promote array dtypes during computation.
                 Used to ensure consistent dtypes between embeddings and queries.
                 Defaults to spx's promote_dtype function.
+            sharding_layout: Optional explicit layout for the embedding table.
+                When omitted, the legacy ``ColumnWise`` layout is used.
             rngs: Random number generator state for parameter initialization.
 
         Note:
@@ -184,7 +187,7 @@ class Embed(spx.Module):
 
         self.weight = spx.Parameter(
             embedding_init(rngs.parameters, (num_embeddings, features), param_to_init),
-            sharding=sharding_for_layout(ColumnWise),
+            sharding=sharding_for_layout(TensorLayout.from_any(sharding_layout) or ColumnWise),
         )
 
         self.num_embeddings = num_embeddings

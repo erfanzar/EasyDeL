@@ -125,6 +125,7 @@ class BatchMetadataPreparer:
         max_model_len: int,
         min_input_pad: int,
         enable_spec_recurrent_commit: bool = False,
+        input_sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         """Initialize the BatchMetadataPreparer.
 
@@ -154,6 +155,7 @@ class BatchMetadataPreparer:
         """
         self.metadata = metadata
         self._empty_sharding = empty_sharding
+        self._input_sharding = input_sharding if input_sharding is not None else empty_sharding
 
         self.max_num_tokens = int(max_num_tokens)
         self.max_num_reqs = int(max_num_reqs)
@@ -165,6 +167,7 @@ class BatchMetadataPreparer:
         self._use_slot_mapping = self._metadata_version == "v2"
         self._use_request_distribution = not self._use_slot_mapping
         self._enable_dp_local_page_path = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+        self._data_parallel_size = max(1, int(getattr(metadata, "data_parallel_size", 1) or 1))
 
         # Ragged paging shapes (compile-stable).
         num_reqs_max_model_len = (
@@ -194,6 +197,17 @@ class BatchMetadataPreparer:
             dtype=np.int32,
         )
         self._request_distribution_placeholder = np.zeros((3,), dtype=np.int32)
+        dp_query_rows = (
+            (self._num_reqs_max_model_len // self._data_parallel_size) + 1
+            if self._data_parallel_size > 0 and self._num_reqs_max_model_len % self._data_parallel_size == 0
+            else 1
+        )
+        self._dp_query_start_loc_cpu = np.zeros((self._data_parallel_size, dp_query_rows), dtype=np.int32)
+        self._dp_request_distribution_cpu = np.zeros((self._data_parallel_size, 3), dtype=np.int32)
+        dp_rows_per_rank = max(1, dp_query_rows - 1)
+        self._dp_context_lens_cpu = np.zeros((self._data_parallel_size, dp_rows_per_rank), dtype=np.int32)
+        self._dp_recurrent_state_indices_cpu = np.zeros_like(self._dp_context_lens_cpu)
+        self._dp_model_row_for_request_cpu = np.full((self.max_num_reqs,), -1, dtype=np.int32)
         self._slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
         self._num_kv_update_placeholder = np.zeros((1,), dtype=np.int32)
         self._async_slot_mapping_placeholder = np.zeros((3, 1), dtype=np.int32)
@@ -224,11 +238,18 @@ class BatchMetadataPreparer:
             dtype=np.int32,
         )
         self._async_request_distribution_cpu = np.zeros((3,), dtype=np.int32)
+        self._async_dp_query_start_loc_cpu = np.zeros_like(self._dp_query_start_loc_cpu)
+        self._async_dp_request_distribution_cpu = np.zeros_like(self._dp_request_distribution_cpu)
+        self._async_dp_context_lens_cpu = np.zeros_like(self._dp_context_lens_cpu)
+        self._async_dp_recurrent_state_indices_cpu = np.zeros_like(self._dp_recurrent_state_indices_cpu)
+        self._async_dp_model_row_for_request_cpu = np.full_like(self._dp_model_row_for_request_cpu, -1)
         self._async_num_kv_update_cpu = np.zeros((1,), dtype=np.int32)
 
         self._async_num_computed_tokens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_scheduled_full_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_active_mask_full_cpu = np.zeros((self.max_num_reqs,), dtype=bool)
+        self._async_window_row_indices_cpu = np.arange(self.max_num_reqs, dtype=np.int32)
+        self._async_recurrent_slot_indices_cpu = np.arange(self.max_num_reqs, dtype=np.int32)
         self._async_temperature_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
         self._async_top_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
         self._async_top_k_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
@@ -285,6 +306,7 @@ class BatchMetadataPreparer:
         scheduled: np.ndarray,
         num_computed_tokens_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
+        window_row_indices_cpu: np.ndarray | None = None,
     ) -> None:
         """Validate that active rows only use page IDs local to their DP shard.
 
@@ -326,7 +348,8 @@ class BatchMetadataPreparer:
             if seq_len <= 0:
                 continue
 
-            req_shard = min(req_idx // rows_per_shard, dp_size - 1)
+            global_row = int(window_row_indices_cpu[req_idx]) if window_row_indices_cpu is not None else int(req_idx)
+            req_shard = min(max(global_row, 0) // rows_per_shard, dp_size - 1)
             page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
             page_cnt = min((seq_len + page_size - 1) // page_size, max_pages_per_req)
 
@@ -340,7 +363,7 @@ class BatchMetadataPreparer:
             if invalid.size:
                 raise ValueError(
                     "Non-DP-local page IDs detected for active request row. "
-                    f"req_idx={req_idx} req_shard={req_shard} "
+                    f"req_idx={req_idx} global_row={global_row} req_shard={req_shard} "
                     f"valid_range=[{page_lo}, {page_hi}) sample_bad_page={int(invalid[0])}. "
                     "Ensure scheduler/allocator produce per-DP-local block IDs "
                     "(or run with data-parallel page sharding disabled)."
@@ -385,15 +408,19 @@ class BatchMetadataPreparer:
         outputs: list[object | None] = [None] * len(host_payload)
         put_indices: list[int] = []
         put_values: list[object] = []
+        put_shardings: list[jax.sharding.Sharding] = []
         for idx, value in enumerate(host_payload):
             if isinstance(value, jax.Array):
                 outputs[idx] = value
             else:
                 put_indices.append(idx)
                 put_values.append(value)
+                put_shardings.append(
+                    self._input_sharding if self._uses_spmd_dp() and idx in (0, 1) else self._empty_sharding
+                )
 
         if put_values:
-            put_results = jax.device_put(tuple(put_values), self._empty_sharding)
+            put_results = jax.device_put(tuple(put_values), tuple(put_shardings))
             for idx, value in zip(put_indices, put_results, strict=True):
                 outputs[idx] = value
 
@@ -428,6 +455,10 @@ class BatchMetadataPreparer:
             True if using ragged page attention v3 with request distribution.
         """
         return self._use_request_distribution
+
+    def _uses_spmd_dp(self) -> bool:
+        """Return whether this step should build rank-major DP model inputs."""
+        return self._data_parallel_size > 1
 
     def _compute_slot_mapping_v2(
         self,
@@ -568,6 +599,8 @@ class BatchMetadataPreparer:
         page_table_version: int | None,
         padded_num_reqs_in: int,
         copy_slot_mapping: bool,
+        window_row_indices_cpu: np.ndarray | None = None,
+        recurrent_slot_indices_cpu: np.ndarray | None = None,
         spec_recurrent_commit_cpu: np.ndarray | None = None,
         use_async_buffers: bool = False,
     ) -> tuple[tuple, int, int, int]:
@@ -640,6 +673,11 @@ class BatchMetadataPreparer:
             packed_misc_i32 = self._async_packed_misc_i32_cpu
             spec_recurrent_commit = self._async_spec_recurrent_commit_cpu
             request_distribution = self._async_request_distribution_cpu
+            dp_query_start_loc = self._async_dp_query_start_loc_cpu
+            dp_request_distribution = self._async_dp_request_distribution_cpu
+            dp_context_lens = self._async_dp_context_lens_cpu
+            dp_recurrent_state_indices = self._async_dp_recurrent_state_indices_cpu
+            dp_model_row_for_request = self._async_dp_model_row_for_request_cpu
             num_kv_update_cpu = self._async_num_kv_update_cpu
             slot_mapping_buf = self._async_slot_mapping_cpu
         else:
@@ -656,6 +694,11 @@ class BatchMetadataPreparer:
             packed_misc_i32 = self._packed_misc_i32_cpu
             spec_recurrent_commit = self._spec_recurrent_commit_cpu
             request_distribution = self._request_distribution_placeholder
+            dp_query_start_loc = self._dp_query_start_loc_cpu
+            dp_request_distribution = self._dp_request_distribution_cpu
+            dp_context_lens = self._dp_context_lens_cpu
+            dp_recurrent_state_indices = self._dp_recurrent_state_indices_cpu
+            dp_model_row_for_request = self._dp_model_row_for_request_cpu
             num_kv_update_cpu = self._num_kv_update_placeholder
             slot_mapping_buf = self._slot_mapping_cpu
 
@@ -663,6 +706,8 @@ class BatchMetadataPreparer:
         scheduled.fill(0)
         if num_requests > 0:
             scheduled[:num_requests] = scheduled_full_cpu[:num_requests]
+
+        use_spmd_dp = self._uses_spmd_dp()
 
         # query_start_loc: prefix sums of scheduled tokens.
         qsl.fill(0)
@@ -680,21 +725,114 @@ class BatchMetadataPreparer:
         # Contiguous token batch: fill only the current bucket size.
         input_ids.fill(0)
         positions.fill(0)
+        logits_indices.fill(0)
+        dp_query_start_loc.fill(0)
+        dp_request_distribution.fill(0)
+        dp_context_lens.fill(0)
+        dp_recurrent_state_indices.fill(0)
+        dp_model_row_for_request.fill(-1)
 
-        off = 0
-        for req_idx in range(num_requests):
-            n = int(scheduled[req_idx])
-            if n <= 0:
-                continue
-            start = int(num_computed_tokens_cpu[req_idx])
-            end = start + n
-            if end > token_ids_cpu.shape[1]:
+        if use_spmd_dp:
+            dp_size = int(self._data_parallel_size)
+            if int(num_tokens_static) % dp_size != 0:
                 raise ValueError(
-                    f"Request {req_idx} scheduled [{start}:{end}] exceeds token_ids width {token_ids_cpu.shape[1]}."
+                    "rank-major SPMD DP requires token buckets divisible by DP size: "
+                    f"num_tokens_static={num_tokens_static}, dp_size={dp_size}."
                 )
-            positions[off : off + n] = start + self._arange_cpu[:n]
-            input_ids[off : off + n] = token_ids_cpu[req_idx, start:end]
-            off += n
+            if int(self._num_reqs_max_model_len) % dp_size != 0:
+                raise ValueError(
+                    "rank-major SPMD DP requires request rows divisible by DP size: "
+                    f"rows={self._num_reqs_max_model_len}, dp_size={dp_size}."
+                )
+            tokens_per_rank = int(num_tokens_static) // dp_size
+            rows_per_rank = int(self._num_reqs_max_model_len) // dp_size
+            if window_row_indices_cpu is None:
+                global_rows = np.arange(num_requests, dtype=np.int32)
+            else:
+                global_rows = np.asarray(window_row_indices_cpu[:num_requests], dtype=np.int32)
+            if recurrent_slot_indices_cpu is None:
+                recurrent_slots = global_rows
+            else:
+                recurrent_slots = np.asarray(recurrent_slot_indices_cpu[:num_requests], dtype=np.int32)
+            rank_used_tokens = [0] * dp_size
+            rank_live_rows = [0] * dp_size
+            rank_decode_counts = [0] * dp_size
+            rank_prefill_counts = [0] * dp_size
+            for rank in range(dp_size):
+                dp_query_start_loc[rank, : rows_per_rank + 1] = 0
+            for req_idx in range(num_requests):
+                n = int(scheduled[req_idx])
+                if n <= 0:
+                    continue
+                global_row = int(global_rows[req_idx])
+                rank = min(max(global_row, 0) // rows_per_rank, dp_size - 1)
+                local_row = int(rank_live_rows[rank])
+                if local_row >= rows_per_rank:
+                    raise ValueError(
+                        "rank-major SPMD DP rank-local request budget exceeded: "
+                        f"rank={rank} rows_per_rank={rows_per_rank} global_row={global_row}."
+                    )
+                start = int(num_computed_tokens_cpu[req_idx])
+                end = start + n
+                if end > token_ids_cpu.shape[1]:
+                    raise ValueError(
+                        f"Request {req_idx} scheduled [{start}:{end}] exceeds token_ids width {token_ids_cpu.shape[1]}."
+                    )
+                rank_used = int(rank_used_tokens[rank])
+                if rank_used + n > tokens_per_rank:
+                    raise ValueError(
+                        "rank-major SPMD DP rank-local token budget exceeded: "
+                        f"rank={rank} scheduled={rank_used + n} tokens_per_rank={tokens_per_rank}."
+                    )
+                off = rank * tokens_per_rank + rank_used
+                positions[off : off + n] = start + self._arange_cpu[:n]
+                input_ids[off : off + n] = token_ids_cpu[req_idx, start:end]
+                rank_used += n
+                rank_used_tokens[rank] = rank_used
+                rank_live_rows[rank] = local_row + 1
+                dp_query_start_loc[rank, local_row + 1] = rank_used
+                dp_model_row_for_request[req_idx] = rank * rows_per_rank + local_row
+                dp_context_lens[rank, local_row] = start + n
+
+                state_slot = int(recurrent_slots[req_idx])
+                state_rank = min(max(state_slot, 0) // rows_per_rank, dp_size - 1)
+                if state_rank != rank:
+                    raise ValueError(
+                        "rank-major SPMD DP recurrent state slot must belong to the "
+                        f"same DP rank as the request: req_idx={req_idx} rank={rank} "
+                        f"state_slot={state_slot} state_rank={state_rank}."
+                    )
+                dp_recurrent_state_indices[rank, local_row] = state_slot - rank * rows_per_rank
+                logits_indices[req_idx] = off + n - 1
+                if n == 1 and int(num_computed_tokens_cpu[req_idx]) > 0:
+                    rank_decode_counts[rank] += 1
+                else:
+                    rank_prefill_counts[rank] += 1
+            for rank in range(dp_size):
+                live_rows = int(rank_live_rows[rank])
+                rank_used = int(rank_used_tokens[rank])
+                dp_query_start_loc[rank, live_rows + 1 : rows_per_rank + 1] = rank_used
+                decode_count = int(rank_decode_counts[rank])
+                prefill_count = int(rank_prefill_counts[rank])
+                dp_request_distribution[rank, 0] = decode_count
+                dp_request_distribution[rank, 1] = decode_count + prefill_count
+                dp_request_distribution[rank, 2] = live_rows
+        else:
+            off = 0
+            for req_idx in range(num_requests):
+                n = int(scheduled[req_idx])
+                if n <= 0:
+                    continue
+                start = int(num_computed_tokens_cpu[req_idx])
+                end = start + n
+                if end > token_ids_cpu.shape[1]:
+                    raise ValueError(
+                        f"Request {req_idx} scheduled [{start}:{end}] exceeds token_ids width {token_ids_cpu.shape[1]}."
+                    )
+                positions[off : off + n] = start + self._arange_cpu[:n]
+                input_ids[off : off + n] = token_ids_cpu[req_idx, start:end]
+                logits_indices[req_idx] = off + n - 1
+                off += n
 
         # seq_lens: computed tokens after this forward (start + scheduled).
         seq_lens.fill(0)
@@ -717,17 +855,22 @@ class BatchMetadataPreparer:
                 scheduled=scheduled,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 page_table_cpu=page_table_cpu,
+                window_row_indices_cpu=window_row_indices_cpu if use_spmd_dp else None,
             )
 
         # logits_indices: last token index per request in the packed batch.
-        logits_indices.fill(0)
-        if num_requests > 0:
+        if num_requests > 0 and not use_spmd_dp:
             logits_indices[:num_requests] = qsl[1 : num_requests + 1] - 1
 
         # pages_tables: copy active rows, pad inactive.
-        rows_to_copy = min(num_requests, int(self._num_reqs_max_model_len), int(page_table_cpu.shape[0]))
+        rows_to_copy = (
+            int(self._num_reqs_max_model_len)
+            if use_spmd_dp
+            else min(num_requests, int(self._num_reqs_max_model_len), int(page_table_cpu.shape[0]))
+        )
         reuse_pages_tables = (
-            page_table_version is not None
+            not use_spmd_dp
+            and page_table_version is not None
             and self._cached_pages_tables_dev is not None
             and self._cached_page_table_version == int(page_table_version)
             and self._cached_rows_to_copy == int(rows_to_copy)
@@ -736,7 +879,18 @@ class BatchMetadataPreparer:
             pages_tables_payload = self._cached_pages_tables_dev
         else:
             pages_tables.fill(int(PAGE_TABLE_PADDING_VAL))
-            if rows_to_copy > 0:
+            if use_spmd_dp and num_requests > 0:
+                for req_idx in range(num_requests):
+                    model_row = int(dp_model_row_for_request[req_idx])
+                    if model_row < 0:
+                        continue
+                    if model_row >= pages_tables.shape[0]:
+                        raise ValueError(
+                            "rank-major SPMD DP model row exceeds page-table capacity: "
+                            f"model_row={model_row}, capacity={pages_tables.shape[0]}."
+                        )
+                    pages_tables[model_row, :] = page_table_cpu[req_idx, : pages_tables.shape[1]]
+            elif rows_to_copy > 0:
                 pages_tables[:rows_to_copy, :] = page_table_cpu[:rows_to_copy, : pages_tables.shape[1]]
             pages_tables_payload = pages_tables
 
@@ -817,6 +971,14 @@ class BatchMetadataPreparer:
             packed_f32_padded,
             packed_misc_i32,
         )
+        if use_spmd_dp:
+            common_payload = (
+                *common_payload,
+                dp_query_start_loc,
+                dp_request_distribution,
+                dp_context_lens,
+                dp_recurrent_state_indices,
+            )
         if self._enable_spec_recurrent_commit:
             common_payload = (*common_payload, spec_recurrent_commit_payload)
         if self._use_slot_mapping:
@@ -849,6 +1011,8 @@ class BatchMetadataPreparer:
         repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        window_row_indices_cpu: np.ndarray | None = None,
+        recurrent_slot_indices_cpu: np.ndarray | None = None,
         spec_recurrent_commit_cpu: np.ndarray | None = None,
         page_table_version: int | None = None,
         # VLM prefill helpers (optional)
@@ -930,6 +1094,8 @@ class BatchMetadataPreparer:
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
             spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
         )
         host_build_took = time.time() - host_build_start
@@ -960,6 +1126,19 @@ class BatchMetadataPreparer:
         payload_idx += 1
         packed_misc_i32_dev = device_payload[payload_idx]
         payload_idx += 1
+        dp_query_start_loc_dev = None
+        dp_request_distribution_dev = None
+        dp_context_lens_dev = None
+        dp_recurrent_state_indices_dev = None
+        if self._uses_spmd_dp():
+            dp_query_start_loc_dev = device_payload[payload_idx]
+            payload_idx += 1
+            dp_request_distribution_dev = device_payload[payload_idx]
+            payload_idx += 1
+            dp_context_lens_dev = device_payload[payload_idx]
+            payload_idx += 1
+            dp_recurrent_state_indices_dev = device_payload[payload_idx]
+            payload_idx += 1
         spec_recurrent_commit_dev = None
         if self._enable_spec_recurrent_commit:
             spec_recurrent_commit_dev = device_payload[payload_idx]
@@ -1052,6 +1231,10 @@ class BatchMetadataPreparer:
             pages_tables=pages_tables_dev,
             input_ids_buf=input_ids_buf,
             position_ids_buf=position_ids_buf,
+            dp_query_start_loc=dp_query_start_loc_dev,
+            dp_request_distribution=dp_request_distribution_dev,
+            dp_context_lens=dp_context_lens_dev,
+            dp_recurrent_state_indices=dp_recurrent_state_indices_dev,
             input_token_handoff_positions=self._get_zero_dev(
                 namespace="input_token_handoff_positions",
                 shape=(self.max_num_reqs,),
@@ -1113,6 +1296,8 @@ class BatchMetadataPreparer:
         repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        window_row_indices_cpu: np.ndarray | None = None,
+        recurrent_slot_indices_cpu: np.ndarray | None = None,
         spec_recurrent_commit_cpu: np.ndarray | None = None,
         page_table_version: int | None = None,
     ) -> None:
@@ -1163,6 +1348,14 @@ class BatchMetadataPreparer:
         np.copyto(self._async_num_computed_tokens_cpu, num_computed_tokens_cpu)
         np.copyto(self._async_scheduled_full_cpu, scheduled_full_cpu)
         np.copyto(self._async_active_mask_full_cpu, active_mask_full_cpu)
+        if window_row_indices_cpu is None:
+            self._async_window_row_indices_cpu[:] = np.arange(self.max_num_reqs, dtype=np.int32)
+        else:
+            np.copyto(self._async_window_row_indices_cpu, window_row_indices_cpu)
+        if recurrent_slot_indices_cpu is None:
+            self._async_recurrent_slot_indices_cpu[:] = self._async_window_row_indices_cpu
+        else:
+            np.copyto(self._async_recurrent_slot_indices_cpu, recurrent_slot_indices_cpu)
         np.copyto(self._async_temperature_cpu, temperature_cpu)
         np.copyto(self._async_top_p_cpu, top_p_cpu)
         np.copyto(self._async_top_k_cpu, top_k_cpu)
@@ -1190,6 +1383,8 @@ class BatchMetadataPreparer:
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
+            window_row_indices_cpu=self._async_window_row_indices_cpu,
+            recurrent_slot_indices_cpu=self._async_recurrent_slot_indices_cpu,
             spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
             use_async_buffers=True,
         )
@@ -1200,7 +1395,7 @@ class BatchMetadataPreparer:
             from jax.experimental import multihost_utils
 
             host_payload = multihost_utils.broadcast_one_to_all(host_payload)
-        self._pending_transfer = jax.device_put(host_payload, self._empty_sharding)
+        self._pending_transfer = self._device_put_host_payload(host_payload)
         device_put_took = time.time() - device_put_start
         self._pending_transfer_metadata = {
             "num_tokens_static": num_tokens_static,
@@ -1270,6 +1465,19 @@ class BatchMetadataPreparer:
         payload_idx += 1
         packed_misc_i32_dev = self._pending_transfer[payload_idx]
         payload_idx += 1
+        dp_query_start_loc_dev = None
+        dp_request_distribution_dev = None
+        dp_context_lens_dev = None
+        dp_recurrent_state_indices_dev = None
+        if self._uses_spmd_dp():
+            dp_query_start_loc_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
+            dp_request_distribution_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
+            dp_context_lens_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
+            dp_recurrent_state_indices_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
         spec_recurrent_commit_dev = None
         if self._enable_spec_recurrent_commit:
             spec_recurrent_commit_dev = self._pending_transfer[payload_idx]
@@ -1310,6 +1518,10 @@ class BatchMetadataPreparer:
             pages_tables=pages_tables_dev,
             input_ids_buf=input_ids_buf,
             position_ids_buf=position_ids_buf,
+            dp_query_start_loc=dp_query_start_loc_dev,
+            dp_request_distribution=dp_request_distribution_dev,
+            dp_context_lens=dp_context_lens_dev,
+            dp_recurrent_state_indices=dp_recurrent_state_indices_dev,
             input_token_handoff_positions=self._get_zero_dev(
                 namespace="input_token_handoff_positions",
                 shape=(self.max_num_reqs,),

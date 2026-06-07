@@ -71,7 +71,7 @@ class DraftStep:
             verification: accept if ``argmax(target) == draft``).
         hidden_states: Optional drafter hidden rows for this step. Inline MTP
             drafters reuse this as the next step's ``hidden_states``, matching
-            vLLM's repeated-MTP proposal loop.
+            repeated-MTP proposal loops.
     """
 
     token_ids: Int[Array, "batch"]
@@ -246,7 +246,7 @@ class Qwen3_5MTPDrafter:
                 ``compute_mtp_logits``.
             num_draft_tokens: Number of speculative tokens to propose per
                 verify window. Values greater than one repeatedly apply the
-                same inline MTP block, matching vLLM's MTP behavior.
+                same inline MTP block, matching repeated-MTP behavior.
             use_cache: Whether to maintain the MTP-local attention cache.
             cache_length: Optional MTP-local cache length. The eSurge runner
                 sets this to the runner max length; standalone use falls back
