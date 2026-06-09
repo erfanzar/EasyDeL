@@ -1,0 +1,149 @@
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
+name = "ejkernel"
+version = "0.0.80.3"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+keywords = [
+    "Deep Learning",
+    "Machine Learning",
+    "JAX",
+    "CUDA",
+    "XLA",
+    "Triton",
+    "Pallas",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "beartype>=0.22.2",
+    "chex>=0.1.91",
+    "einops>=0.8.1",
+    "jax~=0.10.0",
+    "jaxlib~=0.10.0",
+    "jaxtyping>=0.3.2",
+    "pydantic>=2.11.10",
+    "tqdm>=4.67.1",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/erfanzar/ejkernel"
+"Repository" = "https://github.com/erfanzar/ejkernel"
+"Documentation" = "https://ejkernel.readthedocs.io/en/latest/"
+
+[tool.uv.build-backend]
+module-name = "ejkernel"
+module-root = "."
+source-include = ["csrc/**"]
+data = { purelib = "csrc" }
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"ejkernel" = ["py.typed"]
+
+[project.optional-dependencies]
+
+cuda = [
+    "jax[cuda13]~=0.10.0",
+    "jax-cuda13-plugin[with-cuda]~=0.10.0",
+    "jax-cuda13-pjrt~=0.10.0",
+    "triton==3.6.0",
+    "nvidia-cutlass-dsl[cu13]==4.5.2",
+    "nvidia-cutlass-dsl-libs-base==4.5.2",
+    "nvidia-cutlass-dsl-libs-cu13==4.5.2",
+    "jax-tvm-ffi==0.1.2",
+    "apache-tvm-ffi==0.1.8.post2",
+]
+tpu = ["jax[tpu]~=0.10.0"]
+triton = ["triton==3.6.0"]
+tilelang = [
+    "tilelang==0.1.9",
+    "apache-tvm-ffi==0.1.8.post2",
+    "nvidia-cudnn-cu12==9.12.0.46",
+]
+
+profile = [
+    "xprof>=2.20.6",
+    "tb-nightly>=2.21.0a20250820",
+    "xprof-nightly>=2.21.6a20250820",
+]
+dev = ["eformer"]
+
+[tool.black]
+line-length = 121
+target-version = ["py311"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = ["F722", "B008", "UP015", "A005", "F821", "E741", "UP037","RUF002","RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ["ejkernel/"]
+
+[tool.basedpyright]
+reportAssignmentType = "none"
+reportInvalidTypeForm = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"

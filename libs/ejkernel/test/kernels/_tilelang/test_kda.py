@@ -1,0 +1,48 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""TileLang parity tests for kda."""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+
+from ._helpers import _FP16_BWD_TOL, _FP16_FWD_TOL, _SEED, _max_abs, _randn, _tl, _xla
+
+
+def test_kda_fwd_bwd():
+    B, S, H, Dq, Dv = 1, 6, 2, 16, 16
+    key = jax.random.PRNGKey(_SEED + 55)
+    ks = jax.random.split(key, 5)
+    q = _randn(ks[0], (B, S, H, Dq), scale=0.25)
+    k = _randn(ks[1], (B, S, H, Dq), scale=0.25)
+    v = _randn(ks[2], (B, S, H, Dv), scale=0.25)
+    beta = (jax.random.uniform(ks[3], (B, S, H)) * 0.8 + 0.1).astype(jnp.float16)
+    decay = (jax.random.normal(ks[4], (B, S, H)) * 0.1 - 0.5).astype(jnp.float16)
+    kwargs = {"softmax_scale": 0.3, "use_chunked": False, "use_qk_l2norm": True}
+    tl, xla = _tl("kda"), _xla("kda")
+    out_tl, state_tl = tl(q, k, v, beta, decay, **kwargs)
+    out_x, state_x = xla(q, k, v, beta, decay, **kwargs)
+    assert _max_abs(out_tl, out_x) < _FP16_FWD_TOL
+    assert _max_abs(state_tl, state_x) < _FP16_FWD_TOL
+
+    def loss(fn, *args):
+        y, state = fn(*args, **kwargs)
+        return jnp.sum(y.astype(jnp.float32)) + 0.125 * jnp.sum(state.astype(jnp.float32))
+
+    g_tl = jax.grad(loss, argnums=(1, 2, 3, 4, 5))(tl, q, k, v, beta, decay)
+    g_x = jax.grad(loss, argnums=(1, 2, 3, 4, 5))(xla, q, k, v, beta, decay)
+    for a_tl, a_x, name in zip(g_tl, g_x, "q k v beta decay".split(), strict=True):
+        assert _max_abs(a_tl, a_x) < _FP16_BWD_TOL, f"grad d{name} too large"
