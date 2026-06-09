@@ -1,0 +1,46 @@
+[project]
+name = "easydel-stack"
+version = "0.1.0"
+description = "EasyDeL stack workspace: easydel + spectrax + ejkernel + eformer developed in one repo"
+requires-python = ">=3.11,<3.14"
+dependencies = ["easydel"]
+
+[dependency-groups]
+torch = ["easydel[torch]"]
+cuda = ["easydel[cuda]"]
+tpu = ["easydel[tpu]"]
+tensorflow = ["easydel[tensorflow]"]
+lm-eval = ["easydel[lm_eval]"]
+profile = ["easydel[profile]"]
+podutils = ["easydel[podutils]"]
+mm = ["easydel[mm]"]
+
+[tool.uv]
+# The root is a workspace anchor, not an installable package.
+package = false
+prerelease = "if-necessary-or-explicit"
+conflicts = [
+    [
+        { group = "cuda" },
+        { group = "tpu" },
+    ],
+    [
+        { group = "cuda" },
+        { group = "torch" },
+    ],
+    [
+        { group = "profile" },
+        { group = "tensorflow" },
+    ],
+]
+
+[tool.uv.workspace]
+members = ["libs/easydel", "libs/spectrax", "libs/ejkernel", "libs/eformer"]
+
+[tool.uv.sources]
+easydel = { workspace = true }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

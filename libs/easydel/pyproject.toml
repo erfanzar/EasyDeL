@@ -214,7 +214,6 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.uv]
-prerelease = "if-necessary-or-explicit"
 conflicts = [
 	[
 		{ extra = "cuda" },
@@ -230,10 +229,11 @@ conflicts = [
 	],
 ]
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
+# Resolver-level settings (prerelease policy, the pytorch-cpu index definition)
+# live in the workspace-root pyproject.toml. The sibling libraries resolve from
+# the workspace during development; published wheels keep the pinned versions.
 [tool.uv.sources]
 torch = { index = "pytorch-cpu", marker = "extra == 'torch'" }
+spectrax-lib = { workspace = true }
+ejkernel = { workspace = true }
+eformer = { workspace = true }

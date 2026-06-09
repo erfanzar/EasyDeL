@@ -50,6 +50,9 @@ module-root = "."
 source-include = ["csrc/**"]
 data = { purelib = "csrc" }
 
+[tool.uv.sources]
+eformer = { workspace = true }
+
 [tool.setuptools]
 package-dir = { "" = "." }
 
