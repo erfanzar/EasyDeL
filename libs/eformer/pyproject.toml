@@ -1,0 +1,122 @@
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
+name = "eformer"
+version = "0.0.101"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "(EasyDel Former) is a utility library designed to simplify and enhance the development in JAX"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+keywords = ["JAX", "Deep Learning", "XLA", "EasyDeL", "Distributed Computing"]
+classifiers = [
+	"Development Status :: 3 - Alpha",
+	"Intended Audience :: Developers",
+	"Topic :: Scientific/Engineering :: Artificial Intelligence",
+	"License :: OSI Approved :: Apache Software License",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+]
+dependencies = [
+	"jax>=0.9.2",
+	"optax>=0.2.2",
+	"ml-collections==1.1.0",
+	"plum-dispatch==2.3.2",
+	"ray[default]>=2.54.0",
+	"mergedeep~=1.3.4",
+	"tblib~=3.0.0",
+	"pyyaml~=6.0.2",
+	"contextlib2~=21.6.0",
+	"safetensors>=0.6.2",
+	"tqdm>=4.67.1",
+	"psutil>=7.0.0",
+	"google-cloud-storage>=3.3.0",
+	"tensorstore>=0.1.76",
+	"braceexpand>=0.1.7",
+	"chex>=0.1.91",
+	"jaxtyping>=0.3.2",
+	"fsspec[http]>=2024.2,<2026",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/erfanzar/eformer"
+"Repository" = "https://github.com/erfanzar/eformer"
+"Documentation" = "https://eformer.readthedocs.org/"
+
+[tool.uv.build-backend]
+module-name = "eformer"
+module-root = "."
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"eformer" = ["py.typed"]
+
+[tool.black]
+line-length = 121
+target-version = ["py311"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = ["F722", "B008", "UP015", "A005"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ["eformer/"]
+
+
+[tool.basedpyright]
+reportAssignmentType = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"
