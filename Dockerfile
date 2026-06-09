@@ -67,18 +67,18 @@ RUN uv venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:/usr/local/cuda/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
-# Project files
+# Project files (uv workspace: root pyproject + the four packages under libs/)
 COPY pyproject.toml README.md ./
-COPY easydel ./easydel
+COPY libs ./libs
 
 # Install project deps
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" == "cuda" ]]; then \
-        JAX_PLATFORMS=cpu uv pip install -e ".[cuda,torch,lm_eval,profile]"; \
+        JAX_PLATFORMS=cpu uv pip install -e "./libs/easydel[cuda,torch,lm_eval,profile]"; \
     elif [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
-        JAX_PLATFORMS=cpu uv pip install -e ".[tpu,torch,lm_eval,profile]"; \
+        JAX_PLATFORMS=cpu uv pip install -e "./libs/easydel[tpu,torch,lm_eval,profile]"; \
     else \
-        uv pip install -e ".[torch,lm_eval,profile]"; \
+        uv pip install -e "./libs/easydel[torch,lm_eval,profile]"; \
     fi
 
 # Ray with GCP extras
@@ -113,7 +113,7 @@ RUN mkdir -p "$HOME" && \
     chown -R easydel:easydel "$HOME"
 
 # Helpful env
-ENV PYTHONPATH=/app:/app/easydel:. \
+ENV PYTHONPATH=/app:/app/libs/easydel:. \
     RAY_USAGE_STATS_ENABLED=0 \
     TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS=60 \
     TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES=1024 \

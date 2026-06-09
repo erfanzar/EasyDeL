@@ -1,0 +1,57 @@
+name: Sync subtree mirrors
+
+# Pushes that touch a library under libs/ are automatically re-split and
+# pushed to that library's standalone repository, so the mirrors
+# (erfanzar/Spectrax, erfanzar/ejkernel, erfanzar/eformer) always track the
+# monorepo. Requires the SUBTREE_SYNC_TOKEN secret: a fine-grained PAT with
+# Contents read/write on the three mirror repositories.
+#
+# If a mirror has diverged (someone pushed to it directly), the push here
+# fails loudly. Reconcile from the monorepo with:
+#   scripts/subtree-sync.sh pull <lib>
+# then push again.
+
+on:
+  push:
+    branches: [main, vnext]
+    paths:
+      - "libs/spectrax/**"
+      - "libs/ejkernel/**"
+      - "libs/eformer/**"
+
+concurrency:
+  group: subtree-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lib: spectrax
+            repo: erfanzar/Spectrax
+          - lib: ejkernel
+            repo: erfanzar/ejkernel
+          - lib: eformer
+            repo: erfanzar/eformer
+    steps:
+      - name: Checkout (full history — subtree split walks it)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Split libs/${{ matrix.lib }} subtree
+        run: git subtree split --prefix="libs/${{ matrix.lib }}" -b subtree-split
+
+      - name: Push to ${{ matrix.repo }}
+        run: |
+          git push \
+            "https://x-access-token:${{ secrets.SUBTREE_SYNC_TOKEN }}@github.com/${{ matrix.repo }}.git" \
+            subtree-split:main

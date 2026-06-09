@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: libs/easydel/pyproject.toml
 
       - name: Install linters
         run: |
@@ -30,12 +30,12 @@ jobs:
       - name: Extract version from pyproject.toml
         id: meta
         run: |
-          VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version = ' libs/easydel/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Run linters
         run: |
-          ruff check easydel/ --config pyproject.toml
-          basedpyright easydel
+          ruff check libs/easydel/easydel/ --config libs/easydel/pyproject.toml
+          basedpyright libs/easydel/easydel
         env:
           EASYDEL_VERSION: ${{ steps.meta.outputs.version }}
