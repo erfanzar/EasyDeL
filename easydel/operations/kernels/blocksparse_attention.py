@@ -65,7 +65,8 @@ import typing as tp
 
 import jax
 from eformer.loggings import get_logger
-from ejkernel.modules import blocksparse_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.modules import BlockSparseAttentionConfig, blocksparse_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.ops import BwdParams, FwdParams  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import random as jr
@@ -280,6 +281,11 @@ class BlockSparseAttn(OperationImpl):
         gpu_constraints_failed: bool = query_dim_mod_16 != 0 or value_dim_mod_16 != 0
 
         blocksparse_cfg = self.metadata.get_operation_config("blocksparse")
+        if blocksparse_cfg is None and is_tpu:
+            blocksparse_cfg = BlockSparseAttentionConfig(
+                fwd_params=FwdParams(q_blocksize=512, kv_blocksize=512),
+                bwd_params=BwdParams(q_blocksize=512, kv_blocksize=512),
+            )
         base_cfg = self.metadata.base_config
         q_block_size = _extract_block_size(
             blocksparse_cfg,
@@ -383,36 +389,29 @@ class BlockSparseAttn(OperationImpl):
             layout="bhtd",
         )
 
-        try:
-            outputs_bhtd: Float[Array, "batch num_heads seq_len head_dim"] = blocksparse_attention(
-                query_transposed,
-                key_transposed,
-                value_transposed,
-                softmax_aux,
-                None,
-                mask_info=mask_info,
-                logits_soft_cap=logits_soft_cap,
-                softmax_scale=softmax_scale_computed,
-                sliding_window=sliding_window,
-                causal=causal_computed,
-                fused_backward=fused_backward,
-                cfg=self.metadata.get_operation_config("blocksparse"),
-                mesh=self.metadata.mesh,
-                out_specs=output_sharding,
-                in_specs=(
-                    query_sharding,
-                    key_sharding,
-                    value_sharding,
-                    softmax_aux_sharding,
-                    PartitionSpec(None),
-                ),
-            )
-        except ValueError as exc:
-            msg = str(exc)
-            if "should divide" in msg and ("q_block_size" in msg or "k_block_size" in msg):
-                logger.warning("Falling back to vanilla attention after block-sparse validation error: %s", msg)
-                return _run_vanilla_fallback()
-            raise
+        outputs_bhtd: Float[Array, "batch num_heads seq_len head_dim"] = blocksparse_attention(
+            query_transposed,
+            key_transposed,
+            value_transposed,
+            softmax_aux,
+            None,
+            mask_info=mask_info,
+            logits_soft_cap=logits_soft_cap,
+            softmax_scale=softmax_scale_computed,
+            sliding_window=sliding_window,
+            causal=causal_computed,
+            fused_backward=fused_backward,
+            cfg=blocksparse_cfg,
+            mesh=self.metadata.mesh,
+            out_specs=output_sharding,
+            in_specs=(
+                query_sharding,
+                key_sharding,
+                value_sharding,
+                softmax_aux_sharding,
+                PartitionSpec(None),
+            ),
+        )
 
         # Transpose back from BHTD to BTHD format
         outputs: Float[Array, "batch seq_len num_heads head_dim"] = outputs_bhtd.transpose(0, 2, 1, 3)

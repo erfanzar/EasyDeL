@@ -49,7 +49,6 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
     ScheduledLossAdapter,
-    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
@@ -121,15 +120,29 @@ def _per_token_xent(
         ``(per_token_distill_xent, per_token_teacher_entropy)``: two
         tensors of shape ``[...]`` (i.e. without the vocab axis).
     """
-    teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32) / temperature)
-    teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True)
-    teacher_log_probs = teacher_scaled - teacher_logsumexp
-    teacher_probs = jnp.exp(teacher_log_probs)
-    per_token_teacher_entropy = -jnp.sum(teacher_probs * teacher_log_probs, axis=-1).astype(dtype)
+    compute_dtype = jnp.dtype(dtype)
+    temp = jnp.asarray(temperature, dtype=compute_dtype)
 
-    student_scaled = student_logits.astype(jnp.float32) / temperature
-    student_logsumexp = jax.nn.logsumexp(student_scaled, axis=-1)
-    per_token_distill_xent = (student_logsumexp - jnp.sum(teacher_probs * student_scaled, axis=-1)).astype(dtype)
+    teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(compute_dtype) / temp)
+    teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True).astype(compute_dtype)
+    teacher_log_probs = teacher_scaled - teacher_logsumexp
+    teacher_probs = jnp.exp(teacher_log_probs).astype(compute_dtype)
+    per_token_teacher_entropy = -jnp.sum(
+        teacher_probs * teacher_log_probs,
+        axis=-1,
+        dtype=compute_dtype,
+    ).astype(dtype)
+
+    student_scaled = student_logits.astype(compute_dtype) / temp
+    student_logsumexp = jax.nn.logsumexp(student_scaled, axis=-1).astype(compute_dtype)
+    per_token_distill_xent = (
+        student_logsumexp
+        - jnp.sum(
+            teacher_probs * student_scaled,
+            axis=-1,
+            dtype=compute_dtype,
+        )
+    ).astype(dtype)
     return per_token_distill_xent, per_token_teacher_entropy
 
 
@@ -624,7 +637,7 @@ def distillation_loss(
 
     total_loss = alpha_s * kl_loss
     ce_loss = jnp.array(0.0, dtype=dtype)
-    if use_hard_labels and labels is not None:
+    if use_hard_labels and labels is not None and alpha < 1.0:
         safe_labels = jnp.where(labels == -100, 0, labels)
         if _vp_mesh is not None:
             # Match the KL: with a tensor-parallel-sharded vocabulary, compute the supervised CE
@@ -898,8 +911,6 @@ def chunked_distillation_loss(
     alpha: float = 0.9,
     chunk_size: int = 128,
     checkpoint_chunks: bool = True,
-    hidden_partition_spec: PartitionSpec | None = None,
-    hidden_shard_stage: int | None = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Memory-efficient distillation loss that avoids materialising full logits.
 
@@ -944,11 +955,6 @@ def chunked_distillation_loss(
         checkpoint_chunks: When ``True``, ``jax.checkpoint`` the
             per-chunk body so vocab-sized logits are recomputed in
             the backward pass.
-        hidden_partition_spec: Optional sharding spec applied to the
-            hidden-state slice before the LM-head projection (used to
-            pin the slice to the LM-head's mesh).
-        hidden_shard_stage: Optional MPMD stage rank used with the
-            hidden-state sharding constraint.
 
     Returns:
         ``(total_loss, metrics)`` where ``metrics`` is a dict with
@@ -981,30 +987,16 @@ def chunked_distillation_loss(
         batch_size=B,
     )
 
-    _use_hard = use_hard_labels and has_labels
-    token_partition_spec = None
-    if hidden_partition_spec is not None:
-        token_partition_spec = PartitionSpec(*tuple(hidden_partition_spec)[:2])
+    _use_hard = use_hard_labels and has_labels and alpha < 1.0
+
+    n_chunks = L_padded // chunk_size
+    s_chunks = student_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3)
+    t_chunks = teacher_hidden.reshape(B, n_chunks, chunk_size, -1).transpose(1, 0, 2, 3)
+    m_chunks = mask.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
+    l_chunks = safe_labels.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
 
     def _chunk_kl_ce(s_h, t_h, m, sl):
-        """Project a token-chunk of hidden states and compute fused KL/CE contributions.
-
-        Args:
-            s_h: Student hidden-state slice ``[batch, chunk, hidden_dim]``.
-            t_h: Teacher hidden-state slice with the same shape.
-            m: Loss-mask slice ``[batch, chunk]``.
-            sl: Safe-label slice (with ``-100`` replaced by 0) ``[batch, chunk]``.
-
-        Returns:
-            ``(distill_xent, teacher_entropy, ce, mask_sum)`` scalars
-            for this chunk.
-        """
-        if hidden_partition_spec is not None:
-            s_h = with_sharding_constraint(s_h, hidden_partition_spec, stage=hidden_shard_stage)
-            t_h = with_sharding_constraint(t_h, hidden_partition_spec, stage=hidden_shard_stage)
-        if token_partition_spec is not None:
-            m = with_sharding_constraint(m, token_partition_spec, stage=hidden_shard_stage)
-            sl = with_sharding_constraint(sl, token_partition_spec, stage=hidden_shard_stage)
+        """Project one hidden-state chunk and reduce it to scalar loss terms."""
         with jax.named_scope("easydel/trainer/distillation/chunked_loss/student_lm_head"):
             s_logits = checkpoint_name(student_lm_head_fn(s_h), "distill_student_lm_head_logits")
         with jax.named_scope("easydel/trainer/distillation/chunked_loss/teacher_lm_head"):
@@ -1012,79 +1004,41 @@ def chunked_distillation_loss(
                 jax.lax.stop_gradient(teacher_lm_head_fn(t_h)),
                 "distill_teacher_lm_head_logits",
             )
-        with jax.named_scope("easydel/trainer/distillation/chunked_loss/fused_kl"):
-            kl_out = _fused_kl(
-                s_logits,
-                t_logits,
-                m,
-                reduction="sum",
-                direction="forward",
-                temperature=temperature,
-                return_teacher_entropy=True,
-                platform="xla",
-            )
-        teacher_entropy_sum = kl_out.teacher_entropy.astype(dtype)
-        distill_xent_sum = (kl_out.loss + kl_out.teacher_entropy).astype(dtype)
-
-        ce_sum = jnp.zeros((), dtype=dtype)
-        if _use_hard:
-            with jax.named_scope("easydel/trainer/distillation/chunked_loss/fused_ce"):
-                ce_out = _fused_ce(
-                    s_logits,
-                    sl.astype(jnp.int32),
-                    m,
-                    reduction="sum",
-                    ignore_index=-100,
-                    platform="xla",
-                )
-            ce_sum = ce_out.loss.astype(dtype)
-
-        return distill_xent_sum, teacher_entropy_sum, ce_sum, jnp.sum(m)
+        return _compute_kl_and_ce(
+            student_logits=s_logits,
+            teacher_logits=t_logits,
+            mask=m,
+            safe_labels=sl,
+            use_hard_labels=_use_hard,
+            temperature=temperature,
+            dtype=dtype,
+        )
 
     if checkpoint_chunks:
         _chunk_kl_ce = jax.checkpoint(_chunk_kl_ce)
 
-    def _fori_body(i, carry):
-        """Slice one token chunk and add its KL/CE contributions."""
-        start = i * chunk_size
-        s_h = jax.lax.dynamic_slice_in_dim(student_hidden, start, chunk_size, axis=1)
-        t_h = jax.lax.dynamic_slice_in_dim(teacher_hidden, start, chunk_size, axis=1)
-        m = jax.lax.dynamic_slice_in_dim(mask, start, chunk_size, axis=1)
-        sl = jax.lax.dynamic_slice_in_dim(safe_labels, start, chunk_size, axis=1)
+    def _scan_body(carry, xs):
+        s_h, t_h, m, sl = xs
         distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms)
+        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
 
     _zero = jnp.zeros((), dtype=dtype)
-    n_chunks = L_padded // chunk_size
-    distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum = jax.lax.fori_loop(
-        0,
-        n_chunks,
-        _fori_body,
+    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
+        _scan_body,
         (_zero, _zero, _zero, _zero),
+        (s_chunks, t_chunks, m_chunks, l_chunks),
     )
 
-    # ``_fused_kl`` returns the KL and teacher entropy already multiplied by
-    # T^2, so normalise the fused sums directly instead of using the legacy
-    # finalizer that applies the temperature scaling itself.
-    alpha_s = jnp.array(alpha, dtype=dtype)
-    normalizer = jnp.maximum(mask_sum, jnp.ones((), dtype=dtype))
-    distill_xent_loss = distill_xent_sum / normalizer
-    teacher_entropy_loss = teacher_entropy_sum / normalizer
-    kl_loss = distill_xent_loss - teacher_entropy_loss
-    total_loss = alpha_s * kl_loss
-
-    ce_loss = jnp.zeros((), dtype=dtype)
-    if _use_hard:
-        ce_loss = ce_sum / normalizer
-        total_loss = total_loss + (jnp.ones((), dtype=dtype) - alpha_s) * ce_loss
-
-    metrics = {
-        "kl_loss": jnp.asarray(kl_loss, dtype=dtype),
-        "distill_xent_loss": jnp.asarray(distill_xent_loss, dtype=dtype),
-        "teacher_entropy_loss": jnp.asarray(teacher_entropy_loss, dtype=dtype),
-        "ce_loss": jnp.asarray(ce_loss, dtype=dtype),
-    }
-    return total_loss, metrics
+    return _finalize_distillation_metrics(
+        distill_xent_sum=distill_xent_sum,
+        teacher_entropy_sum=teacher_entropy_sum,
+        ce_sum=ce_sum,
+        mask_sum=mask_sum,
+        temperature=temperature,
+        alpha=alpha,
+        use_hard_labels=_use_hard,
+        dtype=dtype,
+    )
 
 
 def _resolve_indices(
@@ -1375,24 +1329,10 @@ def distillation_step(
     use_advanced_vocab_loss = beta is not None or loss_top_k > 0 or loss_add_tail
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
 
-    # SPMD tensor-parallel vocab path. With a >1 ``tp`` axis the model's LM head is row-parallel and
-    # emits FULL ``[B, S, V]`` logits via a giant all-reduce (the large-vocab distillation OOM). Route
-    # the projection through the hidden-state path with a COLUMN-PARALLEL (vocab-sharded) LM head
-    # (``vocab_shard_stage=0`` -> constraint ``P(None, ("fsdp","sp","tp"))``) so the full vocab is never
-    # materialized -- and do it as a single full-sequence "chunk" so there is no sequence chunking and
-    # ``checkpoint_kl_loss`` (jax.checkpoint) recomputes the vocab-sized logits in the backward. Users
-    # never need to set ``logits_chunk_size``; an explicit value still narrows the per-chunk peak.
     _stage_mesh = spx.get_current_stage_mesh(
         getattr(getattr(student_state, "model", None), "mesh", None), raise_error=False
     )
     _tp_parallel = _stage_mesh is not None and "tp" in _stage_mesh.axis_names and _stage_mesh.shape["tp"] > 1
-    if _tp_parallel and not use_advanced_vocab_loss and not use_chunked and not mtp_distillation:
-        # Single full-sequence pass through the column-parallel projection (below) -- no sequence
-        # chunking; the vocab-sharded logits + jax.checkpoint keep the distillation KL bounded.
-        # Skipped under ``mtp_distillation``: the MTP aux loss only runs on the non-chunked path
-        # (``if mtp_distillation and not use_chunked``), so force-flipping here would silently drop it.
-        logits_chunk_size = int(batch["input_ids"].shape[1])
-        use_chunked = True
 
     def teacher_forward(input_batch: collections.abc.Mapping[str, jax.Array]) -> dict[str, tp.Any]:
         """Run the teacher in stop-gradient mode for one minibatch.
@@ -1534,15 +1474,11 @@ def distillation_step(
         completion_mask = minibatch.get("completion_mask", None)
 
         if use_chunked:
-            # On a TP mesh, project the LM head column-parallel (vocab-sharded) so the full
-            # ``[B, S, V]`` logits are never all-reduced; SPMD has a single stage so the shard stage
-            # is 0. Off-TP keeps the legacy (row-parallel) projection.
-            _vocab_stage = 0 if _tp_parallel else None
             total_loss, loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs.last_hidden_state,
                 teacher_hidden=teacher_hidden_for_kl,
-                student_lm_head_fn=module.make_lm_head_fn(vocab_shard_stage=_vocab_stage),
-                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(vocab_shard_stage=_vocab_stage),
+                student_lm_head_fn=module.make_lm_head_fn(),
+                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
                 attention_mask=attention_mask,
                 loss_mask=completion_mask,
                 labels=labels,
@@ -1551,8 +1487,6 @@ def distillation_step(
                 alpha=alpha,
                 chunk_size=int(logits_chunk_size),
                 checkpoint_chunks=checkpoint_kl_loss,
-                hidden_partition_spec=_LMHEAD_HIDDEN_PSPEC,
-                hidden_shard_stage=_vocab_stage,
             )
         else:
             # If the vocabulary is tensor-parallel-sharded, route the KL/CE through the vocab-parallel
@@ -1714,10 +1648,6 @@ def distillation_step(
         _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
         return metrics
 
-
-_LMHEAD_HIDDEN_PSPEC = PartitionSpec(("dp", "fsdp"), "sp", None)
-
-
 def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
     """Return the scheduled batch unchanged.
 
@@ -1861,12 +1791,11 @@ def _make_distillation_scheduled_loss(call):
             if use_chunked:
                 if teacher_lm_head_module is None:
                     raise RuntimeError("Chunked distillation scheduled MPMD training requires teacher_state.")
-                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
                 total_loss, _loss_components = chunked_distillation_loss(
                     student_hidden=student_outputs["hidden_for_kl"],
                     teacher_hidden=teacher_outputs["hidden_for_kl"],
-                    student_lm_head_fn=module.make_lm_head_fn(vocab_shard_stage=_terminal_rank),
-                    teacher_lm_head_fn=teacher_lm_head_module.make_lm_head_fn(vocab_shard_stage=_terminal_rank),
+                    student_lm_head_fn=module.make_lm_head_fn(),
+                    teacher_lm_head_fn=teacher_lm_head_module.make_lm_head_fn(),
                     attention_mask=attention_mask,
                     loss_mask=completion_mask,
                     labels=labels,
@@ -1875,8 +1804,6 @@ def _make_distillation_scheduled_loss(call):
                     alpha=alpha,
                     chunk_size=int(logits_chunk_size),
                     checkpoint_chunks=checkpoint_kl_loss,
-                    hidden_partition_spec=(_LMHEAD_HIDDEN_PSPEC if _terminal_rank is not None else None),
-                    hidden_shard_stage=_terminal_rank,
                 )
             else:
                 total_loss, _loss_components = distillation_loss(
