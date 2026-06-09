@@ -53,7 +53,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -1791,7 +1791,15 @@ class Qwen3OmniMoeTextDecoderLayer(spx.Module):
         hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        feed_forward_output = self.mlp(feed_forward_input)
+
+        if self.config.use_scan_mlp and not self.is_moe:
+            feed_forward_output = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_output = self.mlp(feed_forward_input)
 
         router_logits = None
         if self.is_moe:
@@ -2303,7 +2311,15 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(spx.Module):
         hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        feed_forward_output = self.mlp(feed_forward_input)
+
+        if self.config.use_scan_mlp and not self.is_moe:
+            feed_forward_output = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_output = self.mlp(feed_forward_input)
 
         router_logits = None
         if self.is_moe:
@@ -2560,7 +2576,16 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(spx.Module):
         hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        feed_forward_output = self.mlp(feed_forward_input)
+
+        if self.config.use_scan_mlp:
+            feed_forward_output = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_output = self.mlp(feed_forward_input)
+
         hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
 
         return DecoderLayerOutput(
@@ -3740,7 +3765,14 @@ class Qwen3OmniMoeCode2WavTransformerLayer(spx.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_output = self.mlp(hidden_states)
+        if self.config.use_scan_mlp:
+            mlp_output = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            mlp_output = self.mlp(hidden_states)
         hidden_states = residual + self.mlp_layer_scale(mlp_output)
 
         return hidden_states

@@ -53,7 +53,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
@@ -485,7 +485,7 @@ class Phi3DecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 hidden_states,
                 self.config.scan_mlp_chunk_size,

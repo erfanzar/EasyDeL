@@ -71,7 +71,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -976,10 +976,18 @@ class Llama4TextDecoderLayer(spx.Module):
         hidden_states = hidden_states + attn_outputs.attention_output
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        feed_forward_hidden_states = self.feed_forward(feed_forward_input)
         if self.is_moe_layer:
+            feed_forward_hidden_states = self.feed_forward(feed_forward_input)
             feed_forward_hidden_states, router_logits = feed_forward_hidden_states
         else:
+            if self.config.use_scan_mlp:
+                feed_forward_hidden_states = blockwise_ffn(
+                    self.feed_forward,
+                    feed_forward_input,
+                    self.config.scan_mlp_chunk_size,
+                )
+            else:
+                feed_forward_hidden_states = self.feed_forward(feed_forward_input)
             router_logits = None
 
         hidden_states = hidden_states + feed_forward_hidden_states.reshape(feed_forward_input.shape)
@@ -1982,7 +1990,14 @@ class Llama4VisionEncoderLayer(spx.Module):
         hidden_states = residual + attn_outputs.attention_output
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         hidden_states = apply_logical_sharding(

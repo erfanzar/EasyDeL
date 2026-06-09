@@ -252,6 +252,26 @@ class DistillationTrainer(Trainer):
         )
         mesh = self.model.mesh
 
+        # Master MTP switch. A checkpoint that ships an MTP head keeps training it via the student's
+        # self-supervised MTP cross-entropy, which the model folds into ``outputs.aux_loss`` (gated by
+        # ``mtp_loss_coef``) and the step adds unconditionally -- independent of the trainer's MTP-KD term.
+        # So when MTP distillation is OFF, freeze the head (``mtp_loss_coef=0``) so ``mtp_distillation=False``
+        # means *no* MTP loss at all. (``mtp_distillation=True`` leaves ``mtp_loss_coef`` untouched; pair it
+        # with ``mtp_kd_weight=0`` if you want the self-supervised MTP CE WITHOUT the soft-KD term.) The MoE
+        # router aux loss is added separately and is unaffected. ``text_config`` covers the VLM student,
+        # whose MTP head lives on the inner text model.
+        if not bool(self.arguments.mtp_distillation):
+            _froze_mtp = False
+            for _cfg in (self.model.config, getattr(self.model.config, "text_config", None)):
+                if _cfg is not None and float(getattr(_cfg, "mtp_loss_coef", 0.0) or 0.0) > 0.0:
+                    _cfg.mtp_loss_coef = 0.0
+                    _froze_mtp = True
+            if _froze_mtp:
+                logger.debug(
+                    "`mtp_distillation=False` -> froze the student MTP head (mtp_loss_coef=0); "
+                    "no MTP loss is trained or distilled."
+                )
+
         # Zero-config large-vocab fit on a tensor-parallel mesh: enable the memory-safe LM-head paths
         # automatically (explicit user values are always preserved). On TP>1 the row-parallel LM head
         # otherwise materializes full ``[B, S, V]`` logits -- the distillation-KL and MTP-aux OOM:
@@ -289,7 +309,7 @@ class DistillationTrainer(Trainer):
                     _t_model = getattr(self.teacher_state, "model", None)
                     if _t_model is not None and getattr(_t_model.config, "lmhead_chunksize", None) is None:
                         _t_model.config.lmhead_chunksize = _lh
-                    logger.info(
+                    logger.debug(
                         "Auto-enabled chunked+checkpointed LM-head/MTP projection (lmhead_chunksize=%d) on a TP=%d mesh.",
                         _lh,
                         _tp_size,

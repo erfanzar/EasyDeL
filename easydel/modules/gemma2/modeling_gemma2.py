@@ -63,7 +63,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -509,7 +509,7 @@ class Gemma2DecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         if self.config.use_scan_mlp:
-            hidden_states = block_wise_ffn(
+            hidden_states = blockwise_ffn(
                 self.mlp,
                 hidden_states,
                 self.config.scan_mlp_chunk_size,

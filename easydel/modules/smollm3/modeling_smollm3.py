@@ -42,7 +42,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -337,7 +337,7 @@ class SmolLM3DecoderLayer(spx.Module):
 
         # MLP
         if self.config.use_scan_mlp:
-            mlp_output = block_wise_ffn(
+            mlp_output = blockwise_ffn(
                 self.mlp,
                 hidden_states,
                 self.config.scan_mlp_chunk_size,

@@ -56,7 +56,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -378,7 +378,7 @@ class SeedOssDecoderLayer(spx.Module):
 
         ff_inputs = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:
-            mlp_outputs = block_wise_ffn(
+            mlp_outputs = blockwise_ffn(
                 self.mlp,
                 ff_inputs,
                 self.config.scan_mlp_chunk_size,

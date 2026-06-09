@@ -38,11 +38,11 @@ from ejkernel.modules.operations import fused_cross_entropy as _fused_ce
 from ejkernel.modules.operations import fused_kl_divergence as _fused_kl
 from jax import Array as JaxArray
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 from spectrax import with_sharding_constraint
 from spectrax.common_types import BATCH, LENGTH, MODE_TRAIN, VOCAB
-from spectrax.sharding import named_sharding_for_shape, reshape_with_named_shardings, transpose_with_named_shardings
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -89,87 +89,6 @@ def _constrain_distillation_input_batch(
         dict[str, tp.Any],
         dict(with_sharding_constraint(batch, partition_spec, mesh=mesh, ignore_mpmd=True)),
     )
-
-
-def _chunk_sequence_for_scan(value: Array, chunk_size: int, *, context: str) -> Array:
-    """Reshape ``(B, L, ...)`` to ``(chunks, B, chunk, ...)`` while preserving sharding.
-
-    Used by :func:`chunked_distillation_loss` to feed
-    sequence-chunked tensors into :func:`jax.lax.scan`. The function
-    propagates the input's :class:`~jax.sharding.NamedSharding`
-    through the reshape and the leading-axis transpose so that the
-    chunked tensor stays consistent with the rest of the mesh layout
-    (otherwise jax inserts implicit reshards that defeat the chunking
-    memory win).
-
-    Args:
-        value: Tensor shaped ``(batch, seq_len, ...)``. ``seq_len``
-            must be a multiple of ``chunk_size``.
-        chunk_size: Number of sequence positions per chunk.
-        context: Debug label used when constructing the propagated
-            ``NamedSharding`` (helpful for spectrax error messages).
-
-    Returns:
-        A tensor shaped
-        ``(n_chunks, batch, chunk_size, ...)`` ready to be scanned
-        over the leading axis.
-    """
-    bsz, seq_len = value.shape[:2]
-    n_chunks = seq_len // chunk_size
-    source_sharding = getattr(value, "sharding", None)
-    source_parts: list[object] | None = None
-    if isinstance(source_sharding, jax.sharding.NamedSharding):
-        source_parts = list(tuple(source_sharding.spec))
-        while len(source_parts) < len(value.shape):
-            source_parts.append(None)
-
-    reshape_axes = (bsz, n_chunks, chunk_size, *value.shape[2:])
-    reshape_spec = None
-    reshape_sharding = None
-    if source_parts is not None:
-        reshape_spec = PartitionSpec(source_parts[0], None, source_parts[1], *source_parts[2 : len(value.shape)])
-        reshape_sharding = named_sharding_for_shape(
-            source_sharding,
-            tuple(int(dim) for dim in reshape_axes),
-            reshape_spec,
-            context=f"{context}:reshape",
-        )
-
-    if isinstance(source_sharding, jax.sharding.NamedSharding) and reshape_sharding is not None:
-        reshaped = reshape_with_named_shardings(
-            value,
-            reshape_axes,
-            in_sharding=source_sharding,
-            out_sharding=reshape_sharding,
-        )
-    else:
-        reshaped = value.reshape(reshape_axes)
-
-    permutation = (1, 0, 2, *range(3, len(reshape_axes)))
-    scan_sharding = None
-    if source_parts is not None:
-        scan_spec = PartitionSpec(None, source_parts[0], source_parts[1], *source_parts[2 : len(value.shape)])
-        scan_shape = tuple(reshape_axes[axis] for axis in permutation)
-        scan_sharding = named_sharding_for_shape(
-            source_sharding,
-            tuple(int(dim) for dim in scan_shape),
-            scan_spec,
-            context=f"{context}:transpose",
-        )
-
-    if isinstance(reshape_sharding, jax.sharding.NamedSharding) and isinstance(
-        scan_sharding, jax.sharding.NamedSharding
-    ):
-        chunked = transpose_with_named_shardings(
-            reshaped,
-            permutation,
-            in_sharding=reshape_sharding,
-            out_sharding=scan_sharding,
-        )
-    else:
-        chunked = reshaped.transpose(permutation)
-    return chunked
-
 
 def _per_token_xent(
     teacher_logits: Array,
@@ -315,8 +234,8 @@ def _compute_kl_and_ce(
 
     Wraps :func:`_per_token_xent` with mask-weighted summation and the
     optional hard-label cross-entropy on the student logits. Returns
-    scalars so the caller (``jax.lax.scan`` in
-    :func:`chunked_distillation_loss`) can accumulate cheaply.
+    scalars so chunked callers can accumulate cheaply without carrying
+    per-token logits.
 
     Args:
         student_logits: Student logits ``[..., vocab]`` for the chunk.
@@ -1062,17 +981,13 @@ def chunked_distillation_loss(
         batch_size=B,
     )
 
-    # Reshape to [n_chunks, B, chunk_size, ...] for scanning while carrying
-    # the incoming layout through the split/transpose.
-    s_chunks = _chunk_sequence_for_scan(student_hidden, chunk_size, context="student_hidden")
-    t_chunks = _chunk_sequence_for_scan(teacher_hidden, chunk_size, context="teacher_hidden")
-    m_chunks = _chunk_sequence_for_scan(mask, chunk_size, context="distillation_mask")
-    l_chunks = _chunk_sequence_for_scan(safe_labels, chunk_size, context="distillation_labels")
-
     _use_hard = use_hard_labels and has_labels
+    token_partition_spec = None
+    if hidden_partition_spec is not None:
+        token_partition_spec = PartitionSpec(*tuple(hidden_partition_spec)[:2])
 
     def _chunk_kl_ce(s_h, t_h, m, sl):
-        """Project a token-chunk of hidden states and compute KL/CE contributions.
+        """Project a token-chunk of hidden states and compute fused KL/CE contributions.
 
         Args:
             s_h: Student hidden-state slice ``[batch, chunk, hidden_dim]``.
@@ -1087,53 +1002,89 @@ def chunked_distillation_loss(
         if hidden_partition_spec is not None:
             s_h = with_sharding_constraint(s_h, hidden_partition_spec, stage=hidden_shard_stage)
             t_h = with_sharding_constraint(t_h, hidden_partition_spec, stage=hidden_shard_stage)
-        s_logits = student_lm_head_fn(s_h)
-        t_logits = teacher_lm_head_fn(t_h)
-        return _compute_kl_and_ce(
-            student_logits=s_logits,
-            teacher_logits=t_logits,
-            mask=m,
-            safe_labels=sl,
-            use_hard_labels=_use_hard,
-            temperature=temperature,
-            dtype=dtype,
-        )
+        if token_partition_spec is not None:
+            m = with_sharding_constraint(m, token_partition_spec, stage=hidden_shard_stage)
+            sl = with_sharding_constraint(sl, token_partition_spec, stage=hidden_shard_stage)
+        with jax.named_scope("easydel/trainer/distillation/chunked_loss/student_lm_head"):
+            s_logits = checkpoint_name(student_lm_head_fn(s_h), "distill_student_lm_head_logits")
+        with jax.named_scope("easydel/trainer/distillation/chunked_loss/teacher_lm_head"):
+            t_logits = checkpoint_name(
+                jax.lax.stop_gradient(teacher_lm_head_fn(t_h)),
+                "distill_teacher_lm_head_logits",
+            )
+        with jax.named_scope("easydel/trainer/distillation/chunked_loss/fused_kl"):
+            kl_out = _fused_kl(
+                s_logits,
+                t_logits,
+                m,
+                reduction="sum",
+                direction="forward",
+                temperature=temperature,
+                return_teacher_entropy=True,
+                platform="xla",
+            )
+        teacher_entropy_sum = kl_out.teacher_entropy.astype(dtype)
+        distill_xent_sum = (kl_out.loss + kl_out.teacher_entropy).astype(dtype)
+
+        ce_sum = jnp.zeros((), dtype=dtype)
+        if _use_hard:
+            with jax.named_scope("easydel/trainer/distillation/chunked_loss/fused_ce"):
+                ce_out = _fused_ce(
+                    s_logits,
+                    sl.astype(jnp.int32),
+                    m,
+                    reduction="sum",
+                    ignore_index=-100,
+                    platform="xla",
+                )
+            ce_sum = ce_out.loss.astype(dtype)
+
+        return distill_xent_sum, teacher_entropy_sum, ce_sum, jnp.sum(m)
 
     if checkpoint_chunks:
         _chunk_kl_ce = jax.checkpoint(_chunk_kl_ce)
 
-    def _scan_body(carry, xs):
-        """Add one chunk's KL/CE contributions into the scan accumulators.
-
-        Args:
-            carry: ``(distill_xent_sum, teacher_entropy_sum, ce_sum,
-                mask_sum)`` accumulator.
-            xs: ``(s_h, t_h, m, sl)`` batched chunk inputs.
-
-        Returns:
-            ``(new_carry, None)`` per the ``jax.lax.scan`` contract.
-        """
-        s_h, t_h, m, sl = xs
+    def _fori_body(i, carry):
+        """Slice one token chunk and add its KL/CE contributions."""
+        start = i * chunk_size
+        s_h = jax.lax.dynamic_slice_in_dim(student_hidden, start, chunk_size, axis=1)
+        t_h = jax.lax.dynamic_slice_in_dim(teacher_hidden, start, chunk_size, axis=1)
+        m = jax.lax.dynamic_slice_in_dim(mask, start, chunk_size, axis=1)
+        sl = jax.lax.dynamic_slice_in_dim(safe_labels, start, chunk_size, axis=1)
         distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
+        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms)
 
     _zero = jnp.zeros((), dtype=dtype)
-    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
-        _scan_body,
+    n_chunks = L_padded // chunk_size
+    distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum = jax.lax.fori_loop(
+        0,
+        n_chunks,
+        _fori_body,
         (_zero, _zero, _zero, _zero),
-        (s_chunks, t_chunks, m_chunks, l_chunks),
     )
 
-    return _finalize_distillation_metrics(
-        distill_xent_sum=distill_xent_sum,
-        teacher_entropy_sum=teacher_entropy_sum,
-        ce_sum=ce_sum,
-        mask_sum=mask_sum,
-        temperature=temperature,
-        alpha=alpha,
-        use_hard_labels=_use_hard,
-        dtype=dtype,
-    )
+    # ``_fused_kl`` returns the KL and teacher entropy already multiplied by
+    # T^2, so normalise the fused sums directly instead of using the legacy
+    # finalizer that applies the temperature scaling itself.
+    alpha_s = jnp.array(alpha, dtype=dtype)
+    normalizer = jnp.maximum(mask_sum, jnp.ones((), dtype=dtype))
+    distill_xent_loss = distill_xent_sum / normalizer
+    teacher_entropy_loss = teacher_entropy_sum / normalizer
+    kl_loss = distill_xent_loss - teacher_entropy_loss
+    total_loss = alpha_s * kl_loss
+
+    ce_loss = jnp.zeros((), dtype=dtype)
+    if _use_hard:
+        ce_loss = ce_sum / normalizer
+        total_loss = total_loss + (jnp.ones((), dtype=dtype) - alpha_s) * ce_loss
+
+    metrics = {
+        "kl_loss": jnp.asarray(kl_loss, dtype=dtype),
+        "distill_xent_loss": jnp.asarray(distill_xent_loss, dtype=dtype),
+        "teacher_entropy_loss": jnp.asarray(teacher_entropy_loss, dtype=dtype),
+        "ce_loss": jnp.asarray(ce_loss, dtype=dtype),
+    }
+    return total_loss, metrics
 
 
 def _resolve_indices(

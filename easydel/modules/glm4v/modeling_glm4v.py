@@ -66,7 +66,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -1302,7 +1302,7 @@ class Glm4vTextDecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(self.mlp, hidden_states, self.config.scan_mlp_chunk_size)
+            feed_forward_hidden_states = blockwise_ffn(self.mlp, hidden_states, self.config.scan_mlp_chunk_size)
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_mlp_layernorm(feed_forward_hidden_states)

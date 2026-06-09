@@ -32,7 +32,7 @@ Key Patterns:
 
     Block-wise FFN:
         For memory efficiency during training, the MLP can be processed in
-        chunks along the sequence dimension via block_wise_ffn().
+        chunks along the sequence dimension via blockwise_ffn().
 
     Standard Decoder Layer:
         The complete pattern combining attention and MLP::
@@ -45,7 +45,7 @@ Classes:
         Collection of static methods for decoder layer operations.
 
 Functions:
-    block_wise_ffn:
+    blockwise_ffn:
         Apply MLP in chunks for memory efficiency.
 
 Example:
@@ -275,7 +275,7 @@ class BaseDecoderLayer:
 
         Mirrors :meth:`pre_norm_residual_attn` for the feed-forward branch
         of a transformer block. Optionally chunks the MLP along the
-        sequence axis via :func:`block_wise_ffn` to bound peak activation
+        sequence axis via :func:`blockwise_ffn` to bound peak activation
         memory on long contexts — useful when the FFN intermediate
         (typically 4× ``hidden_dim`` for dense, 8×+ for SwiGLU) is the
         memory hot-spot during training.
@@ -288,7 +288,7 @@ class BaseDecoderLayer:
                 same shape.
             norm_module: Pre-MLP normalization layer (typically RMSNorm).
             use_scan: When ``True`` apply ``mlp_module`` block-wise via
-                :func:`block_wise_ffn` to reduce peak memory; otherwise
+                :func:`blockwise_ffn` to reduce peak memory; otherwise
                 call it once on the full sequence.
             scan_chunk_size: Sequence-axis chunk size used when
                 ``use_scan=True``. Defaults to 1024.
@@ -309,7 +309,7 @@ class BaseDecoderLayer:
         # Apply MLP (with optional scan)
         mlp_output: Float[Array, "batch_size seq_len hidden_dim"]
         if use_scan:
-            mlp_output = block_wise_ffn(mlp_module, normed, scan_chunk_size)
+            mlp_output = blockwise_ffn(mlp_module, normed, scan_chunk_size)
         else:
             mlp_output = mlp_module(normed)
 
@@ -453,7 +453,7 @@ class BaseDecoderLayer:
         return output
 
 
-def block_wise_ffn(
+def blockwise_ffn(
     mlp_module: Callable,
     inputs: Float[Array, "batch_size seq_len hidden_dim"],
     chunk_size: int = 1024,
@@ -486,7 +486,7 @@ def block_wise_ffn(
         >>> mlp_out = mlp(hidden_states)  # May OOM on long sequences
         >>>
         >>> # Block-wise for memory efficiency
-        >>> mlp_out = block_wise_ffn(mlp, hidden_states, chunk_size=512)
+        >>> mlp_out = blockwise_ffn(mlp, hidden_states, chunk_size=512)
 
     Note:
         If the sequence length is less than or equal to chunk_size, the

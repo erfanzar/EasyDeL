@@ -66,7 +66,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
 )
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, segmented_depthwise_causal_conv1d
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -1144,7 +1144,15 @@ class FalconH1DecoderLayer(spx.Module):
         # MLP
         residual = hidden_states
         hidden_states = self.pre_ff_layernorm(hidden_states)
-        hidden_states = residual + self.feed_forward(hidden_states)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(
+                self.feed_forward,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.feed_forward(hidden_states)
+        hidden_states = residual + feed_forward_hidden_states
 
         hidden_states = apply_logical_sharding(
             hidden_states,

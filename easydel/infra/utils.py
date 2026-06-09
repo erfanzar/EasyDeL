@@ -406,7 +406,7 @@ def add_start_docstrings(*docstr):
     return docstring_decorator
 
 
-def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -> jax.Array:
+def blockwise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -> jax.Array:
     """Apply a feed-forward network block-wise to reduce memory usage.
 
     Implements the block-wise feed-forward approach from the near-infinite
@@ -434,7 +434,7 @@ def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -
 
     Example:
         >>> ffn = lambda x: mlp(x)  # Your FFN function
-        >>> chunked_output = block_wise_ffn(ffn, inputs, chunk_size=256)
+        >>> chunked_output = blockwise_ffn(ffn, inputs, chunk_size=256)
     """
     generating = inputs.shape[1] == 1
     try:

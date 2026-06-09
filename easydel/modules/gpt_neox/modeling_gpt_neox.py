@@ -54,7 +54,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -393,11 +393,28 @@ class GPTNeoXBlock(spx.Module):
             frequencies,
         )
         if self.use_parallel_residual:
-            mlp = self.mlp(self.post_attention_layernorm(hidden_states))
+            feed_forward_input = self.post_attention_layernorm(hidden_states)
+            if self.config.use_scan_mlp:
+                mlp = blockwise_ffn(
+                    self.mlp,
+                    feed_forward_input,
+                    self.config.scan_mlp_chunk_size,
+                )
+            else:
+                mlp = self.mlp(feed_forward_input)
             hidden_states = mlp + hidden_states + attn_outputs.attention_output
         else:
             hidden_states = attn_outputs.attention_output + hidden_states
-            hidden_states = self.mlp(self.post_attention_layernorm(hidden_states)) + hidden_states
+            feed_forward_input = self.post_attention_layernorm(hidden_states)
+            if self.config.use_scan_mlp:
+                feed_forward_hidden_states = blockwise_ffn(
+                    self.mlp,
+                    feed_forward_input,
+                    self.config.scan_mlp_chunk_size,
+                )
+            else:
+                feed_forward_hidden_states = self.mlp(feed_forward_input)
+            hidden_states = feed_forward_hidden_states + hidden_states
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,

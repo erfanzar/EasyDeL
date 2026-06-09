@@ -55,7 +55,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -365,7 +365,7 @@ class MistralDecoderLayer(spx.Module):
         hidden_states = checkpoint_name(attention_output.attention_output + residual, "residual")
         ffd_inp = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(self.mlp, ffd_inp, self.config.scan_mlp_chunk_size)
+            feed_forward_hidden_states = blockwise_ffn(self.mlp, ffd_inp, self.config.scan_mlp_chunk_size)
         else:
             feed_forward_hidden_states = self.mlp(ffd_inp)
 

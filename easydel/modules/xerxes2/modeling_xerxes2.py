@@ -55,7 +55,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -721,10 +721,17 @@ class Xerxes2DecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
         router_logits = None
         if self.is_moe:
-            hidden_states, router_logits = hidden_states
+            hidden_states, router_logits = self.mlp(hidden_states)
+        elif self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(

@@ -53,7 +53,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -545,7 +545,20 @@ class MptBlock(spx.Module):
         )
 
         hidden_states = self.resid_attn_dropout(attn_outputs.attention_output) + hidden_states
-        output = self.ffn(self.norm_2(hidden_states), hidden_states)
+        feed_forward_input = self.norm_2(hidden_states)
+        if self.config.use_scan_mlp:
+            # MptMLP fuses the residual add inside its forward, so scan the pure FFN (zero residual
+            # inside the chunked call) and add the real residual once, outside -- behavior-identical.
+            output = (
+                blockwise_ffn(
+                    lambda _h: self.ffn(_h, jnp.zeros_like(_h)),
+                    feed_forward_input,
+                    self.config.scan_mlp_chunk_size,
+                )
+                + hidden_states
+            )
+        else:
+            output = self.ffn(feed_forward_input, hidden_states)
 
         return DecoderLayerOutput(
             hidden_states=output,

@@ -59,7 +59,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -906,8 +906,15 @@ class RobertaLayer(spx.Module):
             )
             cross_attention = cross_attention_outputs.attention_output
 
-        hidden_states = self.intermediate(attention_output)
-        hidden_states = self.output(hidden_states, attention_output)
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                lambda _h: self.output(self.intermediate(_h), _h),
+                attention_output,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = self.intermediate(attention_output)
+            hidden_states = self.output(hidden_states, attention_output)
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,

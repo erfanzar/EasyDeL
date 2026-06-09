@@ -28,14 +28,14 @@ subpackage owns three layers of abstraction stacked on top of each other:
   handful of ``_create_*`` / ``_postprocess_qkv`` hooks instead of
   reimplementing the full forward path.
 
-Decoder-layer helpers (:class:`BaseDecoderLayer`, :func:`block_wise_ffn`)
+Decoder-layer helpers (:class:`BaseDecoderLayer`, :func:`blockwise_ffn`)
 live alongside attention because the canonical pre-LN ``h + sublayer(norm(h))``
 patterns are tightly coupled to the attention module's outputs.
 """
 
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 
-from ._decoder_base import BaseDecoderLayer, block_wise_ffn
+from ._decoder_base import BaseDecoderLayer, blockwise_ffn
 from ._flexible import (
     AttentionMechanisms,
     AttentionModule,
@@ -52,7 +52,7 @@ __all__ = (
     "FlexibleAttentionModule",
     "MaskInfo",
     "UnifiedAttention",
-    "block_wise_ffn",
+    "blockwise_ffn",
     "get_optimal_config",
     "tpu_version_check",
 )

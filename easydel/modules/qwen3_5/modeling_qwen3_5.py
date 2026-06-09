@@ -61,7 +61,7 @@ from easydel.caching import (
 )
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import MoeCausalLMOutput
-from easydel.infra.utils import auto_remat
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
@@ -316,7 +316,14 @@ class Qwen3_5MTPLayer(spx.Module):
 
         residual = hidden_states
         h = self.post_attention_layernorm(hidden_states)
-        h = self.mlp(h)
+        if self.config.use_scan_mlp:
+            h = blockwise_ffn(
+                self.mlp,
+                h,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            h = self.mlp(h)
         hidden_states = checkpoint_name(residual + h, "mtp_mlp_residual")
         return hidden_states, attn_out.cache_view
 

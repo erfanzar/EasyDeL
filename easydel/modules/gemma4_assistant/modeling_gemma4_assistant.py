@@ -83,7 +83,7 @@ from spectrax import apply_logical_sharding, common_types, nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -652,7 +652,14 @@ class Gemma4AssistantDecoderLayer(spx.Module):
 
         residual = hidden_states
         h = self.pre_feedforward_layernorm(hidden_states)
-        h = self.mlp(h)
+        if self.config.use_scan_mlp:
+            h = blockwise_ffn(
+                self.mlp,
+                h,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            h = self.mlp(h)
         h = self.post_feedforward_layernorm(h)
         hidden_states = (residual + h) * self.layer_scalar.value
         return hidden_states

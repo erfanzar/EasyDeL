@@ -64,7 +64,7 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -1239,7 +1239,7 @@ class Qwen2VLDecoderLayer(spx.Module):
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,

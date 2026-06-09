@@ -50,7 +50,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
-from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
+from easydel.infra.utils import ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -643,7 +643,7 @@ class GiddLayer(spx.Module):
         feed_forward_input = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:
             # Use block-wise computation for memory efficiency
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,

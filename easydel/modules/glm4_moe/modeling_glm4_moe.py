@@ -59,7 +59,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -759,7 +759,15 @@ class Glm4MoeDecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states, router_logits = self.mlp(hidden_states)
+        if self.config.use_scan_mlp and isinstance(self.mlp, Glm4MoeMLP):
+            hidden_states = blockwise_ffn(
+                lambda _h: self.mlp(_h)[0],
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+            router_logits = None
+        else:
+            hidden_states, router_logits = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(

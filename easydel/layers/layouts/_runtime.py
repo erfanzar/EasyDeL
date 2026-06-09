@@ -36,7 +36,13 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import PartitionAxis, with_sharding_constraint
 
-from easydel.infra.sharding import OptionalMesh, mesh_axis_size, resolve_stage_mesh
+from easydel.infra.sharding import (
+    OptionalMesh,
+    mesh_axis_size,
+    partition_spec_for_mesh,
+    resolve_stage_mesh,
+    sanitize_partition_spec_for_shape,
+)
 
 from ._types import Array, EasyDeLBaseConfig
 
@@ -115,6 +121,42 @@ def tensor_parallel_size(
     return int(mesh_axis_size(stage_mesh, tp_axis))
 
 
+def _axis_entry(axis: tp.Any) -> tp.Any:
+    """Normalize list-valued axis entries for ``PartitionSpec``."""
+    return tuple(axis) if isinstance(axis, list) else axis
+
+
+def _fit_axis_entry(axis: tp.Any, dim: int, mesh: OptionalMesh) -> tp.Any:
+    """Keep the largest subset of a compound axis that divides ``dim``."""
+    axis = _axis_entry(axis)
+    if axis is None:
+        return None
+    if not isinstance(axis, tuple):
+        size = int(mesh_axis_size(mesh, axis))
+        return axis if size <= 1 or int(dim) % size == 0 else None
+
+    product = int(mesh_axis_size(mesh, axis))
+    if product <= 1 or int(dim) % product == 0:
+        return axis
+
+    selected: set[tp.Any] = set()
+    running = 1
+    for candidate in sorted(axis, key=lambda name: int(mesh_axis_size(mesh, name)), reverse=True):
+        size = int(mesh_axis_size(mesh, candidate))
+        if size <= 1:
+            selected.add(candidate)
+            continue
+        next_product = running * size
+        if int(dim) % next_product == 0:
+            selected.add(candidate)
+            running = next_product
+
+    kept = tuple(candidate for candidate in axis if candidate in selected)
+    if not kept:
+        return None
+    return kept[0] if len(kept) == 1 else kept
+
+
 def with_tp_last_axis_sharding(
     x: Array,
     config: EasyDeLBaseConfig | None = None,
@@ -148,7 +190,21 @@ def with_tp_last_axis_sharding(
     if tp_size <= 1 or x.ndim < 1 or int(x.shape[-1]) % tp_size != 0:
         return x
 
-    spec = PartitionSpec(*([None] * (x.ndim - 1)), tp_axis)
+    current_spec = partition_spec_for_mesh(x, stage_mesh)
+    if len(current_spec) == x.ndim:
+        spec = PartitionSpec(*tuple(current_spec[:-1]), tp_axis)
+    elif config is not None and x.ndim == 3:
+        axis = _partition_axis(config)
+        batch_axis = _fit_axis_entry(axis.batch_axis, int(x.shape[0]), stage_mesh)
+        sequence_axis = _fit_axis_entry(axis.sequence_axis, int(x.shape[1]), stage_mesh)
+        spec = PartitionSpec(batch_axis, sequence_axis, tp_axis)
+    elif config is not None and x.ndim == 2:
+        axis = _partition_axis(config)
+        batch_axis = _fit_axis_entry(axis.batch_axis, int(x.shape[0]), stage_mesh)
+        spec = PartitionSpec(batch_axis, tp_axis)
+    else:
+        spec = PartitionSpec(*([None] * (x.ndim - 1)), tp_axis)
+    spec = sanitize_partition_spec_for_shape(spec, tuple(int(dim) for dim in x.shape), stage_mesh)
     return tp.cast(Array, with_sharding_constraint(x, spec, mesh=stage_mesh))
 
 

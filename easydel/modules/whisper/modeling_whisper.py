@@ -77,7 +77,7 @@ from easydel.infra.modeling_outputs import (
     Seq2SeqModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -487,10 +487,20 @@ class WhisperEncoderLayer(spx.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.activation_dropout_layer(hidden_states)
-        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                lambda _h: checkpoint_name(
+                    self.fc2(self.activation_dropout_layer(self.activation_fn(checkpoint_name(self.fc1(_h), "mlp_up")))),
+                    "mlp_down",
+                ),
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+            hidden_states = self.activation_fn(hidden_states)
+            hidden_states = self.activation_dropout_layer(hidden_states)
+            hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = checkpoint_name(hidden_states, "layer_output")
@@ -681,10 +691,20 @@ class WhisperDecoderLayer(spx.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.activation_dropout_layer(hidden_states)
-        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                lambda _h: checkpoint_name(
+                    self.fc2(self.activation_dropout_layer(self.activation_fn(checkpoint_name(self.fc1(_h), "mlp_up")))),
+                    "mlp_down",
+                ),
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+            hidden_states = self.activation_fn(hidden_states)
+            hidden_states = self.activation_dropout_layer(hidden_states)
+            hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = checkpoint_name(hidden_states, "layer_output")

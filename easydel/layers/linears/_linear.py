@@ -376,12 +376,16 @@ class ParallelLinear(spx.Module):
             inputs_promoted, kernel_promoted = promote_dtype((inputs, kernel), dtype=self.dtype)
             bias_promoted = None
 
-        y: Shaped[Array, "... out_features"] = jnp.einsum(
-            "...i,io->...o",
-            inputs_promoted,
-            kernel_promoted,
-            precision=self.precision,
-        )
+        out_features = self.out_features
+        if isinstance(out_features, collections.abc.Sequence):
+            out_features = sum(out_features)
+        with jax.named_scope(f"easydel/linear/{type(self).__name__}/in{self.in_features}/out{out_features}"):
+            y: Shaped[Array, "... out_features"] = jnp.einsum(
+                "...i,io->...o",
+                inputs_promoted,
+                kernel_promoted,
+                precision=self.precision,
+            )
 
         y_scaled: Shaped[Array, "... out_features"] = self._scale_operator(y)
 

@@ -65,7 +65,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -565,7 +565,15 @@ class ArcticMoeBlock(BaseMoeModule):
                 act_fn=self.experts.act_fn,
             )
             return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
-        return self.mlp(hidden_states), None  # pyright: ignore[reportReturnType]
+        if self.config.use_scan_mlp:
+            mlp_output = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            mlp_output = self.mlp(hidden_states)
+        return mlp_output, None  # pyright: ignore[reportReturnType]
 
 
 class ArcticDecoderLayer(spx.Module):
@@ -728,7 +736,14 @@ class ArcticDecoderLayer(spx.Module):
         router_logits = None
         if self.parallel_attn_mlp_res:
             hidden_states = self.residual_layernorm(hidden_states)
-            hidden_states = self.residual_mlp(hidden_states)
+            if self.config.use_scan_mlp:
+                hidden_states = blockwise_ffn(
+                    self.residual_mlp,
+                    hidden_states,
+                    self.config.scan_mlp_chunk_size,
+                )
+            else:
+                hidden_states = self.residual_mlp(hidden_states)
             residual_residual = checkpoint_name(residual_attn + hidden_states, "residual")
             # parallel mlp moe part
             hidden_states = self.post_attention_layernorm(residual_input)

@@ -67,7 +67,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -456,10 +456,25 @@ class OPTDecoderLayer(spx.Module):
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 
-        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
-        hidden_states = checkpoint_name(self.activation_fn(hidden_states), "mlp_gate")
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                lambda _h: checkpoint_name(
+                    self.fc2(
+                        checkpoint_name(
+                            self.activation_fn(checkpoint_name(self.fc1(_h), "mlp_up")),
+                            "mlp_gate",
+                        )
+                    ),
+                    "mlp_down",
+                ),
+                hidden_states.reshape(hidden_states_shape),
+                self.config.scan_mlp_chunk_size,
+            ).reshape(-1, hidden_states.shape[-1])
+        else:
+            hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+            hidden_states = checkpoint_name(self.activation_fn(hidden_states), "mlp_gate")
 
-        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
+            hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
 
         hidden_states = checkpoint_name((residual + hidden_states).reshape(hidden_states_shape), "layer_output")

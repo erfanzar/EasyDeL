@@ -45,7 +45,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -442,7 +442,7 @@ class XerxesSparseMoeBlock(spx.Module):
         final_hidden_state = jnp.zeros_like(hidden_states)
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
-                block_wise_ffn(
+                blockwise_ffn(
                     self.experts[index],
                     hidden_states,
                     self.config.scan_mlp_chunk_size,
@@ -582,7 +582,7 @@ class XerxesDecoderLayer(spx.Module):
             feed_forward_input = self.pre_feedforward_layernorm(hidden_states)
 
         if self.config.use_scan_mlp and not self.config.xe_moe:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,

@@ -54,7 +54,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -527,11 +527,18 @@ class Qwen3MoeDecoderLayer(spx.Module):
         )
         hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        feed_forward_hidden_states = self.mlp(feed_forward_input)
 
         router_logits = None
         if self.is_moe:
-            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
+            feed_forward_hidden_states, router_logits = self.mlp(feed_forward_input)
+        elif self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(feed_forward_input)
 
         hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
         return DecoderLayerOutput(

@@ -39,7 +39,7 @@ from spectrax import apply_logical_sharding, common_types, nn
 from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     RMSNorm,
@@ -544,7 +544,7 @@ class PixtralBlock(spx.Module):
         hidden_states = checkpoint_name(attention_output.attention_output + residual, "residual")
         ffd_inp = self.ffn_norm(hidden_states)
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(self.feed_forward, ffd_inp, self.config.scan_mlp_chunk_size)
+            feed_forward_hidden_states = blockwise_ffn(self.feed_forward, ffd_inp, self.config.scan_mlp_chunk_size)
         else:
             feed_forward_hidden_states = self.feed_forward(ffd_inp)
 

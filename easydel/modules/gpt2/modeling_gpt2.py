@@ -56,7 +56,7 @@ from easydel.infra.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     DecoderLayerOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import Embed
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -658,7 +658,7 @@ class GPT2Block(spx.Module):
         Pre-norm flow: ``x + attn(ln_1(x))`` followed (when configured)
         by ``x + crossattn(ln_cross_attn(x), enc)`` and finally
         ``x + mlp(ln_2(x))``. Optionally chunked via
-        :func:`block_wise_ffn` when ``config.use_scan_mlp`` is set.
+        :func:`blockwise_ffn` when ``config.use_scan_mlp`` is set.
 
         Args:
             hidden_states: Input tensor of shape
@@ -729,7 +729,7 @@ class GPT2Block(spx.Module):
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 hidden_states,
                 self.config.scan_mlp_chunk_size,

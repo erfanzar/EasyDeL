@@ -49,7 +49,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.layouts import hf_per_expert_swiglu_reform_param
@@ -344,7 +344,7 @@ class PhiMoeSparseMoeBlock(spx.Module):
         final_hidden_state = jnp.zeros_like(hidden_states)
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
-                block_wise_ffn(
+                blockwise_ffn(
                     self.experts[index],
                     hidden_states,
                     self.config.scan_mlp_chunk_size,

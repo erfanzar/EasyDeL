@@ -55,7 +55,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -478,7 +478,7 @@ class Grok1SparseMoeBlock(spx.Module):
 
         for index in range(self.config.num_experts):
             expert_layer_output = (
-                block_wise_ffn(
+                blockwise_ffn(
                     self.experts[index],
                     hidden_states,
                     self.config.scan_mlp_chunk_size,

@@ -63,7 +63,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
 from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -1483,7 +1483,14 @@ class GlmMoeDsaDecoderLayer(spx.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        feed_forward_hidden_states = self.mlp(hidden_states)
+        if self.config.use_scan_mlp and isinstance(self.mlp, GlmMoeDsaMLP):
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(hidden_states)
         router_logits = None
         if isinstance(feed_forward_hidden_states, tuple):
             feed_forward_hidden_states, router_logits = feed_forward_hidden_states

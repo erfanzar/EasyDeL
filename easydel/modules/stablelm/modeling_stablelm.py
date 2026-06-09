@@ -52,7 +52,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -568,7 +568,7 @@ class StableLmDecoderLayer(spx.Module):
 
         if self.use_parallel_residual:
             if self.config.use_scan_mlp:
-                hidden_states = block_wise_ffn(self.mlp, hidden_states, self.config.scan_mlp_chunk_size)
+                hidden_states = blockwise_ffn(self.mlp, hidden_states, self.config.scan_mlp_chunk_size)
             else:
                 hidden_states = self.mlp(hidden_states)
 
@@ -577,7 +577,7 @@ class StableLmDecoderLayer(spx.Module):
         else:
             residual = residual + attn_outputs.attention_output
             if self.config.use_scan_mlp:
-                hidden_states = block_wise_ffn(
+                hidden_states = blockwise_ffn(
                     self.mlp,
                     self.post_attention_layernorm(residual),
                     self.config.scan_mlp_chunk_size,

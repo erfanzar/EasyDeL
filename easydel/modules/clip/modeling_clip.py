@@ -66,7 +66,7 @@ from easydel.infra.modeling_outputs import (
     EncoderLayerOutput,
     ImageClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -593,7 +593,14 @@ class CLIPEncoderLayer(spx.Module):
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.config.use_scan_mlp:
+            hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = checkpoint_name(residual + hidden_states, name="residual")
         hidden_states = checkpoint_name(hidden_states, name="layer_output")
 

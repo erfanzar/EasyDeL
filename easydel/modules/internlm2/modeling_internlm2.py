@@ -60,7 +60,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -373,7 +373,7 @@ class InternLM2Block(spx.Module):
         feed_forward_input = self.ffn_norm(hidden_states)
 
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.feed_forward, feed_forward_input, self.config.scan_mlp_chunk_size
             )
         else:

@@ -61,7 +61,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
 )
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -1388,11 +1388,18 @@ class KimiDecoderLayer(spx.Module):
         hidden_states = checkpoint_name(hidden_states + attn_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        feed_forward_output = self.mlp(feed_forward_input)
 
         router_logits = None
         if self.is_moe_layer:
-            feed_forward_output, router_logits = feed_forward_output
+            feed_forward_output, router_logits = self.mlp(feed_forward_input)
+        elif self.config.use_scan_mlp:
+            feed_forward_output = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_output = self.mlp(feed_forward_input)
 
         hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
 

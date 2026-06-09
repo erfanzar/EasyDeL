@@ -650,6 +650,29 @@ def sanitize_partition_spec_for_shape(
             return None, True
         return axis_spec, False
 
+    def _fit_compound_axis_to_dim(axis_spec: tp.Any, dim: int) -> tuple[tp.Any, bool]:
+        """Keep the largest subset of a compound axis that divides ``dim``."""
+        if not isinstance(axis_spec, tuple):
+            return None, True
+
+        selected: set[tp.Any] = set()
+        running_product = 1
+        for candidate in sorted(axis_spec, key=lambda axis: int(_mesh_partition_product(mesh, axis)), reverse=True):
+            shard_factor = int(_mesh_partition_product(mesh, candidate))
+            if shard_factor <= 1:
+                selected.add(candidate)
+                continue
+            next_product = running_product * shard_factor
+            if int(dim) % next_product == 0:
+                selected.add(candidate)
+                running_product = next_product
+
+        kept = tuple(axis for axis in axis_spec if axis in selected)
+        if not kept:
+            return None, True
+        fitted = kept[0] if len(kept) == 1 else kept
+        return fitted, fitted != axis_spec
+
     for dim_index, axis_spec in enumerate(axes):
         if axis_spec is None:
             continue
@@ -662,8 +685,11 @@ def sanitize_partition_spec_for_shape(
             continue
         shard_factor = _mesh_partition_product(mesh, axis_spec)
         if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
-            axes[dim_index] = None
+            fitted_axis_spec, fit_changed = _fit_compound_axis_to_dim(axis_spec, int(shape[dim_index]))
+            axes[dim_index] = fitted_axis_spec
             changed = True
+            if not fit_changed and fitted_axis_spec is axis_spec:
+                axes[dim_index] = None
 
     if not changed:
         return pspec

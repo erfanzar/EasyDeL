@@ -58,7 +58,7 @@ from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import (
     ACT2FN,
     auto_remat,
-    block_wise_ffn,
+    blockwise_ffn,
 )
 from easydel.layers import (
     ColumnParallelLinear,
@@ -440,7 +440,7 @@ class Exaone4DecoderLayer(spx.Module):
         # MLP block
         residual = hidden_states
         if self.config.use_scan_mlp:
-            mlp_output = block_wise_ffn(
+            mlp_output = blockwise_ffn(
                 self.mlp,
                 hidden_states,
                 self.config.scan_mlp_chunk_size,

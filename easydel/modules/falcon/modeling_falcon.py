@@ -66,7 +66,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn
+from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -530,7 +530,7 @@ class FalconBlock(spx.Module):
             mlp_layernorm_out = attention_layernorm_out
 
         if self.config.use_scan_mlp:
-            mlp_output = block_wise_ffn(
+            mlp_output = blockwise_ffn(
                 self.mlp,
                 mlp_layernorm_out,
                 self.config.scan_mlp_chunk_size,

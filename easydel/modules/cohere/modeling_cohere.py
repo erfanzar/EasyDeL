@@ -61,7 +61,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
+from easydel.infra.utils import ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -476,7 +476,7 @@ class CohereBlock(spx.Module):
         feed_forward_input = hidden_states
 
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,
