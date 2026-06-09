@@ -1,0 +1,176 @@
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
+name = "spectrax-lib"
+version = "0.1.4"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "SpectraX: a JAX-only neural-network library with a True MPMD pipeline parallelism for JAX — with an eager module API."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "AGPL-3.0-or-later" }
+keywords = [
+	"Deep Learning",
+	"Machine Learning",
+	"Neural Networks",
+	"JAX",
+	"XLA",
+]
+classifiers = [
+	"Development Status :: 3 - Alpha",
+	"Intended Audience :: Developers",
+	"Topic :: Scientific/Engineering :: Artificial Intelligence",
+	"License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+]
+dependencies = [
+	"jax>=0.10.0",
+	"jaxlib>=0.10.0",
+	"numpy>=1.26",
+	"treescope>=0.1.7",
+	"tensorstore>=0.1.76",
+	"fsspec[http]>=2024.2,<2026",
+	"protobuf>=5.29.6,<7",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/erfanzar/spectrax"
+"Repository" = "https://github.com/erfanzar/spectrax"
+
+[project.optional-dependencies]
+cuda = ["jax[cuda13]>=0.10.0"]
+tpu = ["jax[tpu]>=0.10.0"]
+test = ["pytest>=7", "gcsfs>=2024.2,<2026", "optax>=0.2.8"]
+dev = ["ruff>=0.6", "basedpyright>=1.34", "pytest>=7", "gcsfs>=2024.2,<2026", "optax>=0.2.8"]
+contrib = ["optax>=0.2.8"]
+docs = [
+    "sphinx>=7",
+    "sphinx-book-theme>=1.1",
+    "sphinx-design>=0.6",
+    "sphinx-autodoc-typehints>=2",
+    "myst-nb>=1",
+]
+
+[tool.uv.build-backend]
+module-name = ["spectrax"]
+module-root = "."
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"spectrax" = ["py.typed"]
+
+[tool.black]
+line-length = 121
+target-version = ["py311"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = [
+	"F722",   # Forward annotations needed for jaxtyping
+	"B008",   # Do not perform function calls in argument defaults
+	"UP015",  # Unnecessary open mode
+	"A005",   # Module-level shadowing
+	"UP037",  # Remove quotes from type annotation - needed for jaxtyping string literals
+	"E501",   # Line too long (handled by formatter)
+	"RUF001", # Ambiguous unicode character (source)
+	"RUF002", # Ambiguous unicode character (docstring)
+	"RUF003", # Ambiguous unicode character (comment)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403"]
+"docs/conf.py" = ["A001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ["spectrax/"]
+
+[tool.basedpyright]
+reportAssignmentType = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportCallInDefaultInitializer = "none"
+reportConstantRedefinition = "none"
+reportDeprecated = "none"
+reportFunctionMemberAccess = "none"
+reportImportCycles = "none"
+reportImplicitRelativeImport = "none"
+reportInconsistentConstructor = "none"
+reportInvalidCast = "none"
+reportInvalidTypeForm = "none"
+reportInvalidTypeVarUse = "none"
+reportMissingTypeStubs = "none"
+reportOptionalSubscript = "none"
+reportPossiblyUnboundVariable = "none"
+reportPropertyTypeMismatch = "none"
+reportTypedDictNotRequiredAccess = "none"
+reportUnnecessaryComparison = "none"
+reportUnnecessaryTypeIgnoreComment = "none"
+reportUntypedBaseClass = "none"
+reportUntypedFunctionDecorator = "none"
+reportUnusedClass = "none"
+reportUnusedFunction = "none"
+reportUnusedImport = "none"
+reportUnusedVariable = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"
+
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.uv]
+conflicts = [
+	[
+		{ extra = "cuda" },
+		{ extra = "tpu" },
+	],
+]
