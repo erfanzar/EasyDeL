@@ -903,6 +903,7 @@ cuda = [
 ]
 dev = [
     { name = "import-linter" },
+    { name = "ruff" },
 ]
 lm-eval = [
     { name = "easydel", extra = ["lm-eval"] },
@@ -935,7 +936,10 @@ requires-dist = [{ name = "easydel", editable = "libs/easydel" }]
 
 [package.metadata.requires-dev]
 cuda = [{ name = "easydel", extras = ["cuda"], editable = "libs/easydel" }]
-dev = [{ name = "import-linter", specifier = ">=2.0" }]
+dev = [
+    { name = "import-linter", specifier = ">=2.0" },
+    { name = "ruff" },
+]
 lm-eval = [{ name = "easydel", extras = ["lm-eval"], editable = "libs/easydel" }]
 mm = [{ name = "easydel", extras = ["mm"], editable = "libs/easydel" }]
 podutils = [{ name = "easydel", extras = ["podutils"], editable = "libs/easydel" }]
