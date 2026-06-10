@@ -32,7 +32,9 @@ repos:
         stages: [pre-commit]
         args: ["--fix=lf"]
 
-  # Python code formatting with ruff
+  # Python code formatting with ruff. Lint rules for libs/ members come from
+  # their own per-lib hooks (each with its lib's config); the global linter
+  # must not also lint libs/ or the two configs fix-fight over import order.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.6.9
     hooks:
@@ -40,6 +42,7 @@ repos:
       - id: ruff
         stages: [pre-commit]
         args: ["--fix"]
+        exclude: ^libs/
       # Run the formatter
       - id: ruff-format
         stages: [pre-commit]
@@ -101,6 +104,74 @@ repos:
         types: [python]
         pass_filenames: false
 
+      - id: ruff-easydel
+        name: ruff lint+fix (libs/easydel)
+        description: Lints and auto-fixes libs/easydel with its own ruff config
+        entry: ruff check --fix --config libs/easydel/pyproject.toml
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/easydel/
+        stages: [pre-commit]
+      - id: ruff-spectrax
+        name: ruff lint+fix (libs/spectrax)
+        description: Lints and auto-fixes libs/spectrax with its own ruff config
+        entry: ruff check --fix --config libs/spectrax/pyproject.toml
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/spectrax/
+        stages: [pre-commit]
+      - id: ruff-ejkernel
+        name: ruff lint+fix (libs/ejkernel)
+        description: Lints and auto-fixes libs/ejkernel with its own ruff config
+        entry: ruff check --fix --config libs/ejkernel/pyproject.toml
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/ejkernel/
+        stages: [pre-commit]
+      - id: ruff-eformer
+        name: ruff lint+fix (libs/eformer)
+        description: Lints and auto-fixes libs/eformer with its own ruff config
+        entry: ruff check --fix --config libs/eformer/pyproject.toml
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/eformer/
+        stages: [pre-commit]
+      - id: uv-lock-easydel
+        name: uv.lock fresh for libs/easydel
+        description: Pushing changes to libs/easydel/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/easydel/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
+      - id: uv-lock-spectrax
+        name: uv.lock fresh for libs/spectrax
+        description: Pushing changes to libs/spectrax/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/spectrax/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
+      - id: uv-lock-ejkernel
+        name: uv.lock fresh for libs/ejkernel
+        description: Pushing changes to libs/ejkernel/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/ejkernel/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
+      - id: uv-lock-eformer
+        name: uv.lock fresh for libs/eformer
+        description: Pushing changes to libs/eformer/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/eformer/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
       - id: subtree-mirror-sync
         name: Push libs/* updates to standalone mirrors
         description: Pushes spectrax/ejkernel/eformer subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
