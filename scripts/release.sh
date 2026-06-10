@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# Release one workspace package: bump its version, keep easydel's pins on the
-# sibling libraries in sync, refresh the lock, commit, and tag. Publishing to
-# PyPI happens in CI when the tag is pushed (.github/workflows/publish.yaml).
+# Bump one workspace package's version and COMMIT — nothing leaves the machine.
+# Keeps easydel's pins on the sibling libraries in sync and refreshes the lock.
+# Publishing to GitHub/PyPI is a separate, explicit step: scripts/publish.sh.
 #
 #   scripts/release.sh <easydel|spectrax|ejkernel|eformer> <new-version> [--dry-run]
 #
 # Examples:
-#   scripts/release.sh ejkernel 0.0.81          # bump + sync easydel pins + tag ejkernel-v0.0.81
-#   scripts/release.sh easydel 0.4.1            # bump + refresh packaged README + tag easydel-v0.4.1
-#
-# After the script: `git push origin <branch> <tag>` triggers the publish.
+#   scripts/release.sh ejkernel 0.0.82          # bump + sync easydel pins + commit
+#   scripts/release.sh easydel 0.4.1            # bump + refresh packaged README + commit
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -33,7 +31,7 @@ if [ "$dry" = "--dry-run" ]; then
     else
         echo "[dry-run] would refresh libs/easydel/README.md from root README.md"
     fi
-    echo "[dry-run] would: uv lock && git commit && git tag $lib-v$version && uv build --package $dist"
+    echo "[dry-run] would: uv lock && git commit"
     exit 0
 fi
 
@@ -52,13 +50,10 @@ else
     cp README.md libs/easydel/README.md
 fi
 
-# 3. refresh the workspace lock and record the release
+# 3. refresh the workspace lock and record the release locally
 uv lock
 git add "$pp" libs/easydel/pyproject.toml libs/easydel/README.md uv.lock 2>/dev/null || true
 git commit -m "release: $dist v$version"
-git tag "$lib-v$version"
 
-# 4. build artifacts locally as a sanity check (CI rebuilds + publishes on tag push)
-uv build --package "$dist" --out-dir dist/
 echo
-echo "tagged $lib-v$version — push with:  git push origin HEAD $lib-v$version"
+echo "committed $dist v$version — publish later with:  scripts/publish.sh $lib"

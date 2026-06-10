@@ -31,7 +31,7 @@ versions declared in `libs/easydel/pyproject.toml`.
 
 ## Layering contract (CI-enforced)
 
-```
+```md
 spectrax    ejkernel    eformer      <- independent of each other and of easydel
        \        |        /
               easydel                <- the only package that may import the others
@@ -56,25 +56,39 @@ uv run pytest libs/ejkernel/test        # kernels: most need GPU/TPU
 
 ## Releasing
 
-One command per package — bumps the version, keeps easydel's pins on the
-sibling libraries in lockstep, refreshes the lock, commits, and tags:
+Releasing is split into two explicit steps — nothing leaves the machine
+until you run the second one:
 
 ```bash
-scripts/release.sh ejkernel 0.0.81
-git push origin HEAD ejkernel-v0.0.81   # tag push triggers the PyPI publish
+scripts/release.sh ejkernel 0.0.82   # bump + sync easydel pins + lock + COMMIT (local only)
+scripts/publish.sh ejkernel          # tag ejkernel-v0.0.82 + push the tag -> CI publishes to PyPI
 ```
 
 `.github/workflows/publish.yaml` builds and publishes exactly the tagged
 package (PyPI trusted publishing, or the `PYPI_API_TOKEN` secret).
+`publish.sh` pushes the tag only — push the branch yourself with `git push`.
 
 ## Mirror sync
 
-`.github/workflows/sync-subtrees.yaml` re-splits `libs/{spectrax,ejkernel,eformer}`
-on every push to `main`/`vnext` and fast-forwards the standalone repos
+Mirrors update automatically when you `git push`: the pre-push hook
+(`scripts/subtree-sync.sh auto`) detects which of spectrax/ejkernel/eformer
+changed and subtree-pushes just those to their standalone repos
+(`SUBTREE_SYNC_SKIP=1 git push` to bypass; mirror outages never block the
+push). `.github/workflows/sync-subtrees.yaml` is the server-side backstop
 (requires the `SUBTREE_SYNC_TOKEN` secret: fine-grained PAT, Contents
 read/write on the three mirrors). Manual fallback:
 
 ```bash
 scripts/subtree-sync.sh push            # all three
 scripts/subtree-sync.sh pull ejkernel   # reconcile a diverged mirror
+```
+
+## Dev tooling
+
+`uv sync` installs the `dev` group by default: `pytest`, `pre-commit`,
+`ruff`, `import-linter`, `basedpyright`. Activate the git hooks once per
+clone:
+
+```bash
+uv run pre-commit install --hook-type pre-commit --hook-type pre-push
 ```

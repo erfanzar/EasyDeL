@@ -1,5 +1,7 @@
-# Pre-commit hooks for EasyDeL
-# Install with: pip install pre-commit && pre-commit install
+# Pre-commit hooks for the EasyDeL workspace
+# Install with: uv run pre-commit install --hook-type pre-commit --hook-type pre-push
+
+default_stages: [pre-commit]
 
 repos:
   # General fixes
@@ -26,10 +28,9 @@ repos:
     hooks:
       # Run the linter
       - id: ruff
-        args: ["--fix", "--config", "pyproject.toml"]
+        args: ["--fix"]
       # Run the formatter
       - id: ruff-format
-        args: ["--config", "pyproject.toml"]
 
   # Type checking with mypy (optional, can be slow)
   # - repo: https://github.com/pre-commit/mirrors-mypy
@@ -86,6 +87,16 @@ repos:
         language: python
         types: [python]
         pass_filenames: false
+
+      - id: subtree-mirror-sync
+        name: Push libs/* updates to standalone mirrors
+        description: Pushes spectrax/ejkernel/eformer subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
+        entry: scripts/subtree-sync.sh auto
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+        verbose: true
 
       - id: docker-build-push
         name: Docker Build and Push (Manual)

@@ -6,7 +6,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = ["easydel"]
 
 [dependency-groups]
-dev = ["import-linter>=2.0", "ruff"]
+dev = ["import-linter>=2.0", "ruff", "pytest", "pre-commit", "basedpyright"]
 torch = ["easydel[torch]"]
 cuda = ["easydel[cuda]"]
 tpu = ["easydel[tpu]"]
