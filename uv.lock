@@ -4828,7 +4828,7 @@ wheels = [
 
 [[package]]
 name = "spectrax-lib"
-version = "0.1.4"
+version = "0.1.5"
 source = { editable = "libs/spectrax" }
 dependencies = [
     { name = "fsspec", extra = ["http"] },
